@@ -1,0 +1,469 @@
+# Docker Compose deployment
+
+The capture deployment is one process per container and one writer per spool
+lane. Containers share files, not sockets:
+
+```text
+targeter ──> data/live/targets_*.json
+                         │
+                         ├──> splice-polymarket ──────────┐
+                         ├──> splice-limitless ───────────┤
+                         ├──> splice-polymarket-snapshots ┤
+                         └──> optional splice lanes ──────┤
+                                                         v
+                                              data/spool/venue=*/
+                                                         │
+                                                         v
+                                                     ingester
+                                                         │
+                                                         v
+                                              data/ingest-store/store.db
+```
+
+The target files, raw spool, and derived SQLite store are bind-mounted from one
+host directory. Images are immutable; the repository is not mounted into running
+containers.
+
+## Services and profiles
+
+`docker compose up -d` starts the capture path already verified without private
+credentials:
+
+| Service | Default | Purpose |
+|---|---:|---|
+| `targeter` | yes | Continuously publishes per-venue subscription targets |
+| `splice-polymarket` | yes | Polymarket market WebSocket |
+| `splice-limitless` | yes | Limitless market feed |
+| `splice-polymarket-snapshots` | yes | Polled recovery points for Polymarket |
+| `ingester` | yes | Tails all spool lanes and advances the derived fact store |
+| `splice-kalshi` | `kalshi` profile | Authenticated Kalshi feed |
+| `splice-polymarket-sports` | `reference` profile | Polymarket sports reference feed |
+| `splice-polymarket-rtds` | `reference` profile | Polymarket RTDS reference prices |
+| `ingester-integrity` | `ops` profile | One-shot store integrity check |
+| `finalizer` | `ops` profile | Checks every minute and merges sealed windows into compressed canonical evidence |
+| `finalizer-once` | `ops` profile | The same finalization sweep, once |
+| `archiver` | `ops` profile | Hourly sweep publishing sealed segments as immutable compressed objects |
+| `archiver-once` | `ops` profile | The same sweep, once, for an operator or external scheduler |
+| `reaper` | `ops` profile | Hourly dual-receipt audit; deletion is opt-in |
+| `reaper-once` | `ops` profile | The same reaper sweep, once |
+| `canonical-integrity` | `ops` profile | Fully decodes and verifies committed canonical windows |
+
+`compose.targeter-v2.yaml` is a deliberate production override. With it,
+`targeter` becomes a one-shot discover/archive/publish transaction and the
+additional `targeter-v2-integrity` service audits the live generation. The base
+file remains the v1 deployment when the override is absent.
+
+Kalshi is deliberately opt-in until its splice has been exercised against real
+credentials. Reference feeds are opt-in because they are not needed for the core
+two-venue book capture and increase storage use.
+
+## First deployment on Linux
+
+Docker Engine with the Compose v2 plugin is required.
+
+```bash
+test -e .env || cp .env.example .env
+```
+
+Edit `.env` before starting:
+
+```dotenv
+CAPTURE_DATA_ROOT=/srv/prediction-indexer/data
+PUID=1000
+PGID=1000
+```
+
+`PUID` and `PGID` must own the data root. Using the deployment account's numeric
+IDs avoids root-owned tape files:
+
+```bash
+id -u
+id -g
+sudo install -d -o 1000 -g 1000 /srv/prediction-indexer/data
+docker compose config --quiet
+docker compose build
+docker compose up -d
+```
+
+Use the IDs returned by `id`, not necessarily `1000`.
+
+The default services are independently restartable and use
+`restart: unless-stopped`. A target-dependent splice waits for its own venue file;
+a failed Kalshi discovery cannot hold up Polymarket or Limitless.
+
+## Optional feeds
+
+Start the public reference feeds:
+
+```bash
+docker compose --profile reference up -d
+```
+
+For Kalshi, keep the private key outside the repository and make it readable only
+by the deployment account:
+
+```bash
+install -m 600 /path/from/kalshi/private-key.pem /srv/prediction-indexer/kalshi-private-key.pem
+```
+
+Set the host path and key ID in `.env`:
+
+```dotenv
+KALSHI_API_KEY_ID=your-key-id
+KALSHI_PRIVATE_KEY_PATH=/srv/prediction-indexer/kalshi-private-key.pem
+```
+
+Then start the profile:
+
+```bash
+docker compose --profile kalshi up -d
+docker compose logs -f splice-kalshi
+```
+
+The profile proves only that the container and credential mount are correct. The
+first real connection still has to validate Kalshi's signing and subscription
+shape against the venue.
+
+## Targeter v2 opt-in
+
+Targeter v2 is not a long-lived container. A host cron entry or systemd timer
+runs one isolated discovery/archive/publication transaction. Every
+subscription-driven splice resolves the same atomically replaced pointer, so a
+generation cannot be mixed across venues.
+
+Configure the S3 fields from `.env.example`, export credentials only if the host
+does not use an instance/task role, then validate the merged deployment:
+
+```bash
+docker compose -f compose.yaml -f compose.targeter-v2.yaml config --quiet
+docker compose -f compose.yaml -f compose.targeter-v2.yaml build targeter
+docker compose -f compose.yaml -f compose.targeter-v2.yaml run --rm targeter
+docker compose -f compose.yaml -f compose.targeter-v2.yaml --profile ops \
+  run --rm targeter-v2-integrity
+```
+
+Only after the integrity command succeeds should the splice services be
+recreated with the same override. Schedule the exact `run --rm targeter`
+command rather than `up` for recurring runs. The application lease under
+`targeter-v2-runs` rejects overlapping scheduler invocations.
+
+The full archive namespace, commit protocol, failure behavior, cron example,
+rollout gate, and rollback steps are normative in
+`docs/TARGETER_V2_PHASES_6_10.md`.
+
+## Operations
+
+Inspect status and recent logs:
+
+```bash
+docker compose ps
+docker compose logs --tail 200 targeter splice-polymarket splice-limitless ingester
+```
+
+Follow one lane:
+
+```bash
+docker compose logs -f splice-polymarket
+```
+
+Restarting a splice opens a new connection epoch and resumes `delivery_index`
+from its spool. A normal stop gives the splice up to 30 seconds to write its
+closing control record and fsync.
+
+Run a store integrity check without a concurrent ingest writer:
+
+```bash
+docker compose stop ingester
+docker compose run --rm ingester-integrity
+docker compose start ingester
+```
+
+Apply a new v1 manifest without rebuilding (base deployment only):
+
+```bash
+docker compose restart targeter
+```
+
+The manifest is mounted read-only, and running splices poll the target files for
+changes.
+
+Stop without deleting host data:
+
+```bash
+docker compose down
+```
+
+## Persistence and capacity
+
+Everything durable is below `CAPTURE_DATA_ROOT`:
+
+```text
+live/                target files, rejections, and coverage ledger
+spool/               irreversible raw NDJSON tape, sealed segments
+ingest-store/        derived SQLite evidence/fact store   (file_order)
+canonical/           derived merged evidence per window   (EvidenceSeq)
+archive-manifests/   derived replay catalog over verified archive receipts
+```
+
+`ARCHIVE_ROOT` is deliberately outside this tree — see "Raw archive and local
+deletion" below.
+
+The spool is partitioned by **lane** and split into UTC-aligned segments:
+
+```text
+spool/lane=<lane>/date=<YYYY-MM-DD>/
+  <window-start>-<index>-<id>.ndjson       a sealed segment
+  <window-start>-<index>-<id>.seal.json    its commit marker
+  <window-start>-<index>-<id>.ndjson.open  the segment being written
+```
+
+A lane is one splice process, not a venue: Polymarket runs four of them and every
+record from all four carries `venue: polymarket` in its envelope.
+
+**The seal is what makes a segment evidence.** It carries the byte length, line
+count and sha256 of exactly those bytes, so an `.ndjson` without a valid seal is
+never eligible for merge or archive — that is how a reader tells "this lane had
+nothing to say in this window" from "this lane has not finished the window yet".
+At most one `.ndjson.open` exists per lane while capture runs, and none after a
+clean stop. A crash leaves one behind; the next start repairs any torn tail and
+seals it with `seal_reason: "recovery"`.
+
+Segments span reconnects by design, so one file normally holds several
+`connection_epoch` values. `SEGMENT_SECONDS` must divide 86400 evenly.
+
+### Canonical evidence
+
+`docker compose --profile ops run --rm finalizer-once` merges sealed windows into
+cross-lane receive order:
+
+```text
+canonical/date=<YYYY-MM-DD>/window=<start_ns>/
+  evidence.ndjson.zst     one checksummed frame; decoded lines remain byte-for-byte evidence
+  provenance.ndjson.zst   one checksummed frame; one decoded line per position
+  receipt.json        its commit marker
+canonical/watermark.json
+```
+
+`watermark.json` is a **derived index over the receipts**, the same relationship
+a seal has to the tape. It makes "where do I resume, what is the next position,
+which windows are committed" three field reads instead of a scan over the whole
+retention period. Delete it and the next run rebuilds it byte-identically from
+the receipts and re-finalizes nothing; where the two disagree the receipts win.
+
+**Two orders exist and both are honest about what they are.** The ingest store
+numbers records in filename order (`file_order`), which is capture order within a
+lane and meaningless across lanes. Canonical evidence numbers them on
+`(visible_ns, lane_rank, delivery_index)` — that sequence is the spec's
+`EvidenceSeq`. Neither is venue event order; both are capture observation order at
+one host.
+
+As with a segment, **the receipt is the commit marker**: an `evidence.ndjson.zst`
+without one is a crash between two steps and is not evidence.
+
+The receipt records decoded SHA-256, byte length and line count independently
+from the compressed object's SHA-256 and length. Run the bounded-memory full
+audit before replay or export:
+
+```bash
+docker compose --profile ops run --rm canonical-integrity
+```
+
+`--expect-lane` in the `finalizer` service must list exactly the splices this
+deployment runs. It ships with the three ungated ones; enabling the `kalshi`
+profile means adding `kalshi`, and `reference` means adding `polymarket_sports`
+and `polymarket_rtds`. Get this wrong in either direction and completeness stops
+meaning anything — a lane listed but never run makes every window `incomplete`,
+and a lane run but not listed makes a real outage invisible.
+
+`--window-seconds` **must match `SEGMENT_SECONDS`**, and it is the authority for
+every window's bounds. Seals declare their own bounds, but a declaration is not
+an authority: a torn seal leaves no end at all, a stray longer seal could re-tile
+the day and hide a real window, and a seal naming a window its own records fall
+outside of would otherwise still validate. With the period configured, bounds are
+computed from the aligned start and every seal is checked against them — a
+mismatch faults that lane rather than redefining the window.
+
+`FINALIZATION_DEADLINE_SECONDS` (default 300) is how long a window waits for a
+lane that has not delivered a **valid** seal. When it expires the window commits
+anyway with the gap named in its receipt, so one wedged splice cannot halt
+finalization for every healthy venue. A window that has not yet ended is never
+finalized, however complete it looks.
+
+A committed window is immutable. A segment arriving for one afterwards is
+reported as `late_after_finalization` and never merged — it cannot renumber
+positions or change a canonical hash (§5). Such a segment is archived like any
+other and then *retained* by the reaper, since no canonical receipt names it.
+
+One finalizer runs per canonical root, held as a `.finalize.lease` file for the
+service lifetime. SIGTERM and SIGINT finish the active sweep and release it;
+SIGKILL or a host crash can leave it behind. Its contents name the process that
+took it, so remove a stale lease only after confirming no finalizer is running.
+`FINALIZER_INTERVAL_SECONDS` defaults to 60. The latest successful or failed
+sweep is written to `ops/last_finalizer_sweep.json`.
+
+### Raw archive and local deletion
+
+```bash
+docker compose --profile ops up -d archiver        # sweeps hourly, stays up
+docker compose --profile ops run --rm archiver-once   # one sweep, then exits
+docker compose --profile ops up -d finalizer reaper   # independent receipt-coordinated loops
+```
+
+The archiver compresses each sealed segment into one Zstandard frame, publishes
+it beside the unchanged seal under an immutable key, verifies both objects by
+reading them back, and only then writes the receipt:
+
+```text
+<ARCHIVE_ROOT>/raw/lane=<lane>/date=<YYYY-MM-DD>/
+  <segment>.ndjson.zst      the compressed segment, Content-Encoding: zstd
+  <segment>.seal.json       the local seal, byte for byte
+
+spool/lane=<lane>/date=<YYYY-MM-DD>/
+  <segment>.ndjson.zst      a rebuildable local derivative
+  <segment>.archive.json    the archive commit marker  (durable backend)
+  <segment>.archive.local.json   a conformance receipt (test backend)
+
+archive-manifests/date=<YYYY-MM-DD>/manifest.json
+```
+
+**The receipt is the archive commit marker.** A compressed file is not one, a
+key existing in the store is not one, and a successful upload is not one. A
+crash at any earlier step leaves a derivative that the next sweep deletes and
+rebuilds, so there is never a half-archived state to reason about.
+
+**Raw local deletion is not active merely because this code is installed.** The
+reaper deletes a raw segment and its seal only when all of these hold at the
+moment it decides:
+
+1. a structurally valid archive receipt;
+2. archive data and seal objects that still match it when read back;
+3. an archive backend declared an *independent durability domain*;
+4. a structurally valid committed canonical `receipt.json`;
+5. a canonical `inputs` entry matching the lane, source SHA-256, file name and
+   segment index;
+6. the local raw source and seal still matching the receipt, rehashed in full.
+
+Anything less is retention, and the reason appears in the report
+(`archive-manifests/last_reaper_sweep.json`) rather than being folded into a
+backlog count. A late, excluded or never-canonicalized segment stays on disk and
+stays visible; it is never guessed into a canonical window.
+
+**Enabling the durability gate.** Two independent settings, both off by default:
+
+```dotenv
+ARCHIVE_ROOT=/srv/prediction-archive     # separate storage, not a subdirectory
+ARCHIVE_DURABILITY=independent
+```
+
+and then, after the rollout gate below, deliberately enable the periodic mode:
+
+```dotenv
+REAPER_MODE=delete
+```
+
+`REAPER_MODE=audit` is the default. `reaper-once` uses the same mode and gates,
+and `--delete` remains a compatibility alias for direct/manual invocations.
+
+Both commands refuse `independent` when `ARCHIVE_ROOT` and `CAPTURE_DATA_ROOT`
+resolve to the same filesystem — a "second copy" that dies with the first is not
+a durability domain, whatever the flag says. With the default conformance
+backend the archiver writes `.archive.local.json` receipts, which carry a
+different version key precisely so a later durable deployment cannot mistake
+them for proof that a remote copy exists.
+
+**Cadence.** `ARCHIVER_INTERVAL_SECONDS` (default 3600) is how often the
+long-lived `archiver` sweeps; the archive *unit* stays one sealed 30-minute
+segment, so a healthy hour publishes two objects per lane and never concatenates
+them. Watch mode calls the same sweep the one-shot form does — an external
+scheduler running `archiver-once` on a timer is equivalent, and neither has
+different eligibility logic. `spool/` therefore holds up to roughly one sweep
+interval of unarchived segments on top of the finalization delay; shorten the
+interval before shortening the retention.
+
+**Immutable-key conflicts.** The archiver exits `2` and stops the sweep when a
+key already holds different content, because that means the namespace or the
+data is wrong rather than one segment being malformed. Nothing is overwritten.
+In watch mode that exit ends the process, so a `Restarting` archiver in
+`docker compose ps` means an integrity conflict rather than a busy spool — read
+the last sweep's JSON before touching anything.
+Investigate which producer wrote the existing object before touching it; the
+local raw segment and seal are untouched and remain the recovery authority.
+Exit `1` means one or more segments failed for their own reasons (a malformed
+seal, a changed byte, a transient store failure) and the sweep continued.
+
+### S3 archive backend
+
+Both `archiver` and `reaper` build their object store through one factory,
+`archive/store_factory.py`, which reads `ARCHIVE_BACKEND` (`local`, the
+default, or `s3`). Full detail — bucket layout, IAM policy, integrity
+contract, rollout gate — is `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`; this is the
+operator summary.
+
+```dotenv
+ARCHIVE_BACKEND=s3
+ARCHIVE_S3_BUCKET=my-dedicated-archive-bucket
+ARCHIVE_S3_REGION=us-east-1
+ARCHIVE_S3_EXPECTED_OWNER=123456789012   # the bucket-owning account, 12 digits
+```
+
+All three `ARCHIVE_S3_*` values are required together; the factory refuses to
+start with only some of them set, and separately refuses to start if any of
+them is non-empty while `ARCHIVE_BACKEND` is still `local` — both are
+configuration mistakes worth failing loudly on rather than guessing past.
+`ARCHIVE_ROOT`, `ARCHIVE_STORE_ID` and `ARCHIVE_DURABILITY` stay in the
+Compose command either way; the factory ignores them once S3 is selected
+(they have no S3 equivalent to keep the command line identical across
+backends), and an S3 backend is always the `independent_durable` class —
+`ARCHIVE_DURABILITY` cannot downgrade it, and the archiver always writes
+production `.archive.json` receipts against it.
+
+Credentials are never set in `.env`. On AWS, prefer an instance or task role
+scoped to exactly `s3:ListBucket` on the bucket and
+`s3:PutObject`/`s3:GetObject` on `bucket/raw/*`, with no delete permission. If
+the Compose host instead uses temporary or static environment credentials,
+export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and (for temporary
+credentials) `AWS_SESSION_TOKEN` in the shell that invokes Compose. Compose
+forwards them only to `archiver`, `archiver-once`, `reaper`, and `reaper-once`; it does not
+forward them to venue splices. A host `~/.aws` directory is not mounted into
+the containers. For an EC2 instance role, ensure IMDS is reachable from bridge
+containers (including a sufficient IMDSv2 response hop limit).
+
+The bucket itself needs Block Public Access enabled, versioning on, default
+encryption on, and a policy requiring `If-None-Match: *` on writes under
+`raw/` — see `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for the full checklist.
+
+Switching `ARCHIVE_BACKEND` from `local` to `s3` does not touch the reaper's
+own gate: `REAPER_MODE=delete` is still explicit, and S3's fixed
+`INDEPENDENT` durability satisfies condition 3 of the six above by
+construction. §15's rollout gate still applies — run the S3 archiver with
+reaper deletion disabled for at least 24 hours, sample every lane against
+retained local raw, and only then consider enabling destructive reaper runs.
+
+**Still out of scope.** Canonical S3 upload and object-store lifecycle expiry are
+not configured, so those tiers grow until a later sink and retention policy are
+enabled. With the local conformance backend, total local storage is *not*
+bounded — the bytes have changed representation and directory, nothing more;
+an S3 backend does not bound the spool until `REAPER_MODE=delete` is enabled.
+
+Back up `spool/` first. The ingest store and canonical evidence are both derived
+and rebuildable from it; the spool cannot be reconstructed from either. Measured: about 6.8 GB/day uncompressed
+for 20 Polymarket assets, and **about 42 GB/day for Kalshi at full ladder width**
+— roughly ten times the record count of everything else combined. Size disk from
+the Kalshi figure, not the Polymarket one.
+
+Container logs rotate at 25 MB with five files per service by default. Override
+`LOG_MAX_SIZE` and `LOG_MAX_FILES` in `.env` if the host has a central log
+collector.
+
+## Clock and liveness semantics
+
+Linux containers share the host kernel's `CLOCK_MONOTONIC` and boot ID. Each
+splice records `/proc/sys/kernel/random/boot_id` in `connection_opened`, so
+monotonic timestamps from different containers are comparable only when that
+recorded scope ID matches.
+
+There is intentionally no synthetic "healthy" check based only on process
+existence. A quiet market and a silently stalled socket can look identical from
+outside the protocol. Docker restarts crashed processes; operational monitoring
+must additionally watch spool recency, reconnect control records, and
+records-per-subscribed-market.
