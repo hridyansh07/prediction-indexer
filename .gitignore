@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+secrets/
+
+*.key
+
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Raw API responses, checkpoints, and generated discovery manifests.
+data/
+
+# Rust ingester build output
+ingester/target/
+# Standalone shared Rust codec build output
+encoder/rust/target/
+# Live capture output
+data/spool/
+data/ingest-store/
+data/live/
