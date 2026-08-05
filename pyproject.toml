@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prediction-indexer"
+version = "0.1.0"
+description = "Durable prediction-market discovery and partition analysis"
+requires-python = ">=3.11"
+dependencies = [
+  "pyarrow>=17",
+  "websockets>=15",
+  "python-socketio[asyncio_client]>=5",
+  "cryptography>=42",
+  "zstandard>=0.23",
+  "boto3>=1.43,<2"
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools.packages.find]
+include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*"]
+
+[tool.setuptools.package-data]
+replay = ["policy.json"]
