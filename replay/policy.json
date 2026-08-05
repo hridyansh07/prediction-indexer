@@ -1,0 +1,30 @@
+{
+  "policy_version": 1,
+  "scope": {
+    "basket_class": "same_condition_binary_long",
+    "direction": "long",
+    "trusted_only": true,
+    "require_exact_condition_identity": true,
+    "require_fee_metadata": true,
+    "require_complete_depth": true
+  },
+  "thresholds": {
+    "ticket_size_contracts": 100,
+    "maximum_leg_skew_ns": 5000000000,
+    "minimum_headline_observations": 50,
+    "minimum_positive_rate_percentage": "1.000000",
+    "minimum_surviving_candidates": 1,
+    "minimum_displayed_depth_survival_ns": 100000000
+  },
+  "controls": {
+    "placebo": "nearest-time different-condition leg 2, matched on venue, leg count, direction, ticket size, and skew stratum",
+    "polymarket_hash_bootstrap_minimum_anchors": 100,
+    "polymarket_hash_bootstrap_minimum_rate_percentage": "95.000000",
+    "resolution_reconciliation": "venue outcome/index must agree with captured market identity; independent oracle verification is reported separately"
+  },
+  "terminal_labels": {
+    "pass": "DEPLOYABLE_QUOTE_CANDIDATE_REQUIRES_LIVE_ORDER_TEST",
+    "no": "NO_DEPLOYABLE_EDGE_IN_FIXTURE",
+    "inconclusive": "INCONCLUSIVE_FIXTURE"
+  }
+}
