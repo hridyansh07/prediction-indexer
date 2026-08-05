@@ -41,9 +41,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from archive.archiver import ARCHIVED, Archiver  # noqa: E402
-from archive.objectstore import LocalObjectStore  # noqa: E402
-from archive.receipts import read_archive_receipt  # noqa: E402
-from archive.verify import decode_archived_segment  # noqa: E402
+from archive.storage.local import LocalObjectStore  # noqa: E402
+from archive.common.receipts import read_archive_receipt  # noqa: E402
+from archive.common.verify import decode_archived_segment  # noqa: E402
 from encoder import DecodeLimitExceeded, logical_identity_of  # noqa: E402
 from splices.common.segment import Record, SegmentWriter  # noqa: E402
 

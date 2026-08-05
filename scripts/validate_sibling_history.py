@@ -20,8 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.ndjson_sink import safe_name
-from prediction_indexer.storage import iso_to_unix_seconds, utc_now, write_json
+from analysis.ndjson_sink import safe_name
+from analysis.storage import iso_to_unix_seconds, utc_now, write_json
 
 
 def parse_args() -> argparse.Namespace:

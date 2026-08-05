@@ -10,8 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.oddpool_client import RetryingOddpoolClient
-from prediction_indexer.oddpool import load_oddpool_api_key, pull_manifest_history
+from analysis.oddpool_client import RetryingOddpoolClient
+from analysis.oddpool import load_oddpool_api_key, pull_manifest_history
 
 
 def parse_args() -> argparse.Namespace:

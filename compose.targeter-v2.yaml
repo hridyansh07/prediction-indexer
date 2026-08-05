@@ -1,0 +1,301 @@
+# Production opt-in for Targeter v2 phases 6--10.
+#
+# Apply together with compose.yaml.  This file intentionally leaves the v1
+# service definition untouched unless an operator names the override:
+#
+#   docker compose -f compose.yaml -f compose.targeter-v2.yaml run --rm targeter
+
+x-targeter-v2-runtime: &targeter-v2-runtime
+  image: prediction-indexer-capture:${IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: docker/python.Dockerfile
+  init: true
+  user: "${PUID:-1000}:${PGID:-1000}"
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 30s
+  environment: &targeter-v2-aws-environment
+    AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+    AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+    AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+  volumes: &targeter-v2-volumes
+    - type: bind
+      source: ${CAPTURE_DATA_ROOT:-./data}
+      target: /var/lib/prediction-indexer
+      bind:
+        create_host_path: true
+    - type: bind
+      source: ${ARCHIVE_ROOT:-./data/archive}
+      target: /var/lib/prediction-archive
+      bind:
+        create_host_path: true
+
+services:
+  # One discovery/archive/publication transaction.  Cron or a systemd timer
+  # starts another container for the next run; this process owns no timer.
+  targeter:
+    # Runtime hardening and image/build settings are inherited from the base
+    # targeter service. Repeating cap_drop/security_opt here would make the
+    # Compose merge contain duplicate unique-sequence entries.
+    environment: *targeter-v2-aws-environment
+    volumes: *targeter-v2-volumes
+    restart: "no"
+    command:
+      - python
+      - -u
+      - targeter/run_v2.py
+      - --mode
+      - publish
+      - --strategy
+      - /app/configs/targeter_v2.json
+      - --cache-root
+      - /var/lib/prediction-indexer/targeter-v2-cache
+      - --output-root
+      - /var/lib/prediction-indexer/targeter-v2-runs
+      - --live-root
+      - /var/lib/prediction-indexer/live
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --archive-backend
+      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+
+  # All subscription-driven lanes resolve one atomic generation pointer.  A
+  # splice keeps its last valid TargetSet if a future pointer fails validation.
+  splice-polymarket:
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - polymarket
+      - --targets
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+
+  splice-limitless:
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - limitless
+      - --targets
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+
+  splice-polymarket-snapshots:
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - polymarket-snapshots
+      - --targets
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --poll-seconds
+      - "${SNAPSHOT_POLL_SECONDS:-60}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+
+  splice-kalshi:
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - kalshi
+      - --targets
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+
+  # Archives complete run directories that hold no receipt yet — the ones a
+  # failed upload or a shadow-only deployment left behind.  It never deletes
+  # anything and has no flag that could: archival and deletion are separate
+  # authorities.  It holds the same run lease a scheduled publish takes, and a
+  # sweep that cannot take it reports so and exits zero, because a run being in
+  # progress is the expected state several times an hour.
+  #
+  # Without this, an unarchived run has no proof, the reaper retains it forever,
+  # and local disk is not actually bounded.
+  targeter-v2-run-archiver:
+    <<: *targeter-v2-runtime
+    profiles:
+      - ops
+    restart: "no"
+    command:
+      - python
+      - -u
+      - -m
+      - targeter.v2.run_archiver_cli
+      - --output-root
+      - /var/lib/prediction-indexer/targeter-v2-runs
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --archive-backend
+      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --report
+      - /var/lib/prediction-indexer/ops/last_targeter_v2_archive_sweep.json
+
+  # Reclaims local run artifacts that an archive receipt proves are safe to
+  # remove.  A run directory is 12-20 MB and the publish cadence is ten minutes,
+  # so nothing else bounds this disk.
+  #
+  # **Audit mode by default, and it stays that way here.**  Installing this does
+  # not make run deletion active: it additionally needs
+  # TARGETER_RUN_REAPER_MODE=delete and a backend declared as an independent
+  # durability domain.  Until that explicit destructive run, the local run
+  # directory remains the recovery authority.
+  #
+  # It never removes a receipt, the directory holding it, the published
+  # generation, or anything in the archive.
+  targeter-v2-run-reaper:
+    <<: *targeter-v2-runtime
+    profiles:
+      - ops
+    restart: "no"
+    command:
+      - python
+      - -u
+      - -m
+      - targeter.v2.run_reaper_cli
+      - --output-root
+      - /var/lib/prediction-indexer/targeter-v2-runs
+      - --live-root
+      - /var/lib/prediction-indexer/live
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --archive-backend
+      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --mode
+      - "${TARGETER_RUN_REAPER_MODE:-audit}"
+      - --retention-hours
+      - "${TARGETER_RUN_RETENTION_HOURS:-18}"
+      - --report
+      - /var/lib/prediction-indexer/ops/last_targeter_v2_reaper_sweep.json
+
+  # Read-only operational gate.  It performs no discovery and proves the live
+  # pointer, every venue file, the local run, and its immutable remote archive.
+  targeter-v2-integrity:
+    <<: *targeter-v2-runtime
+    profiles:
+      - ops
+    restart: "no"
+    command:
+      - python
+      - -u
+      - targeter/run_v2.py
+      - --mode
+      - audit
+      - --strategy
+      - /app/configs/targeter_v2.json
+      - --output-root
+      - /var/lib/prediction-indexer/targeter-v2-runs
+      - --live-root
+      - /var/lib/prediction-indexer/live
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --archive-backend
+      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"

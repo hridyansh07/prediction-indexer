@@ -141,10 +141,12 @@ modules consume canonical records only.
    the title.
 5. Treat `FUNDED` CLOB markets as open and subscribe by market slug.
 
-Pagination cursor repetition, malformed response shapes, changing totals, and
-premature exhaustion before Limitless's `totalMarketsCount` are fatal. Probe
-page/series caps set `complete: false`; they are for bounded validation, not a
-production selection run.
+Pagination cursor repetition and malformed response shapes are fatal. A live
+change to Limitless's `totalMarketsCount` triggers one bounded second pass and
+the two observations are reconciled by stable vendor market ID. A stable
+premature exhaustion before the reported total remains fatal. Probe page/series
+caps set `complete: false`; they are for bounded validation, not a production
+selection run.
 
 ## 5. Phase 3 — cross-venue event matching
 

@@ -25,14 +25,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.masks import (
+from analysis.masks import (
     STATUS_DERIVABLE,
     compile_mask,
     derive_relationships,
     is_partition,
     state_conditioned_relationships,
 )
-from prediction_indexer.outcome_space import (
+from analysis.outcome_space import (
     SCOPE_FIRST_HALF,
     SCOPE_REGULATION_FULLTIME,
     build_score_space,
@@ -42,7 +42,7 @@ from prediction_indexer.outcome_space import (
     parse_score_ticker,
     settled_outcome_key,
 )
-from prediction_indexer.storage import iso_to_unix_seconds, utc_now, write_json
+from analysis.storage import iso_to_unix_seconds, utc_now, write_json
 
 
 def parse_args() -> argparse.Namespace:

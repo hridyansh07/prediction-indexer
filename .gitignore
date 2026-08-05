@@ -5,6 +5,8 @@ secrets/
 
 *.key
 
+.DS_STORE
+
 .venv/
 __pycache__/
 *.py[cod]

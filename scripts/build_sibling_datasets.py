@@ -10,15 +10,15 @@ import argparse
 import json
 from pathlib import Path
 
-from prediction_indexer.durable_http import DurableJsonClient
-from prediction_indexer.sibling_markets import (
+from analysis.durable_http import DurableJsonClient
+from analysis.sibling_markets import (
     DOTA_SIBLING_SERIES,
     WORLD_CUP_STRUCTURAL_SERIES,
     build_sibling_manifest,
     discover_kalshi_siblings,
     discover_polymarket_siblings,
 )
-from prediction_indexer.storage import write_json
+from analysis.storage import write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

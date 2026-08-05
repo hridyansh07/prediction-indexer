@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.partition_pipeline import run_partition_pipeline
+from analysis.partition_pipeline import run_partition_pipeline
 
 
 def parse_args() -> argparse.Namespace:

@@ -44,7 +44,7 @@ targeter/            v2 motivation and sports discovery/archive/publication; leg
 ingester/            Rust: global sequencing + continuity classification
 encoder/             the shared Zstandard codec — Python and Rust, streaming only
 archive/             raw-segment archiver, immutable object store, dual-receipt reaper
-prediction_indexer/  analysis: masks, outcome space, void policy, partition sums
+analysis/             masks, outcome space, void policy, partition sums
 scripts/             analysis pipelines and historical pulls
 docs/                cross-cutting specs, deployment guide, venue API notes
 data/                pulled data, manifests, spools
@@ -243,7 +243,7 @@ Neither venue serves historical book depth for free. Kalshi has no historical
 orderbook endpoint at all and Polymarket's `/book` serves live markets only. So
 these datasets support the mask engine, relationship derivation and top-of-book
 partition sums, but **not** the size-adjusted VWAP sweep in
-[`prediction_indexer/PARTITION_SUM_TEST_SPEC.md`](prediction_indexer/PARTITION_SUM_TEST_SPEC.md) §2–4. Manifest targets
+[`analysis/PARTITION_SUM_TEST_SPEC.md`](analysis/PARTITION_SUM_TEST_SPEC.md) §2–4. Manifest targets
 record this as `depth_available: false`.
 
 This limitation is the direct reason the capture half exists.
@@ -256,7 +256,7 @@ member's own activity and are deliberately unused.
 ### Partition-sum economic gate
 
 Frozen in `configs/partition_sum_v1.json` and described in
-[`prediction_indexer/PIPELINE_SPEC.md`](prediction_indexer/PIPELINE_SPEC.md).
+[`analysis/PIPELINE_SPEC.md`](analysis/PIPELINE_SPEC.md).
 
 ```bash
 python3 -m venv .venv
@@ -304,7 +304,7 @@ python3 scripts/archive_probe.py     # archive, decode, ratio, decode ceiling, p
 | Document | Covers |
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | **Start here.** How the system fits together and why each boundary sits where it does |
-| [`prediction_indexer/MARKET_RELATIONSHIP_GRAPH.md`](prediction_indexer/MARKET_RELATIONSHIP_GRAPH.md) | The original thesis: conditions, masks, relationship derivation |
+| [`analysis/MARKET_RELATIONSHIP_GRAPH.md`](analysis/MARKET_RELATIONSHIP_GRAPH.md) | The original thesis: conditions, masks, relationship derivation |
 | [`docs/CAPTURE_SPEC.md`](docs/CAPTURE_SPEC.md) | The capture system; §11 records what's been decided and measured since |
 | [`splices/common/ENVELOPE.md`](splices/common/ENVELOPE.md) | The wire contract — start here for the capture half |
 | [`splices/SPLICE.md`](splices/SPLICE.md) | Venue adapters and the no-filtering rule |
@@ -316,6 +316,6 @@ python3 scripts/archive_probe.py     # archive, decode, ratio, decode ceiling, p
 | [`archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md) | Raw archiver, immutable object store, dual-receipt reaper |
 | [`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`](archive/S3_RAW_ARCHIVE_ADAPTER_V1.md) | The production AWS S3 backend for the archiver/reaper |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker Compose topology and Linux operations |
-| [`prediction_indexer/PARTITION_SUM_TEST_SPEC.md`](prediction_indexer/PARTITION_SUM_TEST_SPEC.md) | The first experiment and its staleness controls |
-| [`prediction_indexer/PIPELINE_SPEC.md`](prediction_indexer/PIPELINE_SPEC.md) | The frozen partition-sum pipeline contract |
-| [`prediction_indexer/CORRELATION_PIPELINE_REVIEW_V1.md`](prediction_indexer/CORRELATION_PIPELINE_REVIEW_V1.md) | Review of the correlation candidate pipeline; required reading before resuming that work |
+| [`analysis/PARTITION_SUM_TEST_SPEC.md`](analysis/PARTITION_SUM_TEST_SPEC.md) | The first experiment and its staleness controls |
+| [`analysis/PIPELINE_SPEC.md`](analysis/PIPELINE_SPEC.md) | The frozen partition-sum pipeline contract |
+| [`analysis/CORRELATION_PIPELINE_REVIEW_V1.md`](analysis/CORRELATION_PIPELINE_REVIEW_V1.md) | Review of the correlation candidate pipeline; required reading before resuming that work |

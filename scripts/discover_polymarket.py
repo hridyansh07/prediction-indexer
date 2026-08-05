@@ -10,8 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.durable_http import DurableJsonClient
-from prediction_indexer.polymarket import discover_polymarket
+from analysis.durable_http import DurableJsonClient
+from analysis.polymarket import discover_polymarket
 
 
 def parse_args() -> argparse.Namespace:

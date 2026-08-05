@@ -10,9 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.event_bundles import read_ndjson
-from prediction_indexer.playoff_manifest import build_playoff_manifest
-from prediction_indexer.storage import write_json
+from analysis.event_bundles import read_ndjson
+from analysis.playoff_manifest import build_playoff_manifest
+from analysis.storage import write_json
 
 
 def parse_args() -> argparse.Namespace:

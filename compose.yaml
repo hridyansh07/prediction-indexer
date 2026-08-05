@@ -1,0 +1,556 @@
+name: prediction-indexer
+
+x-capture-build: &capture-build
+  context: .
+  dockerfile: docker/python.Dockerfile
+
+x-capture-service: &capture-service
+  image: prediction-indexer-capture:${IMAGE_TAG:-local}
+  build: *capture-build
+  init: true
+  user: "${PUID:-1000}:${PGID:-1000}"
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "${LOG_MAX_SIZE:-25m}"
+      max-file: "${LOG_MAX_FILES:-5}"
+
+x-ingester-service: &ingester-service
+  image: prediction-indexer-ingester:${IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: docker/ingester.Dockerfile
+  init: true
+  user: "${PUID:-1000}:${PGID:-1000}"
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "${LOG_MAX_SIZE:-25m}"
+      max-file: "${LOG_MAX_FILES:-5}"
+
+x-data-volume: &data-volume
+  type: bind
+  source: ${CAPTURE_DATA_ROOT:-./data}
+  target: /var/lib/prediction-indexer
+  bind:
+    create_host_path: true
+
+# Configured separately from CAPTURE_DATA_ROOT on purpose. An archive that
+# shares a filesystem with the spool is a compression probe, not a second copy —
+# one device failure takes both — so the archiver refuses to call it an
+# independent durability domain and the reaper refuses to delete against it.
+x-archive-volume: &archive-volume
+  type: bind
+  source: ${ARCHIVE_ROOT:-./data/archive}
+  target: /var/lib/prediction-archive
+  bind:
+    create_host_path: true
+
+# Credentials remain outside `.env`: export these in the shell that invokes
+# Compose when a host is not using an AWS instance/task role. Only the three
+# S3-facing services receive them; venue capture has no archive authority.
+x-aws-archive-environment: &aws-archive-environment
+  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+  AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+
+services:
+  targeter:
+    <<: *capture-service
+    command:
+      - python
+      - -u
+      - targeter/run.py
+      - --manifest
+      - /etc/prediction-indexer/capture_manifest.json
+      - --live-dir
+      - /var/lib/prediction-indexer/live
+      - --tick-seconds
+      - "${TARGETER_TICK_SECONDS:-5}"
+    volumes:
+      - *data-volume
+      - type: bind
+        source: ./configs/capture_manifest.json
+        target: /etc/prediction-indexer/capture_manifest.json
+        read_only: true
+        bind:
+          create_host_path: false
+
+  splice-polymarket:
+    <<: *capture-service
+    depends_on:
+      targeter:
+        condition: service_started
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - polymarket
+      - --targets
+      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+
+  splice-limitless:
+    <<: *capture-service
+    depends_on:
+      targeter:
+        condition: service_started
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targets_limitless.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - limitless
+      - --targets
+      - /var/lib/prediction-indexer/live/targets_limitless.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+
+  splice-polymarket-snapshots:
+    <<: *capture-service
+    depends_on:
+      targeter:
+        condition: service_started
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - polymarket-snapshots
+      - --targets
+      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --poll-seconds
+      - "${SNAPSHOT_POLL_SECONDS:-60}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+
+  splice-kalshi:
+    <<: *capture-service
+    profiles:
+      - kalshi
+    depends_on:
+      targeter:
+        condition: service_started
+    environment:
+      KALSHI_API_KEY_ID: "${KALSHI_API_KEY_ID:-}"
+      KALSHI_API_KEY: "${KALSHI_API_KEY:-}"
+      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
+    command:
+      - python
+      - -u
+      - docker/wait_for_target.py
+      - /var/lib/prediction-indexer/live/targets_kalshi.json
+      - --
+      - python
+      - -u
+      - splices/run.py
+      - kalshi
+      - --targets
+      - /var/lib/prediction-indexer/live/targets_kalshi.json
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --target-poll-seconds
+      - "${TARGET_POLL_SECONDS:-30}"
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+      - type: bind
+        source: ${KALSHI_PRIVATE_KEY_PATH:-./kalshi.key}
+        target: /run/secrets/kalshi-private-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
+
+  splice-polymarket-sports:
+    <<: *capture-service
+    profiles:
+      - reference
+    command:
+      - python
+      - -u
+      - splices/run.py
+      - polymarket-sports
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+
+  splice-polymarket-rtds:
+    <<: *capture-service
+    profiles:
+      - reference
+    command:
+      - python
+      - -u
+      - splices/run.py
+      - polymarket-rtds
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --fsync-interval-seconds
+      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
+      - --backoff-max-seconds
+      - "${BACKOFF_MAX_SECONDS:-60}"
+      - --segment-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --writer-queue-capacity
+      - "${WRITER_QUEUE_CAPACITY:-20000}"
+    volumes:
+      - *data-volume
+
+  ingester:
+    <<: *ingester-service
+    command:
+      - /var/lib/prediction-indexer/spool
+      - /var/lib/prediction-indexer/ingest-store
+      - --watch-interval-seconds
+      - "${INGEST_INTERVAL_SECONDS:-5}"
+    volumes:
+      - *data-volume
+
+  ingester-integrity:
+    <<: *ingester-service
+    profiles:
+      - ops
+    restart: "no"
+    command:
+      - /var/lib/prediction-indexer/spool
+      - /var/lib/prediction-indexer/ingest-store
+      - --check-integrity
+    volumes:
+      - *data-volume
+
+  # Merges sealed windows into canonical evidence. A separate command from the
+  # ingester per SEALED_CAPTURE_PIPELINE_V1 §8.3 — the two assign different
+  # global orders over the same spool and both stay available.
+  #
+  # `--expect-lane` must list exactly the splices this deployment runs. §3: "The
+  # deployment manifest defines which lanes are expected; a disabled Kalshi
+  # profile is not waited on." The three below are the services with no profile
+  # gate. Enabling the `kalshi` profile means adding `kalshi` here, and the
+  # `reference` profile means adding `polymarket_sports` and `polymarket_rtds`
+  # — otherwise a running lane's outage is invisible. Listing one that is not
+  # running is the opposite error: every window sits out its deadline and
+  # commits incomplete forever.
+  finalizer:
+    <<: *ingester-service
+    profiles:
+      - ops
+    entrypoint: ["/usr/local/bin/indexer-finalize"]
+    command:
+      - /var/lib/prediction-indexer/spool
+      - /var/lib/prediction-indexer/canonical
+      - --expect-lane
+      - polymarket
+      - --expect-lane
+      - polymarket_snapshots
+      - --expect-lane
+      - limitless
+      # Must match the splices' SEGMENT_SECONDS above. This is the authority for
+      # every window's bounds — seals are checked against it rather than trusted
+      # for it, so a mismatch fails loudly instead of silently re-tiling.
+      - --window-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --finalization-deadline-seconds
+      - "${FINALIZATION_DEADLINE_SECONDS:-300}"
+      - --interval-seconds
+      - "${FINALIZER_INTERVAL_SECONDS:-60}"
+      - --report
+      - /var/lib/prediction-indexer/ops/last_finalizer_sweep.json
+    volumes:
+      - *data-volume
+
+  # The identical finalization sweep without the service loop, for operators
+  # and external schedulers.
+  finalizer-once:
+    <<: *ingester-service
+    profiles:
+      - ops
+    restart: "no"
+    entrypoint: ["/usr/local/bin/indexer-finalize"]
+    command:
+      - /var/lib/prediction-indexer/spool
+      - /var/lib/prediction-indexer/canonical
+      - --expect-lane
+      - polymarket
+      - --expect-lane
+      - polymarket_snapshots
+      - --expect-lane
+      - limitless
+      - --window-seconds
+      - "${SEGMENT_SECONDS:-1800}"
+      - --finalization-deadline-seconds
+      - "${FINALIZATION_DEADLINE_SECONDS:-300}"
+      - --report
+      - /var/lib/prediction-indexer/ops/last_finalizer_sweep.json
+    volumes:
+      - *data-volume
+
+  # Publishes each sealed segment as one immutable compressed object plus its
+  # unchanged seal, then writes the receipt that is the archive commit marker.
+  # Never deletes anything: PHASE_4_RAW_ARCHIVE_REAPER_V1 §2 makes archival and
+  # deletion separate authorities, and this is the archival one.
+  #
+  # `ARCHIVE_DURABILITY` stays `conformance` until the archive destination is
+  # genuinely separate storage. Conformance runs exercise the whole path and
+  # write `.archive.local.json` receipts, which authorize nothing.
+  #
+  # Long-lived, sweeping every `ARCHIVER_INTERVAL_SECONDS` (§8.1's recommended
+  # hour). Watch mode calls the identical sweep the one-shot form does — the
+  # archive unit stays one sealed segment however many an hour discovers — so a
+  # scheduler running it manually and this container archive the same segments.
+  # A per-segment failure is reported and the loop continues; an immutable-key
+  # conflict exits, so a *restarting* archiver means an integrity conflict and
+  # not a busy spool.
+  archiver:
+    <<: *capture-service
+    profiles:
+      - ops
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.archiver.cli
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --manifest-root
+      - /var/lib/prediction-indexer/archive-manifests
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      # --archive-root, --store-id and --archive-durability above are local-only
+      # and stay in this static command whichever backend is selected;
+      # archive/storage/factory.py ignores them for S3 (S3_RAW_ARCHIVE_ADAPTER_V1
+      # §11). The three --s3-* flags default to empty, which is a no-op for the
+      # local backend and validated only when ARCHIVE_BACKEND=s3.
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --interval-seconds
+      - "${ARCHIVER_INTERVAL_SECONDS:-3600}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_archive_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  # The same sweep, once, for an operator or an external scheduler. Identical
+  # eligibility logic; it simply exits when the sweep finishes.
+  archiver-once:
+    <<: *capture-service
+    profiles:
+      - ops
+    restart: "no"
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.archiver.cli
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --manifest-root
+      - /var/lib/prediction-indexer/archive-manifests
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_archive_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  # Deletes local raw segments that two receipts prove are safe to delete.
+  #
+  # **Audit mode by default, and it stays that way here.** Installing Phase 4
+  # does not make raw deletion active (§8.2): destructive operation always
+  # needs `REAPER_MODE=delete` (or the manual `--delete` compatibility alias)
+  # and an independent backend. A local backend additionally needs
+  # `ARCHIVE_DURABILITY=independent` and a different filesystem from the spool;
+  # an S3 backend is independent by construction. Until the explicit destructive
+  # run, local raw data remains the recovery authority.
+  reaper:
+    <<: *capture-service
+    profiles:
+      - ops
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.reaper.cli
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --mode
+      - "${REAPER_MODE:-audit}"
+      - --interval-seconds
+      - "${REAPER_INTERVAL_SECONDS:-3600}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_reaper_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  reaper-once:
+    <<: *capture-service
+    profiles:
+      - ops
+    restart: "no"
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.reaper.cli
+      - --spool-root
+      - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --mode
+      - "${REAPER_MODE:-audit}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_reaper_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  canonical-integrity:
+    <<: *ingester-service
+    profiles:
+      - ops
+    restart: "no"
+    entrypoint: ["/usr/local/bin/indexer-canonical-audit"]
+    command:
+      - /var/lib/prediction-indexer/canonical
+    volumes:
+      - *data-volume

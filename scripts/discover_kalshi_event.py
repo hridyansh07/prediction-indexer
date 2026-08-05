@@ -11,14 +11,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.durable_http import DurableJsonClient
-from prediction_indexer.event_bundles import write_event_bundle_files
-from prediction_indexer.kalshi import (
+from analysis.durable_http import DurableJsonClient
+from analysis.event_bundles import write_event_bundle_files
+from analysis.kalshi import (
     KALSHI_BASE_URL,
     normalize_kalshi_event,
     normalize_kalshi_market,
 )
-from prediction_indexer.storage import (
+from analysis.storage import (
     stable_job_id,
     utc_now,
     write_json,

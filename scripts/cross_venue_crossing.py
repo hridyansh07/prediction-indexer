@@ -34,15 +34,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.masks import compile_mask
-from prediction_indexer.ndjson_sink import safe_name
-from prediction_indexer.outcome_space import (
+from analysis.masks import compile_mask
+from analysis.ndjson_sink import safe_name
+from analysis.outcome_space import (
     build_series_space,
     build_state_timeline,
     parse_best_of,
     reachable_keys,
 )
-from prediction_indexer.storage import iso_to_unix_seconds, utc_now, write_json
+from analysis.storage import iso_to_unix_seconds, utc_now, write_json
 
 BAR = 60
 MAX_SNAPSHOT_AGE = 60  # seconds; older than this and the quote is stale

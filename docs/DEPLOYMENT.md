@@ -47,11 +47,15 @@ credentials:
 | `reaper` | `ops` profile | Hourly dual-receipt audit; deletion is opt-in |
 | `reaper-once` | `ops` profile | The same reaper sweep, once |
 | `canonical-integrity` | `ops` profile | Fully decodes and verifies committed canonical windows |
+| `targeter-v2-run-archiver` | `ops` profile, v2 override | Archives complete target-run directories that hold no receipt yet; never deletes |
+| `targeter-v2-run-reaper` | `ops` profile, v2 override | Hourly receipt-proved audit of local target-run directories; deletion is opt-in |
 
 `compose.targeter-v2.yaml` is a deliberate production override. With it,
-`targeter` becomes a one-shot discover/archive/publish transaction and the
-additional `targeter-v2-integrity` service audits the live generation. The base
-file remains the v1 deployment when the override is absent.
+`targeter` becomes a one-shot discover/archive/publish transaction, the
+additional `targeter-v2-integrity` service audits the live generation, and
+`targeter-v2-run-archiver` and `targeter-v2-run-reaper` bound the disk the run
+directories occupy. The base file remains the v1 deployment when the override is
+absent, and the last three services also require `--profile ops`.
 
 Kalshi is deliberately opt-in until its splice has been exercised against real
 credentials. Reference feeds are opt-in because they are not needed for the core
@@ -150,6 +154,58 @@ command rather than `up` for recurring runs. The application lease under
 The full archive namespace, commit protocol, failure behavior, cron example,
 rollout gate, and rollback steps are normative in
 `docs/TARGETER_V2_PHASES_6_10.md`.
+
+### Targeter v2 run retention
+
+Every scheduled run leaves a 12–20 MB directory under `targeter-v2-runs`. At the
+ten-minute cadence that is about 2 GB per day, and nothing in the base
+deployment removes any of it, so both retention services have to be scheduled
+alongside the publish entry:
+
+```cron
+5  * * * * cd /opt/prediction-indexer && docker compose -f compose.yaml -f compose.targeter-v2.yaml --profile ops run --rm targeter-v2-run-archiver >> /var/log/prediction-targeter-v2-archive.log 2>&1
+35 * * * * cd /opt/prediction-indexer && docker compose -f compose.yaml -f compose.targeter-v2.yaml --profile ops run --rm targeter-v2-run-reaper   >> /var/log/prediction-targeter-v2-reaper.log  2>&1
+```
+
+Each sweep prints its record and writes it to
+`/var/lib/prediction-indexer/ops/last_targeter_v2_archive_sweep.json` and
+`…_reaper_sweep.json`. Run either by hand the same way:
+
+```bash
+docker compose -f compose.yaml -f compose.targeter-v2.yaml --profile ops \
+  run --rm targeter-v2-run-reaper
+```
+
+The archiver covers what an inline `publish` could not archive — a run whose
+upload failed, or any run of a shadow deployment. It has no flag that deletes.
+Its `lease_acquired: false` is not a fault: a scheduled publish held the run
+lease, which happens several times an hour, and the sweep exits zero and defers.
+Watch its `failed` count, which is a crashed run process an operator has to
+clear, and its `pending` count, which should rise and fall rather than climb.
+
+The reaper deletes only what an archive receipt proves is elsewhere. Two numbers
+in its report matter most:
+
+- `counts.unarchived` — runs nothing has archived. These can never be reclaimed,
+  so a number that climbs means the archiver is not running and disk is not
+  actually bounded.
+- `counts.reapable` — runs that passed every condition and were kept only
+  because deletion is not enabled. This is what enabling deletion would remove.
+
+**Audit is the default and installing the service does not make deletion
+active.** It additionally needs `TARGETER_RUN_REAPER_MODE=delete` in `.env` and
+an archive declared as an independent durability domain; delete mode against a
+local conformance store is refused at startup. Enable it the same way the raw
+reaper is enabled: run in audit for several cycles first, confirm
+`counts.unarchived` is zero and no fault reason appears, and only then switch the
+mode. `TARGETER_RUN_RETENTION_HOURS` may be raised above the 18-hour floor but
+not below it.
+
+Deletion leaves `archive_receipt.json` and the directory behind as a tombstone —
+that receipt is what makes the deletion auditable and what makes the next sweep
+idempotent. Archive objects, receipts, and published generations are never
+touched. The gate, the reason strings, and the rollout are normative in
+`docs/TARGETER_V2_PHASES_6_10.md` §7.
 
 ## Operations
 
@@ -394,7 +450,7 @@ seal, a changed byte, a transient store failure) and the sweep continued.
 ### S3 archive backend
 
 Both `archiver` and `reaper` build their object store through one factory,
-`archive/store_factory.py`, which reads `ARCHIVE_BACKEND` (`local`, the
+`archive/storage/factory.py`, which reads `ARCHIVE_BACKEND` (`local`, the
 default, or `s3`). Full detail — bucket layout, IAM policy, integrity
 contract, rollout gate — is `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`; this is the
 operator summary.

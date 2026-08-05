@@ -11,10 +11,10 @@ import argparse
 import json
 from pathlib import Path
 
-from prediction_indexer.durable_http import RetryingJsonClient
-from prediction_indexer.kalshi_history import pull_kalshi_history
-from prediction_indexer.polymarket_history import pull_polymarket_history
-from prediction_indexer.storage import write_json
+from analysis.durable_http import RetryingJsonClient
+from analysis.kalshi_history import pull_kalshi_history
+from analysis.polymarket_history import pull_polymarket_history
+from analysis.storage import write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

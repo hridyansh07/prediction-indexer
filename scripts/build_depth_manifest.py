@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prediction_indexer.storage import parse_iso8601, utc_now, write_json
+from analysis.storage import parse_iso8601, utc_now, write_json
 
 
 def parse_args() -> argparse.Namespace:

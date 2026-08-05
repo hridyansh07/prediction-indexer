@@ -74,7 +74,7 @@ cheap discoveries rather than expensive ones.
                                         │  SQLite: evidence + facts, hash-bound
                               ┌─────────▼─────────┐
                               │     ANALYSIS      │   Python
-                              │  masks · Ω · fees │   prediction_indexer/
+                              │  masks · Ω · fees │   analysis/
                               └───────────────────┘
 ```
 
@@ -237,7 +237,7 @@ here. Normalising at capture makes a schema misreading permanent; normalising at
 replay makes it a code change — the same argument capture.md §6.3 already makes
 about tags.
 
-### 4.4 Analysis — `prediction_indexer/`
+### 4.4 Analysis — `analysis/`
 
 Masks, outcome spaces, void policy, partition sums, fees, equivalence classes.
 Unchanged by the capture work and deliberately so — it consumes the tape and never
