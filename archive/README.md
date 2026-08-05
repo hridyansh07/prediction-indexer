@@ -1,0 +1,103 @@
+# Raw archive and reaper
+
+This subsystem copies receipt-committed sealed capture segments to immutable
+object storage, verifies them, publishes local archive receipts and derived daily
+manifests, then separately audits whether local raw data may be removed. The
+archiver never deletes capture evidence. The reaper requires both a currently
+verified archive receipt/object pair and a committed canonical-ingestion receipt.
+
+## Layout and flow
+
+```text
+archiver/  service.py, manifest.py, cli.py   seal -> object + receipt + manifest
+reaper/    service.py, cli.py                dual-receipt audit/deletion decision
+storage/   base.py, local.py, s3.py, factory.py
+common/    durable.py, receipts.py, seal.py, verify.py
+```
+
+Input must be a final `.ndjson` segment with its valid `.seal.json` commit
+marker; open or unsealed data is ineligible. Install the project package and
+Python dependencies first. S3 operation additionally requires `boto3`/botocore
+(included by the project install): `.venv/bin/python -m pip install -e .`.
+
+## Production S3 prerequisites
+
+Use a dedicated, private, general-purpose AWS S3 bucket, preferably in the same
+region as capture. Enable versioning, Block Public Access, default SSE-S3,
+TLS-only access, and a bucket policy requiring `If-None-Match: *` for writes.
+Do not configure lifecycle expiry initially. Configure and verify the 12-digit
+bucket owner account ID; every request sends `ExpectedBucketOwner`.
+
+The runtime role needs exactly:
+
+```text
+s3:ListBucket                 on arn:aws:s3:::BUCKET
+s3:GetObject
+s3:PutObject                 on arn:aws:s3:::BUCKET/raw/*
+```
+
+Do **not** grant `s3:DeleteObject`, `s3:DeleteObjectVersion`, bucket-policy,
+lifecycle, ACL, encryption-admin, or other bucket-administration permissions.
+Use boto3's standard credential provider chain; an EC2 instance role (or other
+workload role) is preferred. Containers need network access to EC2 IMDS when an
+instance role supplies credentials—do not bake static credentials into images.
+
+Copy variable *names/defaults* from [`archive/.env.example`](.env.example) into
+your deployment configuration. Do not put credentials there. The repository-root
+`.env` is what Compose consumes at runtime; the archive-local file is reference
+documentation only.
+
+Preflight and build:
+
+```bash
+docker compose config --quiet
+docker compose build archiver
+```
+
+One-shot archive through Compose:
+
+```bash
+docker compose --profile ops run --rm archiver-once
+```
+
+Direct project-root invocation is:
+
+```bash
+.venv/bin/python -m archive.archiver.cli --spool-root data/spool \
+  --archive-backend s3 --s3-bucket "$ARCHIVE_S3_BUCKET" \
+  --s3-region "$ARCHIVE_S3_REGION" --s3-expected-owner "$ARCHIVE_S3_EXPECTED_OWNER"
+```
+
+Objects are stored as
+`raw/lane=<lane>/date=<date>/<segment>.{ndjson.zst,seal.json}`. Beside each local
+segment, `.archive.json` is production verification authority; local conformance
+uses `.archive.local.json`, which authorizes nothing. Daily manifests are derived
+catalogs and can be rebuilt from verified receipts.
+
+## Reaper safety and rollout
+
+Run `python -m archive.reaper.cli` in `audit` mode (the default). It re-verifies
+both archived objects and the canonical receipt before reporting eligibility.
+Archive and audit for at least 24 hours, inspect every retention reason, retain
+local raw, and keep lifecycle expiry disabled. Do not enable `REAPER_MODE=delete`
+until a separate, explicit rollout enables destructive operation.
+
+The local backend is for conformance and development. On the capture filesystem
+it is not an independent durability domain and cannot authorize deletion; even a
+separate local device lacks S3's service-side conditional-write and checksum
+controls.
+
+## Adding a backend
+
+1. Implement `storage.base.ObjectStore` in a new adapter using immutable,
+   conditional publication and bounded streaming reads.
+2. Return provider-verified SHA-256 metadata and declare durability explicitly.
+3. Preserve key normalization, identity checks, errors, and no-delete behavior.
+4. Add one import/selection branch in `storage/factory.py` and export the adapter
+   intentionally from `storage/__init__.py`.
+5. Run the shared object-store tests plus archiver, verifier, manifest, reaper,
+   crash-boundary, and deployment tests.
+
+Normative detail: [raw archive/reaper spec](PHASE_4_RAW_ARCHIVE_REAPER_V1.md),
+[S3 adapter spec](S3_RAW_ARCHIVE_ADAPTER_V1.md), and
+[deployment guide](../docs/DEPLOYMENT.md).
