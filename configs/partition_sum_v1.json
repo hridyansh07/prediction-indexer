@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "dataset_name": "ewc_dota_playoffs",
+  "manifest_path": "data/manifests/ewc_dota_playoffs.json",
+  "history_job_directory": "data/oddpool/orderbooks/27bd23c87b2408a6",
+  "http_cache_root": "data/cache/http",
+  "output_root": "data/analysis/partition_sum",
+  "bar_seconds": 60,
+  "max_snapshot_age_seconds": 60,
+  "low_skew_seconds": 5,
+  "skew_bucket_edges_seconds": [
+    5,
+    15,
+    60
+  ],
+  "sizes_contracts": [
+    1,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000
+  ],
+  "validation": {
+    "price_tolerance": 1e-09,
+    "size_tolerance": 1e-06,
+    "polymarket_pair_tolerance_ms": 100,
+    "minimum_polymarket_complement_rate": 0.98,
+    "minimum_distinct_nonzero_level_counts": 5,
+    "maximum_share_at_observed_level_cap": 0.1
+  },
+  "fees": {
+    "kalshi_series_ticker": "KXDOTA2GAME",
+    "kalshi_base_taker_rate": 0.07,
+    "kalshi_base_rate_effective_at": "2026-02-05T00:00:00Z",
+    "kalshi_base_rate_source": "https://kalshi.com/docs/kalshi-fee-schedule.pdf",
+    "kalshi_default_fee_multiplier": 1.0,
+    "kalshi_normal_rounding_dollars": 0.0001,
+    "kalshi_conservative_rounding_dollars": 0.01,
+    "polymarket_normal_rounding_dollars": 0.00001,
+    "polymarket_conservative_rounding_dollars": 0.00001,
+    "fixed_execution_costs_dollars": {
+      "kalshi": 0.0,
+      "polymarket": 0.0
+    }
+  },
+  "gate": {
+    "ticket_size_contracts": 100,
+    "minimum_valid_low_skew_observations_per_event": 100,
+    "minimum_positive_rate": 0.01,
+    "minimum_passing_events": 2,
+    "direction": "long",
+    "short_gate_enabled": false,
+    "same_venue_class": "PARTITION_KALSHI_EVENT",
+    "cross_venue_class": "PARTITION_CROSS_VENUE"
+  }
+}

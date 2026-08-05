@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "note": "Adding a market is a config change, never a code change. Each entry names one structural idea; the per-venue selector says how that idea is spelled at each venue.",
+  "entries": [
+    {
+      "id": "btc_hourly_ladder",
+      "structure_type": "LADDER",
+      "note": "P0 control condition. Masks derive from strikes, so a positive finding cannot be a mask error and a negative one cannot be blamed on illiquidity. Kalshi ladders are taken whole - a partial chain cannot answer a monotonicity question.",
+      "discover_every_seconds": 60,
+      "venues": {
+        "kalshi": {
+          "series": ["KXBTCD"],
+          "max_events_per_series": 1,
+          "min_strikes": 5,
+          "max_targets": 200
+        },
+        "limitless": {
+          "horizons": ["5min", "15min", "hourly"],
+          "underlyings": ["btc"],
+          "pages": 4,
+          "max_targets": 20
+        },
+        "polymarket": {
+          "tag": "crypto",
+          "slug_contains": "bitcoin",
+          "min_liquidity": 5000,
+          "max_targets": 20
+        }
+      }
+    },
+    {
+      "id": "eth_hourly_ladder",
+      "structure_type": "LADDER",
+      "discover_every_seconds": 60,
+      "venues": {
+        "kalshi": {
+          "series": ["KXETHD"],
+          "max_events_per_series": 1,
+          "min_strikes": 5,
+          "max_targets": 300
+        },
+        "limitless": {
+          "horizons": ["5min", "15min", "hourly"],
+          "underlyings": ["eth"],
+          "pages": 4,
+          "max_targets": 20
+        }
+      }
+    },
+    {
+      "id": "sol_hourly_ladder",
+      "structure_type": "LADDER",
+      "discover_every_seconds": 120,
+      "venues": {
+        "kalshi": {
+          "series": ["KXSOLD"],
+          "max_events_per_series": 1,
+          "min_strikes": 5,
+          "max_targets": 300
+        },
+        "limitless": {
+          "horizons": ["hourly"],
+          "underlyings": ["sol"],
+          "pages": 4,
+          "max_targets": 10
+        }
+      }
+    },
+    {
+      "id": "crypto_range_partition",
+      "structure_type": "PARTITION",
+      "note": "Range markets over the same underlying are mutually exclusive and exhaustive, so they partition where the directional ladders imply. Disabled until the ladder entries are proven end to end - enabling it triples the Kalshi subscription width.",
+      "enabled": false,
+      "discover_every_seconds": 300,
+      "venues": {
+        "kalshi": {
+          "series": ["KXBTC", "KXETH"],
+          "max_events_per_series": 1,
+          "min_strikes": 5,
+          "max_targets": 400
+        }
+      }
+    }
+  ]
+}

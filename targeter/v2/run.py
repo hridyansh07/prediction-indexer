@@ -1,0 +1,293 @@
+"""Run one Targeter v2 discovery, archive, publication, or integrity pass.
+
+The process is deliberately one-shot.  A host scheduler invokes ``publish``
+periodically; the command never owns an internal sleep loop and therefore
+cannot silently overlap or retain stale vendor state between runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from archive.storage.base import ObjectStoreError
+from archive.storage.factory import add_store_arguments, build_store
+from analysis.storage import write_json, write_ndjson
+from targeter.v2.adapters import durable_client, live_adapters
+from targeter.v2.domain import CatalogSnapshot, SUPPORTED_VENUES, parse_timestamp
+from targeter.v2.lease import TargeterRunLease
+from targeter.v2.registry import Strategy, StrategyError, load_strategy
+from targeter.v2.publication import (
+    PublicationError,
+    audit_current_publication,
+    publish_run,
+)
+from targeter.v2.run_archive import RunArchiveError, archive_run
+from targeter.v2.selection import SelectionResult, select_targets
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_STRATEGY = PROJECT_ROOT / "configs" / "targeter_v2.json"
+DEFAULT_CACHE = PROJECT_ROOT / "data" / "targeter-v2-cache"
+DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "targeter-v2-shadow"
+DEFAULT_LIVE = PROJECT_ROOT / "data" / "live"
+
+
+@dataclass(frozen=True)
+class ShadowRun:
+    run_id: str
+    directory: Path
+    selection: SelectionResult
+    discovery_failures: dict[str, str]
+    # Decided once, from the catalogs themselves, and serialized into the
+    # selection report. Publication trusts the serialized value, so nothing
+    # downstream may re-derive it from a different view of the same run.
+    input_complete: bool
+
+
+def _run_id(now: datetime) -> str:
+    return now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+
+
+def run_shadow(
+    *,
+    strategy: Strategy,
+    output_root: Path,
+    cache_root: Path,
+    now: datetime | None = None,
+    adapters: Iterable[Any] | None = None,
+    client: Any | None = None,
+    force_refresh: bool = True,
+    persist_responses: bool = True,
+    max_kalshi_series: int | None = None,
+    max_kalshi_pages: int | None = None,
+    max_polymarket_pages: int | None = None,
+    max_limitless_pages: int | None = None,
+) -> ShadowRun:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    adapter_set = tuple(adapters or live_adapters(
+        strategy,
+        max_kalshi_series=max_kalshi_series,
+        max_kalshi_pages=max_kalshi_pages,
+        max_polymarket_pages=max_polymarket_pages,
+        max_limitless_pages=max_limitless_pages,
+    ))
+    http = client or durable_client(
+        cache_root,
+        force_refresh=force_refresh,
+        persist_responses=persist_responses,
+    )
+    catalogs: list[CatalogSnapshot] = []
+    failures: dict[str, str] = {}
+    for adapter in adapter_set:
+        try:
+            catalogs.append(adapter.discover(http, now=now))
+        except Exception as error:  # noqa: BLE001 - one vendor must not hide the others
+            failures[str(adapter.venue)] = f"{type(error).__name__}: {error}"
+
+    selection = select_targets(catalogs, strategy=strategy, now=now)
+    run_id = _run_id(now)
+    directory = Path(output_root) / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    for catalog in catalogs:
+        write_ndjson(
+            directory / f"catalog_{catalog.venue}_events.ndjson",
+            (event.as_record() for event in catalog.events),
+        )
+        write_ndjson(
+            directory / f"catalog_{catalog.venue}_markets.ndjson",
+            (market.as_record() for market in catalog.markets),
+        )
+    record = selection.as_record()
+    record["run_id"] = run_id
+    record["strategy_source"] = strategy.source_path
+    record["discovery_failures"] = dict(sorted(failures.items()))
+    catalog_venues = [catalog.venue for catalog in catalogs]
+    input_complete = (
+        not failures
+        and len(catalog_venues) == len(SUPPORTED_VENUES)
+        and set(catalog_venues) == set(SUPPORTED_VENUES)
+        and all(catalog.complete for catalog in catalogs)
+    )
+    record["input_complete"] = input_complete
+    write_json(directory / "selection_report.json", record)
+    write_ndjson(
+        directory / "rule_templates.ndjson",
+        (
+            template.as_record()
+            for candidate in selection.candidates
+            for template in candidate.rules.templates
+        ),
+    )
+    write_ndjson(
+        directory / "rule_drift.ndjson",
+        (
+            {"bundle_id": candidate.bundle.bundle_id, **drift}
+            for candidate in selection.candidates
+            for drift in candidate.rules.drift
+        ),
+    )
+    return ShadowRun(run_id, directory, selection, failures, input_complete)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("shadow", "archive", "publish", "audit"),
+        default="shadow",
+        help=(
+            "shadow writes local evidence; archive also commits it to the object store; "
+            "publish additionally replaces the live generation pointer; audit verifies the "
+            "current pointer against its archived run without discovery"
+        ),
+    )
+    parser.add_argument("--strategy", type=Path, default=DEFAULT_STRATEGY)
+    parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--live-root", type=Path, default=DEFAULT_LIVE)
+    add_store_arguments(parser)
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument(
+        "--reuse-cache",
+        action="store_true",
+        help="Offline/debug mode: reuse matching cached responses instead of querying live catalogs.",
+    )
+    cache_mode.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Compatibility flag; live refresh is already the default.",
+    )
+    cache_mode.add_argument(
+        "--no-response-cache",
+        action="store_true",
+        help=(
+            "Always query live APIs and retain only rate-limit state plus the normalized "
+            "run artifacts; do not persist raw HTTP response bodies."
+        ),
+    )
+    parser.add_argument("--now", help="Deterministic ISO-8601 run time for probes/tests.")
+    parser.add_argument("--max-kalshi-series", type=int)
+    parser.add_argument("--max-kalshi-pages", type=int)
+    parser.add_argument("--max-polymarket-pages", type=int)
+    parser.add_argument("--max-limitless-pages", type=int)
+    return parser.parse_args(argv)
+
+
+def _optional_positive(value: int | None, name: str) -> None:
+    if value is not None and value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _configured_store(arguments: argparse.Namespace):
+    # The shared archive factory calls this root ``spool_root`` because raw
+    # capture introduced the adapter.  For target-run archival the analogous
+    # primary copy is output_root; the same-filesystem guard must compare the
+    # archive against that directory.
+    arguments.spool_root = arguments.output_root
+    return build_store(arguments)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = parse_args(argv)
+    lease: TargeterRunLease | None = None
+    try:
+        for value, name in (
+            (arguments.max_kalshi_series, "--max-kalshi-series"),
+            (arguments.max_kalshi_pages, "--max-kalshi-pages"),
+            (arguments.max_polymarket_pages, "--max-polymarket-pages"),
+            (arguments.max_limitless_pages, "--max-limitless-pages"),
+        ):
+            _optional_positive(value, name)
+        strategy = load_strategy(arguments.strategy)
+        now = parse_timestamp(arguments.now) if arguments.now else None
+        if arguments.now and now is None:
+            raise ValueError("--now must be a valid ISO-8601 timestamp")
+
+        if arguments.mode == "audit":
+            audited = audit_current_publication(
+                live_root=arguments.live_root,
+                output_root=arguments.output_root,
+                store=_configured_store(arguments),
+                strategy=strategy,
+            )
+            print(
+                f"targeter-v2 audit {audited.run_id}: "
+                + ", ".join(
+                    f"{venue}={count}" for venue, count in audited.venue_counts.items()
+                )
+            )
+            return 0
+
+        lease = TargeterRunLease.acquire(arguments.output_root)
+        result = run_shadow(
+            strategy=strategy,
+            output_root=arguments.output_root,
+            cache_root=arguments.cache_root,
+            now=now,
+            force_refresh=not arguments.reuse_cache,
+            persist_responses=not arguments.no_response_cache,
+            max_kalshi_series=arguments.max_kalshi_series,
+            max_kalshi_pages=arguments.max_kalshi_pages,
+            max_polymarket_pages=arguments.max_polymarket_pages,
+            max_limitless_pages=arguments.max_limitless_pages,
+        )
+        complete = result.input_complete
+        if arguments.mode == "shadow":
+            print(
+                f"targeter-v2 shadow run {result.run_id}: "
+                f"{len(result.selection.selected)} bundles -> {result.directory}"
+            )
+            return 0 if complete else 1
+
+        store = _configured_store(arguments)
+        receipt = archive_run(result.directory, store, now=now)
+        if not complete:
+            print(
+                f"targeter-v2 {result.run_id}: archived incomplete discovery evidence; "
+                "live publication was not changed"
+            )
+            return 1
+        if arguments.mode == "archive":
+            print(
+                f"targeter-v2 archive {result.run_id}: {len(receipt.objects)} objects -> "
+                f"{receipt.location}/{receipt.prefix}"
+            )
+            return 0
+
+        generation = publish_run(
+            result.directory,
+            receipt,
+            store,
+            live_root=arguments.live_root,
+            strategy=strategy,
+            now=now,
+        )
+        print(
+            f"targeter-v2 publish {result.run_id}: "
+            + ", ".join(
+                f"{venue}={count}" for venue, count in generation.venue_counts.items()
+            )
+            + f" -> {generation.pointer_path}"
+        )
+        return 0
+    except (
+        ObjectStoreError,
+        OSError,
+        PublicationError,
+        RunArchiveError,
+        StrategyError,
+        ValueError,
+    ) as error:
+        print(str(error))
+        return 2
+    finally:
+        if lease is not None:
+            lease.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

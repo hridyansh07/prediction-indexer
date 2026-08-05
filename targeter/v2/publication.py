@@ -1,0 +1,513 @@
+"""Atomic publication and audit of Targeter v2 splice subscriptions.
+
+All venue files are materialized inside an immutable run generation.  Its
+``manifest.json`` commits those files; only then is one small ``current.json``
+pointer replaced.  Every splice reads the same pointer and selects its venue,
+so a crash cannot expose a mixture of old and new venue generations.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping
+
+from archive.common.durable import confirm_durable, write_json_durable
+from archive.storage.base import ObjectStore
+from encoder import StoredIdentity, stored_identity_of
+from targeter.targets import (
+    TARGET_GENERATION_POINTER_VERSION,
+    TARGET_PUBLICATION_MANIFEST_VERSION,
+    Target,
+    TargetsError,
+    load_targets,
+    write_targets,
+)
+from targeter.v2.domain import SUPPORTED_VENUES
+from targeter.v2.registry import Strategy
+from targeter.v2.run_archive import (
+    PRODUCTION_RECEIPT_FILE,
+    RunArchiveReceipt,
+    read_run_archive_receipt,
+    validate_local_run,
+    verify_run_archive,
+)
+
+
+class PublicationError(ValueError):
+    """A run cannot safely become the splice subscription authority."""
+
+
+@dataclass(frozen=True)
+class PublishedGeneration:
+    run_id: str
+    directory: Path
+    manifest_path: Path
+    pointer_path: Path
+    venue_counts: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class PublicationAudit:
+    run_id: str
+    venue_counts: Mapping[str, int]
+
+
+def _read_json(path: Path, description: str) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise PublicationError(f"cannot read {description} {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise PublicationError(f"invalid {description} {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise PublicationError(f"{description} must be a JSON object")
+    return document
+
+
+def publication_pointer_path(live_root: Path) -> Path:
+    return Path(live_root) / "targeter-v2" / "current.json"
+
+
+def read_publication_pointer(live_root: Path) -> str:
+    """The run_id the live generation pointer currently names.
+
+    Extracted so that every reader of "which run is published" is this one
+    function.  The run reaper asks the same question before it deletes, and a
+    reaper that answered it differently from the audit could remove the local
+    evidence the audit is about to demand.
+    """
+    pointer = _read_json(
+        publication_pointer_path(live_root), "target generation pointer"
+    )
+    run_id = pointer.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise PublicationError("target generation pointer has no run_id")
+    return run_id
+
+
+def _identity(path: Path) -> StoredIdentity:
+    with path.open("rb") as handle:
+        return stored_identity_of(handle)
+
+
+def _identity_record(path: Path) -> dict[str, Any]:
+    stored = _identity(path)
+    return {
+        "file": path.name,
+        "byte_length": stored.byte_length,
+        "sha256": stored.sha256,
+    }
+
+
+def _selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
+    report = _read_json(run_directory / "selection_report.json", "selection report")
+    if report.get("run_id") != run_directory.name:
+        raise PublicationError("selection report run_id does not match its directory")
+    if report.get("report_version") != 1 or report.get("mode") != "shadow":
+        raise PublicationError("publication requires a phase-5 shadow report")
+    if report.get("strategy_version") != strategy.version:
+        raise PublicationError("selection report and publication strategy versions differ")
+    if report.get("input_complete") is not True or report.get("discovery_failures") != {}:
+        raise PublicationError("incomplete targeter runs cannot be published")
+    catalogs = report.get("catalogs")
+    if not isinstance(catalogs, list) or not catalogs or any(
+        not isinstance(summary, dict) or summary.get("complete") is not True
+        for summary in catalogs
+    ):
+        raise PublicationError("publication requires complete catalog summaries")
+    catalog_venues = [summary.get("venue") for summary in catalogs]
+    if (
+        len(catalog_venues) != len(SUPPORTED_VENUES)
+        or set(catalog_venues) != set(SUPPORTED_VENUES)
+    ):
+        raise PublicationError("publication requires exactly one catalog for every supported venue")
+    selection = report.get("selection")
+    if not isinstance(selection, dict) or selection.get("publication_performed") is not False:
+        raise PublicationError("selection report has invalid publication state")
+    bundle_ids = selection.get("bundle_ids")
+    if (
+        not isinstance(bundle_ids, list)
+        or not all(isinstance(item, str) and item for item in bundle_ids)
+        or len(bundle_ids) != len(set(bundle_ids))
+        or selection.get("bundle_count") != len(bundle_ids)
+    ):
+        raise PublicationError("selection report has invalid selected bundle identifiers")
+    targets = selection.get("targets")
+    if not isinstance(targets, dict) or set(targets) != set(SUPPORTED_VENUES):
+        raise PublicationError("selection report targets must name every supported venue")
+    return report
+
+
+def _targets_from_report(
+    report: dict[str, Any],
+    receipt: RunArchiveReceipt,
+    strategy: Strategy,
+    catalog_markets: Mapping[str, Mapping[str, dict[str, Any]]],
+) -> dict[str, list[Target]]:
+    selection = report["selection"]
+    bundle_ids = frozenset(selection["bundle_ids"])
+    candidates = report.get("candidates")
+    if not isinstance(candidates, list):
+        raise PublicationError("selection report candidates must be an array")
+    candidates_by_bundle: dict[str, dict[str, Any]] = {}
+    for raw_candidate in candidates:
+        if not isinstance(raw_candidate, dict):
+            raise PublicationError("selection report candidate is not an object")
+        bundle_id = raw_candidate.get("bundle_id")
+        if not isinstance(bundle_id, str) or not bundle_id or bundle_id in candidates_by_bundle:
+            raise PublicationError("selection report has invalid or duplicate candidate bundles")
+        candidates_by_bundle[bundle_id] = raw_candidate
+    selected_candidate_markets: dict[str, frozenset[str]] = {}
+    for bundle_id in bundle_ids:
+        candidate = candidates_by_bundle.get(bundle_id)
+        if candidate is None or candidate.get("eligible") is not True:
+            raise PublicationError(f"selected bundle {bundle_id} is not an eligible report candidate")
+        eligible_market_ids = candidate.get("eligible_market_ids")
+        if (
+            not isinstance(eligible_market_ids, list)
+            or not eligible_market_ids
+            or not all(isinstance(item, str) and item for item in eligible_market_ids)
+            or len(eligible_market_ids) != len(set(eligible_market_ids))
+        ):
+            raise PublicationError(f"selected bundle {bundle_id} has invalid eligible markets")
+        selected_candidate_markets[bundle_id] = frozenset(eligible_market_ids)
+    report_object = next(
+        (item for item in receipt.objects if item.file == "selection_report.json"), None
+    )
+    if report_object is None:
+        raise PublicationError("run archive receipt does not contain the selection report")
+    by_venue: dict[str, list[Target]] = {venue: [] for venue in SUPPORTED_VENUES}
+    bundle_venues: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
+    selected_market_ids: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
+    seen_target_ids: set[str] = set()
+
+    for venue in SUPPORTED_VENUES:
+        raw_targets = selection["targets"].get(venue)
+        if not isinstance(raw_targets, list):
+            raise PublicationError(f"selection targets for {venue} must be an array")
+        seen_assets: dict[str, Target] = {}
+        for position, raw in enumerate(raw_targets):
+            if not isinstance(raw, dict):
+                raise PublicationError(f"selection target {venue}[{position}] is not an object")
+            bundle_id = _required_text(raw, "bundle_id", venue, position)
+            if bundle_id not in bundle_ids:
+                raise PublicationError(f"selection target {venue}[{position}] names an unselected bundle")
+            target_id = _required_text(raw, "target_id", venue, position)
+            if not target_id.startswith(venue + ":"):
+                raise PublicationError(f"selection target {target_id!r} belongs to another venue")
+            if target_id in seen_target_ids:
+                raise PublicationError(f"selection report repeats target {target_id!r}")
+            seen_target_ids.add(target_id)
+            canonical_class = _required_text(raw, "canonical_class", venue, position)
+            subscription_ids = raw.get("subscription_ids")
+            if (
+                not isinstance(subscription_ids, list)
+                or not subscription_ids
+                or not all(isinstance(item, str) and item.strip() for item in subscription_ids)
+                or len(subscription_ids) != len(set(subscription_ids))
+            ):
+                raise PublicationError(
+                    f"selection target {venue}[{position}] has invalid subscription_ids"
+                )
+            catalog = catalog_markets[venue].get(target_id)
+            if catalog is None:
+                raise PublicationError(f"selection target {target_id!r} is absent from its catalog")
+            if (
+                catalog.get("canonical_class") != canonical_class
+                or catalog.get("subscription_ids") != subscription_ids
+                or catalog.get("source_ref") != raw.get("source_ref")
+            ):
+                raise PublicationError(
+                    f"selection target {target_id!r} disagrees with its archived catalog"
+                )
+            candidate = candidates_by_bundle[bundle_id]
+            if (
+                raw.get("activation_at") != candidate.get("activation_at")
+                or raw.get("capture_start_at") != candidate.get("capture_start_at")
+            ):
+                raise PublicationError(
+                    f"selection target {target_id!r} timing disagrees with its candidate"
+                )
+            bundle_venues[bundle_id].add(venue)
+            selected_market_ids[bundle_id].add(target_id)
+            resolution = {
+                "version": 2,
+                "source": "targeter_v2",
+                "run_id": report["run_id"],
+                "bundle_id": bundle_id,
+                "target_id": target_id,
+                "canonical_class": canonical_class,
+                "activation_at": raw.get("activation_at"),
+                "capture_start_at": raw.get("capture_start_at"),
+                "source_ref": raw.get("source_ref"),
+                "selection_report_sha256": report_object.stored.sha256,
+                "archive_manifest_key": receipt.manifest.key,
+                "archive_manifest_sha256": receipt.manifest.stored.sha256,
+            }
+            for asset_id in subscription_ids:
+                target = Target(
+                    asset_id=asset_id,
+                    market_id=target_id.split(":", 1)[1],
+                    note=canonical_class,
+                    resolution=resolution,
+                )
+                existing = seen_assets.get(asset_id)
+                if existing is not None and existing != target:
+                    raise PublicationError(
+                        f"subscription id {asset_id!r} has conflicting selection provenance"
+                    )
+                seen_assets[asset_id] = target
+        by_venue[venue] = sorted(seen_assets.values(), key=lambda item: item.asset_id)
+
+    if not bundle_ids or not any(by_venue.values()):
+        raise PublicationError("empty target selections require explicit human review and are not published")
+    for bundle_id, venues in bundle_venues.items():
+        if len(venues) < strategy.minimum_venues:
+            raise PublicationError(
+                f"selected bundle {bundle_id} has targets on only {len(venues)} venues"
+            )
+        if selected_market_ids[bundle_id] != selected_candidate_markets[bundle_id]:
+            raise PublicationError(
+                f"selected bundle {bundle_id} targets do not match its eligible candidate markets"
+            )
+    if len({venue for venue, targets in by_venue.items() if targets}) < strategy.minimum_venues:
+        raise PublicationError("publication has fewer than the configured minimum venues")
+    return by_venue
+
+
+def _catalog_markets(run_directory: Path) -> dict[str, dict[str, dict[str, Any]]]:
+    """Read the archived catalogue boundary used to produce subscriptions."""
+    catalogs: dict[str, dict[str, dict[str, Any]]] = {}
+    for venue in SUPPORTED_VENUES:
+        path = Path(run_directory) / f"catalog_{venue}_markets.ndjson"
+        records: dict[str, dict[str, Any]] = {}
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.endswith("\n") or not line.strip():
+                        raise PublicationError(
+                            f"catalog {path.name}:{line_number} is not one complete NDJSON record"
+                        )
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise PublicationError(
+                            f"catalog {path.name}:{line_number} is invalid JSON: {error}"
+                        ) from error
+                    if not isinstance(record, dict) or record.get("venue") != venue:
+                        raise PublicationError(
+                            f"catalog {path.name}:{line_number} has the wrong venue or shape"
+                        )
+                    target_id = record.get("target_id")
+                    if not isinstance(target_id, str) or not target_id.startswith(venue + ":"):
+                        raise PublicationError(
+                            f"catalog {path.name}:{line_number} has an invalid target_id"
+                        )
+                    if target_id in records:
+                        raise PublicationError(f"catalog {path.name} repeats target {target_id!r}")
+                    records[target_id] = record
+        except OSError as error:
+            raise PublicationError(f"cannot read archived catalog {path}: {error}") from error
+        catalogs[venue] = records
+    return catalogs
+
+
+def _required_text(raw: dict[str, Any], field: str, venue: str, position: int) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str) or not value:
+        raise PublicationError(f"selection target {venue}[{position}] has no {field}")
+    return value
+
+
+def publish_run(
+    run_directory: Path,
+    receipt: RunArchiveReceipt,
+    store: ObjectStore,
+    *,
+    live_root: Path,
+    strategy: Strategy,
+    now: datetime | None = None,
+) -> PublishedGeneration:
+    run_directory = Path(run_directory)
+    live_root = Path(live_root)
+    if not receipt.is_production or not store.durability.independent:
+        raise PublicationError("publication requires a verified independent archive")
+    verify_run_archive(store, receipt)
+    validate_local_run(run_directory, receipt)
+    report = _selection_report(run_directory, strategy)
+    catalog_markets = _catalog_markets(run_directory)
+    targets = _targets_from_report(report, receipt, strategy, catalog_markets)
+
+    publication_root = live_root / "targeter-v2"
+    generation_directory = publication_root / "generations" / receipt.run_id
+    manifest_path = generation_directory / "manifest.json"
+    pointer_path = publication_pointer_path(live_root)
+    generation_directory.mkdir(parents=True, exist_ok=True)
+
+    if manifest_path.exists():
+        manifest = _read_json(manifest_path, "target publication manifest")
+        _verify_generation_manifest(manifest_path, manifest, receipt, strategy, targets)
+        confirm_durable(manifest_path)
+    else:
+        venue_records: dict[str, dict[str, Any]] = {}
+        for venue in SUPPORTED_VENUES:
+            target_path = generation_directory / f"targets_{venue}.json"
+            write_targets(
+                target_path,
+                venue=venue,
+                targets=targets[venue],
+                note=f"Targeter v2 generation {receipt.run_id}",
+            )
+            loaded = load_targets(target_path, venue=venue)
+            # ``write_targets`` uses atomic file replacement.  Before the
+            # generation manifest can commit those names, make both the target
+            # file and its content-addressed metadata snapshot strictly durable
+            # (including their directory entries).
+            confirm_durable(target_path)
+            if loaded.metadata_path is None:
+                raise PublicationError(f"publication target file for {venue} has no metadata snapshot")
+            confirm_durable(Path(loaded.metadata_path))
+            venue_records[venue] = {
+                "target_file": _identity_record(target_path),
+                "target_digest": loaded.digest,
+                "metadata_digest": loaded.metadata_digest,
+                "target_count": len(loaded),
+            }
+
+        instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        report_object = next(
+            item for item in receipt.objects if item.file == "selection_report.json"
+        )
+        manifest = {
+            "target_publication_manifest_version": TARGET_PUBLICATION_MANIFEST_VERSION,
+            "run_id": receipt.run_id,
+            "published_at": instant.isoformat().replace("+00:00", "Z"),
+            "selection_report": {
+                "byte_length": report_object.stored.byte_length,
+                "sha256": report_object.stored.sha256,
+            },
+            "archive": {
+                "bucket": receipt.location,
+                "manifest_key": receipt.manifest.key,
+                "manifest_byte_length": receipt.manifest.stored.byte_length,
+                "manifest_sha256": receipt.manifest.stored.sha256,
+            },
+            "minimum_venues": strategy.minimum_venues,
+            "venues": venue_records,
+        }
+        write_json_durable(manifest_path, manifest)
+        _verify_generation_manifest(manifest_path, manifest, receipt, strategy, targets)
+
+    manifest_identity = _identity(manifest_path)
+    pointer = {
+        "target_generation_pointer_version": TARGET_GENERATION_POINTER_VERSION,
+        "run_id": receipt.run_id,
+        "manifest_path": str(manifest_path.relative_to(publication_root)),
+        "manifest": {
+            "byte_length": manifest_identity.byte_length,
+            "sha256": manifest_identity.sha256,
+        },
+    }
+    write_json_durable(pointer_path, pointer)
+    counts = {
+        venue: int(manifest["venues"][venue]["target_count"])
+        for venue in SUPPORTED_VENUES
+    }
+    return PublishedGeneration(
+        run_id=receipt.run_id,
+        directory=generation_directory,
+        manifest_path=manifest_path,
+        pointer_path=pointer_path,
+        venue_counts=dict(sorted(counts.items())),
+    )
+
+
+def _verify_generation_manifest(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    receipt: RunArchiveReceipt,
+    strategy: Strategy,
+    expected: Mapping[str, list[Target]],
+) -> None:
+    if manifest.get("target_publication_manifest_version") != TARGET_PUBLICATION_MANIFEST_VERSION:
+        raise PublicationError("unsupported target publication manifest version")
+    if manifest.get("run_id") != receipt.run_id:
+        raise PublicationError("publication manifest names another run")
+    if manifest.get("minimum_venues") != strategy.minimum_venues:
+        raise PublicationError("publication manifest minimum_venues drifted")
+    report_object = next(
+        (item for item in receipt.objects if item.file == "selection_report.json"), None
+    )
+    if report_object is None or manifest.get("selection_report") != {
+        "byte_length": report_object.stored.byte_length,
+        "sha256": report_object.stored.sha256,
+    }:
+        raise PublicationError("publication manifest selection identity is invalid")
+    archive = manifest.get("archive")
+    if archive != {
+        "bucket": receipt.location,
+        "manifest_key": receipt.manifest.key,
+        "manifest_byte_length": receipt.manifest.stored.byte_length,
+        "manifest_sha256": receipt.manifest.stored.sha256,
+    }:
+        raise PublicationError("publication manifest archive identity is invalid")
+    venues = manifest.get("venues")
+    if not isinstance(venues, dict) or set(venues) != set(SUPPORTED_VENUES):
+        raise PublicationError("publication manifest must name every supported venue")
+    for venue in SUPPORTED_VENUES:
+        entry = venues[venue]
+        if not isinstance(entry, dict):
+            raise PublicationError(f"publication manifest venue {venue} is invalid")
+        target_file = entry.get("target_file")
+        if not isinstance(target_file, dict) or target_file.get("file") != f"targets_{venue}.json":
+            raise PublicationError(f"publication manifest target file for {venue} is invalid")
+        target_path = manifest_path.parent / target_file["file"]
+        if _identity_record(target_path) != target_file:
+            raise PublicationError(f"publication target file identity drifted for {venue}")
+        try:
+            loaded = load_targets(target_path, venue=venue)
+        except TargetsError as error:
+            raise PublicationError(f"publication target file for {venue} is invalid: {error}") from error
+        if (
+            entry.get("target_digest") != loaded.digest
+            or entry.get("metadata_digest") != loaded.metadata_digest
+            or entry.get("target_count") != len(loaded)
+        ):
+            raise PublicationError(f"publication manifest target metadata drifted for {venue}")
+        if loaded.targets != tuple(expected[venue]):
+            raise PublicationError(f"publication targets no longer match selection report for {venue}")
+
+
+def audit_current_publication(
+    *,
+    live_root: Path,
+    output_root: Path,
+    store: ObjectStore,
+    strategy: Strategy,
+) -> PublicationAudit:
+    pointer_path = publication_pointer_path(live_root)
+    run_id = read_publication_pointer(live_root)
+    run_directory = Path(output_root) / run_id
+    receipt = read_run_archive_receipt(run_directory / PRODUCTION_RECEIPT_FILE)
+    verify_run_archive(store, receipt)
+    validate_local_run(run_directory, receipt)
+    report = _selection_report(run_directory, strategy)
+    expected = _targets_from_report(
+        report,
+        receipt,
+        strategy,
+        _catalog_markets(run_directory),
+    )
+    counts: dict[str, int] = {}
+    for venue in SUPPORTED_VENUES:
+        try:
+            loaded = load_targets(pointer_path, venue=venue)
+        except TargetsError as error:
+            raise PublicationError(f"current publication is invalid for {venue}: {error}") from error
+        if loaded.targets != tuple(expected[venue]):
+            raise PublicationError(f"current {venue} targets do not match archived selection")
+        counts[venue] = len(loaded)
+    return PublicationAudit(run_id=run_id, venue_counts=dict(sorted(counts.items())))

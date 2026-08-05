@@ -1,0 +1,603 @@
+{
+  "version": 3,
+  "note": "Sports-first event selection. Admission uses normalized dollar/USDC moneyline volume; vendor-native contract counts remain diagnostics only.",
+  "sports": [
+    "soccer",
+    "esports"
+  ],
+  "selection": {
+    "minimum_venues": 2,
+    "preferred_venues": 3,
+    "discovery_horizon_seconds": 172800,
+    "pre_event_seconds": 3600,
+    "run_interval_seconds": 600,
+    "subscription_guard_seconds": 60,
+    "event_time_tolerance_seconds": 900,
+    "minimum_market_age_seconds": 1800,
+    "minimum_combined_moneyline_volume_usd": 25000,
+    "post_start_retention_seconds": 21600,
+    "maximum_bundles": 50
+  },
+  "target_budgets": {
+    "kalshi": 1000,
+    "polymarket": 400,
+    "limitless": 400
+  },
+  "polymarket_tags": [
+    "soccer",
+    "esports"
+  ],
+  "limitless_category_ids": [
+    53
+  ],
+  "participant_aliases": {},
+  "known_rule_templates": [],
+  "market_classes": [
+    {
+      "id": "soccer.correct_score",
+      "sport": "soccer",
+      "market_type": "correct_score",
+      "scope": "regulation_fulltime",
+      "venue_patterns": {
+        "kalshi": {
+          "series_title": [
+            "^(?!.*(?:first half|second half|half[- ]?time|extra time|after 45 minutes|penalt(?:y|ies)|corners)).*correct score.*$"
+          ]
+        },
+        "polymarket": {
+          "event_title": [
+            "exact score",
+            "correct score"
+          ]
+        }
+      }
+    },
+    {
+      "id": "soccer.both_teams_to_score",
+      "sport": "soccer",
+      "market_type": "both_teams_to_score",
+      "scope": "regulation_fulltime",
+      "venue_patterns": {
+        "kalshi": {
+          "series_title": [
+            "^(?!.*(?:first half|second half|half[- ]?time|extra time|after 45 minutes|penalt(?:y|ies)|corners)).*both teams to score.*$"
+          ]
+        },
+        "polymarket": {
+          "group_title": [
+            "both teams to score"
+          ]
+        },
+        "limitless": {
+          "market_title": [
+            "both to score",
+            "both teams to score"
+          ]
+        }
+      }
+    },
+    {
+      "id": "soccer.total_goals",
+      "sport": "soccer",
+      "market_type": "total_goals",
+      "scope": "regulation_fulltime",
+      "venue_patterns": {
+        "kalshi": {
+          "series_title": [
+            "^(?!.*(?:first half|second half|half[- ]?time|extra time|after 45 minutes|penalt(?:y|ies)|corners)).*(?:match|game|world cup|soccer).*total.*$",
+            "^total$"
+          ]
+        },
+        "polymarket": {
+          "group_title": [
+            "^o/u\\s+\\d"
+          ]
+        },
+        "limitless": {
+          "market_title": [
+            "total goals",
+            "\\d+ or more total goals"
+          ]
+        }
+      }
+    },
+    {
+      "id": "soccer.spread",
+      "sport": "soccer",
+      "market_type": "spread",
+      "scope": "regulation_fulltime",
+      "venue_patterns": {
+        "kalshi": {
+          "series_title": [
+            "^(?!.*(?:first half|second half|half[- ]?time|extra time|after 45 minutes|penalt(?:y|ies)|corners)).*spread.*$"
+          ]
+        },
+        "polymarket": {
+          "group_title": [
+            "\\([-+]?[0-9]+(?:\\.[0-9]+)?\\)"
+          ]
+        },
+        "limitless": {
+          "metadata_market_type": [
+            "spread",
+            "handicap"
+          ]
+        }
+      }
+    },
+    {
+      "id": "soccer.moneyline_3way",
+      "sport": "soccer",
+      "market_type": "moneyline_3way",
+      "scope": "regulation_fulltime",
+      "venue_patterns": {
+        "kalshi": {
+          "series_title": [
+            "^(?!.*(?:first half|second half|half[- ]?time|extra time|after 45 minutes|penalt(?:y|ies)|corners)).*(?:match winner|game winner|winner|\\bgame\\b).*$"
+          ]
+        },
+        "polymarket": {
+          "event_title": [
+            "\\bvs\\.?\\b"
+          ]
+        },
+        "limitless": {
+          "metadata_market_type": [
+            "match_winner"
+          ]
+        }
+      }
+    },
+    {
+      "id": "esports.series_moneyline",
+      "sport": "esports",
+      "market_type": "series_moneyline",
+      "scope": "series",
+      "venue_patterns": {}
+    },
+    {
+      "id": "esports.map_winner",
+      "sport": "esports",
+      "market_type": "map_winner",
+      "scope": "map",
+      "venue_patterns": {}
+    },
+    {
+      "id": "esports.map_handicap",
+      "sport": "esports",
+      "market_type": "map_handicap",
+      "scope": "series",
+      "venue_patterns": {}
+    },
+    {
+      "id": "esports.total_maps",
+      "sport": "esports",
+      "market_type": "total_maps",
+      "scope": "series",
+      "venue_patterns": {}
+    }
+  ],
+  "game_families": [
+    {
+      "id": "league_of_legends",
+      "sport": "esports",
+      "topology": "best_of_series",
+      "polymarket_game_tags": [
+        "league-of-legends"
+      ],
+      "venue_game_aliases": {
+        "kalshi": [
+          "league of legends"
+        ],
+        "polymarket": [
+          "lol",
+          "league of legends"
+        ],
+        "limitless": [
+          "lol",
+          "league of legends",
+          "league-of-legends"
+        ]
+      },
+      "venue_products": {
+        "kalshi": [
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXLOLGAME"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXLOLMAP"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXLOLTOTALMAPS"
+            ],
+            "canonical_class": "esports.total_maps"
+          }
+        ],
+        "polymarket": [
+          {
+            "field": "group_title",
+            "patterns": [
+              "^match winner$"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+(?P<index>[1-9][0-9]*)\\s+winner$"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^o/u\\s+(?P<line>[0-9]+(?:\\.5)?)\\s+(?:games|maps)$"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+handicap(?::.*)?$"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ],
+        "limitless": [
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "match_winner"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_winner"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "total_maps"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_handicap"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ]
+      }
+    },
+    {
+      "id": "counter_strike_2",
+      "sport": "esports",
+      "topology": "best_of_series",
+      "polymarket_game_tags": [
+        "counter-strike-2"
+      ],
+      "venue_game_aliases": {
+        "kalshi": [
+          "counter-strike 2",
+          "cs2"
+        ],
+        "polymarket": [
+          "counter-strike",
+          "counter-strike 2",
+          "cs2"
+        ],
+        "limitless": [
+          "counter-strike 2",
+          "counter-strike-2",
+          "cs2"
+        ]
+      },
+      "venue_products": {
+        "kalshi": [
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXCS2GAME"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXCS2MAP"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXCS2TOTALMAPS"
+            ],
+            "canonical_class": "esports.total_maps"
+          }
+        ],
+        "polymarket": [
+          {
+            "field": "group_title",
+            "patterns": [
+              "^match winner$"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+(?P<index>[1-9][0-9]*)\\s+winner$"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^o/u\\s+(?P<line>[0-9]+(?:\\.5)?)\\s+(?:games|maps)$"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+handicap(?::.*)?$"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ],
+        "limitless": [
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "match_winner"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_winner"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "total_maps"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_handicap"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dota_2",
+      "sport": "esports",
+      "topology": "best_of_series",
+      "polymarket_game_tags": [
+        "dota-2"
+      ],
+      "venue_game_aliases": {
+        "kalshi": [
+          "dota 2",
+          "dota2"
+        ],
+        "polymarket": [
+          "dota 2",
+          "dota2"
+        ],
+        "limitless": [
+          "dota 2",
+          "dota-2",
+          "dota2"
+        ]
+      },
+      "venue_products": {
+        "kalshi": [
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXDOTA2GAME"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXDOTA2MAP"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXDOTA2TOTALMAPS"
+            ],
+            "canonical_class": "esports.total_maps"
+          }
+        ],
+        "polymarket": [
+          {
+            "field": "group_title",
+            "patterns": [
+              "^match winner$"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+(?P<index>[1-9][0-9]*)\\s+winner$"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^o/u\\s+(?P<line>[0-9]+(?:\\.5)?)\\s+(?:games|maps)$"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+handicap(?::.*)?$"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ],
+        "limitless": [
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "match_winner"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_winner"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "total_maps"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_handicap"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ]
+      }
+    },
+    {
+      "id": "valorant",
+      "sport": "esports",
+      "topology": "best_of_series",
+      "polymarket_game_tags": [
+        "valorant"
+      ],
+      "venue_game_aliases": {
+        "kalshi": [
+          "valorant"
+        ],
+        "polymarket": [
+          "valorant"
+        ],
+        "limitless": [
+          "valorant"
+        ]
+      },
+      "venue_products": {
+        "kalshi": [
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXVALORANTGAME"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "series_ticker",
+            "values": [
+              "KXVALORANTMAP"
+            ],
+            "canonical_class": "esports.map_winner"
+          }
+        ],
+        "polymarket": [
+          {
+            "field": "group_title",
+            "patterns": [
+              "^match winner$"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+(?P<index>[1-9][0-9]*)\\s+winner$"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^o/u\\s+(?P<line>[0-9]+(?:\\.5)?)\\s+(?:games|maps)$"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "group_title",
+            "patterns": [
+              "^(?:game|map)\\s+handicap(?::.*)?$"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ],
+        "limitless": [
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "match_winner"
+            ],
+            "canonical_class": "esports.series_moneyline"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_winner"
+            ],
+            "canonical_class": "esports.map_winner"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "total_maps"
+            ],
+            "canonical_class": "esports.total_maps"
+          },
+          {
+            "field": "metadata_market_type",
+            "values": [
+              "map_handicap"
+            ],
+            "canonical_class": "esports.map_handicap"
+          }
+        ]
+      }
+    }
+  ]
+}
