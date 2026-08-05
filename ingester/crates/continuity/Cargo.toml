@@ -1,0 +1,20 @@
+[package]
+name = "indexer-continuity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+indexer-types = { path = "../types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Test-only. The crate itself no longer links the store — classification is
+# gated on the `Positioned`/`Committed` contract in `indexer-types`, not on one
+# concrete sink — but the tests are worth running against the real one.
+indexer-store = { path = "../store" }
+tempdir = "0.3"

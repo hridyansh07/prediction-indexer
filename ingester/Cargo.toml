@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/types",
+    "crates/store",
+    "crates/continuity",
+    "crates/segment",
+    "crates/finalize",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+prediction-encoder = { path = "../encoder/rust" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
