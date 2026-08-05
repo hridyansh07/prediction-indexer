@@ -1,0 +1,36 @@
+{
+  "compression": {
+    "algorithm": "zstd",
+    "dictionary": null,
+    "frame_checksum": true,
+    "frame_count": 1,
+    "level": 3
+  },
+  "fixture_version": 1,
+  "frames": {
+    "python": {
+      "encoder": "python-zstandard/0.25.0",
+      "file": "roundtrip_v1.python.ndjson.zst",
+      "stored": {
+        "byte_length": 4531,
+        "sha256": "a8ca84b5ff2ab367e16e6918ae9a4d48650f6e1e30d6beb7c5827e9133653896"
+      }
+    },
+    "rust": {
+      "encoder": "zstd-rs/0.13; libzstd/1.5.7",
+      "file": "roundtrip_v1.rust.ndjson.zst",
+      "stored": {
+        "byte_length": 4531,
+        "sha256": "a8ca84b5ff2ab367e16e6918ae9a4d48650f6e1e30d6beb7c5827e9133653896"
+      }
+    }
+  },
+  "payload": {
+    "file": "roundtrip_v1.ndjson",
+    "logical": {
+      "byte_length": 121232,
+      "line_count": 256,
+      "sha256": "61d8080cf357099a3dee50a642f0cb20650fe57ca69b5de55ae2b772e32e4dd4"
+    }
+  }
+}
