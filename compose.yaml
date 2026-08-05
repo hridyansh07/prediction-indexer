@@ -5,7 +5,7 @@ x-capture-build: &capture-build
   dockerfile: docker/python.Dockerfile
 
 x-capture-service: &capture-service
-  image: prediction-indexer-capture:${IMAGE_TAG:-local}
+  image: ${IMAGE_REGISTRY:-}prediction-indexer-capture:${IMAGE_TAG:-local}
   build: *capture-build
   init: true
   user: "${PUID:-1000}:${PGID:-1000}"
@@ -25,7 +25,7 @@ x-capture-service: &capture-service
       max-file: "${LOG_MAX_FILES:-5}"
 
 x-ingester-service: &ingester-service
-  image: prediction-indexer-ingester:${IMAGE_TAG:-local}
+  image: ${IMAGE_REGISTRY:-}prediction-indexer-ingester:${IMAGE_TAG:-local}
   build:
     context: .
     dockerfile: docker/ingester.Dockerfile

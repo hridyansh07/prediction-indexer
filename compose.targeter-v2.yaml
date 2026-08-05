@@ -6,7 +6,7 @@
 #   docker compose -f compose.yaml -f compose.targeter-v2.yaml run --rm targeter
 
 x-targeter-v2-runtime: &targeter-v2-runtime
-  image: prediction-indexer-capture:${IMAGE_TAG:-local}
+  image: ${IMAGE_REGISTRY:-}prediction-indexer-capture:${IMAGE_TAG:-local}
   build:
     context: .
     dockerfile: docker/python.Dockerfile
