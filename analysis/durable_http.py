@@ -17,6 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from archive.common.durable import fsync_directory
+from analysis.storage import read_json_zstd, write_json_zstd
+from encoder import CodecError, LogicalIdentity, StoredIdentity
+
 
 DEFAULT_MIN_INTERVAL_SECONDS = {
     # Oddpool's free tier allows one request per second. The small buffer avoids
@@ -71,6 +75,20 @@ def _atomic_write(path: Path, content: bytes) -> None:
         os.fsync(handle.fileno())
         temporary_path = Path(handle.name)
     os.replace(temporary_path, path)
+    fsync_directory(path.parent)
+
+
+@contextmanager
+def _cache_entry_lock(response_path: Path) -> Iterator[None]:
+    """Serialize readers and two-file commits for one response cache key."""
+    lock_path = response_path.with_suffix(".cache.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _default_transport(
@@ -100,6 +118,7 @@ class DurableJsonClient:
         *,
         force_refresh: bool = False,
         persist_responses: bool = True,
+        compress_responses: bool = False,
         timeout_seconds: float = 30.0,
         min_interval_seconds: Mapping[str, float] | None = None,
         transport: Transport | None = None,
@@ -108,6 +127,7 @@ class DurableJsonClient:
         self.cache_root = Path(cache_root)
         self.force_refresh = force_refresh
         self.persist_responses = persist_responses
+        self.compress_responses = compress_responses
         self.timeout_seconds = timeout_seconds
         self.min_interval_seconds = {
             **DEFAULT_MIN_INTERVAL_SECONDS,
@@ -159,24 +179,49 @@ class DurableJsonClient:
         host = parsed.hostname or "unknown-host"
         request_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
         host_directory = re.sub(r"[^a-zA-Z0-9._-]", "_", host)
-        response_path = self.cache_root / host_directory / f"{request_hash}.json"
+        response_suffix = ".json.zst" if self.compress_responses else ".json"
+        response_path = self.cache_root / host_directory / f"{request_hash}{response_suffix}"
         metadata_path = response_path.with_suffix(".meta.json")
+        cache_miss = object()
 
-        if self.persist_responses and response_path.exists() and not self.force_refresh:
-            self.cache_hits += 1
-            data = json.loads(response_path.read_text(encoding="utf-8"))
-            metadata = (
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-                if metadata_path.exists()
-                else {}
-            )
-            return JsonResponse(
-                data=data,
-                url=url,
-                cache_path=response_path,
-                from_cache=True,
-                fetched_at=metadata.get("fetched_at", "unknown"),
-            )
+        if self.persist_responses and not self.force_refresh:
+            with _cache_entry_lock(response_path):
+                if response_path.exists():
+                    try:
+                        metadata = (
+                            json.loads(metadata_path.read_text(encoding="utf-8"))
+                            if metadata_path.exists()
+                            else {}
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        metadata = {}
+                    if self.compress_responses:
+                        try:
+                            data = read_json_zstd(
+                                response_path,
+                                expected_logical=LogicalIdentity.from_record(
+                                    metadata.get("decoded")
+                                ),
+                                expected_stored=StoredIdentity.from_record(
+                                    metadata.get("stored")
+                                ),
+                            )
+                        except (CodecError, OSError, ValueError):
+                            # Body plus metadata is one cache commit. An
+                            # interrupted or mismatched pair is an uncommitted
+                            # cache miss, not a durable discovery failure.
+                            data = cache_miss
+                    else:
+                        data = json.loads(response_path.read_text(encoding="utf-8"))
+                    if data is not cache_miss:
+                        self.cache_hits += 1
+                        return JsonResponse(
+                            data=data,
+                            url=url,
+                            cache_path=response_path,
+                            from_cache=True,
+                            fetched_at=metadata.get("fetched_at", "unknown"),
+                        )
 
         request_headers = {
             "Accept": "application/json",
@@ -202,28 +247,42 @@ class DurableJsonClient:
 
         fetched_at = _utc_now()
         if self.persist_responses:
-            _atomic_write(
-                response_path,
-                json.dumps(
-                    data,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-            )
-            _atomic_write(
-                metadata_path,
-                json.dumps(
-                    {
-                        "url": url,
-                        "fetched_at": fetched_at,
-                        "status": status,
-                        "response_headers": dict(response_headers),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                ).encode("utf-8"),
-            )
+            with _cache_entry_lock(response_path):
+                cache_identity = None
+                if self.compress_responses:
+                    cache_identity = write_json_zstd(response_path, data)
+                else:
+                    _atomic_write(
+                        response_path,
+                        json.dumps(
+                            data,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8"),
+                    )
+                metadata = {
+                    "url": url,
+                    "fetched_at": fetched_at,
+                    "status": status,
+                    "response_headers": dict(response_headers),
+                }
+                if cache_identity is not None:
+                    metadata.update(
+                        {
+                            "content_encoding": "zstd",
+                            "decoded": cache_identity.logical.as_record(),
+                            "stored": cache_identity.stored.as_record(),
+                        }
+                    )
+                _atomic_write(
+                    metadata_path,
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
         return JsonResponse(
             data=data,
             url=url,

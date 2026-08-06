@@ -9,14 +9,16 @@ so a crash cannot expose a mixture of old and new venue generations.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, BinaryIO, Iterator, Mapping
 
 from archive.common.durable import confirm_durable, write_json_durable
 from archive.storage.base import ObjectStore
-from encoder import StoredIdentity, stored_identity_of
+from analysis.storage import decoded_zstd_file
+from encoder import CodecError, StoredIdentity, stored_identity_of
 from targeter.targets import (
     TARGET_GENERATION_POINTER_VERSION,
     TARGET_PUBLICATION_MANIFEST_VERSION,
@@ -29,7 +31,9 @@ from targeter.v2.domain import SUPPORTED_VENUES
 from targeter.v2.registry import Strategy
 from targeter.v2.run_archive import (
     PRODUCTION_RECEIPT_FILE,
+    RunArchiveError,
     RunArchiveReceipt,
+    read_run_report,
     read_run_archive_receipt,
     validate_local_run,
     verify_run_archive,
@@ -53,6 +57,20 @@ class PublishedGeneration:
 class PublicationAudit:
     run_id: str
     venue_counts: Mapping[str, int]
+
+
+def _selection_report_object(receipt: RunArchiveReceipt):
+    item = next(
+        (
+            candidate
+            for candidate in receipt.objects
+            if candidate.file in {"selection_report.json", "selection_report.json.zst"}
+        ),
+        None,
+    )
+    if item is None:
+        raise PublicationError("run archive receipt does not contain the selection report")
+    return item
 
 
 def _read_json(path: Path, description: str) -> dict[str, Any]:
@@ -103,7 +121,10 @@ def _identity_record(path: Path) -> dict[str, Any]:
 
 
 def _selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
-    report = _read_json(run_directory / "selection_report.json", "selection report")
+    try:
+        report = read_run_report(run_directory)
+    except (RunArchiveError, OSError) as error:
+        raise PublicationError(f"cannot read selection report: {error}") from error
     if report.get("run_id") != run_directory.name:
         raise PublicationError("selection report run_id does not match its directory")
     if report.get("report_version") != 1 or report.get("mode") != "shadow":
@@ -174,11 +195,7 @@ def _targets_from_report(
         ):
             raise PublicationError(f"selected bundle {bundle_id} has invalid eligible markets")
         selected_candidate_markets[bundle_id] = frozenset(eligible_market_ids)
-    report_object = next(
-        (item for item in receipt.objects if item.file == "selection_report.json"), None
-    )
-    if report_object is None:
-        raise PublicationError("run archive receipt does not contain the selection report")
+    report_object = _selection_report_object(receipt)
     by_venue: dict[str, list[Target]] = {venue: [] for venue in SUPPORTED_VENUES}
     bundle_venues: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
     selected_market_ids: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
@@ -278,16 +295,49 @@ def _targets_from_report(
     return by_venue
 
 
-def _catalog_markets(run_directory: Path) -> dict[str, dict[str, dict[str, Any]]]:
+@contextmanager
+def _catalog_reader(path: Path, item: Any) -> Iterator[BinaryIO]:
+    if item.content_encoding == "zstd":
+        if item.logical is None:
+            raise PublicationError(f"compressed catalog {path.name} has no decoded identity")
+        try:
+            with decoded_zstd_file(
+                path,
+                expected_logical=item.logical,
+                expected_stored=item.stored,
+            ) as handle:
+                yield handle
+        except (CodecError, OSError) as error:
+            raise PublicationError(f"cannot decode archived catalog {path}: {error}") from error
+    elif item.content_encoding is None:
+        try:
+            with path.open("rb") as handle:
+                yield handle
+        except OSError as error:
+            raise PublicationError(f"cannot read archived catalog {path}: {error}") from error
+    else:  # receipt parsing should make this impossible
+        raise PublicationError(f"catalog {path.name} has unsupported content encoding")
+
+
+def _catalog_markets(
+    run_directory: Path,
+    receipt: RunArchiveReceipt,
+    report: dict[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]]:
     """Read the archived catalogue boundary used to produce subscriptions."""
     catalogs: dict[str, dict[str, dict[str, Any]]] = {}
+    suffix = ".ndjson.zst" if report.get("artifact_format") == "zstd" else ".ndjson"
     for venue in SUPPORTED_VENUES:
-        path = Path(run_directory) / f"catalog_{venue}_markets.ndjson"
+        name = f"catalog_{venue}_markets{suffix}"
+        path = Path(run_directory) / name
+        item = next((candidate for candidate in receipt.objects if candidate.file == name), None)
+        if item is None:
+            raise PublicationError(f"archive receipt has no catalog {name}")
         records: dict[str, dict[str, Any]] = {}
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with _catalog_reader(path, item) as handle:
                 for line_number, line in enumerate(handle, 1):
-                    if not line.endswith("\n") or not line.strip():
+                    if not line.endswith(b"\n") or not line.strip():
                         raise PublicationError(
                             f"catalog {path.name}:{line_number} is not one complete NDJSON record"
                         )
@@ -338,7 +388,7 @@ def publish_run(
     verify_run_archive(store, receipt)
     validate_local_run(run_directory, receipt)
     report = _selection_report(run_directory, strategy)
-    catalog_markets = _catalog_markets(run_directory)
+    catalog_markets = _catalog_markets(run_directory, receipt, report)
     targets = _targets_from_report(report, receipt, strategy, catalog_markets)
 
     publication_root = live_root / "targeter-v2"
@@ -378,9 +428,7 @@ def publish_run(
             }
 
         instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        report_object = next(
-            item for item in receipt.objects if item.file == "selection_report.json"
-        )
+        report_object = _selection_report_object(receipt)
         manifest = {
             "target_publication_manifest_version": TARGET_PUBLICATION_MANIFEST_VERSION,
             "run_id": receipt.run_id,
@@ -438,10 +486,8 @@ def _verify_generation_manifest(
         raise PublicationError("publication manifest names another run")
     if manifest.get("minimum_venues") != strategy.minimum_venues:
         raise PublicationError("publication manifest minimum_venues drifted")
-    report_object = next(
-        (item for item in receipt.objects if item.file == "selection_report.json"), None
-    )
-    if report_object is None or manifest.get("selection_report") != {
+    report_object = _selection_report_object(receipt)
+    if manifest.get("selection_report") != {
         "byte_length": report_object.stored.byte_length,
         "sha256": report_object.stored.sha256,
     }:
@@ -499,7 +545,7 @@ def audit_current_publication(
         report,
         receipt,
         strategy,
-        _catalog_markets(run_directory),
+        _catalog_markets(run_directory, receipt, report),
     )
     counts: dict[str, int] = {}
     for venue in SUPPORTED_VENUES:

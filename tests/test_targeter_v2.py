@@ -26,6 +26,7 @@ from targeter.v2.matching import match_events
 from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
 from targeter.v2.rules import assess_rules, normal_path_contradictions, template_for
 from targeter.v2.run import ShadowRun, main as shadow_main, parse_args, run_shadow
+from targeter.v2.run_archive import read_run_report
 from targeter.v2.selection import select_targets
 
 
@@ -1049,6 +1050,13 @@ class ShadowRunTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parse_args(["--reuse-cache", "--no-response-cache"])
 
+    def test_zstd_is_the_default_artifact_format_with_an_ndjson_override(self) -> None:
+        self.assertEqual(parse_args([]).artifact_format, "zstd")
+        self.assertEqual(
+            parse_args(["--artifact-format", "ndjson"]).artifact_format,
+            "ndjson",
+        )
+
     def test_writes_a_local_auditable_run_without_live_publication(self) -> None:
         strategy = load_strategy(STRATEGY_PATH)
 
@@ -1072,7 +1080,7 @@ class ShadowRunTests(unittest.TestCase):
                 ),
                 client=object(),
             )
-            report = json.loads((result.directory / "selection_report.json").read_text())
+            report = read_run_report(result.directory)
             self.assertEqual(report["mode"], "shadow")
             self.assertFalse(report["selection"]["publication_performed"])
             self.assertEqual(report["selection"]["bundle_count"], 1)
@@ -1080,8 +1088,67 @@ class ShadowRunTests(unittest.TestCase):
                 report["input_complete"],
                 "omitting one supported venue is a diagnostic probe, not a complete production input",
             )
+            self.assertEqual(report["artifact_format"], "zstd")
+            self.assertTrue((result.directory / "catalog_kalshi_markets.ndjson.zst").exists())
+            self.assertTrue((result.directory / "rule_templates.ndjson.zst").exists())
+            self.assertTrue((result.directory / "selection_report.json.zst").exists())
+            self.assertTrue((result.directory / "selection_report.meta.json").exists())
+            self.assertFalse((result.directory / "catalog_kalshi_markets.ndjson").exists())
+            self.assertFalse((result.directory / "selection_report.json").exists())
+
+    def test_shadow_can_emit_plain_ndjson_for_local_inspection(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+
+        class Adapter:
+            venue = "kalshi"
+
+            def discover(self, _client, *, now):
+                return snapshot("kalshi", "k", "km")
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_shadow(
+                strategy=strategy,
+                output_root=Path(directory) / "out",
+                cache_root=Path(directory) / "cache",
+                now=NOW,
+                adapters=(Adapter(),),
+                client=object(),
+                artifact_format="ndjson",
+            )
+
+            report = read_run_report(result.directory)
+            self.assertEqual(report["artifact_format"], "ndjson")
             self.assertTrue((result.directory / "catalog_kalshi_markets.ndjson").exists())
             self.assertTrue((result.directory / "rule_templates.ndjson").exists())
+            self.assertTrue((result.directory / "selection_report.json").exists())
+            self.assertFalse((result.directory / "catalog_kalshi_markets.ndjson.zst").exists())
+            self.assertFalse((result.directory / "selection_report.meta.json").exists())
+
+    def test_artifact_directory_fsync_failure_publishes_no_selection_report(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+
+        class Adapter:
+            venue = "kalshi"
+
+            def discover(self, _client, *, now):
+                return snapshot("kalshi", "k", "km")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "analysis.storage.fsync_directory_strict",
+            side_effect=OSError("injected directory fsync failure"),
+        ):
+            output_root = Path(directory) / "out"
+            with self.assertRaisesRegex(OSError, "directory fsync failure"):
+                run_shadow(
+                    strategy=strategy,
+                    output_root=output_root,
+                    cache_root=Path(directory) / "cache",
+                    now=NOW,
+                    adapters=(Adapter(),),
+                    client=object(),
+                )
+            run_directory = output_root / "20260803T120000.000000Z"
+            self.assertFalse((run_directory / "selection_report.meta.json").exists())
 
     def test_adapter_failure_is_preserved_in_the_report(self) -> None:
         strategy = load_strategy(STRATEGY_PATH)
@@ -1101,7 +1168,7 @@ class ShadowRunTests(unittest.TestCase):
                 adapters=(Broken(),),
                 client=object(),
             )
-            report = json.loads((result.directory / "selection_report.json").read_text())
+            report = read_run_report(result.directory)
             self.assertFalse(report["input_complete"])
             self.assertIn("catalog unavailable", report["discovery_failures"]["kalshi"])
 

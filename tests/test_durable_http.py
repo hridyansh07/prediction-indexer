@@ -9,6 +9,37 @@ from analysis.durable_http import DurableJsonClient
 
 
 class DurableJsonClientTests(unittest.TestCase):
+    def test_compressed_response_cache_round_trips_without_plain_json_body(self) -> None:
+        calls: list[str] = []
+
+        def transport(request, timeout_seconds):
+            calls.append(request.full_url)
+            return 200, {"Content-Type": "application/json"}, b'{"items":[1,2,3]}'
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = DurableJsonClient(
+                Path(directory),
+                compress_responses=True,
+                transport=transport,
+                min_interval_seconds={"example.test": 0.0},
+            )
+            first = client.get_json("https://example.test", "/items")
+            second = client.get_json("https://example.test", "/items")
+
+            self.assertEqual(second.data, first.data)
+            self.assertTrue(second.from_cache)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first.cache_path.suffixes[-2:], [".json", ".zst"])
+            self.assertEqual(first.cache_path.read_bytes()[:4], b"\x28\xb5\x2f\xfd")
+            self.assertFalse(first.cache_path.with_suffix("").exists())
+
+            first.cache_path.with_suffix(".meta.json").unlink()
+            recovered = client.get_json("https://example.test", "/items")
+            cached_again = client.get_json("https://example.test", "/items")
+            self.assertFalse(recovered.from_cache)
+            self.assertTrue(cached_again.from_cache)
+            self.assertEqual(len(calls), 2)
+
     def test_identical_request_is_loaded_from_disk(self) -> None:
         calls: list[str] = []
 

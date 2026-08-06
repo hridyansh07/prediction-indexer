@@ -75,7 +75,9 @@ class EsportsRegistryAndParserTests(unittest.TestCase):
 
     def test_live_client_retries_partial_catalogue_reads(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.assertIsInstance(durable_client(Path(directory)), RetryingJsonClient)
+            client = durable_client(Path(directory))
+            self.assertIsInstance(client, RetryingJsonClient)
+            self.assertTrue(client.compress_responses)
 
 
 class _Client:

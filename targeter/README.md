@@ -193,20 +193,33 @@ For repeated observation without retaining large raw HTTP bodies:
 per-host rate-limit state. It keeps the normalized catalogue and report for
 each run, which are the artifacts needed to compare targeter behavior over
 time. `--reuse-cache` is the explicit offline/debug option and is mutually
-exclusive with this mode.
+exclusive with this mode. When response caching is enabled, Targeter v2 stores
+each canonical JSON body as one checksummed Zstandard frame (`.json.zst`) and
+keeps its decoded/stored identities in the adjacent metadata file.
 
 Every successful or incomplete run writes:
 
 ```text
 data/targeter-v2-shadow/<run-id>/
-  catalog_<venue>_events.ndjson
-  catalog_<venue>_markets.ndjson
-  rule_templates.ndjson
-  rule_drift.ndjson
-  selection_report.json
+  catalog_<venue>_events.ndjson.zst
+  catalog_<venue>_markets.ndjson.zst
+  rule_templates.ndjson.zst
+  rule_drift.ndjson.zst
+  selection_report.json.zst
+  selection_report.meta.json
 ```
 
-Start with `selection_report.json` when reviewing a run:
+The `.zst` files use the shared `encoder` profile: exact NDJSON, level 3, frame
+checksum enabled, one frame, and no dictionary. Their decoded and stored
+identities are committed in the report, while `selection_report.meta.json`
+commits the report frame itself. All identities are carried through the run
+manifest and archive receipt. For a directly inspectable shadow run, pass
+`--artifact-format ndjson`; this emits the normalized artifacts as `.ndjson`
+and the report as plain `selection_report.json`, without changing selection
+semantics or the raw-response cache format.
+
+Start with the decoded `selection_report.json.zst` (or the plain
+`selection_report.json` override) when reviewing a run:
 
 - `input_complete` proves whether all expected catalogues completed;
 - `candidates` contains one record per matched event bundle;

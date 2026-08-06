@@ -30,11 +30,18 @@ publication, or integrity validation failed.
 
 ## 2. Phase 6 — immutable target-run archive
 
-Input is one timestamped phase-5 run directory containing:
+Input is one timestamped phase-5 run directory containing by default:
 
-- `selection_report.json`;
-- `rule_templates.ndjson` and `rule_drift.ndjson`;
-- the event and market catalogue NDJSON files named by the report.
+- `selection_report.json.zst` plus its small `selection_report.meta.json` commit
+  marker;
+- `rule_templates.ndjson.zst` and `rule_drift.ndjson.zst` by default;
+- the event and market catalogue `.ndjson.zst` files named by the report.
+
+Plain `.ndjson` artifacts and `selection_report.json` remain valid only when the
+report records the explicit `ndjson` artifact format. Existing version-1
+uncompressed receipts remain
+readable during rollout; all new manifests and receipts are version 2 and carry
+both decoded and stored identities for normalized artifacts.
 
 `archive_run` validates the report and rejects missing, unexpected, non-regular,
 or changed artifacts. It writes a local `run_manifest.json`, then publishes each
@@ -45,10 +52,11 @@ targeter-v2/runs/date=<UTC-date>/run=<run_id>/<artifact>
 ```
 
 Writes are immutable. An identical object is an idempotent retry; different
-bytes at the same key are an integrity conflict. SHA-256 and byte length are
-verified through the object-store adapter, and production objects require the
-provider's explicit SHA-256 checksum. An S3 ETag is never accepted as a content
-checksum.
+bytes at the same key are an integrity conflict. Stored SHA-256 and byte length
+are verified through the object-store adapter, compressed artifacts are also
+strictly decoded against their logical identity before archival, and production
+objects require the provider's explicit SHA-256 checksum. An S3 ETag is never
+accepted as a content checksum.
 
 `run_manifest.json` is uploaded last and is the remote commit marker. Only after
 it verifies does the local run receive:
@@ -221,9 +229,11 @@ restart it after the cause is understood.
 
 Each scheduled run leaves a complete run directory under `--output-root`: three
 venue catalogues, the selection report, the rule templates, the drift record and
-the run manifest — 12–20 MB. At the ten-minute cadence of §5 that is roughly
-144 runs and **2 GB per day**, and no other component removes any of it. A
-deployment without this section fills its disk in weeks.
+the run manifest. Earlier uncompressed runs measured 12–20 MB each, roughly 2 GB
+per day at the ten-minute cadence. New normalized artifacts use Zstandard by
+default, substantially reducing that input-dependent rate, but no component
+removes the files merely because they compressed well. A deployment without
+this section remains unbounded and eventually fills its disk.
 
 Two commands, deliberately separate, mirroring `archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`
 §7.1: uploading must never be the last step before deleting.
@@ -243,9 +253,9 @@ receipt, so the reaper can never reclaim them, and local disk is not actually
 bounded until they are archived.
 
 Completeness is decided structurally, not by interpreting an error. `run_shadow`
-writes the catalogues, then `selection_report.json`, then `rule_templates.ndjson`,
-then `rule_drift.ndjson`, each through one atomic rename. Per run the sweep
-reports:
+writes the catalogues, rules, and compressed selection report through atomic
+renames, then writes `selection_report.meta.json` last with the report frame's
+exact identity. Per run the sweep reports:
 
 | Status | Meaning |
 |---|---|

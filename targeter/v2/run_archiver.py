@@ -14,12 +14,12 @@ before deleting; ``AGENTS.md`` states the same rule.  A test asserts that this
 file imports no removal primitive.
 
 Completeness is decided structurally rather than by interpreting an error
-message.  ``run_shadow`` writes the catalogues, then ``selection_report.json``,
-then ``rule_templates.ndjson``, then ``rule_drift.ndjson``, each through one
-atomic rename, so a run holding all of ``REQUIRED_FILES`` is a finished run and
-a run missing any of them is either in progress or was abandoned by a process
-that died.  Age separates those two, and the difference matters: one is
-ordinary backlog and the other is a fault an operator has to clear.
+message. ``run_shadow`` writes every catalogue/rule artifact and the compressed
+report first, then writes ``selection_report.meta.json`` as its commit marker. A
+run missing the marker or one of its named files is either in progress or was
+abandoned by a process that died. Age separates those two, and the difference
+matters: one is ordinary backlog and the other is a fault an operator has to
+clear.
 """
 
 from __future__ import annotations
@@ -34,10 +34,13 @@ from targeter.v2.run_archive import (
     LOCAL_RECEIPT_FILE,
     PRODUCTION_RECEIPT_FILE,
     REQUIRED_FILES,
+    SELECTION_REPORT_FILE,
+    SELECTION_REPORT_METADATA_FILE,
     RunArchiveError,
     archive_run,
     discover_runs,
     parse_run_id_ns,
+    required_run_files,
 )
 
 __all__ = [
@@ -205,7 +208,16 @@ class TargetRunArchiveSweep:
                 run_id, run_directory, FAILED, f"cannot read the run directory: {error}"
             )
 
-        missing = sorted(REQUIRED_FILES - present)
+        if {SELECTION_REPORT_FILE, SELECTION_REPORT_METADATA_FILE} & present:
+            try:
+                required = required_run_files(run_directory)
+            except RunArchiveError as error:
+                return self._outcome(
+                    run_id, run_directory, FAILED, f"RunArchiveError: {error}"
+                )
+        else:
+            required = REQUIRED_FILES
+        missing = sorted(required - present)
         if missing:
             age = self._age_ns(run_id)
             if age is None:

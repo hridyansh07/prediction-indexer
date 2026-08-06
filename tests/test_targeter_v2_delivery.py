@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from archive.storage import INDEPENDENT, LocalObjectStore, ObjectStoreError
+from encoder import StoredIdentity
 from targeter.targets import TargetsError, load_targets
 from targeter.v2.domain import CatalogSnapshot
 from targeter.v2.publication import (
@@ -19,7 +20,9 @@ from targeter.v2.publication import (
 from targeter.v2.registry import load_strategy
 from targeter.v2.run import run_shadow
 from targeter.v2.run_archive import (
+    RunArchiveError,
     archive_run,
+    parse_run_archive_receipt,
     read_run_archive_receipt,
     verify_run_archive,
 )
@@ -74,7 +77,14 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             durability=INDEPENDENT,
         )
 
-    def run_directory(self, *, now=NOW, empty: bool = False, broken: bool = False) -> Path:
+    def run_directory(
+        self,
+        *,
+        now=NOW,
+        empty: bool = False,
+        broken: bool = False,
+        artifact_format: str = "zstd",
+    ) -> Path:
         catalogs = (
             CatalogSnapshot("kalshi", (), ()) if empty else snapshot("kalshi", "k", "km"),
             CatalogSnapshot("polymarket", (), ()) if empty else snapshot("polymarket", "p", "pm"),
@@ -91,6 +101,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             now=now,
             adapters=adapters,
             client=object(),
+            artifact_format=artifact_format,
         )
         return result.directory
 
@@ -109,6 +120,86 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             read_run_archive_receipt(run_directory / "archive_receipt.json").document,
             receipt.document,
         )
+
+    def test_v2_receipt_requires_decoded_identity_for_every_ndjson_artifact(self) -> None:
+        run_directory = self.run_directory()
+        receipt = archive_run(run_directory, self.store, now=NOW)
+        document = json.loads(json.dumps(receipt.document))
+        artifact = next(
+            item for item in document["objects"] if item["file"].endswith(".ndjson.zst")
+        )
+        del artifact["decoded"]
+        if document["manifest"]["file"] == artifact["file"]:
+            del document["manifest"]["decoded"]
+
+        with self.assertRaisesRegex(RunArchiveError, "decoded"):
+            parse_run_archive_receipt(
+                document,
+                path=run_directory / "archive_receipt.json",
+            )
+
+    def test_interrupted_v1_manifest_archive_resumes_without_rewriting_it(self) -> None:
+        run_directory = self.run_directory(artifact_format="ndjson")
+        report_path = run_directory / "selection_report.json"
+        report = json.loads(report_path.read_text())
+        report.pop("artifact_format")
+        report.pop("artifacts")
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        source_files = sorted(run_directory.iterdir(), key=lambda path: path.name)
+        legacy_manifest = {
+            "targeter_run_manifest_version": 1,
+            "run_id": run_directory.name,
+            "generated_at": report["generated_at"],
+            "input_complete": report["input_complete"],
+            "files": [],
+        }
+        for path in source_files:
+            content = path.read_bytes()
+            legacy_manifest["files"].append(
+                {
+                    "file": path.name,
+                    "byte_length": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "content_type": (
+                        "application/x-ndjson"
+                        if path.name.endswith(".ndjson")
+                        else "application/json"
+                    ),
+                }
+            )
+        manifest_path = run_directory / "run_manifest.json"
+        manifest_path.write_text(
+            json.dumps(legacy_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        prefix = f"targeter-v2/runs/date={NOW:%Y-%m-%d}/run={run_directory.name}"
+        for path in [*source_files, manifest_path]:
+            content = path.read_bytes()
+            identity = StoredIdentity(
+                sha256=hashlib.sha256(content).hexdigest(),
+                byte_length=len(content),
+            )
+            with path.open("rb") as reader:
+                self.store.put_immutable(
+                    f"{prefix}/{path.name}",
+                    reader,
+                    identity,
+                    content_type=(
+                        "application/x-ndjson"
+                        if path.name.endswith(".ndjson")
+                        else "application/json"
+                    ),
+                    content_encoding=None,
+                )
+
+        before = manifest_path.read_bytes()
+        receipt = archive_run(run_directory, self.store, now=NOW)
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertEqual(receipt.document["targeter_run_archive_receipt_version"], 2)
+        verify_run_archive(self.store, receipt)
 
     def test_remote_manifest_is_the_commit_marker(self) -> None:
         run_directory = self.run_directory()
@@ -242,7 +333,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             )
 
     def test_publication_rejects_a_selection_target_forged_outside_the_catalog(self) -> None:
-        run_directory = self.run_directory()
+        run_directory = self.run_directory(artifact_format="ndjson")
         report_path = run_directory / "selection_report.json"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["selection"]["targets"]["kalshi"][0]["subscription_ids"] = ["forged-id"]

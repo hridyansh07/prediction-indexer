@@ -51,6 +51,7 @@ from targeter.v2.run_archive import (
     PRODUCTION_RECEIPT_FILE,
     RUN_MANIFEST_FILE,
     SELECTION_REPORT_FILE,
+    SELECTION_REPORT_METADATA_FILE,
     RunArchiveError,
     RunArchiveReceipt,
     discover_runs,
@@ -262,9 +263,10 @@ def _deletion_order(receipt: RunArchiveReceipt) -> tuple[str, ...]:
     marker.
     """
     names = sorted(item.file for item in receipt.objects)
-    ends = {SELECTION_REPORT_FILE, RUN_MANIFEST_FILE}
+    report_markers = {SELECTION_REPORT_FILE, SELECTION_REPORT_METADATA_FILE}
+    ends = report_markers | {RUN_MANIFEST_FILE}
     return tuple(
-        [name for name in names if name == SELECTION_REPORT_FILE]
+        [name for name in names if name in report_markers]
         + [name for name in names if name not in ends]
         + [name for name in names if name == RUN_MANIFEST_FILE]
     )
