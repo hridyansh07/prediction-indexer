@@ -556,5 +556,213 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         discovery.assert_not_called()
 
 
+class CoverageLedgerTests(unittest.TestCase):
+    """Coverage-from-inception must survive the v1 to v2 move.
+
+    v1 kept this ledger from its discovery loop; v2 shipped without it, so
+    `discovery_coverage` in `replay/gate1.py` read 453 subscribed assets and
+    zero covered against a real 19-hour capture. The number it protects —
+    how much of a market's life the tape contains — cannot be recovered later
+    from the frames, which all look healthy whether or not the open was missed.
+    """
+
+    def setUp(self) -> None:
+        self.case = TargeterV2DeliveryTests("run")
+        self.case.setUp()
+        self.addCleanup(self.case.directory.cleanup)
+
+    def publish(self, *, now=NOW):
+        run_directory = self.case.run_directory(now=now)
+        receipt = archive_run(run_directory, self.case.store, now=now)
+        return publish_run(
+            run_directory,
+            receipt,
+            self.case.store,
+            live_root=self.case.live_root,
+            strategy=self.case.strategy,
+            now=now,
+        )
+
+    def ledger_document(self) -> dict:
+        path = self.case.live_root / "coverage.json"
+        self.assertTrue(path.exists(), "publication wrote no coverage ledger")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def sightings(self) -> dict[tuple[str, str], dict]:
+        return {
+            (item["venue"], item["asset_id"]): item
+            for item in self.ledger_document()["sightings"]
+        }
+
+    def test_publishing_records_a_first_sighting_for_every_subscribed_asset(self) -> None:
+        generation = self.publish()
+        subscribed = {
+            (venue, asset)
+            for venue in generation.venue_counts
+            for asset in load_targets(
+                self.case.live_root / "targeter-v2" / "current.json", venue=venue
+            ).asset_ids()
+        }
+        self.assertEqual(subscribed, set(self.sightings()))
+        self.assertEqual(generation.newly_seen, {"kalshi": 1, "limitless": 0, "polymarket": 1})
+
+    def test_the_ledger_is_where_gate_one_looks_and_carries_the_fields_it_reads(self) -> None:
+        # `_AuditState.observe_coverage` (replay/gate1.py:414-423) rejects a
+        # document without `sightings` and keys each entry on venue + asset_id;
+        # `gate1_object` admits it only at exactly this path.
+        self.publish()
+        self.assertTrue((self.case.live_root / "coverage.json").exists())
+        document = self.ledger_document()
+        self.assertIsInstance(document.get("sightings"), list)
+        for item in document["sightings"]:
+            self.assertIsInstance(item.get("venue"), str)
+            self.assertIsInstance(item.get("asset_id"), str)
+            self.assertIn("created_at", item)
+
+    def test_a_venue_creation_time_makes_discovery_lag_measurable(self) -> None:
+        self.publish()
+        kalshi = self.sightings()[("kalshi", "km-subscription")]
+        self.assertIsNotNone(
+            kalshi["created_at"], "the archived catalogue record carries created_at"
+        )
+        # The fixture market is created a day before the run.
+        self.assertAlmostEqual(kalshi["discovery_lag_seconds"], 86_400, delta=1)
+
+    def test_a_later_generation_never_overwrites_an_existing_first_sighting(self) -> None:
+        self.publish()
+        before = self.sightings()[("kalshi", "km-subscription")]["first_seen_at"]
+        later = self.publish(now=NOW + timedelta(hours=3))
+        after = self.sightings()[("kalshi", "km-subscription")]["first_seen_at"]
+        self.assertEqual(before, after)
+        # Nothing new to see, so the second publication claims no fresh coverage.
+        self.assertEqual(later.newly_seen, {"kalshi": 0, "limitless": 0, "polymarket": 0})
+
+    def test_a_venue_selecting_nothing_contributes_no_sightings(self) -> None:
+        self.publish()
+        self.assertNotIn(
+            "limitless", {venue for venue, _ in self.sightings()},
+            "an unsubscribed venue must not claim coverage it does not have",
+        )
+
+
+class CoverageBackfillTests(unittest.TestCase):
+    """Reconstructing sightings for generations published before the ledger existed.
+
+    The failure this prevents is not a missing number, it is a wrong one. A
+    ledger started today stamps assets subscribed days ago with today's date,
+    and because `first_seen_at` bounds how far back the tape counts as covered,
+    that makes real captured frames look like they predate coverage.
+    """
+
+    def setUp(self) -> None:
+        self.case = TargeterV2DeliveryTests("run")
+        self.case.setUp()
+        self.addCleanup(self.case.directory.cleanup)
+
+    def publish_at(self, moment):
+        run_directory = self.case.run_directory(now=moment)
+        receipt = archive_run(run_directory, self.case.store, now=moment)
+        return publish_run(
+            run_directory,
+            receipt,
+            self.case.store,
+            live_root=self.case.live_root,
+            strategy=self.case.strategy,
+            now=moment,
+        )
+
+    def backfill(self) -> dict:
+        from scripts.backfill_coverage import backfill
+
+        return backfill(self.case.live_root, self.case.output_root)
+
+    def sightings(self) -> dict[tuple[str, str], dict]:
+        document = json.loads(
+            (self.case.live_root / "coverage.json").read_text(encoding="utf-8")
+        )
+        return {(item["venue"], item["asset_id"]): item for item in document["sightings"]}
+
+    def test_a_ledger_deleted_after_the_fact_is_rebuilt_from_the_generations(self) -> None:
+        self.publish_at(NOW)
+        self.publish_at(NOW + timedelta(hours=6))
+        expected = self.sightings()
+        (self.case.live_root / "coverage.json").unlink()
+
+        summary = self.backfill()
+        self.assertEqual(summary["generations"], 2)
+        self.assertEqual(summary["unreadable"], [])
+        rebuilt = self.sightings()
+        self.assertEqual(set(rebuilt), set(expected))
+        for key, item in rebuilt.items():
+            self.assertEqual(item["first_seen_at"], expected[key]["first_seen_at"], key)
+            self.assertEqual(item["created_at"], expected[key]["created_at"], key)
+
+    def test_the_earliest_generation_wins_not_the_most_recent(self) -> None:
+        self.publish_at(NOW)
+        self.publish_at(NOW + timedelta(hours=6))
+        (self.case.live_root / "coverage.json").unlink()
+        self.backfill()
+        first_seen = self.sightings()[("kalshi", "km-subscription")]["first_seen_at"]
+        self.assertEqual(first_seen[:19], NOW.isoformat()[:19])
+
+    def test_it_repairs_a_sighting_an_earlier_generation_contradicts(self) -> None:
+        # The state a live-only ledger leaves behind: capture ran for hours, the
+        # writer was deployed late, and the first sighting it recorded is the
+        # deployment time rather than the subscription time.
+        self.publish_at(NOW)
+        late = self.publish_at(NOW + timedelta(hours=6))
+        self.assertEqual(late.newly_seen["kalshi"], 0)
+        stale = {
+            "version": 1,
+            "updated_at": (NOW + timedelta(hours=6)).isoformat(),
+            "sightings": [
+                {
+                    "asset_id": "km-subscription",
+                    "venue": "kalshi",
+                    "first_seen_at": (NOW + timedelta(hours=6)).isoformat(),
+                    "created_at": None,
+                    "discovery_lag_seconds": None,
+                }
+            ],
+        }
+        (self.case.live_root / "coverage.json").write_text(json.dumps(stale), encoding="utf-8")
+
+        summary = self.backfill()
+        self.assertEqual(summary["repaired"], 1)
+        repaired = self.sightings()[("kalshi", "km-subscription")]
+        self.assertEqual(repaired["first_seen_at"][:19], NOW.isoformat()[:19])
+        # The repair also recovers the creation time the stale entry lacked.
+        self.assertIsNotNone(repaired["created_at"])
+
+    def test_running_it_twice_changes_nothing(self) -> None:
+        self.publish_at(NOW)
+        self.backfill()
+        once = (self.case.live_root / "coverage.json").read_text(encoding="utf-8")
+        second = self.backfill()
+        self.assertEqual(second["repaired"], 0)
+        self.assertEqual(second["recorded"], {"kalshi": 0, "limitless": 0, "polymarket": 0})
+        twice = json.loads((self.case.live_root / "coverage.json").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(once)["sightings"], twice["sightings"])
+
+    def test_a_reaped_run_still_yields_its_sighting(self) -> None:
+        # The reaper removes run artifacts but keeps the receipt as a tombstone.
+        # Coverage must survive that, because the generation is the evidence for
+        # what was subscribed; the run directory only carries created_at.
+        self.publish_at(NOW)
+        run_directory = self.case.output_root / sorted(
+            item.name for item in self.case.output_root.iterdir() if item.is_dir()
+        )[0]
+        for artifact in run_directory.iterdir():
+            if artifact.name != "archive_receipt.json":
+                artifact.unlink()
+        (self.case.live_root / "coverage.json").unlink()
+
+        summary = self.backfill()
+        self.assertEqual(summary["unreadable"], [])
+        sighting = self.sightings()[("kalshi", "km-subscription")]
+        self.assertEqual(sighting["first_seen_at"][:19], NOW.isoformat()[:19])
+        self.assertIsNone(sighting["created_at"], "a reaped catalogue cannot supply one")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,11 @@ services:
       - /app/configs/targeter_v2.json
       - --cache-root
       - /var/lib/prediction-indexer/targeter-v2-cache
+      # The cache root still holds rate-limit state, which is read every run.
+      # Raw HTTP response bodies are not: a publish run always refreshes live
+      # (`--reuse-cache` is the only thing that would read them back), so
+      # persisting them wrote ~230 MB per run that nothing could ever open.
+      - --no-response-cache
       - --output-root
       - /var/lib/prediction-indexer/targeter-v2-runs
       - --live-root

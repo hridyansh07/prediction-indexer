@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from replay.gate1 import Gate1Auditor
+from replay.gate1 import Gate1Auditor, gate1_object, generation_metadata_object
 from replay.stream import MemoryByteStreamer
 
 
@@ -89,6 +89,64 @@ class Gate1Tests(unittest.TestCase):
         one = Gate1Auditor().audit(MemoryByteStreamer(objects, chunk_size=1)).as_record()
         many = Gate1Auditor().audit(MemoryByteStreamer(objects, chunk_size=4096)).as_record()
         self.assertEqual(one, many)
+
+
+class GateOneObjectFilterTests(unittest.TestCase):
+    """What the gate will read. An input it excludes is an input it cannot fail on.
+
+    `iter_ndjson_lines` skips a non-`.ndjson` key with a bare `continue`, and this
+    filter runs earlier still, at `DirectoryByteStreamer` construction. Both are
+    silent. A shape that belongs in the dataset and is not named here does not
+    make the gate fail loudly — it makes the evidence invisible.
+    """
+
+    V2_METADATA = (
+        "live/targeter-v2/generations/20260806T101500.123456Z/metadata/kalshi/"
+        "3f1a2b.json"
+    )
+
+    def test_a_v2_generation_metadata_snapshot_is_admitted(self) -> None:
+        self.assertTrue(generation_metadata_object(self.V2_METADATA))
+        self.assertTrue(gate1_object(self.V2_METADATA))
+
+    def test_a_dataset_rooted_at_the_live_directory_resolves_the_same_shape(self) -> None:
+        without_live = self.V2_METADATA.removeprefix("live/")
+        self.assertTrue(generation_metadata_object(without_live))
+        self.assertTrue(gate1_object(without_live))
+
+    def test_the_v1_flat_metadata_layout_is_still_admitted(self) -> None:
+        self.assertTrue(gate1_object("live/metadata/polymarket/3f1a2b.json"))
+        self.assertTrue(gate1_object("metadata/polymarket/3f1a2b.json"))
+
+    def test_every_generation_is_admitted_not_only_the_published_one(self) -> None:
+        for run_id in ("20260806T101500.123456Z", "20260806T102500.654321Z"):
+            key = f"live/targeter-v2/generations/{run_id}/metadata/limitless/aa.json"
+            self.assertTrue(gate1_object(key), key)
+
+    def test_a_generations_target_file_is_not_metadata(self) -> None:
+        # The snapshot is the content-addressed evidence; `targets_<venue>.json`
+        # is the mutable-by-generation pointer at it, and admitting it would put
+        # a second, unhashed spelling of the same targets into the manifest.
+        key = "live/targeter-v2/generations/20260806T101500.123456Z/targets_kalshi.json"
+        self.assertFalse(generation_metadata_object(key))
+        self.assertFalse(gate1_object(key))
+
+    def test_the_publication_pointer_and_run_artifacts_stay_excluded(self) -> None:
+        for key in (
+            "live/targeter-v2/current.json",
+            "live/targeter-v2/generations/20260806T101500.123456Z/manifest.json",
+            "targeter-v2-runs/20260806T101500.123456Z/selection_report.json",
+            "targeter-v2-runs/20260806T101500.123456Z/catalog_kalshi_markets.ndjson",
+        ):
+            self.assertFalse(gate1_object(key), key)
+
+    def test_an_unsealed_segment_is_never_admitted(self) -> None:
+        self.assertFalse(gate1_object("spool/lane=kalshi/date=2026-08-06/a.ndjson.open"))
+
+    def test_a_compressed_segment_is_not_mistaken_for_a_readable_one(self) -> None:
+        # `iter_ndjson_lines` would skip it silently, so admitting it would add
+        # bytes to `dataset_sha256` that no check ever reads.
+        self.assertFalse(gate1_object("spool/lane=kalshi/date=2026-08-06/a.ndjson.zst"))
 
 
 if __name__ == "__main__":

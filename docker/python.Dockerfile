@@ -35,6 +35,10 @@ COPY targeter/ ./targeter/
 COPY archive/ ./archive/
 COPY configs/ ./configs/
 COPY docker/wait_for_target.py ./docker/wait_for_target.py
+# Named one file at a time, as `wait_for_target.py` is. Most of `scripts/` is
+# offline research tooling with dependencies this image deliberately does not
+# carry; this one is an operational repair that has to run where the data is.
+COPY scripts/backfill_coverage.py ./scripts/backfill_coverage.py
 
 USER indexer:indexer
 

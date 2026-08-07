@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping
@@ -27,6 +27,7 @@ from targeter.targets import (
     load_targets,
     write_targets,
 )
+from targeter.coverage import CoverageLedger, created_at_of
 from targeter.v2.domain import SUPPORTED_VENUES
 from targeter.v2.registry import Strategy
 from targeter.v2.run_archive import (
@@ -51,6 +52,10 @@ class PublishedGeneration:
     manifest_path: Path
     pointer_path: Path
     venue_counts: Mapping[str, int]
+    #: Assets whose first sighting this publication recorded, per venue. Zero
+    #: across the board is the steady state — a republish of an unchanged target
+    #: set sees nothing new.
+    newly_seen: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -296,7 +301,7 @@ def _targets_from_report(
 
 
 @contextmanager
-def _catalog_reader(path: Path, item: Any) -> Iterator[BinaryIO]:
+def catalog_reader(path: Path, item: Any) -> Iterator[BinaryIO]:
     if item.content_encoding == "zstd":
         if item.logical is None:
             raise PublicationError(f"compressed catalog {path.name} has no decoded identity")
@@ -335,7 +340,7 @@ def _catalog_markets(
             raise PublicationError(f"archive receipt has no catalog {name}")
         records: dict[str, dict[str, Any]] = {}
         try:
-            with _catalog_reader(path, item) as handle:
+            with catalog_reader(path, item) as handle:
                 for line_number, line in enumerate(handle, 1):
                     if not line.endswith(b"\n") or not line.strip():
                         raise PublicationError(
@@ -363,6 +368,70 @@ def _catalog_markets(
             raise PublicationError(f"cannot read archived catalog {path}: {error}") from error
         catalogs[venue] = records
     return catalogs
+
+
+def coverage_ledger_path(live_root: Path) -> Path:
+    return Path(live_root) / "coverage.json"
+
+
+def record_coverage(
+    live_root: Path,
+    targets: Mapping[str, list[Target]],
+    catalog_markets: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """First sightings for everything this generation subscribes.
+
+    v1 kept this ledger from its discovery loop (`targeter/run.py:236`) and v2
+    did not carry it across, which left `discovery_coverage` in `replay/gate1.py`
+    with nothing to read: every subscribed asset reported uncovered. The measure
+    is coverage-from-inception (`docs/CAPTURE_SPEC.md` §6.1) — how much of a
+    market's life the tape actually contains — and for short-dated markets it is
+    the difference between a usable dataset and a misleading one.
+
+    Written from `publish_run` rather than from discovery because publication is
+    the point where the subscription set becomes a fact: an asset selected by a
+    run that then failed to archive was never watched, and recording it would
+    claim coverage the tape does not have.
+
+    `created_at` comes from the archived catalogue record, so the venue's own
+    creation time is read from the same immutable boundary the targets were
+    derived from rather than re-fetched later. `Market.as_record` already
+    normalises it to ISO-8601 (`targeter/v2/domain.py:355`); `created_at_of`
+    still mediates the read so a venue that publishes none leaves the field
+    null, which `Sighting.discovery_lag_seconds` reports as unmeasurable
+    instead of as a lag of zero.
+
+    The ledger never overwrites a sighting, so this is idempotent under
+    republication and cheap in the steady state.
+    """
+    ledger = CoverageLedger(coverage_ledger_path(live_root))
+    # The run's own instant, so a `--now` probe does not stamp sightings with
+    # the wall clock and report a discovery lag measured against the wrong run.
+    seen_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    fresh: dict[str, int] = {}
+    for venue in SUPPORTED_VENUES:
+        venue_targets = targets.get(venue) or []
+        catalog = catalog_markets.get(venue) or {}
+        created: dict[str, str] = {}
+        for target in venue_targets:
+            record = catalog.get(f"{venue}:{target.market_id}")
+            if not isinstance(record, Mapping):
+                continue
+            value = created_at_of(dict(record))
+            if value is not None:
+                created[target.asset_id] = value
+        fresh[venue] = len(
+            ledger.observe(
+                venue,
+                [target.asset_id for target in venue_targets],
+                created_at=created,
+                now=seen_at,
+            )
+        )
+    ledger.save()
+    return fresh
 
 
 def _required_text(raw: dict[str, Any], field: str, venue: str, position: int) -> str:
@@ -464,12 +533,16 @@ def publish_run(
         venue: int(manifest["venues"][venue]["target_count"])
         for venue in SUPPORTED_VENUES
     }
+    # After the pointer commits: the ledger claims the tape watches these
+    # assets, and that only becomes true once a splice can resolve them.
+    newly_seen = record_coverage(live_root, targets, catalog_markets, now=now)
     return PublishedGeneration(
         run_id=receipt.run_id,
         directory=generation_directory,
         manifest_path=manifest_path,
         pointer_path=pointer_path,
         venue_counts=dict(sorted(counts.items())),
+        newly_seen=dict(sorted(newly_seen.items())),
     )
 
 

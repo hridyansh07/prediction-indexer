@@ -60,7 +60,7 @@ policy while writing the adapter.
 | Question | V1 decision |
 |---|---|
 | Archive unit | one sealed segment per S3 data object, plus its seal object |
-| Bucket layout | the existing `raw/lane=<lane>/date=<date>/...` keys |
+| Bucket layout | two archive prefixes: `raw/lane=<lane>/date=<date>/...` for sealed capture and `targeter-v2/runs/date=<date>/run=<run_id>/...` for target runs |
 | Bucket sharing | one dedicated archive bucket per deployment |
 | Immutability | every upload uses `IfNoneMatch="*"` |
 | Integrity | explicit full-object SHA-256; ETag is ignored |
@@ -205,7 +205,8 @@ Interpret the response as follows:
 The role receives `s3:ListBucket` on the dedicated bucket so S3 can return 404
 for a missing key. Without it, S3 may return 403, which the adapter correctly
 treats as a configuration or authorization failure. Object read and write
-permissions remain restricted to `raw/*`.
+permissions remain restricted to the archive prefixes of §12 — `raw/*` and
+`targeter-v2/*` — and to nothing else in the bucket.
 
 ## 8. `put_immutable` algorithm
 
@@ -390,26 +391,95 @@ containers, including an adequate IMDSv2 response hop limit.
 Use a dedicated, private general purpose bucket in the same region as the
 capture host for V1.
 
-Bucket checklist:
+### 12.1 Archive prefixes
+
+One bucket holds two independent archive namespaces, written by different
+commands with different cadences but under identical immutability rules:
+
+```text
+raw/lane=<lane>/date=<date>/<segment>            sealed capture segments and seals
+targeter-v2/runs/date=<date>/run=<run_id>/<file> target-run artifacts and manifest
+```
+
+`raw/` is written by `archive.archiver.cli` (`archive/archiver/service.py:98`).
+`targeter-v2/` is written by `targeter/v2/run_archive.py:245`, reached from a
+scheduled `targeter/run_v2.py --mode publish|archive` and from
+`targeter.v2.run_archiver_cli`.
+
+**Every rule in this section applies to both prefixes.** They are two namespaces
+rather than one because they have different producers, different retention
+questions, and different reapers; they are in one bucket because they share a
+durability domain and one bucket-owner identity. A policy written for `raw/`
+alone leaves target-run archival unauthorized, and — worse than a plain
+failure — leaves its writes unprotected by the conditional-write enforcement
+that makes the archive immutable.
+
+### 12.2 Bucket checklist
 
 - all four S3 Block Public Access settings enabled;
 - bucket versioning enabled as recovery defense;
 - default encryption enabled, initially SSE-S3;
 - bucket policy denies non-TLS requests;
-- bucket policy requires `If-None-Match: *` for writes under `raw/`;
-- no raw-object expiration lifecycle rule yet;
+- bucket policy requires `If-None-Match: *` for writes under **both** `raw/`
+  and `targeter-v2/`;
+- no expiration lifecycle rule on either prefix yet;
 - no application permission to delete objects or object versions.
 
-Runtime role, restricted to this bucket and `raw/*`:
+The conditional-write condition, applied to both prefixes:
 
-```text
-s3:ListBucket       on the dedicated bucket
-s3:PutObject        on bucket/raw/*
-s3:GetObject        on bucket/raw/*
+```json
+{
+  "Sid": "RequireConditionalWritesOnArchivePrefixes",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": [
+    "arn:aws:s3:::BUCKET/raw/*",
+    "arn:aws:s3:::BUCKET/targeter-v2/*"
+  ],
+  "Condition": {
+    "StringNotEquals": { "s3:if-none-match": "*" }
+  }
+}
 ```
 
+### 12.3 Runtime role
+
+Restricted to this bucket and these two prefixes:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListForAccurate404",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET"
+    },
+    {
+      "Sid": "ArchiveObjectReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::BUCKET/raw/*",
+        "arn:aws:s3:::BUCKET/targeter-v2/*"
+      ]
+    }
+  ]
+}
+```
+
+`s3:ListBucket` is granted on the bucket rather than per prefix so a missing key
+returns 404 rather than 403, which §7 depends on to distinguish absence from an
+authorization fault.
+
 Do not grant `s3:DeleteObject`, `s3:DeleteObjectVersion`, ACL management, bucket
-policy management, or lifecycle management to the capture service.
+policy management, or lifecycle management to the capture service. Neither
+reaper needs any of them: the raw reaper deletes local spool files, and the
+Targeter v2 run reaper deletes local run artifacts. **No component in this
+repository ever deletes an S3 object**, and withholding the permission is what
+makes that a property of the deployment rather than a property of the code.
 
 If the bucket later moves to SSE-KMS, add and test the KMS permissions required
 for checksum-enabled `HeadObject` before changing production. V1 recommends
@@ -453,6 +523,22 @@ Run against a disposable AWS test bucket with a unique key path:
 5. attempt different bytes at the same key and observe `IntegrityConflict`;
 6. run the archiver twice and confirm one unchanged production receipt;
 7. run the reaper in audit mode and confirm it verifies S3 but deletes nothing.
+
+Then repeat the authorization half against `targeter-v2/`, because a policy that
+authorizes `raw/` proves nothing about the other prefix:
+
+8. run `targeter/run_v2.py --mode archive` and confirm the run receives
+   `archive_receipt.json`, not `archive_receipt.local.json` — a conformance
+   receipt here means the store was not recognized as independent;
+9. confirm the receipt's `prefix` is `targeter-v2/runs/date=<date>/run=<run_id>`
+   and that `run_manifest.json` is the last object committed;
+10. run `targeter.v2.run_archiver_cli` against the same output root and confirm
+    the run reports `skipped` rather than re-uploading;
+11. run `targeter.v2.run_reaper_cli` in its default audit mode and confirm it
+    heads every archived object and deletes nothing.
+
+An `AccessDenied` at step 8 is the expected failure when the runtime role was
+written for `raw/*` only; §12.3 is what fixes it.
 
 Do not run the conflict test in a production prefix.
 
@@ -529,8 +615,11 @@ The phase is complete only when every answer is yes:
 - Does any failure leave the raw segment and seal untouched?
 - Do both commands construct the backend through one factory?
 - Does the runtime role lack S3 deletion authority?
-- Is the reaper still audit-only by default?
+- Are the reapers still audit-only by default?
 - Is object lifecycle expiry still disabled?
+- Do the runtime role and the conditional-write bucket policy cover both `raw/*`
+  and `targeter-v2/*`?
+- Has a real target run produced `archive_receipt.json` under `targeter-v2/`?
 
 ## 17. AWS references
 
@@ -547,7 +636,8 @@ The phase is complete only when every answer is yes:
 
 Approve or change these before implementation:
 
-1. one dedicated bucket per deployment, with keys beginning at `raw/`;
+1. one dedicated bucket per deployment, holding the `raw/` and `targeter-v2/`
+   archive prefixes of §12.1 under identical immutability rules;
 2. single `PutObject` only in V1, failing closed above 5 GB;
 3. SSE-S3 bucket-default encryption for the first deployment;
 4. bucket owner account ID required in configuration;

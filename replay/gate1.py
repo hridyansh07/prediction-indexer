@@ -642,6 +642,34 @@ def _book_shape(value: dict[str, Any]) -> bool:
     return isinstance(value.get("bids"), list) and isinstance(value.get("asks"), list)
 
 
+def generation_metadata_object(key: str) -> bool:
+    """One Targeter v2 generation's content-addressed metadata snapshot.
+
+    v1 wrote these to a flat `<live>/metadata/<venue>/<digest>.json`. v2 writes
+    the same document beside the target files each generation publishes, at
+    `<live>/targeter-v2/generations/<run_id>/metadata/<venue>/<digest>.json`,
+    because a generation commits to its snapshot by name. Only the location
+    moved — `observe_metadata` validates both identically — so admitting the v1
+    shape alone reports a v2 capture as carrying no catalogue evidence at all,
+    with every digest the tape references landing in `missing_references`.
+
+    **Every generation is admitted, not only the published one.** A capture
+    window spans as many generations as it contains republishes, and a
+    `connection_opened` record naming a since-superseded generation's digest
+    still needs that snapshot present to resolve.
+    """
+    parts = key.split("/")
+    if parts[:1] == ["live"]:
+        parts = parts[1:]
+    return (
+        len(parts) == 6
+        and parts[0] == "targeter-v2"
+        and parts[1] == "generations"
+        and parts[3] == "metadata"
+        and parts[5].endswith(".json")
+    )
+
+
 def gate1_object(key: str) -> bool:
     """The immutable capture bundle inputs that can satisfy this gate.
 
@@ -660,6 +688,7 @@ def gate1_object(key: str) -> bool:
             (key.startswith("live/metadata/") or key.startswith("metadata/"))
             and key.endswith(".json")
         )
+        or generation_metadata_object(key)
         or key in {"live/coverage.json", "coverage.json"}
     )
 

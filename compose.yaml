@@ -306,12 +306,15 @@ services:
   #
   # `--expect-lane` must list exactly the splices this deployment runs. §3: "The
   # deployment manifest defines which lanes are expected; a disabled Kalshi
-  # profile is not waited on." The three below are the services with no profile
-  # gate. Enabling the `kalshi` profile means adding `kalshi` here, and the
-  # `reference` profile means adding `polymarket_sports` and `polymarket_rtds`
-  # — otherwise a running lane's outage is invisible. Listing one that is not
-  # running is the opposite error: every window sits out its deadline and
-  # commits incomplete forever.
+  # profile is not waited on." Three of the four below are the services with no
+  # profile gate; `kalshi` is listed because this deployment enables the `kalshi`
+  # profile. **Turning that profile off means removing the line**, and enabling
+  # the `reference` profile means adding `polymarket_sports` and
+  # `polymarket_rtds` — otherwise a running lane's outage is invisible. A lane
+  # that runs unexpected is still merged (it is evidence either way), so the
+  # symptom is silent: every window reads complete whether or not it arrived.
+  # Listing one that is not running is the opposite error: every window sits out
+  # its deadline and commits incomplete forever.
   finalizer:
     <<: *ingester-service
     profiles:
@@ -326,6 +329,8 @@ services:
       - polymarket_snapshots
       - --expect-lane
       - limitless
+      - --expect-lane
+      - kalshi
       # Must match the splices' SEGMENT_SECONDS above. This is the authority for
       # every window's bounds — seals are checked against it rather than trusted
       # for it, so a mismatch fails loudly instead of silently re-tiling.
@@ -357,6 +362,8 @@ services:
       - polymarket_snapshots
       - --expect-lane
       - limitless
+      - --expect-lane
+      - kalshi
       - --window-seconds
       - "${SEGMENT_SECONDS:-1800}"
       - --finalization-deadline-seconds

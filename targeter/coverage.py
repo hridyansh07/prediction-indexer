@@ -91,10 +91,27 @@ class CoverageLedger:
                 self._sightings[(sighting.venue, sighting.asset_id)] = sighting
 
     def observe(
-        self, venue: str, asset_ids: Iterable[str], *, created_at: dict[str, str] | None = None
+        self,
+        venue: str,
+        asset_ids: Iterable[str],
+        *,
+        created_at: dict[str, str] | None = None,
+        now: str | None = None,
     ) -> list[Sighting]:
-        """Records anything not seen before. Returns only the new sightings."""
-        now = utc_now()
+        """Records anything not seen before. Returns only the new sightings.
+
+        `now` stamps the first sighting. It defaults to the wall clock, which is
+        what a live discovery cycle wants. A caller supplies it when the sighting
+        time is not the current time: a deterministic `--now` probe run, or a
+        reconstruction from evidence recorded earlier.
+
+        A time *later* than the truth is the damaging direction. It overstates
+        the discovery lag, and — because `first_seen_at` also bounds how far back
+        the tape can be trusted as subscribed — it makes frames that were in fact
+        being captured look like they predate coverage. That discards real
+        evidence, which is worse than the flattering error of understating lag.
+        """
+        now = now or utc_now()
         created_at = created_at or {}
         fresh: list[Sighting] = []
         for asset_id in asset_ids:
@@ -110,6 +127,45 @@ class CoverageLedger:
             self._sightings[key] = sighting
             fresh.append(sighting)
         return fresh
+
+    def lower_first_sighting(
+        self,
+        venue: str,
+        asset_id: str,
+        first_seen_at: str,
+        *,
+        created_at: str | None = None,
+    ) -> bool:
+        """Move a sighting earlier. Returns whether anything changed.
+
+        The one revision this ledger permits, and it is deliberately a separate
+        method rather than a mode of `observe`. `observe` is append-only because
+        a discovery loop re-seeing a known market must not restamp it; that rule
+        is what keeps the numbers falsifiable.
+
+        Moving a sighting *earlier* is the opposite operation and is a repair:
+        it can only be justified by evidence that the asset was already
+        subscribed before the ledger knew about it, and it makes the measured
+        discovery lag smaller and the trusted span of tape longer — both toward
+        the truth, and both away from the direction that silently discards
+        captured frames. A later timestamp is never accepted here.
+        """
+        key = (venue, asset_id)
+        existing = self._sightings.get(key)
+        if existing is not None:
+            current = parse_iso8601(existing.first_seen_at)
+            proposed = parse_iso8601(first_seen_at)
+            if current is None or proposed is None or proposed >= current:
+                return False
+        self._sightings[key] = Sighting(
+            asset_id=asset_id,
+            venue=venue,
+            first_seen_at=first_seen_at,
+            created_at=created_at if created_at is not None else (
+                existing.created_at if existing is not None else None
+            ),
+        )
+        return existing is not None
 
     def save(self) -> None:
         write_json(

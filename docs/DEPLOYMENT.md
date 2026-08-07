@@ -207,6 +207,38 @@ idempotent. Archive objects, receipts, and published generations are never
 touched. The gate, the reason strings, and the rollout are normative in
 `docs/TARGETER_V2_PHASES_6_10.md` §7.
 
+### Discovery coverage
+
+Publication records a first sighting for every asset it subscribes, into
+`<live-root>/coverage.json`. This is the coverage-from-inception measure of
+`docs/CAPTURE_SPEC.md` §6.1 — how much of a market's life the tape actually
+contains — and `replay/gate1.py`'s `discovery_coverage` check reads it. No
+service or cron entry is needed; it is written inside `publish_run`.
+
+**A deployment that captured before this existed must backfill once, before
+enabling run deletion.** Starting the ledger from empty is not neutral: assets
+subscribed days ago would be stamped with today's date, and because
+`first_seen_at` also bounds how far back the tape counts as covered, frames that
+were genuinely captured would look like they predate coverage. The run reaper
+reclaims the catalogues the backfill reads for venue creation times, so the
+order matters.
+
+```bash
+docker compose -f compose.yaml -f compose.targeter-v2.yaml \
+  run --rm --no-deps targeter \
+  python -u -m scripts.backfill_coverage \
+    --live-root /var/lib/prediction-indexer/live \
+    --output-root /var/lib/prediction-indexer/targeter-v2-runs \
+    --report /var/lib/prediction-indexer/ops/coverage_backfill.json
+```
+
+It reconstructs sightings from `<live-root>/targeter-v2/generations/<run_id>/`,
+which is exactly what the splices resolved, at the instant each run id names. It
+is idempotent, never moves a sighting later, and repairs one already stamped too
+late. A reaped run still yields its sighting; only `created_at` is lost with the
+catalogue, and an asset without one is reported unmeasurable rather than given a
+lag of zero.
+
 ## Operations
 
 Inspect status and recent logs:
@@ -475,18 +507,28 @@ production `.archive.json` receipts against it.
 
 Credentials are never set in `.env`. On AWS, prefer an instance or task role
 scoped to exactly `s3:ListBucket` on the bucket and
-`s3:PutObject`/`s3:GetObject` on `bucket/raw/*`, with no delete permission. If
-the Compose host instead uses temporary or static environment credentials,
+`s3:PutObject`/`s3:GetObject` on **both** `bucket/raw/*` and
+`bucket/targeter-v2/*`, with no delete permission. Both prefixes are required:
+sealed capture archives under `raw/`, and Targeter v2 archives run directories
+under `targeter-v2/runs/date=<date>/run=<run_id>/`. A role written for `raw/*`
+alone fails the first target-run archival with `AccessDenied`, which in turn
+means the run reaper can never reclaim disk. The exact policy documents are in
+`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12.3.
+
+If the Compose host instead uses temporary or static environment credentials,
 export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and (for temporary
 credentials) `AWS_SESSION_TOKEN` in the shell that invokes Compose. Compose
-forwards them only to `archiver`, `archiver-once`, `reaper`, and `reaper-once`; it does not
-forward them to venue splices. A host `~/.aws` directory is not mounted into
-the containers. For an EC2 instance role, ensure IMDS is reachable from bridge
-containers (including a sufficient IMDSv2 response hop limit).
+forwards them only to `archiver`, `archiver-once`, `reaper`, and `reaper-once`,
+plus — when the v2 override is included — `targeter`, `targeter-v2-integrity`,
+`targeter-v2-run-archiver`, and `targeter-v2-run-reaper`. It does not forward
+them to venue splices or the ingester. A host `~/.aws` directory is not mounted
+into the containers. For an EC2 instance role, ensure IMDS is reachable from
+bridge containers (including a sufficient IMDSv2 response hop limit).
 
 The bucket itself needs Block Public Access enabled, versioning on, default
-encryption on, and a policy requiring `If-None-Match: *` on writes under
-`raw/` — see `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for the full checklist.
+encryption on, and a policy requiring `If-None-Match: *` on writes under both
+`raw/` and `targeter-v2/` — see `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
+the full checklist and the JSON.
 
 Switching `ARCHIVE_BACKEND` from `local` to `s3` does not touch the reaper's
 own gate: `REAPER_MODE=delete` is still explicit, and S3's fixed
