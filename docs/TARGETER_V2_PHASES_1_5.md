@@ -265,7 +265,9 @@ Catalog refresh is the default. `--reuse-cache` is an explicit offline/debug
 mode. For repeated live monitoring, `--no-response-cache` still performs fresh
 requests and preserves the normalized run artifacts, but retains only the
 durable per-host rate-limit state instead of raw HTTP response bodies. It is
-mutually exclusive with `--reuse-cache`. Bounded probes can use:
+mutually exclusive with `--reuse-cache`. Persisted raw response bodies are
+checksummed `.json.zst` frames using the shared encoder; metadata retains both
+decoded and stored identities. Bounded probes can use:
 
 ```bash
 python3 targeter/run_v2.py \
@@ -281,13 +283,23 @@ result.
 
 Each run writes a timestamped local directory containing:
 
-- `catalog_<venue>_events.ndjson`;
-- `catalog_<venue>_markets.ndjson`;
-- `rule_templates.ndjson`;
-- `rule_drift.ndjson`;
-- `selection_report.json`.
+- `catalog_<venue>_events.ndjson.zst`;
+- `catalog_<venue>_markets.ndjson.zst`;
+- `rule_templates.ndjson.zst`;
+- `rule_drift.ndjson.zst`;
+- `selection_report.json.zst`;
+- `selection_report.meta.json`.
 
-`selection_report.json` records source completeness, match rejections, every
+Zstandard is the default and uses the repository encoder contract (level 3,
+frame checksum, no dictionary, exactly one frame, exact NDJSON). The compressed
+selection report commits each normalized artifact's decoded SHA-256/length/LF
+count and stored SHA-256/length. Its small metadata document is written last and
+commits the report frame's own decoded and stored identities. `--artifact-format
+ndjson` is an explicit shadow/debug override that emits the normalized artifact
+classes and `selection_report.json` as plain files while preserving the same
+inventory and identities.
+
+The decoded selection report records source completeness, match rejections, every
 candidate and rejection reason, masks, relationships, rule evidence, score
 components, budget use, and the proposed subscription IDs. Each candidate has
 one event-level `event_status`, an `admission` block with threshold evidence,

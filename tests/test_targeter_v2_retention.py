@@ -140,7 +140,7 @@ class TargetRunCase(unittest.TestCase):
 
     # -- fixtures ----------------------------------------------------------
 
-    def run_directory(self, *, now=None) -> Path:
+    def run_directory(self, *, now=None, artifact_format: str = "ndjson") -> Path:
         # An hour after NOW by default, so a bare call is never accidentally
         # the same run id as the published fixture, which must sit at NOW.
         now = NOW + HOUR if now is None else now
@@ -156,6 +156,7 @@ class TargetRunCase(unittest.TestCase):
             now=now,
             adapters=adapters,
             client=object(),
+            artifact_format=artifact_format,
         )
         return result.directory
 
@@ -445,6 +446,16 @@ class DeletionTests(TargetRunCase):
         self.assertEqual(decision.reason, AUDIT_MODE)
         self.assertEqual(result.counts["reapable"], 1)
         self.assertEqual(self.artifacts(directory), before)
+
+    def test_a_compressed_run_is_reaped_through_the_same_receipt_gate(self) -> None:
+        self.published()
+        directory = self.run_directory(artifact_format="zstd")
+        archive_run(directory, self.store, now=NOW + HOUR)
+
+        decision = self.decide(directory)
+
+        self.assertEqual(decision.decision, REAPED)
+        self.assertEqual(self.artifacts(directory), {RECEIPT})
 
     def test_a_proven_run_loses_every_artifact_but_keeps_its_receipt(self) -> None:
         directory = self.candidate()

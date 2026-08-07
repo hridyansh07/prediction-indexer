@@ -1504,4 +1504,5 @@ def durable_client(
         cache_root,
         force_refresh=force_refresh,
         persist_responses=persist_responses,
+        compress_responses=True,
     )

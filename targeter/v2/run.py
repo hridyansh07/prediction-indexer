@@ -13,9 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from archive.common.durable import write_json_durable
 from archive.storage.base import ObjectStoreError
 from archive.storage.factory import add_store_arguments, build_store
-from analysis.storage import write_json, write_ndjson
+from analysis.storage import write_json_zstd, write_ndjson, write_ndjson_zstd
+from encoder import DEFAULT_ZSTD_LEVEL, encoder_version, logical_identity_of, stored_identity_of
 from targeter.v2.adapters import durable_client, live_adapters
 from targeter.v2.domain import CatalogSnapshot, SUPPORTED_VENUES, parse_timestamp
 from targeter.v2.lease import TargeterRunLease
@@ -34,6 +36,9 @@ DEFAULT_STRATEGY = PROJECT_ROOT / "configs" / "targeter_v2.json"
 DEFAULT_CACHE = PROJECT_ROOT / "data" / "targeter-v2-cache"
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "targeter-v2-shadow"
 DEFAULT_LIVE = PROJECT_ROOT / "data" / "live"
+ARTIFACT_FORMATS = ("zstd", "ndjson")
+SELECTION_REPORT_ZSTD_FILE = "selection_report.json.zst"
+SELECTION_REPORT_METADATA_FILE = "selection_report.meta.json"
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,49 @@ def _run_id(now: datetime) -> str:
     return now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
+def _write_artifact(
+    directory: Path,
+    stem: str,
+    rows: Iterable[dict[str, Any]],
+    *,
+    artifact_format: str,
+) -> tuple[str, dict[str, Any]]:
+    if artifact_format not in ARTIFACT_FORMATS:
+        raise ValueError(f"artifact_format must be one of {', '.join(ARTIFACT_FORMATS)}")
+    name = f"{stem}.ndjson.zst" if artifact_format == "zstd" else f"{stem}.ndjson"
+    path = directory / name
+    if artifact_format == "zstd":
+        result = write_ndjson_zstd(path, rows)
+        logical = result.logical
+        stored = result.stored
+        content_encoding = "zstd"
+    else:
+        write_ndjson(path, rows)
+        with path.open("rb") as handle:
+            logical = logical_identity_of(handle)
+        with path.open("rb") as handle:
+            stored = stored_identity_of(handle)
+        content_encoding = None
+    return name, {
+        "content_type": "application/x-ndjson",
+        "content_encoding": content_encoding,
+        "decoded": logical.as_record(),
+        "stored": stored.as_record(),
+        "compression": (
+            {
+                "algorithm": "zstd",
+                "level": DEFAULT_ZSTD_LEVEL,
+                "frame_checksum": True,
+                "dictionary": None,
+                "frame_count": 1,
+                "encoder": encoder_version(),
+            }
+            if content_encoding == "zstd"
+            else None
+        ),
+    }
+
+
 def run_shadow(
     *,
     strategy: Strategy,
@@ -62,6 +110,7 @@ def run_shadow(
     client: Any | None = None,
     force_refresh: bool = True,
     persist_responses: bool = True,
+    artifact_format: str = "zstd",
     max_kalshi_series: int | None = None,
     max_kalshi_pages: int | None = None,
     max_polymarket_pages: int | None = None,
@@ -92,15 +141,22 @@ def run_shadow(
     run_id = _run_id(now)
     directory = Path(output_root) / run_id
     directory.mkdir(parents=True, exist_ok=True)
+    artifacts: dict[str, dict[str, Any]] = {}
     for catalog in catalogs:
-        write_ndjson(
-            directory / f"catalog_{catalog.venue}_events.ndjson",
+        name, identity = _write_artifact(
+            directory,
+            f"catalog_{catalog.venue}_events",
             (event.as_record() for event in catalog.events),
+            artifact_format=artifact_format,
         )
-        write_ndjson(
-            directory / f"catalog_{catalog.venue}_markets.ndjson",
+        artifacts[name] = identity
+        name, identity = _write_artifact(
+            directory,
+            f"catalog_{catalog.venue}_markets",
             (market.as_record() for market in catalog.markets),
+            artifact_format=artifact_format,
         )
+        artifacts[name] = identity
     record = selection.as_record()
     record["run_id"] = run_id
     record["strategy_source"] = strategy.source_path
@@ -113,23 +169,57 @@ def run_shadow(
         and all(catalog.complete for catalog in catalogs)
     )
     record["input_complete"] = input_complete
-    write_json(directory / "selection_report.json", record)
-    write_ndjson(
-        directory / "rule_templates.ndjson",
+    name, identity = _write_artifact(
+        directory,
+        "rule_templates",
         (
             template.as_record()
             for candidate in selection.candidates
             for template in candidate.rules.templates
         ),
+        artifact_format=artifact_format,
     )
-    write_ndjson(
-        directory / "rule_drift.ndjson",
+    artifacts[name] = identity
+    name, identity = _write_artifact(
+        directory,
+        "rule_drift",
         (
             {"bundle_id": candidate.bundle.bundle_id, **drift}
             for candidate in selection.candidates
             for drift in candidate.rules.drift
         ),
+        artifact_format=artifact_format,
     )
+    artifacts[name] = identity
+    record["artifact_format"] = artifact_format
+    record["artifacts"] = dict(sorted(artifacts.items()))
+    if artifact_format == "zstd":
+        report_result = write_json_zstd(directory / SELECTION_REPORT_ZSTD_FILE, record)
+        write_json_durable(
+            directory / SELECTION_REPORT_METADATA_FILE,
+            {
+                "targeter_selection_report_metadata_version": 1,
+                "run_id": run_id,
+                "report": {
+                    "file": SELECTION_REPORT_ZSTD_FILE,
+                    "content_type": "application/json",
+                    "content_encoding": "zstd",
+                    "decoded": report_result.logical.as_record(),
+                    "stored": report_result.stored.as_record(),
+                    "compression": {
+                        "algorithm": "zstd",
+                        "level": DEFAULT_ZSTD_LEVEL,
+                        "frame_checksum": True,
+                        "dictionary": None,
+                        "frame_count": 1,
+                        "encoder": encoder_version(),
+                    },
+                },
+            },
+        )
+    else:
+        # Plain shadow/debug runs retain the original directly readable report.
+        write_json_durable(directory / "selection_report.json", record)
     return ShadowRun(run_id, directory, selection, failures, input_complete)
 
 
@@ -149,6 +239,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--live-root", type=Path, default=DEFAULT_LIVE)
+    parser.add_argument(
+        "--artifact-format",
+        choices=ARTIFACT_FORMATS,
+        default="zstd",
+        help=(
+            "Normalized run artifact format. zstd is the bounded-disk default; "
+            "ndjson preserves plain files for shadow inspection."
+        ),
+    )
     add_store_arguments(parser)
     cache_mode = parser.add_mutually_exclusive_group()
     cache_mode.add_argument(
@@ -230,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             now=now,
             force_refresh=not arguments.reuse_cache,
             persist_responses=not arguments.no_response_cache,
+            artifact_format=arguments.artifact_format,
             max_kalshi_series=arguments.max_kalshi_series,
             max_kalshi_pages=arguments.max_kalshi_pages,
             max_polymarket_pages=arguments.max_polymarket_pages,

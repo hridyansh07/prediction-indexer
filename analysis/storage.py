@@ -4,9 +4,13 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, BinaryIO, Iterable, Iterator, Mapping
+
+from archive.common.durable import fsync_directory as fsync_directory_strict
+from encoder import EncodeResult, LogicalIdentity, StoredIdentity, decode_stream, encode_stream
 
 
 def utc_now() -> str:
@@ -98,17 +102,120 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def write_ndjson(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    content = "".join(
-        json.dumps(
-            row,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            for row in rows:
+                json.dump(
+                    row,
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        fsync_directory_strict(path.parent)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def write_ndjson_zstd(path: Path, rows: Iterable[Mapping[str, Any]]) -> EncodeResult:
+    """Durably write exact NDJSON inside the repository's one-frame Zstd profile."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded_path: Path | None = None
+    try:
+        with tempfile.TemporaryFile(
+            mode="w+",
+            encoding="utf-8",
+            dir=path.parent,
+        ) as raw:
+            for row in rows:
+                json.dump(
+                    row,
+                    raw,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                raw.write("\n")
+            raw.flush()
+            os.fsync(raw.fileno())
+            with open(os.dup(raw.fileno()), "rb", closefd=True) as source:
+                source.seek(0)
+                with tempfile.NamedTemporaryFile(
+                    mode="w+b",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    delete=False,
+                ) as encoded:
+                    encoded_path = Path(encoded.name)
+                    result = encode_stream(source, encoded)
+                    encoded.flush()
+                    os.fsync(encoded.fileno())
+        os.replace(encoded_path, path)
+        encoded_path = None
+        fsync_directory_strict(path.parent)
+        return result
+    finally:
+        if encoded_path is not None:
+            encoded_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def decoded_zstd_file(
+    path: Path,
+    *,
+    expected_logical: LogicalIdentity,
+    expected_stored: StoredIdentity,
+) -> Iterator[BinaryIO]:
+    """Stage one strictly verified frame on disk and yield its decoded bytes."""
+    path = Path(path)
+    with path.open("rb") as source, tempfile.TemporaryFile(
+        mode="w+b",
+        dir=path.parent,
+    ) as decoded:
+        decode_stream(
+            source,
+            decoded,
+            expected_logical=expected_logical,
+            expected_stored=expected_stored,
+            max_decoded_bytes=expected_logical.byte_length,
         )
-        + "\n"
-        for row in rows
-    )
-    _atomic_write(path, content)
+        decoded.seek(0)
+        yield decoded
+
+
+def write_json_zstd(path: Path, value: Any) -> EncodeResult:
+    """Durably write canonical JSON plus LF through the shared streaming encoder."""
+    return write_ndjson_zstd(path, (value,))
+
+
+def read_json_zstd(
+    path: Path,
+    *,
+    expected_logical: LogicalIdentity,
+    expected_stored: StoredIdentity,
+) -> Any:
+    with decoded_zstd_file(
+        path,
+        expected_logical=expected_logical,
+        expected_stored=expected_stored,
+    ) as decoded:
+        return json.load(decoded)
 
 
 def in_time_window(
@@ -122,4 +229,3 @@ def in_time_window(
     if maximum is not None and (parsed is None or parsed > maximum):
         return False
     return True
-
