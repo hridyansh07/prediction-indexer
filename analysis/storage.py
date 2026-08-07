@@ -183,7 +183,11 @@ def decoded_zstd_file(
     expected_stored: StoredIdentity,
 ) -> Iterator[BinaryIO]:
     """Stage one strictly verified frame on disk and yield its decoded bytes."""
-    with Path(path).open("rb") as source, tempfile.TemporaryFile(mode="w+b") as decoded:
+    path = Path(path)
+    with path.open("rb") as source, tempfile.TemporaryFile(
+        mode="w+b",
+        dir=path.parent,
+    ) as decoded:
         decode_stream(
             source,
             decoded,
