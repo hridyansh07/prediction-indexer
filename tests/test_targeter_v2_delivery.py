@@ -691,6 +691,12 @@ class CoverageBackfillTests(unittest.TestCase):
         summary = self.backfill()
         self.assertEqual(summary["generations"], 2)
         self.assertEqual(summary["unreadable"], [])
+        # A rebuild from empty must *report* what it wrote. Counting only the
+        # repairs made a first run indistinguishable from a no-op second one,
+        # which is the one thing an operator reads this summary to tell apart.
+        self.assertEqual(summary["recorded"], {"kalshi": 1, "limitless": 0, "polymarket": 1})
+        self.assertEqual(summary["sightings"], 2)
+        self.assertEqual(summary["repaired"], 0)
         rebuilt = self.sightings()
         self.assertEqual(set(rebuilt), set(expected))
         for key, item in rebuilt.items():

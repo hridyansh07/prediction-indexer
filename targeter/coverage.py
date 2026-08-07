@@ -149,23 +149,26 @@ class CoverageLedger:
         discovery lag smaller and the trusted span of tape longer — both toward
         the truth, and both away from the direction that silently discards
         captured frames. A later timestamp is never accepted here.
+
+        Revises only; it never creates. An unknown asset is `observe`'s to
+        record, and having this method fall through to creating one made a
+        first sighting arrive by a path that reports no sighting was made.
         """
         key = (venue, asset_id)
         existing = self._sightings.get(key)
-        if existing is not None:
-            current = parse_iso8601(existing.first_seen_at)
-            proposed = parse_iso8601(first_seen_at)
-            if current is None or proposed is None or proposed >= current:
-                return False
+        if existing is None:
+            return False
+        current = parse_iso8601(existing.first_seen_at)
+        proposed = parse_iso8601(first_seen_at)
+        if current is None or proposed is None or proposed >= current:
+            return False
         self._sightings[key] = Sighting(
             asset_id=asset_id,
             venue=venue,
             first_seen_at=first_seen_at,
-            created_at=created_at if created_at is not None else (
-                existing.created_at if existing is not None else None
-            ),
+            created_at=created_at if created_at is not None else existing.created_at,
         )
-        return existing is not None
+        return True
 
     def save(self) -> None:
         write_json(
