@@ -5,5 +5,19 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
 install -d -m 0700 "$(dirname "$AWS_WEB_IDENTITY_TOKEN_FILE")"
 
+for name in \
+	AWS_OIDC_AUDIENCE \
+	AWS_REGION \
+	AWS_ROLE_ARN \
+	AWS_ROLE_SESSION_NAME \
+	TARGETER_UI_AWS_REGION \
+	TARGETER_UI_S3_BUCKET \
+	TARGETER_UI_S3_EXPECTED_OWNER; do
+	if [[ -z "${!name:-}" ]]; then
+		printf -v "$name" '%s' "$(amp secrets get "$name" --project)"
+		export "$name"
+	fi
+done
+
 amp orb services ensure
 amp orb service restart aws-identity
