@@ -26,3 +26,11 @@ encoder/rust/target/
 data/spool/
 data/ingest-store/
 data/live/
+
+# Targeter observability web build/dependencies
+targeter-ui/node_modules/
+targeter-ui/dist/
+targeter-ui/dist-server/
+
+# Orb service runtime state
+.amp/portals/

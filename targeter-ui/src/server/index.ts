@@ -1,0 +1,27 @@
+import express from 'express';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { S3Client } from '@aws-sdk/client-s3';
+import { S3ArchiveStore } from './store.js';
+import { SnapshotService } from './service.js';
+
+const here=path.dirname(fileURLToPath(import.meta.url));
+const readConfig=()=>JSON.parse(fs.readFileSync(path.resolve(here,'../../../configs/targeter_v2.json'),'utf8'));
+const fixture=process.env.TARGETER_UI_FIXTURE_PATH;
+const required=['TARGETER_UI_S3_BUCKET','TARGETER_UI_AWS_REGION','TARGETER_UI_S3_EXPECTED_OWNER'] as const;
+if(!fixture){ const missing=required.filter(k=>!process.env[k]); if(missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`); }
+if(!fixture && !/^\d{12}$/.test(process.env.TARGETER_UI_S3_EXPECTED_OWNER!)) throw new Error('TARGETER_UI_S3_EXPECTED_OWNER must be a 12-digit AWS account ID');
+const refreshSeconds=positive(process.env.TARGETER_UI_REFRESH_SECONDS,60,'TARGETER_UI_REFRESH_SECONDS');
+const expectedRunSeconds=positive(process.env.TARGETER_UI_EXPECTED_RUN_SECONDS,600,'TARGETER_UI_EXPECTED_RUN_SECONDS');
+const maxRuns=positive(process.env.TARGETER_UI_MAX_RUNS,5,'TARGETER_UI_MAX_RUNS'); if(maxRuns!==5)throw new Error('TARGETER_UI_MAX_RUNS is fixed at 5');
+const port=positive(process.env.PORT,3000,'PORT');
+const store=fixture?null:new S3ArchiveStore(new S3Client({region:process.env.TARGETER_UI_AWS_REGION}),process.env.TARGETER_UI_S3_BUCKET!,process.env.TARGETER_UI_S3_PREFIX??'targeter-v2/runs',process.env.TARGETER_UI_S3_EXPECTED_OWNER!);
+const service=new SnapshotService(store,readConfig(),refreshSeconds,expectedRunSeconds,fixture);
+const app=express(); app.disable('x-powered-by'); app.use(express.json({limit:'8kb'}));
+app.get('/healthz',(_q,r)=>r.status(service.snapshot.lastSuccessfulRefresh?200:503).json({ready:!!service.snapshot.lastSuccessfulRefresh,stale:service.snapshot.stale,refreshing:service.snapshot.refreshing}));
+app.get('/api/snapshot',(_q,r)=>r.json(service.snapshot)); app.post('/api/refresh',async(_q,r)=>r.json(await service.refresh()));
+const web=path.resolve(here,'../../dist'); if(fs.existsSync(web)){app.use(express.static(web));app.get('*splat',(_q,r)=>r.sendFile(path.join(web,'index.html')));}
+app.listen(port,'0.0.0.0',()=>console.log(`Targeter UI listening on port ${port} (${fixture?'fixture':'S3'} mode)`));
+void service.refresh(); setInterval(()=>void service.refresh(),refreshSeconds*1000).unref();
+function positive(raw:string|undefined,fallback:number,name:string){const n=raw===undefined?fallback:Number(raw);if(!Number.isInteger(n)||n<=0)throw new Error(`${name} must be a positive integer`);return n;}

@@ -1,0 +1,7 @@
+services:
+  targeter-ui:
+    command: yarn --cwd targeter-ui dev
+    port: 3000
+    environment:
+      PORT: "3000"
+    portal: true
