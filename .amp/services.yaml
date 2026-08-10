@@ -1,6 +1,20 @@
 services:
+  aws-identity:
+    command: |
+      set -eu
+      while true; do
+        ./scripts/refresh-amp-aws-token
+        sleep 2700
+      done
+
   targeter-ui:
-    command: yarn --cwd targeter-ui dev
+    command: |
+      set -eu
+      : "${AWS_WEB_IDENTITY_TOKEN_FILE:?AWS_WEB_IDENTITY_TOKEN_FILE is required}"
+      while [ ! -s "$AWS_WEB_IDENTITY_TOKEN_FILE" ]; do
+        sleep 1
+      done
+      exec yarn --cwd targeter-ui dev
     port: 3000
     environment:
       PORT: "3000"

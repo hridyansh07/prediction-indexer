@@ -34,3 +34,4 @@ targeter-ui/dist-server/
 
 # Orb service runtime state
 .amp/portals/
+.amp/runtime/
