@@ -16,3 +16,4 @@ if ! command -v zstd >/dev/null 2>&1; then
 fi
 
 yarn --cwd targeter-ui install --frozen-lockfile
+git config core.hooksPath .githooks

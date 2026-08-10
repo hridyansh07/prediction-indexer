@@ -1,13 +1,127 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { ArchiveStore } from './store.js';
-import { latestRunKeys, MAX_STORED_BYTES, reportFile, summarizeReport, validateManifest, validateReportBytes } from './core.js';
+import {
+  latestRunKeys,
+  MAX_STORED_BYTES,
+  reportFile,
+  summarizeReport,
+  validateManifest,
+  validateReportBytes,
+} from './core.js';
 import type { Json, Snapshot } from '../shared.js';
 
 export class SnapshotService {
-  snapshot:Snapshot; private active:Promise<Snapshot>|null=null;
-  constructor(private store:ArchiveStore|null, private config:Json, private refreshSeconds:number, private expectedRunSeconds:number, private fixturePath?:string){ this.snapshot={generatedAt:new Date(0).toISOString(),stale:true,refreshing:false,lastSuccessfulRefresh:null,lastRefreshError:null,refreshSeconds,expectedRunSeconds,source:fixturePath?'fixture':'s3',runs:[],config:{label:'Current checkout config — a matching version is an indication, not byte-level historical proof',version:(config as any)?.version??null,versionMatchesRunIds:[],value:config}}; }
-  refresh(){ if(this.active)return this.active; this.snapshot={...this.snapshot,refreshing:true}; this.active=this.load().then(s=>(this.snapshot=s,s)).catch(e=>{this.snapshot={...this.snapshot,stale:true,refreshing:false,lastRefreshError:e instanceof Error?e.message:'refresh failed'};return this.snapshot}).finally(()=>this.active=null); return this.active; }
-  private async load():Promise<Snapshot>{ let reports:any[]; if(this.fixturePath){ const raw=JSON.parse(await fs.readFile(this.fixturePath,'utf8')); reports=Array.isArray(raw)?raw:raw.runs; if(!Array.isArray(reports))throw new Error('fixture must be an array or {runs: []}'); } else { const store=this.store!; const keys=latestRunKeys(await store.listManifests()); reports=await Promise.all(keys.map(async ({key,parsed})=>{ const manifest=validateManifest(JSON.parse(new TextDecoder().decode(await store.get(key,1024*1024))),parsed.runId); const file=reportFile(manifest); const report=await validateReportBytes(await store.get(path.posix.join(path.posix.dirname(key),file.file),MAX_STORED_BYTES),file,parsed.runId); if(report.generated_at!==manifest.generated_at || report.input_complete!==manifest.input_complete)throw new Error(`manifest/report mismatch for ${parsed.runId}`); return report; })); }
-    const runs=reports.map(r=>({runId:r.run_id,generatedAt:r.generated_at,inputComplete:r.input_complete,strategyVersion:r.strategy_version??null,report:r,summary:summarizeReport(r)})).sort((a,b)=>b.runId.localeCompare(a.runId)).slice(0,5); const now=new Date().toISOString(); const version=(this.config as any)?.version??null; return {generatedAt:now,stale:false,refreshing:false,lastSuccessfulRefresh:now,lastRefreshError:null,refreshSeconds:this.refreshSeconds,expectedRunSeconds:this.expectedRunSeconds,source:this.fixturePath?'fixture':'s3',runs,config:{...this.snapshot.config,versionMatchesRunIds:runs.filter(r=>String(r.strategyVersion)===String(version)).map(r=>r.runId)}}; }
+  snapshot: Snapshot;
+  private active: Promise<Snapshot> | null = null;
+  constructor(
+    private store: ArchiveStore | null,
+    private config: Json,
+    private refreshSeconds: number,
+    private expectedRunSeconds: number,
+    private fixturePath?: string,
+  ) {
+    this.snapshot = {
+      generatedAt: new Date(0).toISOString(),
+      stale: true,
+      refreshing: false,
+      lastSuccessfulRefresh: null,
+      lastRefreshError: null,
+      refreshSeconds,
+      expectedRunSeconds,
+      source: fixturePath ? 'fixture' : 's3',
+      runs: [],
+      config: {
+        label:
+          'Current checkout config — a matching version is an indication, not byte-level historical proof',
+        version: (config as any)?.version ?? null,
+        versionMatchesRunIds: [],
+        value: config,
+      },
+    };
+  }
+  refresh() {
+    if (this.active) return this.active;
+    this.snapshot = { ...this.snapshot, refreshing: true };
+    this.active = this.load()
+      .then((s) => ((this.snapshot = s), s))
+      .catch((e) => {
+        this.snapshot = {
+          ...this.snapshot,
+          stale: true,
+          refreshing: false,
+          lastRefreshError: e instanceof Error ? e.message : 'refresh failed',
+        };
+        return this.snapshot;
+      })
+      .finally(() => (this.active = null));
+    return this.active;
+  }
+  private async load(): Promise<Snapshot> {
+    let reports: any[];
+    if (this.fixturePath) {
+      const raw = JSON.parse(await fs.readFile(this.fixturePath, 'utf8'));
+      reports = Array.isArray(raw) ? raw : raw.runs;
+      if (!Array.isArray(reports))
+        throw new Error('fixture must be an array or {runs: []}');
+    } else {
+      const store = this.store!;
+      const keys = latestRunKeys(await store.listManifests());
+      reports = await Promise.all(
+        keys.map(async ({ key, parsed }) => {
+          const manifest = validateManifest(
+            JSON.parse(
+              new TextDecoder().decode(await store.get(key, 1024 * 1024)),
+            ),
+            parsed.runId,
+          );
+          const file = reportFile(manifest);
+          const report = await validateReportBytes(
+            await store.get(
+              path.posix.join(path.posix.dirname(key), file.file),
+              MAX_STORED_BYTES,
+            ),
+            file,
+            parsed.runId,
+          );
+          if (
+            report.generated_at !== manifest.generated_at ||
+            report.input_complete !== manifest.input_complete
+          )
+            throw new Error(`manifest/report mismatch for ${parsed.runId}`);
+          return report;
+        }),
+      );
+    }
+    const runs = reports
+      .map((r) => ({
+        runId: r.run_id,
+        generatedAt: r.generated_at,
+        inputComplete: r.input_complete,
+        strategyVersion: r.strategy_version ?? null,
+        report: r,
+        summary: summarizeReport(r),
+      }))
+      .sort((a, b) => b.runId.localeCompare(a.runId))
+      .slice(0, 5);
+    const now = new Date().toISOString();
+    const version = (this.config as any)?.version ?? null;
+    return {
+      generatedAt: now,
+      stale: false,
+      refreshing: false,
+      lastSuccessfulRefresh: now,
+      lastRefreshError: null,
+      refreshSeconds: this.refreshSeconds,
+      expectedRunSeconds: this.expectedRunSeconds,
+      source: this.fixturePath ? 'fixture' : 's3',
+      runs,
+      config: {
+        ...this.snapshot.config,
+        versionMatchesRunIds: runs
+          .filter((r) => String(r.strategyVersion) === String(version))
+          .map((r) => r.runId),
+      },
+    };
+  }
 }

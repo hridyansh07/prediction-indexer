@@ -16,7 +16,9 @@ yarn dev
 
 `TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
 
-Commands: `yarn test`, `yarn typecheck`, `yarn build`, and `yarn start` (after build). The production Express server serves `dist/` and its API on `PORT`.
+Commands: `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, `yarn build`, and `yarn start` (after build). The production Express server serves `dist/` and its API on `PORT`.
+
+Repository setup configures `.githooks/pre-commit` through the local `core.hooksPath`. The hook runs `yarn --cwd targeter-ui lint` and blocks commits containing unformatted or lint-invalid UI code. Developers who do not run `.agents/setup` can enable it with `git config core.hooksPath .githooks`.
 
 ## IAM / OIDC
 

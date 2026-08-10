@@ -1,4 +1,14 @@
 {
-  "compilerOptions": {"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"esModuleInterop":true,"skipLibCheck":true,"outDir":"dist-server","rootDir":"src","resolveJsonModule":true},
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist-server",
+    "rootDir": "src",
+    "resolveJsonModule": true
+  },
   "include": ["src/server", "src/shared.ts"]
 }
