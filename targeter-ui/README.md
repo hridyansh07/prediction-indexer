@@ -8,7 +8,6 @@ Read-only React/Vite + Express dashboard for the five latest committed Targeter 
 
 ```sh
 export AWS_OIDC_AUDIENCE=sts.amazonaws.com
-export AWS_WEB_IDENTITY_TOKEN_FILE=/home/user/workspace/repo/.amp/runtime/aws-web-identity-token
 export AWS_ROLE_ARN=arn:aws:iam::123456789012:role/prediction-indexer-targeter-ui
 export AWS_ROLE_SESSION_NAME=prediction-indexer-targeter-ui
 export TARGETER_UI_S3_BUCKET=example-archive
@@ -30,7 +29,7 @@ Repository setup configures `.githooks/pre-commit` through the local `core.hooks
 
 The workload identity needs only `s3:ListBucket` on the bucket constrained with `s3:prefix` to `targeter-v2/runs/*`, and `s3:GetObject` on `arn:aws:s3:::BUCKET/targeter-v2/runs/*`. Its OIDC trust policy should constrain the provider subject/audience to this workload. Do not grant Put/Delete. Every list/get includes the configured expected bucket owner.
 
-The `aws-identity` orb service runs [`scripts/refresh-amp-aws-token`](../scripts/refresh-amp-aws-token) immediately and every 45 minutes. The script asks Amp for a one-hour ID token, writes it with mode `0600`, and atomically replaces `AWS_WEB_IDENTITY_TOKEN_FILE`; it never prints or persists the token anywhere else. The AWS SDK reads that file and uses `AWS_ROLE_ARN` to call `AssumeRoleWithWebIdentity`. The UI service waits for the first non-empty token file before starting. If refresh fails, the supervised identity service exits and is restarted rather than sleeping with a stale success state.
+The `aws-identity` orb service runs [`scripts/refresh-amp-aws-token`](../scripts/refresh-amp-aws-token) immediately and every 45 minutes. The token path is derived as `<repository>/.amp/runtime/aws-oidc-token`, so `AWS_WEB_IDENTITY_TOKEN_FILE` does not need to be configured. The script asks Amp for a one-hour ID token, writes it with mode `0600`, and atomically replaces that file; it never prints or persists the token anywhere else. The AWS SDK reads the exported path and uses `AWS_ROLE_ARN` to call `AssumeRoleWithWebIdentity`. The UI service waits for the first non-empty token file before starting. If refresh fails, the supervised identity service exits and is restarted rather than sleeping with a stale success state. On orb resume, `.agents/resume` reconciles all declared services and restarts the identity worker so a fresh token is minted immediately instead of waiting for the existing refresh interval.
 
 ## Identity and bounds
 

@@ -2,11 +2,13 @@
 set -euo pipefail
 
 : "${AWS_OIDC_AUDIENCE:?AWS_OIDC_AUDIENCE is required}"
-: "${AWS_WEB_IDENTITY_TOKEN_FILE:?AWS_WEB_IDENTITY_TOKEN_FILE is required}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
 
 umask 077
 token_directory="$(dirname "$AWS_WEB_IDENTITY_TOKEN_FILE")"
-mkdir -p "$token_directory"
+install -d -m 0700 "$token_directory"
 
 tmp="$(mktemp "${AWS_WEB_IDENTITY_TOKEN_FILE}.tmp.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT

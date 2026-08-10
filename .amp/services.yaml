@@ -10,7 +10,8 @@ services:
   targeter-ui:
     command: |
       set -eu
-      : "${AWS_WEB_IDENTITY_TOKEN_FILE:?AWS_WEB_IDENTITY_TOKEN_FILE is required}"
+      REPO_ROOT="$(git rev-parse --show-toplevel)"
+      export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
       while [ ! -s "$AWS_WEB_IDENTITY_TOKEN_FILE" ]; do
         sleep 1
       done
