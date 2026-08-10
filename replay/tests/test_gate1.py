@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 
@@ -89,6 +90,106 @@ class Gate1Tests(unittest.TestCase):
         one = Gate1Auditor().audit(MemoryByteStreamer(objects, chunk_size=1)).as_record()
         many = Gate1Auditor().audit(MemoryByteStreamer(objects, chunk_size=4096)).as_record()
         self.assertEqual(one, many)
+
+
+def _seal(data: bytes, *, data_file: str) -> bytes:
+    return json.dumps(
+        {
+            "data_file": data_file,
+            "byte_length": len(data),
+            "line_count": data.count(b"\n"),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+class SealedSegmentTests(unittest.TestCase):
+    """A silent lane and a deleted segment must not produce the same verdict.
+
+    `segments_seen` is populated per parsed record, so a sealed segment holding
+    no records never enters it. Reporting that as "the segment is absent" turns
+    the normal state of a low-volume venue into an integrity failure, and hides
+    the real thing that message is for.
+    """
+
+    LANE = "spool/lane=limitless/date=2026-08-05"
+
+    def _report(self, objects: dict[str, bytes]):
+        return Gate1Auditor().audit(MemoryByteStreamer(objects))
+
+    def _check(self, report, name: str):
+        return next(item for item in report.as_record()["checks"] if item["name"] == name)
+
+    def _populated(self) -> dict[str, bytes]:
+        # One segment carrying a record, so `segments_seen` is non-empty and the
+        # check is not vacuously false.
+        data = _line(1, 1, {"bids": [], "asks": []})
+        return {
+            f"{self.LANE}/full.ndjson": data,
+            f"{self.LANE}/full.seal.json": _seal(data, data_file="full.ndjson"),
+        }
+
+    def test_an_empty_sealed_segment_is_evidence_not_a_missing_segment(self) -> None:
+        objects = self._populated()
+        objects[f"{self.LANE}/quiet.ndjson"] = b""
+        objects[f"{self.LANE}/quiet.seal.json"] = _seal(b"", data_file="quiet.ndjson")
+
+        check = self._check(self._report(objects), "every_segment_is_sealed")
+        self.assertEqual(check["status"], "PASS")
+        self.assertEqual(check["evidence"]["failures"], [])
+        self.assertEqual(check["evidence"]["empty_segments"], 1)
+        self.assertEqual(
+            check["evidence"]["empty_examples"], [f"{self.LANE}/quiet.ndjson"]
+        )
+
+    def test_a_seal_whose_segment_is_really_gone_still_fails(self) -> None:
+        objects = self._populated()
+        # The seal names a data file the dataset does not carry at all.
+        objects[f"{self.LANE}/gone.seal.json"] = _seal(b"", data_file="gone.ndjson")
+
+        check = self._check(self._report(objects), "every_segment_is_sealed")
+        self.assertEqual(check["status"], "FAIL")
+        self.assertEqual(
+            check["evidence"]["failures"],
+            [f"{self.LANE}/gone.ndjson: sealed but the segment is absent"],
+        )
+        self.assertEqual(check["evidence"]["empty_segments"], 0)
+
+    def test_an_empty_segment_is_verified_against_its_seal_not_skipped(self) -> None:
+        # The old loop never reached an empty segment, so a seal that lied about
+        # it was accepted. Both the length and the digest must now be checked.
+        objects = self._populated()
+        objects[f"{self.LANE}/quiet.ndjson"] = b""
+        objects[f"{self.LANE}/quiet.seal.json"] = json.dumps(
+            {
+                "data_file": "quiet.ndjson",
+                "byte_length": 41,
+                "line_count": 0,
+                "sha256": hashlib.sha256(b"not what is on disk").hexdigest(),
+            },
+            separators=(",", ":"),
+        ).encode()
+
+        check = self._check(self._report(objects), "every_segment_is_sealed")
+        self.assertEqual(check["status"], "FAIL")
+        failures = check["evidence"]["failures"]
+        self.assertIn(f"{self.LANE}/quiet.ndjson: byte_length 41 != 0", failures)
+        self.assertIn(
+            f"{self.LANE}/quiet.ndjson: sha256 disagrees with the bytes", failures
+        )
+
+    def test_a_segment_with_records_but_no_seal_still_fails(self) -> None:
+        data = _line(1, 1, {"bids": [], "asks": []})
+        check = self._check(
+            self._report({f"{self.LANE}/unsealed.ndjson": data}),
+            "every_segment_is_sealed",
+        )
+        self.assertEqual(check["status"], "FAIL")
+        self.assertEqual(
+            check["evidence"]["failures"],
+            [f"{self.LANE}/unsealed.ndjson: no seal"],
+        )
 
 
 class GateOneObjectFilterTests(unittest.TestCase):

@@ -173,6 +173,9 @@ class _AuditState:
         self.seals: dict[str, dict[str, Any]] = {}
         self.seal_failures: list[str] = []
         self.segments_seen: set[str] = set()
+        #: Sealed segments that hold no records. Evidence, not failure — see
+        #: `verify_seals`.
+        self.empty_segments: list[str] = []
         self.reference_events = 0
         self.reference_events_stamped = 0
         self.game_state_events = 0
@@ -393,14 +396,30 @@ class _AuditState:
         commit marker, so a segment missing one is a file whose writer never
         finished claiming it — indistinguishable, without this check, from one
         that did.
+
+        **A sealed segment holding no records is not a missing segment.** It is
+        the positive evidence that the lane was alive and the venue was silent
+        for that window, which is the normal state of a low-volume venue —
+        Limitless produced 30 such windows out of 82 in one real capture. This
+        walks the union of the segments records were observed in and the
+        segments a seal names, and consults the input manifest to tell the two
+        apart: a key the manifest does not carry is genuinely absent, while a
+        key it does carry is present and simply empty.
+
+        The earlier loop walked `segments_seen` alone, which is populated per
+        parsed record (`observe`). An empty segment therefore fell out of it and
+        was reported as absent — and, less visibly, was never length- or
+        digest-checked at all. Both are fixed here: an empty segment is verified
+        against its seal like any other and then recorded as evidence.
         """
-        for segment in sorted(self.segments_seen):
+        for segment in sorted(self.segments_seen | set(self.seals)):
             seal = self.seals.get(segment)
             if seal is None:
                 self.seal_failures.append(f"{segment}: no seal")
                 continue
             identity = objects.get(segment)
             if identity is None:
+                self.seal_failures.append(f"{segment}: sealed but the segment is absent")
                 continue
             if identity.size != seal["byte_length"]:
                 self.seal_failures.append(
@@ -408,8 +427,8 @@ class _AuditState:
                 )
             if identity.sha256 != seal["sha256"]:
                 self.seal_failures.append(f"{segment}: sha256 disagrees with the bytes")
-        for segment in sorted(set(self.seals) - self.segments_seen):
-            self.seal_failures.append(f"{segment}: sealed but the segment is absent")
+            if segment not in self.segments_seen:
+                self.empty_segments.append(segment)
 
     def observe_coverage(self, document: Any) -> None:
         if not isinstance(document, dict) or not isinstance(document.get("sightings"), list):
@@ -548,6 +567,11 @@ class _AuditState:
             "Every segment carries a seal whose length and digest match its bytes.",
             segments=len(self.segments_seen),
             seals=len(self.seals),
+            # A silent window is reported rather than hidden: a lane that is
+            # alive and producing nothing looks identical to a dead one in every
+            # other number here.
+            empty_segments=len(self.empty_segments),
+            empty_examples=sorted(self.empty_segments)[:10],
             failures=self.seal_failures[:10],
         )
         add(
