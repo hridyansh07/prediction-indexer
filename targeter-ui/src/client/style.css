@@ -199,6 +199,7 @@ main {
 .cards {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
+  align-items: start;
   gap: 14px;
 }
 .bundle {
@@ -236,14 +237,50 @@ main {
   font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
-.bundle p {
-  color: #b6c0ca;
-  font-size: 13px;
-}
-.relationships {
-  padding: 12px 0;
+.markets {
+  margin-bottom: 12px;
   border-top: 1px solid #26333b;
   border-bottom: 1px solid #26333b;
+}
+.markets summary {
+  padding: 10px 0;
+  color: #d7e0e8;
+  font-size: 12px;
+  font-weight: 700;
+}
+.markets ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 12px;
+  list-style: none;
+}
+.markets li {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  gap: 2px 8px;
+  padding: 7px 8px;
+  border-radius: 4px;
+  background: #0c1217;
+  color: #b6c0ca;
+  font-size: 11px;
+}
+.markets code {
+  grid-column: 2;
+  color: #778693;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.market-venue {
+  grid-row: 1 / span 2;
+  color: #67e4c2;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.relationships {
+  padding-top: 2px;
   color: #b6c0ca;
   font-size: 12px;
 }

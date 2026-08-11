@@ -38,6 +38,15 @@ const scoreLabel = (x: any) => {
     ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
     : '—';
 };
+const compactCurrency = (x: any) => {
+  const n = Number(x);
+  return Number.isFinite(n)
+    ? `$${n.toLocaleString('en-US', {
+        notation: 'compact',
+        maximumFractionDigits: 1,
+      })}`
+    : '—';
+};
 const relationshipSummary = (candidate: any) => {
   const counts = new Map<string, number>();
   for (const item of list(candidate.relationship_analysis?.relationships)) {
@@ -239,22 +248,60 @@ function Bundles({ run }: { run: RunView }) {
               <dd>{date(c.capture_start_at)}</dd>
               <dt>Volume gate</dt>
               <dd>
-                {val(c.admission?.combined_moneyline_volume_usd)} /{' '}
-                {val(c.admission?.minimum_moneyline_volume_usd)} USD
+                {compactCurrency(c.admission?.combined_moneyline_volume_usd)} /{' '}
+                {compactCurrency(c.admission?.minimum_moneyline_volume_usd)}
               </dd>
-              <dt>Markets</dt>
-              <dd>{list(c.eligible_market_ids).length}</dd>
             </dl>
+            <MarketList run={run} candidate={c} />
             <RelationshipSummary candidate={c} />
-            <p>
-              <b>Why chosen:</b> Passed event admission gates and fit the
-              configured allocation limits.
-            </p>
           </article>
         ))}
       </div>
       {!cs.length && <p className="empty">No bundles selected in this run.</p>}
     </section>
+  );
+}
+function MarketList({ run, candidate }: { run: RunView; candidate: any }) {
+  const targets = Object.entries(run.report.selection?.targets ?? {}).flatMap(
+    ([venue, items]) =>
+      list(items)
+        .filter((item) => item.bundle_id === candidate.bundle_id)
+        .map((item) => ({
+          venue,
+          id: String(item.target_id ?? item.source_ref ?? ''),
+          type: String(item.canonical_class ?? ''),
+        })),
+  );
+  const markets = (
+    targets.length
+      ? targets
+      : list(candidate.eligible_market_ids).map((id) => {
+          const [venue, ...rest] = String(id).split(':');
+          return { venue, id: String(id), type: rest.length ? '' : 'market' };
+        })
+  ).sort(
+    (a, b) =>
+      a.venue.localeCompare(b.venue) ||
+      a.type.localeCompare(b.type) ||
+      a.id.localeCompare(b.id),
+  );
+  return (
+    <details className="markets">
+      <summary>{markets.length} markets</summary>
+      <ul>
+        {markets.map((market) => (
+          <li key={market.id}>
+            <span className="market-venue">{market.venue}</span>
+            <span>
+              {market.type
+                ? relationshipLabel(market.type.split('.').at(-1)!)
+                : 'Market'}
+            </span>
+            <code>{market.id.replace(`${market.venue}:`, '')}</code>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 function RelationshipSummary({ candidate }: { candidate: any }) {
