@@ -19,5 +19,5 @@ for name in \
 	fi
 done
 
+./scripts/refresh-amp-aws-token
 amp orb services ensure
-amp orb service restart aws-identity
