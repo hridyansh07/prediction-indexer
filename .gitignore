@@ -27,7 +27,12 @@ data/spool/
 data/ingest-store/
 data/live/
 
-# Targeter observability web build/dependencies
+# Node workspace build/dependencies
+node_modules/
+archive/node/node_modules/
+archive/node/dist/
+encoder/node/node_modules/
+encoder/node/dist/
 targeter-ui/node_modules/
 targeter-ui/dist/
 targeter-ui/dist-server/

@@ -1,4 +1,4 @@
 #!/usr/bin/env sh
 set -eu
 
-yarn --cwd targeter-ui lint
+yarn lint

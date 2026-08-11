@@ -1,0 +1,28 @@
+{
+  "name": "@prediction-indexer/read-only-object-store",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.864.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.17.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}

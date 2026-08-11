@@ -4,11 +4,18 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'dist-server/**', 'node_modules/**'] },
+  {
+    ignores: [
+      '**/dist/**',
+      '**/dist-server/**',
+      '**/node_modules/**',
+      'encoder/rust/target/**',
+    ],
+  },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ['src/client/**/*.{ts,tsx}'],
+    files: ['targeter-ui/src/client/**/*.{ts,tsx}'],
     languageOptions: { globals: globals.browser },
     plugins: {
       'react-hooks': reactHooks,
@@ -18,7 +25,13 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/server/**/*.ts', 'test/**/*.ts', 'vite.config.ts'],
+    files: [
+      'archive/node/**/*.ts',
+      'encoder/node/**/*.ts',
+      'targeter-ui/src/server/**/*.ts',
+      'targeter-ui/test/**/*.ts',
+      'targeter-ui/vite.config.ts',
+    ],
     languageOptions: { globals: globals.node },
   },
   {

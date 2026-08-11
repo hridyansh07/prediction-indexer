@@ -14,10 +14,10 @@ if ! command -v docker >/dev/null 2>&1; then
 	sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 
-if ! command -v zstd >/dev/null 2>&1; then
-	sudo apt-get update
-	sudo apt-get install -y zstd
-fi
-
-yarn --cwd targeter-ui install --frozen-lockfile
+yarn install --frozen-lockfile
+yarn build:packages
+CARGO_BIN="$(command -v cargo || printf '%s' "$HOME/.cargo/bin/cargo")"
+"$CARGO_BIN" build --release \
+	--manifest-path encoder/rust/Cargo.toml \
+	--bin prediction-decode-v1
 git config core.hooksPath .githooks

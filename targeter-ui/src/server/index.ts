@@ -2,8 +2,8 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { S3Client } from '@aws-sdk/client-s3';
-import { S3ArchiveStore } from './store.js';
+import { S3ReadOnlyObjectStore } from '@prediction-indexer/read-only-object-store';
+import { RustV1Decoder } from '@prediction-indexer/rust-v1-decoder';
 import { SnapshotService } from './service.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +19,7 @@ const required = [
   'TARGETER_UI_S3_BUCKET',
   'TARGETER_UI_AWS_REGION',
   'TARGETER_UI_S3_EXPECTED_OWNER',
+  'TARGETER_UI_DECODER_PATH',
 ] as const;
 if (!fixture) {
   const missing = required.filter((k) => !process.env[k]);
@@ -50,17 +51,21 @@ if (maxRuns !== 5) throw new Error('TARGETER_UI_MAX_RUNS is fixed at 5');
 const port = positive(process.env.PORT, 3000, 'PORT');
 const store = fixture
   ? null
-  : new S3ArchiveStore(
-      new S3Client({ region: process.env.TARGETER_UI_AWS_REGION }),
-      process.env.TARGETER_UI_S3_BUCKET!,
-      process.env.TARGETER_UI_S3_PREFIX ?? 'targeter-v2/runs',
-      process.env.TARGETER_UI_S3_EXPECTED_OWNER!,
-    );
+  : new S3ReadOnlyObjectStore({
+      bucket: process.env.TARGETER_UI_S3_BUCKET!,
+      region: process.env.TARGETER_UI_AWS_REGION!,
+      expectedBucketOwner: process.env.TARGETER_UI_S3_EXPECTED_OWNER!,
+    });
+const decoder = fixture
+  ? null
+  : new RustV1Decoder({ binaryPath: process.env.TARGETER_UI_DECODER_PATH! });
 const service = new SnapshotService(
   store,
+  decoder,
   readConfig(),
   refreshSeconds,
   expectedRunSeconds,
+  process.env.TARGETER_UI_S3_PREFIX ?? 'targeter-v2/runs',
   fixture,
 );
 const app = express();

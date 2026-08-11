@@ -1,10 +1,14 @@
 services:
   aws-identity:
     command: |
-      set -eu
+      set -u
       while true; do
-        ./scripts/refresh-amp-aws-token
-        sleep 2700
+        if ./scripts/refresh-amp-aws-token; then
+          sleep 2700
+        else
+          echo "Amp AWS identity refresh failed; retrying in 30 seconds" >&2
+          sleep 30
+        fi
       done
 
   targeter-ui:
@@ -12,10 +16,12 @@ services:
       set -eu
       REPO_ROOT="$(git rev-parse --show-toplevel)"
       export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
+      export TARGETER_UI_DECODER_PATH="$REPO_ROOT/encoder/rust/target/release/prediction-decode-v1"
       while [ ! -s "$AWS_WEB_IDENTITY_TOKEN_FILE" ]; do
         sleep 1
       done
-      exec yarn --cwd targeter-ui dev
+      yarn build
+      exec yarn workspace prediction-indexer-targeter-ui start
     port: 3000
     environment:
       PORT: "3000"

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[[bin]]
+name = "prediction-decode-v1"
+path = "src/bin/decode_v1.rs"
+
 [dependencies]
 zstd = "0.13"
 sha2 = "0.10"
