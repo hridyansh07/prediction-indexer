@@ -227,9 +227,36 @@ main {
 .bundle dd {
   margin: 0;
 }
+.score {
+  color: #67e4c2;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
 .bundle p {
   color: #b6c0ca;
   font-size: 13px;
+}
+.relationships {
+  padding: 12px 0;
+  border-top: 1px solid #26333b;
+  border-bottom: 1px solid #26333b;
+  color: #b6c0ca;
+  font-size: 12px;
+}
+.relationship-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.relationship-types span {
+  padding: 4px 7px;
+  border: 1px solid #30423f;
+  border-radius: 4px;
+  background: #15221f;
+}
+.relationship-types strong {
+  color: #67e4c2;
 }
 .reasonbar {
   display: flex;

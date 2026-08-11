@@ -11,6 +11,31 @@ const date = (x: any) => {
   const d = new Date(x);
   return Number.isNaN(d.valueOf()) ? val(x) : d.toLocaleString();
 };
+const numericScore = (x: any) => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
+};
+const scoreLabel = (x: any) => {
+  const n = numericScore(x);
+  return Number.isFinite(n)
+    ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+    : '—';
+};
+const relationshipSummary = (candidate: any) => {
+  const counts = new Map<string, number>();
+  for (const item of list(candidate.relationship_analysis?.relationships)) {
+    if (typeof item?.relationship !== 'string' || !item.relationship) continue;
+    counts.set(item.relationship, (counts.get(item.relationship) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort(
+    ([left, leftCount], [right, rightCount]) =>
+      rightCount - leftCount || left.localeCompare(right),
+  );
+};
+const relationshipLabel = (x: string) => {
+  const label = x.toLowerCase().replaceAll('_', ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+};
 function App() {
   const [s, setS] = useState<Snapshot | null>(null);
   const [error, setError] = useState('');
@@ -155,9 +180,13 @@ function Metric({ n, label }: { n: any; label: string }) {
 }
 function Bundles({ run }: { run: RunView }) {
   const selected = new Set(list(run.report.selection?.bundle_ids));
-  const cs = list(run.report.candidates).filter((c) =>
-    selected.has(c.bundle_id),
-  );
+  const cs = list(run.report.candidates)
+    .filter((c) => selected.has(c.bundle_id))
+    .sort(
+      (a, b) =>
+        numericScore(b.score) - numericScore(a.score) ||
+        String(a.bundle_id).localeCompare(String(b.bundle_id)),
+    );
   return (
     <section>
       <Title
@@ -169,9 +198,10 @@ function Bundles({ run }: { run: RunView }) {
           <article className="bundle" key={c.bundle_id}>
             <div className="row">
               <span className="tag">{val(c.sport)}</span>
-              <span className="muted">{list(c.venues).join(' · ')}</span>
+              <strong className="score">Score {scoreLabel(c.score)}</strong>
             </div>
             <h3>{list(c.participants).join(' vs ') || c.bundle_id}</h3>
+            <div className="muted">{list(c.venues).join(' · ')}</div>
             <dl>
               <dt>Activation</dt>
               <dd>{date(c.activation_at)}</dd>
@@ -185,22 +215,34 @@ function Bundles({ run }: { run: RunView }) {
               <dt>Markets</dt>
               <dd>{list(c.eligible_market_ids).length}</dd>
             </dl>
-            <p>
-              <b>Relationships:</b>{' '}
-              {list(c.relationship_analysis?.relationships)
-                .map((x: any) => x.relationship)
-                .filter(Boolean)
-                .join(', ') || 'None recorded'}
-            </p>
+            <RelationshipSummary candidate={c} />
             <p>
               <b>Why chosen:</b> Passed event admission gates and fit the
-              configured allocation limits. Diagnostic score: {val(c.score)}.
+              configured allocation limits.
             </p>
           </article>
         ))}
       </div>
       {!cs.length && <p className="empty">No bundles selected in this run.</p>}
     </section>
+  );
+}
+function RelationshipSummary({ candidate }: { candidate: any }) {
+  const entries = relationshipSummary(candidate);
+  const total = entries.reduce((sum, [, count]) => sum + count, 0);
+  return (
+    <div className="relationships">
+      <b>{total ? `${total} relationships` : 'No relationships recorded'}</b>
+      {!!entries.length && (
+        <div className="relationship-types">
+          {entries.map(([type, count]) => (
+            <span key={type}>
+              <strong>{count}</strong> {relationshipLabel(type)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 function Rejections({ run }: { run: RunView }) {
@@ -256,21 +298,28 @@ function Events({ s }: { s: Snapshot }) {
     [s],
   );
   const reasons = [...new Set(rows.flatMap((x) => x.reasons))];
-  const shown = rows.filter((x) => {
-    const hay = JSON.stringify([
-      x.c.participants,
-      x.c.bundle_id,
-      x.c.venues,
-      x.c.event_status,
-      x.reasons,
-    ]).toLowerCase();
-    return (
-      hay.includes(q.toLowerCase()) &&
-      (state === 'all' || state === x.decision) &&
-      (run === 'all' || run === x.r.runId) &&
-      (reason === 'all' || x.reasons.includes(reason))
+  const shown = rows
+    .filter((x) => {
+      const hay = JSON.stringify([
+        x.c.participants,
+        x.c.bundle_id,
+        x.c.venues,
+        x.c.event_status,
+        x.reasons,
+      ]).toLowerCase();
+      return (
+        hay.includes(q.toLowerCase()) &&
+        (state === 'all' || state === x.decision) &&
+        (run === 'all' || run === x.r.runId) &&
+        (reason === 'all' || x.reasons.includes(reason))
+      );
+    })
+    .sort(
+      (a, b) =>
+        numericScore(b.c.score) - numericScore(a.c.score) ||
+        b.r.runId.localeCompare(a.r.runId) ||
+        String(a.c.bundle_id).localeCompare(String(b.c.bundle_id)),
     );
-  });
   return (
     <section>
       <Title
@@ -329,7 +378,7 @@ function Events({ s }: { s: Snapshot }) {
               </span>
               <b>{list(c.participants).join(' vs ') || c.bundle_id}</b>
               <span>
-                {val(c.event_status)} · {r.runId}
+                Score {scoreLabel(c.score)} · {val(c.event_status)} · {r.runId}
               </span>
             </summary>
             <div className="detail">
