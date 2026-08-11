@@ -1,13 +1,17 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { ArchiveStore } from './store.js';
+import {
+  withStagedObject,
+  type ReadOnlyObjectStore,
+} from '@prediction-indexer/read-only-object-store';
 import {
   latestRunKeys,
   MAX_STORED_BYTES,
+  type ReportDecoder,
   reportFile,
   summarizeReport,
   validateManifest,
-  validateReportBytes,
+  validateReportPath,
 } from './core.js';
 import type { Json, Snapshot } from '../shared.js';
 
@@ -15,10 +19,12 @@ export class SnapshotService {
   snapshot: Snapshot;
   private active: Promise<Snapshot> | null = null;
   constructor(
-    private store: ArchiveStore | null,
+    private store: ReadOnlyObjectStore | null,
+    private decoder: ReportDecoder | null,
     private config: Json,
     private refreshSeconds: number,
     private expectedRunSeconds: number,
+    private prefix = 'targeter-v2/runs',
     private fixturePath?: string,
   ) {
     this.snapshot = {
@@ -66,23 +72,29 @@ export class SnapshotService {
         throw new Error('fixture must be an array or {runs: []}');
     } else {
       const store = this.store!;
-      const keys = latestRunKeys(await store.listManifests());
+      const listed: string[] = [];
+      const prefix = `${this.prefix.replace(/\/+$/, '')}/`;
+      for await (const key of store.listKeys(prefix)) listed.push(key);
+      const keys = latestRunKeys(listed);
       reports = await Promise.all(
         keys.map(async ({ key, parsed }) => {
-          const manifest = validateManifest(
-            JSON.parse(
-              new TextDecoder().decode(await store.get(key, 1024 * 1024)),
-            ),
-            parsed.runId,
+          const manifest = await withStagedObject(
+            store,
+            key,
+            { maxBytes: 1024 * 1024 },
+            async ({ path: manifestPath }) =>
+              validateManifest(
+                JSON.parse(await fs.readFile(manifestPath, 'utf8')),
+                parsed.runId,
+              ),
           );
           const file = reportFile(manifest);
-          const report = await validateReportBytes(
-            await store.get(
-              path.posix.join(path.posix.dirname(key), file.file),
-              MAX_STORED_BYTES,
-            ),
-            file,
-            parsed.runId,
+          const report = await withStagedObject(
+            store,
+            path.posix.join(path.posix.dirname(key), file.file),
+            { maxBytes: MAX_STORED_BYTES, expected: file.storedIdentity },
+            ({ path: reportPath }) =>
+              validateReportPath(reportPath, file, parsed.runId, this.decoder),
           );
           if (
             report.generated_at !== manifest.generated_at ||

@@ -13,17 +13,20 @@ export AWS_ROLE_SESSION_NAME=prediction-indexer-targeter-ui
 export TARGETER_UI_S3_BUCKET=example-archive
 export TARGETER_UI_AWS_REGION=us-east-1
 export TARGETER_UI_S3_EXPECTED_OWNER=123456789012
+export TARGETER_UI_DECODER_PATH="$PWD/encoder/rust/target/release/prediction-decode-v1"
 # optional: TARGETER_UI_S3_PREFIX=targeter-v2/runs
 # optional: TARGETER_UI_REFRESH_SECONDS=60 TARGETER_UI_EXPECTED_RUN_SECONDS=600 PORT=3000
 yarn install --frozen-lockfile
-yarn dev
+cargo build --release --manifest-path encoder/rust/Cargo.toml --bin prediction-decode-v1
+yarn build
+yarn workspace prediction-indexer-targeter-ui start
 ```
 
 `TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
 
-Commands: `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, `yarn build`, and `yarn start` (after build). The production Express server serves `dist/` and its API on `PORT`.
+From the repository root, use `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, and `yarn build`. The production Express server serves `dist/` and its API on `PORT`.
 
-Repository setup configures `.githooks/pre-commit` through the local `core.hooksPath`. The hook runs `yarn --cwd targeter-ui lint` and blocks commits containing unformatted or lint-invalid UI code. Developers who do not run `.agents/setup` can enable it with `git config core.hooksPath .githooks`.
+Repository setup configures `.githooks/pre-commit` through the local `core.hooksPath`. The hook runs the root `yarn lint` gate and blocks commits containing unformatted or lint-invalid Node/UI code. Developers who do not run `.agents/setup` can enable it with `git config core.hooksPath .githooks`.
 
 ## IAM / OIDC
 
@@ -33,10 +36,10 @@ The `aws-identity` orb service runs [`scripts/refresh-amp-aws-token`](../scripts
 
 ## Identity and bounds
 
-Only `date=YYYY-MM-DD/run=<run_id>/run_manifest.json` keys are commit markers. Listing is paginated and latest runs are chosen by validated microsecond UTC run ID, never `LastModified`. Manifest v2 and report v1 structure are checked. Stored SHA-256/length are verified before decoding; the system `zstd` decoder validates the checksum while a bounded child stream and frame parser enforce one frame, no trailing data, and the logical output limit. Logical SHA-256/length/LF count are checked before UTF-8 JSON parsing. Selection reports alone may be buffered: stored size is limited to **16 MiB**, decoded size to **64 MiB**, and manifest to **1 MiB**. Catalogues are never downloaded. The cache is memory-only, refreshes at startup/on interval/API request, coalesces overlapping refreshes, and retains the last successful snapshot with a stale/error flag.
+Only `date=YYYY-MM-DD/run=<run_id>/run_manifest.json` keys are commit markers. Listing is paginated and latest runs are chosen by validated microsecond UTC run ID, never `LastModified`. Manifest v2 and report v1 structure are checked. The shared staging package verifies stored SHA-256/length. For compressed reports, the Rust protocol-v1 decoder verifies the strict Zstandard profile and logical SHA-256/length/LF count before the UI parses its output. `TARGETER_UI_DECODER_PATH` is required in S3 mode and must be an absolute path; fixture mode does not require it. Selection reports alone may be buffered after validation: stored size is limited to **16 MiB**, decoded size to **64 MiB**, and manifest to **1 MiB**. Catalogues are never downloaded. The cache is memory-only, refreshes at startup/on interval/API request, coalesces overlapping refreshes, and retains the last successful snapshot with a stale/error flag.
 
 The displayed strategy is `configs/targeter_v2.json` from the **current checkout**. Archives do not embed the complete historical config. The UI compares report and checkout strategy versions, but correctly labels a match as evidence rather than byte-level proof of the historical settings.
 
 ## Amp orb
 
-Register the required environment variables in the Amp project before creating the orb, then run `amp orb services ensure`. Project variables added later are available to newly created orbs, not an already-running orb. `.amp/services.yaml` starts the token refresher and exposes port 3000 through an Amp portal. The token lives only under the gitignored `.amp/runtime/` directory; no AWS access key or web-identity token belongs in Git or `.env.example`.
+Register the required AWS and archive environment variables in the Amp project before creating the orb, then run `amp orb services ensure`. Project variables added later are available to newly created orbs, not an already-running orb. `.agents/setup` builds `prediction-decode-v1`; `.amp/services.yaml` passes that binary's exact repository path to the UI, starts the token refresher, and exposes port 3000 through an Amp portal. The token lives only under the gitignored `.amp/runtime/` directory; no AWS access key or web-identity token belongs in Git or `.env.example`.

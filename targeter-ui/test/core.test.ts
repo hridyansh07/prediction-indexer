@@ -1,238 +1,222 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   latestRunKeys,
-  parseManifestKey,
   reportFile,
   summarizeReport,
   validateManifest,
-  validateReportBytes,
+  validateReportPath,
 } from '../src/server/core.js';
-const id = (b: Uint8Array) => ({
-  sha256: createHash('sha256').update(b).digest('hex'),
-  byte_length: b.length,
-});
-const candidate = (
-  bundle_id: string,
-  eligible: boolean,
-  rejection_reasons: string[],
-) => ({
-  bundle_id,
-  eligible,
-  event_status: eligible ? 'ELIGIBLE' : 'REJECTED',
-  rejection_reasons,
-  participants: ['Alpha', 'Beta'],
-  venues: ['kalshi', 'polymarket'],
-  activation_at: '2026-08-10T13:00:00Z',
-  capture_start_at: '2026-08-10T12:00:00Z',
-  admission: {},
-  market_exclusions: {},
-  eligible_market_ids: [],
-});
-const artifacts = Object.fromEntries(
-  [
-    'rule_templates.ndjson',
-    'rule_drift.ndjson',
-    ...['kalshi', 'polymarket', 'limitless'].flatMap((venue) => [
-      `catalog_${venue}_events.ndjson`,
-      `catalog_${venue}_markets.ndjson`,
-    ]),
-  ].map((name) => [name, {}]),
-);
-const report = {
+
+const hash = (bytes: Uint8Array) =>
+  createHash('sha256').update(bytes).digest('hex');
+const report = (runId = '20260810T120000.000001Z') => ({
   report_version: 1,
   mode: 'shadow',
-  run_id: '20260810T120000.000001Z',
+  run_id: runId,
   generated_at: '2026-08-10T12:00:00Z',
   input_complete: true,
   discovery_failures: {},
-  artifact_format: 'ndjson',
-  artifacts,
-  candidates: [
-    candidate('a', true, []),
-    candidate('b', false, ['low_volume']),
-    candidate('c', true, []),
-  ],
-  catalogs: ['kalshi', 'polymarket', 'limitless'].map((venue, index) => ({
-    venue,
-    complete: index !== 1,
-    events: 1,
-    markets: 2,
-  })),
+  catalogs: [],
+  candidates: [],
   selection: {
-    bundle_ids: ['a'],
-    bundle_count: 1,
-    targets: { kalshi: [1], polymarket: [2, 3], limitless: [] },
-    allocation_rejections: { c: 'target_budget_exceeded' },
+    bundle_ids: [],
+    bundle_count: 0,
+    targets: { kalshi: [], polymarket: [], limitless: [] },
+    allocation_rejections: {},
     publication_performed: false,
   },
-};
-test('parses only canonical committed manifest keys and sorts by run id', () => {
-  assert.equal(
-    parseManifestKey(
-      'x/date=2026-08-10/run=20260810T120000.000001Z/run_manifest.json',
-    )?.runId,
-    report.run_id,
-  );
-  assert.equal(
-    parseManifestKey(
-      'x/date=2026-08-09/run=20260810T120000.000001Z/run_manifest.json',
-    ),
-    null,
-  );
-  const got = latestRunKeys([
-    'p/date=2026-08-10/run=20260810T120000.000001Z/run_manifest.json',
-    'p/date=2026-08-10/run=20260810T130000.000001Z/run_manifest.json',
-  ]);
-  assert.match(got[0].key, /130000/);
 });
-test('validates manifest v2', () => {
-  assert.equal(
-    validateManifest(
+const plainFile = (bytes: Buffer) =>
+  reportFile({
+    files: [
       {
-        targeter_run_manifest_version: 2,
-        run_id: report.run_id,
-        generated_at: report.generated_at,
-        input_complete: true,
-        files: [],
+        file: 'selection_report.json',
+        sha256: hash(bytes),
+        byte_length: bytes.length,
+        content_type: 'application/json',
+        content_encoding: null,
       },
-      report.run_id,
-    ).run_id,
-    report.run_id,
+    ],
+  });
+
+test('filters canonical keys and applies latest-five run-id ordering', () => {
+  const keys = Array.from(
+    { length: 6 },
+    (_, i) =>
+      `p/date=2026-08-10/run=20260810T1${i}0000.000001Z/run_manifest.json`,
   );
-  assert.throws(() => validateManifest({}, report.run_id));
-});
-test('requires the report commit metadata and approved compression profile', () => {
-  const compression = {
-    algorithm: 'zstd',
-    level: 3,
-    frame_checksum: true,
-    dictionary: null,
-    frame_count: 1,
-    encoder: 'test',
-  };
-  const compressed = {
-    file: 'selection_report.json.zst',
-    content_type: 'application/json',
-    content_encoding: 'zstd',
-    decoded: {},
-    stored: {},
-    compression,
-  };
-  assert.throws(() => reportFile({ files: [compressed] }), /metadata marker/);
-  const marker = {
-    file: 'selection_report.meta.json',
-    sha256: '0'.repeat(64),
-    byte_length: 10,
-    content_type: 'application/json',
-    content_encoding: null,
-  };
-  assert.equal(
-    reportFile({ files: [compressed, marker] }).file,
-    'selection_report.json.zst',
+  keys.push(
+    'p/catalog_kalshi_events.ndjson',
+    'p/date=bad/run=x/run_manifest.json',
+  );
+  assert.deepEqual(
+    latestRunKeys(keys).map((x) => x.parsed.runId.slice(9, 11)),
+    ['15', '14', '13', '12', '11'],
   );
 });
-test('verifies plain report identity before parsing', async () => {
-  const bytes = Buffer.from(JSON.stringify(report));
-  const file = {
-    file: 'selection_report.json',
-    ...id(bytes),
-    content_type: 'application/json',
-    content_encoding: null,
+
+test('keeps manifest schemas closed and report compression profiles exact', () => {
+  const runId = report().run_id;
+  const manifest = {
+    targeter_run_manifest_version: 2,
+    run_id: runId,
+    generated_at: report().generated_at,
+    input_complete: true,
+    files: [],
   };
-  assert.equal(
-    (await validateReportBytes(bytes, file, report.run_id)).run_id,
-    report.run_id,
+  assert.equal(validateManifest(manifest, runId).run_id, runId);
+  assert.throws(
+    () => validateManifest({ ...manifest, unexpected: true }, runId),
+    /fields/,
   );
-  await assert.rejects(
+  assert.throws(
     () =>
-      validateReportBytes(
-        bytes,
-        { ...file, sha256: '0'.repeat(64) },
-        report.run_id,
-      ),
-    /identity/,
+      reportFile({
+        files: [
+          {
+            file: 'selection_report.json.zst',
+            content_type: 'application/json',
+            content_encoding: 'zstd',
+            stored: { sha256: '0'.repeat(64), byte_length: 1 },
+            decoded: {
+              sha256: '0'.repeat(64),
+              byte_length: 1,
+              line_count: 0,
+            },
+            compression: {
+              algorithm: 'zstd',
+              level: 4,
+              frame_checksum: true,
+              dictionary: null,
+              frame_count: 1,
+              encoder: 'test',
+            },
+          },
+          {
+            file: 'selection_report.meta.json',
+            sha256: '0'.repeat(64),
+            byte_length: 1,
+            content_type: 'application/json',
+            content_encoding: null,
+          },
+        ],
+      }),
+    /compression profile/,
   );
 });
-test('strict Zstd decode rejects missing/bad checksums, truncation, trailing frames, and LF drift', async () => {
-  const zstdReport = {
-    ...report,
-    artifact_format: 'zstd',
-    artifacts: Object.fromEntries(
-      Object.keys(artifacts).map((name) => [`${name}.zst`, {}]),
-    ),
+
+test('summarizes admission and allocation rejection evidence', () => {
+  const value: any = report();
+  value.candidates = [
+    { bundle_id: 'selected' },
+    { bundle_id: 'admission', rejection_reasons: ['low_volume'] },
+    { bundle_id: 'allocation', rejection_reasons: [] },
+  ];
+  value.selection.bundle_ids = ['selected'];
+  value.selection.bundle_count = 1;
+  value.selection.allocation_rejections = {
+    allocation: 'target_budget_exceeded',
   };
-  const decoded = Buffer.from(`${JSON.stringify(zstdReport)}\n`);
-  const encode = (checksum: boolean) => {
-    const result = spawnSync(
-      'zstd',
-      [
-        '--compress',
-        '-3',
-        checksum ? '--check' : '--no-check',
-        '--stdout',
-        '--quiet',
-      ],
-      { input: decoded },
+  assert.deepEqual(summarizeReport(value).rejectionReasons, {
+    low_volume: 1,
+    target_budget_exceeded: 1,
+  });
+});
+
+test('parses plain staged paths and compressed paths only after decoder success', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'ui-core-'));
+  try {
+    const decoded = Buffer.from(JSON.stringify(report()));
+    const plainPath = join(dir, 'plain');
+    await writeFile(plainPath, decoded);
+    assert.equal(
+      (
+        await validateReportPath(
+          plainPath,
+          plainFile(decoded),
+          report().run_id,
+          null,
+        )
+      ).run_id,
+      report().run_id,
     );
-    assert.equal(result.status, 0, result.stderr.toString());
-    return result.stdout;
-  };
-  const stored = encode(true);
-  const file = {
-    file: 'selection_report.json.zst',
-    stored: id(stored),
-    decoded: { ...id(decoded), line_count: 1 },
-  };
-  assert.equal(
-    (await validateReportBytes(stored, file, report.run_id)).run_id,
-    report.run_id,
-  );
-  for (const invalid of [
-    Buffer.concat([stored, stored]),
-    stored.subarray(0, stored.length - 1),
-    Buffer.from(stored),
-  ]) {
-    if (invalid.length === stored.length) invalid[invalid.length - 1] ^= 1;
+
+    const stored = Buffer.from('not decoded by UI');
+    const storedPath = join(dir, 'stored');
+    const decodedPath = join(dir, 'decoded');
+    await writeFile(storedPath, stored);
+    await writeFile(decodedPath, decoded);
+    const compressed = reportFile({
+      files: [
+        {
+          file: 'selection_report.json.zst',
+          content_type: 'application/json',
+          content_encoding: 'zstd',
+          stored: { sha256: hash(stored), byte_length: stored.length },
+          decoded: {
+            sha256: hash(decoded),
+            byte_length: decoded.length,
+            line_count: 0,
+          },
+          compression: {
+            algorithm: 'zstd',
+            level: 3,
+            frame_checksum: true,
+            dictionary: null,
+            frame_count: 1,
+            encoder: 'test',
+          },
+        },
+        {
+          file: 'selection_report.meta.json',
+          sha256: '0'.repeat(64),
+          byte_length: 1,
+          content_type: 'application/json',
+          content_encoding: null,
+        },
+      ],
+    });
+    let decoderSucceeded = false;
+    const decoder = {
+      async withDecodedFile<T>(
+        _path: string,
+        expectation: any,
+        use: (path: string) => Promise<T>,
+      ) {
+        assert.equal(expectation.stored.sha256, hash(stored));
+        decoderSucceeded = true;
+        return use(decodedPath);
+      },
+    };
+    assert.equal(
+      (
+        await validateReportPath(
+          storedPath,
+          compressed,
+          report().run_id,
+          decoder,
+        )
+      ).run_id,
+      report().run_id,
+    );
+    assert.equal(decoderSucceeded, true);
+    const rejecting = {
+      async withDecodedFile() {
+        throw new Error('decode rejected');
+      },
+    };
     await assert.rejects(
       () =>
-        validateReportBytes(
-          invalid,
-          { ...file, stored: id(invalid) },
-          report.run_id,
-        ),
-      /strict Zstd/,
+        validateReportPath(storedPath, compressed, report().run_id, rejecting),
+      /strict Zstd.*decode rejected/,
     );
+    assert.equal(await readFile(storedPath, 'utf8'), 'not decoded by UI');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
-  const unchecked = encode(false);
-  await assert.rejects(
-    () =>
-      validateReportBytes(
-        unchecked,
-        { ...file, stored: id(unchecked) },
-        report.run_id,
-      ),
-    /strict Zstd/,
-  );
-  await assert.rejects(
-    () =>
-      validateReportBytes(
-        stored,
-        { ...file, decoded: { ...file.decoded, line_count: 0 } },
-        report.run_id,
-      ),
-    /decoded identity/,
-  );
 });
-test('summarizes admission and allocation rejection evidence', () =>
-  assert.deepEqual(summarizeReport(report), {
-    candidates: 3,
-    selected: 1,
-    rejected: 2,
-    targets: 3,
-    catalogsComplete: 2,
-    catalogsTotal: 3,
-    rejectionReasons: { low_volume: 1, target_budget_exceeded: 1 },
-  }));

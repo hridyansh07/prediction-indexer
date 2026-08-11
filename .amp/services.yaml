@@ -12,10 +12,12 @@ services:
       set -eu
       REPO_ROOT="$(git rev-parse --show-toplevel)"
       export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
+      export TARGETER_UI_DECODER_PATH="$REPO_ROOT/encoder/rust/target/release/prediction-decode-v1"
       while [ ! -s "$AWS_WEB_IDENTITY_TOKEN_FILE" ]; do
         sleep 1
       done
-      exec yarn --cwd targeter-ui dev
+      yarn build
+      exec yarn workspace prediction-indexer-targeter-ui start
     port: 3000
     environment:
       PORT: "3000"

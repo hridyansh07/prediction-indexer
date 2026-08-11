@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { readFile, stat } from 'node:fs/promises';
+import type { DecodeExpectation } from '@prediction-indexer/rust-v1-decoder';
 import type { RunSummary } from '../shared.js';
 
 export const RUN_RE =
@@ -166,8 +167,34 @@ export function reportFile(manifest: Record<string, any>) {
     if (p.content_type !== 'application/json' || p.content_encoding !== null)
       throw new Error('plain selection report content metadata is invalid');
   }
-  return f;
+  const stored = z
+    ? identity(z.stored, 'stored')
+    : identity(
+        { sha256: p.sha256, byte_length: p.byte_length },
+        'report identity',
+      );
+  const logical = z ? identity(z.decoded, 'decoded', true) : stored;
+  return {
+    ...f,
+    storedIdentity: {
+      sha256: stored.sha256,
+      byteLength: stored.byte_length,
+    },
+    logicalIdentity: {
+      sha256: logical.sha256,
+      byteLength: logical.byte_length,
+      ...(logical.line_count === undefined
+        ? {}
+        : { lineCount: logical.line_count }),
+    },
+  } as ReportFile;
 }
+export type ReportFile = Record<string, any> & {
+  file: 'selection_report.json' | 'selection_report.json.zst';
+  storedIdentity: { sha256: string; byteLength: number };
+  logicalIdentity: { sha256: string; byteLength: number; lineCount?: number };
+};
+
 function identity(x: unknown, label: string, logical = false) {
   const i = obj(x, label);
   exactKeys(
@@ -185,283 +212,166 @@ function identity(x: unknown, label: string, logical = false) {
     throw new Error(`${label} is invalid`);
   return i as { sha256: string; byte_length: number; line_count?: number };
 }
-function littleEndian(frame: Uint8Array, offset: number, length: number) {
-  let value = 0n;
-  for (let index = 0; index < length; index++)
-    value |= BigInt(frame[offset + index]) << BigInt(index * 8);
-  return value;
+export interface ReportDecoder {
+  withDecodedFile<T>(
+    storedPath: string,
+    expectation: DecodeExpectation,
+    use: (decodedPath: string) => T | Promise<T>,
+  ): Promise<T>;
 }
-function requireStrictZstdFrame(frame: Uint8Array, maxDecoded: number) {
-  if (
-    frame.byteLength < 12 ||
-    frame[0] !== 0x28 ||
-    frame[1] !== 0xb5 ||
-    frame[2] !== 0x2f ||
-    frame[3] !== 0xfd
-  )
-    throw new Error('selection report is not one ordinary Zstd frame');
-  const descriptor = frame[4];
-  const sizeFlag = descriptor >>> 6;
-  const singleSegment = (descriptor & 0x20) !== 0;
-  if (
-    (descriptor & 0x18) !== 0 ||
-    (descriptor & 0x03) !== 0 ||
-    (descriptor & 0x04) === 0
-  )
-    throw new Error(
-      'selection report Zstd frame flags violate the approved profile',
-    );
-  let offset = 5;
-  if (!singleSegment) {
-    const windowDescriptor = frame[offset++];
-    const windowBase = 1n << BigInt(10 + (windowDescriptor >>> 3));
-    const windowSize =
-      windowBase + (windowBase >> 3n) * BigInt(windowDescriptor & 7);
-    if (windowSize > BigInt(MAX_DECODED_BYTES))
-      throw new Error('selection report Zstd window exceeds the decode limit');
-  }
-  const contentSizeBytes =
-    sizeFlag === 0
-      ? singleSegment
-        ? 1
-        : 0
-      : sizeFlag === 1
-        ? 2
-        : sizeFlag === 2
-          ? 4
-          : 8;
-  if (offset + contentSizeBytes > frame.byteLength)
-    throw new Error('selection report Zstd frame header is truncated');
-  if (contentSizeBytes) {
-    let contentSize = littleEndian(frame, offset, contentSizeBytes);
-    if (contentSizeBytes === 2) contentSize += 256n;
-    if (contentSize > BigInt(maxDecoded))
-      throw new Error(
-        'selection report Zstd content size exceeds its logical identity',
-      );
-  }
-  offset += contentSizeBytes;
-  if (offset > frame.byteLength - 7)
-    throw new Error('selection report Zstd frame header is truncated');
-  let last = false;
-  while (!last) {
-    if (offset + 3 > frame.byteLength - 4)
-      throw new Error('selection report Zstd block header is truncated');
-    const header =
-      frame[offset] | (frame[offset + 1] << 8) | (frame[offset + 2] << 16);
-    offset += 3;
-    last = (header & 1) !== 0;
-    const type = (header >>> 1) & 3;
-    if (type === 3)
-      throw new Error('selection report Zstd block type is reserved');
-    const blockSize = header >>> 3;
-    offset += type === 1 ? 1 : blockSize;
-    if (offset > frame.byteLength - 4)
-      throw new Error('selection report Zstd block is truncated');
-  }
-  if (offset + 4 !== frame.byteLength)
-    throw new Error(
-      'selection report must contain exactly one Zstd frame with no trailing data',
-    );
-}
-function decompressBounded(
-  frame: Uint8Array,
-  maxDecoded: number,
-): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('zstd', ['--decompress', '--stdout', '--quiet'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let stderr = '';
-    let settled = false;
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      child.kill();
-      reject(error);
-    };
-    child.on('error', (error) =>
-      fail(new Error(`cannot run zstd decoder: ${error.message}`)),
-    );
-    child.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length < 65536) stderr += chunk.toString('utf8');
-    });
-    child.stdout.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > maxDecoded) {
-        fail(new Error('selection report exceeds decoded size limit'));
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-    });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        reject(
-          new Error(
-            `zstd decoder rejected frame${stderr.trim() ? `: ${stderr.trim()}` : ''}`,
-          ),
-        );
-        return;
-      }
-      resolve(Buffer.concat(chunks, total));
-    });
-    child.stdin.on('error', (error) =>
-      fail(new Error(`cannot write to zstd decoder: ${error.message}`)),
-    );
-    child.stdin.end(Buffer.from(frame));
-  });
-}
-export async function validateReportBytes(
-  stored: Uint8Array,
-  file: Record<string, any>,
+
+export async function validateReportPath(
+  storedPath: string,
+  file: ReportFile,
   runId: string,
+  decoder: ReportDecoder | null,
 ) {
-  if (stored.byteLength > MAX_STORED_BYTES)
-    throw new Error('selection report exceeds stored size limit');
   const compressed = file.file.endsWith('.zst');
-  const si = compressed
-    ? identity(file.stored, 'stored')
-    : identity(
-        { sha256: file.sha256, byte_length: file.byte_length },
-        'report identity',
+  const parse = async (decodedPath: string) => {
+    const metadata = await stat(decodedPath);
+    if (!metadata.isFile() || metadata.size !== file.logicalIdentity.byteLength)
+      throw new Error('selection report decoded identity mismatch');
+    if (metadata.size > MAX_DECODED_BYTES)
+      throw new Error('selection report exceeds decoded size limit');
+    const decoded = await readFile(decodedPath);
+    if (!compressed && sha(decoded) !== file.logicalIdentity.sha256)
+      throw new Error('selection report decoded identity mismatch');
+    let report: unknown;
+    try {
+      report = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(decoded),
       );
-  if (si.byte_length !== stored.byteLength || sha(stored) !== si.sha256)
-    throw new Error('selection report stored identity mismatch');
-  const di = compressed ? identity(file.decoded, 'decoded', true) : si;
-  let decoded: Uint8Array;
+    } catch {
+      throw new Error('selection report is not valid UTF-8 JSON');
+    }
+    const r = obj(report, 'selection report');
+    if (
+      r.report_version !== 1 ||
+      r.mode !== 'shadow' ||
+      r.run_id !== runId ||
+      typeof r.input_complete !== 'boolean' ||
+      !Array.isArray(r.catalogs) ||
+      !Array.isArray(r.candidates)
+    )
+      throw new Error('invalid selection report v1');
+    timestamp(r.generated_at, 'selection report generated_at');
+    obj(r.discovery_failures, 'selection report discovery_failures');
+    if (
+      (r.artifact_format === undefined) !== (r.artifacts === undefined) ||
+      (r.artifact_format !== undefined &&
+        !['zstd', 'ndjson'].includes(r.artifact_format))
+    )
+      throw new Error('selection report artifact inventory is invalid');
+    const catalogVenues = new Set<string>();
+    for (const rawCatalog of r.catalogs) {
+      const catalog = obj(rawCatalog, 'catalog summary');
+      if (
+        !supportedVenues.includes(catalog.venue) ||
+        catalogVenues.has(catalog.venue) ||
+        typeof catalog.complete !== 'boolean'
+      )
+        throw new Error('catalog summaries are invalid');
+      int(catalog.events, 'catalog events');
+      int(catalog.markets, 'catalog markets');
+      catalogVenues.add(catalog.venue);
+    }
+    if (r.artifacts !== undefined) {
+      const artifacts = obj(r.artifacts, 'selection report artifacts');
+      const suffix = r.artifact_format === 'zstd' ? '.ndjson.zst' : '.ndjson';
+      const expected = [
+        `rule_templates${suffix}`,
+        `rule_drift${suffix}`,
+        ...[...catalogVenues].flatMap((venue) => [
+          `catalog_${venue}_events${suffix}`,
+          `catalog_${venue}_markets${suffix}`,
+        ]),
+      ];
+      if (
+        Object.keys(artifacts).sort().join('\0') !== expected.sort().join('\0')
+      )
+        throw new Error(
+          'selection report artifact inventory is incomplete or unexpected',
+        );
+    }
+    const selection = obj(r.selection, 'selection');
+    if (
+      selection.publication_performed !== false ||
+      !Array.isArray(selection.bundle_ids) ||
+      selection.bundle_count !== selection.bundle_ids.length ||
+      new Set(selection.bundle_ids).size !== selection.bundle_ids.length ||
+      selection.bundle_ids.some((id: unknown) => typeof id !== 'string' || !id)
+    )
+      throw new Error('selection report selection is invalid');
+    const targets = obj(selection.targets, 'selection targets');
+    if (
+      Object.keys(targets).sort().join('\0') !==
+        [...supportedVenues].sort().join('\0') ||
+      supportedVenues.some((venue) => !Array.isArray(targets[venue]))
+    )
+      throw new Error('selection report targets are invalid');
+    obj(selection.allocation_rejections, 'selection allocation_rejections');
+    const candidates = new Map<string, Record<string, any>>();
+    for (const rawCandidate of r.candidates) {
+      const candidate = obj(rawCandidate, 'candidate');
+      const participants = candidate.participants;
+      const venues = candidate.venues;
+      if (
+        typeof candidate.bundle_id !== 'string' ||
+        !candidate.bundle_id ||
+        candidates.has(candidate.bundle_id) ||
+        typeof candidate.eligible !== 'boolean' ||
+        !Array.isArray(candidate.rejection_reasons) ||
+        candidate.rejection_reasons.some(
+          (reason: unknown) => typeof reason !== 'string' || !reason,
+        ) ||
+        candidate.event_status !==
+          (candidate.eligible ? 'ELIGIBLE' : 'REJECTED') ||
+        !Array.isArray(participants) ||
+        participants.length !== 2 ||
+        participants.some(
+          (value: unknown) => typeof value !== 'string' || !value,
+        ) ||
+        !Array.isArray(venues) ||
+        new Set(venues).size !== venues.length ||
+        venues.some(
+          (venue: unknown) => !supportedVenues.includes(String(venue)),
+        )
+      )
+        throw new Error('selection report candidate is invalid');
+      timestamp(candidate.activation_at, 'candidate activation_at');
+      timestamp(candidate.capture_start_at, 'candidate capture_start_at');
+      obj(candidate.admission, 'candidate admission');
+      obj(candidate.market_exclusions, 'candidate market_exclusions');
+      if (!Array.isArray(candidate.eligible_market_ids))
+        throw new Error('candidate eligible_market_ids is invalid');
+      candidates.set(candidate.bundle_id, candidate);
+    }
+    if (
+      selection.bundle_ids.some((id: string) => !candidates.get(id)?.eligible)
+    )
+      throw new Error('selected bundle is absent or ineligible');
+    return r;
+  };
+  if (!compressed) return parse(storedPath);
+  if (!decoder) throw new Error('selection report decoder is required');
+  const logical = file.logicalIdentity;
+  if (logical.lineCount === undefined)
+    throw new Error('decoded identity is invalid');
   try {
-    if (compressed) requireStrictZstdFrame(stored, di.byte_length);
-    decoded = compressed
-      ? await decompressBounded(stored, di.byte_length)
-      : stored;
+    return await decoder.withDecodedFile(
+      storedPath,
+      {
+        stored: file.storedIdentity,
+        logical: { ...logical, lineCount: logical.lineCount },
+        maxDecodedBytes: MAX_DECODED_BYTES,
+      },
+      parse,
+    );
   } catch (error) {
     throw new Error(
       `selection report strict Zstd decode failed: ${error instanceof Error ? error.message : 'unknown error'}`,
     );
   }
-  const lineCount = decoded.reduce(
-    (count, byte) => count + (byte === 0x0a ? 1 : 0),
-    0,
-  );
-  if (
-    decoded.byteLength !== di.byte_length ||
-    sha(decoded) !== di.sha256 ||
-    (compressed && lineCount !== di.line_count)
-  )
-    throw new Error('selection report decoded identity mismatch');
-  let report: unknown;
-  try {
-    report = JSON.parse(
-      new TextDecoder('utf-8', { fatal: true }).decode(decoded),
-    );
-  } catch {
-    throw new Error('selection report is not valid UTF-8 JSON');
-  }
-  const r = obj(report, 'selection report');
-  if (
-    r.report_version !== 1 ||
-    r.mode !== 'shadow' ||
-    r.run_id !== runId ||
-    typeof r.input_complete !== 'boolean' ||
-    !Array.isArray(r.catalogs) ||
-    !Array.isArray(r.candidates)
-  )
-    throw new Error('invalid selection report v1');
-  timestamp(r.generated_at, 'selection report generated_at');
-  obj(r.discovery_failures, 'selection report discovery_failures');
-  if (
-    (r.artifact_format === undefined) !== (r.artifacts === undefined) ||
-    (r.artifact_format !== undefined &&
-      !['zstd', 'ndjson'].includes(r.artifact_format))
-  )
-    throw new Error('selection report artifact inventory is invalid');
-  const catalogVenues = new Set<string>();
-  for (const rawCatalog of r.catalogs) {
-    const catalog = obj(rawCatalog, 'catalog summary');
-    if (
-      !supportedVenues.includes(catalog.venue) ||
-      catalogVenues.has(catalog.venue) ||
-      typeof catalog.complete !== 'boolean'
-    )
-      throw new Error('catalog summaries are invalid');
-    int(catalog.events, 'catalog events');
-    int(catalog.markets, 'catalog markets');
-    catalogVenues.add(catalog.venue);
-  }
-  if (r.artifacts !== undefined) {
-    const artifacts = obj(r.artifacts, 'selection report artifacts');
-    const suffix = r.artifact_format === 'zstd' ? '.ndjson.zst' : '.ndjson';
-    const expected = [
-      `rule_templates${suffix}`,
-      `rule_drift${suffix}`,
-      ...[...catalogVenues].flatMap((venue) => [
-        `catalog_${venue}_events${suffix}`,
-        `catalog_${venue}_markets${suffix}`,
-      ]),
-    ];
-    if (Object.keys(artifacts).sort().join('\0') !== expected.sort().join('\0'))
-      throw new Error(
-        'selection report artifact inventory is incomplete or unexpected',
-      );
-  }
-  const selection = obj(r.selection, 'selection');
-  if (
-    selection.publication_performed !== false ||
-    !Array.isArray(selection.bundle_ids) ||
-    selection.bundle_count !== selection.bundle_ids.length ||
-    new Set(selection.bundle_ids).size !== selection.bundle_ids.length ||
-    selection.bundle_ids.some((id: unknown) => typeof id !== 'string' || !id)
-  )
-    throw new Error('selection report selection is invalid');
-  const targets = obj(selection.targets, 'selection targets');
-  if (
-    Object.keys(targets).sort().join('\0') !==
-      [...supportedVenues].sort().join('\0') ||
-    supportedVenues.some((venue) => !Array.isArray(targets[venue]))
-  )
-    throw new Error('selection report targets are invalid');
-  obj(selection.allocation_rejections, 'selection allocation_rejections');
-  const candidates = new Map<string, Record<string, any>>();
-  for (const rawCandidate of r.candidates) {
-    const candidate = obj(rawCandidate, 'candidate');
-    const participants = candidate.participants;
-    const venues = candidate.venues;
-    if (
-      typeof candidate.bundle_id !== 'string' ||
-      !candidate.bundle_id ||
-      candidates.has(candidate.bundle_id) ||
-      typeof candidate.eligible !== 'boolean' ||
-      !Array.isArray(candidate.rejection_reasons) ||
-      candidate.rejection_reasons.some(
-        (reason: unknown) => typeof reason !== 'string' || !reason,
-      ) ||
-      candidate.event_status !==
-        (candidate.eligible ? 'ELIGIBLE' : 'REJECTED') ||
-      !Array.isArray(participants) ||
-      participants.length !== 2 ||
-      participants.some(
-        (value: unknown) => typeof value !== 'string' || !value,
-      ) ||
-      !Array.isArray(venues) ||
-      new Set(venues).size !== venues.length ||
-      venues.some((venue: unknown) => !supportedVenues.includes(String(venue)))
-    )
-      throw new Error('selection report candidate is invalid');
-    timestamp(candidate.activation_at, 'candidate activation_at');
-    timestamp(candidate.capture_start_at, 'candidate capture_start_at');
-    obj(candidate.admission, 'candidate admission');
-    obj(candidate.market_exclusions, 'candidate market_exclusions');
-    if (!Array.isArray(candidate.eligible_market_ids))
-      throw new Error('candidate eligible_market_ids is invalid');
-    candidates.set(candidate.bundle_id, candidate);
-  }
-  if (selection.bundle_ids.some((id: string) => !candidates.get(id)?.eligible))
-    throw new Error('selected bundle is absent or ineligible');
-  return r;
 }
 export function summarizeReport(report: Record<string, any>): RunSummary {
   const cs = Array.isArray(report.candidates) ? report.candidates : [];
