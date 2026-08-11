@@ -11,6 +11,23 @@ const date = (x: any) => {
   const d = new Date(x);
   return Number.isNaN(d.valueOf()) ? val(x) : d.toLocaleString();
 };
+const relativeTime = (x: any) => {
+  const timestamp = new Date(x).valueOf();
+  if (Number.isNaN(timestamp)) return val(x);
+  const seconds = (timestamp - Date.now()) / 1000;
+  const absolute = Math.abs(seconds);
+  if (absolute < 60) return 'just now';
+  const [divisor, unit] =
+    absolute < 3600
+      ? [60, 'minute']
+      : absolute < 86400
+        ? [3600, 'hour']
+        : [86400, 'day'];
+  return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(
+    Math.round(seconds / divisor),
+    unit as Intl.RelativeTimeFormatUnit,
+  );
+};
 const numericScore = (x: any) => {
   const n = Number(x);
   return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
@@ -90,39 +107,19 @@ function App() {
           <div className="loading">Loading archive snapshot…</div>
         )}
       </main>
+      {s && <StatusFooter s={s} />}
     </>
   );
 }
 function Overview({ s }: { s: Snapshot }) {
-  const run = s.runs[0];
-  const age = run
-    ? (Date.now() - new Date(run.generatedAt).valueOf()) / 1000
-    : Infinity;
-  const stalled = age > s.expectedRunSeconds * 2;
+  const [selectedRunId, setSelectedRunId] = useState(s.runs[0]?.runId ?? '');
+  useEffect(() => {
+    if (!s.runs.some((run) => run.runId === selectedRunId))
+      setSelectedRunId(s.runs[0]?.runId ?? '');
+  }, [s.runs, selectedRunId]);
+  const run = s.runs.find((item) => item.runId === selectedRunId) ?? s.runs[0];
   return (
     <div className="stack">
-      <section className="hero">
-        <div>
-          <span className={`dot ${stalled ? 'bad' : 'good'}`} />
-          <span className="eyebrow">TARGETER HEARTBEAT · HEURISTIC</span>
-          <h2>
-            {stalled
-              ? 'Run cadence appears stalled'
-              : 'Run cadence appears active'}
-          </h2>
-          <p>
-            Latest committed run age is compared with 2× the expected run
-            cadence ({s.expectedRunSeconds}s). This is an observability
-            heuristic, not scheduler proof.
-          </p>
-        </div>
-        <div className="health">
-          <b>{s.stale ? 'STALE' : 'CURRENT'}</b>
-          <span>Archive snapshot</span>
-          <small>Updated {date(s.lastSuccessfulRefresh)}</small>
-          <small>Source: {s.source.toUpperCase()}</small>
-        </div>
-      </section>
       <section>
         <Title
           title="Committed run timeline"
@@ -130,20 +127,25 @@ function Overview({ s }: { s: Snapshot }) {
         />
         <div className="timeline">
           {s.runs.map((r, i) => (
-            <article key={r.runId} className={i === 0 ? 'latest' : ''}>
+            <button
+              key={r.runId}
+              className={`${i === 0 ? 'latest' : ''} ${r.runId === run?.runId ? 'selected' : ''}`}
+              aria-pressed={r.runId === run?.runId}
+              onClick={() => setSelectedRunId(r.runId)}
+            >
               <span>{i === 0 ? 'LATEST' : 'RUN'}</span>
               <b>{r.runId}</b>
               <small>{date(r.generatedAt)}</small>
               <em className={r.inputComplete ? 'ok' : 'warn'}>
                 {r.inputComplete ? 'Complete' : 'Incomplete'}
               </em>
-            </article>
+            </button>
           ))}
         </div>
       </section>
       {run ? (
         <>
-          <Metrics run={run} />
+          <Metrics run={run} latest={run.runId === s.runs[0]?.runId} />
           <Bundles run={run} />
           <Rejections run={run} />
         </>
@@ -153,11 +155,14 @@ function Overview({ s }: { s: Snapshot }) {
     </div>
   );
 }
-function Metrics({ run }: { run: RunView }) {
+function Metrics({ run, latest }: { run: RunView; latest: boolean }) {
   const m = run.summary;
   return (
     <section>
-      <Title title="Latest run" sub={run.runId} />
+      <Title
+        title={latest ? 'Latest run' : 'Selected run'}
+        sub={relativeTime(run.generatedAt)}
+      />
       <div className="metrics">
         <Metric n={m.selected} label="Selected bundles" />
         <Metric n={m.targets} label="Capture targets" />
@@ -168,6 +173,31 @@ function Metrics({ run }: { run: RunView }) {
         />
       </div>
     </section>
+  );
+}
+function StatusFooter({ s }: { s: Snapshot }) {
+  const latest = s.runs[0];
+  const age = latest
+    ? (Date.now() - new Date(latest.generatedAt).valueOf()) / 1000
+    : Infinity;
+  const live = !!latest && age <= s.expectedRunSeconds * 2;
+  return (
+    <footer className="status-footer">
+      <div className={live ? 'good' : 'bad'}>
+        <span className={`dot ${live ? 'good' : 'bad'}`} />
+        <strong>{live ? 'LIVE' : 'NOT LIVE'}</strong>
+        <span>Targeter cadence</span>
+      </div>
+      <span>
+        Latest run {latest ? relativeTime(latest.generatedAt) : 'unavailable'}
+      </span>
+      <span>
+        Archive {s.stale ? 'STALE' : 'CURRENT'} · {s.source.toUpperCase()}
+      </span>
+      <small>
+        Heuristic: latest run within 2× {s.expectedRunSeconds}s cadence
+      </small>
+    </footer>
   );
 }
 function Metric({ n, label }: { n: any; label: string }) {
