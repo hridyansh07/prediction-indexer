@@ -26,9 +26,18 @@ pub use state::{ClassifierState, EpochHealth, EpochKey, EpochState, IdentityVerd
 use indexer_types::{Committed, ContentHash, EnvelopeView, Positioned, RecordKind, SourceCursor};
 
 /// Previews and applies continuity transitions.
-#[derive(Default)]
 pub struct Classifier {
     state: ClassifierState,
+    retain_identity_history: bool,
+}
+
+impl Default for Classifier {
+    fn default() -> Self {
+        Self {
+            state: ClassifierState::default(),
+            retain_identity_history: true,
+        }
+    }
 }
 
 impl Classifier {
@@ -38,6 +47,23 @@ impl Classifier {
 
     pub fn state(&self) -> &ClassifierState {
         &self.state
+    }
+
+    /// Builds a classifier whose caller supplies exact identity verdicts.
+    ///
+    /// The long-lived ingester uses the durable store's indexed identity table;
+    /// retaining the same record IDs here would duplicate an unbounded history
+    /// in RAM. The finalizer keeps [`new`](Self::new)'s in-memory identity because
+    /// its scope is one fixed thirty-minute window and it has no SQLite store.
+    pub fn without_identity_history() -> Self {
+        Self {
+            state: ClassifierState::default(),
+            retain_identity_history: false,
+        }
+    }
+
+    pub fn retained_identity_count(&self) -> usize {
+        self.state.identity.records.len()
     }
 
     /// Previews what one delivery means. Takes `&self` — nothing moves here.
@@ -52,6 +78,26 @@ impl Classifier {
         envelope: &EnvelopeView<'_>,
         captured: &impl Positioned,
     ) -> ContinuityFact {
+        let content = ContentHash::hash(envelope.raw_payload.as_bytes());
+        let verdict = self
+            .state
+            .identity
+            .verdict(envelope.record_id.as_str(), content);
+        self.classify_with_identity(envelope, captured, verdict)
+    }
+
+    /// Classifies with an exact identity verdict supplied by another owner.
+    ///
+    /// Used by the long-lived ingester after the durable store has looked up the
+    /// record ID. Keeping the rest of classification here preserves the same
+    /// identity-first short circuit and ordering transition as the in-memory
+    /// finalizer path.
+    pub fn classify_with_identity(
+        &self,
+        envelope: &EnvelopeView<'_>,
+        captured: &impl Positioned,
+        verdict: IdentityVerdict,
+    ) -> ContinuityFact {
         let fact_seq = captured.position();
         let content = ContentHash::hash(envelope.raw_payload.as_bytes());
         let key = EpochKey::new(
@@ -62,10 +108,6 @@ impl Classifier {
 
         // Rule 1: identity first. A retransmission is not evidence of anything
         // about the stream's continuity, so it must not be allowed to touch it.
-        let verdict = self
-            .state
-            .identity
-            .verdict(envelope.record_id.as_str(), content);
         if !matches!(verdict, IdentityVerdict::Unseen) {
             return ContinuityFact::duplicate(fact_seq, envelope, key, content, verdict);
         }
@@ -94,7 +136,7 @@ impl Classifier {
     /// `classify` and here costs nothing — replay re-derives from the fact.
     pub fn apply(&mut self, committed: &impl Committed<ContinuityFact>) {
         let fact = committed.value();
-        self.state.observe(fact);
+        self.state.observe(fact, self.retain_identity_history);
     }
 
     /// Replaces the retained state wholesale.

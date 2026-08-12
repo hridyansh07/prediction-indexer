@@ -23,7 +23,8 @@ to satisfy rather than in a comment asking them to be careful.
 spool files (venue=*/date=*/<ts>-<epoch>.ndjson)
   → capture_raw        exact bytes durable before anything parses them
   → assign EvidenceSeq the one global cross-venue order
-  → classify           identity verdict, epoch health, cursor continuity
+  → identity lookup    exact global verdict from the durable SQLite index
+  → classify           epoch health and cursor continuity
   → commit_fact        the classification, durable, hash-bound
   → fact log (SQLite)
 ```
@@ -40,7 +41,7 @@ isn't explained by interleaving, something is wrong and it is worth knowing.
 | Crate | What | Scope |
 |---|---|---|
 | `types` | `envelope`, `identity`, `sequence`, `hash`, `sink`, `error` | `kalshi`/`limitless` venues, `public_trade` stream, `control` kind. |
-| `store` | `capture_raw`, `commit_fact`, `recover_fact`, integrity, recovery | No approval/parent/command gates — those are order-management concerns this component doesn't have. |
+| `store` | `capture_raw`, `commit_fact`, exact record-identity index, integrity, recovery | No approval/parent/command gates — those are order-management concerns this component doesn't have. |
 | `continuity` | identity verdict, epoch health, lane authority, cursor continuity | No `classify_gateway`, `classify_reconciliation`, or order-ack parsing — there are no orders to reconcile. |
 
 **Out of scope:** `risk`, `oms`, `market`. Capital reservation, iceberg children and
@@ -65,7 +66,11 @@ Three things tracked per `(venue, stream, connection_epoch)`:
 **Identity** — `Unseen` / `Duplicate` / `Conflict` on `(record_id, content_hash)`.
 Duplicate is a retransmission. Conflict is the same id with different bytes, which
 is a venue misbehaving and worth surfacing loudly. Identity is decided *before*
-continuity so a retransmission cannot move a counter or stale a stream.
+continuity so a retransmission cannot move a counter or stale a stream. In the
+long-lived ingester this is an indexed SQLite lookup, not a process-local map:
+the verdict remains global and exact without retaining every historical record ID
+in RAM. The finalizer still uses an in-memory map scoped to one fixed 30-minute
+window because it deliberately does not link the SQLite store.
 
 **Epoch health** — `AwaitingBootstrap` → `Healthy` → `Stale` → `Retired`. A new
 connection starts unproven. Snapshot proof is tracked **per instrument, not per
@@ -125,6 +130,39 @@ now classify as `sparse_monotonic` unconditionally.
 continuity is verifiable without knowing the instrument. Whether Kalshi actually
 numbers per connection or per market is unverified; if per market, it needs the
 same treatment.
+
+### Memory bound and store schema v2
+
+The original ingester streamed spool lines in 512-record batches but retained one
+`BTreeMap` entry for every unique `record_id`. Startup rebuilt the same map by
+folding the complete fact log. File cursors were therefore bounded while retained
+classifier state was not.
+
+Measured on the largest complete archived window found for 2026-08-08 — four
+lanes, five sealed segments, 2,670,449 records and 2,331,516,814 decoded bytes:
+
+| Release path | Peak RSS |
+|---|---:|
+| k-way cursors, parse and merge only | 2,592 KiB |
+| original `indexer-ingest`, initial ingest | 510,140 KiB |
+| original `indexer-ingest`, no-new-data restart | 520,248 KiB |
+| schema-v2 migration plus recovery | 7,472 KiB |
+| schema-v2 `indexer-ingest`, initial ingest | 7,972 KiB |
+| schema-v2 `indexer-ingest`, no-new-data restart | 6,580 KiB |
+
+Schema v2 adds `record_identity(record_id, content_hash, first_seen)`. A first
+observation, its fact, and the spool-cursor advance commit in one SQLite
+transaction. Duplicate and conflict lookups return the original fact position,
+so moving identity to disk changes no verdict semantics. No LRU or probabilistic
+filter is used.
+
+Opening a schema-v1 store performs one transactional SQLite migration from the
+already committed canonical facts in sequence order. It does not reconstruct the
+identity history in Rust memory. On this sample the store grew from 4.9 GiB to
+5.3 GiB (rounded `du` values), and fixed initial ingest took 145 seconds — about
+18,400 records/second, still over twenty times the measured steady capture rate.
+The migration rolls back on malformed historical identity data and leaves the
+schema version at 1.
 
 ## Not in v1
 

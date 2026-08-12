@@ -10,3 +10,6 @@ workspace = true
 [dependencies]
 indexer-types = { path = "../types" }
 rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempdir = "0.3"

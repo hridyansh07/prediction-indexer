@@ -266,6 +266,21 @@ docker compose run --rm ingester-integrity
 docker compose start ingester
 ```
 
+### Ingester schema-v2 memory migration
+
+The first ingester start after upgrading a schema-v1 `ingest-store/store.db`
+builds the durable `record_identity` index from its committed facts and changes
+`meta.schema_version` to `2`. The migration is one SQLite transaction: failure
+rolls it back rather than leaving a partial identity index, and the raw spool is
+unchanged. Stop the old ingester before deploying the new binary and leave disk
+headroom for the index. On the measured 2.67-million-record store it added about
+0.4 GiB to a 4.9 GiB database and peaked at 7.3 MiB RSS; time and additional disk
+scale with the existing fact count.
+
+After startup, `identity_records_in_memory` in the ingester report must be `0`.
+Duplicate/conflict detection remains exact and global through the SQLite index;
+this is not an LRU or probabilistic cache.
+
 Apply a new v1 manifest without rebuilding (base deployment only):
 
 ```bash
