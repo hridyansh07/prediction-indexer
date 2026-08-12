@@ -147,6 +147,14 @@ class BaseSplice:
     #: identical silence on the tape and mean opposite things.
     requires_targets: bool = True
 
+    #: How often the loop asks a venue to re-send state the connection may have
+    #: missed. Zero — the default — means the loop never calls
+    #: `request_stale_snapshots` at all, which is the disabled configuration for
+    #: every venue that cannot be asked and for any venue whose operator has
+    #: turned the sweep off. Read live rather than captured at loop start so a
+    #: venue that has to slow down can widen it from its own error handling.
+    snapshot_sweep_seconds: float = 0.0
+
     def __init__(
         self,
         spool: Spool,
@@ -205,6 +213,21 @@ class BaseSplice:
 
     async def send_heartbeat(self, transport: Transport) -> None:
         """Default: nothing. Override where the venue closes an idle socket."""
+        return None
+
+    async def request_stale_snapshots(self, transport: Transport, targets: TargetSet) -> None:
+        """Ask the venue to re-send state for anything that has gone quiet.
+
+        Default: nothing, because most venues offer nothing to ask for. Shaped
+        like `send_heartbeat` — a hook the connection loop calls on a clock —
+        rather than a second loop with its own lifecycle, because the request
+        travels on the connection being protected and must stop when it does.
+
+        An override inherits `send_heartbeat`'s contract: whatever is raised here
+        ends the epoch. A venue that can recover from its own request failing
+        therefore records the failure and returns, and only a genuinely dead
+        socket is allowed to propagate.
+        """
         return None
 
     async def after_frame(self, transport: Transport, message: str) -> None:
@@ -453,6 +476,7 @@ class BaseSplice:
 
                 last_heartbeat = time.monotonic()
                 last_target_check = time.monotonic()
+                last_snapshot_sweep = time.monotonic()
                 while True:
                     now = time.monotonic()
                     if stop_after_seconds is not None and now - started >= stop_after_seconds:
@@ -473,6 +497,12 @@ class BaseSplice:
                     if self.heartbeat_seconds and now - last_heartbeat >= self.heartbeat_seconds:
                         last_heartbeat = now
                         await self.send_heartbeat(transport)
+                    if (
+                        self.snapshot_sweep_seconds
+                        and now - last_snapshot_sweep >= self.snapshot_sweep_seconds
+                    ):
+                        last_snapshot_sweep = now
+                        await self.request_stale_snapshots(transport, targets)
 
                     try:
                         message = await asyncio.wait_for(
