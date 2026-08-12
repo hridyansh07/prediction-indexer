@@ -133,6 +133,15 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("creating spool root: {error}"))?;
     }
     let mut store = Store::open(&arguments.store_dir).map_err(|error| error.to_string())?;
+    if let Some(migration) = store.migration_report() {
+        eprintln!(
+            "migrated store schema {} -> {}: {} identity records in {:.3} seconds",
+            migration.from_schema,
+            migration.to_schema,
+            migration.identity_records,
+            migration.elapsed.as_secs_f64(),
+        );
+    }
     // Global identity lives in the store's indexed `record_identity` table.
     // Keeping the same history in `ClassifierState` costs O(all records) RAM —
     // tens of gigabytes per production day — while every other retained field
@@ -434,12 +443,26 @@ fn render_report(
         ),
         None => String::new(),
     };
+    let migration = store
+        .migration_report()
+        .map(|migration| {
+            format!(
+                "{{\"from_schema\": {}, \"to_schema\": {}, \"identity_records\": {}, \
+                 \"elapsed_seconds\": {:.3}}}",
+                migration.from_schema,
+                migration.to_schema,
+                migration.identity_records,
+                migration.elapsed.as_secs_f64(),
+            )
+        })
+        .unwrap_or_else(|| "null".to_owned());
 
     format!(
         "{{\n  \"spool_root\": {:?},\n  \"store\": {:?},\n  \"spool_files\": {},\n  \
          \"lines_read\": {},\n  \"already_ingested\": {},\n  \"facts_committed\": {},\n  \
          \"unparseable_recorded\": {},\n  \"evidence_rows\": {},\n  \"fact_rows\": {},\n  \
          \"duplicates\": {},\n  \"conflicts\": {},\n  \"identity_records_in_memory\": {},\n  \
+         \"store_migration\": {},\n  \
          \"causes\": {{\n{}\n  }},\n  \
          \"epochs\": [\n{}\n  ],\n  \"rejections\": [\n{}\n  ]{}\n}}",
         arguments.spool_root.display().to_string(),
@@ -454,6 +477,7 @@ fn render_report(
         state.duplicates,
         state.conflicts,
         classifier.retained_identity_count(),
+        migration,
         causes.join(",\n"),
         epochs.join(",\n"),
         rejections.join(",\n"),

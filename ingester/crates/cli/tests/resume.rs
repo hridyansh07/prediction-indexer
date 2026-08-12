@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{seal_segment, write_sealed};
+use rusqlite::Connection;
 use serde_json::Value;
 use tempdir::TempDir;
 
@@ -60,6 +61,46 @@ fn ingest(spool: &Path, store: &Path) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("JSON report")
+}
+
+#[test]
+fn a_schema_migration_reports_its_duration_once() {
+    let (_root, spool, store, _file) = fixture();
+    fs::create_dir_all(&store).expect("store directory");
+    let connection = Connection::open(store.join("store.db")).expect("create v1 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+        )
+        .expect("schema-v1 marker");
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_indexer-ingest"))
+        .arg(&spool)
+        .arg(&store)
+        .output()
+        .expect("run migrating indexer-ingest");
+    assert!(
+        output.status.success(),
+        "migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["store_migration"]["from_schema"], 1);
+    assert_eq!(report["store_migration"]["to_schema"], 2);
+    assert_eq!(report["store_migration"]["identity_records"], 0);
+    assert!(report["store_migration"]["elapsed_seconds"].is_number());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("migrated store schema 1 -> 2"),
+        "the blocking migration must be visible in service logs"
+    );
+
+    let reopened = ingest(&spool, &store);
+    assert!(
+        reopened["store_migration"].is_null(),
+        "the report names work performed by this startup, not migration history"
+    );
 }
 
 #[test]

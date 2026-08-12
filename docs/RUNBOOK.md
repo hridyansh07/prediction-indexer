@@ -336,6 +336,16 @@ Rough daily rates at the current configuration:
 | targeter-v2-runs | ~4.6 G |
 | canonical | ~1.8 G |
 
+The schema-v2 ingester upgrade performs one blocking identity-index migration.
+At six days the ingest store is roughly 162 GiB at this rate. The measured
+2.67-million-fact migration permanently added 5.1% and temporarily needed 10.2%
+above the original database while its WAL existed, so have at least 11% free
+(about 18 GiB for 162 GiB), plus operating margin. These percentages are capacity
+guidance, not a downtime estimate: copy and time the actual production store
+before the upgrade because migration time follows fact and unique-identity counts.
+The completed time and count appear in the ingester log and in
+`store_migration` in its JSON report.
+
 Compression on the archive path measures ~12.7x, so S3 growth is far below the
 local spool rate. `targeter-v2-cache` should stay near zero now that
 `--no-response-cache` is set; if it grows, the flag is not reaching the container

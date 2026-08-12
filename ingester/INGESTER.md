@@ -148,24 +148,35 @@ lanes, five sealed segments, 2,670,449 records and 2,331,516,814 decoded bytes:
 | original `indexer-finalize` | 530,120 KiB |
 | original `indexer-ingest`, initial ingest | 510,140 KiB |
 | original `indexer-ingest`, no-new-data restart | 520,248 KiB |
-| schema-v2 migration plus recovery | 7,472 KiB |
+| schema-v2 migration plus recovery | 7,220 KiB |
 | schema-v2 `indexer-ingest`, initial ingest | 7,972 KiB |
 | schema-v2 `indexer-ingest`, no-new-data restart | 6,580 KiB |
 | disk-backed `indexer-finalize` | 13,756 KiB |
 
-Schema v2 adds `record_identity(record_id, content_hash, first_seen)`. A first
-observation, its fact, and the spool-cursor advance commit in one SQLite
+Schema v2 adds `record_identity(record_id, content_hash, first_seen)` as one
+`WITHOUT ROWID` table. The primary key is explicitly `NOT NULL`, and the content
+hash is the exact 32-byte digest rather than its 64-byte hexadecimal rendering.
+A first observation, its fact, and the spool-cursor advance commit in one SQLite
 transaction. Duplicate and conflict lookups return the original fact position,
 so moving identity to disk changes no verdict semantics. No LRU or probabilistic
 filter is used.
 
 Opening a schema-v1 store performs one transactional SQLite migration from the
 already committed canonical facts in sequence order. It does not reconstruct the
-identity history in Rust memory. On this sample the store grew from 4.9 GiB to
-5.3 GiB (rounded `du` values), and fixed initial ingest took 145 seconds — about
-18,400 records/second, still over twenty times the measured steady capture rate.
-The migration rolls back on malformed historical identity data and leaves the
-schema version at 1.
+identity history in Rust memory. On this sample the migration itself took 7.10
+seconds; complete startup including continuity recovery took 20.80 seconds. The
+identity projection added 243,068,928 bytes (5.1% of the schema-v1 database),
+while the database plus WAL grew by 488,061,880 bytes (10.2%) at the transaction
+peak. The previous rowid table with hexadecimal hashes required 483,909,632
+permanent bytes and took 27.39 seconds for complete startup on the same input.
+
+Migration time scales primarily with fact and unique-identity counts, not merely
+database bytes. Time a copy of the actual production store before scheduling the
+upgrade; the CLI reports the completed migration separately on stderr and under
+`store_migration` in its JSON report. Malformed historical identity data rolls
+the transaction back and leaves the schema version at 1. Fixed initial ingest
+after migration took 145 seconds — about 18,400 records/second, still over twenty
+times the measured steady capture rate.
 
 The finalizer has no lifetime-global identity contract: duplicate and conflict
 verdicts deliberately start fresh at each 30-minute window. It therefore creates
