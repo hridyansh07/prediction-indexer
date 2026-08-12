@@ -5,14 +5,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from replay.catalog import (
+    ASSERTED,
+    CAPTURED,
+    canonical_sha256 as _canonical_sha256,
+    has_fee_terms,
+)
 from replay.envelope import Envelope, EnvelopeError, parse_envelope
 from replay.events import GAME_STATE_MARKERS
-from replay.lanes import PARTITION_PREFIXES, lane_of
+from replay.lanes import PARTITION_PREFIXES, LaneError, lane_of
 from replay.stream import (
     ByteStreamer,
     DirectoryByteStreamer,
@@ -88,12 +96,28 @@ class Gate1Report:
 class Gate1Auditor:
     """A streaming audit; payloads are counted and discarded, never accumulated."""
 
+    def __init__(self, *, allow_asserted_records: bool = False) -> None:
+        self.allow_asserted_records = bool(allow_asserted_records)
+
     def audit(self, streamer: ByteStreamer) -> Gate1Report:
         manifest = build_input_manifest(streamer)
-        state = _AuditState()
+        state = _AuditState(allow_asserted=self.allow_asserted_records)
         parse_failures: list[str] = []
 
-        for line in iter_ndjson_lines(streamer):
+        # Target records are NDJSON but they are not tape: they carry no
+        # envelope and no lane partition, so feeding them to `parse_envelope`
+        # would report a parse failure, and feeding them to `lane_of` would
+        # raise. Routed by key before either is reached.
+        record_keys = tuple(
+            key for key in streamer.object_keys() if target_record_object(key)
+        )
+        tape_keys = tuple(
+            key
+            for key in streamer.object_keys()
+            if key.endswith(".ndjson") and key not in set(record_keys)
+        )
+
+        for line in iter_ndjson_lines(streamer, keys=tape_keys):
             try:
                 envelope = parse_envelope(line.data)
             except EnvelopeError as error:
@@ -102,6 +126,14 @@ class Gate1Auditor:
             state.observe(line.object_key, envelope)
 
         auxiliary_failures: list[str] = []
+        for line in iter_ndjson_lines(streamer, keys=record_keys):
+            try:
+                state.observe_target_record(json.loads(line.data))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                auxiliary_failures.append(
+                    f"{line.object_key}:{line.line_number}: {error}"
+                )
+
         for key in streamer.object_keys():
             if key.endswith(".ndjson"):
                 continue
@@ -141,7 +173,12 @@ class Gate1Auditor:
 
 
 class _AuditState:
-    def __init__(self) -> None:
+    def __init__(self, *, allow_asserted: bool = False) -> None:
+        #: Whether records fetched after the fact satisfy the metadata checks.
+        #: Off by default: an asserted record is a belief that the venue's terms
+        #: are immutable, not proof of what the targeter used, and the two must
+        #: not be silently interchangeable.
+        self.allow_asserted = bool(allow_asserted)
         self.records = 0
         self.v2_records = 0
         self.frames = 0
@@ -160,6 +197,20 @@ class _AuditState:
         self.metadata_invalid: list[str] = []
         self.rules_records = 0
         self.fee_records = 0
+        self.target_records = 0
+        self.target_record_provenance: Counter[str] = Counter()
+        #: Assets by the strength of the evidence behind them. An asset may be
+        #: in both — a market observed live and later re-fetched by a backfill —
+        #: and when it is, the captured evidence is what counts. Subtracting
+        #: `asserted_assets` wholesale let one backfill row nullify a real
+        #: sighting, reporting an asset as uncovered in the same breath as
+        #: reporting captured evidence for it.
+        self.captured_assets: set[tuple[str, str]] = set()
+        self.asserted_assets: set[tuple[str, str]] = set()
+        self.rules_assets: set[tuple[str, str]] = set()
+        self.rules_assets_asserted: set[tuple[str, str]] = set()
+        self.fee_assets: set[tuple[str, str]] = set()
+        self.fee_assets_asserted: set[tuple[str, str]] = set()
         self.coverage_sightings: dict[tuple[str, str], dict[str, Any]] = {}
         self.pm_books = 0
         self.pm_changes = 0
@@ -173,6 +224,9 @@ class _AuditState:
         self.seals: dict[str, dict[str, Any]] = {}
         self.seal_failures: list[str] = []
         self.segments_seen: set[str] = set()
+        #: Sealed segments that hold no records. Evidence, not failure — see
+        #: `verify_seals`.
+        self.empty_segments: list[str] = []
         self.reference_events = 0
         self.reference_events_stamped = 0
         self.game_state_events = 0
@@ -370,8 +424,122 @@ class _AuditState:
                 self.metadata_invalid.append(f"{key}: catalogue record hash mismatch")
             if any(record.get(field) for field in ("description", "rules_primary", "rules", "question")):
                 self.rules_records += 1
-            if record.get("feeSchedule") is not None or record.get("feeType") is not None:
+            if has_fee_terms(record):
                 self.fee_records += 1
+
+    def observe_target_record(self, document: Any) -> None:
+        """One venue record for one market a run subscribed to.
+
+        Feeds the same counters as `observe_metadata`, deliberately. A v1 dataset
+        carries the record inside `resolution.catalogue_record`; a v2 dataset
+        carries it here. The question the check asks — is the contemporaneous
+        venue record present for the markets we watched — is identical, and a
+        dataset holding both should satisfy it once rather than being made to
+        choose a source.
+        """
+        if not isinstance(document, dict):
+            raise ValueError("target record is not an object")
+        venue = document.get("venue")
+        target_id = document.get("target_id")
+        record = document.get("record")
+        provenance = document.get("provenance")
+        if not isinstance(venue, str) or not isinstance(target_id, str):
+            raise ValueError("target record lacks venue or target_id")
+        if not isinstance(record, dict):
+            raise ValueError(f"target record {target_id} carries no record object")
+        if provenance not in (CAPTURED, ASSERTED):
+            raise ValueError(
+                f"target record {target_id} has unknown provenance {provenance!r}"
+            )
+        declared = document.get("record_sha256")
+        if declared != _canonical_sha256(record):
+            self.metadata_invalid.append(f"{target_id}: record hash disagrees with bytes")
+
+        self.target_records += 1
+        self.target_record_provenance[str(provenance)] += 1
+        captured = provenance != ASSERTED
+        has_rules = any(
+            record.get(field)
+            for field in ("description", "rules_primary", "rules", "question")
+        )
+        has_fees = has_fee_terms(record)
+
+        # Counted per asset rather than per row. Rows repeat every run by
+        # design, so counting rows would let one market observed 144 times a day
+        # look like 144 markets — and the checks these feed are then intersected
+        # with the subscribed set, because "the markets we watched" is what the
+        # requirement says and a record for an asset nobody subscribed to
+        # answers no question about this tape.
+        observed_at = document.get("observed_at")
+        created_at = record.get("createdAt") or record.get("created_time")
+        for asset in document.get("subscription_ids") or ():
+            key = (venue, str(asset))
+            (self.captured_assets if captured else self.asserted_assets).add(key)
+            if has_rules:
+                (self.rules_assets if captured else self.rules_assets_asserted).add(key)
+            if has_fees:
+                (self.fee_assets if captured else self.fee_assets_asserted).add(key)
+            # Discovery coverage without the live tree. The earliest run naming
+            # an asset is when we first saw it, and the venue's own creation
+            # timestamp travels in the record — `createdAt` on Polymarket Gamma,
+            # `created_time` on Kalshi — so the lag this check measures survives
+            # the move off `live/coverage.json` unchanged.
+            if isinstance(observed_at, str):
+                self._record_sighting(
+                    venue,
+                    str(asset),
+                    first_seen_at=observed_at,
+                    created_at=created_at if isinstance(created_at, str) else None,
+                )
+
+    def _record_sighting(
+        self,
+        venue: str,
+        asset_id: str,
+        *,
+        first_seen_at: str | None,
+        created_at: str | None,
+    ) -> None:
+        """Keep the earliest sighting of an asset, whichever source supplied it.
+
+        Both `live/coverage.json` and the target records describe the same fact,
+        and a dataset may carry both. Two things this must not do, and both were
+        done before it existed:
+
+        - **Let arrival order decide.** The auxiliary-object loop runs after the
+          target-record loop, so an unconditional assignment meant the ledger
+          always won — including when it held a strictly later, less informative
+          sighting, which could flip a passing dataset to failing by *adding*
+          evidence.
+        - **Compare timestamps as strings.** The two sources do not spell an
+          instant the same way: `analysis.storage.utc_now` emits
+          `...+00:00` and `targeter.v2.domain.isoformat` emits `...Z`, and
+          `isoformat` further drops the fractional part on a whole second.
+          Lexically `'Z' > '.'` and `'+' < '.'`, so string comparison picks the
+          later row in both directions. `targeter/coverage.py:131` already got
+          this right by parsing; this is the same rule.
+        """
+        key = (venue, asset_id)
+        existing = self.coverage_sightings.get(key)
+        instant = _instant(first_seen_at)
+        if existing is not None:
+            previous = _instant(existing.get("first_seen_at"))
+            # An unparseable instant never displaces a parseable one, and a
+            # later one never displaces an earlier one.
+            if previous is not None and (instant is None or previous <= instant):
+                if created_at is not None and existing.get("created_at") is None:
+                    existing["created_at"] = created_at
+                return
+        self.coverage_sightings[key] = {
+            "venue": venue,
+            "asset_id": asset_id,
+            "first_seen_at": first_seen_at,
+            "created_at": (
+                created_at
+                if created_at is not None
+                else (existing or {}).get("created_at")
+            ),
+        }
 
     def observe_seal(self, key: str, document: Any) -> None:
         """One sealed segment's commit marker."""
@@ -393,14 +561,30 @@ class _AuditState:
         commit marker, so a segment missing one is a file whose writer never
         finished claiming it — indistinguishable, without this check, from one
         that did.
+
+        **A sealed segment holding no records is not a missing segment.** It is
+        the positive evidence that the lane was alive and the venue was silent
+        for that window, which is the normal state of a low-volume venue —
+        Limitless produced 30 such windows out of 82 in one real capture. This
+        walks the union of the segments records were observed in and the
+        segments a seal names, and consults the input manifest to tell the two
+        apart: a key the manifest does not carry is genuinely absent, while a
+        key it does carry is present and simply empty.
+
+        The earlier loop walked `segments_seen` alone, which is populated per
+        parsed record (`observe`). An empty segment therefore fell out of it and
+        was reported as absent — and, less visibly, was never length- or
+        digest-checked at all. Both are fixed here: an empty segment is verified
+        against its seal like any other and then recorded as evidence.
         """
-        for segment in sorted(self.segments_seen):
+        for segment in sorted(self.segments_seen | set(self.seals)):
             seal = self.seals.get(segment)
             if seal is None:
                 self.seal_failures.append(f"{segment}: no seal")
                 continue
             identity = objects.get(segment)
             if identity is None:
+                self.seal_failures.append(f"{segment}: sealed but the segment is absent")
                 continue
             if identity.size != seal["byte_length"]:
                 self.seal_failures.append(
@@ -408,8 +592,8 @@ class _AuditState:
                 )
             if identity.sha256 != seal["sha256"]:
                 self.seal_failures.append(f"{segment}: sha256 disagrees with the bytes")
-        for segment in sorted(set(self.seals) - self.segments_seen):
-            self.seal_failures.append(f"{segment}: sealed but the segment is absent")
+            if segment not in self.segments_seen:
+                self.empty_segments.append(segment)
 
     def observe_coverage(self, document: Any) -> None:
         if not isinstance(document, dict) or not isinstance(document.get("sightings"), list):
@@ -419,8 +603,19 @@ class _AuditState:
                 continue
             venue = item.get("venue")
             asset_id = item.get("asset_id")
-            if isinstance(venue, str) and isinstance(asset_id, str):
-                self.coverage_sightings[(venue, asset_id)] = item
+            if not isinstance(venue, str) or not isinstance(asset_id, str):
+                continue
+            first_seen_at = item.get("first_seen_at")
+            created_at = item.get("created_at")
+            # A live sighting is an observation the targeter made at the time,
+            # so it is captured evidence and admissible under strict mode.
+            self.captured_assets.add((venue, asset_id))
+            self._record_sighting(
+                venue,
+                asset_id,
+                first_seen_at=first_seen_at if isinstance(first_seen_at, str) else None,
+                created_at=created_at if isinstance(created_at, str) else None,
+            )
 
     def checks(
         self,
@@ -488,33 +683,85 @@ class _AuditState:
                 for item in self.connection_opened
             ),
         )
-        missing_metadata = sorted(
-            self.metadata_digests_referenced - self.metadata_digests_seen
-        )
-        add(
-            "market_rules_and_metadata",
-            self.metadata_targets > 0
-            and self.rules_records > 0
-            and not self.metadata_invalid
-            and not missing_metadata,
-            "Referenced raw catalogue/rules versions are content-addressed and present.",
-            metadata_targets=self.metadata_targets,
-            rules_records=self.rules_records,
-            invalid=self.metadata_invalid[:10],
-            referenced_snapshots=len(self.metadata_digests_referenced),
-            present_snapshots=len(self.metadata_digests_seen),
-            missing_references=missing_metadata,
-        )
+        # Which assets the tape says we watched. Every target-record check is
+        # scored against this rather than against the rows on their own: a
+        # record for an asset nobody subscribed to answers no question about
+        # this tape, and counting it made the checks satisfiable by a run bundle
+        # that had nothing to do with the capture beside it.
         subscribed = {
             (str(item.get("_capture_venue") or ""), str(asset))
             for item in self.connection_opened
             if item.get("target_digest") != "broadcast"
             for asset in item.get("asset_ids") or []
         }
-        uncovered = sorted(subscribed - set(self.coverage_sightings))
+
+        def watched(captured: set, asserted: set) -> int:
+            admitted = captured | (asserted if self.allow_asserted else set())
+            return len(subscribed & admitted)
+
+        rules_watched = watched(self.rules_assets, self.rules_assets_asserted)
+        # v1 datasets carry the record inside a metadata snapshot, which is not
+        # keyed by asset, so those rows are counted as they always were.
+        rules_admitted = rules_watched + self.rules_records
+        add(
+            "market_rules_and_metadata",
+            self.metadata_targets + rules_watched > 0
+            and rules_admitted > 0
+            and not self.metadata_invalid,
+            "The contemporaneous raw venue record is present and content-addressed for the markets we watched.",
+            metadata_targets=self.metadata_targets,
+            rules_records=rules_admitted,
+            subscribed_with_rules=rules_watched,
+            subscribed_with_rules_captured=len(subscribed & self.rules_assets),
+            subscribed_with_rules_asserted=len(subscribed & self.rules_assets_asserted),
+            snapshot_rules_records=self.rules_records,
+            allow_asserted_records=self.allow_asserted,
+            target_records=self.target_records,
+            provenance=dict(sorted(self.target_record_provenance.items())),
+            invalid=self.metadata_invalid[:10],
+        )
+        # Split out of `market_rules_and_metadata`, which conflated two
+        # questions. Whether the tape's referenced metadata snapshots resolve is
+        # about the tape and its snapshots; whether the venue's record survived
+        # is about the catalogue. Left joined, an archive-only dataset — which
+        # carries no snapshots, because `live/` is not archived — failed a tape
+        # that was fine, for lacking something that was never in it.
+        missing_metadata = sorted(
+            self.metadata_digests_referenced - self.metadata_digests_seen
+        )
+        checks.append(
+            Check(
+                "metadata_snapshot_references",
+                FAIL
+                if self.metadata_digests_seen and missing_metadata
+                else PASS
+                if self.metadata_digests_seen
+                else ADVISORY,
+                {
+                    "referenced_snapshots": len(self.metadata_digests_referenced),
+                    "present_snapshots": len(self.metadata_digests_seen),
+                    "missing_references": missing_metadata[:10],
+                    "note": (
+                        None
+                        if self.metadata_digests_seen
+                        else "dataset carries no metadata snapshots; nothing to resolve against"
+                    ),
+                },
+                "Every metadata digest the tape references resolves to a snapshot the dataset carries.",
+            )
+        )
+        # An asserted sighting proves the market's terms, not when we first saw
+        # it, so it counts only when the run allows it. Excluded is the
+        # asserted-*only* set: an asset with captured evidence keeps it, because
+        # subtracting every asserted asset let one backfill row nullify a real
+        # sighting the same report was affirming.
+        admissible = set(self.coverage_sightings)
+        if not self.allow_asserted:
+            admissible -= self.asserted_assets - self.captured_assets
+        uncovered = sorted(subscribed - admissible)
         created_known = sum(
             self.coverage_sightings[key].get("created_at") is not None
-            for key in subscribed & set(self.coverage_sightings)
+            for key in subscribed & admissible
         )
         add(
             "discovery_coverage",
@@ -523,6 +770,14 @@ class _AuditState:
             subscribed_assets=len(subscribed),
             covered_assets=len(subscribed) - len(uncovered),
             with_created_at=created_known,
+            # The three buckets, named rather than summarized: an asset backed
+            # by a live observation, one backed only by a later re-fetch, and
+            # one backed by nothing. Only the third is a failure.
+            covered_by_captured=len(subscribed & self.captured_assets),
+            covered_by_asserted_only=len(
+                subscribed & (self.asserted_assets - self.captured_assets)
+            ),
+            allow_asserted_records=self.allow_asserted,
             uncovered=uncovered[:10],
         )
         add(
@@ -542,13 +797,29 @@ class _AuditState:
             snapshot_hashes=len(self.pm_snapshot_hashes),
             stream_hash_matches=len(overlap),
         )
+        # `segments_seen` is populated per record, so a day on which every sealed
+        # segment is empty leaves it empty too. Requiring it non-empty scored
+        # that day FAIL with nothing in `failures` -- a verdict naming no reason,
+        # which reads like a fault in this gate rather than in the dataset. A
+        # sealed empty segment is evidence of a quiet lane, not a missing one, so
+        # the seals count toward the dataset carrying segments at all; a dataset
+        # carrying none still fails, and now says why.
+        segments_known = self.segments_seen | set(self.seals)
+        seal_failures = list(self.seal_failures)
+        if not segments_known:
+            seal_failures.append("dataset carries no segments")
         add(
             "every_segment_is_sealed",
-            not self.seal_failures and bool(self.segments_seen),
+            not seal_failures,
             "Every segment carries a seal whose length and digest match its bytes.",
-            segments=len(self.segments_seen),
+            segments=len(segments_known),
             seals=len(self.seals),
-            failures=self.seal_failures[:10],
+            # A silent window is reported rather than hidden: a lane that is
+            # alive and producing nothing looks identical to a dead one in every
+            # other number here.
+            empty_segments=len(self.empty_segments),
+            empty_examples=sorted(self.empty_segments)[:10],
+            failures=seal_failures[:10],
         )
         add(
             "limitless_full_books",
@@ -600,11 +871,17 @@ class _AuditState:
                 "Raw market creation and final-resolution events are both present.",
             )
         )
+        fees_watched = watched(self.fee_assets, self.fee_assets_asserted)
+        fees_admitted = fees_watched + self.fee_records
         add(
             "fee_model_evidence",
-            self.fee_records > 0,
+            fees_admitted > 0,
             "Raw market metadata contains the contemporaneous fee schedule needed for net economics.",
-            metadata_records_with_fees=self.fee_records,
+            metadata_records_with_fees=fees_admitted,
+            subscribed_with_fees_captured=len(subscribed & self.fee_assets),
+            subscribed_with_fees_asserted=len(subscribed & self.fee_assets_asserted),
+            snapshot_records_with_fees=self.fee_records,
+            allow_asserted_records=self.allow_asserted,
         )
         unclosed = sorted(
             f"{lane}/{epoch}"
@@ -636,6 +913,24 @@ class _AuditState:
                 "game_states_with_venue_update_time": self.game_state_events_stamped,
             },
         }
+
+
+def _instant(value: Any) -> datetime | None:
+    """Parse a timestamp for comparison, or `None` if it cannot be compared.
+
+    Deliberately not a string compare. The two sources that write sightings
+    disagree on spelling — `+00:00` from `analysis.storage.utc_now`, `Z` from
+    `targeter.v2.domain.isoformat`, and the latter drops the fractional part on
+    a whole second — and every one of those differences sorts the wrong way
+    lexically.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _book_shape(value: dict[str, Any]) -> bool:
@@ -670,6 +965,30 @@ def generation_metadata_object(key: str) -> bool:
     )
 
 
+def target_record_object(key: str) -> bool:
+    """One run's venue records for the markets it subscribed to.
+
+    Admitted from a run bundle even though the rest of the bundle is not: the
+    selection report is the record of *why* markets were chosen, and the
+    catalogue artifacts describe markets that were never subscribed. Neither can
+    interpret a tape. This one can, and it is the only part of a run that a gate
+    reads.
+
+    `.ndjson` only, never `.ndjson.zst`, for the reason
+    `test_a_compressed_segment_is_not_mistaken_for_a_readable_one` states:
+    `iter_ndjson_lines` skips a key it cannot frame with a bare `continue`, so a
+    compressed artifact admitted here would produce a vacuously empty check
+    rather than an error. Excluded, a zstd run fails loudly for having no
+    records at all — which is the failure that gets noticed.
+    """
+    name = key.rsplit("/", 1)[-1]
+    return (
+        name.startswith("target_records_")
+        and name.endswith(".ndjson")
+        and "/" in key
+    )
+
+
 def gate1_object(key: str) -> bool:
     """The immutable capture bundle inputs that can satisfy this gate.
 
@@ -689,6 +1008,7 @@ def gate1_object(key: str) -> bool:
             and key.endswith(".json")
         )
         or generation_metadata_object(key)
+        or target_record_object(key)
         or key in {"live/coverage.json", "coverage.json"}
     )
 
@@ -697,13 +1017,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset_root", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--allow-asserted-records",
+        action="store_true",
+        help=(
+            "Count venue records fetched after the fact toward the metadata "
+            "checks. Off by default: an asserted record is a belief that the "
+            "venue's terms are immutable, not proof of what the targeter used."
+        ),
+    )
     arguments = parser.parse_args()
     try:
-        report = Gate1Auditor().audit(
-            DirectoryByteStreamer(arguments.dataset_root, include=gate1_object)
-        )
-    except StreamError as error:
-        parser.error(str(error))
+        report = Gate1Auditor(
+            allow_asserted_records=arguments.allow_asserted_records
+        ).audit(DirectoryByteStreamer(arguments.dataset_root, include=gate1_object))
+    except (StreamError, LaneError) as error:
+        # Neither condition is command-line misuse, which is precisely what
+        # `parser.error` announced: it prints a usage block and sends the reader
+        # to check their invocation for a fault that lives in the dataset. A
+        # truncated or unreadable object raises StreamError; an object key
+        # carrying no lane partition raises LaneError, which is a ValueError and
+        # so escaped that handler altogether, surfacing as a traceback. Exit 2
+        # keeps "could not audit" distinct from the clean FAIL that is 1.
+        print(f"gate1: cannot audit {arguments.dataset_root}: {error}", file=sys.stderr)
+        return 2
     encoded = json.dumps(report.as_record(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if arguments.output is not None:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)

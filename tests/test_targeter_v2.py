@@ -20,7 +20,9 @@ from targeter.v2.domain import (
     CanonicalEvent,
     CanonicalMarket,
     CatalogSnapshot,
+    SUPPORTED_VENUES,
     canonical_participant,
+    isoformat,
 )
 from targeter.v2.matching import match_events
 from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
@@ -81,8 +83,26 @@ def market(
     created_at=NOW - timedelta(days=1),
     rules="Resolves Yes if Arsenal wins in regulation time only.",
     volume_total_usd=20_000,
+    raw=None,
 ) -> CanonicalMarket:
+    # Shaped like a real venue record: the fields `replay.catalog._instrument`
+    # reads, plus the volume fields that move on every trade and must stay out
+    # of the projection.
+    if raw is None:
+        raw = {
+            "id": identifier,
+            "clobTokenIds": f'["{identifier}-subscription", "{identifier}-no"]',
+            "outcomes": '["Yes", "No"]',
+            "orderMinSize": "5",
+            "endDate": "2026-08-04T00:00:00Z",
+            "description": rules,
+            "feesEnabled": False,
+            "createdAt": isoformat(created_at),
+            "volume24hr": 100,
+            "liquidity": 200,
+        }
     return CanonicalMarket(
+        raw=raw,
         venue=venue,
         venue_market_id=identifier,
         venue_event_id=event_id,
@@ -1197,6 +1217,132 @@ class ShadowRunTests(unittest.TestCase):
                     ),
                     1,
                 )
+
+
+class TargetRecordArtifactTests(unittest.TestCase):
+    class _Adapter:
+        def __init__(self, catalog):
+            self.venue, self.catalog = catalog.venue, catalog
+
+        def discover(self, _client, *, now):
+            return self.catalog
+
+    def _run(self, *catalogs, directory):
+        return run_shadow(
+            strategy=load_strategy(STRATEGY_PATH),
+            output_root=Path(directory) / "out",
+            cache_root=Path(directory) / "cache",
+            now=NOW,
+            adapters=tuple(self._Adapter(item) for item in catalogs),
+            client=object(),
+            artifact_format="ndjson",
+        )
+
+    @staticmethod
+    def _rows(run_directory: Path, venue: str) -> list[dict]:
+        path = run_directory / f"target_records_{venue}.ndjson"
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def test_the_venue_record_survives_the_run_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(
+                snapshot("kalshi", "k", "km"),
+                snapshot("polymarket", "p", "pm"),
+                CatalogSnapshot("limitless", (), ()),
+                directory=directory,
+            )
+            rows = self._rows(result.directory, "polymarket")
+            self.assertEqual(len(rows), 1)
+            record = rows[0]["record"]
+            # The fields the reader consumes.
+            self.assertIn("clobTokenIds", record)
+            self.assertIn("endDate", record)
+            # And the ones it does not. Trimming to the projection would save a
+            # few kilobytes and cost every field nobody has thought of yet,
+            # which is the mistake this artifact exists to undo.
+            self.assertIn("volume24hr", record)
+            self.assertIn("liquidity", record)
+            self.assertEqual(rows[0]["provenance"], "captured")
+            self.assertEqual(rows[0]["run_id"], result.directory.name)
+
+    def test_only_subscribed_markets_get_a_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(
+                snapshot("kalshi", "k", "km"),
+                snapshot("polymarket", "p", "pm"),
+                CatalogSnapshot("limitless", (), ()),
+                directory=directory,
+            )
+            published = {
+                target["target_id"]
+                for targets in result.selection.targets.values()
+                for target in targets
+            }
+            recorded = {
+                row["target_id"]
+                for venue in SUPPORTED_VENUES
+                for row in self._rows(result.directory, venue)
+            }
+            self.assertEqual(recorded, published)
+
+    def test_a_venue_that_subscribed_nothing_still_writes_its_artifact(self) -> None:
+        # An empty artifact is positive evidence that nothing was subscribed. A
+        # missing file is indistinguishable from a writer that died, which is
+        # the same distinction `every_segment_is_sealed` draws for the tape.
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(
+                snapshot("kalshi", "k", "km"),
+                snapshot("polymarket", "p", "pm"),
+                CatalogSnapshot("limitless", (), ()),
+                directory=directory,
+            )
+            path = result.directory / "target_records_limitless.ndjson"
+            self.assertTrue(path.exists())
+            self.assertEqual(self._rows(result.directory, "limitless"), [])
+
+    def test_a_venue_the_reader_cannot_read_gets_no_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(
+                snapshot("kalshi", "k", "km"),
+                snapshot("polymarket", "p", "pm"),
+                CatalogSnapshot("limitless", (), ()),
+                directory=directory,
+            )
+            kalshi = self._rows(result.directory, "kalshi")[0]
+            self.assertIsNone(kalshi["projection_id"])
+            self.assertIsNone(kalshi["projection_sha256"])
+            polymarket = self._rows(result.directory, "polymarket")[0]
+            self.assertEqual(polymarket["projection_id"], "polymarket.v1")
+            self.assertIsNotNone(polymarket["projection_sha256"])
+
+    def test_a_subscribed_market_with_no_record_is_reported_not_skipped(self) -> None:
+        # A subscribed asset whose record never arrived is exactly what makes a
+        # leg unanalysable, so it must not be discoverable only by its absence.
+        with tempfile.TemporaryDirectory() as directory:
+            stripped = snapshot("polymarket", "p", "pm")
+            stripped = CatalogSnapshot(
+                "polymarket",
+                stripped.events,
+                tuple(
+                    replace(market, raw={}) for market in stripped.markets
+                ),
+            )
+            result = self._run(
+                snapshot("kalshi", "k", "km"),
+                stripped,
+                CatalogSnapshot("limitless", (), ()),
+                directory=directory,
+            )
+            self.assertEqual(self._rows(result.directory, "polymarket"), [])
+            report = read_run_report(result.directory)
+            self.assertEqual(
+                report["target_record_diagnostics"]["polymarket"],
+                ["polymarket:pm: catalogue market carries no raw record"],
+            )
 
 
 if __name__ == "__main__":

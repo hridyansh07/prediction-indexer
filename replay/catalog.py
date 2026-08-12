@@ -12,6 +12,125 @@ from typing import Any
 
 from replay.stream import ByteStreamer, read_object
 
+#: Bumped when a projection's field set changes, so rows minted under the old
+#: set are distinguishable rather than silently comparable.
+PROJECTION_VERSION = 1
+
+#: How a target record came to exist. `captured` was written by the run that
+#: fetched it and is proof of what the targeter used. `asserted` was fetched
+#: later by a backfill that believes the venue's terms immutable — real evidence,
+#: weaker evidence, and the difference stays in the data rather than in a flag
+#: somebody forgets was set.
+CAPTURED = "captured"
+ASSERTED = "asserted"
+
+#: The fields `_instrument` reads out of a venue record, as dotted paths.
+#:
+#: **This is not a claim about which fields the venue keeps stable.** That is a
+#: venue schema guess and unknowable. It is a restatement of what this module
+#: already consumes, which is why it lives here rather than in the targeter: a
+#: field added to `_instrument` without being added here produces validity
+#: intervals that miss real changes, silently, and co-location makes that a
+#: one-file mistake a test can catch.
+#:
+#: Deliberately absent: `volume_24h`, `volume_total`, `volume_total_usd`,
+#: `liquidity`, `bestBid`, `bestAsk`, `lastTradePrice`, `spread`. Nothing in
+#: `replay/` reads them, and they move on every trade — projecting them would
+#: mint a new interval per run for almost every market.
+TARGET_RECORD_PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "polymarket": (
+        "clobTokenIds",
+        "description",
+        "endDate",
+        "feeSchedule.exponent",
+        "feeSchedule.rate",
+        "feeSchedule.takerOnly",
+        "feeType",
+        "feesEnabled",
+        "orderMinSize",
+        "outcomes",
+    ),
+    "limitless": (
+        "collateralToken.decimals",
+        "description",
+        "expirationTimestamp",
+        "feeSchedule.exponent",
+        "feeSchedule.rate",
+        "feeSchedule.takerOnly",
+        "feeType",
+        "feesEnabled",
+        "priceOracleMetadata.chainlinkPair",
+        "priceOracleMetadata.chartSource",
+        "priceOracleMetadata.symbol",
+        "settings.minSize",
+        "title",
+        "tokens.yes",
+    ),
+    # kalshi has no entry because `_instrument` has no Kalshi branch: there is
+    # nothing this module reads, so there is no basis for calling a record
+    # unchanged. Callers must treat a missing projection as "cannot compact"
+    # rather than as "nothing changed".
+}
+
+
+def projection_id(venue: str) -> str | None:
+    """The identity of `venue`'s projection, or `None` if none is declared."""
+    if venue not in TARGET_RECORD_PROJECTIONS:
+        return None
+    return f"{venue}.v{PROJECTION_VERSION}"
+
+
+def project_record(venue: str, record: Any) -> dict[str, Any] | None:
+    """The reader-visible slice of a venue record, or `None` if undeclared.
+
+    An absent path is omitted rather than stored as null, so a field the venue
+    stops publishing is distinguishable from one it publishes as null.
+    """
+    paths = TARGET_RECORD_PROJECTIONS.get(venue)
+    if paths is None or not isinstance(record, dict):
+        return None
+    projected: dict[str, Any] = {}
+    for path in paths:
+        cursor: Any = record
+        for part in path.split("."):
+            if not isinstance(cursor, dict) or part not in cursor:
+                cursor = _ABSENT
+                break
+            cursor = cursor[part]
+        if cursor is not _ABSENT:
+            projected[path] = cursor
+    return projected
+
+
+def projection_sha256(venue: str, record: Any) -> str | None:
+    """Content address of `venue`'s projection of `record`, or `None`."""
+    projected = project_record(venue, record)
+    if projected is None:
+        return None
+    return canonical_sha256(projected)
+
+
+def canonical_sha256(value: Any) -> str:
+    """The encoding `catalogue_record_hash` already commits to."""
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+class _Absent:
+    __slots__ = ()
+
+
+_ABSENT = _Absent()
+
 
 @dataclass(frozen=True)
 class FeeTerms:
@@ -152,15 +271,7 @@ def _instrument(venue: str, target: dict[str, Any]) -> InstrumentMetadata | None
         or not isinstance(record_hash, str)
     ):
         return None
-    computed = hashlib.sha256(
-        json.dumps(
-            record,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    computed = canonical_sha256(record)
     if computed != record_hash:
         raise ValueError(f"catalogue record hash mismatch for {venue}/{asset_id}")
 
@@ -255,6 +366,20 @@ def _instrument(venue: str, target: dict[str, Any]) -> InstrumentMetadata | None
             catalogue_record_hash=record_hash,
         )
     return None
+
+
+def has_fee_terms(record: Any) -> bool:
+    """Whether `record` yields fee terms, asked exactly as `_instrument` asks it.
+
+    Gate 1 counts records carrying a fee model, and it used to do so with its own
+    predicate — `feeSchedule is not None or feeType is not None`. That disagreed
+    with the reader in both directions: it missed `feesEnabled: false`, which is
+    a *complete* fee model (no fees) and the one Polymarket publishes most often,
+    and it counted a bare `feeType`, which alone produces nothing. A gate whose
+    idea of "measurable" differs from the code that measures is reporting on a
+    dataset nobody reads.
+    """
+    return isinstance(record, dict) and _fee_terms(record, "") is not None
 
 
 def _fee_terms(record: dict[str, Any], record_hash: str) -> FeeTerms | None:
