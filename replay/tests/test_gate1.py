@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from replay.catalog import canonical_sha256
 from replay.gate1 import (
     Gate1Auditor,
     gate1_object,
     generation_metadata_object,
+    main,
     target_record_object,
 )
 from replay.stream import MemoryByteStreamer
@@ -411,6 +418,30 @@ class SealedSegmentTests(unittest.TestCase):
             f"{self.LANE}/quiet.ndjson: sha256 disagrees with the bytes", failures
         )
 
+    def test_a_day_on_which_every_segment_is_quiet_passes(self) -> None:
+        # The case `_populated` is written to avoid, which therefore went
+        # untested: no segment holds a record, so `segments_seen` is empty and
+        # requiring it non-empty scored a correctly sealed day FAIL -- with an
+        # empty failure list, naming no reason at all. A low-volume venue
+        # reaches this state on an ordinary quiet night.
+        objects = {}
+        for name in ("first", "second"):
+            objects[f"{self.LANE}/{name}.ndjson"] = b""
+            objects[f"{self.LANE}/{name}.seal.json"] = _seal(b"", data_file=f"{name}.ndjson")
+
+        check = self._check(self._report(objects), "every_segment_is_sealed")
+        self.assertEqual(check["status"], "PASS")
+        self.assertEqual(check["evidence"]["failures"], [])
+        self.assertEqual(check["evidence"]["empty_segments"], 2)
+        self.assertEqual(check["evidence"]["segments"], 2)
+
+    def test_a_dataset_carrying_no_segments_fails_with_a_stated_reason(self) -> None:
+        # Still a failure -- but one that says what is wrong, so the verdict is
+        # not indistinguishable from a fault in this gate.
+        check = self._check(self._report({}), "every_segment_is_sealed")
+        self.assertEqual(check["status"], "FAIL")
+        self.assertEqual(check["evidence"]["failures"], ["dataset carries no segments"])
+
     def test_a_segment_with_records_but_no_seal_still_fails(self) -> None:
         data = _line(1, 1, {"bids": [], "asks": []})
         check = self._check(
@@ -506,6 +537,42 @@ class GateOneObjectFilterTests(unittest.TestCase):
         # `iter_ndjson_lines` would skip it silently, so admitting it would add
         # bytes to `dataset_sha256` that no check ever reads.
         self.assertFalse(gate1_object("spool/lane=kalshi/date=2026-08-06/a.ndjson.zst"))
+
+
+class GateOneCommandLineTests(unittest.TestCase):
+    """A fault in the dataset must not be announced as a fault in the command.
+
+    `parser.error` printed a usage block and exited, which sends the reader to
+    check an invocation that was correct. It also only ever ran for
+    `StreamError`, so the `LaneError` raised by a malformed partition -- a
+    `ValueError`, unrelated by inheritance -- escaped it as a traceback.
+    """
+
+    def _run(self, objects: dict[str, bytes]) -> tuple[int, str]:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for key, data in objects.items():
+            path = root / key
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", ["gate1", str(root)]):
+            with contextlib.redirect_stderr(stderr):
+                return main(), stderr.getvalue()
+
+    def test_a_key_with_no_lane_partition_is_reported_not_raised(self) -> None:
+        data = _line(1, 1, {"bids": [], "asks": []})
+        code, stderr = self._run(
+            {
+                "spool/lane=/date=2026-08-05/a.ndjson": data,
+                "spool/lane=/date=2026-08-05/a.seal.json": _seal(data, data_file="a.ndjson"),
+            }
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("empty lane partition", stderr)
+        # The tell that this was being blamed on the caller.
+        self.assertNotIn("usage:", stderr)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ from replay.catalog import (
 )
 from replay.envelope import Envelope, EnvelopeError, parse_envelope
 from replay.events import GAME_STATE_MARKERS
-from replay.lanes import PARTITION_PREFIXES, lane_of
+from replay.lanes import PARTITION_PREFIXES, LaneError, lane_of
 from replay.stream import (
     ByteStreamer,
     DirectoryByteStreamer,
@@ -796,18 +797,29 @@ class _AuditState:
             snapshot_hashes=len(self.pm_snapshot_hashes),
             stream_hash_matches=len(overlap),
         )
+        # `segments_seen` is populated per record, so a day on which every sealed
+        # segment is empty leaves it empty too. Requiring it non-empty scored
+        # that day FAIL with nothing in `failures` -- a verdict naming no reason,
+        # which reads like a fault in this gate rather than in the dataset. A
+        # sealed empty segment is evidence of a quiet lane, not a missing one, so
+        # the seals count toward the dataset carrying segments at all; a dataset
+        # carrying none still fails, and now says why.
+        segments_known = self.segments_seen | set(self.seals)
+        seal_failures = list(self.seal_failures)
+        if not segments_known:
+            seal_failures.append("dataset carries no segments")
         add(
             "every_segment_is_sealed",
-            not self.seal_failures and bool(self.segments_seen),
+            not seal_failures,
             "Every segment carries a seal whose length and digest match its bytes.",
-            segments=len(self.segments_seen),
+            segments=len(segments_known),
             seals=len(self.seals),
             # A silent window is reported rather than hidden: a lane that is
             # alive and producing nothing looks identical to a dead one in every
             # other number here.
             empty_segments=len(self.empty_segments),
             empty_examples=sorted(self.empty_segments)[:10],
-            failures=self.seal_failures[:10],
+            failures=seal_failures[:10],
         )
         add(
             "limitless_full_books",
@@ -1019,8 +1031,16 @@ def main() -> int:
         report = Gate1Auditor(
             allow_asserted_records=arguments.allow_asserted_records
         ).audit(DirectoryByteStreamer(arguments.dataset_root, include=gate1_object))
-    except StreamError as error:
-        parser.error(str(error))
+    except (StreamError, LaneError) as error:
+        # Neither condition is command-line misuse, which is precisely what
+        # `parser.error` announced: it prints a usage block and sends the reader
+        # to check their invocation for a fault that lives in the dataset. A
+        # truncated or unreadable object raises StreamError; an object key
+        # carrying no lane partition raises LaneError, which is a ValueError and
+        # so escaped that handler altogether, surfacing as a traceback. Exit 2
+        # keeps "could not audit" distinct from the clean FAIL that is 1.
+        print(f"gate1: cannot audit {arguments.dataset_root}: {error}", file=sys.stderr)
+        return 2
     encoded = json.dumps(report.as_record(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if arguments.output is not None:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
