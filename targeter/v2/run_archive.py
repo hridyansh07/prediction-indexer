@@ -28,7 +28,7 @@ from archive.storage.base import (
     provider_checksum_of,
 )
 from encoder import CodecError, LogicalIdentity, StoredIdentity, logical_identity_of, stored_identity_of
-from targeter.v2.domain import parse_timestamp
+from targeter.v2.domain import SUPPORTED_VENUES, parse_timestamp
 
 
 RUN_MANIFEST_VERSION = 2
@@ -266,6 +266,10 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
         raise RunArchiveError("selection report artifacts must be a non-empty object")
     suffix = ".ndjson.zst" if artifact_format == "zstd" else ".ndjson"
     expected = {f"rule_templates{suffix}", f"rule_drift{suffix}"}
+    # Target records are written for every supported venue, not only the ones
+    # that produced a catalogue: a venue that discovered nothing still has to be
+    # distinguishable from a venue whose artifact went missing.
+    expected.update(f"target_records_{venue}{suffix}" for venue in SUPPORTED_VENUES)
     catalogues = report.get("catalogs")
     if not isinstance(catalogues, list):
         raise RunArchiveError("selection report catalogs must be an array")

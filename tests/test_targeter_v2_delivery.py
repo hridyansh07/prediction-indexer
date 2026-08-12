@@ -144,6 +144,12 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         report = json.loads(report_path.read_text())
         report.pop("artifact_format")
         report.pop("artifacts")
+        report.pop("target_record_diagnostics", None)
+        # A run old enough to carry a v1 manifest predates target records, so it
+        # has neither the inventory nor the files. Stripping only the inventory
+        # would build a hybrid that never existed.
+        for stale in run_directory.glob("target_records_*"):
+            stale.unlink()
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

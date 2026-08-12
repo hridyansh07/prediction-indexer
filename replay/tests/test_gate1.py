@@ -4,7 +4,13 @@ import hashlib
 import json
 import unittest
 
-from replay.gate1 import Gate1Auditor, gate1_object, generation_metadata_object
+from replay.catalog import canonical_sha256
+from replay.gate1 import (
+    Gate1Auditor,
+    gate1_object,
+    generation_metadata_object,
+    target_record_object,
+)
 from replay.stream import MemoryByteStreamer
 
 
@@ -24,6 +30,223 @@ def _line(index: int, local: int, payload: dict, *, event_kind: str = "venue_fra
         "raw_payload": json.dumps(payload, separators=(",", ":")),
     }
     return json.dumps(record, separators=(",", ":")).encode() + b"\n"
+
+
+def _target_record(asset: str, *, provenance: str = "captured", **overrides) -> bytes:
+    record = {
+        "clobTokenIds": f'["{asset}", "no"]',
+        "outcomes": '["Yes", "No"]',
+        "orderMinSize": "5",
+        "endDate": "2026-08-04T00:00:00Z",
+        "description": "Resolves against the Binance 1 minute candle.",
+        "feesEnabled": False,
+        "createdAt": "2026-08-02T12:00:00Z",
+        "volume24hr": 1000,
+    }
+    record.update(overrides.pop("record", {}))
+    row = {
+        "version": 1,
+        "run_id": "20260803T120000.000000Z",
+        "venue": "polymarket",
+        "target_id": f"polymarket:{asset}",
+        "subscription_ids": [asset],
+        "observed_at": "2026-08-03T12:00:00Z",
+        "provenance": provenance,
+        "projection_id": "polymarket.v1",
+        "projection_sha256": "unused-by-gate-1",
+        "record_sha256": canonical_sha256(record),
+        "record": record,
+    }
+    row.update(overrides)
+    return json.dumps(row, separators=(",", ":")).encode() + b"\n"
+
+
+def _dataset(*, records: bytes, asset: str = "asset") -> dict[str, bytes]:
+    """A tape subscribing to `asset`, plus one run's target records. No `live/`."""
+    opened = {
+        "event": "connection_opened",
+        "target_digest": "d",
+        "asset_ids": [asset],
+        "delivers_deltas": True,
+        "fsync_interval_seconds": 0.25,
+        "clock_scope": {"scope_id": "boot", "comparable_across_processes": True},
+    }
+    tape = (
+        _line(1, 1, opened, event_kind="control")
+        + _line(2, 2, {"event_type": "book", "bids": [], "asks": [], "hash": "h"})
+        + _line(3, 3, {"event": "connection_closed"}, event_kind="control")
+    )
+    segment = "spool/lane=polymarket/date=2026-08-03/seg.ndjson"
+    return {
+        segment: tape,
+        segment.replace(".ndjson", ".seal.json"): json.dumps(
+            {
+                "data_file": "seg.ndjson",
+                "byte_length": len(tape),
+                "line_count": 3,
+                "sha256": hashlib.sha256(tape).hexdigest(),
+            }
+        ).encode(),
+        "targeter-v2-runs/20260803T120000.000000Z/target_records_polymarket.ndjson": records,
+    }
+
+
+class TargetRecordTests(unittest.TestCase):
+    def _checks(self, objects: dict[str, bytes], **kwargs) -> dict[str, dict]:
+        report = Gate1Auditor(**kwargs).audit(MemoryByteStreamer(objects)).as_record()
+        return {check["name"]: check for check in report["checks"]}
+
+    def test_a_run_bundle_satisfies_the_metadata_checks_with_no_live_tree(self) -> None:
+        # The point of the whole exercise: rules, fees and discovery coverage
+        # all resolve from an archived run artifact, so gate 1's inputs are
+        # segments, seals and target records — every one of them immutable and
+        # already in the archive.
+        checks = self._checks(_dataset(records=_target_record("asset")))
+        self.assertEqual(checks["market_rules_and_metadata"]["status"], "PASS")
+        self.assertEqual(checks["fee_model_evidence"]["status"], "PASS")
+        self.assertEqual(checks["discovery_coverage"]["status"], "PASS")
+        coverage = checks["discovery_coverage"]["evidence"]
+        self.assertEqual(coverage["subscribed_assets"], 1)
+        self.assertEqual(coverage["covered_assets"], 1)
+        # `createdAt` travels in the venue's own record, so the discovery-lag
+        # measurement survives the move off `live/coverage.json` intact.
+        self.assertEqual(coverage["with_created_at"], 1)
+
+    def test_disabled_fees_are_counted_as_a_fee_model(self) -> None:
+        checks = self._checks(_dataset(records=_target_record("asset")))
+        evidence = checks["fee_model_evidence"]["evidence"]
+        self.assertEqual(evidence["metadata_records_with_fees"], 1)
+
+    def test_an_asserted_record_does_not_count_unless_it_is_allowed(self) -> None:
+        objects = _dataset(records=_target_record("asset", provenance="asserted"))
+
+        strict = self._checks(objects)
+        self.assertEqual(strict["market_rules_and_metadata"]["status"], "FAIL")
+        self.assertEqual(strict["fee_model_evidence"]["status"], "FAIL")
+        # An asserted record proves the market's terms, not when we first saw
+        # it, so it cannot answer a discovery-coverage question either.
+        self.assertEqual(strict["discovery_coverage"]["status"], "FAIL")
+        rules = strict["market_rules_and_metadata"]["evidence"]
+        self.assertEqual(rules["subscribed_with_rules_captured"], 0)
+        self.assertEqual(rules["subscribed_with_rules_asserted"], 1)
+
+        allowed = self._checks(objects, allow_asserted_records=True)
+        self.assertEqual(allowed["market_rules_and_metadata"]["status"], "PASS")
+        self.assertEqual(allowed["fee_model_evidence"]["status"], "PASS")
+        self.assertEqual(allowed["discovery_coverage"]["status"], "PASS")
+
+    def test_the_report_states_which_evidence_it_counted(self) -> None:
+        # Weaker evidence stays visible in the report rather than being folded
+        # into a number that looks like the real thing.
+        objects = _dataset(
+            records=_target_record("asset")
+            + _target_record("other", provenance="asserted")
+        )
+        evidence = self._checks(objects)["market_rules_and_metadata"]["evidence"]
+        self.assertEqual(evidence["provenance"], {"asserted": 1, "captured": 1})
+        self.assertEqual(evidence["subscribed_with_rules_captured"], 1)
+        self.assertFalse(evidence["allow_asserted_records"])
+
+    def test_a_record_that_disagrees_with_its_own_hash_is_reported(self) -> None:
+        objects = _dataset(
+            records=_target_record("asset", record_sha256="0" * 64)
+        )
+        check = self._checks(objects)["market_rules_and_metadata"]
+        self.assertEqual(check["status"], "FAIL")
+        self.assertIn(
+            "polymarket:asset: record hash disagrees with bytes",
+            check["evidence"]["invalid"],
+        )
+
+    def test_an_unknown_provenance_is_a_failure_not_a_default(self) -> None:
+        objects = _dataset(records=_target_record("asset", provenance="probably-fine"))
+        checks = self._checks(objects)
+        self.assertEqual(checks["byte_and_envelope_integrity"]["status"], "FAIL")
+
+    def test_a_backfill_row_does_not_nullify_captured_evidence(self) -> None:
+        # A market observed live and later re-fetched by a backfill has both a
+        # captured and an asserted row. Subtracting every asserted asset made
+        # the report say "captured evidence exists" and "this asset is
+        # uncovered" at the same time.
+        objects = _dataset(
+            records=_target_record("asset")
+            + _target_record("asset", provenance="asserted")
+        )
+        checks = self._checks(objects)
+        coverage = checks["discovery_coverage"]["evidence"]
+        self.assertEqual(checks["discovery_coverage"]["status"], "PASS")
+        self.assertEqual(coverage["uncovered"], [])
+        self.assertEqual(coverage["covered_by_captured"], 1)
+        self.assertEqual(coverage["covered_by_asserted_only"], 0)
+
+    def test_a_live_ledger_sighting_is_not_nullified_by_a_backfill(self) -> None:
+        objects = _dataset(records=_target_record("asset", provenance="asserted"))
+        objects["live/coverage.json"] = json.dumps(
+            {
+                "version": 1,
+                "sightings": [
+                    {
+                        "venue": "polymarket",
+                        "asset_id": "asset",
+                        "first_seen_at": "2026-08-03T11:00:00+00:00",
+                        "created_at": "2026-08-02T12:00:00+00:00",
+                    }
+                ],
+            }
+        ).encode()
+        coverage = self._checks(objects)["discovery_coverage"]["evidence"]
+        self.assertEqual(coverage["uncovered"], [])
+        self.assertEqual(coverage["covered_by_captured"], 1)
+
+    def test_the_earliest_sighting_wins_regardless_of_source_or_spelling(self) -> None:
+        # `live/coverage.json` writes `+00:00`; the targeter writes `Z` and
+        # drops the fraction on a whole second. Lexically `'+' < '.' < 'Z'`, so
+        # a string compare picks the later row in both directions. The ledger
+        # here is strictly later and must not displace the record's sighting.
+        objects = _dataset(records=_target_record("asset"))
+        objects["live/coverage.json"] = json.dumps(
+            {
+                "version": 1,
+                "sightings": [
+                    {
+                        "venue": "polymarket",
+                        "asset_id": "asset",
+                        "first_seen_at": "2099-01-01T00:00:00.500000+00:00",
+                        "created_at": None,
+                    }
+                ],
+            }
+        ).encode()
+        checks = self._checks(objects)
+        coverage = checks["discovery_coverage"]["evidence"]
+        self.assertEqual(checks["discovery_coverage"]["status"], "PASS")
+        # The record's own `createdAt` survives a ledger row that has none, so
+        # adding evidence cannot take the discovery-lag measurement away.
+        self.assertEqual(coverage["with_created_at"], 1)
+
+    def test_a_record_for_an_asset_nobody_subscribed_to_proves_nothing(self) -> None:
+        # "for the markets we watched" is what the requirement says. A run
+        # bundle with no relationship to the tape beside it must not satisfy it.
+        objects = _dataset(records=_target_record("never-subscribed"))
+        checks = self._checks(objects)
+        self.assertEqual(checks["market_rules_and_metadata"]["status"], "FAIL")
+        self.assertEqual(checks["fee_model_evidence"]["status"], "FAIL")
+        self.assertEqual(checks["discovery_coverage"]["status"], "FAIL")
+
+    def test_repeating_a_row_every_run_does_not_inflate_the_counts(self) -> None:
+        # Rows repeat per run by design, so counting rows would let one market
+        # observed 144 times a day look like 144 markets.
+        objects = _dataset(records=_target_record("asset") * 3)
+        evidence = self._checks(objects)["market_rules_and_metadata"]["evidence"]
+        self.assertEqual(evidence["subscribed_with_rules"], 1)
+        self.assertEqual(evidence["target_records"], 3)
+
+    def test_target_records_are_not_parsed_as_tape(self) -> None:
+        # They are NDJSON with no envelope and no lane partition. Routed by key,
+        # so they neither register a parse failure nor make `lane_of` raise.
+        checks = self._checks(_dataset(records=_target_record("asset")))
+        self.assertEqual(checks["byte_and_envelope_integrity"]["status"], "PASS")
+        self.assertEqual(checks["deterministic_capture_order"]["status"], "PASS")
 
 
 class Gate1Tests(unittest.TestCase):
@@ -65,8 +288,17 @@ class Gate1Tests(unittest.TestCase):
         # arrive only on a subscription sending `custom_feature_enabled`, which
         # capture does not set, so a blocking check here would gate every later
         # analysis on a capture change nobody has asked for.
+        #
+        # `metadata_snapshot_references` is advisory for a different reason:
+        # this tape carries no metadata snapshots at all, so there is nothing
+        # for its referenced digests to resolve against. A dataset is not failed
+        # for lacking something that was never in it — the check goes blocking
+        # the moment the dataset carries a single snapshot.
         advisory = {check.name for check in report.checks if check.status == "ADVISORY"}
-        self.assertEqual(advisory, {"market_lifecycle_observability"})
+        self.assertEqual(
+            advisory,
+            {"market_lifecycle_observability", "metadata_snapshot_references"},
+        )
         self.assertNotIn("market_lifecycle_observability", failed)
 
     def test_report_is_identical_across_storage_chunking(self) -> None:
@@ -240,6 +472,32 @@ class GateOneObjectFilterTests(unittest.TestCase):
             "targeter-v2-runs/20260806T101500.123456Z/catalog_kalshi_markets.ndjson",
         ):
             self.assertFalse(gate1_object(key), key)
+
+    def test_target_records_are_the_only_part_of_a_run_a_gate_reads(self) -> None:
+        run = "targeter-v2-runs/20260806T101500.123456Z"
+        self.assertTrue(gate1_object(f"{run}/target_records_kalshi.ndjson"))
+        self.assertTrue(target_record_object(f"{run}/target_records_polymarket.ndjson"))
+        # The archive spells the same object differently. Both resolve.
+        self.assertTrue(
+            gate1_object(
+                "targeter-v2/runs/date=2026-08-06/run=20260806T101500.123456Z"
+                "/target_records_limitless.ndjson"
+            )
+        )
+        # The selection report is the record of *why* markets were chosen and
+        # the catalogue describes markets that were never subscribed. Neither
+        # can interpret a tape, so neither is evidence a gate reads.
+        self.assertFalse(gate1_object(f"{run}/selection_report.json"))
+        self.assertFalse(gate1_object(f"{run}/catalog_kalshi_markets.ndjson"))
+
+    def test_a_compressed_target_record_is_excluded_rather_than_skipped(self) -> None:
+        # `iter_ndjson_lines` skips a key it cannot frame with a bare `continue`,
+        # so admitting this would make the metadata checks vacuously empty
+        # instead of failing. Excluded, the dataset has no records at all and
+        # the gate says so.
+        key = "targeter-v2-runs/20260806T101500.123456Z/target_records_kalshi.ndjson.zst"
+        self.assertFalse(target_record_object(key))
+        self.assertFalse(gate1_object(key))
 
     def test_an_unsealed_segment_is_never_admitted(self) -> None:
         self.assertFalse(gate1_object("spool/lane=kalshi/date=2026-08-06/a.ndjson.open"))

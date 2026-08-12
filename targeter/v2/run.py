@@ -19,7 +19,12 @@ from archive.storage.factory import add_store_arguments, build_store
 from analysis.storage import write_json_zstd, write_ndjson, write_ndjson_zstd
 from encoder import DEFAULT_ZSTD_LEVEL, encoder_version, logical_identity_of, stored_identity_of
 from targeter.v2.adapters import durable_client, live_adapters
-from targeter.v2.domain import CatalogSnapshot, SUPPORTED_VENUES, parse_timestamp
+from targeter.v2.domain import (
+    CatalogSnapshot,
+    SUPPORTED_VENUES,
+    isoformat,
+    parse_timestamp,
+)
 from targeter.v2.lease import TargeterRunLease
 from targeter.v2.registry import Strategy, StrategyError, load_strategy
 from targeter.v2.publication import (
@@ -29,6 +34,7 @@ from targeter.v2.publication import (
 )
 from targeter.v2.run_archive import RunArchiveError, archive_run
 from targeter.v2.selection import SelectionResult, select_targets
+from targeter.v2.target_records import artifact_stem, target_record_rows
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -157,10 +163,35 @@ def run_shadow(
             artifact_format=artifact_format,
         )
         artifacts[name] = identity
+    # The venue's own record for every subscribed market, beside the normalized
+    # view rather than in place of it. Written for every venue the strategy
+    # budgets for, including one that selected nothing, so an empty artifact is
+    # positive evidence that nothing was subscribed rather than a missing file.
+    observed_at = isoformat(now)
+    target_record_diagnostics: dict[str, list[str]] = {}
+    for venue in SUPPORTED_VENUES:
+        rows, diagnostics = target_record_rows(
+            run_id=run_id,
+            observed_at=observed_at,
+            venue=venue,
+            catalogs=catalogs,
+            targets=selection.targets.get(venue, ()),
+        )
+        name, identity = _write_artifact(
+            directory,
+            artifact_stem(venue),
+            rows,
+            artifact_format=artifact_format,
+        )
+        artifacts[name] = identity
+        if diagnostics:
+            target_record_diagnostics[venue] = diagnostics
+
     record = selection.as_record()
     record["run_id"] = run_id
     record["strategy_source"] = strategy.source_path
     record["discovery_failures"] = dict(sorted(failures.items()))
+    record["target_record_diagnostics"] = dict(sorted(target_record_diagnostics.items()))
     catalog_venues = [catalog.venue for catalog in catalogs]
     input_complete = (
         not failures
