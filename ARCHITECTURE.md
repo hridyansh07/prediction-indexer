@@ -236,6 +236,14 @@ not retained in the long-lived classifier: doing so costs O(all historical
 records) RAM even though file reads themselves are cursor-based. Ordering state
 remains in memory; exact identity remains durable and global.
 
+The sealed-window finalizer uses the same bounded classifier but not that global
+projection: its duplicate/conflict contract is window-scoped. Each merge attempt
+gets an exact disposable SQLite index, removed before the attempt can become
+canonical evidence. A lane-invalid retry starts with a fresh index so excluded
+records cannot affect the surviving merge. Thus finalization memory is independent
+of window record count without coupling canonical output to the mutable ingest
+store.
+
 **Deliberately stops before normalisation.** Converting venue frames into typed
 canonical events at ingest is what a trading system does, because it must act on
 the frame immediately. We don't need to, so there is no fixed-point money stack

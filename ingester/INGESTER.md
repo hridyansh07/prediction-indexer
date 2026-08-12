@@ -69,8 +69,9 @@ is a venue misbehaving and worth surfacing loudly. Identity is decided *before*
 continuity so a retransmission cannot move a counter or stale a stream. In the
 long-lived ingester this is an indexed SQLite lookup, not a process-local map:
 the verdict remains global and exact without retaining every historical record ID
-in RAM. The finalizer still uses an in-memory map scoped to one fixed 30-minute
-window because it deliberately does not link the SQLite store.
+in RAM. The finalizer keeps the narrower window-scoped semantics but uses a
+disposable SQLite index for each merge attempt; it does not link or mutate the
+ingester's global store.
 
 **Epoch health** — `AwaitingBootstrap` → `Healthy` → `Stale` → `Retired`. A new
 connection starts unproven. Snapshot proof is tracked **per instrument, not per
@@ -131,7 +132,7 @@ continuity is verifiable without knowing the instrument. Whether Kalshi actually
 numbers per connection or per market is unverified; if per market, it needs the
 same treatment.
 
-### Memory bound and store schema v2
+### Memory bounds and disk-backed identity
 
 The original ingester streamed spool lines in 512-record batches but retained one
 `BTreeMap` entry for every unique `record_id`. Startup rebuilt the same map by
@@ -144,11 +145,13 @@ lanes, five sealed segments, 2,670,449 records and 2,331,516,814 decoded bytes:
 | Release path | Peak RSS |
 |---|---:|
 | k-way cursors, parse and merge only | 2,592 KiB |
+| original `indexer-finalize` | 530,120 KiB |
 | original `indexer-ingest`, initial ingest | 510,140 KiB |
 | original `indexer-ingest`, no-new-data restart | 520,248 KiB |
 | schema-v2 migration plus recovery | 7,472 KiB |
 | schema-v2 `indexer-ingest`, initial ingest | 7,972 KiB |
 | schema-v2 `indexer-ingest`, no-new-data restart | 6,580 KiB |
+| disk-backed `indexer-finalize` | 13,756 KiB |
 
 Schema v2 adds `record_identity(record_id, content_hash, first_seen)`. A first
 observation, its fact, and the spool-cursor advance commit in one SQLite
@@ -163,6 +166,16 @@ identity history in Rust memory. On this sample the store grew from 4.9 GiB to
 18,400 records/second, still over twenty times the measured steady capture rate.
 The migration rolls back on malformed historical identity data and leaves the
 schema version at 1.
+
+The finalizer has no lifetime-global identity contract: duplicate and conflict
+verdicts deliberately start fresh at each 30-minute window. It therefore creates
+`.record-identity.sqlite.open` as an exact scratch index for each merge attempt,
+with a bounded 2 MiB SQLite page cache, no durability work, and no receipt status.
+Success, deferral, or a lane fault closes and removes it; a retry after a lane
+fault starts empty so the excluded lane cannot influence surviving records. On
+the same sample finalization took 67.52 seconds versus 58.51 seconds before the
+change, while peak RSS fell by 97.4%. The independent canonical audit verified
+all 2,670,449 evidence/provenance pairs.
 
 ## Not in v1
 

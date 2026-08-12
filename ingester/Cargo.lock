@@ -186,6 +186,7 @@ dependencies = [
  "indexer-segment",
  "indexer-types",
  "prediction-encoder",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

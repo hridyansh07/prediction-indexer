@@ -371,6 +371,17 @@ audit before replay or export:
 docker compose --profile ops run --rm canonical-integrity
 ```
 
+Duplicate/conflict classification uses an exact, window-scoped SQLite scratch
+index named `.record-identity.sqlite.open` inside the open window directory. It
+is neither canonical output nor a commit marker and is removed after every merge
+attempt; a stale file after a killed process is replaced when that window is
+retried. Leave temporary disk headroom proportional to the largest window. The
+finalizer report's `max_identity_records_in_memory` must be `0`.
+
+On the measured 2.67-million-record production window this reduced finalizer peak
+RSS from 530,120 KiB to 13,756 KiB. Finalization took 67.52 seconds instead of
+58.51 seconds, and the independent audit verified every evidence/provenance pair.
+
 `--expect-lane` in the `finalizer` service must list exactly the splices this
 deployment runs. It ships with the three ungated ones; enabling the `kalshi`
 profile means adding `kalshi`, and `reference` means adding `polymarket_sports`

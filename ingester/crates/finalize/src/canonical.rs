@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use indexer_continuity::Classifier;
+use indexer_continuity::{Classifier, IdentityVerdict};
 use indexer_types::{CanonicalSeq, EnvelopeView, Positioned};
 use prediction_encoder::{
     CODEC_VERSION, DEFAULT_ZSTD_LEVEL, EncodeResult, StreamingEncoder, encoder_version,
@@ -34,6 +34,7 @@ use prediction_encoder::{
 use serde::{Deserialize, Serialize};
 
 use crate::continuity::{ClassifiedLine, LaneClocks, OrderingState, SeenEpochs, WrittenLine};
+use crate::identity::AttemptIdentity;
 use crate::merge::LaneStream;
 use crate::reader::{LaneReader, SegmentClaims, SegmentInput};
 use crate::window::{
@@ -218,9 +219,9 @@ struct ProvenanceLine<'a> {
     /// What this delivery meant for its stream: `continuous`, `gap_proven`,
     /// `duplicate`, and so on — the same vocabulary `indexer-ingest` commits.
     ///
-    /// Duplicate and conflict are **window-scoped**: identity state starts empty
-    /// for each window, because carrying it would mean holding every record id
-    /// in the retention period. See `continuity.rs`.
+    /// Duplicate and conflict are **window-scoped**: the exact scratch index
+    /// starts empty for each window and is never carried in the watermark. See
+    /// `continuity.rs`.
     continuity_verdict: &'a str,
     /// Non-null exactly when two or more distinct lanes share this `visible_ns`.
     /// §1 requires analysis to treat such records as simultaneous at capture
@@ -232,6 +233,9 @@ struct ProvenanceLine<'a> {
 pub struct FinalizedWindow {
     pub receipt: Receipt,
     pub directory: PathBuf,
+    /// Operational proof that canonicalization did not retain per-record
+    /// identity history in the classifier.
+    pub identity_records_in_memory: usize,
 }
 
 /// What finalizing one window produced.
@@ -548,7 +552,17 @@ pub fn finalize_window(
     create_dir_all_durable(&directory)?;
 
     let mut attempt = 0;
-    let (evidence, provenance, inputs, lane_names, first_written, written, ordering, clocks) = loop {
+    let (
+        evidence,
+        provenance,
+        inputs,
+        lane_names,
+        first_written,
+        written,
+        ordering,
+        clocks,
+        identity_records_in_memory,
+    ) = loop {
         attempt += 1;
         if attempt > window.lanes.len() + 1 {
             return Err(format!(
@@ -610,9 +624,12 @@ pub fn finalize_window(
         let mut first_written: Option<CanonicalSeq> = None;
         let mut written = 0u64;
 
-        // Identity starts empty for every window and every attempt; ordering
-        // history continues from the watermark. See `continuity.rs`.
-        let mut classifier = Classifier::new();
+        // Identity starts empty for every window and every lane-retry attempt;
+        // ordering history continues from the watermark. The exact identity
+        // index spills to a disposable SQLite file instead of retaining one
+        // BTreeMap node per canonical record. See `continuity.rs`.
+        let mut identity = AttemptIdentity::create(&directory)?;
+        let mut classifier = Classifier::without_identity_history();
         classifier.restore(carried.ordering.seed());
         let mut seen = SeenEpochs::default();
         let mut clocks = LaneClocks::default();
@@ -634,6 +651,10 @@ pub fn finalize_window(
                     })
                 })?;
                 let content_hash = indexer_types::ContentHash::hash(view.raw_payload.as_bytes());
+                let identity_verdict = identity
+                    .verdict(view.record_id.as_str(), content_hash)
+                    .map_err(MergeAttemptError::Fatal)?;
+                let first_observation = matches!(identity_verdict, IdentityVerdict::Unseen);
 
                 // 1. bytes down, position assigned — the receipt.
                 evidence
@@ -642,7 +663,8 @@ pub fn finalize_window(
                 let written_line = WrittenLine::new(next_seq);
 
                 // 2. decide, holding the receipt. Moves nothing.
-                let fact = classifier.classify(&view, &written_line);
+                let fact =
+                    classifier.classify_with_identity(&view, &written_line, identity_verdict);
 
                 // 3. the verdict goes down beside the record it describes.
                 let line = serde_json::to_vec(&ProvenanceLine {
@@ -672,6 +694,15 @@ pub fn finalize_window(
                     Positioned::position(&written_line),
                     fact,
                 ));
+                if first_observation {
+                    identity
+                        .remember(
+                            view.record_id.as_str(),
+                            content_hash,
+                            Positioned::position(&written_line),
+                        )
+                        .map_err(MergeAttemptError::Fatal)?;
+                }
 
                 first_written.get_or_insert(next_seq);
                 next_seq = next_seq.next();
@@ -695,6 +726,7 @@ pub fn finalize_window(
                     written,
                     OrderingState::capture(&carried.ordering, classifier.state(), &seen.into_map()),
                     clocks,
+                    classifier.retained_identity_count(),
                 );
             }
             Err(fault) => {
@@ -825,6 +857,7 @@ pub fn finalize_window(
     Ok(WindowOutcome::Committed(Box::new(FinalizedWindow {
         receipt,
         directory,
+        identity_records_in_memory,
     })))
 }
 
