@@ -225,6 +225,15 @@ services:
       - "${SEGMENT_SECONDS:-1800}"
       - --writer-queue-capacity
       - "${WRITER_QUEUE_CAPACITY:-20000}"
+      # Ask Kalshi to re-send the book for any market that has gone this long
+      # without a snapshot. **Zero, the default, disables the poller entirely**,
+      # so an image carrying it behaves exactly as before until an operator opts
+      # in. It ships off because the production capture connection is not where a
+      # command shape is tried without someone watching: a rejected command that
+      # drops this connection costs tape, and tape cannot be recovered. 600 is
+      # the value measured against the live venue.
+      - --snapshot-max-age-seconds
+      - "${KALSHI_SNAPSHOT_MAX_AGE_SECONDS:-0}"
     volumes:
       - *data-volume
       - type: bind

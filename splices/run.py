@@ -51,7 +51,8 @@ VENUES = tuple(FEEDS)
 
 
 def build_splice(feed: str, spool: Spool, targets: Path | None, *,
-                 poll_seconds: float = 60.0, **kwargs):
+                 poll_seconds: float = 60.0,
+                 snapshot_max_age_seconds: float = 0.0, **kwargs):
     """Imported lazily so a venue whose optional dependency is missing does not
     stop the others from running."""
     if feed == "polymarket":
@@ -67,7 +68,8 @@ def build_splice(feed: str, spool: Spool, targets: Path | None, *,
 
         # Credentials are read lazily at connect time, so an unconfigured Kalshi
         # never blocks constructing a splice for a venue that is configured.
-        return KalshiSplice(spool, targets, dotenv_path=PROJECT_ROOT / ".env", **kwargs)
+        return KalshiSplice(spool, targets, dotenv_path=PROJECT_ROOT / ".env",
+                            snapshot_max_age_seconds=snapshot_max_age_seconds, **kwargs)
     if feed == "polymarket-sports":
         from splices.polymarket.sports import PolymarketSportsSplice
 
@@ -107,6 +109,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=float, default=60.0,
                         help="Snapshot poller only: how often a full book cycle runs. "
                              "This is the worst-case unverified window it can bound.")
+    # Defaulted off rather than to the splice's own 600, and the difference is
+    # deliberate. This is the entry point production runs, and a rejected command
+    # that drops the connection here costs tape. Turning it on stays one flag, so
+    # that enabling it is always the record that a human decided to.
+    parser.add_argument("--snapshot-max-age-seconds", type=float, default=0.0,
+                        help="Kalshi only: ask for an orderbook snapshot for any market "
+                             "that has not received one for this long. 0 disables the "
+                             "poller, which is the default: enabling it is a per-"
+                             "deployment decision. 600 is the measured value.")
     return parser.parse_args()
 
 
@@ -118,6 +129,7 @@ async def main_async(arguments: argparse.Namespace) -> int:
     splice = build_splice(
         arguments.feed, spool, arguments.targets,
         poll_seconds=arguments.poll_seconds,
+        snapshot_max_age_seconds=arguments.snapshot_max_age_seconds,
         backoff=BackoffPolicy(maximum_seconds=arguments.backoff_max_seconds),
         target_poll_seconds=arguments.target_poll_seconds,
     )

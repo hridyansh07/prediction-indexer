@@ -185,6 +185,14 @@ services:
       - "${SEGMENT_SECONDS:-1800}"
       - --writer-queue-capacity
       - "${WRITER_QUEUE_CAPACITY:-20000}"
+      # Must be repeated here. Compose replaces `command` wholesale rather than
+      # merging it, so every flag the base service carries has to be restated by
+      # any override that names a command at all — and one that is merely
+      # forgotten fails silently, as a default, with no error anywhere. This one
+      # was: the flag was added to `compose.yaml` and dropped on the floor here,
+      # so the poller read zero and reported "never fired" while looking armed.
+      - --snapshot-max-age-seconds
+      - "${KALSHI_SNAPSHOT_MAX_AGE_SECONDS:-0}"
 
   # Archives complete run directories that hold no receipt yet — the ones a
   # failed upload or a shadow-only deployment left behind.  It never deletes
