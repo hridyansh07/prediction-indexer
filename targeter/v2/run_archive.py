@@ -15,7 +15,7 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from archive.common.durable import confirm_durable, write_json_durable
 from analysis.storage import decoded_zstd_file, read_json_zstd
@@ -844,13 +844,36 @@ def _parse_object(
 
 
 def verify_run_archive(store: ObjectStore, receipt: RunArchiveReceipt) -> None:
+    verify_run_archive_objects(store, receipt, receipt.objects)
+
+
+def verify_run_archive_objects(
+    store: ObjectStore,
+    receipt: RunArchiveReceipt,
+    objects: Iterable[ArchivedRunObject],
+) -> None:
+    """Freshly verify a receipt-owned subset of one committed run archive.
+
+    Full integrity and deletion audits pass ``receipt.objects`` through
+    :func:`verify_run_archive`. Replay may consume only the remote manifest and
+    target-record artifacts; forcing it to head unrelated catalogues and reports
+    would make intact metadata unreadable because an unrelated artifact failed.
+    The local receipt remains the semantic inventory and the remote manifest the
+    commit marker, so every selected object must be an exact member of that
+    closed-parsed receipt.
+    """
     if receipt.location != store.store_id:
         raise VerificationFailure(
             f"run archive receipt names {receipt.location!r}, not store {store.store_id!r}"
         )
     if receipt.is_production and not store.durability.independent:
         raise VerificationFailure("production run archive receipt requires an independent store")
-    for item in receipt.objects:
+    inventory = {item.key: item for item in receipt.objects}
+    for item in objects:
+        if inventory.get(item.key) != item:
+            raise VerificationFailure(
+                f"targeter object is not an exact member of the run receipt: {item.key}"
+            )
         metadata = store.head(item.key)
         if metadata is None:
             raise VerificationFailure(f"archived targeter object is absent: {item.key}")

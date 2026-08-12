@@ -5,14 +5,25 @@ selection is therefore an adapter decision:
 
 - NFS/local: `DirectoryByteStreamer`
 - tests and exact fixtures: `MemoryByteStreamer`
-- S3: a future adapter implementing the same two methods (`object_keys`,
-  `iter_bytes`)
+- receipt-committed raw S3 objects: `archive.ArchivedSegmentByteStreamer`
+- receipt-committed Targeter records: `targeter.v2.replay_stream.ArchivedTargetRecordByteStreamer`
+
+`CompositeByteStreamer` snapshots disjoint adapters into one lexically ordered
+dataset and rejects duplicate logical keys. Gate 1 can therefore consume raw
+segments and decoded `target_records_<venue>.ndjson` together without learning
+about S3, Zstandard, or either receipt protocol.
 
 No capture, ingester, targeter, or legacy-analysis module is imported.
 
 The package is included in the installed distribution, including the frozen
-terminal policy. A future S3 adapter must provide bytes through `ByteStreamer`;
-none of the replay, trust, economics, or execution code changes.
+terminal policy. Storage adapters provide bytes through `ByteStreamer`; none of
+the replay, trust, economics, or execution code changes.
+
+Target-record run selection includes every run in the half-open capture window
+and the latest run strictly before it. Production run archive receipts remain
+the authority: prefix listings are not accepted as commit evidence. Each read
+freshly verifies the receipted remote manifest and selected object, fully stages
+and verifies the decoded logical identity, and only then yields bytes.
 
 ## Ordered exit gates
 

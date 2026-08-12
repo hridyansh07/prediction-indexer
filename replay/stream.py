@@ -37,6 +37,29 @@ class ByteStreamer(Protocol):
         """Yield the complete immutable value for ``key`` in non-empty chunks."""
 
 
+class CompositeByteStreamer:
+    """One immutable logical dataset assembled from disjoint byte sources."""
+
+    def __init__(self, *streamers: ByteStreamer) -> None:
+        self._owners: dict[str, ByteStreamer] = {}
+        for streamer in streamers:
+            for key in streamer.object_keys():
+                if key in self._owners:
+                    raise ValueError(f"duplicate composite object key: {key}")
+                self._owners[key] = streamer
+        self._keys = tuple(sorted(self._owners))
+
+    def object_keys(self) -> tuple[str, ...]:
+        return self._keys
+
+    def iter_bytes(self, key: str) -> Iterator[bytes]:
+        try:
+            streamer = self._owners[key]
+        except KeyError as error:
+            raise StreamError(f"unknown composite object key: {key}") from error
+        yield from streamer.iter_bytes(key)
+
+
 @dataclass(frozen=True)
 class TapeLine:
     object_key: str
