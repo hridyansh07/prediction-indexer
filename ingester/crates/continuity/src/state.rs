@@ -173,7 +173,7 @@ pub struct ClassifierState {
 }
 
 impl ClassifierState {
-    pub fn observe(&mut self, fact: &ContinuityFact) {
+    pub fn observe(&mut self, fact: &ContinuityFact, retain_identity_history: bool) {
         match &fact.cause {
             ContinuityCause::Duplicate { .. } => {
                 self.duplicates += 1;
@@ -186,8 +186,10 @@ impl ClassifierState {
             _ => {}
         }
 
-        self.identity
-            .remember(&fact.record_id, fact.content, fact.seq);
+        if retain_identity_history {
+            self.identity
+                .remember(&fact.record_id, fact.content, fact.seq);
+        }
 
         let lane = fact.key.lane.clone();
         self.lanes

@@ -206,7 +206,7 @@ access, no venue-specific behaviour beyond a labelled field.
 
 ```
 crates/types       envelope parsing, identity, sequences, domain-separated hashing
-crates/store       capture_raw → CapturedRecord, commit_fact → CommittedFact
+crates/store       raw/fact commits plus the exact durable record-identity index
 crates/continuity  identity verdict, epoch health, cursor classification
 crates/cli         indexer-ingest: tail, sequence, classify, report
 ```
@@ -229,6 +229,20 @@ Two rules this component holds to:
 2. **One encode, one hash, one write.** `Sinkable::to_canonical_bytes` produces the
    buffer that is both hashed and persisted. Encoding separately for each would let
    them disagree, surfacing as corruption years of data later.
+
+Global duplicate/conflict identity is an indexed SQLite projection, committed in
+the same transaction as its first fact and the spool cursor. It is deliberately
+not retained in the long-lived classifier: doing so costs O(all historical
+records) RAM even though file reads themselves are cursor-based. Ordering state
+remains in memory; exact identity remains durable and global.
+
+The sealed-window finalizer uses the same bounded classifier but not that global
+projection: its duplicate/conflict contract is window-scoped. Each merge attempt
+gets an exact disposable SQLite index, removed before the attempt can become
+canonical evidence. A lane-invalid retry starts with a fresh index so excluded
+records cannot affect the surviving merge. Thus finalization memory is independent
+of window record count without coupling canonical output to the mutable ingest
+store.
 
 **Deliberately stops before normalisation.** Converting venue frames into typed
 canonical events at ingest is what a trading system does, because it must act on
@@ -388,9 +402,11 @@ shape, cursor extraction) and all three are isolated, with the third degrading t
 a first run every market is "newly seen" at once, so the reported lag is market age
 at first sighting, not our latency.
 
-**Volume is measured but not stress-tested.** 20 Polymarket assets produce 6.2M
-records/day and 6.8 GB/day uncompressed. Whether SQLite-per-frame survives real
-subscription width is untested.
+**Volume is measured but not fully stress-tested.** 20 Polymarket assets produce
+6.2M records/day and 6.8 GB/day uncompressed. A 2.67M-record archived production
+window sustained about 18,400 records/second through the schema-v2 SQLite path
+with an 8 MiB peak RSS, but a complete production day and its long-term storage
+growth have not been replayed as one acceptance run.
 
 **`resolution_source` is not yet part of condition identity.** A mask is only half
 a condition's identity; the settlement oracle is the other half. Two venues quoting

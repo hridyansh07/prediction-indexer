@@ -20,6 +20,10 @@ pub enum StoreError {
         seq: i64,
         detail: String,
     },
+    /// An indexed identity row contains a value outside the closed store schema.
+    CorruptRecordIdentity {
+        record_id: String,
+    },
     Encoding,
 }
 
@@ -39,6 +43,9 @@ impl fmt::Display for StoreError {
             }
             Self::Decoding { seq, detail } => {
                 write!(formatter, "fact {seq} could not be decoded: {detail}")
+            }
+            Self::CorruptRecordIdentity { record_id } => {
+                write!(formatter, "record identity {record_id:?} is corrupt")
             }
             Self::Encoding => formatter.write_str("value could not produce canonical bytes"),
         }

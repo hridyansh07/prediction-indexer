@@ -622,9 +622,11 @@ indexer-finalize  [100, 200, 300]   EvidenceSeq  (visible_ns, lane_rank, deliver
   in `indexer-types`, because the canonical write *is* a receipt — the bytes are
   down and the position assigned. That removed `indexer-continuity`'s dependency
   on the store rather than adding one, so the finalizer classifies without
-  linking SQLite. Ordering state crosses windows via the watermark; identity is
-  window-scoped, since carrying it would mean holding every record id in the
-  retention period.
+  linking the long-lived ingest store. Ordering state crosses windows via the
+  watermark; identity remains window-scoped in an exact disposable SQLite index
+  per merge attempt. The index is scratch, not evidence or a commit marker, and a
+  lane-invalid retry recreates it so excluded records cannot affect the surviving
+  merge.
 - **The watermark** (§7) is a derived index over receipts: deletable, rebuilt
   byte-identically, and checked against the newest receipt on load.
 

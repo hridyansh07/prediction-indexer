@@ -23,6 +23,7 @@
 pub mod audit;
 pub mod canonical;
 pub mod continuity;
+mod identity;
 pub mod merge;
 pub mod rank;
 pub mod reader;

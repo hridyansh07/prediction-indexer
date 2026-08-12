@@ -5,13 +5,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{seal_segment, write_sealed};
+use rusqlite::Connection;
 use serde_json::Value;
 use tempdir::TempDir;
 
 fn envelope(delivery: u64, counter: u64) -> String {
+    envelope_with_identity(delivery, counter, &format!("pm-epoch-{counter}"), counter)
+}
+
+fn envelope_with_identity(
+    delivery: u64,
+    counter: u64,
+    record_id: &str,
+    payload_counter: u64,
+) -> String {
     let record = serde_json::json!({
         "delivery_index": delivery,
-        "record_id": format!("pm-epoch-{counter}"),
+        "record_id": record_id,
         "visible_ns": delivery,
         "venue": "polymarket",
         "stream": "public_book",
@@ -19,7 +29,7 @@ fn envelope(delivery: u64, counter: u64) -> String {
         "local_counter": counter,
         "source_cursor": {"type": "unsequenced", "counter": counter},
         "kind": "venue_frame",
-        "raw_payload": format!(r#"{{"counter":{counter}}}"#),
+        "raw_payload": format!(r#"{{"counter":{payload_counter}}}"#),
     });
     format!(
         "{}\n",
@@ -54,6 +64,46 @@ fn ingest(spool: &Path, store: &Path) -> Value {
 }
 
 #[test]
+fn a_schema_migration_reports_its_duration_once() {
+    let (_root, spool, store, _file) = fixture();
+    fs::create_dir_all(&store).expect("store directory");
+    let connection = Connection::open(store.join("store.db")).expect("create v1 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+        )
+        .expect("schema-v1 marker");
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_indexer-ingest"))
+        .arg(&spool)
+        .arg(&store)
+        .output()
+        .expect("run migrating indexer-ingest");
+    assert!(
+        output.status.success(),
+        "migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["store_migration"]["from_schema"], 1);
+    assert_eq!(report["store_migration"]["to_schema"], 2);
+    assert_eq!(report["store_migration"]["identity_records"], 0);
+    assert!(report["store_migration"]["elapsed_seconds"].is_number());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("migrated store schema 1 -> 2"),
+        "the blocking migration must be visible in service logs"
+    );
+
+    let reopened = ingest(&spool, &store);
+    assert!(
+        reopened["store_migration"].is_null(),
+        "the report names work performed by this startup, not migration history"
+    );
+}
+
+#[test]
 fn continuity_state_survives_a_process_restart() {
     let (_root, spool, store, file) = fixture();
     write_sealed(&file, "polymarket", envelope(1, 1));
@@ -68,6 +118,47 @@ fn continuity_state_survives_a_process_restart() {
         resumed["causes"]["local_counter_broken"], 1,
         "counter 1 followed by counter 3 must remain a proven local hole across restart"
     );
+}
+
+#[test]
+fn global_identity_survives_restart_without_retaining_record_history_in_memory() {
+    let (_root, spool, store, file) = fixture();
+    let record_id = "pm-epoch-original";
+    write_sealed(
+        &file,
+        "polymarket",
+        envelope_with_identity(1, 1, record_id, 7),
+    );
+    let first = ingest(&spool, &store);
+    assert_eq!(first["facts_committed"], 1);
+    assert_eq!(first["identity_records_in_memory"], 0);
+
+    let retransmission = file.with_file_name("20260729T000001000000-epoch.ndjson");
+    write_sealed(
+        &retransmission,
+        "polymarket",
+        envelope_with_identity(2, 2, record_id, 7),
+    );
+
+    let resumed = ingest(&spool, &store);
+    assert_eq!(resumed["causes"]["duplicate"], 1);
+    assert_eq!(resumed["duplicates"], 1);
+    assert_eq!(
+        resumed["identity_records_in_memory"], 0,
+        "the store must answer exact global identity while the process retains only bounded \
+         ordering state"
+    );
+
+    let contradiction = file.with_file_name("20260729T000002000000-epoch.ndjson");
+    write_sealed(
+        &contradiction,
+        "polymarket",
+        envelope_with_identity(3, 3, record_id, 99),
+    );
+    let conflicted = ingest(&spool, &store);
+    assert_eq!(conflicted["causes"]["conflict"], 1);
+    assert_eq!(conflicted["conflicts"], 1);
+    assert_eq!(conflicted["identity_records_in_memory"], 0);
 }
 
 #[test]

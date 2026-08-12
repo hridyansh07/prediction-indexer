@@ -186,6 +186,7 @@ dependencies = [
  "indexer-segment",
  "indexer-types",
  "prediction-encoder",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -207,6 +208,7 @@ version = "0.1.0"
 dependencies = [
  "indexer-types",
  "rusqlite",
+ "tempdir",
 ]
 
 [[package]]

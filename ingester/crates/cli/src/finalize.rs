@@ -352,6 +352,7 @@ fn sweep_once(arguments: &Arguments) -> Result<(), String> {
 
     let mut finalized = Vec::new();
     let mut deferred: Vec<String> = Vec::new();
+    let mut max_identity_records_in_memory = 0usize;
 
     for (key, verdict, status) in &ready {
         let window = &windows[key];
@@ -372,6 +373,8 @@ fn sweep_once(arguments: &Arguments) -> Result<(), String> {
         )?;
         match outcome {
             WindowOutcome::Committed(window) => {
+                max_identity_records_in_memory =
+                    max_identity_records_in_memory.max(window.identity_records_in_memory);
                 advance_delivery_continuity(&mut delivery_continuity, &window.receipt)?;
                 if let Some(last) = window.receipt.last_canonical_seq {
                     next_seq = indexer_types::CanonicalSeq::new(last + 1)
@@ -458,6 +461,7 @@ fn sweep_once(arguments: &Arguments) -> Result<(), String> {
          \"expected_lanes\": {:?},\n  \"finalization_deadline_seconds\": {},\n  \
          \"windows_seen\": {},\n  \"windows_synthesized\": {},\n  \
          \"windows_finalized\": {},\n  \"windows_already_committed\": {},\n  \
+         \"max_identity_records_in_memory\": {},\n  \
          \"next_canonical_seq\": {},\n  \"quarantined_windows\": {},\n  \
          \"behind_watermark\": {:?},\n  \
          \"unplaceable_seals\": {:?},\n  \
@@ -471,6 +475,7 @@ fn sweep_once(arguments: &Arguments) -> Result<(), String> {
         synthesized,
         finalized.len(),
         committed_starts.len(),
+        max_identity_records_in_memory,
         next_seq.get(),
         mark.as_ref()
             .map(|mark| mark.quarantined.len())

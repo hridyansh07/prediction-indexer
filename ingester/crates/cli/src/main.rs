@@ -47,7 +47,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use indexer_continuity::{Classifier, ContinuityFact};
+use indexer_continuity::{Classifier, ContinuityFact, IdentityVerdict};
 use indexer_segment::{discover_segments, validate_sealed_segment};
 use indexer_store::{IntegrityReport, Store, StoreError};
 use indexer_types::EnvelopeView;
@@ -133,7 +133,20 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("creating spool root: {error}"))?;
     }
     let mut store = Store::open(&arguments.store_dir).map_err(|error| error.to_string())?;
-    let mut classifier = Classifier::new();
+    if let Some(migration) = store.migration_report() {
+        eprintln!(
+            "migrated store schema {} -> {}: {} identity records in {:.3} seconds",
+            migration.from_schema,
+            migration.to_schema,
+            migration.identity_records,
+            migration.elapsed.as_secs_f64(),
+        );
+    }
+    // Global identity lives in the store's indexed `record_identity` table.
+    // Keeping the same history in `ClassifierState` costs O(all records) RAM —
+    // tens of gigabytes per production day — while every other retained field
+    // is ordering state bounded by connections and epochs.
+    let mut classifier = Classifier::without_identity_history();
     store
         .recover_facts(ContinuityFact::from_canonical_bytes, |fact| {
             classifier.apply(&fact)
@@ -319,8 +332,34 @@ fn commit_batch(
 
                 match parsed {
                     Ok(view) => {
-                        let fact = classifier.classify(&view, &captured);
+                        // Identity is global and exact, but disk-backed. An LRU
+                        // would miss old retransmissions and a Bloom filter could
+                        // manufacture duplicates, so neither preserves the fact
+                        // log's contract. The lookup and first insert share this
+                        // transaction with the fact and spool cursor.
+                        let identity = store.record_identity(view.record_id.as_str())?;
+                        let verdict = match identity {
+                            None => IdentityVerdict::Unseen,
+                            Some(original) if original.content == captured.content_hash() => {
+                                IdentityVerdict::Duplicate {
+                                    original: original.first_seen,
+                                }
+                            }
+                            Some(original) => IdentityVerdict::Conflict {
+                                original: original.first_seen,
+                                original_content: original.content,
+                            },
+                        };
+                        let first_observation = matches!(verdict, IdentityVerdict::Unseen);
+                        let fact = classifier.classify_with_identity(&view, &captured, verdict);
                         let committed = store.commit_fact(&captured, fact)?;
+                        if first_observation {
+                            store.remember_record_identity(
+                                view.record_id.as_str(),
+                                captured.content_hash(),
+                                committed.seq(),
+                            )?;
+                        }
                         classifier.apply(&committed);
                         facts.push(committed);
                         accepted += 1;
@@ -404,12 +443,27 @@ fn render_report(
         ),
         None => String::new(),
     };
+    let migration = store
+        .migration_report()
+        .map(|migration| {
+            format!(
+                "{{\"from_schema\": {}, \"to_schema\": {}, \"identity_records\": {}, \
+                 \"elapsed_seconds\": {:.3}}}",
+                migration.from_schema,
+                migration.to_schema,
+                migration.identity_records,
+                migration.elapsed.as_secs_f64(),
+            )
+        })
+        .unwrap_or_else(|| "null".to_owned());
 
     format!(
         "{{\n  \"spool_root\": {:?},\n  \"store\": {:?},\n  \"spool_files\": {},\n  \
          \"lines_read\": {},\n  \"already_ingested\": {},\n  \"facts_committed\": {},\n  \
          \"unparseable_recorded\": {},\n  \"evidence_rows\": {},\n  \"fact_rows\": {},\n  \
-         \"duplicates\": {},\n  \"conflicts\": {},\n  \"causes\": {{\n{}\n  }},\n  \
+         \"duplicates\": {},\n  \"conflicts\": {},\n  \"identity_records_in_memory\": {},\n  \
+         \"store_migration\": {},\n  \
+         \"causes\": {{\n{}\n  }},\n  \
          \"epochs\": [\n{}\n  ],\n  \"rejections\": [\n{}\n  ]{}\n}}",
         arguments.spool_root.display().to_string(),
         arguments.store_dir.display().to_string(),
@@ -422,6 +476,8 @@ fn render_report(
         store.fact_count().unwrap_or(0),
         state.duplicates,
         state.conflicts,
+        classifier.retained_identity_count(),
+        migration,
         causes.join(",\n"),
         epochs.join(",\n"),
         rejections.join(",\n"),

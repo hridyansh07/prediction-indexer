@@ -269,6 +269,7 @@ mod tests {
         let window = FinalizedWindow {
             receipt,
             directory: PathBuf::new(),
+            identity_records_in_memory: 0,
         };
 
         let advanced = Watermark::advance(Some(&previous), &window);

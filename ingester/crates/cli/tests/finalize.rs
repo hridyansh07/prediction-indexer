@@ -232,6 +232,19 @@ fn canonical_order_is_receive_order_across_lanes() {
 }
 
 #[test]
+fn finalizer_retains_no_record_identity_history() {
+    let (root, spool, _) = interleaved_fixture();
+    let canonical = root.path().join("canonical");
+
+    let report = finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    assert_eq!(
+        report["max_identity_records_in_memory"], 0,
+        "record identity must be exact but disk-backed; retaining one entry per \
+         canonical record makes finalizer memory O(records in the window)"
+    );
+}
+
+#[test]
 fn the_two_binaries_disagree_about_identical_bytes() {
     // Stated as one assertion, because this is the whole reason the finalizer
     // exists. Both binaries read the same spool; neither rewrites it.
@@ -1603,6 +1616,31 @@ fn verdicts(canonical: &Path, start_ns: u64) -> Vec<String> {
         .collect()
 }
 
+fn envelope_with_identity(
+    venue: &str,
+    delivery: u64,
+    visible_ns: u64,
+    record_id: &str,
+    raw_payload: &str,
+) -> String {
+    let record = serde_json::json!({
+        "delivery_index": delivery,
+        "record_id": record_id,
+        "visible_ns": visible_ns,
+        "venue": venue,
+        "stream": "public_book",
+        "connection_epoch": "identity-epoch",
+        "local_counter": delivery,
+        "source_cursor": {"type": "unsequenced", "counter": delivery},
+        "kind": "venue_frame",
+        "raw_payload": raw_payload,
+    });
+    format!(
+        "{}\n",
+        serde_json::to_string(&record).expect("encode identity envelope")
+    )
+}
+
 #[test]
 fn provenance_carries_the_continuity_verdict() {
     let (root, spool, _) = interleaved_fixture();
@@ -1618,6 +1656,90 @@ fn provenance_carries_the_continuity_verdict() {
             .all(|verdict| verdict == "unsequenced_venue"),
         "{:?}",
         verdicts(&canonical, 0)
+    );
+}
+
+#[test]
+fn disk_backed_identity_preserves_exact_duplicate_and_conflict_verdicts() {
+    let root = TempDir::new("finalize-disk-identity").expect("temporary directory");
+    let spool = root.path().join("spool");
+    let canonical = root.path().join("canonical");
+    write_lane(
+        &spool,
+        "polymarket",
+        "identity",
+        &[
+            envelope_with_identity("polymarket", 1, 100, "same-id", "same-content"),
+            envelope_with_identity("polymarket", 2, 200, "same-id", "same-content"),
+            envelope_with_identity("polymarket", 3, 300, "same-id", "changed-content"),
+        ],
+    );
+
+    let report = finalize(&spool, &canonical, &["polymarket"], 0);
+    assert_eq!(report["max_identity_records_in_memory"], 0);
+    assert_eq!(
+        verdicts(&canonical, 0),
+        vec!["unsequenced_venue", "duplicate", "conflict"]
+    );
+    assert!(
+        !window_directory(&canonical, 0)
+            .join(".record-identity.sqlite.open")
+            .exists(),
+        "the per-attempt index is not a durable canonical artifact"
+    );
+}
+
+#[test]
+fn lane_retry_does_not_carry_excluded_identity_into_the_surviving_merge() {
+    let root = TempDir::new("finalize-identity-retry").expect("temporary directory");
+    let spool = root.path().join("spool");
+    let canonical = root.path().join("canonical");
+
+    let malformed = serde_json::json!({
+        "delivery_index": 3,
+        "record_id": "malformed",
+        "visible_ns": 300,
+        "venue": "polymarket",
+        "stream": "public_book",
+        "connection_epoch": "identity-epoch",
+        "local_counter": 3,
+        "source_cursor": {"type": "unsequenced", "counter": 3},
+        "kind": "venue_frame",
+        "raw_payload": "{}",
+        "unknown": true,
+    });
+    write_lane(
+        &spool,
+        "polymarket",
+        "faulting",
+        &[
+            envelope_with_identity("polymarket", 1, 100, "cross-lane-id", "same-content"),
+            envelope_with_identity("polymarket", 2, 150, "polymarket-second", "other"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&malformed).expect("encode malformed envelope")
+            ),
+        ],
+    );
+    write_lane(
+        &spool,
+        "kalshi",
+        "surviving",
+        &[envelope_with_identity(
+            "kalshi",
+            1,
+            200,
+            "cross-lane-id",
+            "same-content",
+        )],
+    );
+
+    let report = finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    assert_eq!(report["max_identity_records_in_memory"], 0);
+    assert_eq!(verdicts(&canonical, 0), vec!["unsequenced_venue"]);
+    assert_eq!(
+        receipt(&canonical, 0)["invalid_lanes"][0]["lane"],
+        "polymarket"
     );
 }
 

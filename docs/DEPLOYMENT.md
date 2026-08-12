@@ -266,6 +266,37 @@ docker compose run --rm ingester-integrity
 docker compose start ingester
 ```
 
+### Ingester schema-v2 memory migration
+
+The first ingester start after upgrading a schema-v1 `ingest-store/store.db`
+builds the durable `record_identity` index from its committed facts and changes
+`meta.schema_version` to `2`. This is one blocking `BEGIN IMMEDIATE` transaction
+inside `Store::open`, before ingest or continuity recovery starts. Failure rolls
+it back rather than leaving a partial identity index, and the raw spool is
+unchanged. Stop the old ingester before deploying the new binary.
+
+The index is a `WITHOUT ROWID` table with a 32-byte binary content hash. On the
+measured 2,670,449-fact store, migration took 7.10 seconds and complete startup
+including continuity recovery took 20.80 seconds, with 7,220 KiB peak RSS. The
+permanent identity table added 243,068,928 bytes (5.1% of the schema-v1 database).
+At the transaction peak, the database plus WAL had grown by 488,061,880 bytes
+(10.2%), so leave **at least 11% of the current store size free**, plus normal
+operating margin. A six-day store growing at the runbook's observed 27 GiB/day is
+roughly 162 GiB: this measurement projects about 9 GiB permanent growth and at
+least 18 GiB of free migration headroom, but the real unique-identity ratio can
+change both figures.
+
+Migration duration scales primarily with fact and unique-identity counts, not
+database bytes alone. Before the deployment window, time the new binary against a
+copy of the actual production store rather than extrapolating from this sample.
+After completion, stderr reports the migration duration and record count, and the
+JSON report records the same values under `store_migration`. Subsequent schema-v2
+starts report `store_migration: null`.
+
+After startup, `identity_records_in_memory` in the ingester report must be `0`.
+Duplicate/conflict detection remains exact and global through the SQLite index;
+this is not an LRU or probabilistic cache.
+
 Apply a new v1 manifest without rebuilding (base deployment only):
 
 ```bash
@@ -355,6 +386,17 @@ audit before replay or export:
 ```bash
 docker compose --profile ops run --rm canonical-integrity
 ```
+
+Duplicate/conflict classification uses an exact, window-scoped SQLite scratch
+index named `.record-identity.sqlite.open` inside the open window directory. It
+is neither canonical output nor a commit marker and is removed after every merge
+attempt; a stale file after a killed process is replaced when that window is
+retried. Leave temporary disk headroom proportional to the largest window. The
+finalizer report's `max_identity_records_in_memory` must be `0`.
+
+On the measured 2.67-million-record production window this reduced finalizer peak
+RSS from 530,120 KiB to 13,756 KiB. Finalization took 67.52 seconds instead of
+58.51 seconds, and the independent audit verified every evidence/provenance pair.
 
 `--expect-lane` in the `finalizer` service must list exactly the splices this
 deployment runs. It ships with the three ungated ones; enabling the `kalshi`

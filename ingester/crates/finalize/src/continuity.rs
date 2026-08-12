@@ -28,14 +28,13 @@
 //! watermark, the state is a function of committed history rather than of run
 //! boundaries.
 //!
-//! Identity — the record-id map behind duplicate and conflict detection — starts
-//! empty for every window, and that is a real limit stated plainly. Carrying it
-//! would mean holding every record id in the retention window, which at the
-//! measured 70M records/day over 5–7 days is hundreds of millions of entries;
-//! walking it back on demand would need a queryable store of ids that does not
-//! exist. Window-scoped detection still catches what duplicates actually come
-//! from — reconnect retransmission, which resolves in seconds inside a
-//! thirty-minute window — and `indexer-ingest`'s fact log keeps the global view.
+//! Identity starts empty for every window, and that is a real limit stated
+//! plainly. Carrying it across windows would change provenance semantics and
+//! require hundreds of millions of entries over the retention period. Within a
+//! window it remains exact through a disposable SQLite index owned by one merge
+//! attempt, not this retained classifier state. Window-scoped detection catches
+//! reconnect retransmission, which resolves in seconds inside a thirty-minute
+//! window, while `indexer-ingest`'s fact log keeps the global view.
 //!
 //! `EpochState::bootstrapped` is not carried: `classify_cause` never consults it.
 

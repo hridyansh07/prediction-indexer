@@ -29,6 +29,7 @@
 pub mod error;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use indexer_types::{
     Committed, ContentHash, EvidenceHash, EvidenceSeq, FactHash, FactSeq, Positioned, Sinkable,
@@ -38,9 +39,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub use error::StoreError;
 
 /// The schema this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = "
+const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -69,6 +70,54 @@ CREATE TABLE IF NOT EXISTS spool_cursor (
 );
 ";
 
+/// The exact global identity index used by the long-lived ingester.
+///
+/// This is derived from the fact log but durable so the process does not need a
+/// `BTreeMap` entry for every record ever captured. `first_seen` is the original
+/// fact position returned for duplicate/conflict provenance.
+const IDENTITY_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS record_identity (
+    record_id    TEXT    NOT NULL PRIMARY KEY,
+    content_hash BLOB    NOT NULL
+                         CHECK (
+                             typeof(content_hash) = 'blob'
+                             AND length(content_hash) = 32
+                         ),
+    first_seen   INTEGER NOT NULL CHECK (first_seen > 0)
+) WITHOUT ROWID;
+";
+
+/// V1 retained global identity only in the classifier's unbounded in-memory map.
+/// Its facts already carry the exact record ID, content hash, and first position,
+/// so V2 materializes that projection with a streaming SQLite statement. The
+/// primary-key conflict keeps the earliest row because input is explicitly in
+/// sequence order; malformed JSON or a missing/invalid field violates the closed
+/// V2 table schema and rolls the migration back rather than silently omitting an
+/// identity.
+const MIGRATE_V1_TO_V2: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE record_identity (
+    record_id    TEXT    NOT NULL PRIMARY KEY,
+    content_hash BLOB    NOT NULL
+                         CHECK (
+                             typeof(content_hash) = 'blob'
+                             AND length(content_hash) = 32
+                         ),
+    first_seen   INTEGER NOT NULL CHECK (first_seen > 0)
+) WITHOUT ROWID;
+INSERT INTO record_identity (record_id, content_hash, first_seen)
+SELECT
+    json_extract(CAST(canonical AS TEXT), '$.record_id'),
+    unhex(json_extract(CAST(canonical AS TEXT), '$.content')),
+    seq
+FROM facts
+WHERE true
+ORDER BY seq
+ON CONFLICT(record_id) DO NOTHING;
+UPDATE meta SET value = '2' WHERE key = 'schema_version';
+COMMIT;
+";
+
 // ---------------------------------------------------------------------------
 // Commit receipts
 // ---------------------------------------------------------------------------
@@ -78,6 +127,7 @@ CREATE TABLE IF NOT EXISTS spool_cursor (
 pub struct CapturedRecord {
     seq: EvidenceSeq,
     evidence_hash: EvidenceHash,
+    content_hash: ContentHash,
     raw_line: Vec<u8>,
 }
 
@@ -87,6 +137,9 @@ impl CapturedRecord {
     }
     pub fn evidence_hash(&self) -> EvidenceHash {
         self.evidence_hash
+    }
+    pub fn content_hash(&self) -> ContentHash {
+        self.content_hash
     }
     /// The exact delivered bytes, including a trailing newline where one arrived.
     pub fn raw_line(&self) -> &[u8] {
@@ -139,6 +192,22 @@ pub struct SpoolCursor {
     pub records: u64,
 }
 
+/// The first exact content committed under one record ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordIdentity {
+    pub content: ContentHash,
+    pub first_seen: FactSeq,
+}
+
+/// One schema migration completed while opening the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub from_schema: i64,
+    pub to_schema: i64,
+    pub identity_records: u64,
+    pub elapsed: Duration,
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -146,6 +215,7 @@ pub struct SpoolCursor {
 pub struct Store {
     connection: Connection,
     next_evidence: i64,
+    migration: Option<MigrationReport>,
 }
 
 impl Store {
@@ -160,7 +230,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(BASE_SCHEMA)?;
 
         let stored: Option<String> = connection
             .query_row(
@@ -169,16 +239,32 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        match stored {
+        let migration = match stored {
             None => {
+                connection.execute_batch(IDENTITY_SCHEMA)?;
                 connection.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
+                None
             }
-            Some(value) if value == SCHEMA_VERSION.to_string() => {}
+            Some(value) if value == "1" => {
+                let started = Instant::now();
+                connection.execute_batch(MIGRATE_V1_TO_V2)?;
+                let identity_records =
+                    connection.query_row("SELECT COUNT(*) FROM record_identity", [], |row| {
+                        row.get::<_, i64>(0)
+                    })? as u64;
+                Some(MigrationReport {
+                    from_schema: 1,
+                    to_schema: SCHEMA_VERSION,
+                    identity_records,
+                    elapsed: started.elapsed(),
+                })
+            }
+            Some(value) if value == SCHEMA_VERSION.to_string() => None,
             Some(value) => return Err(StoreError::SchemaMismatch { found: value }),
-        }
+        };
 
         let highest: i64 =
             connection.query_row("SELECT COALESCE(MAX(seq), 0) FROM evidence", [], |row| {
@@ -187,7 +273,13 @@ impl Store {
         Ok(Self {
             connection,
             next_evidence: highest + 1,
+            migration,
         })
+    }
+
+    /// Reports a migration performed by this call to [`open`](Self::open).
+    pub fn migration_report(&self) -> Option<MigrationReport> {
+        self.migration
     }
 
     /// Makes one delivered line durable and assigns its global position.
@@ -229,6 +321,7 @@ impl Store {
         Ok(CapturedRecord {
             seq,
             evidence_hash,
+            content_hash,
             raw_line: raw_line.to_vec(),
         })
     }
@@ -253,6 +346,59 @@ impl Store {
             params![seq.get(), captured.seq.get(), hex, bytes],
         )?;
         Ok(CommittedFact { seq, value })
+    }
+
+    // -- global record identity -------------------------------------------
+
+    /// Returns the first content committed for `record_id`, if any.
+    ///
+    /// This indexed lookup replaces the classifier's unbounded process-local
+    /// identity map. It remains exact — no Bloom-filter false positives, LRU
+    /// expiry, or window boundary can turn a retransmission into a new record.
+    pub fn record_identity(&self, record_id: &str) -> Result<Option<RecordIdentity>, StoreError> {
+        let row: Option<(Vec<u8>, i64)> = self
+            .connection
+            .query_row(
+                "SELECT content_hash, first_seen FROM record_identity WHERE record_id = ?1",
+                params![record_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((raw_content, raw_first_seen)) = row else {
+            return Ok(None);
+        };
+        let content = ContentHash::from_raw(raw_content.try_into().map_err(|_| {
+            StoreError::CorruptRecordIdentity {
+                record_id: record_id.to_owned(),
+            }
+        })?);
+        let first_seen =
+            FactSeq::new(raw_first_seen).ok_or_else(|| StoreError::CorruptRecordIdentity {
+                record_id: record_id.to_owned(),
+            })?;
+        Ok(Some(RecordIdentity {
+            content,
+            first_seen,
+        }))
+    }
+
+    /// Commits the first identity after its fact is down.
+    ///
+    /// Called inside the same transaction as `commit_fact` and the spool cursor
+    /// advance. A rollback therefore removes all three, while a successful
+    /// cursor can never get ahead of the identity required to classify a replay.
+    pub fn remember_record_identity(
+        &mut self,
+        record_id: &str,
+        content: ContentHash,
+        first_seen: FactSeq,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO record_identity (record_id, content_hash, first_seen) \
+             VALUES (?1, ?2, ?3)",
+            params![record_id, content.as_bytes().as_slice(), first_seen.get()],
+        )?;
+        Ok(())
     }
 
     // -- spool cursors -----------------------------------------------------
