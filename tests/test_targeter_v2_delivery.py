@@ -21,12 +21,34 @@ from targeter.v2.registry import load_strategy
 from targeter.v2.run import run_shadow
 from targeter.v2.run_archive import (
     RunArchiveError,
+    _artifact_inventory,
     archive_run,
     parse_run_archive_receipt,
     read_run_archive_receipt,
     verify_run_archive,
 )
 from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
+
+
+def _inventory_entry(name: str) -> dict:
+    """A minimally valid `artifacts` entry, so the inventory check is what fails."""
+    digest = hashlib.sha256(name.encode()).hexdigest()
+    return {
+        "content_type": "application/x-ndjson",
+        "content_encoding": "zstd" if name.endswith(".zst") else None,
+        "decoded": {"sha256": digest, "byte_length": 1, "line_count": 1},
+        "stored": {"sha256": digest, "byte_length": 1},
+        "compression": {
+            "algorithm": "zstd",
+            "level": 3,
+            "frame_checksum": True,
+            "dictionary": None,
+            "frame_count": 1,
+            "encoder": "test",
+        }
+        if name.endswith(".zst")
+        else None,
+    }
 
 
 class _Adapter:
@@ -206,6 +228,87 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         self.assertEqual(manifest_path.read_bytes(), before)
         self.assertEqual(receipt.document["targeter_run_archive_receipt_version"], 2)
         verify_run_archive(self.store, receipt)
+
+    def _strip_target_records(self, run_directory: Path) -> dict:
+        """Rewrite a run to look the way the previous build committed it.
+
+        The inventory and the files go together: a report naming artifacts it
+        does not carry is a hybrid no build ever wrote.
+        """
+        report_path = run_directory / "selection_report.json"
+        report = json.loads(report_path.read_text())
+        report["artifacts"] = {
+            name: entry
+            for name, entry in report["artifacts"].items()
+            if not name.startswith("target_records_")
+        }
+        report.pop("target_record_diagnostics", None)
+        for stale in run_directory.glob("target_records_*"):
+            stale.unlink()
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return report
+
+    def test_a_run_committed_before_target_records_still_archives(self) -> None:
+        # A run is archived by whichever build is deployed when its turn comes,
+        # which after an upgrade is the new one. Any run the old targeter had
+        # already committed but not yet archived would otherwise fail closed
+        # forever, on an inventory it had no way to write.
+        run_directory = self.run_directory(artifact_format="ndjson")
+        self._strip_target_records(run_directory)
+
+        receipt = archive_run(run_directory, self.store, now=NOW)
+        verify_run_archive(self.store, receipt)
+        self.assertFalse(
+            [item for item in receipt.objects if "target_records_" in item.file]
+        )
+
+    def test_the_same_tolerance_holds_for_the_compressed_format(self) -> None:
+        # Production runs zstd, and a compressed report cannot be rewritten in
+        # place without recompressing it, so the inventory check is exercised
+        # directly for the format that actually ships.
+        report = {
+            "artifact_format": "zstd",
+            "catalogs": [{"venue": "kalshi"}],
+            "artifacts": {
+                name: _inventory_entry(name)
+                for name in (
+                    "rule_templates.ndjson.zst",
+                    "rule_drift.ndjson.zst",
+                    "catalog_kalshi_events.ndjson.zst",
+                    "catalog_kalshi_markets.ndjson.zst",
+                )
+            },
+        }
+        self.assertEqual(len(_artifact_inventory(report)), 4)
+
+        report["artifacts"]["target_records_kalshi.ndjson.zst"] = _inventory_entry(
+            "target_records_kalshi.ndjson.zst"
+        )
+        with self.assertRaisesRegex(RunArchiveError, "inventory"):
+            _artifact_inventory(report)
+
+    def test_an_inventory_missing_only_some_target_records_still_fails(self) -> None:
+        # Tolerating the absent set must not tolerate a partial one: that is an
+        # inventory which really is incomplete, and it is the case the check
+        # exists to catch.
+        run_directory = self.run_directory(artifact_format="ndjson")
+        report_path = run_directory / "selection_report.json"
+        report = json.loads(report_path.read_text())
+        victim = next(
+            name for name in report["artifacts"] if name.startswith("target_records_")
+        )
+        report["artifacts"].pop(victim)
+        (run_directory / victim).unlink()
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RunArchiveError, "inventory"):
+            archive_run(run_directory, self.store, now=NOW)
 
     def test_remote_manifest_is_the_commit_marker(self) -> None:
         run_directory = self.run_directory()

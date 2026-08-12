@@ -269,7 +269,17 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     # Target records are written for every supported venue, not only the ones
     # that produced a catalogue: a venue that discovered nothing still has to be
     # distinguishable from a venue whose artifact went missing.
-    expected.update(f"target_records_{venue}{suffix}" for venue in SUPPORTED_VENUES)
+    records = {f"target_records_{venue}{suffix}" for venue in SUPPORTED_VENUES}
+    # A run committed by the previous build carries an inventory naming none of
+    # them, and a run is archived by whichever build is deployed when its turn
+    # comes -- after an upgrade, this one. Demanding them of a report written
+    # before they existed fails that run closed, permanently, for a reason no
+    # retry clears. So absent as a whole set is the older inventory and is
+    # accepted; a partial set is an inventory that really is incomplete and
+    # still fails. `_legacy_artifact_names` carries the same tolerance for the
+    # format one generation further back.
+    if set(raw) & records:
+        expected |= records
     catalogues = report.get("catalogs")
     if not isinstance(catalogues, list):
         raise RunArchiveError("selection report catalogs must be an array")
