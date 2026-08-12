@@ -13,6 +13,7 @@ archiver/  service.py, manifest.py, cli.py   seal -> object + receipt + manifest
 reaper/    service.py, cli.py                dual-receipt audit/deletion decision
 storage/   base.py, local.py, s3.py, factory.py
 common/    durable.py, receipts.py, seal.py, verify.py
+stream.py  verified archive objects -> replay ByteStreamer boundary
 ```
 
 Input must be a final `.ndjson` segment with its valid `.seal.json` commit
@@ -73,6 +74,22 @@ Objects are stored as
 segment, `.archive.json` is production verification authority; local conformance
 uses `.archive.local.json`, which authorizes nothing. Daily manifests are derived
 catalogs and can be rebuilt from verified receipts.
+
+## Streaming archived segments to replay
+
+`ArchivedSegmentByteStreamer` implements replay's structural `ByteStreamer`
+contract (`object_keys`, `iter_bytes`) without making replay aware of S3 or
+Zstandard. Supply validated archive receipts from the local spool; the adapter
+re-verifies their objects, stages each compressed segment, performs the strict
+single-frame decode, and yields exact `.ndjson` bytes only after stored and
+logical identities pass. Seal objects are likewise fully staged and verified
+before exposure.
+
+The caller supplies receipts because they are the archive commit markers. S3
+prefix listings and daily manifests are not accepted as substitutes. Storage
+prefixes are removed from logical keys, so for example
+`raw/lane=kalshi/date=2026-07-30/a.ndjson.zst` appears to replay as
+`lane=kalshi/date=2026-07-30/a.ndjson`.
 
 ## Reaper safety and rollout
 
