@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
+install -d -m 0700 "$(dirname "$AWS_WEB_IDENTITY_TOKEN_FILE")"
+
 if ! command -v docker >/dev/null 2>&1; then
 	sudo install -m 0755 -d /etc/apt/keyrings
 	sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
@@ -9,3 +13,11 @@ if ! command -v docker >/dev/null 2>&1; then
 	sudo apt-get update
 	sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
+
+yarn install --frozen-lockfile
+yarn build:packages
+CARGO_BIN="$(command -v cargo || printf '%s' "$HOME/.cargo/bin/cargo")"
+"$CARGO_BIN" build --release \
+	--manifest-path encoder/rust/Cargo.toml \
+	--bin prediction-decode-v1
+git config core.hooksPath .githooks

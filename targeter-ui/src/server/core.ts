@@ -1,0 +1,419 @@
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import type { DecodeExpectation } from '@prediction-indexer/rust-v1-decoder';
+import type { RunSummary } from '../shared.js';
+
+export const RUN_RE =
+  /(?:^|\/)date=(\d{4}-\d{2}-\d{2})\/run=(\d{8}T\d{6}\.\d{6}Z)\/run_manifest\.json$/;
+export const MAX_STORED_BYTES = 16 * 1024 * 1024;
+export const MAX_DECODED_BYTES = 64 * 1024 * 1024;
+const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+const obj = (x: unknown, label: string): Record<string, any> => {
+  if (!x || typeof x !== 'object' || Array.isArray(x))
+    throw new Error(`${label} must be an object`);
+  return x as Record<string, any>;
+};
+const int = (x: unknown, label: string) => {
+  if (!Number.isSafeInteger(x) || (x as number) < 0)
+    throw new Error(`${label} is invalid`);
+  return x as number;
+};
+const timestamp = (x: unknown, label: string) => {
+  if (
+    typeof x !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(x) ||
+    Number.isNaN(Date.parse(x))
+  )
+    throw new Error(`${label} is invalid`);
+  return x;
+};
+const exactKeys = (
+  value: Record<string, any>,
+  expected: string[],
+  label: string,
+) => {
+  if (Object.keys(value).sort().join('\0') !== [...expected].sort().join('\0'))
+    throw new Error(`${label} fields are invalid`);
+};
+const supportedVenues = ['kalshi', 'polymarket', 'limitless'];
+export function parseManifestKey(
+  key: string,
+): { runId: string; date: string } | null {
+  const m = RUN_RE.exec(key);
+  if (!m) return null;
+  const d = new Date(
+    `${m[1]}T${m[2].slice(9, 11)}:${m[2].slice(11, 13)}:${m[2].slice(13, 15)}.${m[2].slice(16, 22)}Z`,
+  );
+  if (
+    Number.isNaN(d.valueOf()) ||
+    m[2].slice(0, 8) !== m[1].replaceAll('-', '')
+  )
+    return null;
+  return { date: m[1], runId: m[2] };
+}
+export function latestRunKeys(keys: string[], limit = 5) {
+  return keys
+    .map((k) => ({ key: k, parsed: parseManifestKey(k) }))
+    .filter(
+      (x): x is { key: string; parsed: { runId: string; date: string } } =>
+        !!x.parsed,
+    )
+    .sort((a, b) => b.parsed.runId.localeCompare(a.parsed.runId))
+    .slice(0, limit);
+}
+export function validateManifest(raw: unknown, expectedRunId: string) {
+  const m = obj(raw, 'manifest');
+  exactKeys(
+    m,
+    [
+      'targeter_run_manifest_version',
+      'run_id',
+      'generated_at',
+      'input_complete',
+      'files',
+    ],
+    'manifest',
+  );
+  if (
+    m.targeter_run_manifest_version !== 2 ||
+    m.run_id !== expectedRunId ||
+    typeof m.input_complete !== 'boolean' ||
+    !Array.isArray(m.files)
+  )
+    throw new Error('invalid manifest v2');
+  timestamp(m.generated_at, 'manifest generated_at');
+  const names = m.files.map(
+    (entry: unknown) => obj(entry, 'manifest file').file,
+  );
+  if (
+    names.some((name: unknown) => typeof name !== 'string' || !name) ||
+    new Set(names).size !== names.length
+  )
+    throw new Error('manifest filenames must be non-empty and unique');
+  return m;
+}
+export function reportFile(manifest: Record<string, any>) {
+  const files = manifest.files.map((x: unknown) => obj(x, 'manifest file'));
+  const z = files.find((x: any) => x.file === 'selection_report.json.zst');
+  const p = files.find((x: any) => x.file === 'selection_report.json');
+  const f = z ?? p;
+  if (!f || (z && p))
+    throw new Error('manifest must name exactly one selection report');
+  if (z) {
+    const metadata = files.find(
+      (x: any) => x.file === 'selection_report.meta.json',
+    );
+    if (!metadata)
+      throw new Error('compressed selection report metadata marker is missing');
+    exactKeys(
+      metadata,
+      ['file', 'byte_length', 'sha256', 'content_type', 'content_encoding'],
+      'selection report metadata marker',
+    );
+    identity(
+      { sha256: metadata.sha256, byte_length: metadata.byte_length },
+      'selection report metadata marker identity',
+    );
+    if (
+      metadata.content_type !== 'application/json' ||
+      metadata.content_encoding !== null
+    )
+      throw new Error(
+        'selection report metadata marker content metadata is invalid',
+      );
+    exactKeys(
+      z,
+      [
+        'file',
+        'content_type',
+        'content_encoding',
+        'decoded',
+        'stored',
+        'compression',
+      ],
+      'compressed selection report',
+    );
+    const compression = obj(z.compression, 'selection report compression');
+    exactKeys(
+      compression,
+      [
+        'algorithm',
+        'level',
+        'frame_checksum',
+        'dictionary',
+        'frame_count',
+        'encoder',
+      ],
+      'selection report compression',
+    );
+    if (
+      z.content_type !== 'application/json' ||
+      z.content_encoding !== 'zstd' ||
+      compression.algorithm !== 'zstd' ||
+      compression.level !== 3 ||
+      compression.frame_checksum !== true ||
+      compression.dictionary !== null ||
+      compression.frame_count !== 1 ||
+      typeof compression.encoder !== 'string' ||
+      !compression.encoder
+    )
+      throw new Error('selection report compression profile is invalid');
+  } else {
+    exactKeys(
+      p,
+      ['file', 'byte_length', 'sha256', 'content_type', 'content_encoding'],
+      'plain selection report',
+    );
+    if (p.content_type !== 'application/json' || p.content_encoding !== null)
+      throw new Error('plain selection report content metadata is invalid');
+  }
+  const stored = z
+    ? identity(z.stored, 'stored')
+    : identity(
+        { sha256: p.sha256, byte_length: p.byte_length },
+        'report identity',
+      );
+  const logical = z ? identity(z.decoded, 'decoded', true) : stored;
+  return {
+    ...f,
+    storedIdentity: {
+      sha256: stored.sha256,
+      byteLength: stored.byte_length,
+    },
+    logicalIdentity: {
+      sha256: logical.sha256,
+      byteLength: logical.byte_length,
+      ...(logical.line_count === undefined
+        ? {}
+        : { lineCount: logical.line_count }),
+    },
+  } as ReportFile;
+}
+export type ReportFile = Record<string, any> & {
+  file: 'selection_report.json' | 'selection_report.json.zst';
+  storedIdentity: { sha256: string; byteLength: number };
+  logicalIdentity: { sha256: string; byteLength: number; lineCount?: number };
+};
+
+function identity(x: unknown, label: string, logical = false) {
+  const i = obj(x, label);
+  exactKeys(
+    i,
+    logical
+      ? ['sha256', 'byte_length', 'line_count']
+      : ['sha256', 'byte_length'],
+    label,
+  );
+  if (
+    !/^[a-f0-9]{64}$/.test(i.sha256) ||
+    int(i.byte_length, `${label}.byte_length`) > MAX_DECODED_BYTES ||
+    (logical && int(i.line_count, `${label}.line_count`) > i.byte_length)
+  )
+    throw new Error(`${label} is invalid`);
+  return i as { sha256: string; byte_length: number; line_count?: number };
+}
+export interface ReportDecoder {
+  withDecodedFile<T>(
+    storedPath: string,
+    expectation: DecodeExpectation,
+    use: (decodedPath: string) => T | Promise<T>,
+  ): Promise<T>;
+}
+
+export async function validateReportPath(
+  storedPath: string,
+  file: ReportFile,
+  runId: string,
+  decoder: ReportDecoder | null,
+) {
+  const compressed = file.file.endsWith('.zst');
+  const parse = async (decodedPath: string) => {
+    const metadata = await stat(decodedPath);
+    if (!metadata.isFile() || metadata.size !== file.logicalIdentity.byteLength)
+      throw new Error('selection report decoded identity mismatch');
+    if (metadata.size > MAX_DECODED_BYTES)
+      throw new Error('selection report exceeds decoded size limit');
+    const decoded = await readFile(decodedPath);
+    if (!compressed && sha(decoded) !== file.logicalIdentity.sha256)
+      throw new Error('selection report decoded identity mismatch');
+    let report: unknown;
+    try {
+      report = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(decoded),
+      );
+    } catch {
+      throw new Error('selection report is not valid UTF-8 JSON');
+    }
+    const r = obj(report, 'selection report');
+    if (
+      r.report_version !== 1 ||
+      r.mode !== 'shadow' ||
+      r.run_id !== runId ||
+      typeof r.input_complete !== 'boolean' ||
+      !Array.isArray(r.catalogs) ||
+      !Array.isArray(r.candidates)
+    )
+      throw new Error('invalid selection report v1');
+    timestamp(r.generated_at, 'selection report generated_at');
+    obj(r.discovery_failures, 'selection report discovery_failures');
+    if (
+      (r.artifact_format === undefined) !== (r.artifacts === undefined) ||
+      (r.artifact_format !== undefined &&
+        !['zstd', 'ndjson'].includes(r.artifact_format))
+    )
+      throw new Error('selection report artifact inventory is invalid');
+    const catalogVenues = new Set<string>();
+    for (const rawCatalog of r.catalogs) {
+      const catalog = obj(rawCatalog, 'catalog summary');
+      if (
+        !supportedVenues.includes(catalog.venue) ||
+        catalogVenues.has(catalog.venue) ||
+        typeof catalog.complete !== 'boolean'
+      )
+        throw new Error('catalog summaries are invalid');
+      int(catalog.events, 'catalog events');
+      int(catalog.markets, 'catalog markets');
+      catalogVenues.add(catalog.venue);
+    }
+    if (r.artifacts !== undefined) {
+      const artifacts = obj(r.artifacts, 'selection report artifacts');
+      const suffix = r.artifact_format === 'zstd' ? '.ndjson.zst' : '.ndjson';
+      const expected = [
+        `rule_templates${suffix}`,
+        `rule_drift${suffix}`,
+        ...[...catalogVenues].flatMap((venue) => [
+          `catalog_${venue}_events${suffix}`,
+          `catalog_${venue}_markets${suffix}`,
+        ]),
+      ];
+      if (
+        Object.keys(artifacts).sort().join('\0') !== expected.sort().join('\0')
+      )
+        throw new Error(
+          'selection report artifact inventory is incomplete or unexpected',
+        );
+    }
+    const selection = obj(r.selection, 'selection');
+    if (
+      selection.publication_performed !== false ||
+      !Array.isArray(selection.bundle_ids) ||
+      selection.bundle_count !== selection.bundle_ids.length ||
+      new Set(selection.bundle_ids).size !== selection.bundle_ids.length ||
+      selection.bundle_ids.some((id: unknown) => typeof id !== 'string' || !id)
+    )
+      throw new Error('selection report selection is invalid');
+    const targets = obj(selection.targets, 'selection targets');
+    if (
+      Object.keys(targets).sort().join('\0') !==
+        [...supportedVenues].sort().join('\0') ||
+      supportedVenues.some((venue) => !Array.isArray(targets[venue]))
+    )
+      throw new Error('selection report targets are invalid');
+    obj(selection.allocation_rejections, 'selection allocation_rejections');
+    const candidates = new Map<string, Record<string, any>>();
+    for (const rawCandidate of r.candidates) {
+      const candidate = obj(rawCandidate, 'candidate');
+      const participants = candidate.participants;
+      const venues = candidate.venues;
+      if (
+        typeof candidate.bundle_id !== 'string' ||
+        !candidate.bundle_id ||
+        candidates.has(candidate.bundle_id) ||
+        typeof candidate.eligible !== 'boolean' ||
+        !Array.isArray(candidate.rejection_reasons) ||
+        candidate.rejection_reasons.some(
+          (reason: unknown) => typeof reason !== 'string' || !reason,
+        ) ||
+        candidate.event_status !==
+          (candidate.eligible ? 'ELIGIBLE' : 'REJECTED') ||
+        !Array.isArray(participants) ||
+        participants.length !== 2 ||
+        participants.some(
+          (value: unknown) => typeof value !== 'string' || !value,
+        ) ||
+        !Array.isArray(venues) ||
+        new Set(venues).size !== venues.length ||
+        venues.some(
+          (venue: unknown) => !supportedVenues.includes(String(venue)),
+        )
+      )
+        throw new Error('selection report candidate is invalid');
+      timestamp(candidate.activation_at, 'candidate activation_at');
+      timestamp(candidate.capture_start_at, 'candidate capture_start_at');
+      obj(candidate.admission, 'candidate admission');
+      obj(candidate.market_exclusions, 'candidate market_exclusions');
+      if (!Array.isArray(candidate.eligible_market_ids))
+        throw new Error('candidate eligible_market_ids is invalid');
+      candidates.set(candidate.bundle_id, candidate);
+    }
+    if (
+      selection.bundle_ids.some((id: string) => !candidates.get(id)?.eligible)
+    )
+      throw new Error('selected bundle is absent or ineligible');
+    return r;
+  };
+  if (!compressed) return parse(storedPath);
+  if (!decoder) throw new Error('selection report decoder is required');
+  const logical = file.logicalIdentity;
+  if (logical.lineCount === undefined)
+    throw new Error('decoded identity is invalid');
+  try {
+    return await decoder.withDecodedFile(
+      storedPath,
+      {
+        stored: file.storedIdentity,
+        logical: { ...logical, lineCount: logical.lineCount },
+        maxDecodedBytes: MAX_DECODED_BYTES,
+      },
+      parse,
+    );
+  } catch (error) {
+    throw new Error(
+      `selection report strict Zstd decode failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+    );
+  }
+}
+export function summarizeReport(report: Record<string, any>): RunSummary {
+  const cs = Array.isArray(report.candidates) ? report.candidates : [];
+  const sel = new Set(
+    Array.isArray(report.selection?.bundle_ids)
+      ? report.selection.bundle_ids
+      : [],
+  );
+  const allocations = obj(
+    report.selection?.allocation_rejections ?? {},
+    'allocation rejections',
+  );
+  const reasons: Record<string, number> = {};
+  for (const c of cs)
+    if (!sel.has(c?.bundle_id)) {
+      const admission = Array.isArray(c?.rejection_reasons)
+        ? c.rejection_reasons
+        : [];
+      const rejected = admission.length
+        ? admission
+        : [allocations[c?.bundle_id] ?? 'eligible_not_selected'];
+      for (const reason of rejected)
+        reasons[String(reason)] = (reasons[String(reason)] ?? 0) + 1;
+    }
+  const cats =
+    report.catalogs && typeof report.catalogs === 'object'
+      ? Object.values(report.catalogs)
+      : [];
+  const targets =
+    report.selection?.targets && typeof report.selection.targets === 'object'
+      ? Object.values(report.selection.targets).reduce(
+          (n: number, v: any) => n + (Array.isArray(v) ? v.length : 0),
+          0,
+        )
+      : 0;
+  return {
+    candidates: cs.length,
+    selected: sel.size,
+    rejected: cs.length - sel.size,
+    targets: targets as number,
+    catalogsComplete: cats.filter((x: any) => x?.complete === true).length,
+    catalogsTotal: cats.length,
+    rejectionReasons: reasons,
+  };
+}
