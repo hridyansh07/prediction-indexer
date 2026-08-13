@@ -309,6 +309,27 @@ services:
     volumes:
       - *data-volume
 
+  # One-shot UTC ingest-partition retention for a host cron or systemd timer.
+  # It is deliberately not another long-running loop. Audit is the default;
+  # delete mode still verifies the closed database against its receipt and never
+  # touches `store.db.open` or the retained receipt/segment skip ledger.
+  ingest-store-reaper:
+    <<: *ingester-service
+    profiles:
+      - ops
+    restart: "no"
+    entrypoint: ["/usr/local/bin/indexer-store-reap"]
+    command:
+      - /var/lib/prediction-indexer/ingest-store
+      - --retention-hours
+      - "${INGEST_STORE_RETENTION_HOURS:-24}"
+      - --mode
+      - "${INGEST_STORE_REAPER_MODE:-audit}"
+      - --report
+      - /var/lib/prediction-indexer/ops/last_ingest_store_reaper_sweep.json
+    volumes:
+      - *data-volume
+
   # Merges sealed windows into canonical evidence. A separate command from the
   # ingester per SEALED_CAPTURE_PIPELINE_V1 §8.3 — the two assign different
   # global orders over the same spool and both stay available.

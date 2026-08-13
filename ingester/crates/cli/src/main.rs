@@ -47,8 +47,11 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use indexer_continuity::{Classifier, ContinuityFact, IdentityVerdict};
-use indexer_segment::{discover_segments, validate_sealed_segment};
+use indexer_cli::ingest_partition::{
+    CarryTracker, IDENTITY_SCOPE, OpenPartition, relative_segment_path,
+};
+use indexer_continuity::{Classifier, IdentityVerdict};
+use indexer_segment::{SegmentSeal, discover_segments, read_seal, validate_sealed_segment};
 use indexer_store::{IntegrityReport, Store, StoreError};
 use indexer_types::EnvelopeView;
 
@@ -121,9 +124,16 @@ struct Tally {
     read: u64,
     captured: u64,
     skipped_resumed: u64,
+    skipped_segments: u64,
     rejected: u64,
     causes: BTreeMap<&'static str, u64>,
     first_rejections: Vec<String>,
+}
+
+struct IngestState<'a> {
+    store: &'a mut Store,
+    classifier: &'a mut Classifier,
+    tracker: &'a mut CarryTracker,
 }
 
 fn run() -> Result<(), String> {
@@ -132,8 +142,12 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(&arguments.spool_root)
             .map_err(|error| format!("creating spool root: {error}"))?;
     }
-    let mut store = Store::open(&arguments.store_dir).map_err(|error| error.to_string())?;
-    if let Some(migration) = store.migration_report() {
+    // Cursor and receipt identities are relative to this canonical root, so a
+    // different spelling of the same path cannot ingest a segment twice.
+    let spool_root = std::fs::canonicalize(&arguments.spool_root)
+        .map_err(|error| format!("resolving spool root: {error}"))?;
+    let mut partition = OpenPartition::open(&arguments.store_dir, unix_now_ns()?)?;
+    if let Some(migration) = partition.store.migration_report() {
         eprintln!(
             "migrated store schema {} -> {}: {} identity records in {:.3} seconds",
             migration.from_schema,
@@ -142,22 +156,6 @@ fn run() -> Result<(), String> {
             migration.elapsed.as_secs_f64(),
         );
     }
-    // Global identity lives in the store's indexed `record_identity` table.
-    // Keeping the same history in `ClassifierState` costs O(all records) RAM —
-    // tens of gigabytes per production day — while every other retained field
-    // is ordering state bounded by connections and epochs.
-    let mut classifier = Classifier::without_identity_history();
-    store
-        .recover_facts(ContinuityFact::from_canonical_bytes, |fact| {
-            classifier.apply(&fact)
-        })
-        .map_err(|error| format!("recovering continuity state: {error}"))?;
-
-    // Cursor identity must not depend on whether the caller wrote `data/spool`,
-    // `../data/spool`, or another equivalent spelling. Without canonicalising
-    // here, the same file is assigned fresh evidence positions on the second run.
-    let spool_root = std::fs::canonicalize(&arguments.spool_root)
-        .map_err(|error| format!("resolving spool root: {error}"))?;
     // Hashing a sealed segment is deliberately a once-per-process operation.
     // Watch mode polls every few seconds and production segments can be close to
     // a gigabyte; rereading every old file on every poll would turn validation
@@ -166,6 +164,16 @@ fn run() -> Result<(), String> {
     let mut validated_segments = BTreeSet::new();
 
     loop {
+        // A restart after midnight must close yesterday before it consumes any
+        // newly discovered work. The same check runs between segments below, so
+        // rollover never bisects a sealed segment even when ingestion spans UTC
+        // midnight.
+        let rollover_time = unix_now_ns()?;
+        if partition.should_rotate(rollover_time)? {
+            partition = partition.rotate(rollover_time)?;
+            validated_segments.clear();
+        }
+
         // Discovery returns segments sorted by filename. Reading them in that
         // order, each to completion, is what makes `EvidenceSeq` `file_order` —
         // the claim belongs here, at the call site that acts on it, not to
@@ -174,34 +182,55 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("reading spool root: {error}"))?;
         let mut tally = Tally::default();
 
-        for (venue, path) in &files {
+        for (lane, path) in &files {
+            let rollover_time = unix_now_ns()?;
+            if partition.should_rotate(rollover_time)? {
+                partition = partition.rotate(rollover_time)?;
+                validated_segments.clear();
+            }
+            let key = relative_segment_path(&spool_root, path)?;
+            let declared = read_seal(path)?;
+            if partition.consumed.contains(&key, &declared.sha256)? {
+                tally.skipped_segments += 1;
+                continue;
+            }
             if !validated_segments.contains(path) {
-                validate_sealed_segment(venue, path)?;
+                validate_sealed_segment(lane, path)?;
                 validated_segments.insert(path.clone());
             }
-            ingest_file(&mut store, &mut classifier, venue, path, &mut tally)
+            let mut state = IngestState {
+                store: &mut partition.store,
+                classifier: &mut partition.classifier,
+                tracker: &mut partition.tracker,
+            };
+            ingest_file(&mut state, &spool_root, lane, path, &declared, &mut tally)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
+            partition.consumed.remember(&key, &declared.sha256)?;
         }
 
         let integrity = if arguments.check_integrity {
-            Some(store.check_integrity().map_err(|error| error.to_string())?)
+            Some(
+                partition
+                    .store
+                    .check_integrity()
+                    .map_err(|error| error.to_string())?,
+            )
         } else {
             None
         };
         println!(
             "{}",
-            render_report(
-                &arguments,
-                &files,
-                &tally,
-                &classifier,
-                &store,
-                integrity.as_ref(),
-            )
+            render_report(&arguments, &files, &tally, &partition, integrity.as_ref(),)
         );
         std::io::stdout()
             .flush()
             .map_err(|error| format!("flushing report: {error}"))?;
+
+        let rollover_time = unix_now_ns()?;
+        if partition.should_rotate(rollover_time)? {
+            partition = partition.rotate(rollover_time)?;
+            validated_segments.clear();
+        }
 
         match arguments.watch_interval {
             Some(interval) => std::thread::sleep(interval),
@@ -212,14 +241,16 @@ fn run() -> Result<(), String> {
 }
 
 fn ingest_file(
-    store: &mut Store,
-    classifier: &mut Classifier,
-    venue: &str,
+    state: &mut IngestState<'_>,
+    spool_root: &Path,
+    lane: &str,
     path: &Path,
+    seal: &SegmentSeal,
     tally: &mut Tally,
 ) -> Result<(), String> {
-    let key = path.to_string_lossy().to_string();
-    let cursor = store
+    let key = relative_segment_path(spool_root, path)?;
+    let cursor = state
+        .store
         .spool_cursor(&key)
         .map_err(|error| error.to_string())?;
     let already = cursor
@@ -270,25 +301,36 @@ fn ingest_file(
         batch.push((start, line));
 
         if batch.len() >= BATCH {
-            records += commit_batch(store, classifier, venue, &key, &batch, records, tally)?;
+            records += commit_batch(state, lane, &key, &batch, records, tally)?;
             batch.clear();
         }
     }
 
     if !batch.is_empty() {
-        commit_batch(store, classifier, venue, &key, &batch, records, tally)?;
-    } else if cursor.is_none() || already != durable_offset {
-        store
-            .advance_spool_cursor(&key, venue, durable_offset, records)
-            .map_err(|e| e.to_string())?;
+        records += commit_batch(state, lane, &key, &batch, records, tally)?;
     }
+    // A cursor at EOF and the completed-segment identity commit together. If a
+    // crash happens after the final record batch but before this small
+    // transaction, restart seeks to EOF and commits only this marker.
+    state
+        .store
+        .transaction(|store| {
+            store.advance_spool_cursor(&key, lane, durable_offset, records)?;
+            store.complete_spool_segment(
+                &key,
+                lane,
+                &seal.sha256,
+                seal.byte_length,
+                seal.line_count,
+            )
+        })
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 fn commit_batch(
-    store: &mut Store,
-    classifier: &mut Classifier,
-    venue: &str,
+    state: &mut IngestState<'_>,
+    lane: &str,
     key: &str,
     batch: &[(u64, Vec<u8>)],
     records_before: u64,
@@ -315,7 +357,8 @@ fn commit_batch(
     // whole run — the in-memory classifier is discarded with the process and the
     // next run rebuilds it from the spool cursor, which rolled back with the rows.
     // In-memory state that moved past a failed commit is therefore never observed.
-    let committed = store
+    let committed = state
+        .store
         .transaction(|store| {
             let mut facts = Vec::with_capacity(batch.len());
             for (start, line) in batch {
@@ -328,15 +371,15 @@ fn commit_batch(
                     Ok(view) => view.raw_payload.as_bytes().to_vec(),
                     Err(_) => line.clone(),
                 };
-                let captured = store.capture_raw(venue, key, *start, line, &content)?;
+                let captured = store.capture_raw(lane, key, *start, line, &content)?;
 
                 match parsed {
                     Ok(view) => {
-                        // Identity is global and exact, but disk-backed. An LRU
-                        // would miss old retransmissions and a Bloom filter could
-                        // manufacture duplicates, so neither preserves the fact
-                        // log's contract. The lookup and first insert share this
-                        // transaction with the fact and spool cursor.
+                        state.tracker.observe_envelope(&view);
+                        // Identity is exact within this UTC ingest partition and
+                        // disk-backed. It resets only at a committed rollover;
+                        // lookup and first insert share this transaction with the
+                        // fact and spool cursor.
                         let identity = store.record_identity(view.record_id.as_str())?;
                         let verdict = match identity {
                             None => IdentityVerdict::Unseen,
@@ -351,7 +394,9 @@ fn commit_batch(
                             },
                         };
                         let first_observation = matches!(verdict, IdentityVerdict::Unseen);
-                        let fact = classifier.classify_with_identity(&view, &captured, verdict);
+                        let fact = state
+                            .classifier
+                            .classify_with_identity(&view, &captured, verdict);
                         let committed = store.commit_fact(&captured, fact)?;
                         if first_observation {
                             store.remember_record_identity(
@@ -360,7 +405,7 @@ fn commit_batch(
                                 committed.seq(),
                             )?;
                         }
-                        classifier.apply(&committed);
+                        state.classifier.apply(&committed);
                         facts.push(committed);
                         accepted += 1;
                     }
@@ -372,7 +417,7 @@ fn commit_batch(
                     }
                 }
             }
-            store.advance_spool_cursor(key, venue, offset, records_before + accepted)?;
+            store.advance_spool_cursor(key, lane, offset, records_before + accepted)?;
             Ok(facts)
         })
         .map_err(|error: StoreError| error.to_string())?;
@@ -394,11 +439,10 @@ fn render_report(
     arguments: &Arguments,
     files: &[(String, PathBuf)],
     tally: &Tally,
-    classifier: &Classifier,
-    store: &Store,
+    partition: &OpenPartition,
     integrity: Option<&IntegrityReport>,
 ) -> String {
-    let state = classifier.state();
+    let state = partition.classifier.state();
 
     let causes: Vec<String> = tally
         .causes
@@ -443,7 +487,8 @@ fn render_report(
         ),
         None => String::new(),
     };
-    let migration = store
+    let migration = partition
+        .store
         .migration_report()
         .map(|migration| {
             format!(
@@ -458,8 +503,10 @@ fn render_report(
         .unwrap_or_else(|| "null".to_owned());
 
     format!(
-        "{{\n  \"spool_root\": {:?},\n  \"store\": {:?},\n  \"spool_files\": {},\n  \
-         \"lines_read\": {},\n  \"already_ingested\": {},\n  \"facts_committed\": {},\n  \
+        "{{\n  \"spool_root\": {:?},\n  \"store\": {:?},\n  \"partition_date\": {:?},\n  \
+         \"closed_partitions\": {},\n  \"identity_scope\": {:?},\n  \"spool_files\": {},\n  \
+         \"segments_already_ingested\": {},\n  \"lines_read\": {},\n  \"already_ingested\": {},\n  \
+         \"facts_committed\": {},\n  \
          \"unparseable_recorded\": {},\n  \"evidence_rows\": {},\n  \"fact_rows\": {},\n  \
          \"duplicates\": {},\n  \"conflicts\": {},\n  \"identity_records_in_memory\": {},\n  \
          \"store_migration\": {},\n  \
@@ -467,20 +514,32 @@ fn render_report(
          \"epochs\": [\n{}\n  ],\n  \"rejections\": [\n{}\n  ]{}\n}}",
         arguments.spool_root.display().to_string(),
         arguments.store_dir.display().to_string(),
+        partition.date(),
+        partition.receipt_count(),
+        IDENTITY_SCOPE,
         files.len(),
+        tally.skipped_segments,
         tally.read,
         tally.skipped_resumed,
         tally.captured,
         tally.rejected,
-        store.evidence_count().unwrap_or(0),
-        store.fact_count().unwrap_or(0),
+        partition.store.evidence_count().unwrap_or(0),
+        partition.store.fact_count().unwrap_or(0),
         state.duplicates,
         state.conflicts,
-        classifier.retained_identity_count(),
+        partition.classifier.retained_identity_count(),
         migration,
         causes.join(",\n"),
         epochs.join(",\n"),
         rejections.join(",\n"),
         integrity_line,
     )
+}
+
+fn unix_now_ns() -> Result<u64, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("reading UTC clock: {error}"))?
+        .as_nanos();
+    u64::try_from(nanos).map_err(|_| "UTC clock is outside the supported range".to_owned())
 }

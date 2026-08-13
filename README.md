@@ -41,7 +41,7 @@ splices/             venue adapters — auth, subscribe, reconnect, record verba
   limitless/           built, verified live
   kalshi/              built, plug-and-play once an API key is set
 targeter/            v2 motivation and sports discovery/archive/publication; legacy v1
-ingester/            Rust: global sequencing + continuity classification
+ingester/            Rust: daily fact-store partitions, sequencing, continuity, retention
 encoder/             the shared Zstandard codec — Python and Rust, streaming only
 archive/             raw-segment archiver, immutable object store, dual-receipt reaper
 analysis/             masks, outcome space, void policy, partition sums
@@ -101,6 +101,9 @@ ingester/…/indexer-ingest data/spool data/ingest-store --watch-interval-second
 
 # one-shot integrity verification
 ingester/…/indexer-ingest data/spool data/ingest-store --check-integrity
+
+# audit closed ingest partitions older than 24 hours (use --mode delete deliberately)
+ingester/…/indexer-store-reap data/ingest-store --retention-hours 24
 ```
 
 Kalshi needs `KALSHI_API_KEY_ID` and a private key (see `.env.example`); nothing
@@ -133,7 +136,9 @@ docker compose --profile kalshi up -d
 ```
 
 Sports and RTDS reference lanes use the `reference` profile. The raw tape and
-derived store are bind-mounted beneath `CAPTURE_DATA_ROOT`; see
+daily derived-store partitions are bind-mounted beneath `CAPTURE_DATA_ROOT`. The
+`ingest-store-reaper` ops service is a one-shot command intended for host cron;
+see
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Linux ownership, secret mounts,
 profiles, integrity checks, storage sizing, and operations.
 

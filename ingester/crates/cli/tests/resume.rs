@@ -88,11 +88,11 @@ fn a_schema_migration_reports_its_duration_once() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(report["store_migration"]["from_schema"], 1);
-    assert_eq!(report["store_migration"]["to_schema"], 2);
+    assert_eq!(report["store_migration"]["to_schema"], 3);
     assert_eq!(report["store_migration"]["identity_records"], 0);
     assert!(report["store_migration"]["elapsed_seconds"].is_number());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("migrated store schema 1 -> 2"),
+        String::from_utf8_lossy(&output.stderr).contains("migrated store schema 1 -> 3"),
         "the blocking migration must be visible in service logs"
     );
 
@@ -121,7 +121,7 @@ fn continuity_state_survives_a_process_restart() {
 }
 
 #[test]
-fn global_identity_survives_restart_without_retaining_record_history_in_memory() {
+fn partition_identity_survives_restart_without_retaining_record_history_in_memory() {
     let (_root, spool, store, file) = fixture();
     let record_id = "pm-epoch-original";
     write_sealed(
@@ -145,7 +145,7 @@ fn global_identity_survives_restart_without_retaining_record_history_in_memory()
     assert_eq!(resumed["duplicates"], 1);
     assert_eq!(
         resumed["identity_records_in_memory"], 0,
-        "the store must answer exact global identity while the process retains only bounded \
+        "the active partition must answer exact identity while the process retains only bounded \
          ordering state"
     );
 

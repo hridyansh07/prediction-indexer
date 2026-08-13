@@ -34,3 +34,7 @@ path = "src/finalize.rs"
 [[bin]]
 name = "indexer-canonical-audit"
 path = "src/canonical_audit.rs"
+
+[[bin]]
+name = "indexer-store-reap"
+path = "src/store_reap.rs"

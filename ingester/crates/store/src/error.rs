@@ -24,6 +24,20 @@ pub enum StoreError {
     CorruptRecordIdentity {
         record_id: String,
     },
+    /// A completed-segment path was reused for different sealed bytes.
+    ConsumedSegmentConflict {
+        spool_file: String,
+    },
+    /// A partition was opened with a different first global position than the
+    /// one durably recorded in its metadata.
+    PartitionSequenceMismatch {
+        expected: i64,
+        found: i64,
+    },
+    /// SQLite could not checkpoint every WAL frame before partition closure.
+    CheckpointBusy {
+        remaining_frames: i64,
+    },
     Encoding,
 }
 
@@ -47,6 +61,20 @@ impl fmt::Display for StoreError {
             Self::CorruptRecordIdentity { record_id } => {
                 write!(formatter, "record identity {record_id:?} is corrupt")
             }
+            Self::ConsumedSegmentConflict { spool_file } => {
+                write!(
+                    formatter,
+                    "consumed segment {spool_file:?} changed identity"
+                )
+            }
+            Self::PartitionSequenceMismatch { expected, found } => write!(
+                formatter,
+                "partition starts at global position {found}; its marker requires {expected}"
+            ),
+            Self::CheckpointBusy { remaining_frames } => write!(
+                formatter,
+                "partition WAL checkpoint left {remaining_frames} frames"
+            ),
             Self::Encoding => formatter.write_str("value could not produce canonical bytes"),
         }
     }

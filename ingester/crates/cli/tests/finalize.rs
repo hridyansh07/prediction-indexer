@@ -259,7 +259,8 @@ fn the_two_binaries_disagree_about_identical_bytes() {
     assert!(ingest.status.success());
     finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
 
-    let connection = rusqlite::Connection::open(store.join("store.db")).expect("open store");
+    let connection =
+        rusqlite::Connection::open(common::ingest_database(&store)).expect("open store");
     let mut statement = connection
         .prepare("SELECT raw_line FROM evidence ORDER BY seq")
         .expect("prepare");

@@ -35,6 +35,14 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
                     "environment: *aws-archive-environment", self.service(service)
                 )
 
+    def test_ingest_store_reaper_is_one_shot_audit_first_and_uses_the_rust_image(self) -> None:
+        service = self.service("ingest-store-reaper")
+        self.assertIn("<<: *ingester-service", service)
+        self.assertIn('restart: "no"', service)
+        self.assertIn("indexer-store-reap", service)
+        self.assertIn("${INGEST_STORE_REAPER_MODE:-audit}", service)
+        self.assertNotIn("--interval-seconds", service)
+
 
 class TargeterV2DeploymentTests(unittest.TestCase):
     def setUp(self) -> None:
