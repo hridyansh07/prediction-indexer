@@ -39,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub use error::StoreError;
 
 /// The schema this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS spool_cursor (
     venue          TEXT    NOT NULL,
     bytes_consumed INTEGER NOT NULL CHECK (bytes_consumed >= 0),
     records        INTEGER NOT NULL CHECK (records >= 0)
+);
+CREATE TABLE IF NOT EXISTS consumed_segment (
+    spool_file    TEXT    PRIMARY KEY,
+    lane          TEXT    NOT NULL,
+    source_sha256 TEXT    NOT NULL CHECK (length(source_sha256) = 64),
+    byte_length   INTEGER NOT NULL CHECK (byte_length >= 0),
+    line_count    INTEGER NOT NULL CHECK (line_count >= 0)
 );
 ";
 
@@ -115,6 +122,19 @@ WHERE true
 ORDER BY seq
 ON CONFLICT(record_id) DO NOTHING;
 UPDATE meta SET value = '2' WHERE key = 'schema_version';
+COMMIT;
+";
+
+/// V3 makes global sequence continuation explicit so one UTC ingest partition
+/// can begin where the previous partition ended without retaining its rows.
+const MIGRATE_V2_TO_V3: &str = "
+BEGIN IMMEDIATE;
+INSERT INTO meta (key, value)
+VALUES (
+    'first_evidence_seq',
+    CAST(COALESCE((SELECT MIN(seq) FROM evidence), 1) AS TEXT)
+);
+UPDATE meta SET value = '3' WHERE key = 'schema_version';
 COMMIT;
 ";
 
@@ -192,6 +212,16 @@ pub struct SpoolCursor {
     pub records: u64,
 }
 
+/// One sealed segment fully consumed by this partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumedSegment {
+    pub spool_file: String,
+    pub lane: String,
+    pub source_sha256: String,
+    pub byte_length: u64,
+    pub line_count: u64,
+}
+
 /// The first exact content committed under one record ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordIdentity {
@@ -214,6 +244,7 @@ pub struct MigrationReport {
 
 pub struct Store {
     connection: Connection,
+    first_evidence: i64,
     next_evidence: i64,
     migration: Option<MigrationReport>,
 }
@@ -221,6 +252,21 @@ pub struct Store {
 impl Store {
     /// Opens or creates a store directory.
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
+        Self::open_internal(directory, None)
+    }
+
+    /// Opens or creates one partition at an explicit first global position.
+    ///
+    /// Existing partitions must agree with `first_seq`; a mismatch means the
+    /// active marker and database came from different rollover attempts.
+    pub fn open_with_first_seq(directory: &Path, first_seq: i64) -> Result<Self, StoreError> {
+        if first_seq <= 0 {
+            return Err(StoreError::CorruptSequence);
+        }
+        Self::open_internal(directory, Some(first_seq))
+    }
+
+    fn open_internal(directory: &Path, requested_first: Option<i64>) -> Result<Self, StoreError> {
         std::fs::create_dir_all(directory)?;
         let connection = Connection::open(directory.join("store.db"))?;
         // WAL keeps a reader from blocking the ingest writer. `NORMAL` is the
@@ -242,15 +288,21 @@ impl Store {
         let migration = match stored {
             None => {
                 connection.execute_batch(IDENTITY_SCHEMA)?;
+                let first = requested_first.unwrap_or(1);
                 connection.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO meta (key, value) VALUES ('first_evidence_seq', ?1)",
+                    params![first.to_string()],
                 )?;
                 None
             }
             Some(value) if value == "1" => {
                 let started = Instant::now();
                 connection.execute_batch(MIGRATE_V1_TO_V2)?;
+                connection.execute_batch(MIGRATE_V2_TO_V3)?;
                 let identity_records =
                     connection.query_row("SELECT COUNT(*) FROM record_identity", [], |row| {
                         row.get::<_, i64>(0)
@@ -262,17 +314,52 @@ impl Store {
                     elapsed: started.elapsed(),
                 })
             }
+            Some(value) if value == "2" => {
+                let started = Instant::now();
+                connection.execute_batch(MIGRATE_V2_TO_V3)?;
+                let identity_records =
+                    connection.query_row("SELECT COUNT(*) FROM record_identity", [], |row| {
+                        row.get::<_, i64>(0)
+                    })? as u64;
+                Some(MigrationReport {
+                    from_schema: 2,
+                    to_schema: SCHEMA_VERSION,
+                    identity_records,
+                    elapsed: started.elapsed(),
+                })
+            }
             Some(value) if value == SCHEMA_VERSION.to_string() => None,
             Some(value) => return Err(StoreError::SchemaMismatch { found: value }),
         };
 
+        let first_evidence: i64 = connection.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'first_evidence_seq'",
+            [],
+            |row| row.get(0),
+        )?;
+        if first_evidence <= 0 {
+            return Err(StoreError::CorruptSequence);
+        }
+        if let Some(expected) = requested_first {
+            if expected != first_evidence {
+                return Err(StoreError::PartitionSequenceMismatch {
+                    expected,
+                    found: first_evidence,
+                });
+            }
+        }
         let highest: i64 =
             connection.query_row("SELECT COALESCE(MAX(seq), 0) FROM evidence", [], |row| {
                 row.get(0)
             })?;
         Ok(Self {
             connection,
-            next_evidence: highest + 1,
+            first_evidence,
+            next_evidence: if highest == 0 {
+                first_evidence
+            } else {
+                highest + 1
+            },
             migration,
         })
     }
@@ -470,6 +557,53 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a sealed segment fully consumed by this partition.
+    ///
+    /// Callers place this in the same transaction as the final cursor advance.
+    /// The durable identity is copied into the partition receipt at rollover, so
+    /// a retained raw segment is not re-ingested after this database is reaped.
+    pub fn complete_spool_segment(
+        &mut self,
+        spool_file: &str,
+        lane: &str,
+        source_sha256: &str,
+        byte_length: u64,
+        line_count: u64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO consumed_segment \
+             (spool_file, lane, source_sha256, byte_length, line_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(spool_file) DO NOTHING",
+            params![
+                spool_file,
+                lane,
+                source_sha256,
+                byte_length as i64,
+                line_count as i64,
+            ],
+        )?;
+        let recorded: (String, String, i64, i64) = self.connection.query_row(
+            "SELECT lane, source_sha256, byte_length, line_count \
+             FROM consumed_segment WHERE spool_file = ?1",
+            params![spool_file],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if recorded
+            != (
+                lane.to_owned(),
+                source_sha256.to_owned(),
+                byte_length as i64,
+                line_count as i64,
+            )
+        {
+            return Err(StoreError::ConsumedSegmentConflict {
+                spool_file: spool_file.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Runs a closure inside one transaction.
     ///
     /// Ingest batches a run of records together with the cursor advance that
@@ -517,6 +651,27 @@ impl Store {
 
     pub fn next_evidence_seq(&self) -> i64 {
         self.next_evidence
+    }
+
+    pub fn first_evidence_seq(&self) -> i64 {
+        self.first_evidence
+    }
+
+    pub fn consumed_segments(&self) -> Result<Vec<ConsumedSegment>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT spool_file, lane, source_sha256, byte_length, line_count \
+             FROM consumed_segment ORDER BY spool_file",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ConsumedSegment {
+                spool_file: row.get(0)?,
+                lane: row.get(1)?,
+                source_sha256: row.get(2)?,
+                byte_length: row.get::<_, i64>(3)? as u64,
+                line_count: row.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Folds every durable fact in sequence order into caller-owned state.
@@ -578,14 +733,18 @@ impl Store {
             }
         }
 
-        // Dense from 1: a hole means a row was removed outside this program, which
-        // invalidates every position after it.
-        let highest: i64 =
-            self.connection
-                .query_row("SELECT COALESCE(MAX(seq), 0) FROM evidence", [], |row| {
-                    row.get(0)
-                })?;
-        let dense = highest == checked as i64;
+        // Dense from this partition's first global position: older positions
+        // live in older partitions and need not remain on disk.
+        let (lowest, highest): (i64, i64) = self.connection.query_row(
+            "SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM evidence",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let dense = if checked == 0 {
+            true
+        } else {
+            lowest == self.first_evidence && highest - lowest + 1 == checked as i64
+        };
 
         Ok(IntegrityReport {
             checked,
