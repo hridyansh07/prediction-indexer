@@ -286,7 +286,7 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(directory)?;
-        let connection = Connection::open(database)?;
+        let mut connection = Connection::open(database)?;
         // WAL keeps a reader from blocking the ingest writer. `NORMAL` is the
         // right durability point here because the spool — not this database — is
         // the irreversible copy: a lost transaction is re-ingested from bytes we
@@ -305,16 +305,18 @@ impl Store {
             .optional()?;
         let migration = match stored {
             None => {
-                connection.execute_batch(IDENTITY_SCHEMA)?;
                 let first = requested_first.unwrap_or(1);
-                connection.execute(
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(IDENTITY_SCHEMA)?;
+                transaction.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
-                connection.execute(
+                transaction.execute(
                     "INSERT INTO meta (key, value) VALUES ('first_evidence_seq', ?1)",
                     params![first.to_string()],
                 )?;
+                transaction.commit()?;
                 None
             }
             Some(value) if value == "1" => {

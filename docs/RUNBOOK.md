@@ -386,6 +386,12 @@ before the upgrade because migration time follows fact and unique-identity count
 The completed time and count appear in the ingester log and in
 `store_migration` in its JSON report.
 
+For a large legacy store whose old derived history is not needed, the documented
+fresh-store cutover in `docs/DEPLOYMENT.md` avoids this migration. It starts a new
+`file_order` lineage and re-ingests every sealed segment still in the local spool;
+it does not reconstruct segments the raw reaper already removed. Move any backup
+to another filesystem if the purpose is to recover capacity.
+
 Compression on the archive path measures ~12.7x, so S3 growth is far below the
 local spool rate. `targeter-v2-cache` should stay near zero now that
 `--no-response-cache` is set; if it grows, the flag is not reaching the container

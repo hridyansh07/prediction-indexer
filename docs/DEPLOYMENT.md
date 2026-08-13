@@ -295,6 +295,25 @@ After completion, stderr reports the migration duration and record count, and th
 JSON report records the same values under `store_migration`. Subsequent schema-v3
 starts report `store_migration: null`.
 
+#### Fresh derived-store cutover instead of migration
+
+Migrating the legacy database is optional. The ingest store is a derived
+`file_order` projection; the finalizer, archiver, raw reaper, and analysis paths
+do not read it. For a very large legacy store, stop the old ingester and move the
+entire `ingest-store/` directory to a backup volume before starting the new image.
+Starting with no `ingest-store/` directory creates a fresh schema-v3 daily
+partition instead of entering the migration path. A rename on the same filesystem
+does not release capacity, so it does not solve disk pressure by itself.
+
+This is a new ingest-store lineage: `file_order` starts at 1, prior continuity and
+duplicate/conflict history are not carried, and every sealed segment still present
+under `spool/` is ingested again into the new store. Segments already removed by
+the raw reaper cannot be reconstructed by `indexer-ingest`, even if their
+canonical or archived evidence remains available. That does not affect those
+independent evidence tiers, but it means a fresh cutover is not a byte-for-byte
+historical store rebuild. Preserve `spool/`, `canonical/`, archive objects, and
+their receipts; only the derived `ingest-store/` is being replaced.
+
 After startup, `identity_records_in_memory` in the ingester report must be `0`.
 Duplicate/conflict detection remains exact through the SQLite index within each
 UTC ingestion-day partition; it deliberately resets at rollover. This is not an

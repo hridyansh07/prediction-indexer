@@ -1,5 +1,6 @@
-use indexer_store::Store;
+use indexer_store::{SCHEMA_VERSION, Store};
 use indexer_types::{ContentHash, Sinkable};
+use rusqlite::Connection;
 use tempdir::TempDir;
 
 #[derive(Clone)]
@@ -11,6 +12,70 @@ impl Sinkable for Fact {
             .write_all(self.0)
             .map_err(indexer_types::SinkError::from)
     }
+}
+
+#[test]
+fn fresh_partition_metadata_initialization_is_atomic_and_retryable() {
+    let directory = TempDir::new("partition-metadata-atomicity").expect("temporary directory");
+    let database = directory.path().join("store.db.open");
+    {
+        let connection = Connection::open(&database).expect("create database");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TRIGGER reject_first_evidence_seq
+                BEFORE INSERT ON meta
+                WHEN NEW.key = 'first_evidence_seq'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected metadata failure');
+                END;
+                ",
+            )
+            .expect("install metadata failure");
+    }
+
+    assert!(
+        Store::open_partition(directory.path(), 42).is_err(),
+        "the injected second metadata write must fail store creation"
+    );
+    let connection = Connection::open(&database).expect("inspect failed initialization");
+    let version_rows: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version count");
+    assert_eq!(
+        version_rows, 0,
+        "a failed fresh-store initialization must not leave a schema version without its sequence origin"
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_first_evidence_seq;")
+        .expect("remove metadata failure");
+    drop(connection);
+
+    let store =
+        Store::open_partition(directory.path(), 42).expect("retry fresh-store initialization");
+    assert_eq!(store.first_evidence_seq(), 42);
+    drop(store);
+
+    let connection = Connection::open(database).expect("inspect initialized store");
+    let metadata: Vec<(String, String)> = connection
+        .prepare("SELECT key, value FROM meta ORDER BY key")
+        .expect("prepare metadata query")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query metadata")
+        .collect::<Result<_, _>>()
+        .expect("read metadata");
+    assert_eq!(
+        metadata,
+        vec![
+            ("first_evidence_seq".to_owned(), "42".to_owned()),
+            ("schema_version".to_owned(), SCHEMA_VERSION.to_string()),
+        ]
+    );
 }
 
 #[test]
