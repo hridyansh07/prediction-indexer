@@ -278,6 +278,10 @@ export async function validateReportPath(
     if (r.artifacts !== undefined) {
       const artifacts = obj(r.artifacts, 'selection report artifacts');
       const suffix = r.artifact_format === 'zstd' ? '.ndjson.zst' : '.ndjson';
+      const names = Object.keys(artifacts);
+      const targetRecords = supportedVenues.map(
+        (venue) => `target_records_${venue}${suffix}`,
+      );
       const expected = [
         `rule_templates${suffix}`,
         `rule_drift${suffix}`,
@@ -285,10 +289,11 @@ export async function validateReportPath(
           `catalog_${venue}_events${suffix}`,
           `catalog_${venue}_markets${suffix}`,
         ]),
+        ...(targetRecords.some((name) => names.includes(name))
+          ? targetRecords
+          : []),
       ];
-      if (
-        Object.keys(artifacts).sort().join('\0') !== expected.sort().join('\0')
-      )
+      if (names.sort().join('\0') !== expected.sort().join('\0'))
         throw new Error(
           'selection report artifact inventory is incomplete or unexpected',
         );

@@ -128,6 +128,69 @@ test('summarizes admission and allocation rejection evidence', () => {
   });
 });
 
+test('accepts complete old and target-record artifact inventories', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ui-target-records-'));
+  let sequence = 0;
+  const validate = async (
+    artifactFormat: 'ndjson' | 'zstd',
+    artifacts: Record<string, unknown>,
+  ) => {
+    const value: any = report();
+    value.catalogs = [
+      { venue: 'kalshi', complete: true, events: 0, markets: 0 },
+    ];
+    value.artifact_format = artifactFormat;
+    value.artifacts = artifacts;
+    const bytes = Buffer.from(JSON.stringify(value));
+    const path = join(directory, `report-${sequence++}`);
+    await writeFile(path, bytes);
+    return validateReportPath(path, plainFile(bytes), value.run_id, null);
+  };
+
+  try {
+    for (const [artifactFormat, suffix] of [
+      ['ndjson', '.ndjson'],
+      ['zstd', '.ndjson.zst'],
+    ] as const) {
+      const baseArtifacts = {
+        [`rule_templates${suffix}`]: {},
+        [`rule_drift${suffix}`]: {},
+        [`catalog_kalshi_events${suffix}`]: {},
+        [`catalog_kalshi_markets${suffix}`]: {},
+      };
+      const targetRecords = Object.fromEntries(
+        ['kalshi', 'polymarket', 'limitless'].map((venue) => [
+          `target_records_${venue}${suffix}`,
+          {},
+        ]),
+      );
+      assert.equal(
+        (await validate(artifactFormat, baseArtifacts)).run_id,
+        report().run_id,
+      );
+      assert.equal(
+        (
+          await validate(artifactFormat, {
+            ...baseArtifacts,
+            ...targetRecords,
+          })
+        ).run_id,
+        report().run_id,
+      );
+      await assert.rejects(
+        () =>
+          validate(artifactFormat, {
+            ...baseArtifacts,
+            [`target_records_kalshi${suffix}`]: {},
+          }),
+        /artifact inventory is incomplete or unexpected/,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('parses plain staged paths and compressed paths only after decoder success', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'ui-core-'));
   try {
