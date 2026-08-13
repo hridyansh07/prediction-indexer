@@ -34,6 +34,10 @@ pub enum StoreError {
         expected: i64,
         found: i64,
     },
+    /// SQLite could not checkpoint every WAL frame before partition closure.
+    CheckpointBusy {
+        remaining_frames: i64,
+    },
     Encoding,
 }
 
@@ -66,6 +70,10 @@ impl fmt::Display for StoreError {
             Self::PartitionSequenceMismatch { expected, found } => write!(
                 formatter,
                 "partition starts at global position {found}; its marker requires {expected}"
+            ),
+            Self::CheckpointBusy { remaining_frames } => write!(
+                formatter,
+                "partition WAL checkpoint left {remaining_frames} frames"
             ),
             Self::Encoding => formatter.write_str("value could not produce canonical bytes"),
         }

@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS consumed_segment (
 );
 ";
 
-/// The exact global identity index used by the long-lived ingester.
+/// The exact identity index used within one ingest-store database.
 ///
 /// This is derived from the fact log but durable so the process does not need a
 /// `BTreeMap` entry for every record ever captured. `first_seen` is the original
@@ -252,7 +252,7 @@ pub struct Store {
 impl Store {
     /// Opens or creates a store directory.
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
-        Self::open_internal(directory, None)
+        Self::open_internal(&directory.join("store.db"), None)
     }
 
     /// Opens or creates one partition at an explicit first global position.
@@ -263,12 +263,30 @@ impl Store {
         if first_seq <= 0 {
             return Err(StoreError::CorruptSequence);
         }
-        Self::open_internal(directory, Some(first_seq))
+        Self::open_internal(&directory.join("store.db"), Some(first_seq))
     }
 
-    fn open_internal(directory: &Path, requested_first: Option<i64>) -> Result<Self, StoreError> {
+    /// Opens or creates the writable database for one ingest partition.
+    ///
+    /// The `.open` suffix is part of the closure protocol. Rollover checkpoints
+    /// and closes this file, renames it to `store.db`, fsyncs the directory, and
+    /// only then publishes the partition receipt.
+    pub fn open_partition(directory: &Path, first_seq: i64) -> Result<Self, StoreError> {
+        if first_seq <= 0 {
+            return Err(StoreError::CorruptSequence);
+        }
+        Self::open_internal(&directory.join("store.db.open"), Some(first_seq))
+    }
+
+    fn open_internal(database: &Path, requested_first: Option<i64>) -> Result<Self, StoreError> {
+        let directory = database.parent().ok_or_else(|| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("database path {} has no parent", database.display()),
+            ))
+        })?;
         std::fs::create_dir_all(directory)?;
-        let connection = Connection::open(directory.join("store.db"))?;
+        let connection = Connection::open(database)?;
         // WAL keeps a reader from blocking the ingest writer. `NORMAL` is the
         // right durability point here because the spool — not this database — is
         // the irreversible copy: a lost transaction is re-ingested from bytes we
@@ -435,13 +453,13 @@ impl Store {
         Ok(CommittedFact { seq, value })
     }
 
-    // -- global record identity -------------------------------------------
+    // -- partition record identity ----------------------------------------
 
     /// Returns the first content committed for `record_id`, if any.
     ///
     /// This indexed lookup replaces the classifier's unbounded process-local
-    /// identity map. It remains exact — no Bloom-filter false positives, LRU
-    /// expiry, or window boundary can turn a retransmission into a new record.
+    /// identity map. It remains exact within this database — no Bloom-filter
+    /// false positives or LRU expiry can change a verdict before rollover.
     pub fn record_identity(&self, record_id: &str) -> Result<Option<RecordIdentity>, StoreError> {
         let row: Option<(Vec<u8>, i64)> = self
             .connection
@@ -672,6 +690,26 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Checkpoints every WAL frame and closes the partition database.
+    ///
+    /// A closed partition is immutable and may later be removed as one file, so
+    /// no state may remain only in `store.db-wal` when its receipt is published.
+    pub fn checkpoint_and_close(self) -> Result<(), StoreError> {
+        let (busy, log_frames, checkpointed): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 || checkpointed != log_frames {
+            return Err(StoreError::CheckpointBusy {
+                remaining_frames: log_frames.saturating_sub(checkpointed),
+            });
+        }
+        self.connection
+            .close()
+            .map_err(|(_, error)| StoreError::Sqlite(error))
     }
 
     /// Folds every durable fact in sequence order into caller-owned state.

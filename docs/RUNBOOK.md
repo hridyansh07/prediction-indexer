@@ -29,6 +29,7 @@ without it — `dc ps` will not show it, and `dc up -d` will not start it.
 | `splice-kalshi` | `kalshi` | capture |
 | `finalizer`, `finalizer-once` | `ops` | ingester |
 | `ingester-integrity` | `ops` | ingester |
+| `ingest-store-reaper` | `ops` | ingester |
 | `archiver`, `archiver-once` | `ops` | capture |
 | `reaper`, `reaper-once` | `ops` | capture |
 | `canonical-integrity` | `ops` | capture |
@@ -89,6 +90,7 @@ That matters: a cleanly sealed segment means the next start resumes from seals
 | Run reaper report | `data/ops/last_targeter_v2_reaper_sweep.json` |
 | Archiver report | `data/archive-manifests/last_archive_sweep.json` |
 | Raw reaper report | `data/archive-manifests/last_reaper_sweep.json` |
+| Ingest-store reaper report | `data/ops/last_ingest_store_reaper_sweep.json` |
 
 The raw archive pair write to `archive-manifests/`, not `ops/` — they predate
 that directory. Both the long-lived service and its `-once` variant write the
@@ -98,7 +100,42 @@ Everything below assumes `DATA=/srv/prediction-indexer/data`.
 
 ---
 
-## 3. Reading the raw reaper report
+## 3. Reading the ingest-store reaper report
+
+```bash
+sudo python3 -m json.tool $DATA/ops/last_ingest_store_reaper_sweep.json
+```
+
+This is a third reaper with a deliberately narrow authority: it deletes only a
+derived, closed daily SQLite database. It never touches raw spool files, active
+`store.db.open`, partition receipts, or directories.
+
+Read `counts.reapable` first. In audit mode it is the number of closed databases
+that are at least 24 hours past `closed_at_ns` and still byte-identical to their
+receipts. `counts.reaped` remains zero until
+`INGEST_STORE_REAPER_MODE=delete` is explicitly set.
+
+| Reason | Means |
+|---|---|
+| `audit_mode` | Eligible, retained only because deletion is disabled |
+| `retention_floor` | Closed less than `INGEST_STORE_RETENTION_HOURS` ago |
+| `active_partition` | Contains the writer's active marker or `.open` database |
+| `receipt_missing` | A closed-looking database has no commit receipt; retained |
+| `database_identity_mismatch` | Closed bytes no longer match receipt; investigate |
+| `database_already_reaped` | Database is gone and its receipt skip ledger remains |
+
+Run one audit by hand with:
+
+```bash
+dc --profile ops run --rm ingest-store-reaper
+```
+
+The scheduled command is the same one-shot invocation. Do not use `up -d` for
+it. The minimum retention is 24 hours, and the command refuses a lower value.
+
+---
+
+## 4. Reading the raw reaper report
 
 ```bash
 sudo python3 -m json.tool $DATA/archive-manifests/last_reaper_sweep.json | head -40
@@ -189,7 +226,7 @@ for seal in glob.glob('$DATA/spool/lane=*/date=*/*.seal.json'):
 
 ---
 
-## 4. Reading the targeter run reaper report
+## 5. Reading the targeter run reaper report
 
 ```bash
 sudo python3 -m json.tool $DATA/ops/last_targeter_v2_reaper_sweep.json | head -40
@@ -225,7 +262,7 @@ published generations are never touched.
 
 ---
 
-## 5. Reading the finalizer report
+## 6. Reading the finalizer report
 
 ```bash
 sudo python3 -m json.tool $DATA/ops/last_finalizer_sweep.json | head -30
@@ -241,7 +278,7 @@ sudo python3 -m json.tool $DATA/ops/last_finalizer_sweep.json | head -30
 
 ---
 
-## 6. Reading gate 1
+## 7. Reading gate 1
 
 ```bash
 dc run --rm --no-deps targeter \
@@ -291,10 +328,12 @@ duration of a gate run.
 
 ---
 
-## 7. Enabling deletion — the ordering that matters
+## 8. Enabling deletion — the ordering that matters
 
-The two reapers behave very differently and this is the single most important
-thing on this page.
+The two evidence/run reapers behave very differently and this is the single most
+important thing on this page. The ingest-store reaper is independent of both:
+its databases are derived, its 24-hour floor is mandatory, and deleting one does
+not delete raw or canonical evidence.
 
 | | Raw reaper | Targeter run reaper |
 |---|---|---|
@@ -320,7 +359,7 @@ and `counts.unarchived` is zero.
 
 ---
 
-## 8. Capacity
+## 9. Capacity
 
 ```bash
 sudo du -sh $DATA/* | sort -h
@@ -336,7 +375,8 @@ Rough daily rates at the current configuration:
 | targeter-v2-runs | ~4.6 G |
 | canonical | ~1.8 G |
 
-The schema-v2 ingester upgrade performs one blocking identity-index migration.
+The schema-v3 ingester upgrade performs one blocking identity-index migration and
+moves the legacy database into the current UTC ingestion-day partition.
 At six days the ingest store is roughly 162 GiB at this rate. The measured
 2.67-million-fact migration permanently added 5.1% and temporarily needed 10.2%
 above the original database while its WAL existed, so have at least 11% free
@@ -351,12 +391,15 @@ local spool rate. `targeter-v2-cache` should stay near zero now that
 `--no-response-cache` is set; if it grows, the flag is not reaching the container
 — check that both `-f` files are being passed.
 
-Nothing reaps `live/targeter-v2/generations/`. It gains one directory per publish
-and no command removes it.
+With `INGEST_STORE_REAPER_MODE=delete`, ingest-store usage is bounded to the
+active partition plus closed partitions still inside the configured 24-hour
+floor. Receipts remain but are small. Nothing reaps
+`live/targeter-v2/generations/`; it gains one directory per publish and no command
+removes it.
 
 ---
 
-## 9. Quick health sweep
+## 10. Quick health sweep
 
 ```bash
 dc --profile ops --profile kalshi ps

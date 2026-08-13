@@ -46,7 +46,7 @@ fn ingest(spool: &Path, store: &Path) -> Value {
 
 /// The receive times of every stored line, in the global order the store assigned.
 fn visible_ns_in_evidence_order(store: &Path) -> Vec<u64> {
-    let connection = Connection::open(store.join("store.db")).expect("open store");
+    let connection = Connection::open(common::ingest_database(store)).expect("open store");
     let mut statement = connection
         .prepare("SELECT raw_line FROM evidence ORDER BY seq")
         .expect("prepare evidence scan");
@@ -89,7 +89,7 @@ fn a_later_lane_file_cannot_precede_an_earlier_one_however_early_its_records() {
     let (_root, spool, store) = interleaved_fixture();
     ingest(&spool, &store);
 
-    let connection = Connection::open(store.join("store.db")).expect("open store");
+    let connection = Connection::open(common::ingest_database(&store)).expect("open store");
     let kalshi_first: i64 = connection
         .query_row(
             "SELECT MIN(seq) FROM evidence WHERE venue = 'kalshi'",

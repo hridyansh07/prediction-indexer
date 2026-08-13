@@ -20,10 +20,10 @@ to satisfy rather than in a comment asking them to be careful.
 ## What it does
 
 ```
-spool files (venue=*/date=*/<ts>-<epoch>.ndjson)
+sealed spool files (lane=*/date=*/*.ndjson + seal)
   → capture_raw        exact bytes durable before anything parses them
   → assign EvidenceSeq the one global cross-venue order
-  → identity lookup    exact global verdict from the durable SQLite index
+  → identity lookup    exact verdict within the active UTC ingest partition
   → classify           epoch health and cursor continuity
   → commit_fact        the classification, durable, hash-bound
   → fact log (SQLite)
@@ -67,11 +67,13 @@ Three things tracked per `(venue, stream, connection_epoch)`:
 Duplicate is a retransmission. Conflict is the same id with different bytes, which
 is a venue misbehaving and worth surfacing loudly. Identity is decided *before*
 continuity so a retransmission cannot move a counter or stale a stream. In the
-long-lived ingester this is an indexed SQLite lookup, not a process-local map:
-the verdict remains global and exact without retaining every historical record ID
-in RAM. The finalizer keeps the narrower window-scoped semantics but uses a
-disposable SQLite index for each merge attempt; it does not link or mutate the
-ingester's global store.
+long-lived ingester this is an indexed SQLite lookup, not a process-local map. It
+is exact within one UTC ingestion-day partition; a record ID first repeated after
+rollover is deliberately `Unseen`. This weaker scope lets retention remove whole
+derived databases without retaining every historical record ID in RAM or on local
+disk. The finalizer uses a still narrower window-scoped contract and a disposable
+SQLite index for each merge attempt; it does not link or mutate the ingester's
+partition store.
 
 **Epoch health** — `AwaitingBootstrap` → `Healthy` → `Stale` → `Retired`. A new
 connection starts unproven. Snapshot proof is tracked **per instrument, not per
@@ -153,13 +155,13 @@ lanes, five sealed segments, 2,670,449 records and 2,331,516,814 decoded bytes:
 | schema-v2 `indexer-ingest`, no-new-data restart | 6,580 KiB |
 | disk-backed `indexer-finalize` | 13,756 KiB |
 
-Schema v2 adds `record_identity(record_id, content_hash, first_seen)` as one
-`WITHOUT ROWID` table. The primary key is explicitly `NOT NULL`, and the content
-hash is the exact 32-byte digest rather than its 64-byte hexadecimal rendering.
-A first observation, its fact, and the spool-cursor advance commit in one SQLite
-transaction. Duplicate and conflict lookups return the original fact position,
-so moving identity to disk changes no verdict semantics. No LRU or probabilistic
-filter is used.
+Schema v2 added `record_identity(record_id, content_hash, first_seen)` as one
+`WITHOUT ROWID` table; schema v3 retains that table inside each daily partition.
+The primary key is explicitly `NOT NULL`, and the content hash is the exact
+32-byte digest rather than its 64-byte hexadecimal rendering. A first
+observation, its fact, and the spool-cursor advance commit in one SQLite
+transaction. Duplicate and conflict lookups return the original fact position
+within that partition. No LRU or probabilistic filter is used.
 
 Opening a schema-v1 store performs one transactional SQLite migration from the
 already committed canonical facts in sequence order. It does not reconstruct the
@@ -178,7 +180,41 @@ the transaction back and leaves the schema version at 1. Fixed initial ingest
 after migration took 145 seconds — about 18,400 records/second, still over twenty
 times the measured steady capture rate.
 
-The finalizer has no lifetime-global identity contract: duplicate and conflict
+### Daily store partitions and retention
+
+The active store is selected by the UTC day on which the ingester consumes a
+sealed segment, not by a date asserted by its payload or spool path:
+
+```text
+ingest-store/date=<YYYY-MM-DD>/
+  active.json       next global position and bounded initial continuity carry
+  store.db.open     the only writable database
+
+  store.db          immutable after rollover
+  receipt.json      close commit marker; retained after `store.db` is reaped
+```
+
+Rollover occurs only between complete sealed segments. Closure checkpoints every
+WAL frame, closes and fsyncs `store.db.open`, renames it to `store.db`, fsyncs the
+directory, removes the active marker, and publishes `receipt.json` last. The
+receipt hashes the closed database and carries the next `file_order` position,
+the bounded connection/cursor state needed by the next partition, and every
+consumed segment's spool-relative path plus sealed SHA-256.
+
+That segment list is a small durable skip ledger. It remains after database
+deletion, so an old raw segment retained by the independent archive reaper is not
+silently ingested a second time. The same path with a different sealed SHA-256 is
+an integrity conflict and stops ingestion.
+
+`indexer-store-reap` is a one-shot Rust command intended for a daily host cron or
+systemd timer. Audit is the default. Delete mode removes only a closed `store.db`
+whose receipt is valid, whose bytes still match the receipt, and whose
+`closed_at_ns` is at least 24 hours old. It never removes `store.db.open`, the
+partition directory, or `receipt.json`. The raw-data reaper remains a separate
+authority because it deletes irreversible spool evidence and therefore has the
+stronger archive-plus-canonical gate.
+
+The finalizer has no ingestion-day identity contract: duplicate and conflict
 verdicts deliberately start fresh at each 30-minute window. It therefore creates
 `.record-identity.sqlite.open` as an exact scratch index for each merge attempt,
 with a bounded 2 MiB SQLite page cache, no durability work, and no receipt status.

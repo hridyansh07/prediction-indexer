@@ -14,6 +14,13 @@ if ! command -v docker >/dev/null 2>&1; then
 	sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 
+if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+		| sh -s -- -y --profile minimal --default-toolchain 1.85.0
+fi
+RUSTUP_BIN="$(command -v rustup || printf '%s' "$HOME/.cargo/bin/rustup")"
+"$RUSTUP_BIN" component add --toolchain 1.85.0 rustfmt clippy
+
 yarn install --frozen-lockfile
 yarn build:packages
 CARGO_BIN="$(command -v cargo || printf '%s' "$HOME/.cargo/bin/cargo")"

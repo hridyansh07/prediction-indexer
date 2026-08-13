@@ -17,12 +17,12 @@ targeter ──> data/live/targets_*.json
                                                      ingester
                                                          │
                                                          v
-                                              data/ingest-store/store.db
+                                      data/ingest-store/date=<UTC-day>/store.db.open
 ```
 
-The target files, raw spool, and derived SQLite store are bind-mounted from one
-host directory. Images are immutable; the repository is not mounted into running
-containers.
+The target files, raw spool, and daily derived SQLite partitions are bind-mounted
+from one host directory. Images are immutable; the repository is not mounted
+into running containers.
 
 ## Services and profiles
 
@@ -40,6 +40,7 @@ credentials:
 | `splice-polymarket-sports` | `reference` profile | Polymarket sports reference feed |
 | `splice-polymarket-rtds` | `reference` profile | Polymarket RTDS reference prices |
 | `ingester-integrity` | `ops` profile | One-shot store integrity check |
+| `ingest-store-reaper` | `ops` profile | One-shot audit/delete of closed ingest databases older than 24 hours |
 | `finalizer` | `ops` profile | Checks every minute and merges sealed windows into compressed canonical evidence |
 | `finalizer-once` | `ops` profile | The same finalization sweep, once |
 | `archiver` | `ops` profile | Hourly sweep publishing sealed segments as immutable compressed objects |
@@ -266,14 +267,15 @@ docker compose run --rm ingester-integrity
 docker compose start ingester
 ```
 
-### Ingester schema-v2 memory migration
+### Ingester schema-v3 daily partition migration
 
 The first ingester start after upgrading a schema-v1 `ingest-store/store.db`
+first moves that database into the current UTC ingestion-day partition, then
 builds the durable `record_identity` index from its committed facts and changes
-`meta.schema_version` to `2`. This is one blocking `BEGIN IMMEDIATE` transaction
-inside `Store::open`, before ingest or continuity recovery starts. Failure rolls
-it back rather than leaving a partial identity index, and the raw spool is
-unchanged. Stop the old ingester before deploying the new binary.
+`meta.schema_version` to `3`. This is one blocking migration before ingest or
+continuity recovery starts. Failure rolls it back rather than leaving a partial
+identity index, and the raw spool is unchanged. Stop the old ingester before
+deploying the new binary.
 
 The index is a `WITHOUT ROWID` table with a 32-byte binary content hash. On the
 measured 2,670,449-fact store, migration took 7.10 seconds and complete startup
@@ -290,12 +292,47 @@ Migration duration scales primarily with fact and unique-identity counts, not
 database bytes alone. Before the deployment window, time the new binary against a
 copy of the actual production store rather than extrapolating from this sample.
 After completion, stderr reports the migration duration and record count, and the
-JSON report records the same values under `store_migration`. Subsequent schema-v2
+JSON report records the same values under `store_migration`. Subsequent schema-v3
 starts report `store_migration: null`.
 
 After startup, `identity_records_in_memory` in the ingester report must be `0`.
-Duplicate/conflict detection remains exact and global through the SQLite index;
-this is not an LRU or probabilistic cache.
+Duplicate/conflict detection remains exact through the SQLite index within each
+UTC ingestion-day partition; it deliberately resets at rollover. This is not an
+LRU or probabilistic cache.
+
+### Daily ingest-store retention
+
+The ingester rotates only between complete sealed segments. The active partition
+contains `active.json` and `store.db.open`. At a UTC-day boundary it checkpoints
+the WAL, closes and fsyncs the database, renames it to immutable `store.db`,
+fsyncs the directory, removes the active marker, and publishes `receipt.json`
+last. The receipt records the closed database's exact length and SHA-256 plus a
+small consumed-segment ledger. It remains after database deletion so old raw
+spool files cannot be ingested twice.
+
+Run the reaper manually in its default audit mode:
+
+```bash
+docker compose --profile ops run --rm ingest-store-reaper
+sudo python3 -m json.tool \
+  ${CAPTURE_DATA_ROOT}/ops/last_ingest_store_reaper_sweep.json
+```
+
+It is one-shot, not a service loop. Schedule the same command once per day,
+alongside the existing host cron entries:
+
+```cron
+25 3 * * * cd /opt/prediction-indexer && docker compose --profile ops run --rm ingest-store-reaper >> /var/log/prediction-ingest-store-reaper.log 2>&1
+```
+
+`INGEST_STORE_REAPER_MODE=audit` is the default and deletes nothing. Set it to
+`delete` only after reviewing several reports. The command refuses retention
+below `INGEST_STORE_RETENTION_HOURS=24`, never deletes the active
+`store.db.open`, and deletes a closed database only when it is at least the
+configured age and still byte-identical to its valid receipt. It retains every
+receipt and partition directory. This is intentionally separate from the raw
+reaper: ingest databases are derived, while raw spool deletion needs independent
+archive and canonical receipts.
 
 Apply a new v1 manifest without rebuilding (base deployment only):
 
@@ -319,7 +356,7 @@ Everything durable is below `CAPTURE_DATA_ROOT`:
 ```text
 live/                target files, rejections, and coverage ledger
 spool/               irreversible raw NDJSON tape, sealed segments
-ingest-store/        derived SQLite evidence/fact store   (file_order)
+ingest-store/        daily derived SQLite evidence/fact partitions (file_order)
 canonical/           derived merged evidence per window   (EvidenceSeq)
 archive-manifests/   derived replay catalog over verified archive receipts
 ```

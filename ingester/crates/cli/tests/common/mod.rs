@@ -198,6 +198,19 @@ pub fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// The one writable ingest database created beneath a UTC date partition.
+pub fn ingest_database(store_root: &Path) -> PathBuf {
+    let mut found = fs::read_dir(store_root)
+        .expect("ingest store root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("store.db.open"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    found.sort();
+    assert_eq!(found.len(), 1, "exactly one writable ingest partition");
+    found.pop().expect("writable ingest database")
+}
+
 pub const SECOND_NS: u64 = 1_000_000_000;
 
 /// One lane's segment, sealed into an explicit window.

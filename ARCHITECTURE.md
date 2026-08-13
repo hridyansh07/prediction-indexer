@@ -71,7 +71,7 @@ cheap discoveries rather than expensive ones.
                               │  global sequence  │   types · store · continuity · cli
                               │  + continuity     │
                               └─────────┬─────────┘
-                                        │  SQLite: evidence + facts, hash-bound
+                                        │  daily SQLite partitions: evidence + facts
                               ┌─────────▼─────────┐
                               │     ANALYSIS      │   Python
                               │  masks · Ω · fees │   analysis/
@@ -230,13 +230,16 @@ Two rules this component holds to:
    buffer that is both hashed and persisted. Encoding separately for each would let
    them disagree, surfacing as corruption years of data later.
 
-Global duplicate/conflict identity is an indexed SQLite projection, committed in
-the same transaction as its first fact and the spool cursor. It is deliberately
-not retained in the long-lived classifier: doing so costs O(all historical
-records) RAM even though file reads themselves are cursor-based. Ordering state
-remains in memory; exact identity remains durable and global.
+Duplicate/conflict identity is an indexed SQLite projection, committed in the
+same transaction as its first fact and the spool cursor. It is deliberately not
+retained in the long-lived classifier: doing so costs O(all records in the
+partition) RAM even though file reads themselves are cursor-based. The index is
+exact and durable within one UTC ingestion-day partition. At rollover the
+ingester checkpoints and closes that database, carries only the next global
+sequence and classification-critical connection state, and starts identity
+empty in the next partition.
 
-The sealed-window finalizer uses the same bounded classifier but not that global
+The sealed-window finalizer uses the same bounded classifier but not that ingest
 projection: its duplicate/conflict contract is window-scoped. Each merge attempt
 gets an exact disposable SQLite index, removed before the attempt can become
 canonical evidence. A lane-invalid retry starts with a fresh index so excluded
@@ -323,7 +326,10 @@ Three things tracked, and the boundary between them is where the subtlety lives.
 **Identity** — `Unseen` / `Duplicate` / `Conflict` on `(record_id, content_hash)`.
 Decided *before* continuity, so a retransmission cannot move a counter or stale a
 stream. A conflict is the same id with different bytes: a venue contradicting
-itself, surfaced loudly rather than silently becoming the new truth.
+itself, surfaced loudly rather than silently becoming the new truth. The
+long-lived ingest path now makes this claim within one UTC ingestion-day
+partition, not for deployment lifetime; rollover deliberately starts a fresh
+exact identity index so the derived store can be reaped as whole files.
 
 **Epoch health** — `AwaitingBootstrap` → `Healthy` → `Stale`. Snapshot proof is
 tracked **per instrument, not per connection**: on a multi-instrument stream the
@@ -363,7 +369,9 @@ data/live/targets_<venue>.json         current subscription set + digest
 data/live/rejected_<venue>.json        candidates dropped, with reasons
 data/live/coverage.json                first-sighting ledger
 data/spool/venue=…/date=…/<ts>-<epoch>.ndjson   raw tape, append-only, never mutated
-data/ingest-store/store.db             evidence + facts, hash-bound, derived
+data/ingest-store/date=<YYYY-MM-DD>/
+  store.db.open                        active evidence + facts, hash-bound, derived
+  store.db + receipt.json              closed immutable partition and commit marker
 data/analysis/…                        content-addressed analysis runs
 ```
 
@@ -382,7 +390,9 @@ and state store, Parquet appears only when a query is actually slow.
 
 Stated because a limit you know about is a caveat and a limit you don't is a bug.
 
-**`EvidenceSeq` is file-ordered, not wall-clock ordered.** Records from two venues
+**`EvidenceSeq` is file-ordered, not wall-clock ordered.** Its numeric sequence
+continues across daily ingest partitions even after old databases are reaped.
+Records from two venues
 live at the same instant land in file order. `visible_ns` carries real timing and
 is preserved on every record, so **any lead-lag analysis must sort on `visible_ns`**.
 A k-way merge on `visible_ns` at ingest is the fix; it first needs a way to know
@@ -432,6 +442,7 @@ in the one class nominated as immune to mask error.
 cargo build --release --manifest-path ingester/Cargo.toml
 indexer-ingest data/spool data/ingest-store --watch-interval-seconds 5
 indexer-ingest data/spool data/ingest-store --check-integrity
+indexer-store-reap data/ingest-store --retention-hours 24 --mode audit
 
 # tests
 .venv/bin/python -m unittest discover -s tests -q     # 207
