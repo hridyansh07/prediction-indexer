@@ -136,7 +136,7 @@ def sweep_once(arguments: argparse.Namespace, store: ObjectStore) -> int:
         or (canonical is not None and (canonical.halted or canonical.count(CANONICAL_CONFLICT)))
     ):
         return EXIT_CONFLICT
-    if result.count(FAILED) or (
+    if result.count(FAILED) or result.counts["universe_failed"] or (
         canonical is not None and canonical.count(CANONICAL_FAILED)
     ):
         return EXIT_FAILURES
