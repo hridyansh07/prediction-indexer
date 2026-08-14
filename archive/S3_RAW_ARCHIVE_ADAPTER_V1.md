@@ -121,10 +121,14 @@ class S3ObjectStore:
     def head(self, key: str) -> ObjectMetadata | None: ...
 
     def open(self, key: str, *, max_bytes: int | None = None) -> BinaryIO: ...
+
+    def list_keys(self, prefix: str) -> Iterator[str]: ...
 ```
 
 Do not add S3 methods to `Archiver` or `Reaper`. They continue to depend only on
-`ObjectStore`.
+`ObjectStore`. `list_keys` is the later Event Universe discovery extension: it
+uses paginated `ListObjectsV2`, but a listed key is not a commit marker and must
+still be verified through its owning receipt or manifest.
 
 Constructor inputs:
 

@@ -112,7 +112,11 @@ def sweep_once(arguments: argparse.Namespace, store: ObjectStore) -> int:
 
     if result.halted or result.count(CONFLICT):
         return EXIT_CONFLICT
-    return EXIT_FAILURES if result.count(FAILED) else EXIT_OK
+    return (
+        EXIT_FAILURES
+        if result.count(FAILED) or result.counts["universe_failed"]
+        else EXIT_OK
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,228 +1,432 @@
-# Event Universe Store
+# Event Universe Store V1
 
-**Status:** specification. Nothing implemented. Nothing in `replay/` changes.
+**Status:** implemented contract on `feat/event-universe`.
 
-Build the universe of what was actually captured, from S3 alone, and a UI over it.
-Replay stays untouched until the data model is known — the gates will likely be
-rewritten to consume it, and doing that work now means doing it twice.
+The Event Universe is a durable, queryable index over immutable Targeter and raw
+capture evidence. It makes event, sibling-market, selection, connection, and
+segment relationships cheap to inspect without deciding how a future replay
+harness must consume them.
 
----
+This document supersedes the earlier proposal in this file. In particular, V1:
 
-## 1. The problem: intent is not reality
+- does not add a ReplayPlan or change anything under `replay/`;
+- does not add human-authored links;
+- does not add or extend a UI;
+- does not claim per-asset delivery from venue payloads;
+- does not treat a UTC day or one archive object as an event-completeness boundary;
+- uses a per-segment universe receipt, not a published daily "catalogue receipt."
 
-Two populations exist and nothing reconciles them.
-
-**What the targeter selected.** A run publishes targets for a venue and records
-them in its selection report and `target_records_<venue>.ndjson`.
-
-**What capture actually listened to.** A splice opens a connection, subscribes,
-and may add or drop assets mid-connection or fail entirely.
-
-A market can be selected and never subscribed — the splice was down, the targets
-file was unreadable, the connection failed, or the subscribe was rejected. Nothing
-reports that today, and no analysis can assume a selected market has data.
-
-The universe answers one question per asset: **for which spans were we actually
-listening, and did records arrive?**
+The implementation lives in `universe/` and the raw derivative publisher lives
+in `archive/archiver/universe.py`.
 
 ---
 
-## 2. Constraint: S3 only
+## 1. Decision
 
-The universe must not run on the capture host. That machine's job is to never drop
-a frame, and a long-lived queryable service with an API is the wrong thing to put
-beside it. Reading the spool directly is also self-defeating: the reaper deletes
-it, so a spool-backed store silently loses history exactly when retention works.
+Proceed with the Event Universe, but as an evidence index rather than a replay
+format.
 
-Everything therefore reads archived, immutable objects. That also gives the reseed
-property the store needs — rebuilding is deterministic rather than a race against
-retention.
+This is worthwhile because the expensive facts already exist in two durable
+streams that are difficult to join interactively:
 
-**Consequence:** the universe is complete for *closed* UTC days. An open day has no
-published manifest, so today is approximate. Acceptable — realtime is not the goal.
+1. Targeter run archives contain event/market grouping, sibling markets,
+   selected targets, and selected markets' exact vendor records.
+2. Raw segment archives contain splice lifecycle controls and the raw data spans
+   those controls describe.
+
+The universe verifies those sources, indexes their relationships in SQLite, and
+keeps enough identity to detect drift or ambiguity. It does not manufacture an
+event file, select replay gates, parse venue frames, or claim that one database
+row is sufficient input to replay. Those choices depend on the future pull and
+execution model and are intentionally deferred.
 
 ---
 
-## 3. What exists today, and what does not
+## 2. Authority and trust boundaries
 
-### 3.1 Intent — already on S3
+SQLite is durable operational state, but it is not the evidence authority.
 
-Archived by `targeter-v2-run-archiver` under
-`targeter-v2/runs/date=<d>/run=<run_id>/`:
-
-| Artifact | Carries |
-|---|---|
-| selection report | `run_id`, `generated_at`, published target digests |
-| `target_records_<venue>.ndjson` | the venue's own record per selected market |
-| `catalog_<venue>_events.ndjson` | `venue_event_id`, title |
-| `catalog_<venue>_markets.ndjson` | market → `venue_event_id` |
-
-Within-venue event grouping is a fact from the venue's API. No inference needed.
-
-### 3.2 Span and volume — exists, but not on S3
-
-`archive/archiver/manifest.py` already builds the daily manifest: one entry per
-segment with lane, window, data key, seal key, logical identity and stored
-identity, sorted by `(window_start_ns, lane rank, segment_index, segment_id)`.
-Exactly the index this needs.
-
-It is written to a local `--manifest-root` as `date=<d>/manifest.json` and **never
-uploaded**. `put_immutable` covers data and seal objects only.
-
-→ **Deliverable A.**
-
-### 3.3 Reality — on S3, but only inside full segments
-
-Control records are emitted by `splices/common/base.py` with `kind=control`:
-
-| Record | Carries | Means |
+| Evidence | Commit marker | Indexed facts |
 |---|---|---|
-| `connection_opened` | `target_digest`, `asset_ids`, `target_count`, `target_metadata_digest` | listening began under this exact generation |
-| `subscription_sent` | `target_digest`, `target_count` | the subscribe was actually sent |
-| `subscription_changed` | `from_digest`, `to_digest`, `added[]`, `removed[]` | membership changed mid-connection |
-| `target_metadata_changed` | metadata digest transition | same targets, new metadata |
-| `targets_unreadable` | error | intent existed, listening did not |
-| `connection_closed` | — | listening ended |
+| Targeter v2 run | `run_manifest.json` | catalog events and markets, bundle/sibling membership, selections, target records |
+| Raw segment | production `.archive.json` plus the segment universe receipt | verified raw interval and exact control envelopes |
+| Universe database | SQLite transaction plus source identity | query acceleration, folds, checkpoints, explicit diagnostics |
 
-`target_digest` is the join key: computed by `targeter/targets.py:74`, echoed
-verbatim by the splice. "This epoch listened under that generation" is a recorded
-fact, not an inference.
+An object listing is discovery only. The ingester may discover
+`run_manifest.json` and `.universe.json` keys with `ListObjectsV2`, but it must
+then closed-parse and verify the commit marker and every object it consumes.
+The existence of an uncommitted sidecar, data object, or S3 prefix is never
+evidence by itself.
 
-They are a tiny fraction of the tape but live inside segments, so reading them
-today means streaming every segment in full.
-
-→ **Deliverable B.**
+Every indexed source is keyed by its immutable object key and SHA-256. Repeating
+the same source is a no-op. Reusing a key with another identity is an integrity
+conflict and fails closed.
 
 ---
 
-## 4. Deliverables
+## 3. Raw archive derivatives
 
-### A. Publish the daily manifest — `archive/archiver/`
+After a production raw archive receipt has reverified both its data and seal,
+the archiver independently derives:
 
-Upload each closed day's `manifest.json` to the object store beside the segments
-it describes. Open days stay local-only; publish on close, after every included
-receipt revalidates.
-
-The manifest is a derived catalog, not a commit marker, and does not replace
-per-object verification — identity is still checked when bytes are streamed.
-
-### B. Control sidecar — `archive/archiver/`
-
-At archive time, when the segment bytes are already in hand, write a second object
-beside each segment containing only its `kind=control` lines:
-
-```
+```text
 <segment>.control.ndjson.zst
+<segment>.universe.json
 ```
 
-Verbatim envelopes, same order, no interpretation. Mechanical extraction, not
-judgement, so it belongs in the archiver rather than the splice.
+The control sidecar contains the exact original envelope lines whose
+`kind == "control"`, in source order. It does not:
 
-Its identity goes in the daily manifest entry beside the data and seal identities.
+- parse or normalize venue frames;
+- count asset delivery;
+- infer acceptance from a successful socket send;
+- filter lifecycle events by economic relevance.
 
-This is what makes the universe cheap: it reads a small artifact per segment
-instead of pulling full tape.
+The shared `encoder` contract applies: exact NDJSON, Zstandard level 3, checksum
+enabled, no dictionary, one frame, and both logical and stored identities.
 
-### C. Store — `universe/store.py`
+### 3.1 Segment universe receipt
 
-SQLite, split by what a reseed may destroy.
+`<segment>.universe.json` is published last and is the commit marker for the
+sidecar. Its closed V1 schema binds:
 
-**Derived** — rebuilt from immutable S3 artifacts, drop and reseed freely:
+- archive location;
+- lane, segment ID/index, and `[window_start_ns, window_end_ns)`;
+- the local production archive receipt filename, byte length, SHA-256, and
+  verification instant;
+- source logical identity;
+- raw data key and stored identity;
+- seal key and stored identity;
+- control key, content metadata, logical/stored identities, compression
+  contract, and first/last control delivery indexes;
+- publication instant and publisher version.
 
-```
-lane_window    lane, start_ns, end_ns, segment_index, line_count, data_key, control_key
-subscription   venue, asset_id, start_ns, end_ns, target_digest, epoch, lane
-intent         venue, asset_id, run_id, target_digest, published_at_ns
-market         venue, venue_market_id, venue_event_id, asset_id, record_sha256
-event          venue, venue_event_id, title
-```
+Call this a **segment universe receipt** or **segment universe commit record**.
+It is not a catalogue receipt.
 
-**Human** — never touched by a reseed:
+What it buys us is an S3-native, immutable, independently verifiable inventory
+of raw segments the universe is allowed to reference. The local raw archive
+receipt is authoritative but is not itself uploaded. The universe receipt binds
+that receipt's identity to the raw data, seal, and small control derivative, so
+the query service does not have to trust an arbitrary data-key listing or copy
+the capture host's local filesystem.
 
-```
-block          block_id, label, created_by, created_at
-block_member   block_id, venue, venue_event_id, note
-link_decision  block_id, venue_a, venue_b, decision, decided_by, decided_at, basis
-```
+It does **not** claim that the segment contains a complete event, all sibling
+markets, one Targeter generation, or one day of state.
 
-Cross-venue linking is judgement and lives only in the human tables. Within-venue
-grouping is fact and is derived.
+### 3.2 Independent failure
 
-Seeding is one idempotent command over immutable inputs. Hold that and the
-substrate choice stays reversible.
-
-### D. Ingest — `universe/ingest.py`
-
-Three readers, all S3:
-
-1. daily manifests → `lane_window`
-2. control sidecars → `subscription`
-3. targeter run artifacts → `intent`, `market`, `event`
-
-Idempotent, keyed on the digests consumed, so re-running is free.
-
-### E. Coverage — `universe/coverage.py`
-
-Given assets and a period, report per asset:
-
-- subscription intervals with the target generation in force
-- lane span coverage, and any gap in `segment_index`
-- record volume per window
-- the three differences below, named rather than summarised
-
-| State | Established by | Meaning |
-|---|---|---|
-| `intended` | targeter published a digest containing it | we meant to listen |
-| `subscribed` | `connection_opened` / `subscription_changed` names it | we were listening |
-| `delivered` | frames exist for it in that span | data arrived |
-
-- `intended` not `subscribed` — selected, never listened to. The invisible gap.
-- `subscribed` not `delivered` — listening, nothing arrived. Legitimate for a quiet
-  market; indistinguishable from a broken subscription without volume context.
-- `delivered` not `intended` — should be empty. If not, something is wrong.
-
-Output is data, not a verdict. **This is availability, not correctness.** It says
-when we were listening and whether bytes arrived. It makes no claim that nothing
-was lost — that is replay's question and stays there.
-
-### F. UI — `targeter-ui/`
-
-Events as data: venue events with their markets, the periods we were listening,
-volume. Enough to answer "is this event worth replaying" before replay exists.
-
-Cross-venue links are proposed here and confirmed by a human, writing
-`link_decision`. Rejection is a new decision row, never a delete, so results
-explained under an earlier view stay explicable.
+Raw archival commits first. A sidecar or universe-receipt failure is reported as
+`universe_failed` and makes the archive command non-zero, but the raw outcome
+remains `archived` or `skipped`. Retrying is immutable and idempotent. A sidecar
+failure must never invalidate or overwrite a successful raw archive.
 
 ---
 
-## 5. Explicitly not now
+## 4. Time and state semantics
 
-- No changes to `replay/`. Gates keep taking a directory.
-- No interval-validity model, no capture/transport evidence classes.
-- No materialized block files.
-- No cross-venue basket formation.
+A connection epoch may begin in one segment and finish in another. It may cross
+UTC midnight. An event may be selected by several Targeter runs and its data may
+span many S3 date prefixes.
 
-The point of doing this first is that the harness can be built around a known data
-model afterwards, even if the gates are rewritten to meet it.
+Therefore:
+
+- fold controls by `(lane_id, delivery_index)` across every ingested segment;
+- group lifecycle controls by `(lane_id, connection_epoch)`;
+- preserve the predecessor epoch for each lane;
+- query raw segments by interval overlap, not by one date or one object;
+- retain open/unknown boundaries as unknown rather than truncating at the end of
+  a query or UTC day.
+
+Daily manifests may remain useful derived accelerators elsewhere, but they are
+not required for V1 universe correctness and are not a commit boundary.
+
+The database stores both verified segment intervals and folded connection
+epochs. A future data-pull planner can select every overlapping segment, even
+when the event spans multiple dates, without the universe prescribing the
+planner's output format.
 
 ---
 
-## 6. Open questions
+## 5. Evidence language
 
-1. **Link derivation.** Are cross-venue links proposed from event titles and start
-   times, from resolution text, or hand-seeded at first? Sets how much of F is
-   machine work versus review.
+V1 exposes narrowly stated facts:
 
-2. **Per-asset delivery counts.** Nothing carries them. Manifests hold `line_count`
-   per segment; the control sidecar holds no frames. Either the sidecar also carries
-   a per-asset frame tally computed during extraction — cheap there, since the
-   archiver is already reading every line — or `delivered` stays at lane
-   granularity until replay exists. **The sidecar is the only place this is cheap;
-   decide before B is built.**
+| State | Required evidence |
+|---|---|
+| `selected` | Targeter selection report names the market/bundle |
+| `socket_opened` | `connection_opened` control observed |
+| `subscription_send_completed` | `subscription_sent` control observed after the transport send returned |
+| `venue_acceptance_observed` | an explicit acceptance control, if a future splice emits one |
+| `asset_delivery_observed` | not available in V1 |
 
-3. **Backfill.** Segments already archived have no sidecar. Regenerate by streaming
-   them once, or accept that the universe starts from the deployment date?
+Absence of acceptance evidence is `unknown`, not rejected. A
+`subscription_sent` record proves only that the client completed its send; it
+does not prove the venue accepted or delivered the subscription. V1 sidecars do
+not parse venue-frame acknowledgements, so current generic acceptance state is
+normally `unknown`.
 
-4. **Retention.** The store references objects the reaper may delete. Pin what it
-   references, or record that a span is no longer retrievable?
+Likewise, the store does not claim "actual per-asset delivery." One socket
+delivery can contain vendor-specific batches, and determining asset membership
+requires payload interpretation that belongs outside archive extraction. A
+future vendor parser may add separately versioned evidence without changing the
+meaning of V1 rows.
+
+### 5.1 Target digest ambiguity
+
+`target_digest` hashes only the venue and sorted asset IDs. It is a subscription
+set identity, not a unique Targeter-run identity. The same set can be selected
+by multiple runs.
+
+The universe computes subscription-set digests from selected target assets and
+joins them to control epochs. One candidate run is reported as `exact`; multiple
+runs are reported as `ambiguous` with the candidate count. It never chooses the
+nearest timestamp and calls that an exact historical join.
+
+`target_metadata_digest` is retained from controls when present, but V1 does
+not reconstruct publication metadata merely to force a match.
+
+---
+
+## 6. SQLite store
+
+The deployment target is one SQLite database on an attached persistent volume.
+It is appropriate because workload is bursty, writes are serialized ingestion
+jobs, queries do not need realtime latency, and one small server should be easy
+to operate.
+
+Runtime settings:
+
+- WAL journal mode;
+- `synchronous=FULL`;
+- foreign keys enabled;
+- 30-second busy timeout;
+- one `BEGIN IMMEDIATE` transaction per immutable source;
+- schema version in `PRAGMA user_version`;
+- read-only per-request API connections;
+- SQLite-native online backups and `PRAGMA integrity_check`.
+
+V1 tables cover:
+
+- immutable source identities and ingestion checkpoints;
+- Targeter runs;
+- catalog events and markets;
+- event bundles and bundle-to-event/market membership;
+- selected targets and computed subscription sets/assets;
+- exact selected target records, including the vendor record and its content
+  hash;
+- verified segment universe receipts;
+- exact control envelopes;
+- globally folded connection epochs;
+- structured missing/ambiguous evidence issues.
+
+There are no human-editable relationship tables. Within-venue event grouping
+and cross-venue Targeter bundle membership come from archived machine evidence.
+Humans cannot introduce a new market into Targeter through this database, so a
+manual linking workflow would add state without improving capture and is out of
+scope.
+
+### 6.1 Durability model
+
+The database should not be treated as disposable in normal operation. A full
+reseed is possible, deterministic, and useful for disaster recovery, but it can
+require reading every historical Targeter artifact and control sidecar. That is
+the highest-cost path, not a routine deployment step.
+
+Operate it as durable state:
+
+1. place the database and WAL on an attached persistent SSD volume;
+2. preserve the volume across instance replacement;
+3. run periodic SQLite online backups;
+4. publish backup files immutably to independently durable object storage;
+5. periodically restore a backup elsewhere and run `PRAGMA integrity_check`;
+6. retain immutable source archives so a full reseed remains possible.
+
+Do not copy a live `.sqlite3` file with a filesystem copy command. Use the
+`backup` command, which calls SQLite's backup API and atomically publishes the
+completed local file.
+
+---
+
+## 7. Incremental ingestion
+
+`python -m universe.cli ... sync` is a one-shot job. A host scheduler owns its
+cadence; the command has no internal interval loop.
+
+It performs two scans:
+
+1. `targeter-v2/runs/` for `run_manifest.json` commit markers;
+2. `raw/` for `.universe.json` commit markers.
+
+For Targeter runs it supports committed manifest versions 1 and 2, verifies the
+manifest-owned object identities and content metadata, strictly decodes bounded
+Zstandard artifacts, and indexes:
+
+- normalized catalog event/market records;
+- candidate bundles and sibling membership;
+- selected targets and assets;
+- exact selected vendor target records when present;
+- the selection report and completeness state.
+
+For raw segments it closed-parses the segment universe receipt, reverifies raw,
+seal, and control objects, strictly decodes the bounded control frame, inserts
+exact envelopes, then refolds the complete affected lane. This makes receipt
+arrival order irrelevant to the final epoch state.
+
+One malformed source is reported without hiding later sources. The process exits
+non-zero when any source failed.
+
+---
+
+## 8. Query API
+
+The V1 server is read-only JSON. It deliberately has no replay endpoint and no
+frontend.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | schema version and row counts |
+| `GET /v1/bundles?limit=N` | latest observation of each event bundle |
+| `GET /v1/bundles/<bundle_id>` | events, sibling markets, selection, exact target record, subscription evidence, ambiguity/issues |
+| `GET /v1/segments?start_ns=&end_ns=&lane_id=` | verified raw segments overlapping an interval |
+| `GET /v1/epochs?start_ns=&end_ns=&lane_id=` | folded connection epochs overlapping an interval |
+
+The existing Targeter UI can consume these endpoints in a later phase, but V1
+does not modify that UI or make its current data model part of this contract.
+
+---
+
+## 9. Historical backfill
+
+Historical data is first-class, but backfill is optional on day one.
+
+### 9.1 Targeter artifacts
+
+The ordinary sync path indexes every committed Targeter run manifest it
+discovers, so existing catalog events, sibling markets, selections, and target
+records are naturally resumable historical backfill. Source identities in
+SQLite make retries no-ops.
+
+### 9.2 Raw control sidecars
+
+Previously archived raw segments have no universe derivative. Use:
+
+```text
+python -m universe.cli --database <db> backfill-controls \
+  --receipt-root <retained-spool-or-receipt-root> \
+  <object-store arguments>
+```
+
+The backfill accepts retained local production archive receipts or explicit
+newline-delimited inventories of receipt paths. It never treats an arbitrary S3
+data listing as proof of commitment.
+
+For each receipt it:
+
+1. closed-parses the production archive receipt;
+2. reverifies the archived raw and seal objects;
+3. uses the local sealed source when retained;
+4. otherwise strictly reconstructs exact raw NDJSON into temporary storage from
+   the receipted archive object;
+5. publishes the control sidecar and segment universe receipt idempotently;
+6. advances a durable SQLite checkpoint and reports every failure.
+
+The scan revisits old receipt paths so a late-added receipt cannot hide behind a
+high-water mark. Immutable publication makes this safe. No production backfill
+is run merely to test the code.
+
+---
+
+## 10. Operations on a small burstable VM
+
+Recommended initial topology:
+
+```text
+burstable VM
+├── attached persistent SSD
+│   ├── event-universe.sqlite3
+│   └── local SQLite backups
+├── scheduled universe sync (single writer)
+├── scheduled SQLite backup/upload
+└── read-only universe API
+```
+
+Start small. Query latency is not a correctness requirement, and WAL permits
+readers while the one ingestion writer commits. Scale the volume before the VM;
+catalog and evidence tables are likely to dominate disk long before API CPU.
+
+Operational rules:
+
+- run only one sync/backfill writer at a time;
+- keep the database and WAL on the same persistent filesystem;
+- monitor disk space, sync failures, backup age, and integrity-check results;
+- bind the API to a private interface or put authentication/TLS in the existing
+  reverse proxy;
+- use an instance role for object-store reads and backup writes;
+- do not place the service on the capture host;
+- do not rebuild the database during ordinary deploys.
+
+Example lifecycle:
+
+```bash
+python -m universe.cli --database /var/lib/prediction-indexer/universe/event-universe.sqlite3 init
+
+python -m universe.cli --database /var/lib/prediction-indexer/universe/event-universe.sqlite3 \
+  sync --archive-backend s3 --s3-bucket <bucket> --s3-region <region> \
+  --s3-expected-owner <account-id>
+
+python -m universe.cli --database /var/lib/prediction-indexer/universe/event-universe.sqlite3 \
+  backup --output /var/lib/prediction-indexer/universe/backups/<timestamp>.sqlite3 \
+  --object-key universe/backups/<timestamp>.sqlite3 \
+  --archive-backend s3 --s3-bucket <bucket> --s3-region <region> \
+  --s3-expected-owner <account-id>
+
+python -m universe.cli --database /var/lib/prediction-indexer/universe/event-universe.sqlite3 \
+  serve --host 127.0.0.1 --port 8080
+```
+
+Exact scheduler, VM size, volume size, retention, and backup frequency are
+deployment choices based on observed database growth. They are not persisted
+format semantics.
+
+---
+
+## 11. Failure and crash behavior
+
+- Raw archive committed, sidecar absent: raw remains valid; retry or backfill.
+- Control object uploaded, universe receipt absent: sidecar is uncommitted and
+  ignored; retry safely publishes/reuses exact bytes.
+- Universe receipt present, object missing/drifted: ingestion fails closed.
+- Sync crashes before commit: the SQLite source transaction rolls back.
+- Sync retries after commit: source key plus SHA-256 returns `skipped`.
+- A source key changes identity: integrity conflict; do not overwrite rows.
+- Connection opens before the queried day: the global lane fold preserves its
+  predecessor/open state.
+- Connection close is missing: interval end remains unknown; it is not silently
+  clipped.
+- Same target digest occurs in multiple runs: historical link is ambiguous.
+- Backup crashes before rename: no final backup name is published.
+
+---
+
+## 12. Acceptance criteria
+
+V1 is complete when tests prove:
+
+1. raw archival publishes exact control lines and the receipt last;
+2. derivative failure leaves raw archive success intact;
+3. immutable retry skips committed artifacts and conflicts on drift;
+4. Targeter manifests, catalogs, selections, and target records ingest
+   idempotently;
+5. one connection epoch folds across segments and UTC dates;
+6. socket send and venue acceptance remain distinct evidence states;
+7. repeated target digests surface ambiguity;
+8. interval queries return every overlapping verified segment;
+9. a backfill can reconstruct locally reaped raw data from the verified archive
+   and resume safely;
+10. a SQLite-native backup passes an independent integrity check;
+11. existing archive, S3, Targeter archive, and object-store regressions remain
+    green.
+
+No criterion requires replay integration, a ReplayPlan, a manual relationship,
+per-asset payload attribution, or UI work.

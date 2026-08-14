@@ -20,7 +20,7 @@ dependencies = [
 dev = []
 
 [tool.setuptools.packages.find]
-include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*"]
+include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*"]
 
 [tool.setuptools.package-data]
 replay = ["policy.json"]

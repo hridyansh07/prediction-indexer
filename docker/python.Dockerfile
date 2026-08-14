@@ -33,6 +33,7 @@ RUN python -m pip install .
 COPY splices/ ./splices/
 COPY targeter/ ./targeter/
 COPY archive/ ./archive/
+COPY universe/ ./universe/
 COPY configs/ ./configs/
 COPY docker/wait_for_target.py ./docker/wait_for_target.py
 # Named one file at a time, as `wait_for_target.py` is. Most of `scripts/` is
@@ -41,4 +42,3 @@ COPY docker/wait_for_target.py ./docker/wait_for_target.py
 COPY scripts/backfill_coverage.py ./scripts/backfill_coverage.py
 
 USER indexer:indexer
-

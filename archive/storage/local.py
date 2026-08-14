@@ -7,6 +7,7 @@ The write-side protocol is deliberately much smaller than an S3 client
 put_immutable(key, reader, expected_identity) -> ObjectMetadata
 head(key)                                     -> ObjectMetadata | None
 open(key)                                     -> bounded byte reader
+list_keys(prefix)                             -> immutable key iterator
 ```
 
 `expected_identity` is known before publication, always. Passing it in is what
@@ -37,7 +38,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
 from encoder import DEFAULT_BUFFER_BYTES, StoredIdentity
 from archive.storage.base import (
@@ -386,6 +387,27 @@ class LocalObjectStore:
             raise ObjectStoreError(f"opening {normalized}: {error}") from error
         return BoundedReader(handle, normalized, max_bytes)
 
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        """List immutable object keys below one normalized prefix.
+
+        The metadata sidecar tree is an implementation detail and is never an
+        object key.  Sorting makes local development and production S3 scans
+        expose the same deterministic order.
+        """
+        normalized = _normalize_prefix(prefix)
+        if not self.root.is_dir():
+            return
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.root).as_posix()
+            if relative == METADATA_DIRECTORY or relative.startswith(
+                METADATA_DIRECTORY + "/"
+            ):
+                continue
+            if relative.startswith(normalized):
+                yield relative
+
     # -- content type and encoding ----------------------------------------
 
     def _write_attributes(
@@ -449,3 +471,9 @@ def _is_within(candidate: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _normalize_prefix(prefix: str) -> str:
+    if prefix.endswith("/"):
+        return normalize_key(prefix[:-1]) + "/"
+    return normalize_key(prefix)
