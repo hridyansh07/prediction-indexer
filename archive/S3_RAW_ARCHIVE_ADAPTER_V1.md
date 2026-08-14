@@ -35,6 +35,12 @@ The adapter is complete when a successful `put_immutable` proves all of these:
 The local production archive receipt remains the archive commit marker. An S3
 response, S3 key, or ETag is not a commit marker.
 
+The Event Universe addendum may publish an immutable
+`.archive-receipt-mirror.json` wrapper after that local receipt commits. The
+wrapper preserves the exact receipt bytes for a separately deployed derivative
+worker, but declares itself non-authoritative and unable to authorize deletion.
+It does not change this adapter's raw commit marker or reaper contract.
+
 ## 2. Non-goals
 
 V1 does **not** add:

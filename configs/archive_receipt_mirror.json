@@ -1,0 +1,9 @@
+{
+  "archive_receipt_mirror_config_version": 1,
+  "receipt_root": "/var/lib/prediction-indexer/spool",
+  "archive": {
+    "bucket": "${ARCHIVE_S3_BUCKET}",
+    "region": "${ARCHIVE_S3_REGION}",
+    "expected_owner": "${ARCHIVE_S3_EXPECTED_OWNER}"
+  }
+}

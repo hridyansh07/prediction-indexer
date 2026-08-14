@@ -4,6 +4,7 @@ The raw archive receipt remains the authority for the complete segment.  This
 module derives a smaller, exact view only after that receipt re-verifies:
 
 ```
+<segment>.archive-receipt-mirror.json  exact receipt bytes, no commit/delete authority
 <segment>.control.ndjson.zst  exact envelope lines whose kind is ``control``
 <segment>.universe.json      immutable commit record, published last
 ```
@@ -18,6 +19,8 @@ separately and retries it on a later sweep.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import io
 import json
@@ -26,8 +29,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from archive.common.receipts import ArchiveReceipt, compression_contract
-from archive.common.verify import verify_archive
+from archive.common.receipts import (
+    ArchiveReceipt,
+    ReceiptError,
+    compression_contract,
+    parse_archive_receipt,
+)
+from archive.common.verify import decode_archived_segment, verify_archive
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
     NDJSON_CONTENT_TYPE,
@@ -47,19 +55,26 @@ __all__ = [
     "FAILED",
     "PUBLISHED",
     "SKIPPED",
+    "ArchiveReceiptMirror",
     "ControlObject",
+    "MirrorPublication",
     "ReceiptIdentity",
     "SegmentUniverseReceipt",
     "UniverseArtifactError",
     "UniversePublication",
+    "archive_receipt_mirror_key",
     "parse_segment_universe_receipt",
+    "publish_archive_receipt_mirror",
     "publish_segment_universe",
+    "publish_segment_universe_from_archive",
+    "read_archive_receipt_mirror",
     "read_segment_universe_receipt",
     "segment_universe_keys",
     "verify_segment_universe_receipt",
 ]
 
 SEGMENT_UNIVERSE_RECEIPT_VERSION = 1
+ARCHIVE_RECEIPT_MIRROR_VERSION = 1
 UNIVERSE_PUBLISHER_VERSION = 1
 MAX_RECEIPT_BYTES = 1_048_576
 
@@ -78,6 +93,23 @@ class ReceiptIdentity:
     sha256: str
     byte_length: int
     verified_at_ns: int
+    mirror_key: str
+    mirror_stored: StoredIdentity
+
+
+@dataclass(frozen=True)
+class ArchiveReceiptMirror:
+    key: str
+    stored: StoredIdentity
+    receipt_identity: StoredIdentity
+    receipt: ArchiveReceipt
+    document: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MirrorPublication:
+    status: str
+    mirror: ArchiveReceiptMirror
 
 
 @dataclass(frozen=True)
@@ -119,6 +151,16 @@ class UniversePublication:
     control_count: int
 
 
+def archive_receipt_mirror_key(receipt: ArchiveReceipt) -> str:
+    """S3 key for a non-authoritative mirror of one committed local receipt."""
+    suffix = ".ndjson.zst"
+    if not receipt.data_key.endswith(suffix):
+        raise UniverseArtifactError(
+            f"archive object {receipt.data_key!r} is not a raw NDJSON Zstd segment"
+        )
+    return receipt.data_key[: -len(suffix)] + ".archive-receipt-mirror.json"
+
+
 def segment_universe_keys(receipt: ArchiveReceipt) -> tuple[str, str]:
     """Return ``(control key, universe receipt key)`` beside the raw object."""
     suffix = ".ndjson.zst"
@@ -128,6 +170,149 @@ def segment_universe_keys(receipt: ArchiveReceipt) -> tuple[str, str]:
         )
     stem = receipt.data_key[: -len(suffix)]
     return f"{stem}.control.ndjson.zst", f"{stem}.universe.json"
+
+
+def publish_archive_receipt_mirror(
+    store: ObjectStore, archive_receipt: ArchiveReceipt
+) -> MirrorPublication:
+    """Mirror exact committed receipt bytes for remote derivative discovery.
+
+    The wrapper is deliberately not an archive receipt and explicitly carries
+    no deletion authority.  Its only role is to attest that the capture-side
+    archiver observed a committed production receipt, while preserving the
+    exact receipt bytes a remote universe worker must parse and reverify.
+    """
+    if not archive_receipt.is_production:
+        raise UniverseArtifactError("only a production archive receipt can be mirrored")
+    verify_archive(store, archive_receipt)
+    try:
+        receipt_bytes = archive_receipt.path.read_bytes()
+    except OSError as error:
+        raise UniverseArtifactError(
+            f"cannot read archive receipt {archive_receipt.path}: {error}"
+        ) from error
+    if len(receipt_bytes) > MAX_RECEIPT_BYTES:
+        raise UniverseArtifactError(
+            f"archive receipt {archive_receipt.path.name} exceeds {MAX_RECEIPT_BYTES} bytes"
+        )
+    receipt_identity = stored_identity_of(io.BytesIO(receipt_bytes))
+    key = archive_receipt_mirror_key(archive_receipt)
+    document = {
+        "raw_archive_receipt_mirror_version": ARCHIVE_RECEIPT_MIRROR_VERSION,
+        "authoritative_commit_marker": False,
+        "authorizes_deletion": False,
+        "location": archive_receipt.location,
+        "source_receipt": {
+            "file": archive_receipt.path.name,
+            "sha256": receipt_identity.sha256,
+            "byte_length": receipt_identity.byte_length,
+            "bytes_base64": base64.b64encode(receipt_bytes).decode("ascii"),
+        },
+        "universe_publisher_version": UNIVERSE_PUBLISHER_VERSION,
+    }
+    encoded = _canonical_json(document)
+    expected = stored_identity_of(io.BytesIO(encoded))
+    existing = store.head(key)
+    if existing is not None:
+        mirror = read_archive_receipt_mirror(store, key)
+        _mirror_matches_receipt(mirror, archive_receipt, receipt_identity)
+        return MirrorPublication(SKIPPED, mirror)
+    with io.BytesIO(encoded) as source:
+        store.put_immutable(key, source, expected, content_type=JSON_CONTENT_TYPE)
+    mirror = read_archive_receipt_mirror(store, key)
+    _mirror_matches_receipt(mirror, archive_receipt, receipt_identity)
+    return MirrorPublication(PUBLISHED, mirror)
+
+
+def read_archive_receipt_mirror(
+    store: ObjectStore, key: str
+) -> ArchiveReceiptMirror:
+    metadata = store.head(key)
+    if metadata is None:
+        raise UniverseArtifactError(f"archive receipt mirror is absent: {key}")
+    if metadata.byte_length > MAX_RECEIPT_BYTES * 2:
+        raise UniverseArtifactError(f"archive receipt mirror {key} is too large")
+    if metadata.content_type != JSON_CONTENT_TYPE or metadata.content_encoding is not None:
+        raise UniverseArtifactError(f"archive receipt mirror {key} has invalid content metadata")
+    payload = _read_exact(store, key, metadata.stored, MAX_RECEIPT_BYTES * 2)
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise UniverseArtifactError(f"invalid archive receipt mirror {key}: {error}") from error
+
+    def invalid(detail: str) -> UniverseArtifactError:
+        return UniverseArtifactError(f"invalid archive receipt mirror {key}: {detail}")
+
+    _exact_object(
+        document,
+        {
+            "raw_archive_receipt_mirror_version",
+            "authoritative_commit_marker",
+            "authorizes_deletion",
+            "location",
+            "source_receipt",
+            "universe_publisher_version",
+        },
+        invalid,
+        "mirror",
+    )
+    assert isinstance(document, dict)
+    if document["raw_archive_receipt_mirror_version"] != ARCHIVE_RECEIPT_MIRROR_VERSION:
+        raise UniverseArtifactError(f"archive receipt mirror {key} has unsupported version")
+    if document["authoritative_commit_marker"] is not False:
+        raise UniverseArtifactError(f"archive receipt mirror {key} claims commit authority")
+    if document["authorizes_deletion"] is not False:
+        raise UniverseArtifactError(f"archive receipt mirror {key} claims deletion authority")
+    if document["universe_publisher_version"] != UNIVERSE_PUBLISHER_VERSION:
+        raise UniverseArtifactError(f"archive receipt mirror {key} has unsupported publisher")
+    if document["location"] != store.store_id:
+        raise UniverseArtifactError(
+            f"archive receipt mirror names {document['location']!r}, not {store.store_id!r}"
+        )
+    source = _closed_section(
+        document,
+        "source_receipt",
+        {"file", "sha256", "byte_length", "bytes_base64"},
+        invalid,
+    )
+    receipt_file = _basename(source, "file", invalid)
+    receipt_identity = StoredIdentity(
+        sha256=_digest(source, "sha256", invalid),
+        byte_length=_integer(source, "byte_length", invalid),
+    )
+    encoded_receipt = _text(source, "bytes_base64", invalid)
+    try:
+        receipt_bytes = base64.b64decode(encoded_receipt, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise UniverseArtifactError(
+            f"archive receipt mirror {key} has invalid receipt bytes"
+        ) from error
+    actual_identity = stored_identity_of(io.BytesIO(receipt_bytes))
+    if actual_identity != receipt_identity:
+        raise UniverseArtifactError(
+            f"archive receipt mirror {key} receipt bytes do not match their identity"
+        )
+    try:
+        receipt_document = json.loads(receipt_bytes)
+        receipt = parse_archive_receipt(receipt_document, path=Path(receipt_file))
+    except (UnicodeDecodeError, json.JSONDecodeError, ReceiptError) as error:
+        raise UniverseArtifactError(
+            f"archive receipt mirror {key} contains an invalid receipt: {error}"
+        ) from error
+    if not receipt.is_production:
+        raise UniverseArtifactError(f"archive receipt mirror {key} is not production evidence")
+    if receipt.location != store.store_id or key != archive_receipt_mirror_key(receipt):
+        raise UniverseArtifactError(
+            f"archive receipt mirror {key} does not match its archive location or object key"
+        )
+    verify_archive(store, receipt)
+    return ArchiveReceiptMirror(
+        key=key,
+        stored=metadata.stored,
+        receipt_identity=receipt_identity,
+        receipt=receipt,
+        document=document,
+    )
 
 
 def publish_segment_universe(
@@ -147,20 +332,10 @@ def publish_segment_universe(
         raise UniverseArtifactError("a segment universe requires a production archive receipt")
     verify_archive(store, archive_receipt)
     source_path = Path(source_path)
-    receipt_identity = _file_identity(archive_receipt.path)
-    control_key, receipt_key = segment_universe_keys(archive_receipt)
-
-    existing = store.head(receipt_key)
+    mirror = publish_archive_receipt_mirror(store, archive_receipt).mirror
+    existing = _existing_universe(store, archive_receipt, mirror)
     if existing is not None:
-        committed = read_segment_universe_receipt(store, receipt_key)
-        _matches_archive(committed, archive_receipt, receipt_identity)
-        verify_segment_universe_receipt(store, committed)
-        return UniversePublication(
-            status=SKIPPED,
-            receipt_key=receipt_key,
-            archive_receipt_sha256=receipt_identity.sha256,
-            control_count=committed.control.logical.line_count,
-        )
+        return existing
 
     with tempfile.TemporaryFile(mode="w+b", dir=source_path.parent) as controls:
         source_logical, first_control, last_control = _extract_controls(
@@ -170,36 +345,110 @@ def publish_segment_universe(
             raise UniverseArtifactError(
                 f"{source_path.name} no longer matches its archive receipt while extracting controls"
             )
-        controls.seek(0)
-        with tempfile.TemporaryFile(mode="w+b", dir=source_path.parent) as encoded:
-            result = encode_stream(controls, encoded)
-            encoded.flush()
-            encoded.seek(0)
-            metadata = store.put_immutable(
-                control_key,
-                encoded,
-                result.stored,
-                content_type=NDJSON_CONTENT_TYPE,
-                content_encoding=ZSTD_CONTENT_ENCODING,
-            )
+        return _publish_controls(
+            store,
+            archive_receipt,
+            mirror,
+            controls,
+            first_control_delivery_index=first_control,
+            last_control_delivery_index=last_control,
+            temp_root=source_path.parent,
+            now_ns=now_ns,
+        )
+
+
+def publish_segment_universe_from_archive(
+    store: ObjectStore,
+    mirror: ArchiveReceiptMirror,
+    *,
+    now_ns: int,
+    temp_root: Path | None = None,
+) -> UniversePublication:
+    """Stream one S3 archive through the shared strict decoder into controls.
+
+    Only control lines are staged. The decoded raw segment is never retained on
+    the universe host, so historical volume does not accumulate on its disk.
+    """
+    archive_receipt = mirror.receipt
+    existing = _existing_universe(store, archive_receipt, mirror)
+    if existing is not None:
+        return existing
+    if temp_root is not None:
+        Path(temp_root).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(mode="w+b", dir=temp_root) as controls:
+        extractor = _ControlLineExtractor(controls, archive_receipt.source_file)
+        decode_archived_segment(store, archive_receipt, extractor)
+        first_control, last_control = extractor.finish()
+        return _publish_controls(
+            store,
+            archive_receipt,
+            mirror,
+            controls,
+            first_control_delivery_index=first_control,
+            last_control_delivery_index=last_control,
+            temp_root=temp_root,
+            now_ns=now_ns,
+        )
+
+
+def _existing_universe(
+    store: ObjectStore,
+    archive_receipt: ArchiveReceipt,
+    mirror: ArchiveReceiptMirror,
+) -> UniversePublication | None:
+    _, receipt_key = segment_universe_keys(archive_receipt)
+    if store.head(receipt_key) is None:
+        return None
+    committed = read_segment_universe_receipt(store, receipt_key)
+    _matches_archive(committed, archive_receipt, mirror)
+    return UniversePublication(
+        status=SKIPPED,
+        receipt_key=receipt_key,
+        archive_receipt_sha256=mirror.receipt_identity.sha256,
+        control_count=committed.control.logical.line_count,
+    )
+
+
+def _publish_controls(
+    store: ObjectStore,
+    archive_receipt: ArchiveReceipt,
+    mirror: ArchiveReceiptMirror,
+    controls: BinaryIO,
+    *,
+    first_control_delivery_index: int | None,
+    last_control_delivery_index: int | None,
+    temp_root: Path | None,
+    now_ns: int,
+) -> UniversePublication:
+    control_key, receipt_key = segment_universe_keys(archive_receipt)
+    controls.seek(0)
+    with tempfile.TemporaryFile(mode="w+b", dir=temp_root) as encoded:
+        result = encode_stream(controls, encoded)
+        encoded.flush()
+        encoded.seek(0)
+        metadata = store.put_immutable(
+            control_key,
+            encoded,
+            result.stored,
+            content_type=NDJSON_CONTENT_TYPE,
+            content_encoding=ZSTD_CONTENT_ENCODING,
+        )
     if not metadata.matches_request(
         result.stored, NDJSON_CONTENT_TYPE, ZSTD_CONTENT_ENCODING
     ):
         raise VerificationFailure(
             f"control sidecar {control_key} failed identity or metadata verification"
         )
-
     document = _build_document(
         archive_receipt,
-        receipt_identity,
+        mirror,
         control_key=control_key,
         control_logical=result.logical,
         control_stored=result.stored,
-        first_control_delivery_index=first_control,
-        last_control_delivery_index=last_control,
+        first_control_delivery_index=first_control_delivery_index,
+        last_control_delivery_index=last_control_delivery_index,
         published_at_ns=now_ns,
     )
-    # Prove our own closed reader accepts the document before committing it.
     parsed = parse_segment_universe_receipt(document, key=receipt_key)
     verify_segment_universe_receipt(store, parsed)
     encoded_receipt = _canonical_json(document)
@@ -211,11 +460,11 @@ def publish_segment_universe(
             content_type=JSON_CONTENT_TYPE,
         )
     committed = read_segment_universe_receipt(store, receipt_key)
-    _matches_archive(committed, archive_receipt, receipt_identity)
+    _matches_archive(committed, archive_receipt, mirror)
     return UniversePublication(
         status=PUBLISHED,
         receipt_key=receipt_key,
-        archive_receipt_sha256=receipt_identity.sha256,
+        archive_receipt_sha256=mirror.receipt_identity.sha256,
         control_count=result.logical.line_count,
     )
 
@@ -287,17 +536,27 @@ def parse_segment_universe_receipt(
     raw_archive = _closed_section(
         document,
         "source_archive_receipt",
-        {"file", "sha256", "byte_length", "verified_at_ns"},
+        {"file", "sha256", "byte_length", "verified_at_ns", "mirror"},
         invalid,
     )
     archive_file = _basename(raw_archive, "file", invalid)
     if not archive_file.endswith(".archive.json"):
         raise invalid("source archive receipt is not a production receipt filename")
+    archive_mirror = _closed_section(
+        raw_archive, "mirror", {"key", "stored"}, invalid
+    )
     archive_identity = ReceiptIdentity(
         file=archive_file,
         sha256=_digest(raw_archive, "sha256", invalid),
         byte_length=_integer(raw_archive, "byte_length", invalid),
         verified_at_ns=_integer(raw_archive, "verified_at_ns", invalid),
+        mirror_key=_text(archive_mirror, "key", invalid),
+        mirror_stored=_stored(
+            _closed_section(
+                archive_mirror, "stored", {"sha256", "byte_length"}, invalid
+            ),
+            invalid,
+        ),
     )
 
     source = _closed_section(document, "source", {"file", "logical", "data", "seal"}, invalid)
@@ -350,6 +609,8 @@ def parse_segment_universe_receipt(
     expected_control, expected_receipt = _keys_from_data_key(data_key)
     if key != expected_receipt or control_key != expected_control:
         raise invalid("receipt or control key is not beside the source data object")
+    if archive_identity.mirror_key != _mirror_key_from_data_key(data_key):
+        raise invalid("archive receipt mirror is not beside the source data object")
     if not source_file.endswith(".ndjson") or not data_key.endswith(
         source_file + ".zst"
     ):
@@ -404,6 +665,12 @@ def verify_segment_universe_receipt(
             NDJSON_CONTENT_TYPE,
             ZSTD_CONTENT_ENCODING,
         ),
+        (
+            receipt.source_archive_receipt.mirror_key,
+            receipt.source_archive_receipt.mirror_stored,
+            JSON_CONTENT_TYPE,
+            None,
+        ),
     ):
         metadata = store.head(key)
         if metadata is None or not metadata.matches_request(
@@ -412,6 +679,47 @@ def verify_segment_universe_receipt(
             raise UniverseArtifactError(
                 f"segment universe object {key} does not match its committed identity"
             )
+
+
+class _ControlLineExtractor:
+    """Binary sink that retains only complete control-envelope lines."""
+
+    def __init__(self, destination: BinaryIO, label: str) -> None:
+        self.destination = destination
+        self.label = label
+        self.pending = bytearray()
+        self.line_number = 0
+        self.first: int | None = None
+        self.last: int | None = None
+
+    def write(self, chunk: bytes) -> int:
+        size = len(chunk)
+        self.pending.extend(chunk)
+        consumed = 0
+        while True:
+            newline = self.pending.find(b"\n", consumed)
+            if newline < 0:
+                break
+            line = bytes(self.pending[consumed : newline + 1])
+            consumed = newline + 1
+            self.line_number += 1
+            delivery = _control_delivery(line, self.label, self.line_number)
+            if delivery is None:
+                continue
+            self.destination.write(line)
+            self.first = delivery if self.first is None else self.first
+            self.last = delivery
+        if consumed:
+            del self.pending[:consumed]
+        return size
+
+    def finish(self) -> tuple[int | None, int | None]:
+        if self.pending:
+            raise UniverseArtifactError(
+                f"{self.label}:{self.line_number + 1} is not one complete NDJSON record"
+            )
+        self.destination.flush()
+        return self.first, self.last
 
 
 def _extract_controls(
@@ -427,27 +735,9 @@ def _extract_controls(
             digest.update(line)
             byte_length += len(line)
             line_count += line.count(b"\n")
-            if not line.endswith(b"\n") or not line.strip():
-                raise UniverseArtifactError(
-                    f"{source_path.name}:{line_number} is not one complete NDJSON record"
-                )
-            try:
-                envelope = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise UniverseArtifactError(
-                    f"{source_path.name}:{line_number} is invalid envelope JSON: {error}"
-                ) from error
-            if not isinstance(envelope, dict) or not isinstance(envelope.get("kind"), str):
-                raise UniverseArtifactError(
-                    f"{source_path.name}:{line_number} has no envelope kind"
-                )
-            if envelope["kind"] != "control":
+            delivery = _control_delivery(line, source_path.name, line_number)
+            if delivery is None:
                 continue
-            delivery = envelope.get("delivery_index")
-            if not isinstance(delivery, int) or isinstance(delivery, bool) or delivery < 0:
-                raise UniverseArtifactError(
-                    f"{source_path.name}:{line_number} has invalid delivery_index"
-                )
             destination.write(line)
             first = delivery if first is None else first
             last = delivery
@@ -462,9 +752,30 @@ def _extract_controls(
     )
 
 
+def _control_delivery(line: bytes, label: str, line_number: int) -> int | None:
+    if not line.endswith(b"\n") or not line.strip():
+        raise UniverseArtifactError(
+            f"{label}:{line_number} is not one complete NDJSON record"
+        )
+    try:
+        envelope = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise UniverseArtifactError(
+            f"{label}:{line_number} is invalid envelope JSON: {error}"
+        ) from error
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("kind"), str):
+        raise UniverseArtifactError(f"{label}:{line_number} has no envelope kind")
+    if envelope["kind"] != "control":
+        return None
+    delivery = envelope.get("delivery_index")
+    if not isinstance(delivery, int) or isinstance(delivery, bool) or delivery < 0:
+        raise UniverseArtifactError(f"{label}:{line_number} has invalid delivery_index")
+    return delivery
+
+
 def _build_document(
     receipt: ArchiveReceipt,
-    receipt_identity: StoredIdentity,
+    mirror: ArchiveReceiptMirror,
     *,
     control_key: str,
     control_logical: LogicalIdentity,
@@ -484,9 +795,13 @@ def _build_document(
         "segment_index": receipt.segment_index,
         "source_archive_receipt": {
             "file": receipt.path.name,
-            "sha256": receipt_identity.sha256,
-            "byte_length": receipt_identity.byte_length,
+            "sha256": mirror.receipt_identity.sha256,
+            "byte_length": mirror.receipt_identity.byte_length,
             "verified_at_ns": receipt.verified_at_ns,
+            "mirror": {
+                "key": mirror.key,
+                "stored": mirror.stored.as_record(),
+            },
         },
         "source": {
             "file": receipt.source_file,
@@ -518,7 +833,7 @@ def _build_document(
 def _matches_archive(
     universe: SegmentUniverseReceipt,
     archive: ArchiveReceipt,
-    archive_identity: StoredIdentity,
+    mirror: ArchiveReceiptMirror,
 ) -> None:
     if (
         universe.location != archive.location
@@ -534,11 +849,32 @@ def _matches_archive(
         or universe.seal_key != archive.seal_key
         or universe.seal_stored != archive.seal_stored
         or universe.source_archive_receipt.file != archive.path.name
-        or universe.source_archive_receipt.sha256 != archive_identity.sha256
-        or universe.source_archive_receipt.byte_length != archive_identity.byte_length
+        or universe.source_archive_receipt.sha256 != mirror.receipt_identity.sha256
+        or universe.source_archive_receipt.byte_length != mirror.receipt_identity.byte_length
+        or universe.source_archive_receipt.mirror_key != mirror.key
+        or universe.source_archive_receipt.mirror_stored != mirror.stored
     ):
         raise UniverseArtifactError(
             f"segment universe receipt {universe.key} does not bind the supplied raw archive receipt"
+        )
+
+
+def _mirror_matches_receipt(
+    mirror: ArchiveReceiptMirror,
+    receipt: ArchiveReceipt,
+    receipt_identity: StoredIdentity,
+) -> None:
+    mirrored = mirror.receipt
+    if (
+        mirror.receipt_identity != receipt_identity
+        or mirrored.document != receipt.document
+        or mirrored.location != receipt.location
+        or mirrored.data_key != receipt.data_key
+        or mirrored.seal_key != receipt.seal_key
+        or mirrored.source != receipt.source
+    ):
+        raise UniverseArtifactError(
+            f"archive receipt mirror {mirror.key} does not match {receipt.path.name}"
         )
 
 
@@ -556,11 +892,6 @@ def _read_exact(
     return bytes(payload)
 
 
-def _file_identity(path: Path) -> StoredIdentity:
-    with Path(path).open("rb") as handle:
-        return stored_identity_of(handle)
-
-
 def _canonical_json(document: dict[str, Any]) -> bytes:
     return (
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -574,6 +905,13 @@ def _keys_from_data_key(data_key: str) -> tuple[str, str]:
         raise UniverseArtifactError("source data key has the wrong suffix")
     stem = data_key[: -len(suffix)]
     return f"{stem}.control.ndjson.zst", f"{stem}.universe.json"
+
+
+def _mirror_key_from_data_key(data_key: str) -> str:
+    suffix = ".ndjson.zst"
+    if not data_key.endswith(suffix):
+        raise UniverseArtifactError("source data key has the wrong suffix")
+    return data_key[: -len(suffix)] + ".archive-receipt-mirror.json"
 
 
 def _exact_object(value: Any, expected: set[str], invalid, label: str) -> None:

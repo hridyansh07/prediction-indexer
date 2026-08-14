@@ -695,6 +695,45 @@ Container logs rotate at 25 MB with five files per service by default. Override
 `LOG_MAX_SIZE` and `LOG_MAX_FILES` in `.env` if the host has a central log
 collector.
 
+## Event Universe deployment
+
+Event Universe is a separate small-server deployment, not another process on
+the capture/ingester host. `compose.universe.yaml` uses the dedicated
+`docker/universe.Dockerfile`, mounts only its persistent SQLite volume and
+`configs/event_universe.json`, and starts the read server with the image's
+default command:
+
+```bash
+docker compose -f compose.universe.yaml up -d event-universe
+```
+
+The JSON config holds the database path, API listener, S3 archive identity,
+temporary directory, and backup destination. `${ARCHIVE_S3_*}` references are
+expanded from the environment. AWS credentials continue to use boto3's standard
+provider chain; on AWS, prefer an instance role.
+
+Incremental ingestion and backup remain scheduler-owned one-shot jobs, but they
+are direct scripts with no argument parser:
+
+```bash
+python universe/run_sync.py
+python universe/run_backup.py
+```
+
+Historical rollout uses `python universe/run_backfill.py`. It discovers
+non-authoritative raw receipt mirrors in S3, reverifies each referenced raw and
+seal object, and streams the compressed raw object through the shared strict
+archive decoder. It does not mount the capture spool or retain decoded raw
+segments. Before that remote job, the opt-in capture-side
+`python archive/run_receipt_mirror.py` job mirrors retained production receipt
+documents, including receipts for raw files already reaped. It never reads or
+sends historical raw bytes through the capture host. In Compose it is the
+`archive-receipt-mirror` service under the `ops` profile.
+
+`EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
+backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
+a private interface or authenticated reverse proxy when exposing the API.
+
 ## Clock and liveness semantics
 
 Linux containers share the host kernel's `CLOCK_MONOTONIC` and boot ID. Each

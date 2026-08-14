@@ -4,10 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from archive.archiver import ARCHIVED, Archiver
+from archive.archiver.receipt_mirror import mirror_retained_receipts
 from archive.archiver.universe import (
     PUBLISHED,
+    UniverseArtifactError,
+    read_archive_receipt_mirror,
     read_segment_universe_receipt,
     segment_universe_keys,
 )
@@ -119,6 +123,12 @@ class SegmentUniverseArtifactTests(unittest.TestCase):
         self.assertEqual(universe.control.first_delivery_index, 1)
         self.assertEqual(universe.control.last_delivery_index, 5)
         self.assertEqual(universe.source_archive_receipt.sha256, outcome.archive_receipt_sha256)
+        mirror = read_archive_receipt_mirror(
+            self.store, universe.source_archive_receipt.mirror_key
+        )
+        self.assertFalse(mirror.document["authoritative_commit_marker"])
+        self.assertFalse(mirror.document["authorizes_deletion"])
+        self.assertEqual(mirror.receipt.document, archive_receipt.document)
 
         from encoder import decode_stream
 
@@ -184,6 +194,24 @@ class SegmentUniverseArtifactTests(unittest.TestCase):
         self.assertEqual(result.counts["archived"], 1, result.as_record())
         self.assertEqual(result.counts["universe_failed"], 1, result.as_record())
         self.assertTrue(next(self.spool.rglob("*.archive.json")).is_file())
+
+    def test_a_later_sweep_mirrors_retained_receipts_after_raw_reaping(self) -> None:
+        with mock.patch(
+            "archive.archiver.service.publish_segment_universe",
+            side_effect=UniverseArtifactError("defer sidecar"),
+        ):
+            first = self.archiver.sweep()
+            self.assertEqual(first.counts["archived"], 1)
+        mirrored = mirror_retained_receipts(self.spool, self.store)
+        self.assertEqual(mirrored.published, 1)
+        self.segment.unlink()
+        mirror_keys = [
+            key
+            for key in self.store.list_keys("raw/")
+            if key.endswith(".archive-receipt-mirror.json")
+        ]
+        self.assertEqual(len(mirror_keys), 1)
+        read_archive_receipt_mirror(self.store, mirror_keys[0])
 
 
 if __name__ == "__main__":
