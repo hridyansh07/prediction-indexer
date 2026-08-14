@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -10,14 +12,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from archive.archiver import Archiver
+from archive.archiver.receipt_mirror import mirror_retained_receipts
 from archive.archiver.universe import UniverseArtifactError
+from archive.common.verify import decode_archived_segment
 from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.base import JSON_CONTENT_TYPE, NDJSON_CONTENT_TYPE
 from encoder import logical_identity_of, stored_identity_of
 from splices.common.segment import Record, SegmentWriter
 from targeter.targets import Target, target_digest
 from universe.api import UniverseApplication
-from universe.backfill import backfill_segment_universe, receipt_inventory
+from universe.backfill import backfill_segment_universe
+from universe.config import UniverseConfigError, load_config
 from universe.store import EvidenceConflict, UniverseStore
 from universe.sync import UniverseSync
 
@@ -462,30 +467,69 @@ class UniverseStoreTests(unittest.TestCase):
             archived = Archiver(spool, objects).sweep()
         self.assertEqual(archived.counts["archived"], 1)
         self.assertEqual(archived.counts["universe_failed"], 1)
-        source.unlink()
+        mirrored = mirror_retained_receipts(spool, objects)
+        self.assertEqual(mirrored.published, 1)
+        shutil.rmtree(spool)
 
-        inventory = receipt_inventory([spool])
-        first = backfill_segment_universe(
-            receipt_paths=inventory,
-            objects=objects,
-            database=self.database,
-            temp_root=self.root,
-            now_ns=lambda: DAY_ONE + 99,
-        )
+        temporary_controls = self.root / "remote-temporary-controls"
+        with patch(
+            "archive.archiver.universe.decode_archived_segment",
+            wraps=decode_archived_segment,
+        ) as decoder:
+            first = backfill_segment_universe(
+                objects=objects,
+                database=self.database,
+                temp_root=temporary_controls,
+                now_ns=lambda: DAY_ONE + 99,
+            )
         self.assertEqual(first.failures, [])
-        self.assertEqual((first.published, first.reconstructed), (1, 1))
+        self.assertEqual(first.published, 1)
+        decoder.assert_called_once()
+        self.assertEqual(list(temporary_controls.iterdir()), [])
         second = backfill_segment_universe(
-            receipt_paths=inventory,
             objects=objects,
             database=self.database,
-            temp_root=self.root,
+            temp_root=temporary_controls,
             now_ns=lambda: DAY_ONE + 100,
         )
-        self.assertEqual((second.skipped, second.reconstructed), (1, 1))
-        self.assertEqual(
-            self.database.checkpoint("raw-universe-backfill:historical-archive"),
-            str(inventory[0]),
+        self.assertEqual(second.skipped, 1)
+        checkpoint = self.database.checkpoint(
+            "raw-universe-backfill:historical-archive"
         )
+        assert checkpoint is not None
+        self.assertTrue(checkpoint.endswith(".archive-receipt-mirror.json"))
+        self.assertFalse(source.exists())
+
+    def test_readable_config_expands_environment_without_cli_arguments(self) -> None:
+        config_path = self.root / "event-universe.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "event_universe_config_version": 1,
+                    "database_path": "data/universe.sqlite3",
+                    "archive": {
+                        "bucket": "${TEST_UNIVERSE_BUCKET}",
+                        "region": "us-east-1",
+                        "expected_owner": "123456789012",
+                    },
+                    "api": {"host": "127.0.0.1", "port": 8080},
+                    "backfill": {"temporary_directory": "data/tmp"},
+                    "backup": {
+                        "directory": "data/backups",
+                        "object_prefix": "event-universe/backups",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"TEST_UNIVERSE_BUCKET": "archive-bucket"}):
+            config = load_config(config_path)
+        self.assertEqual(config.archive.bucket, "archive-bucket")
+        self.assertEqual(config.database_path, self.root / "data/universe.sqlite3")
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(
+            UniverseConfigError
+        ):
+            load_config(config_path)
 
 
 if __name__ == "__main__":

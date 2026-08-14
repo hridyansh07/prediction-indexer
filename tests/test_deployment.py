@@ -29,7 +29,12 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
             "AWS_SESSION_TOKEN",
         ):
             self.assertIn(variable, self.compose)
-        for service in ("archiver", "archiver-once", "reaper"):
+        for service in (
+            "archiver",
+            "archiver-once",
+            "archive-receipt-mirror",
+            "reaper",
+        ):
             with self.subTest(service=service):
                 self.assertIn(
                     "environment: *aws-archive-environment", self.service(service)
@@ -65,6 +70,56 @@ class TargeterV2DeploymentTests(unittest.TestCase):
         self.assertIn("run --rm targeter", deployment)
         self.assertIn("cron", deployment.casefold())
         self.assertIn("targeter-v2-integrity", deployment)
+
+
+class EventUniverseDeploymentTests(unittest.TestCase):
+    def test_server_has_a_dedicated_default_image_and_no_capture_mount(self) -> None:
+        compose = (ROOT / "compose.universe.yaml").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "docker" / "universe.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        shared = (ROOT / "docker" / "python.Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("docker/universe.Dockerfile", compose)
+        self.assertIn("configs/event_universe.json", compose)
+        self.assertIn("EVENT_UNIVERSE_DATA_ROOT", compose)
+        self.assertNotIn("CAPTURE_DATA_ROOT", compose)
+        self.assertIn('CMD ["python", "-u", "universe/run_server.py"]', dockerfile)
+        self.assertNotIn("COPY universe/", shared)
+        server = compose.split("  event-universe:", 1)[1].split(
+            "  event-universe-sync:", 1
+        )[0]
+        self.assertNotIn("AWS_ACCESS_KEY_ID", server)
+        runtime = compose.split("x-universe-runtime:", 1)[1].split(
+            "\nservices:", 1
+        )[0]
+        self.assertIn("environment: *universe-config-environment", runtime)
+        self.assertEqual(
+            compose.count("    environment: *universe-job-environment"), 3
+        )
+
+    def test_jobs_are_direct_configured_scripts_without_an_argument_parser(self) -> None:
+        universe = ROOT / "universe"
+        self.assertFalse((universe / "cli.py").exists())
+        for name in ("run_server.py", "run_sync.py", "run_backfill.py", "run_backup.py"):
+            source = (universe / name).read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertIn("load_config()", source)
+                self.assertNotIn("argparse", source)
+        config = (ROOT / "configs" / "event_universe.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"event_universe_config_version": 1', config)
+        mirror = (ROOT / "archive" / "run_receipt_mirror.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("load_config()", mirror)
+        self.assertNotIn("argparse", mirror)
+        self.assertTrue((ROOT / "configs" / "archive_receipt_mirror.json").is_file())
+
+    def test_orb_setup_creates_and_installs_the_project_virtual_environment(self) -> None:
+        setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")
+        self.assertIn('python3 -m venv "$REPO_ROOT/.venv"', setup)
+        self.assertIn('"$REPO_ROOT/.venv/bin/python" -m pip install -e', setup)
 
 
 if __name__ == "__main__":

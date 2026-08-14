@@ -65,9 +65,13 @@ x-archive-volume: &archive-volume
     create_host_path: true
 
 # Credentials remain outside `.env`: export these in the shell that invokes
-# Compose when a host is not using an AWS instance/task role. Only the three
-# S3-facing services receive them; venue capture has no archive authority.
+# Compose when a host is not using an AWS instance/task role. Only S3-facing
+# archive services receive them; venue capture has no archive authority. The
+# non-secret archive identity fields are included for direct config scripts.
 x-aws-archive-environment: &aws-archive-environment
+  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
   AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
   AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
@@ -496,6 +500,23 @@ services:
     volumes:
       - *data-volume
       - *archive-volume
+
+  # Optional metadata-only migration for Event Universe history. It mirrors
+  # retained production receipt documents to S3, but never reads or transfers
+  # local raw segment bytes. The remote universe backfill performs all archive
+  # decoding from S3 later.
+  archive-receipt-mirror:
+    <<: *capture-service
+    profiles:
+      - ops
+    restart: "no"
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - archive/run_receipt_mirror.py
+    volumes:
+      - *data-volume
 
   # Deletes local raw segments that two receipts prove are safe to delete.
   #
