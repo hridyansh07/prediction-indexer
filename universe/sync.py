@@ -18,9 +18,20 @@ from archive.storage.base import (
     VerificationFailure,
 )
 from encoder import LogicalIdentity, StoredIdentity, decode_stream
+from targeter.v2.selected_bundles import (
+    SELECTED_BUNDLE_INDEX_STEM,
+    selected_bundle_rows,
+)
+from universe.selected_bundle_derivative import (
+    SelectedBundleArtifact,
+    derivative_keys,
+    ensure_selected_bundle_derivative,
+)
 from universe.store import UniverseStore
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_SELECTED_INDEX_BYTES = 64 * 1024 * 1024
+MAX_SELECTION_REPORT_BYTES = 128 * 1024 * 1024
 
 
 class UniverseSyncError(ValueError):
@@ -66,9 +77,19 @@ class _RunManifest:
 
 
 class UniverseSync:
-    def __init__(self, database: UniverseStore, objects: ObjectStore) -> None:
+    def __init__(
+        self,
+        database: UniverseStore,
+        objects: ObjectStore,
+        *,
+        temporary_directory: Path | None = None,
+    ) -> None:
         self.database = database
         self.objects = objects
+        self.temporary_directory = Path(
+            temporary_directory or tempfile.gettempdir()
+        )
+        self.temporary_directory.mkdir(parents=True, exist_ok=True)
 
     def sync(self) -> SyncResult:
         result = SyncResult()
@@ -86,53 +107,25 @@ class UniverseSync:
         for key in keys:
             try:
                 manifest = self._read_run_manifest(key)
-                if self.database.source_is_complete(key, manifest.stored.sha256):
+                item, source_key, source_sha256, source_kind = (
+                    self._selected_bundle_artifact(manifest)
+                )
+                if self.database.source_is_complete(source_key, source_sha256):
                     output.targeter_skipped += 1
                     continue
-                events: list[dict[str, Any]] = []
-                markets: list[dict[str, Any]] = []
-                target_records: list[dict[str, Any]] = []
-                report: dict[str, Any] | None = None
-                for item in manifest.objects:
-                    if item.file.startswith("catalog_") and item.file.endswith(
-                        ("_events.ndjson", "_events.ndjson.zst")
-                    ):
-                        events.extend(self._read_ndjson(item))
-                    elif item.file.startswith("catalog_") and item.file.endswith(
-                        ("_markets.ndjson", "_markets.ndjson.zst")
-                    ):
-                        markets.extend(self._read_ndjson(item))
-                    elif item.file.startswith("target_records_") and item.file.endswith(
-                        (".ndjson", ".ndjson.zst")
-                    ):
-                        target_records.extend(self._read_ndjson(item))
-                    elif item.file in {
-                        "selection_report.json",
-                        "selection_report.json.zst",
-                    }:
-                        if report is not None:
-                            raise UniverseSyncError(
-                                f"run {manifest.run_id} has multiple selection reports"
-                            )
-                        report = self._read_json(item)
-                if report is None:
-                    raise UniverseSyncError(
-                        f"run {manifest.run_id} has no selection report"
-                    )
-                if report.get("run_id") != manifest.run_id:
-                    raise UniverseSyncError(
-                        f"run manifest {key} and selection report disagree on run_id"
-                    )
-                status = self.database.ingest_targeter_run(
-                    source_key=key,
-                    source_sha256=manifest.stored.sha256,
+                status = self.database.ingest_selected_bundle_index(
+                    source_key=source_key,
+                    source_sha256=source_sha256,
+                    source_kind=source_kind,
+                    manifest_key=manifest.key,
+                    manifest_sha256=manifest.stored.sha256,
+                    index_key=item.key,
+                    index_sha256=item.stored.sha256,
+                    index_byte_length=item.stored.byte_length,
                     run_id=manifest.run_id,
                     generated_at=manifest.generated_at,
                     input_complete=manifest.input_complete,
-                    events=events,
-                    markets=markets,
-                    report=report,
-                    target_records=target_records,
+                    rows=self._read_ndjson(item),
                 )
                 if status == "ingested":
                     output.targeter_ingested += 1
@@ -141,6 +134,71 @@ class UniverseSync:
             except Exception as error:  # noqa: BLE001 - one source must not hide later sources
                 output.failures.append(f"{key}: {type(error).__name__}: {error}")
         return output
+
+    def _selected_bundle_artifact(
+        self, manifest: _RunManifest
+    ) -> tuple[_RunObject, str, str, str]:
+        native = [
+            item
+            for item in manifest.objects
+            if item.file
+            in {
+                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson",
+                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson.zst",
+            }
+        ]
+        if len(native) > 1:
+            raise UniverseSyncError(
+                f"run {manifest.run_id} has multiple selected-bundle indexes"
+            )
+        if native:
+            item = native[0]
+            _verify_object_metadata(self.objects, item)
+            return item, manifest.key, manifest.stored.sha256, "manifest_index"
+
+        reports = [
+            item
+            for item in manifest.objects
+            if item.file in {"selection_report.json", "selection_report.json.zst"}
+        ]
+        if len(reports) != 1:
+            raise UniverseSyncError(
+                f"run {manifest.run_id} must name one selection report"
+            )
+        report_item = reports[0]
+        _, receipt_key = derivative_keys(manifest.key)
+        receipt_exists = self.objects.head(receipt_key) is not None
+        if receipt_exists:
+            report_logical = None
+            rows: list[dict[str, Any]] = []
+        else:
+            _verify_object_metadata(self.objects, report_item)
+            report = self._read_json(report_item)
+            if report.get("run_id") != manifest.run_id:
+                raise UniverseSyncError(
+                    f"run manifest {manifest.key} and selection report disagree on run_id"
+                )
+            report_logical = self._logical_for(report_item)
+            rows = selected_bundle_rows(report)
+        derivative = ensure_selected_bundle_derivative(
+            self.objects,
+            manifest_key=manifest.key,
+            manifest_stored=manifest.stored,
+            report_key=report_item.key,
+            report_stored=report_item.stored,
+            report_logical=report_logical,
+            rows=rows,
+            temporary_directory=self.temporary_directory,
+        )
+        receipt_metadata = self.objects.head(receipt_key)
+        if receipt_metadata is None:
+            raise VerificationFailure(f"selected-bundle receipt vanished: {receipt_key}")
+        return (
+            _run_object_from_derivative(derivative),
+            receipt_key,
+            receipt_metadata.sha256,
+            "derived_index",
+        )
 
     def sync_controls(self, result: SyncResult | None = None) -> SyncResult:
         output = result or SyncResult()
@@ -217,23 +275,18 @@ class UniverseSync:
         names = [item.file for item in objects]
         if len(names) != len(set(names)):
             raise UniverseSyncError(f"run manifest {key} repeats an object")
-        if not any(name.startswith("catalog_") and "_events.ndjson" in name for name in names):
-            raise UniverseSyncError(f"run manifest {key} contains no catalog events")
-        if not any(name.startswith("catalog_") and "_markets.ndjson" in name for name in names):
-            raise UniverseSyncError(f"run manifest {key} contains no catalog markets")
-        required_rules = {
-            name.removesuffix(".zst")
-            for name in names
-            if name.startswith("rule_")
+        indexes = set(names) & {
+            f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson",
+            f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson.zst",
         }
-        if not {"rule_templates.ndjson", "rule_drift.ndjson"}.issubset(required_rules):
-            raise UniverseSyncError(f"run manifest {key} has incomplete rule evidence")
-        if len(
-            set(names) & {"selection_report.json", "selection_report.json.zst"}
-        ) != 1:
-            raise UniverseSyncError(f"run manifest {key} must name one selection report")
-        for item in objects:
-            _verify_object_metadata(self.objects, item)
+        reports = set(names) & {
+            "selection_report.json",
+            "selection_report.json.zst",
+        }
+        if len(indexes) > 1 or (not indexes and len(reports) != 1):
+            raise UniverseSyncError(
+                f"run manifest {key} must name one selected-bundle index or selection report"
+            )
         return _RunManifest(
             key=key,
             stored=metadata.stored,
@@ -293,11 +346,23 @@ class UniverseSync:
 
     def _read_ndjson(self, item: _RunObject) -> list[dict[str, Any]]:
         if item.content_type != NDJSON_CONTENT_TYPE:
-            raise UniverseSyncError(f"catalog object {item.key} is not NDJSON")
+            raise UniverseSyncError(f"selected-bundle object {item.key} is not NDJSON")
+        decoded_bytes = (
+            item.logical.byte_length if item.logical is not None else item.stored.byte_length
+        )
+        if decoded_bytes > MAX_SELECTED_INDEX_BYTES:
+            raise UniverseSyncError(
+                f"selected-bundle object {item.key} exceeds "
+                f"{MAX_SELECTED_INDEX_BYTES} decoded bytes"
+            )
         if item.logical is None:
             if item.content_encoding is not None:
-                raise UniverseSyncError(f"legacy catalog object {item.key} is compressed")
-            with tempfile.TemporaryFile(mode="w+b") as staged:
+                raise UniverseSyncError(
+                    f"legacy selected-bundle object {item.key} is compressed"
+                )
+            with tempfile.TemporaryFile(
+                mode="w+b", dir=self.temporary_directory
+            ) as staged:
                 _copy_verified(self.objects, item.key, item.stored, staged)
                 staged.seek(0)
                 return list(_iter_ndjson(staged, item.key))
@@ -307,6 +372,14 @@ class UniverseSync:
     def _read_json(self, item: _RunObject) -> dict[str, Any]:
         if item.content_type != JSON_CONTENT_TYPE:
             raise UniverseSyncError(f"selection report {item.key} is not JSON")
+        decoded_bytes = (
+            item.logical.byte_length if item.logical is not None else item.stored.byte_length
+        )
+        if decoded_bytes > MAX_SELECTION_REPORT_BYTES:
+            raise UniverseSyncError(
+                f"selection report {item.key} exceeds "
+                f"{MAX_SELECTION_REPORT_BYTES} decoded bytes"
+            )
         if item.content_encoding == "zstd":
             if item.logical is None:
                 raise UniverseSyncError(f"selection report {item.key} lacks decoded identity")
@@ -321,16 +394,27 @@ class UniverseSync:
                 self.objects,
                 item.key,
                 metadata,
-                maximum=item.stored.byte_length,
+                maximum=MAX_SELECTION_REPORT_BYTES,
             )
         if not isinstance(document, dict):
             raise UniverseSyncError(f"selection report {item.key} is not an object")
         return document
 
+    def _logical_for(self, item: _RunObject) -> LogicalIdentity:
+        if item.logical is not None:
+            return item.logical
+        if item.content_encoding is not None:
+            raise UniverseSyncError(f"object {item.key} has no decoded identity")
+        with tempfile.TemporaryFile(
+            mode="w+b", dir=self.temporary_directory
+        ) as staged:
+            _copy_verified(self.objects, item.key, item.stored, staged)
+            return _logical_identity(staged)
+
     def _decoded(self, item: _RunObject):
         if item.logical is None:
             raise UniverseSyncError(f"object {item.key} has no decoded identity")
-        staged = tempfile.TemporaryFile(mode="w+b")
+        staged = tempfile.TemporaryFile(mode="w+b", dir=self.temporary_directory)
         try:
             if item.content_encoding == "zstd":
                 with self.objects.open(
@@ -357,7 +441,9 @@ class UniverseSync:
     def _read_control_sidecar(
         self, key: str, receipt: Any
     ) -> Iterator[dict[str, Any]]:
-        with tempfile.TemporaryFile(mode="w+b") as decoded:
+        with tempfile.TemporaryFile(
+            mode="w+b", dir=self.temporary_directory
+        ) as decoded:
             with self.objects.open(
                 key, max_bytes=receipt.control.stored.byte_length
             ) as source:
@@ -381,6 +467,17 @@ class _ClosingTemporaryFile:
 
     def __exit__(self, *_: object) -> None:
         self.handle.close()
+
+
+def _run_object_from_derivative(artifact: SelectedBundleArtifact) -> _RunObject:
+    return _RunObject(
+        file=artifact.file,
+        key=artifact.key,
+        stored=artifact.stored,
+        logical=artifact.logical,
+        content_type=artifact.content_type,
+        content_encoding=artifact.content_encoding,
+    )
 
 
 def _iter_ndjson(source: BinaryIO, label: str) -> Iterator[dict[str, Any]]:

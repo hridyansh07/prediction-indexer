@@ -23,6 +23,21 @@ class UniverseApplication:
         if parsed.path == "/v1/bundles":
             limit = _integer_query(query, "limit", default=100)
             return HTTPStatus.OK, {"bundles": self.database.list_bundles(limit=limit)}
+        if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith(
+            "/segments"
+        ):
+            bundle_id = unquote(
+                parsed.path.removeprefix("/v1/bundles/").removesuffix("/segments")
+            )
+            if not bundle_id or "/" in bundle_id:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid bundle id"}
+            segments = self.database.segments_for_bundle(
+                bundle_id,
+                lane_id=_optional_query(query, "lane_id"),
+            )
+            if segments is None:
+                return HTTPStatus.NOT_FOUND, {"error": "bundle not found"}
+            return HTTPStatus.OK, {"bundle_id": bundle_id, "segments": segments}
         if parsed.path.startswith("/v1/bundles/"):
             bundle_id = unquote(parsed.path.removeprefix("/v1/bundles/"))
             if not bundle_id or "/" in bundle_id:

@@ -24,3 +24,4 @@ include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "univers
 
 [tool.setuptools.package-data]
 replay = ["policy.json"]
+universe = ["schema/*.sql", "schema/*.md"]

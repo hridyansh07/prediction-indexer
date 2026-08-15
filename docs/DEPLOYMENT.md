@@ -676,11 +676,26 @@ python universe/run_sync.py
 python universe/run_backup.py
 ```
 
-Historical rollout uses `python universe/run_backfill.py`. It discovers
-non-authoritative raw receipt mirrors in S3, reverifies each referenced raw and
-seal object, and streams the compressed raw object through the shared strict
-archive decoder. It does not mount the capture spool or retain decoded raw
-segments. Before that remote job, the opt-in capture-side
+The store is intentionally sparse: it indexes selected Targeter bundles,
+sibling/event references, normalized target assets and relationships, planned
+capture bounds, segment intervals, and control/epoch facts. It does not copy
+catalogues, selection reports, target vendor records, control-envelope JSON, or
+data deliveries into SQLite. The reviewable schema is
+`universe/schema/v1.sql`.
+
+New Targeter manifests commit `selected_bundle_index.ndjson[.zst]` directly. If
+sync encounters an older committed run without it, sync verifies that run's
+selection report once, publishes an immutable compact derivative plus a
+source-binding `selected_bundle_index.receipt.json`, and then ingests the
+derivative. Later syncs use the committed derivative without downloading the
+report. This is the Targeter historical path; no capture-host filesystem mount
+or separate Targeter bulk-backfill format is required.
+
+Historical **raw-control** rollout uses `python universe/run_backfill.py`. It
+discovers non-authoritative raw receipt mirrors in S3, reverifies each
+referenced raw and seal object, and streams the compressed raw object through
+the shared strict archive decoder. It does not mount the capture spool or
+retain decoded raw segments. Before that remote job, the opt-in capture-side
 `python archive/run_receipt_mirror.py` job mirrors retained production receipt
 documents, including receipts for raw files already reaped. It never reads or
 sends historical raw bytes through the capture host. In Compose it is the
