@@ -134,6 +134,10 @@ polymarket  acceptingOrders == false
 limitless   expired == true  OR  status == "RESOLVED"
 ```
 
+The Kalshi comparison uses the literal `expiration_time` field. Its
+`expected_expiration_time` and `latest_expiration_time` fields are different
+vendor facts and cannot substitute for a missing comparison operand.
+
 A lookup that fails or returns a malformed record leaves the leg **unchanged**,
 not terminal. Eviction on a failed read would drop live capture on an API blip.
 The clamp is what bounds that case.
@@ -223,6 +227,8 @@ a retained bundle, prior ownership wins and the additive candidate is rejected a
 When `held` alone fills the budget, `additive` candidates are rejected as
 `displaced_by_continuity_hold` — distinct from `target_budget_exceeded`, so a
 saturated hold is visible rather than looking like ordinary budget pressure. The
+reason applies only when removing protected budget usage would make that candidate
+fit; exhaustion that remains without the hold is `target_budget_exceeded`. The
 subscription asset set is republished unchanged; run and generation identities
 still advance normally.
 

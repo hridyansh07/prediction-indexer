@@ -387,11 +387,7 @@ class KalshiSportsAdapter:
                 continue
             status = str(raw.get("status") or "").casefold()
             close_time = parse_timestamp(raw.get("close_time"))
-            expiration_time = parse_timestamp(
-                raw.get("expiration_time")
-                or raw.get("expected_expiration_time")
-                or raw.get("latest_expiration_time")
-            )
+            expiration_time = parse_timestamp(raw.get("expiration_time"))
             if status == "finalized":
                 result[ticker] = TerminalProbe("terminal", "status_finalized")
             elif close_time is not None and expiration_time is not None and close_time < expiration_time:

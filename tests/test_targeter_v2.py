@@ -385,8 +385,32 @@ class AdapterContractTests(unittest.TestCase):
         def failed(*_args):
             raise RuntimeError("404")
 
+        kalshi = KalshiSportsAdapter(self.registry)
         polymarket = PolymarketSportsAdapter(self.registry)
         limitless = LimitlessSportsAdapter(self.registry)
+        self.assertEqual(
+            kalshi.probe_terminal(FakeClient(failed), ("missing",))["missing"].state,
+            "unknown",
+        )
+        self.assertEqual(
+            kalshi.probe_terminal(
+                FakeClient(
+                    lambda *_args: {
+                        "markets": [
+                            {
+                                "ticker": "K-ACTIVE",
+                                "status": "active",
+                                "close_time": "2026-08-03T12:00:00Z",
+                                "expected_expiration_time": "2026-08-05T12:00:00Z",
+                            }
+                        ]
+                    }
+                ),
+                ("K-ACTIVE",),
+            )["K-ACTIVE"].state,
+            "open",
+            "expected_expiration_time must not stand in for expiration_time",
+        )
         self.assertEqual(
             polymarket.probe_terminal(FakeClient(failed), ("missing",))["missing"].state,
             "unknown",
@@ -1364,6 +1388,65 @@ class RulesAndSelectionTests(unittest.TestCase):
         self.assertEqual(
             result.allocation_rejections["lower"], "continuity_budget_trimmed"
         )
+
+    def test_unrelated_protected_venue_does_not_relabel_budget_exhaustion(self) -> None:
+        first_participants = ("Arsenal", "Chelsea")
+        second_participants = ("Liverpool", "Everton")
+        catalogs = tuple(
+            CatalogSnapshot(
+                venue,
+                (
+                    event(venue, f"{venue}-first", participants=first_participants),
+                    event(
+                        venue,
+                        f"{venue}-second",
+                        participants=second_participants,
+                        activation=START + timedelta(minutes=5),
+                    ),
+                ),
+                (
+                    market(venue, f"{venue}-first-market", f"{venue}-first"),
+                    market(venue, f"{venue}-second-market", f"{venue}-second"),
+                ),
+            )
+            for venue in ("kalshi", "polymarket")
+        )
+        limitless_hold = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id="limitless-only-hold",
+            activation_at=START,
+            score=1.0,
+            targets=(
+                ContinuityTarget(
+                    target_id="limitless:held",
+                    venue="limitless",
+                    venue_market_id="held",
+                    canonical_class="soccer.moneyline_3way",
+                    subscription_ids=("limitless-held",),
+                    activation_at=START,
+                    capture_start_at=NOW,
+                    source_ref="/markets/held",
+                    probe=TerminalProbe("open", "funded_not_expired"),
+                ),
+            ),
+        )
+
+        result = select_targets(
+            catalogs,
+            strategy=replace(
+                self.strategy,
+                target_budgets={"kalshi": 1, "polymarket": 10, "limitless": 1},
+            ),
+            now=NOW,
+            continuity_bundles=(limitless_hold,),
+        )
+
+        rejected = {
+            bundle_id: reason
+            for bundle_id, reason in result.allocation_rejections.items()
+            if bundle_id != limitless_hold.bundle_id
+        }
+        self.assertEqual(list(rejected.values()), ["target_budget_exceeded"])
 
 
 class ShadowRunTests(unittest.TestCase):

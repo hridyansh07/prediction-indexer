@@ -508,12 +508,21 @@ def select_targets(
                 budget_used[target.venue] += len(target.subscription_ids)
                 targets[target.venue].append(target.as_selection_target(bundle_id, item.score))
 
-    protected_selected = bool(selected or selected_retained)
+    protected_bundle_selected = bool(selected or selected_retained)
+    protected_budget_used = dict(budget_used)
+
+    def blocked_by_protected_budget(increments: Mapping[str, int]) -> bool:
+        return all(
+            budget_used[venue] - protected_budget_used[venue] + count
+            <= strategy.target_budgets[venue]
+            for venue, count in increments.items()
+        )
+
     for position, candidate in enumerate(additive):
         if len(selected) + len(selected_retained) >= strategy.maximum_bundles:
             allocation_rejections[candidate.bundle.bundle_id] = (
                 "displaced_by_continuity_hold"
-                if protected_selected
+                if protected_bundle_selected
                 else "maximum_bundles_reached"
             )
             continue
@@ -536,7 +545,7 @@ def select_targets(
         if not fits(increments):
             allocation_rejections[candidate.bundle.bundle_id] = (
                 "displaced_by_continuity_hold"
-                if protected_selected
+                if blocked_by_protected_budget(increments)
                 else "target_budget_exceeded"
             )
             continue
@@ -562,7 +571,7 @@ def select_targets(
             for remaining in additive[position + 1 :]:
                 allocation_rejections[remaining.bundle.bundle_id] = (
                     "displaced_by_continuity_hold"
-                    if protected_selected
+                    if protected_bundle_selected
                     else "maximum_bundles_reached"
                 )
             break
