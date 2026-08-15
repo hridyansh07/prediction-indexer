@@ -160,19 +160,35 @@ clamp fires.
 
 ### 2.4 The clamp
 
-```
-clamp_at = activation_at + terminal_clamp_seconds     # 28800, flat
+**The clamp already exists.** `targeter/v2/selection.py:303`:
+
+```python
+if bundle.activation_at < now - timedelta(seconds=strategy.post_start_retention_seconds):
+    reasons.append("past_post_start_retention")
 ```
 
-`activation_at` is the anchor because it is the targeter's own reconciled value,
+`activation_at + post_start_retention_seconds` is already an eligibility gate
+with a named rejection reason, currently 21600 s (6 h). Because §3.2 intersects
+`held` with the eligible ranked set, a bundle past it is already released. **A
+separate `terminal_clamp_seconds` would be unreachable** — the existing gate
+always rejects first — so V1 adds no new clamp setting and reuses this one.
+
+`activation_at` is the right anchor: it is the targeter's own reconciled value,
 corroborated by two venues — on 2026-08-15 it was `02:00Z`, matching both
 Polymarket's `eventStartTime` and the Kalshi ticker's `26AUG142200` EDT.
 
-At `clamp_at` the bundle is terminal regardless of venue state. This is the
-catch-all for postponement, cancellation, a flag that never flips, a malformed
-record, and a lookup that keeps failing. It is deliberately generous: terminal
-state should almost always evict first, and the clamp should almost never be the
-reason.
+**The 8 h decision therefore becomes: raise `post_start_retention_seconds` from
+21600 to 28800.** That is one setting change, and it has a coupling that must be
+stated — the same value bounds discovery (`min_close_ts` on Kalshi,
+`end_date_min` on Polymarket and Limitless), so raising it also widens the
+catalogue fetched each run. §1.3 argues the change is warranted regardless: at
+21600 the gate sits *below* p90 duration for both Dota2 and LoL (7.16 h), so it
+is currently evicting bundles whose matches are still being played.
+
+If the discovery widening proves unwanted, the alternative is to split the
+setting in two — `post_start_retention_seconds` for discovery,
+`eligibility_retention_seconds` for the gate — but V1 does not do this, because
+one number that is right is simpler than two that can drift apart.
 
 ---
 
@@ -182,8 +198,8 @@ reason.
 
 Each run partitions eligible ranked candidates into:
 
-- **held** — selected by the previous published generation, still eligible, no
-  leg past `clamp_at`
+- **held** — selected by the previous published generation and still eligible
+  (which already excludes anything past `post_start_retention_seconds`)
 - **additive** — everything else
 
 Budget is claimed by `held` first, then by `additive` in rank order. Scoring and
@@ -195,7 +211,8 @@ displaced by rank.
 ### 3.2 It can never admit
 
 `held` is intersected with the eligible ranked set before use. A bundle failing
-any gate, or past its clamp, is not in `ranked` and so cannot be held. The hold
+any gate, including `past_post_start_retention`, is not in `ranked` and so
+cannot be held. The hold
 preserves a claim; it never creates one.
 
 ### 3.3 Full-budget behaviour
@@ -218,7 +235,7 @@ A market first seen well into its own window is worth less than one yet to start
 Applied as a **rank penalty**, not a gate — it should lose ties, not eligibility:
 
 ```
-elapsed_fraction = (now - activation_at) / terminal_clamp_seconds
+elapsed_fraction = (now - activation_at) / post_start_retention_seconds
 ```
 
 Motivating case: the 2026-08-15 05:41Z run selected
@@ -233,7 +250,8 @@ later**. Not a hypothetical.
 |---|---|
 | `targeter/v2/domain.py` | `CanonicalMarket.terminal: bool`, `terminal_reason: str \| None` |
 | `targeter/v2/adapters.py` | `probe_terminal(held_ids)` per venue, per §2.1 |
-| `targeter/v2/registry.py` | `terminal_clamp_seconds`, `terminal_buffer_seconds`, `continuity_hold_enabled` |
+| `targeter/v2/registry.py` | `terminal_buffer_seconds`, `continuity_hold_enabled` |
+| `configs/targeter_v2.json` | `post_start_retention_seconds` 21600 → 28800 |
 | `targeter/v2/selection.py` | `held` param, two-pass allocation, clamp, lateness penalty, new rejection reason |
 | `targeter/v2/run.py` | read prior generation, resolve to bundle ids, drive the terminal probe |
 | `tests/test_targeter_v2.py` | §5 |
@@ -246,7 +264,7 @@ Nothing under `replay/` or `universe/` changes.
 
 1. `held = ∅` reproduces today's selection byte-for-byte — the regression guard
 2. a held bundle survives a higher-ranked newcomer at the budget limit
-3. a held bundle past `clamp_at` is released even with every venue flag still open
+3. a held bundle past `post_start_retention_seconds` is released even with every venue flag still open
 4. a leg going terminal keeps its subscription for `terminal_buffer_seconds`
 5. a bundle with one terminal leg and one live leg stays subscribed on the live leg
 6. `active: true` on a closed Polymarket market does **not** read as live
