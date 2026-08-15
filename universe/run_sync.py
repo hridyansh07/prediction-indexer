@@ -18,7 +18,11 @@ def main() -> int:
     config = load_config()
     database = UniverseStore(config.database_path)
     database.initialize()
-    result = UniverseSync(database, config.object_store()).sync()
+    result = UniverseSync(
+        database,
+        config.object_store(),
+        temporary_directory=config.temporary_directory,
+    ).sync()
     print(json.dumps(result.as_record(), ensure_ascii=False, sort_keys=True))
     return 1 if result.failures else 0
 

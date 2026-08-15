@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import hashlib
 import json
 import os
 import shutil
@@ -20,6 +19,7 @@ from archive.storage.base import JSON_CONTENT_TYPE, NDJSON_CONTENT_TYPE
 from encoder import logical_identity_of, stored_identity_of
 from splices.common.segment import Record, SegmentWriter
 from targeter.targets import Target, target_digest
+from targeter.v2.selected_bundles import selected_bundle_rows
 from universe.api import UniverseApplication
 from universe.backfill import backfill_segment_universe
 from universe.config import UniverseConfigError, load_config
@@ -31,106 +31,92 @@ HOUR_NS = 3_600_000_000_000
 DAY_ONE = 1_767_222_000_000_000_000  # 2025-12-31T23:00:00Z
 
 
-def _targeter_records(run_id: str, generated_at: str):
-    events = [
-        {
-            "venue": "polymarket",
-            "venue_event_id": "event-1",
-            "title": "Alpha vs Beta",
-            "sport": "esports",
-            "game": "counter_strike_2",
-            "activation_at": "2026-01-01T01:00:00Z",
-        }
-    ]
-    markets = [
-        {
-            "venue": "polymarket",
-            "venue_event_id": "event-1",
-            "venue_market_id": "moneyline",
-            "target_id": "polymarket:moneyline",
-            "canonical_class": "series_moneyline",
-            "market_type": "moneyline",
-            "scope": "series",
-            "title": "Match winner",
-            "subscription_ids": ["asset-a"],
-        },
-        {
-            "venue": "polymarket",
-            "venue_event_id": "event-1",
-            "venue_market_id": "map-one",
-            "target_id": "polymarket:map-one",
-            "canonical_class": "map_moneyline",
-            "market_type": "moneyline",
-            "scope": "map_1",
-            "title": "Map one winner",
-            "subscription_ids": ["asset-b"],
-        },
-    ]
-    report = {
+def _selection_report(run_id: str, generated_at: str) -> dict:
+    return {
         "run_id": run_id,
         "generated_at": generated_at,
+        "input_complete": True,
+        "strategy_version": 3,
+        "selection_policy": {
+            "pre_event_seconds": 3600,
+            "post_start_retention_seconds": 21600,
+        },
         "candidates": [
             {
                 "bundle_id": "bundle-1",
-                "event_refs": ["polymarket:event-1"],
-                "market_ids": ["polymarket:moneyline", "polymarket:map-one"],
-                "activation_at": "2026-01-01T01:00:00Z",
+                "sport": "esports",
                 "game": "counter_strike_2",
-                "confidence": "high",
-            }
+                "topology": "series",
+                "participants": ["Alpha", "Beta"],
+                "participant_keys": ["alpha", "beta"],
+                "event_refs": ["kalshi:event-a", "polymarket:event-b"],
+                "market_ids": [
+                    "kalshi:series",
+                    "polymarket:series",
+                    "polymarket:map-one",
+                ],
+                "eligible_market_ids": ["kalshi:series", "polymarket:series"],
+                "activation_at": "2026-01-01T01:00:00Z",
+                "capture_start_at": "2026-01-01T00:00:00Z",
+                "relationship_analysis": {
+                    "relationships": [
+                        {
+                            "bundle_id": "bundle-1",
+                            "left": "kalshi:series#claim=0",
+                            "right": "polymarket:series#claim=0",
+                            "relationship": "IDENTITY",
+                            "scope": "series",
+                            "left_venue": "kalshi",
+                            "right_venue": "polymarket",
+                            "cross_venue": True,
+                            "coverage": "EXHAUSTIVE",
+                        }
+                    ]
+                },
+            },
+            {"bundle_id": "rejected", "activation_at": "2026-01-01T02:00:00Z"},
         ],
         "selection": {
             "bundle_ids": ["bundle-1"],
             "targets": {
+                "kalshi": [
+                    {
+                        "target_id": "kalshi:series",
+                        "bundle_id": "bundle-1",
+                        "canonical_class": "esports.series_moneyline",
+                        "subscription_ids": ["K-SERIES"],
+                    }
+                ],
                 "polymarket": [
                     {
-                        "target_id": "polymarket:moneyline",
+                        "target_id": "polymarket:series",
                         "bundle_id": "bundle-1",
-                        "subscription_ids": ["asset-a"],
+                        "canonical_class": "esports.series_moneyline",
+                        "subscription_ids": ["pm-yes", "pm-no"],
                     }
                 ]
             },
         },
     }
-    return events, markets, report
-
-
-def _record_sha256(record: dict) -> str:
-    payload = json.dumps(
-        record,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-        allow_nan=False,
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _ingest_targeter(database: UniverseStore, run_id: str, generated_at: str) -> str:
-    events, markets, report = _targeter_records(run_id, generated_at)
-    return database.ingest_targeter_run(
+    rows = selected_bundle_rows(_selection_report(run_id, generated_at))
+    source_sha256 = ("a" if run_id.endswith("1Z") else "b") * 64
+    index_key = f"targeter-v2/runs/run={run_id}/selected_bundle_index.ndjson.zst"
+    return database.ingest_selected_bundle_index(
         source_key=f"targeter-v2/runs/run={run_id}/run_manifest.json",
-        source_sha256=("a" if run_id.endswith("1") else "b") * 64,
+        source_sha256=source_sha256,
+        source_kind="manifest_index",
+        manifest_key=f"targeter-v2/runs/run={run_id}/run_manifest.json",
+        manifest_sha256=source_sha256,
+        index_key=index_key,
+        index_sha256="d" * 64,
+        index_byte_length=50,
         run_id=run_id,
         generated_at=generated_at,
         input_complete=True,
-        events=events,
-        markets=markets,
-        report=report,
-        target_records=[
-            {
-                "version": 1,
-                "run_id": run_id,
-                "venue": "polymarket",
-                "target_id": "polymarket:moneyline",
-                "subscription_ids": ["asset-a"],
-                "observed_at": generated_at,
-                "record_sha256": _record_sha256(
-                    {"conditionId": "moneyline", "question": "Match winner"}
-                ),
-                "record": {"conditionId": "moneyline", "question": "Match winner"},
-            }
-        ],
+        rows=rows,
     )
 
 
@@ -200,48 +186,12 @@ def _put(store: LocalObjectStore, key: str, payload: bytes, content_type: str):
     return identity
 
 
-def _publish_targeter_run(store: LocalObjectStore) -> str:
+def _publish_targeter_run(
+    store: LocalObjectStore, *, include_selected_index: bool = False
+) -> str:
     run_id = "20260101T000000.000001Z"
     prefix = f"targeter-v2/runs/date=2026-01-01/run={run_id}"
-    events, markets, report = _targeter_records(run_id, "2026-01-01T00:00:00Z")
-    rows = {
-        "catalog_polymarket_events.ndjson": events,
-        "catalog_polymarket_markets.ndjson": markets,
-        "rule_templates.ndjson": [],
-        "rule_drift.ndjson": [],
-        "target_records_polymarket.ndjson": [
-            {
-                "version": 1,
-                "run_id": run_id,
-                "venue": "polymarket",
-                "target_id": "polymarket:moneyline",
-                "subscription_ids": ["asset-a"],
-                "observed_at": "2026-01-01T00:00:00Z",
-                "record_sha256": _record_sha256(
-                    {"conditionId": "moneyline", "question": "Match winner"}
-                ),
-                "record": {"conditionId": "moneyline", "question": "Match winner"},
-            }
-        ],
-    }
-    files = []
-    for name, records in rows.items():
-        payload = b"".join(
-            (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode()
-            for record in records
-        )
-        stored = _put(store, f"{prefix}/{name}", payload, NDJSON_CONTENT_TYPE)
-        logical = logical_identity_of(io.BytesIO(payload))
-        files.append(
-            {
-                "file": name,
-                "content_type": NDJSON_CONTENT_TYPE,
-                "content_encoding": None,
-                "decoded": logical.as_record(),
-                "stored": stored.as_record(),
-                "compression": None,
-            }
-        )
+    report = _selection_report(run_id, "2026-01-01T00:00:00Z")
     report_payload = (
         json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode()
@@ -251,7 +201,7 @@ def _publish_targeter_run(store: LocalObjectStore) -> str:
         report_payload,
         JSON_CONTENT_TYPE,
     )
-    files.append(
+    files = [
         {
             "file": "selection_report.json",
             "byte_length": report_identity.byte_length,
@@ -259,7 +209,31 @@ def _publish_targeter_run(store: LocalObjectStore) -> str:
             "content_type": JSON_CONTENT_TYPE,
             "content_encoding": None,
         }
-    )
+    ]
+    if include_selected_index:
+        index_name = "selected_bundle_index.ndjson"
+        index_payload = b"".join(
+            (
+                json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode()
+            for row in selected_bundle_rows(report)
+        )
+        index_identity = _put(
+            store,
+            f"{prefix}/{index_name}",
+            index_payload,
+            NDJSON_CONTENT_TYPE,
+        )
+        files.append(
+            {
+                "file": index_name,
+                "content_type": NDJSON_CONTENT_TYPE,
+                "content_encoding": None,
+                "decoded": logical_identity_of(io.BytesIO(index_payload)).as_record(),
+                "stored": index_identity.as_record(),
+                "compression": None,
+            }
+        )
     manifest = {
         "targeter_run_manifest_version": 2,
         "run_id": run_id,
@@ -280,6 +254,29 @@ class UniverseStoreTests(unittest.TestCase):
         self.database = UniverseStore(self.root / "universe.sqlite3")
         self.database.initialize()
 
+    def test_schema_contains_no_catalogue_or_json_payload_tables(self) -> None:
+        with sqlite3.connect(self.database.path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                )
+            }
+            columns = {
+                f"{table}.{row[1]}"
+                for table in tables
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+        self.assertTrue(
+            {
+                "catalog_events",
+                "catalog_markets",
+                "target_records",
+                "event_bundles",
+            }.isdisjoint(tables)
+        )
+        self.assertFalse(any("json" in column.lower() for column in columns))
+
     def test_indexes_sibling_markets_idempotently_and_exposes_selection(self) -> None:
         self.assertEqual(
             _ingest_targeter(
@@ -295,26 +292,25 @@ class UniverseStoreTests(unittest.TestCase):
         )
         detail = self.database.bundle_detail("bundle-1")
         assert detail is not None
-        selected = next(item for item in detail["markets"] if item["selected"])
-        self.assertEqual(
-            selected["target_record"]["record"]["conditionId"], "moneyline"
-        )
-        self.assertEqual(len(detail["events"]), 1)
+        self.assertEqual(len(detail["events"]), 2)
         self.assertEqual(
             {item["target_id"]: item["selected"] for item in detail["markets"]},
-            {"polymarket:map-one": False, "polymarket:moneyline": True},
+            {
+                "kalshi:series": True,
+                "polymarket:map-one": False,
+                "polymarket:series": True,
+            },
         )
-        self.assertEqual(detail["subscriptions"][0]["selection_status"], "selected")
+        selected = next(
+            item for item in detail["markets"] if item["target_id"] == "polymarket:series"
+        )
+        self.assertEqual(selected["subscription_ids"], ["pm-no", "pm-yes"])
+        self.assertEqual(len(detail["subscriptions"]), 2)
+        self.assertIsNone(self.database.bundle_detail("rejected"))
         with self.assertRaises(EvidenceConflict):
-            self.database.ingest_targeter_run(
-                source_key="targeter-v2/runs/run=20260101T000000.000001Z/run_manifest.json",
-                source_sha256="f" * 64,
-                run_id="20260101T000000.000001Z",
-                generated_at="2026-01-01T00:00:00Z",
-                input_complete=True,
-                events=[],
-                markets=[],
-                report={},
+            self.database.source_is_complete(
+                "targeter-v2/runs/run=20260101T000000.000001Z/run_manifest.json",
+                "f" * 64,
             )
 
     def test_repeated_target_digest_is_reported_as_ambiguous(self) -> None:
@@ -326,9 +322,14 @@ class UniverseStoreTests(unittest.TestCase):
         )
         detail = self.database.bundle_detail("bundle-1")
         assert detail is not None
-        link = detail["subscriptions"][0]
-        self.assertEqual(link["historical_link_status"], "ambiguous")
-        self.assertEqual(link["candidate_run_count"], 2)
+        self.assertEqual(detail["run"]["run_id"], "20260101T010000.000002Z")
+        self.assertTrue(
+            all(
+                link["historical_link_status"] == "ambiguous"
+                and link["candidate_run_count"] == 2
+                for link in detail["subscriptions"]
+            )
+        )
 
     def test_syncs_committed_targeter_manifest_and_retries_as_a_noop(self) -> None:
         objects = LocalObjectStore(
@@ -338,9 +339,66 @@ class UniverseStoreTests(unittest.TestCase):
         first = UniverseSync(self.database, objects).sync_targeter()
         self.assertEqual(first.targeter_ingested, 1, first.as_record())
         self.assertEqual(first.failures, [])
-        second = UniverseSync(self.database, objects).sync_targeter()
+        subsequent = UniverseSync(self.database, objects)
+        with patch.object(
+            subsequent,
+            "_read_json",
+            side_effect=AssertionError("committed derivative must avoid the source report"),
+        ):
+            second = subsequent.sync_targeter()
         self.assertEqual(second.targeter_skipped, 1, second.as_record())
-        self.assertIsNotNone(self.database.bundle_detail("bundle-1"))
+        detail = self.database.bundle_detail("bundle-1")
+        assert detail is not None
+        self.assertEqual(detail["source"]["kind"], "derived_index")
+        self.assertIsNone(self.database.bundle_detail("rejected"))
+        keys = set(objects.list_keys("targeter-v2/runs/"))
+        self.assertTrue(any(key.endswith("/selected_bundle_index.ndjson.zst") for key in keys))
+        self.assertTrue(any(key.endswith("/selected_bundle_index.receipt.json") for key in keys))
+
+    def test_sync_prefers_manifest_committed_selected_index(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "native-objects", store_id="archive", durability=INDEPENDENT
+        )
+        _publish_targeter_run(objects, include_selected_index=True)
+        sync = UniverseSync(self.database, objects)
+        with patch.object(
+            sync,
+            "_read_json",
+            side_effect=AssertionError("native index must avoid the selection report"),
+        ):
+            result = sync.sync_targeter()
+        self.assertEqual(result.targeter_ingested, 1, result.as_record())
+        self.assertEqual(result.failures, [])
+        detail = self.database.bundle_detail("bundle-1")
+        assert detail is not None
+        self.assertEqual(detail["source"]["kind"], "manifest_index")
+        self.assertFalse(
+            any(
+                key.endswith("/selected_bundle_index.receipt.json")
+                for key in objects.list_keys("targeter-v2/runs/")
+            )
+        )
+
+    def test_lazy_projection_fails_closed_on_existing_artifact_conflict(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "conflict-objects", store_id="archive", durability=INDEPENDENT
+        )
+        run_id = _publish_targeter_run(objects)
+        prefix = f"targeter-v2/runs/date=2026-01-01/run={run_id}"
+        _put(
+            objects,
+            f"{prefix}/selected_bundle_index.ndjson.zst",
+            b"{}\n",
+            NDJSON_CONTENT_TYPE,
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.targeter_ingested, 0)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("invalid metadata", result.failures[0])
+        self.assertIsNone(self.database.bundle_detail("bundle-1"))
+        self.assertIsNone(
+            objects.head(f"{prefix}/selected_bundle_index.receipt.json")
+        )
 
     def test_folds_connection_state_across_segments_and_utc_days(self) -> None:
         digest = target_digest("polymarket", (Target(asset_id="asset-a"),))
@@ -413,6 +471,16 @@ class UniverseStoreTests(unittest.TestCase):
             start_ns=DAY_ONE, end_ns=DAY_ONE + 2 * HOUR_NS
         )
         self.assertEqual(len(segments), 2)
+        _ingest_targeter(
+            self.database,
+            "20260101T000000.000001Z",
+            "2026-01-01T00:00:00Z",
+        )
+        bundle_segments = self.database.segments_for_bundle("bundle-1")
+        assert bundle_segments is not None
+        self.assertEqual(
+            [segment["segment_id"] for segment in bundle_segments], ["daytwo"]
+        )
 
     def test_api_and_consistent_backup_are_queryable(self) -> None:
         _ingest_targeter(
@@ -424,7 +492,9 @@ class UniverseStoreTests(unittest.TestCase):
         self.assertEqual(health["schema_version"], 1)
         status, detail = application.get("/v1/bundles/bundle-1")
         self.assertEqual(status, 200)
-        self.assertEqual(len(detail["markets"]), 2)
+        self.assertEqual(len(detail["markets"]), 3)
+        status, segments = application.get("/v1/bundles/bundle-1/segments")
+        self.assertEqual((status, segments["segments"]), (200, []))
         status, missing = application.get("/v1/bundles/absent")
         self.assertEqual((status, missing["error"]), (404, "bundle not found"))
 
@@ -434,7 +504,7 @@ class UniverseStoreTests(unittest.TestCase):
                 connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
             )
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM event_bundles").fetchone()[0], 1
+                connection.execute("SELECT COUNT(*) FROM selected_bundles").fetchone()[0], 1
             )
 
     def test_backfill_reconstructs_reaped_raw_and_is_resumable(self) -> None:

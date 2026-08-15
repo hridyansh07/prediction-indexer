@@ -1630,7 +1630,17 @@ class ShadowRunTests(unittest.TestCase):
                 "omitting one supported venue is a diagnostic probe, not a complete production input",
             )
             self.assertEqual(report["artifact_format"], "zstd")
+            self.assertEqual(
+                report["selection_policy"],
+                {
+                    "pre_event_seconds": 3600,
+                    "post_start_retention_seconds": 21600,
+                },
+            )
             self.assertTrue((result.directory / "catalog_kalshi_markets.ndjson.zst").exists())
+            self.assertTrue(
+                (result.directory / "selected_bundle_index.ndjson.zst").exists()
+            )
             self.assertTrue((result.directory / "rule_templates.ndjson.zst").exists())
             self.assertTrue((result.directory / "selection_report.json.zst").exists())
             self.assertTrue((result.directory / "selection_report.meta.json").exists())
@@ -1660,6 +1670,7 @@ class ShadowRunTests(unittest.TestCase):
             report = read_run_report(result.directory)
             self.assertEqual(report["artifact_format"], "ndjson")
             self.assertTrue((result.directory / "catalog_kalshi_markets.ndjson").exists())
+            self.assertTrue((result.directory / "selected_bundle_index.ndjson").exists())
             self.assertTrue((result.directory / "rule_templates.ndjson").exists())
             self.assertTrue((result.directory / "selection_report.json").exists())
             self.assertFalse((result.directory / "catalog_kalshi_markets.ndjson.zst").exists())

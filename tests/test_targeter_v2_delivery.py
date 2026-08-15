@@ -183,10 +183,14 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         report.pop("artifact_format")
         report.pop("artifacts")
         report.pop("target_record_diagnostics", None)
-        # A run old enough to carry a v1 manifest predates target records, so it
-        # has neither the inventory nor the files. Stripping only the inventory
-        # would build a hybrid that never existed.
-        for stale in run_directory.glob("target_records_*"):
+        report.pop("selection_policy", None)
+        # A run old enough to carry a v1 manifest predates target records and
+        # the selected-bundle index, so it has neither their inventory nor files.
+        # Stripping only the inventory would build a hybrid no build wrote.
+        for stale in (
+            *run_directory.glob("target_records_*"),
+            *run_directory.glob("selected_bundle_index.*"),
+        ):
             stale.unlink()
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

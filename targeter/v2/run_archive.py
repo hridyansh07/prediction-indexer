@@ -29,6 +29,7 @@ from archive.storage.base import (
 )
 from encoder import CodecError, LogicalIdentity, StoredIdentity, logical_identity_of, stored_identity_of
 from targeter.v2.models import SUPPORTED_VENUES, parse_timestamp
+from targeter.v2.selected_bundles import SELECTED_BUNDLE_INDEX_STEM
 
 
 RUN_MANIFEST_VERSION = 2
@@ -266,6 +267,9 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
         raise RunArchiveError("selection report artifacts must be a non-empty object")
     suffix = ".ndjson.zst" if artifact_format == "zstd" else ".ndjson"
     expected = {f"rule_templates{suffix}", f"rule_drift{suffix}"}
+    selected_index = f"{SELECTED_BUNDLE_INDEX_STEM}{suffix}"
+    if "selection_policy" in report or selected_index in raw:
+        expected.add(selected_index)
     # Target records are written for every supported venue, not only the ones
     # that produced a catalogue: a venue that discovered nothing still has to be
     # distinguishable from a venue whose artifact went missing.

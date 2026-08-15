@@ -21,9 +21,11 @@ from typing import Any, Iterable, Iterator, Mapping
 from archive.archiver.universe import SegmentUniverseReceipt
 from archive.common.durable import fsync_directory
 from targeter.targets import Target, target_digest
+from targeter.v2.selected_bundles import SELECTED_BUNDLE_INDEX_VERSION
 
 SCHEMA_VERSION = 1
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
+SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
 
 
 class EvidenceConflict(ValueError):
@@ -43,7 +45,7 @@ class UniverseStore:
                     f"universe schema {version} is newer than supported {SCHEMA_VERSION}"
                 )
             if version == 0:
-                connection.executescript(_SCHEMA_V1)
+                connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 connection.commit()
             elif version != SCHEMA_VERSION:
@@ -93,303 +95,184 @@ class UniverseStore:
             )
         return True
 
-    def ingest_targeter_run(
+    def ingest_selected_bundle_index(
         self,
         *,
         source_key: str,
         source_sha256: str,
+        source_kind: str,
+        manifest_key: str,
+        manifest_sha256: str,
+        index_key: str,
+        index_sha256: str,
+        index_byte_length: int,
         run_id: str,
         generated_at: str,
         input_complete: bool,
-        events: Iterable[Mapping[str, Any]],
-        markets: Iterable[Mapping[str, Any]],
-        report: Mapping[str, Any],
-        target_records: Iterable[Mapping[str, Any]] = (),
+        rows: Iterable[Mapping[str, Any]],
     ) -> str:
-        """Index one manifest-committed Targeter run, idempotently."""
-        event_rows = [dict(item) for item in events]
-        market_rows = [dict(item) for item in markets]
-        target_record_rows = [dict(item) for item in target_records]
-        report_record = dict(report)
+        """Index one compact selected-bundle artifact, never its source JSON."""
+        if source_kind not in {"manifest_index", "derived_index"}:
+            raise EvidenceConflict(f"invalid selected index source kind {source_kind!r}")
+        records = [_selected_bundle_row(dict(item)) for item in rows]
+        strategy_versions = {record["strategy_version"] for record in records}
+        if len(strategy_versions) > 1:
+            raise EvidenceConflict("selected bundle index mixes strategy versions")
+        for record in records:
+            if (
+                record["run_id"] != run_id
+                or record["generated_at"] != generated_at
+                or record["input_complete"] is not input_complete
+            ):
+                raise EvidenceConflict(
+                    f"selected bundle {record['bundle_id']} disagrees with its run manifest"
+                )
         generated_ns = _timestamp_ns(generated_at)
         with self.write_transaction() as connection:
             if not _begin_source(
-                connection, source_key, "targeter_run", source_sha256
+                connection, source_key, "selected_bundle_index", source_sha256
             ):
                 return "skipped"
+            existing = connection.execute(
+                "SELECT source_key FROM targeter_sources WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                raise EvidenceConflict(
+                    f"run {run_id} is already indexed from {existing['source_key']}"
+                )
             connection.execute(
-                """INSERT INTO targeter_runs(
-                       run_id, source_key, generated_at, generated_at_ns,
-                       input_complete, report_json
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO targeter_sources(
+                       run_id, source_key, source_kind, generated_at,
+                       generated_at_ns, input_complete, strategy_version,
+                       manifest_key, manifest_sha256, index_key, index_sha256,
+                       index_byte_length
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     source_key,
+                    source_kind,
                     generated_at,
                     generated_ns,
                     int(input_complete),
-                    _canonical_json(report_record),
+                    next(iter(strategy_versions), None),
+                    manifest_key,
+                    manifest_sha256,
+                    index_key,
+                    index_sha256,
+                    index_byte_length,
                 ),
             )
 
-            known_events: set[str] = set()
-            for record in event_rows:
-                venue = _text(record, "venue", "catalog event")
-                venue_event_id = _text(record, "venue_event_id", "catalog event")
-                event_ref = f"{venue}:{venue_event_id}"
-                if event_ref in known_events:
-                    raise EvidenceConflict(f"run {run_id} repeats event {event_ref}")
-                known_events.add(event_ref)
-                connection.execute(
-                    """INSERT INTO catalog_events(
-                           run_id, event_ref, venue, venue_event_id, title, sport,
-                           league, game, activation_at, record_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        run_id,
-                        event_ref,
-                        venue,
-                        venue_event_id,
-                        _optional_text(record.get("title")),
-                        _optional_text(record.get("sport")),
-                        _optional_text(record.get("league")),
-                        _optional_text(record.get("game")),
-                        _optional_text(record.get("activation_at")),
-                        _canonical_json(record),
-                    ),
-                )
-
-            seen_markets: set[str] = set()
-            known_markets: set[str] = set()
-            market_venues: dict[str, str] = {}
-            for record in market_rows:
-                venue = _text(record, "venue", "catalog market")
-                venue_event_id = _text(record, "venue_event_id", "catalog market")
-                venue_market_id = _text(record, "venue_market_id", "catalog market")
-                target_id = _text(record, "target_id", "catalog market")
-                if target_id != f"{venue}:{venue_market_id}":
-                    raise EvidenceConflict(f"catalog market {target_id} has inconsistent identity")
-                if target_id in seen_markets:
-                    raise EvidenceConflict(f"run {run_id} repeats market {target_id}")
-                seen_markets.add(target_id)
-                event_ref = f"{venue}:{venue_event_id}"
-                if event_ref not in known_events:
-                    _issue(
-                        connection,
-                        source_key,
-                        "market_event_missing",
-                        target_id,
-                        event_ref,
-                    )
-                    continue
-                known_markets.add(target_id)
-                market_venues[target_id] = venue
-                subscription_ids = _text_list(
-                    record.get("subscription_ids"), "catalog market subscription_ids"
-                )
-                connection.execute(
-                    """INSERT INTO catalog_markets(
-                           run_id, target_id, event_ref, venue, venue_market_id,
-                           canonical_class, market_type, scope, title,
-                           subscription_ids_json, record_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        run_id,
-                        target_id,
-                        event_ref,
-                        venue,
-                        venue_market_id,
-                        _optional_text(record.get("canonical_class")),
-                        _optional_text(record.get("market_type")),
-                        _optional_text(record.get("scope")),
-                        _optional_text(record.get("title")),
-                        _canonical_json(subscription_ids),
-                        _canonical_json(record),
-                    ),
-                )
-
-            for record in target_record_rows:
-                target_id = _text(record, "target_id", "target record")
-                venue = _text(record, "venue", "target record")
-                if record.get("run_id") != run_id:
-                    raise EvidenceConflict(
-                        f"target record {target_id} names another Targeter run"
-                    )
-                if target_id not in known_markets:
-                    _issue(
-                        connection,
-                        source_key,
-                        "target_record_market_missing",
-                        target_id,
-                        venue,
-                    )
-                    continue
-                if market_venues[target_id] != venue:
-                    raise EvidenceConflict(
-                        f"target record {target_id} is grouped under venue {venue}"
-                    )
-                subscription_ids = _text_list(
-                    record.get("subscription_ids"),
-                    "target record subscription_ids",
-                    allow_empty=True,
-                )
-                raw_record = record.get("record")
-                if not isinstance(raw_record, dict):
-                    raise EvidenceConflict(
-                        f"target record {target_id} raw record is not an object"
-                    )
-                record_sha256 = _text(record, "record_sha256", "target record")
-                computed_sha256 = hashlib.sha256(
-                    _canonical_json(raw_record).encode("utf-8")
-                ).hexdigest()
-                if record_sha256 != computed_sha256:
-                    raise EvidenceConflict(
-                        f"target record {target_id} content hash is invalid"
-                    )
-                connection.execute(
-                    """INSERT INTO target_records(
-                           run_id, target_id, venue, observed_at,
-                           subscription_ids_json, record_sha256, record_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        run_id,
-                        target_id,
-                        venue,
-                        _optional_text(record.get("observed_at")),
-                        _canonical_json(subscription_ids),
-                        record_sha256,
-                        _canonical_json(record),
-                    ),
-                )
-
-            candidates = report_record.get("candidates")
-            if not isinstance(candidates, list):
-                raise EvidenceConflict("Targeter report candidates must be an array")
-            selection = report_record.get("selection")
-            if not isinstance(selection, dict):
-                raise EvidenceConflict("Targeter report selection must be an object")
-            selected_bundle_ids = set(
-                _text_list(selection.get("bundle_ids"), "selected bundle ids", allow_empty=True)
-            )
-            known_bundles: set[str] = set()
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    raise EvidenceConflict("Targeter candidate is not an object")
-                bundle_id = _text(candidate, "bundle_id", "Targeter candidate")
-                if bundle_id in known_bundles:
+            assets_by_venue: dict[str, set[str]] = {}
+            seen_bundles: set[str] = set()
+            for record in records:
+                bundle_id = record["bundle_id"]
+                if bundle_id in seen_bundles:
                     raise EvidenceConflict(f"run {run_id} repeats bundle {bundle_id}")
-                known_bundles.add(bundle_id)
+                seen_bundles.add(bundle_id)
                 connection.execute(
-                    """INSERT INTO event_bundles(
-                           run_id, bundle_id, selected, activation_at, game,
-                           confidence, record_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO selected_bundles(
+                           run_id, bundle_id, sport, game, topology,
+                           activation_at, activation_at_ns,
+                           capture_start_at, capture_start_at_ns,
+                           planned_capture_end_at, planned_capture_end_at_ns,
+                           post_start_retention_seconds
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         run_id,
                         bundle_id,
-                        int(bundle_id in selected_bundle_ids),
-                        _optional_text(candidate.get("activation_at")),
-                        _optional_text(candidate.get("game")),
-                        _optional_text(candidate.get("confidence")),
-                        _canonical_json(candidate),
+                        record["sport"],
+                        record["game"],
+                        record["topology"],
+                        record["activation_at"],
+                        _timestamp_ns(record["activation_at"]),
+                        record["capture_start_at"],
+                        _timestamp_ns(record["capture_start_at"]),
+                        record["planned_capture_end_at"],
+                        _timestamp_ns(record["planned_capture_end_at"]),
+                        record["post_start_retention_seconds"],
                     ),
                 )
-                for event_ref in _text_list(
-                    candidate.get("event_refs"), "candidate event_refs", allow_empty=True
-                ):
-                    if event_ref not in known_events:
-                        _issue(
-                            connection,
-                            source_key,
-                            "bundle_event_missing",
-                            bundle_id,
-                            event_ref,
-                        )
-                        continue
-                    connection.execute(
-                        "INSERT INTO bundle_events(run_id, bundle_id, event_ref) VALUES (?, ?, ?)",
-                        (run_id, bundle_id, event_ref),
-                    )
-                for target_id in _text_list(
-                    candidate.get("market_ids"), "candidate market_ids", allow_empty=True
-                ):
-                    if target_id not in known_markets:
-                        _issue(
-                            connection,
-                            source_key,
-                            "bundle_market_missing",
-                            bundle_id,
-                            target_id,
-                        )
-                        continue
-                    connection.execute(
-                        "INSERT INTO bundle_markets(run_id, bundle_id, target_id) VALUES (?, ?, ?)",
-                        (run_id, bundle_id, target_id),
-                    )
-
-            for missing in sorted(selected_bundle_ids - known_bundles):
-                _issue(
-                    connection,
-                    source_key,
-                    "selected_bundle_missing",
-                    missing,
-                    "selection names no candidate",
+                connection.executemany(
+                    """INSERT INTO bundle_participants(
+                           run_id, bundle_id, position, name, participant_key
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        (run_id, bundle_id, position, name, record["participant_keys"][position])
+                        for position, name in enumerate(record["participants"])
+                    ),
                 )
-
-            targets = selection.get("targets")
-            if not isinstance(targets, dict):
-                raise EvidenceConflict("Targeter selection targets must be an object")
-            assets_by_venue: dict[str, set[str]] = {}
-            for venue, raw_targets in sorted(targets.items()):
-                if not isinstance(venue, str) or not isinstance(raw_targets, list):
-                    raise EvidenceConflict("Targeter selection target group is invalid")
-                for position, raw_target in enumerate(raw_targets):
-                    if not isinstance(raw_target, dict):
-                        raise EvidenceConflict(
-                            f"Targeter selection target {venue}[{position}] is not an object"
-                        )
-                    target_id = _text(raw_target, "target_id", "selection target")
-                    bundle_id = _text(raw_target, "bundle_id", "selection target")
-                    subscription_ids = _text_list(
-                        raw_target.get("subscription_ids"),
-                        "selection target subscription_ids",
-                    )
-                    if target_id not in known_markets:
-                        _issue(
-                            connection,
-                            source_key,
-                            "selected_market_missing",
-                            target_id,
+                connection.executemany(
+                    """INSERT INTO bundle_events(run_id, bundle_id, event_ref, venue)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        (run_id, bundle_id, event_ref, _venue_prefix(event_ref))
+                        for event_ref in record["event_refs"]
+                    ),
+                )
+                connection.executemany(
+                    """INSERT INTO bundle_markets(
+                           run_id, bundle_id, target_id, venue, selected
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        (
+                            run_id,
                             bundle_id,
+                            market["target_id"],
+                            market["venue"],
+                            int(market["selected"]),
                         )
-                        continue
-                    if market_venues[target_id] != venue:
-                        raise EvidenceConflict(
-                            f"selection target {target_id} is grouped under venue {venue}"
-                        )
-                    if bundle_id not in known_bundles:
-                        _issue(
-                            connection,
-                            source_key,
-                            "selected_target_bundle_missing",
-                            target_id,
-                            bundle_id,
-                        )
-                        continue
+                        for market in record["markets"]
+                    ),
+                )
+                for target in record["targets"]:
                     connection.execute(
-                        """INSERT INTO target_selections(
-                               run_id, venue, target_id, bundle_id,
-                               subscription_ids_json
+                        """INSERT INTO selected_targets(
+                               run_id, bundle_id, target_id, venue, canonical_class
                            ) VALUES (?, ?, ?, ?, ?)""",
                         (
                             run_id,
-                            venue,
-                            target_id,
                             bundle_id,
-                            _canonical_json(subscription_ids),
+                            target["target_id"],
+                            target["venue"],
+                            target["canonical_class"],
                         ),
                     )
-                    assets_by_venue.setdefault(venue, set()).update(subscription_ids)
+                    connection.executemany(
+                        """INSERT INTO selected_target_assets(run_id, target_id, asset_id)
+                           VALUES (?, ?, ?)""",
+                        (
+                            (run_id, target["target_id"], asset_id)
+                            for asset_id in target["subscription_ids"]
+                        ),
+                    )
+                    assets_by_venue.setdefault(target["venue"], set()).update(
+                        target["subscription_ids"]
+                    )
+                connection.executemany(
+                    """INSERT INTO bundle_relationships(
+                           run_id, bundle_id, relationship_index,
+                           left_market, right_market, relationship, scope,
+                           left_venue, right_venue, coverage
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        (
+                            run_id,
+                            bundle_id,
+                            position,
+                            relationship["left"],
+                            relationship["right"],
+                            relationship["relationship"],
+                            relationship["scope"],
+                            relationship["left_venue"],
+                            relationship["right_venue"],
+                            relationship["coverage"],
+                        )
+                        for position, relationship in enumerate(
+                            record["relationships"]
+                        )
+                    ),
+                )
 
             for venue, assets in sorted(assets_by_venue.items()):
                 frozen = tuple(Target(asset_id=item) for item in sorted(assets))
@@ -401,14 +284,13 @@ class UniverseStore:
                     (run_id, venue, digest, len(assets)),
                 )
                 connection.executemany(
-                    """INSERT INTO subscription_assets(
-                           run_id, venue, asset_id
-                       ) VALUES (?, ?, ?)""",
+                    """INSERT INTO subscription_assets(run_id, venue, asset_id)
+                       VALUES (?, ?, ?)""",
                     ((run_id, venue, item) for item in sorted(assets)),
                 )
 
             _finish_source(
-                connection, source_key, "targeter_run", source_sha256
+                connection, source_key, "selected_bundle_index", source_sha256
             )
         return "ingested"
 
@@ -465,6 +347,7 @@ class UniverseStore:
                     receipt.lane_id,
                     parsed["delivery_index"],
                     parsed["record_id"],
+                    hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest(),
                     parsed["visible_ns"],
                     parsed["monotonic_ns"],
                     parsed["venue"],
@@ -473,27 +356,26 @@ class UniverseStore:
                     parsed["event"],
                     parsed["target_digest"],
                     parsed["target_metadata_digest"],
-                    _canonical_json(parsed["detail"]),
-                    _canonical_json(envelope),
+                    parsed["target_count"],
                     receipt.key,
                 )
                 try:
                     connection.execute(
                         """INSERT INTO control_records(
-                               lane_id, delivery_index, record_id, visible_ns,
-                               monotonic_ns, venue, connection_epoch, local_counter,
-                               event, target_digest, target_metadata_digest,
-                               detail_json, envelope_json, receipt_key
+                               lane_id, delivery_index, record_id, envelope_sha256,
+                               visible_ns, monotonic_ns, venue, connection_epoch,
+                               local_counter, event, target_digest,
+                               target_metadata_digest, target_count, receipt_key
                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         values,
                     )
                 except sqlite3.IntegrityError as error:
                     existing = connection.execute(
-                        """SELECT envelope_json, receipt_key FROM control_records
+                        """SELECT envelope_sha256, receipt_key FROM control_records
                            WHERE lane_id = ? AND delivery_index = ?""",
                         (receipt.lane_id, parsed["delivery_index"]),
                     ).fetchone()
-                    if existing is None or existing["envelope_json"] != values[12]:
+                    if existing is None or existing["envelope_sha256"] != values[3]:
                         raise EvidenceConflict(
                             f"lane {receipt.lane_id} delivery "
                             f"{parsed['delivery_index']} conflicts with prior evidence"
@@ -628,14 +510,13 @@ class UniverseStore:
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in (
                     "ingest_sources",
-                    "targeter_runs",
-                    "event_bundles",
-                    "catalog_markets",
-                    "target_records",
+                    "targeter_sources",
+                    "selected_bundles",
+                    "bundle_markets",
+                    "selected_targets",
                     "segment_receipts",
                     "control_records",
                     "connection_epochs",
-                    "evidence_issues",
                 )
             }
         return {"status": "ok", "schema_version": version, "counts": counts}
@@ -644,19 +525,24 @@ class UniverseStore:
         bounded = max(1, min(int(limit), 1000))
         with closing(self.connect(readonly=True)) as connection:
             rows = connection.execute(
-                """WITH latest AS (
-                       SELECT eb.bundle_id, MAX(tr.generated_at_ns) AS generated_at_ns
-                       FROM event_bundles eb
-                       JOIN targeter_runs tr USING (run_id)
-                       GROUP BY eb.bundle_id
+                """WITH ranked AS (
+                       SELECT sb.bundle_id, sb.run_id, sb.sport, sb.game,
+                              sb.topology, sb.activation_at, sb.capture_start_at,
+                              sb.planned_capture_end_at, ts.generated_at,
+                              ts.generated_at_ns,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY sb.bundle_id
+                                  ORDER BY ts.generated_at_ns DESC, sb.run_id DESC
+                              ) AS position
+                       FROM selected_bundles sb
+                       JOIN targeter_sources ts USING (run_id)
                    )
-                   SELECT eb.bundle_id, eb.run_id, eb.selected, eb.activation_at,
-                          eb.game, eb.confidence, tr.generated_at
-                   FROM event_bundles eb
-                   JOIN targeter_runs tr USING (run_id)
-                   JOIN latest l ON l.bundle_id = eb.bundle_id
-                                AND l.generated_at_ns = tr.generated_at_ns
-                   ORDER BY tr.generated_at_ns DESC, eb.bundle_id
+                   SELECT bundle_id, run_id, sport, game, topology,
+                          activation_at, capture_start_at,
+                          planned_capture_end_at, generated_at
+                   FROM ranked
+                   WHERE position = 1
+                   ORDER BY generated_at_ns DESC, bundle_id
                    LIMIT ?""",
                 (bounded,),
             ).fetchall()
@@ -665,66 +551,93 @@ class UniverseStore:
     def bundle_detail(self, bundle_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
             bundle = connection.execute(
-                """SELECT eb.*, tr.generated_at, tr.input_complete
-                   FROM event_bundles eb JOIN targeter_runs tr USING (run_id)
-                   WHERE eb.bundle_id = ?
-                   ORDER BY tr.generated_at_ns DESC LIMIT 1""",
+                """SELECT sb.*, ts.generated_at, ts.input_complete,
+                          ts.source_kind, ts.manifest_key, ts.manifest_sha256,
+                          ts.index_key, ts.index_sha256, ts.index_byte_length
+                   FROM selected_bundles sb
+                   JOIN targeter_sources ts USING (run_id)
+                   WHERE sb.bundle_id = ?
+                   ORDER BY ts.generated_at_ns DESC LIMIT 1""",
                 (bundle_id,),
             ).fetchone()
             if bundle is None:
                 return None
             run_id = bundle["run_id"]
+            participants = connection.execute(
+                """SELECT position, name, participant_key FROM bundle_participants
+                   WHERE run_id = ? AND bundle_id = ? ORDER BY position""",
+                (run_id, bundle_id),
+            ).fetchall()
             events = connection.execute(
-                """SELECT ce.record_json FROM bundle_events be
-                   JOIN catalog_events ce USING (run_id, event_ref)
-                   WHERE be.run_id = ? AND be.bundle_id = ?
-                   ORDER BY ce.event_ref""",
+                """SELECT event_ref, venue FROM bundle_events
+                   WHERE run_id = ? AND bundle_id = ? ORDER BY event_ref""",
                 (run_id, bundle_id),
             ).fetchall()
             markets = connection.execute(
-                """SELECT cm.record_json, tr.record_json AS target_record_json,
-                          CASE WHEN ts.target_id IS NULL THEN 0 ELSE 1 END AS selected
+                """SELECT bm.target_id, bm.venue, bm.selected,
+                          st.canonical_class
                    FROM bundle_markets bm
-                   JOIN catalog_markets cm USING (run_id, target_id)
-                   LEFT JOIN target_records tr
-                     ON tr.run_id = bm.run_id AND tr.target_id = bm.target_id
-                   LEFT JOIN target_selections ts
-                     ON ts.run_id = bm.run_id AND ts.target_id = bm.target_id
+                   LEFT JOIN selected_targets st
+                     ON st.run_id = bm.run_id AND st.target_id = bm.target_id
                    WHERE bm.run_id = ? AND bm.bundle_id = ?
-                   ORDER BY cm.target_id""",
+                   ORDER BY bm.target_id""",
+                (run_id, bundle_id),
+            ).fetchall()
+            relationships = connection.execute(
+                """SELECT left_market, right_market, relationship, scope,
+                          left_venue, right_venue, coverage
+                   FROM bundle_relationships
+                   WHERE run_id = ? AND bundle_id = ?
+                   ORDER BY relationship_index""",
                 (run_id, bundle_id),
             ).fetchall()
             subscriptions = self._bundle_subscriptions(connection, run_id, bundle_id)
-            issues = connection.execute(
-                """SELECT code, subject, detail FROM evidence_issues
-                   WHERE source_key = (SELECT source_key FROM targeter_runs WHERE run_id = ?)
-                     AND (subject = ? OR detail = ?)
-                   ORDER BY code, subject""",
-                (run_id, bundle_id, bundle_id),
-            ).fetchall()
-        record = json.loads(bundle["record_json"])
+            market_records: list[dict[str, Any]] = []
+            for market in markets:
+                assets = connection.execute(
+                    """SELECT asset_id FROM selected_target_assets
+                       WHERE run_id = ? AND target_id = ? ORDER BY asset_id""",
+                    (run_id, market["target_id"]),
+                ).fetchall()
+                market_records.append(
+                    {
+                        **_row_record(market),
+                        "selected": bool(market["selected"]),
+                        "subscription_ids": [item["asset_id"] for item in assets],
+                    }
+                )
         return {
-            "bundle": record,
+            "bundle": {
+                key: bundle[key]
+                for key in (
+                    "bundle_id",
+                    "sport",
+                    "game",
+                    "topology",
+                    "activation_at",
+                    "capture_start_at",
+                    "planned_capture_end_at",
+                    "post_start_retention_seconds",
+                )
+            },
             "run": {
                 "run_id": run_id,
                 "generated_at": bundle["generated_at"],
                 "input_complete": bool(bundle["input_complete"]),
             },
-            "events": [json.loads(row["record_json"]) for row in events],
-            "markets": [
-                {
-                    **json.loads(row["record_json"]),
-                    "selected": bool(row["selected"]),
-                    "target_record": (
-                        json.loads(row["target_record_json"])
-                        if row["target_record_json"] is not None
-                        else None
-                    ),
-                }
-                for row in markets
-            ],
+            "participants": [_row_record(row) for row in participants],
+            "events": [_row_record(row) for row in events],
+            "markets": market_records,
+            "relationships": [_row_record(row) for row in relationships],
             "subscriptions": subscriptions,
-            "issues": [_row_record(row) for row in issues],
+            "source": {
+                "kind": bundle["source_kind"],
+                "manifest_key": bundle["manifest_key"],
+                "manifest_sha256": bundle["manifest_sha256"],
+                "index_key": bundle["index_key"],
+                "index_sha256": bundle["index_sha256"],
+                "index_byte_length": bundle["index_byte_length"],
+            },
         }
 
     def _bundle_subscriptions(
@@ -732,9 +645,9 @@ class UniverseStore:
     ) -> list[dict[str, Any]]:
         sets = connection.execute(
             """SELECT DISTINCT ss.venue, ss.target_digest, ss.asset_count
-               FROM target_selections ts
+               FROM selected_targets st
                JOIN subscription_sets ss USING (run_id, venue)
-               WHERE ts.run_id = ? AND ts.bundle_id = ?
+               WHERE st.run_id = ? AND st.bundle_id = ?
                ORDER BY ss.venue""",
             (run_id, bundle_id),
         ).fetchall()
@@ -791,6 +704,28 @@ class UniverseStore:
         with closing(self.connect(readonly=True)) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_row_record(row) for row in rows]
+
+    def segments_for_bundle(
+        self, bundle_id: str, *, lane_id: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        """Return archived segments overlapping the latest selected bundle window."""
+        with closing(self.connect(readonly=True)) as connection:
+            bounds = connection.execute(
+                """SELECT sb.capture_start_at_ns, sb.planned_capture_end_at_ns
+                   FROM selected_bundles sb
+                   JOIN targeter_sources ts USING (run_id)
+                   WHERE sb.bundle_id = ?
+                   ORDER BY ts.generated_at_ns DESC, sb.run_id DESC
+                   LIMIT 1""",
+                (bundle_id,),
+            ).fetchone()
+        if bounds is None:
+            return None
+        return self.overlapping_segments(
+            start_ns=bounds["capture_start_at_ns"],
+            end_ns=bounds["planned_capture_end_at_ns"],
+            lane_id=lane_id,
+        )
 
     def overlapping_epochs(
         self,
@@ -886,19 +821,173 @@ def _finish_source(
     )
 
 
-def _issue(
-    connection: sqlite3.Connection,
-    source_key: str,
-    code: str,
-    subject: str,
-    detail: str,
-) -> None:
-    connection.execute(
-        """INSERT OR IGNORE INTO evidence_issues(
-               source_key, code, subject, detail
-           ) VALUES (?, ?, ?, ?)""",
-        (source_key, code, subject, detail),
+def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "selected_bundle_index_version",
+        "run_id",
+        "generated_at",
+        "input_complete",
+        "strategy_version",
+        "post_start_retention_seconds",
+        "bundle_id",
+        "sport",
+        "game",
+        "topology",
+        "participants",
+        "participant_keys",
+        "activation_at",
+        "capture_start_at",
+        "planned_capture_end_at",
+        "event_refs",
+        "markets",
+        "targets",
+        "relationships",
+    }
+    if set(record) != expected:
+        raise EvidenceConflict("selected bundle index row fields are invalid")
+    if record["selected_bundle_index_version"] != SELECTED_BUNDLE_INDEX_VERSION:
+        raise EvidenceConflict("unsupported selected bundle index version")
+    for field in (
+        "run_id",
+        "generated_at",
+        "bundle_id",
+        "sport",
+        "activation_at",
+        "capture_start_at",
+        "planned_capture_end_at",
+    ):
+        _text(record, field, "selected bundle")
+    if not isinstance(record["input_complete"], bool):
+        raise EvidenceConflict("selected bundle input_complete must be boolean")
+    for field in ("strategy_version", "post_start_retention_seconds"):
+        value = record[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise EvidenceConflict(f"selected bundle {field} must be positive")
+    for field in ("game", "topology"):
+        value = record[field]
+        if value is not None and (not isinstance(value, str) or not value):
+            raise EvidenceConflict(f"selected bundle {field} is invalid")
+    participants = _text_list(record["participants"], "selected bundle participants")
+    participant_keys = _text_list(
+        record["participant_keys"], "selected bundle participant_keys"
     )
+    if len(participants) != 2 or len(participant_keys) != 2:
+        raise EvidenceConflict("selected bundle must contain two participants")
+    event_refs = _text_list(
+        record["event_refs"], "selected bundle event_refs"
+    )
+
+    markets = record["markets"]
+    if not isinstance(markets, list) or not markets:
+        raise EvidenceConflict("selected bundle markets must be a non-empty array")
+    parsed_markets: list[dict[str, Any]] = []
+    market_ids: set[str] = set()
+    selected_market_ids: set[str] = set()
+    for market in markets:
+        if not isinstance(market, dict) or set(market) != {
+            "target_id",
+            "venue",
+            "selected",
+        }:
+            raise EvidenceConflict("selected bundle market fields are invalid")
+        target_id = _text(market, "target_id", "selected bundle market")
+        venue = _text(market, "venue", "selected bundle market")
+        if _venue_prefix(target_id) != venue or target_id in market_ids:
+            raise EvidenceConflict(f"selected bundle market {target_id} is invalid")
+        if not isinstance(market["selected"], bool):
+            raise EvidenceConflict(f"selected bundle market {target_id} selected is invalid")
+        market_ids.add(target_id)
+        if market["selected"]:
+            selected_market_ids.add(target_id)
+        parsed_markets.append(
+            {"target_id": target_id, "venue": venue, "selected": market["selected"]}
+        )
+
+    targets = record["targets"]
+    if not isinstance(targets, list) or not targets:
+        raise EvidenceConflict("selected bundle targets must be a non-empty array")
+    parsed_targets: list[dict[str, Any]] = []
+    target_ids: set[str] = set()
+    for target in targets:
+        if not isinstance(target, dict) or set(target) != {
+            "venue",
+            "target_id",
+            "canonical_class",
+            "subscription_ids",
+        }:
+            raise EvidenceConflict("selected bundle target fields are invalid")
+        target_id = _text(target, "target_id", "selected bundle target")
+        venue = _text(target, "venue", "selected bundle target")
+        canonical_class = _text(
+            target, "canonical_class", "selected bundle target"
+        )
+        assets = _text_list(
+            target["subscription_ids"], "selected bundle target subscription_ids"
+        )
+        if (
+            _venue_prefix(target_id) != venue
+            or target_id in target_ids
+            or target_id not in selected_market_ids
+        ):
+            raise EvidenceConflict(f"selected bundle target {target_id} is invalid")
+        target_ids.add(target_id)
+        parsed_targets.append(
+            {
+                "venue": venue,
+                "target_id": target_id,
+                "canonical_class": canonical_class,
+                "subscription_ids": assets,
+            }
+        )
+    if target_ids != selected_market_ids:
+        raise EvidenceConflict("selected bundle markets and targets disagree")
+
+    relationships = record["relationships"]
+    if not isinstance(relationships, list):
+        raise EvidenceConflict("selected bundle relationships must be an array")
+    relationship_fields = {
+        "left",
+        "right",
+        "relationship",
+        "scope",
+        "left_venue",
+        "right_venue",
+        "coverage",
+    }
+    parsed_relationships: list[dict[str, str]] = []
+    for relationship in relationships:
+        if not isinstance(relationship, dict) or set(relationship) != relationship_fields:
+            raise EvidenceConflict("selected bundle relationship fields are invalid")
+        parsed_relationships.append(
+            {
+                field: _text(relationship, field, "selected bundle relationship")
+                for field in relationship_fields
+            }
+        )
+
+    activation_ns = _timestamp_ns(record["activation_at"])
+    start_ns = _timestamp_ns(record["capture_start_at"])
+    end_ns = _timestamp_ns(record["planned_capture_end_at"])
+    if start_ns >= activation_ns or end_ns <= activation_ns:
+        raise EvidenceConflict("selected bundle capture bounds are invalid")
+    if end_ns - activation_ns != record["post_start_retention_seconds"] * 1_000_000_000:
+        raise EvidenceConflict("selected bundle planned end disagrees with retention policy")
+    return {
+        **record,
+        "participants": participants,
+        "participant_keys": participant_keys,
+        "event_refs": event_refs,
+        "markets": parsed_markets,
+        "targets": parsed_targets,
+        "relationships": parsed_relationships,
+    }
+
+
+def _venue_prefix(reference: str) -> str:
+    venue, separator, identifier = reference.partition(":")
+    if not separator or not venue or not identifier:
+        raise EvidenceConflict(f"reference has no venue prefix: {reference!r}")
+    return venue
 
 
 def _control_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -928,6 +1017,13 @@ def _control_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(detail, dict):
         raise EvidenceConflict("control envelope payload is not an object")
     event = _text(detail, "event", "control payload")
+    target_count = detail.get("target_count")
+    if target_count is not None and (
+        not isinstance(target_count, int)
+        or isinstance(target_count, bool)
+        or target_count < 0
+    ):
+        raise EvidenceConflict("control target_count must be a non-negative integer")
     return {
         **integers,
         "monotonic_ns": monotonic,
@@ -937,7 +1033,7 @@ def _control_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
         "event": event,
         "target_digest": _optional_text(detail.get("target_digest")),
         "target_metadata_digest": _optional_text(detail.get("target_metadata_digest")),
-        "detail": detail,
+        "target_count": target_count,
     }
 
 
@@ -949,7 +1045,13 @@ def _timestamp_ns(value: str) -> int:
         raise EvidenceConflict(f"invalid timestamp {value!r}") from error
     if parsed.tzinfo is None:
         raise EvidenceConflict(f"timestamp {value!r} has no timezone")
-    return int(parsed.timestamp() * 1_000_000_000)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed.astimezone(timezone.utc) - epoch
+    return (
+        delta.days * 86_400_000_000_000
+        + delta.seconds * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
 
 
 def _text(record: Mapping[str, Any], field: str, label: str) -> str:
@@ -988,197 +1090,3 @@ def _canonical_json(value: Any) -> str:
 
 def _row_record(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
-
-
-_SCHEMA_V1 = """
-CREATE TABLE ingest_sources (
-    source_key TEXT PRIMARY KEY,
-    source_type TEXT NOT NULL,
-    identity_sha256 TEXT NOT NULL,
-    ingested_at_ns INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE checkpoints (
-    name TEXT PRIMARY KEY,
-    cursor TEXT NOT NULL,
-    updated_at_ns INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE targeter_runs (
-    run_id TEXT PRIMARY KEY,
-    source_key TEXT NOT NULL UNIQUE REFERENCES ingest_sources(source_key) DEFERRABLE INITIALLY DEFERRED,
-    generated_at TEXT NOT NULL,
-    generated_at_ns INTEGER NOT NULL,
-    input_complete INTEGER NOT NULL CHECK(input_complete IN (0, 1)),
-    report_json TEXT NOT NULL
-) STRICT;
-
-CREATE TABLE catalog_events (
-    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    event_ref TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    venue_event_id TEXT NOT NULL,
-    title TEXT,
-    sport TEXT,
-    league TEXT,
-    game TEXT,
-    activation_at TEXT,
-    record_json TEXT NOT NULL,
-    PRIMARY KEY(run_id, event_ref)
-) STRICT;
-
-CREATE TABLE catalog_markets (
-    run_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    event_ref TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    venue_market_id TEXT NOT NULL,
-    canonical_class TEXT,
-    market_type TEXT,
-    scope TEXT,
-    title TEXT,
-    subscription_ids_json TEXT NOT NULL,
-    record_json TEXT NOT NULL,
-    PRIMARY KEY(run_id, target_id),
-    FOREIGN KEY(run_id, event_ref) REFERENCES catalog_events(run_id, event_ref) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE event_bundles (
-    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    bundle_id TEXT NOT NULL,
-    selected INTEGER NOT NULL CHECK(selected IN (0, 1)),
-    activation_at TEXT,
-    game TEXT,
-    confidence TEXT,
-    record_json TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id)
-) STRICT;
-
-CREATE TABLE target_records (
-    run_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    observed_at TEXT,
-    subscription_ids_json TEXT NOT NULL,
-    record_sha256 TEXT,
-    record_json TEXT NOT NULL,
-    PRIMARY KEY(run_id, target_id),
-    FOREIGN KEY(run_id, target_id) REFERENCES catalog_markets(run_id, target_id) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE bundle_events (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
-    event_ref TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id, event_ref),
-    FOREIGN KEY(run_id, bundle_id) REFERENCES event_bundles(run_id, bundle_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_id, event_ref) REFERENCES catalog_events(run_id, event_ref) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE bundle_markets (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id, target_id),
-    FOREIGN KEY(run_id, bundle_id) REFERENCES event_bundles(run_id, bundle_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_id, target_id) REFERENCES catalog_markets(run_id, target_id) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE target_selections (
-    run_id TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
-    subscription_ids_json TEXT NOT NULL,
-    PRIMARY KEY(run_id, target_id),
-    FOREIGN KEY(run_id, target_id) REFERENCES catalog_markets(run_id, target_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_id, bundle_id) REFERENCES event_bundles(run_id, bundle_id) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE subscription_sets (
-    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    venue TEXT NOT NULL,
-    target_digest TEXT NOT NULL,
-    asset_count INTEGER NOT NULL,
-    PRIMARY KEY(run_id, venue)
-) STRICT;
-CREATE INDEX subscription_sets_digest ON subscription_sets(venue, target_digest);
-
-CREATE TABLE subscription_assets (
-    run_id TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    asset_id TEXT NOT NULL,
-    PRIMARY KEY(run_id, venue, asset_id),
-    FOREIGN KEY(run_id, venue) REFERENCES subscription_sets(run_id, venue) ON DELETE CASCADE
-) STRICT;
-
-CREATE TABLE segment_receipts (
-    receipt_key TEXT PRIMARY KEY,
-    lane_id TEXT NOT NULL,
-    segment_id TEXT NOT NULL,
-    segment_index INTEGER NOT NULL,
-    window_start_ns INTEGER NOT NULL,
-    window_end_ns INTEGER NOT NULL,
-    data_key TEXT NOT NULL UNIQUE,
-    control_key TEXT NOT NULL UNIQUE,
-    control_sha256 TEXT NOT NULL,
-    control_byte_length INTEGER NOT NULL,
-    control_line_count INTEGER NOT NULL,
-    published_at_ns INTEGER NOT NULL,
-    UNIQUE(lane_id, segment_id)
-) STRICT;
-CREATE INDEX segment_interval ON segment_receipts(window_start_ns, window_end_ns, lane_id);
-
-CREATE TABLE control_records (
-    lane_id TEXT NOT NULL,
-    delivery_index INTEGER NOT NULL,
-    record_id TEXT NOT NULL,
-    visible_ns INTEGER NOT NULL,
-    monotonic_ns INTEGER,
-    venue TEXT NOT NULL,
-    connection_epoch TEXT NOT NULL,
-    local_counter INTEGER NOT NULL,
-    event TEXT NOT NULL,
-    target_digest TEXT,
-    target_metadata_digest TEXT,
-    detail_json TEXT NOT NULL,
-    envelope_json TEXT NOT NULL,
-    receipt_key TEXT NOT NULL REFERENCES segment_receipts(receipt_key),
-    PRIMARY KEY(lane_id, delivery_index),
-    UNIQUE(record_id)
-) STRICT;
-CREATE INDEX controls_epoch ON control_records(lane_id, connection_epoch, delivery_index);
-
-CREATE TABLE connection_epochs (
-    lane_id TEXT NOT NULL,
-    connection_epoch TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    predecessor_epoch TEXT,
-    first_delivery_index INTEGER NOT NULL,
-    last_delivery_index INTEGER NOT NULL,
-    observed_start_ns INTEGER NOT NULL,
-    observed_end_ns INTEGER,
-    socket_status TEXT NOT NULL,
-    socket_opened_delivery_index INTEGER,
-    send_status TEXT NOT NULL,
-    send_completed_delivery_index INTEGER,
-    venue_acceptance_status TEXT NOT NULL,
-    venue_acceptance_delivery_index INTEGER,
-    close_status TEXT NOT NULL,
-    closed_delivery_index INTEGER,
-    target_digest TEXT,
-    target_digest_status TEXT NOT NULL,
-    target_metadata_digest TEXT,
-    PRIMARY KEY(lane_id, connection_epoch)
-) STRICT;
-CREATE INDEX epochs_digest ON connection_epochs(venue, target_digest);
-CREATE INDEX epochs_interval ON connection_epochs(observed_start_ns, observed_end_ns, lane_id);
-
-CREATE TABLE evidence_issues (
-    source_key TEXT NOT NULL,
-    code TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    detail TEXT NOT NULL,
-    PRIMARY KEY(source_key, code, subject, detail)
-) STRICT;
-"""
