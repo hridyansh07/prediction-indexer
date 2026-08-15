@@ -18,6 +18,7 @@ from archive.storage.base import ObjectStoreError
 from archive.storage.factory import add_store_arguments, build_store
 from analysis.storage import write_json_zstd, write_ndjson, write_ndjson_zstd
 from encoder import DEFAULT_ZSTD_LEVEL, encoder_version, logical_identity_of, stored_identity_of
+from targeter.targets import TargetsError
 from targeter.v2.adapters import durable_client, live_adapters
 from targeter.v2.continuity import (
     ContinuityBundle,
@@ -130,7 +131,7 @@ def _continuity_for_run(
         return (), [], None
     try:
         bundles = load_continuity_bundles(pointer)
-    except ContinuityError as error:
+    except (ContinuityError, TargetsError) as error:
         run_id = read_publication_pointer(live_root)
         run_ns = parse_run_id_ns(run_id)
         age_seconds = (

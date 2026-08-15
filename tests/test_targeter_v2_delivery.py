@@ -4,6 +4,7 @@ import json
 import hashlib
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -583,6 +584,72 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 self.store,
                 live_root=self.live_root,
                 strategy=self.strategy,
+                now=later,
+            )
+
+    def test_budget_trimming_cannot_publish_an_empty_generation(self) -> None:
+        polymarket = snapshot("polymarket", "p", "pm")
+        polymarket = CatalogSnapshot(
+            polymarket.venue,
+            polymarket.events,
+            (replace(polymarket.markets[0], subscription_ids=("pm-yes", "pm-no")),),
+        )
+        first = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=NOW,
+            adapters=(
+                _Adapter(snapshot("kalshi", "k", "km")),
+                _Adapter(polymarket),
+                _Adapter(CatalogSnapshot("limitless", (), ())),
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        first_receipt = archive_run(first.directory, self.store, now=NOW)
+        publish_run(
+            first.directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        constrained = replace(
+            self.strategy,
+            target_budgets={"kalshi": 1, "polymarket": 1, "limitless": 1},
+        )
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=constrained,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        self.assertEqual(second.selection.as_record()["selection"]["bundle_count"], 0)
+        self.assertEqual(
+            set(second.selection.continuity_dispositions.values()),
+            {"continuity_budget_trimmed"},
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "empty target selections"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=constrained,
                 now=later,
             )
 

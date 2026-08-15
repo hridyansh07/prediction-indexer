@@ -205,6 +205,8 @@ score, then by additive candidates in ordinary rank order. Scoring and
 Held or retained bundles cannot be displaced by an additive candidate. If the
 protected floor itself exceeds a reduced budget or bundle limit, its lowest-score
 bundles are trimmed atomically and reported as `continuity_budget_trimmed`.
+Budget trimming alone cannot authorize an empty generation; that requires every
+prior bundle to be all-terminal or clamped, or explicit human review.
 
 ### 3.2 It can never admit
 
@@ -227,16 +229,17 @@ still advance normally.
 ### 3.4 Degradation
 
 The atomic publication pointer and generation remain the authority. A missing
-pointer means no generation has been published yet. An unreadable or corrupt
-pointer/generation fails closed and cannot be replaced automatically.
+pointer means no generation has been published yet. An unreadable pointer fails
+closed because its run identity and age cannot be established.
 
-If the generation is valid but lacks continuity metadata, publication fails
-closed while it is younger than `continuity_degraded_after_seconds` (default
-14,400, half the clamp). After that timeout the run may proceed without a hold.
-The report records that generation's exact run id, and publication rechecks the
-current pointer and timeout before accepting the degraded run. This compatibility
-path is for older valid generations, not for an unavailable live volume or a
-failed integrity check.
+If the named generation lacks continuity metadata or fails target-generation
+validation, discovery fails closed while it is younger than
+`continuity_degraded_after_seconds` (default 14,400, half the clamp). After that
+timeout the run may proceed without a hold. The report records that generation's
+exact run id, and publication rechecks the current pointer, failure, and timeout
+before accepting the degraded run. This prevents one corrupt generation from
+blocking every subsequent scheduled discovery forever; failed live-volume input
+still cannot use this compatibility path.
 
 ### 3.5 Fresh-retention and terminal-clamp times are separate
 

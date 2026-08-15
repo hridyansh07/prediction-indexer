@@ -512,7 +512,7 @@ def _targets_from_report(
         and bool(continuity_by_bundle)
         and set(dispositions) == set(continuity_by_bundle)
         and all(
-            reason in {"all_markets_terminal", "terminal_clamp_elapsed", "continuity_budget_trimmed"}
+            reason in {"all_markets_terminal", "terminal_clamp_elapsed"}
             for reason in dispositions.values()
         )
     )
@@ -557,7 +557,7 @@ def _verify_continuity_base(
         return
     try:
         expected = load_continuity_bundles(pointer)
-    except ContinuityError as error:
+    except (ContinuityError, TargetsError) as error:
         current_run_id = read_publication_pointer(live_root)
         generated_at = parse_timestamp(report.get("generated_at"))
         current_run_ns = parse_run_id_ns(current_run_id)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from targeter.targets import TargetsError
 from targeter.v2.adapters import (
     KalshiSportsAdapter,
     LimitlessSportsAdapter,
@@ -1240,6 +1241,49 @@ class RulesAndSelectionTests(unittest.TestCase):
             {"committed-kalshi", "committed-polymarket"},
         )
 
+    def test_past_post_start_retention_rejects_only_fresh_admission(self) -> None:
+        catalogs = (
+            snapshot("kalshi", "k", "km"),
+            snapshot("polymarket", "p", "pm"),
+        )
+        fresh = select_targets(catalogs, strategy=self.strategy, now=NOW)
+        candidate = fresh.selected[0]
+        prior = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id=candidate.bundle.bundle_id,
+            activation_at=candidate.bundle.activation_at,
+            score=candidate.score,
+            targets=tuple(
+                ContinuityTarget(
+                    target_id=market.target_id,
+                    venue=market.venue,
+                    venue_market_id=market.venue_market_id,
+                    canonical_class=market.canonical_class,
+                    subscription_ids=market.subscription_ids,
+                    activation_at=candidate.bundle.activation_at,
+                    capture_start_at=candidate.capture_start_at,
+                    source_ref=market.source_ref,
+                    probe=TerminalProbe("open", "accepting_orders"),
+                )
+                for market in candidate.eligible_markets
+            ),
+        )
+
+        later = candidate.bundle.activation_at + timedelta(hours=7)
+        result = select_targets(
+            catalogs,
+            strategy=self.strategy,
+            now=later,
+            continuity_bundles=(prior,),
+        )
+
+        current = next(
+            item for item in result.candidates if item.bundle.bundle_id == prior.bundle_id
+        )
+        self.assertIn("past_post_start_retention", current.rejection_reasons)
+        self.assertEqual(result.as_record()["selection"]["bundle_ids"], [prior.bundle_id])
+        self.assertEqual(result.continuity_dispositions[prior.bundle_id], "retained")
+
     def test_retained_bundle_retires_only_when_all_legs_terminal_or_clamped(self) -> None:
         def continuity(*states: str, activation: datetime = NOW) -> ContinuityBundle:
             return ContinuityBundle(
@@ -1323,10 +1367,55 @@ class RulesAndSelectionTests(unittest.TestCase):
 
 
 class ShadowRunTests(unittest.TestCase):
+    def test_old_corrupt_generation_still_writes_a_discovery_report(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+
+        class Adapter:
+            def __init__(self, venue: str) -> None:
+                self.venue = venue
+
+            def discover(self, _client, *, now):
+                return CatalogSnapshot(self.venue, (), ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_root = root / "live"
+            pointer = live_root / "targeter-v2" / "current.json"
+            pointer.parent.mkdir(parents=True)
+            pointer.write_text(
+                json.dumps({"run_id": "20260803T070000.000000Z"}),
+                encoding="utf-8",
+            )
+            with patch(
+                "targeter.v2.run.load_continuity_bundles",
+                side_effect=TargetsError("committed target identity mismatch"),
+            ):
+                result = run_shadow(
+                    strategy=strategy,
+                    output_root=root / "runs",
+                    cache_root=root / "cache",
+                    live_root=live_root,
+                    now=NOW,
+                    adapters=tuple(Adapter(venue) for venue in SUPPORTED_VENUES),
+                    client=object(),
+                    artifact_format="ndjson",
+                )
+
+            report = read_run_report(result.directory)
+            self.assertTrue(report["input_complete"])
+            self.assertEqual(
+                report["continuity_diagnostics"],
+                ["continuity_degraded_after_timeout: committed target identity mismatch"],
+            )
+            self.assertEqual(
+                report["continuity_degraded_base_run_id"],
+                "20260803T070000.000000Z",
+            )
+
     def test_unreadable_recent_continuity_fails_closed_but_degrades_after_timeout(self) -> None:
         strategy = load_strategy(STRATEGY_PATH)
 
-        def attempt(run_age: timedelta):
+        def attempt(run_age: timedelta, error: Exception):
             with tempfile.TemporaryDirectory() as directory:
                 live_root = Path(directory)
                 pointer = live_root / "targeter-v2" / "current.json"
@@ -1336,7 +1425,7 @@ class ShadowRunTests(unittest.TestCase):
                 pointer.write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
                 with patch(
                     "targeter.v2.run.load_continuity_bundles",
-                    side_effect=ContinuityError("missing continuity metadata"),
+                    side_effect=error,
                 ):
                     return _continuity_for_run(
                         live_root=live_root,
@@ -1347,14 +1436,26 @@ class ShadowRunTests(unittest.TestCase):
                     )
 
         with self.assertRaisesRegex(ContinuityError, "missing continuity metadata"):
-            attempt(timedelta(hours=3))
-        bundles, diagnostics, degraded_base_run_id = attempt(timedelta(hours=5))
+            attempt(timedelta(hours=3), ContinuityError("missing continuity metadata"))
+        bundles, diagnostics, degraded_base_run_id = attempt(
+            timedelta(hours=5), ContinuityError("missing continuity metadata")
+        )
         self.assertEqual(bundles, ())
         self.assertEqual(
             diagnostics,
             ["continuity_degraded_after_timeout: missing continuity metadata"],
         )
         self.assertEqual(degraded_base_run_id, "20260803T070000.000000Z")
+
+        corrupt_bundles, corrupt_diagnostics, corrupt_base_run_id = attempt(
+            timedelta(hours=5), TargetsError("committed target identity mismatch")
+        )
+        self.assertEqual(corrupt_bundles, ())
+        self.assertEqual(
+            corrupt_diagnostics,
+            ["continuity_degraded_after_timeout: committed target identity mismatch"],
+        )
+        self.assertEqual(corrupt_base_run_id, "20260803T070000.000000Z")
 
     def test_raw_response_cache_control_is_explicit_and_incompatible_with_reuse(self) -> None:
         arguments = parse_args(["--no-response-cache"])
