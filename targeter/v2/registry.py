@@ -71,6 +71,9 @@ class Strategy:
     minimum_market_age_seconds: int
     minimum_combined_moneyline_volume_usd: float
     post_start_retention_seconds: int
+    terminal_clamp_seconds: int
+    continuity_degraded_after_seconds: int
+    continuity_hold_enabled: bool
     maximum_bundles: int
     target_budgets: Mapping[str, int]
     polymarket_tags: tuple[str, ...]
@@ -354,11 +357,23 @@ def load_strategy(path: Path) -> Strategy:
         "pre_event_seconds", "run_interval_seconds", "subscription_guard_seconds",
         "event_time_tolerance_seconds", "minimum_market_age_seconds",
         "minimum_combined_moneyline_volume_usd", "post_start_retention_seconds",
-        "maximum_bundles",
+        "terminal_clamp_seconds", "continuity_degraded_after_seconds",
+        "continuity_hold_enabled", "maximum_bundles",
     }
     unknown_selection = sorted(set(selection) - allowed_selection)
     if unknown_selection:
         raise StrategyError(f"unknown selection fields: {', '.join(unknown_selection)}")
+    continuity_hold_enabled = selection.get("continuity_hold_enabled")
+    if not isinstance(continuity_hold_enabled, bool):
+        raise StrategyError("continuity_hold_enabled must be a boolean")
+    terminal_clamp_seconds = _positive_integer(selection, "terminal_clamp_seconds")
+    continuity_degraded_after_seconds = _positive_integer(
+        selection, "continuity_degraded_after_seconds"
+    )
+    if continuity_degraded_after_seconds >= terminal_clamp_seconds:
+        raise StrategyError(
+            "continuity_degraded_after_seconds must be less than terminal_clamp_seconds"
+        )
 
     raw_classes = document.get("market_classes")
     if not isinstance(raw_classes, list) or not raw_classes:
@@ -472,6 +487,9 @@ def load_strategy(path: Path) -> Strategy:
             selection, "minimum_combined_moneyline_volume_usd"
         ),
         post_start_retention_seconds=_positive_integer(selection, "post_start_retention_seconds"),
+        terminal_clamp_seconds=terminal_clamp_seconds,
+        continuity_degraded_after_seconds=continuity_degraded_after_seconds,
+        continuity_hold_enabled=continuity_hold_enabled,
         maximum_bundles=_positive_integer(selection, "maximum_bundles"),
         target_budgets=target_budgets,
         polymarket_tags=tuple(tags),

@@ -9,6 +9,7 @@ so a crash cannot expose a mixture of old and new venue generations.
 from __future__ import annotations
 
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,12 +29,14 @@ from targeter.targets import (
     write_targets,
 )
 from targeter.coverage import CoverageLedger, created_at_of
-from targeter.v2.domain import SUPPORTED_VENUES
+from targeter.v2.continuity import ContinuityError, load_continuity_bundles
+from targeter.v2.domain import SUPPORTED_VENUES, parse_timestamp
 from targeter.v2.registry import Strategy
 from targeter.v2.run_archive import (
     PRODUCTION_RECEIPT_FILE,
     RunArchiveError,
     RunArchiveReceipt,
+    parse_run_id_ns,
     read_run_report,
     read_run_archive_receipt,
     validate_local_run,
@@ -132,7 +135,7 @@ def _selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]
         raise PublicationError(f"cannot read selection report: {error}") from error
     if report.get("run_id") != run_directory.name:
         raise PublicationError("selection report run_id does not match its directory")
-    if report.get("report_version") != 1 or report.get("mode") != "shadow":
+    if report.get("report_version") not in {1, 2} or report.get("mode") != "shadow":
         raise PublicationError("publication requires a phase-5 shadow report")
     if report.get("strategy_version") != strategy.version:
         raise PublicationError("selection report and publication strategy versions differ")
@@ -186,12 +189,203 @@ def _targets_from_report(
         if not isinstance(bundle_id, str) or not bundle_id or bundle_id in candidates_by_bundle:
             raise PublicationError("selection report has invalid or duplicate candidate bundles")
         candidates_by_bundle[bundle_id] = raw_candidate
+    continuity = report.get("continuity", {})
+    if not isinstance(continuity, dict):
+        raise PublicationError("selection report continuity must be an object")
+    raw_continuity_bundles = continuity.get("bundles", [])
+    raw_retained_bundle_ids = continuity.get("retained_bundle_ids", [])
+    dispositions = continuity.get("dispositions", {})
+    if not isinstance(raw_continuity_bundles, list):
+        raise PublicationError("selection report continuity bundles must be an array")
+    if (
+        not isinstance(raw_retained_bundle_ids, list)
+        or not all(isinstance(item, str) and item for item in raw_retained_bundle_ids)
+        or len(raw_retained_bundle_ids) != len(set(raw_retained_bundle_ids))
+        or not isinstance(dispositions, dict)
+        or not all(
+            isinstance(key, str) and key and isinstance(value, str) and value
+            for key, value in dispositions.items()
+        )
+    ):
+        raise PublicationError("selection report continuity state is invalid")
+    continuity_by_bundle: dict[str, dict[str, Any]] = {}
+    continuity_targets: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw_bundle in raw_continuity_bundles:
+        if not isinstance(raw_bundle, dict):
+            raise PublicationError("selection report continuity bundle is not an object")
+        bundle_id = raw_bundle.get("bundle_id")
+        base_run_id = raw_bundle.get("base_run_id")
+        score = raw_bundle.get("score")
+        raw_targets = raw_bundle.get("targets")
+        if (
+            not isinstance(bundle_id, str)
+            or not bundle_id
+            or bundle_id in continuity_by_bundle
+            or not isinstance(base_run_id, str)
+            or not base_run_id
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+            or not isinstance(raw_targets, list)
+            or not raw_targets
+        ):
+            raise PublicationError("selection report has invalid continuity bundle")
+        continuity_by_bundle[bundle_id] = raw_bundle
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, dict):
+                raise PublicationError(f"continuity bundle {bundle_id} has an invalid target")
+            target_id = raw_target.get("target_id")
+            venue = raw_target.get("venue")
+            subscription_ids = raw_target.get("subscription_ids")
+            if (
+                not isinstance(target_id, str)
+                or not target_id
+                or venue not in SUPPORTED_VENUES
+                or not target_id.startswith(str(venue) + ":")
+                or not isinstance(subscription_ids, list)
+                or not subscription_ids
+                or not all(isinstance(item, str) and item for item in subscription_ids)
+                or len(subscription_ids) != len(set(subscription_ids))
+            ):
+                raise PublicationError(f"continuity bundle {bundle_id} has an invalid target id")
+            if (bundle_id, target_id) in continuity_targets:
+                raise PublicationError(f"continuity bundle {bundle_id} repeats a target")
+            continuity_targets[(bundle_id, target_id)] = raw_target
+    retained_bundle_ids = frozenset(raw_retained_bundle_ids)
+    if not retained_bundle_ids <= continuity_by_bundle.keys():
+        raise PublicationError("retained bundle is absent from continuity evidence")
+    if set(dispositions) != set(continuity_by_bundle):
+        raise PublicationError("continuity dispositions do not account for every prior bundle")
+    generated_at = parse_timestamp(report.get("generated_at"))
+    if continuity_by_bundle and generated_at is None:
+        raise PublicationError("selection report has invalid continuity observation time")
+    for bundle_id, bundle in continuity_by_bundle.items():
+        activation_at = parse_timestamp(bundle.get("activation_at"))
+        probes = [
+            target.get("terminal_probe")
+            for target in bundle["targets"]
+        ]
+        if (
+            activation_at is None
+            or any(
+                not isinstance(probe, dict)
+                or probe.get("state") not in {"open", "terminal", "unknown"}
+                or not isinstance(probe.get("reason"), str)
+                or not probe["reason"]
+                for probe in probes
+            )
+        ):
+            raise PublicationError(f"continuity bundle {bundle_id} has invalid terminal probes")
+        clamped = (
+            generated_at is not None
+            and generated_at.timestamp() >= (
+                activation_at.timestamp() + strategy.terminal_clamp_seconds
+            )
+        )
+        all_terminal = all(probe["state"] == "terminal" for probe in probes)
+        disposition = dispositions[bundle_id]
+        expected_retirement = (
+            "terminal_clamp_elapsed"
+            if clamped
+            else "all_markets_terminal"
+            if all_terminal
+            else None
+        )
+        if expected_retirement is not None and disposition != expected_retirement:
+            raise PublicationError(
+                f"continuity bundle {bundle_id} terminal disposition disagrees with its probes"
+            )
+        if expected_retirement is None and disposition in {
+            "all_markets_terminal",
+            "terminal_clamp_elapsed",
+        }:
+            raise PublicationError(
+                f"continuity bundle {bundle_id} terminal disposition disagrees with its probes"
+            )
+        if disposition == "retained" and (
+            bundle_id not in retained_bundle_ids or bundle_id not in bundle_ids
+        ):
+            raise PublicationError(f"continuity bundle {bundle_id} retained disposition was not selected")
+        if disposition == "held_current_candidate" and bundle_id not in bundle_ids:
+            raise PublicationError(f"continuity bundle {bundle_id} held disposition was not selected")
+        if disposition not in {
+            "retained",
+            "held_current_candidate",
+            "continuity_budget_trimmed",
+            "all_markets_terminal",
+            "terminal_clamp_elapsed",
+        }:
+            raise PublicationError(f"continuity bundle {bundle_id} has an invalid disposition")
+
+    protected = sorted(
+        (
+            (-float(bundle["score"]), bundle_id, bundle)
+            for bundle_id, bundle in continuity_by_bundle.items()
+            if dispositions[bundle_id]
+            not in {"all_markets_terminal", "terminal_clamp_elapsed"}
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    budget_used = {venue: 0 for venue in strategy.target_budgets}
+    selected_protected_ids: dict[str, set[str]] = {
+        venue: set() for venue in strategy.target_budgets
+    }
+    expected_trimmed: set[str] = set()
+    protected_count = 0
+    for _negative_score, bundle_id, bundle in protected:
+        increments = {
+            venue: sum(
+                len(target["subscription_ids"])
+                for target in bundle["targets"]
+                if target.get("venue") == venue
+                and target.get("target_id") not in selected_protected_ids[venue]
+            )
+            for venue in strategy.target_budgets
+        }
+        if protected_count >= strategy.maximum_bundles or any(
+            budget_used[venue] + count > strategy.target_budgets[venue]
+            for venue, count in increments.items()
+        ):
+            expected_trimmed.add(bundle_id)
+            continue
+        protected_count += 1
+        for target in bundle["targets"]:
+            venue = target.get("venue")
+            target_id = target.get("target_id")
+            if venue in selected_protected_ids and target_id not in selected_protected_ids[venue]:
+                selected_protected_ids[venue].add(target_id)
+                budget_used[venue] += len(target["subscription_ids"])
+    actual_trimmed = {
+        bundle_id
+        for bundle_id, disposition in dispositions.items()
+        if disposition == "continuity_budget_trimmed"
+    }
+    if actual_trimmed != expected_trimmed:
+        raise PublicationError("continuity budget trimming disagrees with the protected floor")
+
+    selected_continuity_targets = {
+        key: value
+        for key, value in continuity_targets.items()
+        if key[0] in bundle_ids
+    }
     selected_candidate_markets: dict[str, frozenset[str]] = {}
     for bundle_id in bundle_ids:
         candidate = candidates_by_bundle.get(bundle_id)
-        if candidate is None or candidate.get("eligible") is not True:
-            raise PublicationError(f"selected bundle {bundle_id} is not an eligible report candidate")
-        eligible_market_ids = candidate.get("eligible_market_ids")
+        retained = (
+            continuity_by_bundle.get(bundle_id)
+            if bundle_id in retained_bundle_ids
+            else None
+        )
+        if retained is not None:
+            eligible_market_ids = [
+                target.get("target_id") for target in retained.get("targets", [])
+            ]
+        elif candidate is not None and candidate.get("eligible") is True:
+            eligible_market_ids = candidate.get("eligible_market_ids")
+        else:
+            raise PublicationError(
+                f"selected bundle {bundle_id} is neither eligible nor retained"
+            )
         if (
             not isinstance(eligible_market_ids, list)
             or not eligible_market_ids
@@ -235,26 +429,48 @@ def _targets_from_report(
                     f"selection target {venue}[{position}] has invalid subscription_ids"
                 )
             catalog = catalog_markets[venue].get(target_id)
-            if catalog is None:
-                raise PublicationError(f"selection target {target_id!r} is absent from its catalog")
-            if (
-                catalog.get("canonical_class") != canonical_class
-                or catalog.get("subscription_ids") != subscription_ids
-                or catalog.get("source_ref") != raw.get("source_ref")
+            retained_target = selected_continuity_targets.get((bundle_id, target_id))
+            if retained_target is None:
+                if catalog is None:
+                    raise PublicationError(f"selection target {target_id!r} is absent from its catalog")
+                if (
+                    catalog.get("canonical_class") != canonical_class
+                    or catalog.get("subscription_ids") != subscription_ids
+                    or catalog.get("source_ref") != raw.get("source_ref")
+                ):
+                    raise PublicationError(
+                        f"selection target {target_id!r} disagrees with its archived catalog"
+                    )
+                candidate = candidates_by_bundle[bundle_id]
+                if (
+                    raw.get("activation_at") != candidate.get("activation_at")
+                    or raw.get("capture_start_at") != candidate.get("capture_start_at")
+                ):
+                    raise PublicationError(
+                        f"selection target {target_id!r} timing disagrees with its candidate"
+                    )
+            elif (
+                retained_target.get("venue") != venue
+                or retained_target.get("canonical_class") != canonical_class
+                or retained_target.get("subscription_ids") != subscription_ids
+                or retained_target.get("source_ref") != raw.get("source_ref")
+                or retained_target.get("activation_at") != raw.get("activation_at")
+                or retained_target.get("capture_start_at") != raw.get("capture_start_at")
             ):
                 raise PublicationError(
-                    f"selection target {target_id!r} disagrees with its archived catalog"
-                )
-            candidate = candidates_by_bundle[bundle_id]
-            if (
-                raw.get("activation_at") != candidate.get("activation_at")
-                or raw.get("capture_start_at") != candidate.get("capture_start_at")
-            ):
-                raise PublicationError(
-                    f"selection target {target_id!r} timing disagrees with its candidate"
+                    f"selection target {target_id!r} disagrees with retained continuity evidence"
                 )
             bundle_venues[bundle_id].add(venue)
             selected_market_ids[bundle_id].add(target_id)
+            continuity_score = raw.get("continuity_score", 0.0)
+            if (
+                isinstance(continuity_score, bool)
+                or not isinstance(continuity_score, (int, float))
+                or not math.isfinite(float(continuity_score))
+            ):
+                raise PublicationError(
+                    f"selection target {target_id!r} has invalid continuity score"
+                )
             resolution = {
                 "version": 2,
                 "source": "targeter_v2",
@@ -268,6 +484,12 @@ def _targets_from_report(
                 "selection_report_sha256": report_object.stored.sha256,
                 "archive_manifest_key": receipt.manifest.key,
                 "archive_manifest_sha256": receipt.manifest.stored.sha256,
+                "continuity_score": float(continuity_score),
+                "continuity_base_run_id": (
+                    continuity_by_bundle[bundle_id]["base_run_id"]
+                    if bundle_id in continuity_by_bundle
+                    else report["run_id"]
+                ),
             }
             for asset_id in subscription_ids:
                 target = Target(
@@ -284,8 +506,20 @@ def _targets_from_report(
                 seen_assets[asset_id] = target
         by_venue[venue] = sorted(seen_assets.values(), key=lambda item: item.asset_id)
 
-    if not bundle_ids or not any(by_venue.values()):
-        raise PublicationError("empty target selections require explicit human review and are not published")
+    terminal_empty = (
+        not bundle_ids
+        and not any(by_venue.values())
+        and bool(continuity_by_bundle)
+        and set(dispositions) == set(continuity_by_bundle)
+        and all(
+            reason in {"all_markets_terminal", "terminal_clamp_elapsed", "continuity_budget_trimmed"}
+            for reason in dispositions.values()
+        )
+    )
+    if (not bundle_ids or not any(by_venue.values())) and not terminal_empty:
+        raise PublicationError(
+            "empty target selections require terminal continuity evidence or explicit human review"
+        )
     for bundle_id, venues in bundle_venues.items():
         if len(venues) < strategy.minimum_venues:
             raise PublicationError(
@@ -295,9 +529,79 @@ def _targets_from_report(
             raise PublicationError(
                 f"selected bundle {bundle_id} targets do not match its eligible candidate markets"
             )
-    if len({venue for venue, targets in by_venue.items() if targets}) < strategy.minimum_venues:
+    if (
+        not terminal_empty
+        and len({venue for venue, targets in by_venue.items() if targets}) < strategy.minimum_venues
+    ):
         raise PublicationError("publication has fewer than the configured minimum venues")
     return by_venue
+
+
+def _verify_continuity_base(
+    report: Mapping[str, Any], live_root: Path, strategy: Strategy
+) -> None:
+    continuity = report.get("continuity")
+    if isinstance(continuity, dict):
+        observed = continuity.get("bundles")
+    elif report.get("report_version") == 1:
+        observed = []
+    else:
+        observed = None
+    if not isinstance(observed, list):
+        raise PublicationError("selection report continuity bundles must be an array")
+    pointer = publication_pointer_path(live_root)
+    degraded_base_run_id = report.get("continuity_degraded_base_run_id")
+    if not pointer.exists():
+        if observed or degraded_base_run_id is not None:
+            raise PublicationError("selection report claims continuity without a committed generation")
+        return
+    try:
+        expected = load_continuity_bundles(pointer)
+    except ContinuityError as error:
+        current_run_id = read_publication_pointer(live_root)
+        generated_at = parse_timestamp(report.get("generated_at"))
+        current_run_ns = parse_run_id_ns(current_run_id)
+        old_enough = (
+            generated_at is not None
+            and current_run_ns is not None
+            and generated_at.timestamp() - current_run_ns / 1_000_000_000
+            >= strategy.continuity_degraded_after_seconds
+        )
+        if (
+            observed
+            or degraded_base_run_id != current_run_id
+            or not old_enough
+        ):
+            raise PublicationError(
+                "selection report cannot prove its degraded continuity authority"
+            ) from error
+        return
+    if degraded_base_run_id is not None:
+        raise PublicationError("selection report has an unsupported continuity degradation marker")
+
+    def without_probe(bundle: Mapping[str, Any]) -> dict[str, Any]:
+        record = dict(bundle)
+        targets = record.get("targets")
+        if isinstance(targets, list):
+            record["targets"] = [
+                {key: value for key, value in target.items() if key != "terminal_probe"}
+                for target in targets
+                if isinstance(target, dict)
+            ]
+        return record
+
+    observed_records = {
+        str(bundle.get("bundle_id")): without_probe(bundle)
+        for bundle in observed
+        if isinstance(bundle, dict)
+    }
+    expected_records = {
+        bundle.bundle_id: without_probe(bundle.as_record()) for bundle in expected
+    }
+    if observed_records != expected_records:
+        raise PublicationError(
+            "selection report continuity evidence does not match the committed base generation"
+        )
 
 
 @contextmanager
@@ -457,6 +761,7 @@ def publish_run(
     verify_run_archive(store, receipt)
     validate_local_run(run_directory, receipt)
     report = _selection_report(run_directory, strategy)
+    _verify_continuity_base(report, live_root, strategy)
     catalog_markets = _catalog_markets(run_directory, receipt, report)
     targets = _targets_from_report(report, receipt, strategy, catalog_markets)
 

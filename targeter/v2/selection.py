@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
+from targeter.v2.continuity import ContinuityBundle
 from targeter.v2.domain import (
     SUPPORTED_BEST_OF,
     SUPPORTED_VENUES,
@@ -79,22 +80,33 @@ class SelectionResult:
     match_rejections: tuple[MatchRejection, ...]
     candidates: tuple[Candidate, ...]
     selected: tuple[Candidate, ...]
+    retained: tuple[ContinuityBundle, ...]
+    continuity_observed: tuple[ContinuityBundle, ...]
     budget_used: Mapping[str, int]
     targets: Mapping[str, tuple[dict[str, object], ...]]
     allocation_rejections: Mapping[str, str]
+    continuity_dispositions: Mapping[str, str]
 
     def as_record(self) -> dict[str, object]:
         return {
-            "report_version": 1,
+            "report_version": 2,
             "mode": "shadow",
             "generated_at": isoformat(self.generated_at),
             "strategy_version": self.strategy_version,
             "catalogs": list(self.catalog_summaries),
             "match_rejections": [item.as_record() for item in self.match_rejections],
             "candidates": [item.as_record() for item in self.candidates],
+            "continuity": {
+                "bundles": [item.as_record() for item in self.continuity_observed],
+                "retained_bundle_ids": [item.bundle_id for item in self.retained],
+                "dispositions": dict(sorted(self.continuity_dispositions.items())),
+            },
             "selection": {
-                "bundle_ids": [item.bundle.bundle_id for item in self.selected],
-                "bundle_count": len(self.selected),
+                "bundle_ids": [
+                    *[item.bundle.bundle_id for item in self.selected],
+                    *[item.bundle_id for item in self.retained],
+                ],
+                "bundle_count": len(self.selected) + len(self.retained),
                 "budget_used": dict(self.budget_used),
                 "targets": {venue: list(items) for venue, items in sorted(self.targets.items())},
                 "allocation_rejections": dict(sorted(self.allocation_rejections.items())),
@@ -341,6 +353,7 @@ def select_targets(
     *,
     strategy: Strategy,
     now: datetime | None = None,
+    continuity_bundles: Iterable[ContinuityBundle] = (),
 ) -> SelectionResult:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     snapshots = tuple(catalogs)
@@ -355,12 +368,163 @@ def select_targets(
         (candidate for candidate in candidates if candidate.eligible),
         key=_ranking_key,
     )
+    continuity = tuple(continuity_bundles) if strategy.continuity_hold_enabled else ()
+    continuity_dispositions: dict[str, str] = {}
+    protected_by_id: dict[str, ContinuityBundle] = {}
+    for bundle in continuity:
+        if now >= bundle.activation_at + timedelta(seconds=strategy.terminal_clamp_seconds):
+            continuity_dispositions[bundle.bundle_id] = "terminal_clamp_elapsed"
+        elif bundle.all_terminal:
+            continuity_dispositions[bundle.bundle_id] = "all_markets_terminal"
+        else:
+            continuity_dispositions[bundle.bundle_id] = "retained"
+            protected_by_id[bundle.bundle_id] = bundle
+
+    ranked_by_id = {candidate.bundle.bundle_id: candidate for candidate in ranked}
+    held_candidates: list[Candidate] = []
+    retained_bundles: list[ContinuityBundle] = []
+    for bundle_id, bundle in protected_by_id.items():
+        current = ranked_by_id.get(bundle_id)
+        current_targets = (
+            {
+                market.target_id: {
+                    "canonical_class": market.canonical_class,
+                    "subscription_ids": tuple(market.subscription_ids),
+                    "activation_at": current.bundle.activation_at,
+                    "capture_start_at": current.capture_start_at,
+                    "source_ref": market.source_ref,
+                }
+                for market in current.eligible_markets
+            }
+            if current is not None
+            else {}
+        )
+        prior_targets = {
+            target.target_id: {
+                "canonical_class": target.canonical_class,
+                "subscription_ids": target.subscription_ids,
+                "activation_at": target.activation_at,
+                "capture_start_at": target.capture_start_at,
+                "source_ref": target.source_ref,
+            }
+            for target in bundle.targets
+        }
+        if (
+            current is not None
+            and current_targets == prior_targets
+            and not any(target.probe.state == "terminal" for target in bundle.targets)
+        ):
+            held_candidates.append(current)
+            continuity_dispositions[bundle_id] = "held_current_candidate"
+        else:
+            retained_bundles.append(bundle)
+    protected_ids = set(protected_by_id)
+    additive = [
+        candidate
+        for candidate in ranked
+        if candidate.bundle.bundle_id not in protected_ids
+    ]
+
     budget_used = {venue: 0 for venue in strategy.target_budgets}
     selected: list[Candidate] = []
+    selected_retained: list[ContinuityBundle] = []
     selected_target_ids: dict[str, set[str]] = {venue: set() for venue in strategy.target_budgets}
     targets: dict[str, list[dict[str, object]]] = {venue: [] for venue in strategy.target_budgets}
     allocation_rejections: dict[str, str] = {}
-    for position, candidate in enumerate(ranked):
+
+    def candidate_increments(candidate: Candidate) -> dict[str, int]:
+        return {
+            venue: sum(
+                len(market.subscription_ids)
+                for market in candidate.eligible_markets
+                if market.venue == venue and market.target_id not in selected_target_ids[venue]
+            )
+            for venue in strategy.target_budgets
+        }
+
+    def retained_increments(bundle: ContinuityBundle) -> dict[str, int]:
+        return {
+            venue: sum(
+                len(target.subscription_ids)
+                for target in bundle.targets
+                if target.venue == venue and target.target_id not in selected_target_ids[venue]
+            )
+            for venue in strategy.target_budgets
+        }
+
+    def fits(increments: Mapping[str, int]) -> bool:
+        return not any(
+            budget_used[venue] + count > strategy.target_budgets[venue]
+            for venue, count in increments.items()
+        )
+
+    protected: list[tuple[float, str, Candidate | ContinuityBundle]] = [
+        (
+            protected_by_id[candidate.bundle.bundle_id].score,
+            candidate.bundle.bundle_id,
+            candidate,
+        )
+        for candidate in held_candidates
+    ] + [
+        (bundle.score, bundle.bundle_id, bundle) for bundle in retained_bundles
+    ]
+    protected.sort(key=lambda item: (-item[0], item[1]))
+    for _score, bundle_id, item in protected:
+        increments = (
+            candidate_increments(item)
+            if isinstance(item, Candidate)
+            else retained_increments(item)
+        )
+        if not fits(increments) or len(selected) + len(selected_retained) >= strategy.maximum_bundles:
+            allocation_rejections[bundle_id] = "continuity_budget_trimmed"
+            continuity_dispositions[bundle_id] = "continuity_budget_trimmed"
+            continue
+        if isinstance(item, Candidate):
+            selected.append(item)
+            markets = item.eligible_markets
+            for market in markets:
+                if market.target_id in selected_target_ids[market.venue]:
+                    continue
+                selected_target_ids[market.venue].add(market.target_id)
+                budget_used[market.venue] += len(market.subscription_ids)
+                targets[market.venue].append(
+                    {
+                        "target_id": market.target_id,
+                        "bundle_id": bundle_id,
+                        "canonical_class": market.canonical_class,
+                        "subscription_ids": list(market.subscription_ids),
+                        "activation_at": isoformat(item.bundle.activation_at),
+                        "capture_start_at": isoformat(item.capture_start_at),
+                        "source_ref": market.source_ref,
+                        "continuity_score": item.score,
+                    }
+                )
+        else:
+            selected_retained.append(item)
+            for target in item.targets:
+                if target.target_id in selected_target_ids[target.venue]:
+                    continue
+                selected_target_ids[target.venue].add(target.target_id)
+                budget_used[target.venue] += len(target.subscription_ids)
+                targets[target.venue].append(target.as_selection_target(bundle_id, item.score))
+
+    protected_selected = bool(selected or selected_retained)
+    for position, candidate in enumerate(additive):
+        if len(selected) + len(selected_retained) >= strategy.maximum_bundles:
+            allocation_rejections[candidate.bundle.bundle_id] = (
+                "displaced_by_continuity_hold"
+                if protected_selected
+                else "maximum_bundles_reached"
+            )
+            continue
+        if any(
+            market.target_id in selected_target_ids[market.venue]
+            for market in candidate.eligible_markets
+        ):
+            allocation_rejections[candidate.bundle.bundle_id] = (
+                "continuity_identity_collision"
+            )
+            continue
         increments = {
             venue: sum(
                 len(market.subscription_ids)
@@ -369,11 +533,12 @@ def select_targets(
             )
             for venue in strategy.target_budgets
         }
-        if any(
-            budget_used[venue] + count > strategy.target_budgets[venue]
-            for venue, count in increments.items()
-        ):
-            allocation_rejections[candidate.bundle.bundle_id] = "target_budget_exceeded"
+        if not fits(increments):
+            allocation_rejections[candidate.bundle.bundle_id] = (
+                "displaced_by_continuity_hold"
+                if protected_selected
+                else "target_budget_exceeded"
+            )
             continue
         selected.append(candidate)
         for market in candidate.eligible_markets:
@@ -390,11 +555,16 @@ def select_targets(
                     "activation_at": isoformat(candidate.bundle.activation_at),
                     "capture_start_at": isoformat(candidate.capture_start_at),
                     "source_ref": market.source_ref,
+                    "continuity_score": candidate.score,
                 }
             )
-        if len(selected) >= strategy.maximum_bundles:
-            for remaining in ranked[position + 1 :]:
-                allocation_rejections[remaining.bundle.bundle_id] = "maximum_bundles_reached"
+        if len(selected) + len(selected_retained) >= strategy.maximum_bundles:
+            for remaining in additive[position + 1 :]:
+                allocation_rejections[remaining.bundle.bundle_id] = (
+                    "displaced_by_continuity_hold"
+                    if protected_selected
+                    else "maximum_bundles_reached"
+                )
             break
 
     return SelectionResult(
@@ -404,10 +574,13 @@ def select_targets(
         match_rejections=match_rejections,
         candidates=tuple(sorted(candidates, key=lambda item: (item.bundle.activation_at, item.bundle.bundle_id))),
         selected=tuple(selected),
+        retained=tuple(selected_retained),
+        continuity_observed=continuity,
         budget_used=budget_used,
         targets={
             venue: tuple(sorted(items, key=lambda item: str(item["target_id"])))
             for venue, items in targets.items()
         },
         allocation_rejections=allocation_rejections,
+        continuity_dispositions=continuity_dispositions,
     )

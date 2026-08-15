@@ -19,6 +19,13 @@ from archive.storage.factory import add_store_arguments, build_store
 from analysis.storage import write_json_zstd, write_ndjson, write_ndjson_zstd
 from encoder import DEFAULT_ZSTD_LEVEL, encoder_version, logical_identity_of, stored_identity_of
 from targeter.v2.adapters import durable_client, live_adapters
+from targeter.v2.continuity import (
+    ContinuityBundle,
+    ContinuityError,
+    TerminalProbe,
+    load_continuity_bundles,
+    target_ids_by_venue,
+)
 from targeter.v2.domain import (
     CatalogSnapshot,
     SUPPORTED_VENUES,
@@ -30,9 +37,11 @@ from targeter.v2.registry import Strategy, StrategyError, load_strategy
 from targeter.v2.publication import (
     PublicationError,
     audit_current_publication,
+    publication_pointer_path,
+    read_publication_pointer,
     publish_run,
 )
-from targeter.v2.run_archive import RunArchiveError, archive_run
+from targeter.v2.run_archive import RunArchiveError, archive_run, parse_run_id_ns
 from targeter.v2.selection import SelectionResult, select_targets
 from targeter.v2.target_records import artifact_stem, target_record_rows
 
@@ -106,11 +115,74 @@ def _write_artifact(
     }
 
 
+def _continuity_for_run(
+    *,
+    live_root: Path,
+    adapters: tuple[Any, ...],
+    client: Any,
+    strategy: Strategy,
+    now: datetime,
+) -> tuple[tuple[ContinuityBundle, ...], list[str], str | None]:
+    if not strategy.continuity_hold_enabled:
+        return (), [], None
+    pointer = publication_pointer_path(live_root)
+    if not pointer.exists():
+        return (), [], None
+    try:
+        bundles = load_continuity_bundles(pointer)
+    except ContinuityError as error:
+        run_id = read_publication_pointer(live_root)
+        run_ns = parse_run_id_ns(run_id)
+        age_seconds = (
+            (now.timestamp() * 1_000_000_000 - run_ns) / 1_000_000_000
+            if run_ns is not None
+            else -1
+        )
+        if age_seconds < strategy.continuity_degraded_after_seconds:
+            raise
+        return (), [f"continuity_degraded_after_timeout: {error}"], run_id
+
+    by_venue = target_ids_by_venue(bundles)
+    probes: dict[str, TerminalProbe] = {}
+    adapters_by_venue = {str(adapter.venue): adapter for adapter in adapters}
+    for venue, targets in by_venue.items():
+        adapter = adapters_by_venue.get(venue)
+        if adapter is None or not hasattr(adapter, "probe_terminal"):
+            probes.update(
+                {
+                    target.target_id: TerminalProbe("unknown", "terminal_adapter_unavailable")
+                    for target in targets
+                }
+            )
+            continue
+        if venue == "limitless":
+            venue_probes = adapter.probe_terminal(
+                client,
+                {target.target_id: target.source_ref for target in targets},
+            )
+            probes.update(venue_probes)
+        else:
+            venue_probes = adapter.probe_terminal(
+                client, tuple(target.venue_market_id for target in targets)
+            )
+            probes.update(
+                {
+                    target.target_id: venue_probes.get(
+                        target.venue_market_id,
+                        TerminalProbe("unknown", "terminal_probe_missing_record"),
+                    )
+                    for target in targets
+                }
+            )
+    return tuple(bundle.with_probes(probes) for bundle in bundles), [], None
+
+
 def run_shadow(
     *,
     strategy: Strategy,
     output_root: Path,
     cache_root: Path,
+    live_root: Path | None = None,
     now: datetime | None = None,
     adapters: Iterable[Any] | None = None,
     client: Any | None = None,
@@ -135,6 +207,21 @@ def run_shadow(
         force_refresh=force_refresh,
         persist_responses=persist_responses,
     )
+    continuity_bundles: tuple[ContinuityBundle, ...] = ()
+    continuity_diagnostics: list[str] = []
+    continuity_degraded_base_run_id: str | None = None
+    if live_root is not None:
+        (
+            continuity_bundles,
+            continuity_diagnostics,
+            continuity_degraded_base_run_id,
+        ) = _continuity_for_run(
+            live_root=live_root,
+            adapters=adapter_set,
+            client=http,
+            strategy=strategy,
+            now=now,
+        )
     catalogs: list[CatalogSnapshot] = []
     failures: dict[str, str] = {}
     for adapter in adapter_set:
@@ -143,7 +230,12 @@ def run_shadow(
         except Exception as error:  # noqa: BLE001 - one vendor must not hide the others
             failures[str(adapter.venue)] = f"{type(error).__name__}: {error}"
 
-    selection = select_targets(catalogs, strategy=strategy, now=now)
+    selection = select_targets(
+        catalogs,
+        strategy=strategy,
+        now=now,
+        continuity_bundles=continuity_bundles,
+    )
     run_id = _run_id(now)
     directory = Path(output_root) / run_id
     directory.mkdir(parents=True, exist_ok=True)
@@ -191,6 +283,8 @@ def run_shadow(
     record["run_id"] = run_id
     record["strategy_source"] = strategy.source_path
     record["discovery_failures"] = dict(sorted(failures.items()))
+    record["continuity_diagnostics"] = continuity_diagnostics
+    record["continuity_degraded_base_run_id"] = continuity_degraded_base_run_id
     record["target_record_diagnostics"] = dict(sorted(target_record_diagnostics.items()))
     catalog_venues = [catalog.venue for catalog in catalogs]
     input_complete = (
@@ -357,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             strategy=strategy,
             output_root=arguments.output_root,
             cache_root=arguments.cache_root,
+            live_root=arguments.live_root,
             now=now,
             force_refresh=not arguments.reuse_cache,
             persist_responses=not arguments.no_response_cache,

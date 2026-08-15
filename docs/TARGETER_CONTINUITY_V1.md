@@ -1,6 +1,6 @@
 # Targeter continuity and terminal eviction
 
-**Status:** specification. Nothing implemented.
+**Status:** implemented.
 
 Two changes to `targeter/v2`, both narrow:
 
@@ -9,8 +9,10 @@ Two changes to `targeter/v2`, both narrow:
 2. **Continuity hold** — stop a bundle we are already capturing from being
    displaced by a newcomer at the budget limit.
 
-The hold is a *filter, never an admit*. It can preserve an existing budget claim
-and can never create one. Every eligibility gate still runs first, unchanged.
+Fresh admission remains a filter over the current eligible set. Continuity may
+also retain the exact targets of a previously admitted bundle while one venue is
+terminal and another remains open. It can never introduce a target that was not
+in the committed generation it reads.
 
 ---
 
@@ -44,8 +46,8 @@ here: we care when the book stops moving, not when the oracle agrees.
 
 **Polymarket publishes no trading-stop timestamp at all.**
 `acceptingOrdersTimestamp` is when orders *opened*. So Polymarket offers a
-boolean and nothing else — the instant trading stopped is recoverable only from
-our own tape. This is why §2.2 exists.
+boolean and nothing else. V1 therefore treats terminal state as a per-run
+observation, not a timestamped durable fact.
 
 Kalshi's corroborator is free: while open, `close_time == expiration_time` (a
 +48 h placeholder); once closed, `close_time` is rewritten to the real close
@@ -141,12 +143,12 @@ four settled markets probed had been removed entirely. A 404 is indistinguishabl
 from a slug change or a transient fault, so it must not evict; the clamp handles
 a market that stays unreadable.
 
-### 2.2 The tape buffer
+### 2.2 Terminal observations are ephemeral
 
-A leg going terminal does not immediately drop its subscription. It stays
-subscribed for `terminal_buffer_seconds` (default **900**) so the tape records
-the book going static. That transition is the evidence trading stopped — and for
-Polymarket it is the *only* record of when, since the API never timestamps it.
+Each probe classifies a held market as `open`, `terminal`, or `unknown` for that
+run. No first-observed timestamp or terminal flag is carried across runs. A 404,
+transport failure, missing field, or ambiguous shape is `unknown`, which has the
+same retention effect as `open`.
 
 ### 2.3 A bundle is not terminal until every leg is
 
@@ -154,93 +156,94 @@ Kalshi closes early and precisely; Polymarket keeps trading past it. The window
 between them is a known outcome on one venue against a live book on the other,
 which is the cross-venue signal this project exists to find.
 
-So: mark legs terminal individually, drop each leg's subscription after its
-buffer, and release the bundle's budget when **all** legs are terminal or the
-clamp fires.
+So: mark legs terminal individually, but retain the exact entire subscription
+bundle while any leg is `open` or `unknown`. Release the entire bundle only when
+**all** legs are independently terminal in one run or the clamp fires. A terminal
+leg is deliberately still subscribed while a sibling venue trades; V1 does not
+publish a one-venue residual bundle.
+
+If retirement removes the final published bundle, its schema-v2 continuity
+evidence authorizes an empty generation. An unrelated empty discovery still
+cannot replace the live pointer.
 
 ### 2.4 The clamp
 
-**The clamp already exists.** `targeter/v2/selection.py:303`:
-
-```python
-if bundle.activation_at < now - timedelta(seconds=strategy.post_start_retention_seconds):
-    reasons.append("past_post_start_retention")
+```
+clamp_at = activation_at + terminal_clamp_seconds     # 28800, flat
 ```
 
-`activation_at + post_start_retention_seconds` is already an eligibility gate
-with a named rejection reason, currently 21600 s (6 h). Because §3.2 intersects
-`held` with the eligible ranked set, a bundle past it is already released. **A
-separate `terminal_clamp_seconds` would be unreachable** — the existing gate
-always rejects first — so V1 adds no new clamp setting and reuses this one.
-
-`activation_at` is the right anchor: it is the targeter's own reconciled value,
+`activation_at` is the anchor because it is the targeter's own reconciled value,
 corroborated by two venues — on 2026-08-15 it was `02:00Z`, matching both
 Polymarket's `eventStartTime` and the Kalshi ticker's `26AUG142200` EDT.
 
-**The 8 h decision therefore becomes: raise `post_start_retention_seconds` from
-21600 to 28800.** That is one setting change, and it has a coupling that must be
-stated — the same value bounds discovery (`min_close_ts` on Kalshi,
-`end_date_min` on Polymarket and Limitless), so raising it also widens the
-catalogue fetched each run. §1.3 argues the change is warranted regardless: at
-21600 the gate sits *below* p90 duration for both Dota2 and LoL (7.16 h), so it
-is currently evicting bundles whose matches are still being played.
-
-If the discovery widening proves unwanted, the alternative is to split the
-setting in two — `post_start_retention_seconds` for discovery,
-`eligibility_retention_seconds` for the gate — but V1 does not do this, because
-one number that is right is simpler than two that can drift apart.
+At `clamp_at` the bundle is terminal regardless of venue state. This is the
+catch-all for postponement, cancellation, a flag that never flips, a malformed
+record, and a lookup that keeps failing. It is deliberately generous: terminal
+state should almost always evict first, and the clamp should almost never be the
+reason. The existing fresh-admission gate does not make this clamp unreachable:
+an ineligible prior bundle enters the exact-target retained path until terminal
+state or this clamp retires it.
 
 ---
 
 ## 3. Continuity hold
 
-### 3.1 Two lists
+### 3.1 Three lists
 
-Each run partitions eligible ranked candidates into:
+Each run partitions work into:
 
-- **held** — selected by the previous published generation and still eligible
-  (which already excludes anything past `post_start_retention_seconds`)
+- **held** — selected by the previous published generation, still eligible, no
+  terminal leg, and not past `clamp_at`;
+- **retained** — exact prior targets for a bundle which is no longer currently
+  eligible or has at least one terminal leg, but is not all-terminal or clamped;
 - **additive** — everything else
 
-Budget is claimed by `held` first, then by `additive` in rank order. Scoring and
-`_ranking_key` are untouched; only the order in which budget is consumed changes.
+Budget is claimed by held and retained bundles first, ordered by their recorded
+score, then by additive candidates in ordinary rank order. Scoring and
+`_ranking_key` are untouched.
 
-**The purge only ever removes `additive` candidates.** A held bundle cannot be
-displaced by rank.
+Held or retained bundles cannot be displaced by an additive candidate. If the
+protected floor itself exceeds a reduced budget or bundle limit, its lowest-score
+bundles are trimmed atomically and reported as `continuity_budget_trimmed`.
 
 ### 3.2 It can never admit
 
-`held` is intersected with the eligible ranked set before use. A bundle failing
-any gate, including `past_post_start_retention`, is not in `ranked` and so
-cannot be held. The hold
-preserves a claim; it never creates one.
+Fresh and held candidates still run every current eligibility gate. A retained
+bundle is the narrow exception: it may bypass current discovery eligibility only
+by carrying the exact target and subscription IDs from the validated committed
+generation. It cannot add a market, sibling, or subscription ID. A changed
+`bundle_id` remains additive in V1; if it collides with a target already owned by
+a retained bundle, prior ownership wins and the additive candidate is rejected as
+`continuity_identity_collision`.
 
 ### 3.3 Full-budget behaviour
 
 When `held` alone fills the budget, `additive` candidates are rejected as
 `displaced_by_continuity_hold` — distinct from `target_budget_exceeded`, so a
 saturated hold is visible rather than looking like ordinary budget pressure. The
-generation is republished unchanged.
+subscription asset set is republished unchanged; run and generation identities
+still advance normally.
 
 ### 3.4 Degradation
 
-If the prior generation cannot be read, hold the last published target set rather
-than falling back to an empty hold. The filter exists to protect continuity, so
-its degraded mode must also protect continuity; losing discovery for the length
-of an outage is the cheaper failure.
+The atomic publication pointer and generation remain the authority. A missing
+pointer means no generation has been published yet. An unreadable or corrupt
+pointer/generation fails closed and cannot be replaced automatically.
 
-### 3.5 Start-lateness bias
+If the generation is valid but lacks continuity metadata, publication fails
+closed while it is younger than `continuity_degraded_after_seconds` (default
+14,400, half the clamp). After that timeout the run may proceed without a hold.
+The report records that generation's exact run id, and publication rechecks the
+current pointer and timeout before accepting the degraded run. This compatibility
+path is for older valid generations, not for an unavailable live volume or a
+failed integrity check.
 
-A market first seen well into its own window is worth less than one yet to start.
-Applied as a **rank penalty**, not a gate — it should lose ties, not eligibility:
+### 3.5 Fresh-retention and terminal-clamp times are separate
 
-```
-elapsed_fraction = (now - activation_at) / post_start_retention_seconds
-```
-
-Motivating case: the 2026-08-15 05:41Z run selected
-`KXDOTA2GAME-26AUG142200TYRES-TY`, which closed at **05:49:39Z — eight minutes
-later**. Not a hypothetical.
+`post_start_retention_seconds` controls how late a fresh candidate may be
+admitted. `terminal_clamp_seconds` controls how long an already committed bundle
+may be retained. Both are strict strategy fields. V1 defaults them to 21,600 and
+28,800 seconds respectively.
 
 ---
 
@@ -248,13 +251,14 @@ later**. Not a hypothetical.
 
 | File | Change |
 |---|---|
-| `targeter/v2/domain.py` | `CanonicalMarket.terminal: bool`, `terminal_reason: str \| None` |
+| `targeter/v2/continuity.py` | reconstruct committed bundles and model ephemeral terminal probes |
 | `targeter/v2/adapters.py` | `probe_terminal(held_ids)` per venue, per §2.1 |
-| `targeter/v2/registry.py` | `terminal_buffer_seconds`, `continuity_hold_enabled` |
-| `configs/targeter_v2.json` | `post_start_retention_seconds` 21600 → 28800 |
-| `targeter/v2/selection.py` | `held` param, two-pass allocation, clamp, lateness penalty, new rejection reason |
+| `targeter/v2/registry.py` | clamp, degraded timeout, and continuity enablement |
+| `targeter/v2/selection.py` | protected-first allocation, bundle retirement, and budget trimming |
 | `targeter/v2/run.py` | read prior generation, resolve to bundle ids, drive the terminal probe |
-| `tests/test_targeter_v2.py` | §5 |
+| `targeter/v2/publication.py` | validate retained targets and preserve continuity provenance |
+| `targeter/v2/run_archive.py` | read selection-report schema versions 1 and 2 |
+| `tests/test_targeter_v2.py`, `tests/test_targeter_v2_delivery.py` | §5 |
 
 Nothing under `replay/` or `universe/` changes.
 
@@ -262,16 +266,17 @@ Nothing under `replay/` or `universe/` changes.
 
 ## 5. Tests
 
-1. `held = ∅` reproduces today's selection byte-for-byte — the regression guard
+1. no committed generation preserves current selection semantics
 2. a held bundle survives a higher-ranked newcomer at the budget limit
-3. a held bundle past `post_start_retention_seconds` is released even with every venue flag still open
-4. a leg going terminal keeps its subscription for `terminal_buffer_seconds`
-5. a bundle with one terminal leg and one live leg stays subscribed on the live leg
+3. a held bundle past `clamp_at` is released even with every venue flag still open
+4. a bundle with one terminal leg and one live/unknown leg retains every prior subscription
+5. an all-terminal bundle is retired atomically
 6. `active: true` on a closed Polymarket market does **not** read as live
 7. Kalshi `close_time == expiration_time` reads as open; `<` reads as terminal
 8. a failed, malformed, or 404 terminal probe leaves the leg live, not terminal
 9. full budget held → `displaced_by_continuity_hold`, not `target_budget_exceeded`
 10. Limitless `tradeType: "clob"` on a `RESOLVED` market does **not** read as live
+11. a later generation can archive, publish, and audit an exact retained bundle absent from discovery
 
 ---
 
@@ -280,10 +285,5 @@ Nothing under `replay/` or `universe/` changes.
 1. **Probe cadence.** The terminal probe runs per targeter run (10 min). A market
    that closes just after a run keeps its slot for up to one interval. Acceptable
    at current budget slack; revisit if the budget binds.
-2. **Limitless probe addressing.** `/markets/{id}` returns 400 for the numeric
-   `venue_market_id`; the API wants the slug, which the catalogue carries only in
-   `source_ref` (`/markets/arsenal-1785924949664`). The probe must resolve slugs,
-   so either `source_ref` becomes a first-class field or the adapter retains the
-   slug explicitly.
-3. **Clamp review.** 8 h covers ~93–96% of observed durations. Worth re-measuring
+2. **Clamp review.** 8 h covers ~93–96% of observed durations. Worth re-measuring
    once more sports are onboarded, since the current sample is esports only.

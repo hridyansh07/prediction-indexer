@@ -29,6 +29,7 @@ from targeter.v2.domain import (
 )
 from targeter.v2.parsing import esports, products, text, traditional
 from targeter.v2.registry import ClassDefinition, GameFamily, MarketClassRegistry, Strategy
+from targeter.v2.continuity import TerminalProbe
 
 
 KALSHI_API = "https://external-api.kalshi.com/trade-api/v2"
@@ -355,6 +356,55 @@ class KalshiSportsAdapter:
     max_pages: int | None = None
 
     venue: str = "kalshi"
+
+    def probe_terminal(
+        self, client: JsonClient, market_ids: tuple[str, ...]
+    ) -> dict[str, TerminalProbe]:
+        if not market_ids:
+            return {}
+        unknown = {
+            market_id: TerminalProbe("unknown", "terminal_probe_failed")
+            for market_id in market_ids
+        }
+        try:
+            payload = _data(
+                client.get_json(
+                    KALSHI_API,
+                    "/markets",
+                    params={"tickers": ",".join(sorted(market_ids)), "limit": len(market_ids)},
+                )
+            )
+        except Exception:  # noqa: BLE001 - uncertainty must retain capture
+            return unknown
+        if not isinstance(payload, dict) or not isinstance(payload.get("markets"), list):
+            return unknown
+        result = dict(unknown)
+        for raw in payload["markets"]:
+            if not isinstance(raw, dict):
+                continue
+            ticker = str(raw.get("ticker") or "")
+            if ticker not in result:
+                continue
+            status = str(raw.get("status") or "").casefold()
+            close_time = parse_timestamp(raw.get("close_time"))
+            expiration_time = parse_timestamp(
+                raw.get("expiration_time")
+                or raw.get("expected_expiration_time")
+                or raw.get("latest_expiration_time")
+            )
+            if status == "finalized":
+                result[ticker] = TerminalProbe("terminal", "status_finalized")
+            elif close_time is not None and expiration_time is not None and close_time < expiration_time:
+                result[ticker] = TerminalProbe("terminal", "close_before_expiration")
+            elif status in {"active", "open"} and (
+                close_time is None
+                or expiration_time is None
+                or close_time == expiration_time
+            ):
+                result[ticker] = TerminalProbe("open", "status_open")
+            else:
+                result[ticker] = TerminalProbe("unknown", "terminal_shape_ambiguous")
+        return result
 
     def discover(self, client: JsonClient, *, now: datetime) -> CatalogSnapshot:
         requests_before = getattr(client, "network_requests", 0) + getattr(client, "cache_hits", 0)
@@ -713,6 +763,26 @@ class PolymarketSportsAdapter:
 
     venue: str = "polymarket"
 
+    def probe_terminal(
+        self, client: JsonClient, market_ids: tuple[str, ...]
+    ) -> dict[str, TerminalProbe]:
+        result: dict[str, TerminalProbe] = {}
+        for market_id in market_ids:
+            try:
+                raw = _data(client.get_json(POLYMARKET_API, f"/markets/{market_id}"))
+            except Exception:  # noqa: BLE001 - 404 and transport failures retain capture
+                result[market_id] = TerminalProbe("unknown", "terminal_probe_failed")
+                continue
+            if not isinstance(raw, dict) or not isinstance(raw.get("acceptingOrders"), bool):
+                result[market_id] = TerminalProbe("unknown", "terminal_shape_ambiguous")
+            elif raw["acceptingOrders"]:
+                result[market_id] = TerminalProbe("open", "accepting_orders")
+            else:
+                # `active` is intentionally ignored: it remains true after the
+                # CLOB has stopped accepting orders.
+                result[market_id] = TerminalProbe("terminal", "not_accepting_orders")
+        return result
+
     def discover(self, client: JsonClient, *, now: datetime) -> CatalogSnapshot:
         requests_before = getattr(client, "network_requests", 0) + getattr(client, "cache_hits", 0)
         minimum = now - timedelta(seconds=self.registry.strategy.post_start_retention_seconds)
@@ -1018,6 +1088,34 @@ class LimitlessSportsAdapter:
     max_pages: int | None = None
 
     venue: str = "limitless"
+
+    def probe_terminal(
+        self, client: JsonClient, source_refs: Mapping[str, str]
+    ) -> dict[str, TerminalProbe]:
+        result: dict[str, TerminalProbe] = {}
+        for target_id, source_ref in sorted(source_refs.items()):
+            if not source_ref.startswith("/markets/"):
+                result[target_id] = TerminalProbe("unknown", "terminal_source_ref_invalid")
+                continue
+            try:
+                raw = _data(client.get_json(LIMITLESS_API, source_ref))
+            except Exception:  # noqa: BLE001 - 404 and transport failures retain capture
+                result[target_id] = TerminalProbe("unknown", "terminal_probe_failed")
+                continue
+            if not isinstance(raw, dict):
+                result[target_id] = TerminalProbe("unknown", "terminal_shape_ambiguous")
+                continue
+            status = str(raw.get("status") or "").casefold()
+            expired = raw.get("expired")
+            if expired is True or status == "resolved":
+                result[target_id] = TerminalProbe("terminal", "expired_or_resolved")
+            elif expired is False and status in {"funded", "open", "active"}:
+                # `tradeType` remains `clob` after resolution and is not a
+                # terminal discriminator.
+                result[target_id] = TerminalProbe("open", "funded_not_expired")
+            else:
+                result[target_id] = TerminalProbe("unknown", "terminal_shape_ambiguous")
+        return result
 
     @staticmethod
     def _record_id(item: Mapping[str, Any]) -> str:

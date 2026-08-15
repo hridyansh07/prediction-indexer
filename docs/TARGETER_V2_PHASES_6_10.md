@@ -15,8 +15,9 @@ The critical invariants are:
 
 1. Every attempted scheduled run leaves its discovery evidence locally. Archive
    and publish modes also archive that evidence, including incomplete runs.
-2. Only a complete, non-empty, multi-venue selection with a verified independent
-   archive may replace live targets.
+2. Only a complete multi-venue selection with a verified independent archive may
+   replace live targets, except for the terminal-retirement empty generation
+   defined in §3.
 3. A single pointer commits all venue target files. A crash cannot expose a new
    Kalshi file with an old Polymarket file.
 4. The previous pointer remains authoritative on every pre-pointer failure.
@@ -75,7 +76,8 @@ Publication requires all of the following:
 
 - `input_complete: true`, no discovery failures, and every catalogue summary
   complete;
-- a non-empty selected bundle set;
+- a non-empty selected bundle set, or exact schema-v2 continuity evidence
+  authorizing retirement of every prior bundle;
 - every selected bundle represented on at least the strategy's minimum venues;
 - target entries for exactly Kalshi, Polymarket, and Limitless, including an
   empty file for a venue with no selected subscriptions;
@@ -86,6 +88,10 @@ The publisher also cross-checks every subscription ID, canonical class, and
 source reference against the archived venue catalogue, and requires each
 selected bundle's target IDs to equal its eligible candidate market IDs. An
 internally well-formed but forged selection report is therefore not sufficient.
+For a continuity-retained bundle absent from current discovery, the publisher
+instead requires exact equality with the report's archived continuity evidence,
+which was reconstructed from the previously committed generation. Retention may
+carry no new target or subscription ID.
 
 Output is one immutable local generation:
 
@@ -112,9 +118,13 @@ the run ID plus the generation-manifest path, SHA-256, and byte length. This
 single pointer is the live commit marker. A complete generation without a
 pointer is abandoned-but-safe and an identical retry can publish it.
 
-An empty or incomplete run does not replace a prior pointer. Empty publication
-requires a future explicit human control because silently unsubscribing every
-lane is too destructive for the automatic path.
+An incomplete run does not replace a prior pointer. An ordinarily empty run also
+requires explicit human control because silently unsubscribing every lane is too
+destructive. The sole automatic empty-publication path is a schema-v2 report
+which carries the exact prior continuity bundles and proves each was retired by
+all-terminal evidence, the configured terminal clamp, or explicit protected-floor
+budget trimming. This narrow exception is what lets terminal retirement remove
+the final live bundle without weakening the empty-run guard.
 
 ## 4. Phase 8 — splice handoff and reload behavior
 
@@ -424,7 +434,8 @@ docker compose -f compose.yaml -f compose.targeter-v2.yaml build targeter
 ```
 
 Tests must prove immutable archive retries/conflicts, remote-manifest commit
-ordering, incomplete and empty publication refusal, atomic pointer failure,
+ordering, incomplete and unrelated-empty publication refusal, terminal-empty
+publication, atomic pointer failure,
 cross-venue pointer consumption, path containment, corruption rejection,
 archive-to-publication equality, audit without discovery, and overlap refusal.
 
