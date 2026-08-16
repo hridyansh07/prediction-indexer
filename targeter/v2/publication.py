@@ -9,16 +9,14 @@ so a crash cannot expose a mixture of old and new venue generations.
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Mapping
+from typing import Any, Mapping
 
 from archive.common.durable import confirm_durable, write_json_durable
 from archive.storage.base import ObjectStore
-from analysis.storage import decoded_zstd_file
-from encoder import CodecError, StoredIdentity, stored_identity_of
+from encoder import StoredIdentity, stored_identity_of
 from targeter.targets import (
     TARGET_GENERATION_POINTER_VERSION,
     TARGET_PUBLICATION_MANIFEST_VERSION,
@@ -28,21 +26,26 @@ from targeter.targets import (
     write_targets,
 )
 from targeter.coverage import CoverageLedger, created_at_of
-from targeter.v2.domain import SUPPORTED_VENUES
+from targeter.v2.models import SUPPORTED_VENUES
+from targeter.v2.publication_validation import (
+    PublicationError,
+    catalog_reader,
+    catalog_markets as _catalog_markets,
+    publication_pointer_path,
+    read_publication_pointer,
+    selection_report as _selection_report,
+    selection_report_object as _selection_report_object,
+    targets_from_report as _targets_from_report,
+    verify_continuity_base as _verify_continuity_base,
+)
 from targeter.v2.registry import Strategy
 from targeter.v2.run_archive import (
     PRODUCTION_RECEIPT_FILE,
-    RunArchiveError,
     RunArchiveReceipt,
-    read_run_report,
     read_run_archive_receipt,
     validate_local_run,
     verify_run_archive,
 )
-
-
-class PublicationError(ValueError):
-    """A run cannot safely become the splice subscription authority."""
 
 
 @dataclass(frozen=True)
@@ -64,20 +67,6 @@ class PublicationAudit:
     venue_counts: Mapping[str, int]
 
 
-def _selection_report_object(receipt: RunArchiveReceipt):
-    item = next(
-        (
-            candidate
-            for candidate in receipt.objects
-            if candidate.file in {"selection_report.json", "selection_report.json.zst"}
-        ),
-        None,
-    )
-    if item is None:
-        raise PublicationError("run archive receipt does not contain the selection report")
-    return item
-
-
 def _read_json(path: Path, description: str) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -88,27 +77,6 @@ def _read_json(path: Path, description: str) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise PublicationError(f"{description} must be a JSON object")
     return document
-
-
-def publication_pointer_path(live_root: Path) -> Path:
-    return Path(live_root) / "targeter-v2" / "current.json"
-
-
-def read_publication_pointer(live_root: Path) -> str:
-    """The run_id the live generation pointer currently names.
-
-    Extracted so that every reader of "which run is published" is this one
-    function.  The run reaper asks the same question before it deletes, and a
-    reaper that answered it differently from the audit could remove the local
-    evidence the audit is about to demand.
-    """
-    pointer = _read_json(
-        publication_pointer_path(live_root), "target generation pointer"
-    )
-    run_id = pointer.get("run_id")
-    if not isinstance(run_id, str) or not run_id:
-        raise PublicationError("target generation pointer has no run_id")
-    return run_id
 
 
 def _identity(path: Path) -> StoredIdentity:
@@ -123,251 +91,6 @@ def _identity_record(path: Path) -> dict[str, Any]:
         "byte_length": stored.byte_length,
         "sha256": stored.sha256,
     }
-
-
-def _selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
-    try:
-        report = read_run_report(run_directory)
-    except (RunArchiveError, OSError) as error:
-        raise PublicationError(f"cannot read selection report: {error}") from error
-    if report.get("run_id") != run_directory.name:
-        raise PublicationError("selection report run_id does not match its directory")
-    if report.get("report_version") != 1 or report.get("mode") != "shadow":
-        raise PublicationError("publication requires a phase-5 shadow report")
-    if report.get("strategy_version") != strategy.version:
-        raise PublicationError("selection report and publication strategy versions differ")
-    if report.get("input_complete") is not True or report.get("discovery_failures") != {}:
-        raise PublicationError("incomplete targeter runs cannot be published")
-    catalogs = report.get("catalogs")
-    if not isinstance(catalogs, list) or not catalogs or any(
-        not isinstance(summary, dict) or summary.get("complete") is not True
-        for summary in catalogs
-    ):
-        raise PublicationError("publication requires complete catalog summaries")
-    catalog_venues = [summary.get("venue") for summary in catalogs]
-    if (
-        len(catalog_venues) != len(SUPPORTED_VENUES)
-        or set(catalog_venues) != set(SUPPORTED_VENUES)
-    ):
-        raise PublicationError("publication requires exactly one catalog for every supported venue")
-    selection = report.get("selection")
-    if not isinstance(selection, dict) or selection.get("publication_performed") is not False:
-        raise PublicationError("selection report has invalid publication state")
-    bundle_ids = selection.get("bundle_ids")
-    if (
-        not isinstance(bundle_ids, list)
-        or not all(isinstance(item, str) and item for item in bundle_ids)
-        or len(bundle_ids) != len(set(bundle_ids))
-        or selection.get("bundle_count") != len(bundle_ids)
-    ):
-        raise PublicationError("selection report has invalid selected bundle identifiers")
-    targets = selection.get("targets")
-    if not isinstance(targets, dict) or set(targets) != set(SUPPORTED_VENUES):
-        raise PublicationError("selection report targets must name every supported venue")
-    return report
-
-
-def _targets_from_report(
-    report: dict[str, Any],
-    receipt: RunArchiveReceipt,
-    strategy: Strategy,
-    catalog_markets: Mapping[str, Mapping[str, dict[str, Any]]],
-) -> dict[str, list[Target]]:
-    selection = report["selection"]
-    bundle_ids = frozenset(selection["bundle_ids"])
-    candidates = report.get("candidates")
-    if not isinstance(candidates, list):
-        raise PublicationError("selection report candidates must be an array")
-    candidates_by_bundle: dict[str, dict[str, Any]] = {}
-    for raw_candidate in candidates:
-        if not isinstance(raw_candidate, dict):
-            raise PublicationError("selection report candidate is not an object")
-        bundle_id = raw_candidate.get("bundle_id")
-        if not isinstance(bundle_id, str) or not bundle_id or bundle_id in candidates_by_bundle:
-            raise PublicationError("selection report has invalid or duplicate candidate bundles")
-        candidates_by_bundle[bundle_id] = raw_candidate
-    selected_candidate_markets: dict[str, frozenset[str]] = {}
-    for bundle_id in bundle_ids:
-        candidate = candidates_by_bundle.get(bundle_id)
-        if candidate is None or candidate.get("eligible") is not True:
-            raise PublicationError(f"selected bundle {bundle_id} is not an eligible report candidate")
-        eligible_market_ids = candidate.get("eligible_market_ids")
-        if (
-            not isinstance(eligible_market_ids, list)
-            or not eligible_market_ids
-            or not all(isinstance(item, str) and item for item in eligible_market_ids)
-            or len(eligible_market_ids) != len(set(eligible_market_ids))
-        ):
-            raise PublicationError(f"selected bundle {bundle_id} has invalid eligible markets")
-        selected_candidate_markets[bundle_id] = frozenset(eligible_market_ids)
-    report_object = _selection_report_object(receipt)
-    by_venue: dict[str, list[Target]] = {venue: [] for venue in SUPPORTED_VENUES}
-    bundle_venues: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
-    selected_market_ids: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
-    seen_target_ids: set[str] = set()
-
-    for venue in SUPPORTED_VENUES:
-        raw_targets = selection["targets"].get(venue)
-        if not isinstance(raw_targets, list):
-            raise PublicationError(f"selection targets for {venue} must be an array")
-        seen_assets: dict[str, Target] = {}
-        for position, raw in enumerate(raw_targets):
-            if not isinstance(raw, dict):
-                raise PublicationError(f"selection target {venue}[{position}] is not an object")
-            bundle_id = _required_text(raw, "bundle_id", venue, position)
-            if bundle_id not in bundle_ids:
-                raise PublicationError(f"selection target {venue}[{position}] names an unselected bundle")
-            target_id = _required_text(raw, "target_id", venue, position)
-            if not target_id.startswith(venue + ":"):
-                raise PublicationError(f"selection target {target_id!r} belongs to another venue")
-            if target_id in seen_target_ids:
-                raise PublicationError(f"selection report repeats target {target_id!r}")
-            seen_target_ids.add(target_id)
-            canonical_class = _required_text(raw, "canonical_class", venue, position)
-            subscription_ids = raw.get("subscription_ids")
-            if (
-                not isinstance(subscription_ids, list)
-                or not subscription_ids
-                or not all(isinstance(item, str) and item.strip() for item in subscription_ids)
-                or len(subscription_ids) != len(set(subscription_ids))
-            ):
-                raise PublicationError(
-                    f"selection target {venue}[{position}] has invalid subscription_ids"
-                )
-            catalog = catalog_markets[venue].get(target_id)
-            if catalog is None:
-                raise PublicationError(f"selection target {target_id!r} is absent from its catalog")
-            if (
-                catalog.get("canonical_class") != canonical_class
-                or catalog.get("subscription_ids") != subscription_ids
-                or catalog.get("source_ref") != raw.get("source_ref")
-            ):
-                raise PublicationError(
-                    f"selection target {target_id!r} disagrees with its archived catalog"
-                )
-            candidate = candidates_by_bundle[bundle_id]
-            if (
-                raw.get("activation_at") != candidate.get("activation_at")
-                or raw.get("capture_start_at") != candidate.get("capture_start_at")
-            ):
-                raise PublicationError(
-                    f"selection target {target_id!r} timing disagrees with its candidate"
-                )
-            bundle_venues[bundle_id].add(venue)
-            selected_market_ids[bundle_id].add(target_id)
-            resolution = {
-                "version": 2,
-                "source": "targeter_v2",
-                "run_id": report["run_id"],
-                "bundle_id": bundle_id,
-                "target_id": target_id,
-                "canonical_class": canonical_class,
-                "activation_at": raw.get("activation_at"),
-                "capture_start_at": raw.get("capture_start_at"),
-                "source_ref": raw.get("source_ref"),
-                "selection_report_sha256": report_object.stored.sha256,
-                "archive_manifest_key": receipt.manifest.key,
-                "archive_manifest_sha256": receipt.manifest.stored.sha256,
-            }
-            for asset_id in subscription_ids:
-                target = Target(
-                    asset_id=asset_id,
-                    market_id=target_id.split(":", 1)[1],
-                    note=canonical_class,
-                    resolution=resolution,
-                )
-                existing = seen_assets.get(asset_id)
-                if existing is not None and existing != target:
-                    raise PublicationError(
-                        f"subscription id {asset_id!r} has conflicting selection provenance"
-                    )
-                seen_assets[asset_id] = target
-        by_venue[venue] = sorted(seen_assets.values(), key=lambda item: item.asset_id)
-
-    if not bundle_ids or not any(by_venue.values()):
-        raise PublicationError("empty target selections require explicit human review and are not published")
-    for bundle_id, venues in bundle_venues.items():
-        if len(venues) < strategy.minimum_venues:
-            raise PublicationError(
-                f"selected bundle {bundle_id} has targets on only {len(venues)} venues"
-            )
-        if selected_market_ids[bundle_id] != selected_candidate_markets[bundle_id]:
-            raise PublicationError(
-                f"selected bundle {bundle_id} targets do not match its eligible candidate markets"
-            )
-    if len({venue for venue, targets in by_venue.items() if targets}) < strategy.minimum_venues:
-        raise PublicationError("publication has fewer than the configured minimum venues")
-    return by_venue
-
-
-@contextmanager
-def catalog_reader(path: Path, item: Any) -> Iterator[BinaryIO]:
-    if item.content_encoding == "zstd":
-        if item.logical is None:
-            raise PublicationError(f"compressed catalog {path.name} has no decoded identity")
-        try:
-            with decoded_zstd_file(
-                path,
-                expected_logical=item.logical,
-                expected_stored=item.stored,
-            ) as handle:
-                yield handle
-        except (CodecError, OSError) as error:
-            raise PublicationError(f"cannot decode archived catalog {path}: {error}") from error
-    elif item.content_encoding is None:
-        try:
-            with path.open("rb") as handle:
-                yield handle
-        except OSError as error:
-            raise PublicationError(f"cannot read archived catalog {path}: {error}") from error
-    else:  # receipt parsing should make this impossible
-        raise PublicationError(f"catalog {path.name} has unsupported content encoding")
-
-
-def _catalog_markets(
-    run_directory: Path,
-    receipt: RunArchiveReceipt,
-    report: dict[str, Any],
-) -> dict[str, dict[str, dict[str, Any]]]:
-    """Read the archived catalogue boundary used to produce subscriptions."""
-    catalogs: dict[str, dict[str, dict[str, Any]]] = {}
-    suffix = ".ndjson.zst" if report.get("artifact_format") == "zstd" else ".ndjson"
-    for venue in SUPPORTED_VENUES:
-        name = f"catalog_{venue}_markets{suffix}"
-        path = Path(run_directory) / name
-        item = next((candidate for candidate in receipt.objects if candidate.file == name), None)
-        if item is None:
-            raise PublicationError(f"archive receipt has no catalog {name}")
-        records: dict[str, dict[str, Any]] = {}
-        try:
-            with catalog_reader(path, item) as handle:
-                for line_number, line in enumerate(handle, 1):
-                    if not line.endswith(b"\n") or not line.strip():
-                        raise PublicationError(
-                            f"catalog {path.name}:{line_number} is not one complete NDJSON record"
-                        )
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError as error:
-                        raise PublicationError(
-                            f"catalog {path.name}:{line_number} is invalid JSON: {error}"
-                        ) from error
-                    if not isinstance(record, dict) or record.get("venue") != venue:
-                        raise PublicationError(
-                            f"catalog {path.name}:{line_number} has the wrong venue or shape"
-                        )
-                    target_id = record.get("target_id")
-                    if not isinstance(target_id, str) or not target_id.startswith(venue + ":"):
-                        raise PublicationError(
-                            f"catalog {path.name}:{line_number} has an invalid target_id"
-                        )
-                    if target_id in records:
-                        raise PublicationError(f"catalog {path.name} repeats target {target_id!r}")
-                    records[target_id] = record
-        except OSError as error:
-            raise PublicationError(f"cannot read archived catalog {path}: {error}") from error
-        catalogs[venue] = records
-    return catalogs
 
 
 def coverage_ledger_path(live_root: Path) -> Path:
@@ -397,8 +120,8 @@ def record_coverage(
 
     `created_at` comes from the archived catalogue record, so the venue's own
     creation time is read from the same immutable boundary the targets were
-    derived from rather than re-fetched later. `Market.as_record` already
-    normalises it to ISO-8601 (`targeter/v2/domain.py:355`); `created_at_of`
+    derived from rather than re-fetched later. `CanonicalMarket.as_record`
+    already normalises it to ISO-8601; `created_at_of`
     still mediates the read so a venue that publishes none leaves the field
     null, which `Sighting.discovery_lag_seconds` reports as unmeasurable
     instead of as a lag of zero.
@@ -434,13 +157,6 @@ def record_coverage(
     return fresh
 
 
-def _required_text(raw: dict[str, Any], field: str, venue: str, position: int) -> str:
-    value = raw.get(field)
-    if not isinstance(value, str) or not value:
-        raise PublicationError(f"selection target {venue}[{position}] has no {field}")
-    return value
-
-
 def publish_run(
     run_directory: Path,
     receipt: RunArchiveReceipt,
@@ -457,6 +173,7 @@ def publish_run(
     verify_run_archive(store, receipt)
     validate_local_run(run_directory, receipt)
     report = _selection_report(run_directory, strategy)
+    _verify_continuity_base(report, live_root, strategy)
     catalog_markets = _catalog_markets(run_directory, receipt, report)
     targets = _targets_from_report(report, receipt, strategy, catalog_markets)
 

@@ -12,7 +12,7 @@ import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
-from targeter.v2.domain import canonical_text
+from targeter.v2.models import canonical_text
 
 
 def normalize_label(value: object) -> str:

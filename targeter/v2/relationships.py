@@ -16,7 +16,7 @@ from analysis.outcome_space import (
     OutcomeSpace,
     build_series_space,
 )
-from targeter.v2.domain import (
+from targeter.v2.models import (
     SUPPORTED_BEST_OF,
     CanonicalEvent,
     CanonicalMarket,

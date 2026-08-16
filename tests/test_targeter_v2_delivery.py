@@ -4,6 +4,7 @@ import json
 import hashlib
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -59,12 +60,26 @@ class _Adapter:
     def discover(self, _client, *, now):
         return self.catalog
 
+    def probe_terminal(self, _client, targets):
+        from targeter.v2.continuity import TerminalProbe
+
+        keys = targets if isinstance(targets, dict) else tuple(targets)
+        return {key: TerminalProbe("open", "test_open") for key in keys}
+
 
 class _BrokenAdapter:
     venue = "limitless"
 
     def discover(self, _client, *, now):
         raise RuntimeError("catalogue unavailable")
+
+
+class _TerminalAdapter(_Adapter):
+    def probe_terminal(self, _client, targets):
+        from targeter.v2.continuity import TerminalProbe
+
+        keys = targets if isinstance(targets, dict) else tuple(targets)
+        return {key: TerminalProbe("terminal", "test_terminal") for key in keys}
 
 
 class _FailingManifestStore:
@@ -120,6 +135,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             strategy=self.strategy,
             output_root=self.output_root,
             cache_root=self.root / "cache",
+            live_root=self.live_root,
             now=now,
             adapters=adapters,
             client=object(),
@@ -353,6 +369,290 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         self.assertEqual(audited.run_id, run_directory.name)
         self.assertEqual(audited.venue_counts, {"kalshi": 1, "limitless": 0, "polymarket": 1})
 
+    def test_a_later_run_retains_the_exact_published_bundle_when_discovery_no_longer_sees_it(self) -> None:
+        first_directory = self.run_directory()
+        first_receipt = archive_run(first_directory, self.store, now=NOW)
+        publish_run(
+            first_directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        self.assertEqual(second.selection.as_record()["selection"]["bundle_count"], 1)
+        second_receipt = archive_run(second.directory, self.store, now=later)
+        publish_run(
+            second.directory,
+            second_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=later,
+        )
+
+        pointer = self.live_root / "targeter-v2" / "current.json"
+        self.assertEqual(load_targets(pointer, venue="kalshi").asset_ids(), ("km-subscription",))
+        self.assertEqual(load_targets(pointer, venue="polymarket").asset_ids(), ("pm-subscription",))
+
+    def test_a_run_without_continuity_authority_cannot_replace_a_committed_generation(self) -> None:
+        first_directory = self.run_directory()
+        first_receipt = archive_run(first_directory, self.store, now=NOW)
+        publish_run(
+            first_directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "committed base generation"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=self.strategy,
+                now=later,
+            )
+
+    def test_all_terminal_evidence_can_publish_an_empty_retirement_generation(self) -> None:
+        first_directory = self.run_directory()
+        first_receipt = archive_run(first_directory, self.store, now=NOW)
+        publish_run(
+            first_directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _TerminalAdapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        self.assertEqual(second.selection.as_record()["selection"]["bundle_count"], 0)
+        second_receipt = archive_run(second.directory, self.store, now=later)
+        publish_run(
+            second.directory,
+            second_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=later,
+        )
+
+        pointer = self.live_root / "targeter-v2" / "current.json"
+        for venue in ("kalshi", "polymarket", "limitless"):
+            self.assertEqual(load_targets(pointer, venue=venue).asset_ids(), ())
+
+    def test_empty_retirement_rejects_a_terminal_disposition_with_open_probes(self) -> None:
+        first_directory = self.run_directory()
+        first_receipt = archive_run(first_directory, self.store, now=NOW)
+        publish_run(
+            first_directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _TerminalAdapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        report_path = second.directory / "selection_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        for bundle in report["continuity"]["bundles"]:
+            for target in bundle["targets"]:
+                target["terminal_probe"] = {"state": "open", "reason": "forged_open"}
+        report_path.write_text(
+            json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "terminal disposition disagrees"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=self.strategy,
+                now=later,
+            )
+
+    def test_empty_retirement_rejects_unsupported_budget_trimming(self) -> None:
+        first_directory = self.run_directory()
+        first_receipt = archive_run(first_directory, self.store, now=NOW)
+        publish_run(
+            first_directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        report_path = second.directory / "selection_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["continuity"]["retained_bundle_ids"] = []
+        for bundle_id in report["continuity"]["dispositions"]:
+            report["continuity"]["dispositions"][bundle_id] = "continuity_budget_trimmed"
+        report["selection"]["bundle_ids"] = []
+        report["selection"]["bundle_count"] = 0
+        report["selection"]["targets"] = {
+            venue: [] for venue in ("kalshi", "polymarket", "limitless")
+        }
+        report_path.write_text(
+            json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "protected floor"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=self.strategy,
+                now=later,
+            )
+
+    def test_budget_trimming_cannot_publish_an_empty_generation(self) -> None:
+        polymarket = snapshot("polymarket", "p", "pm")
+        polymarket = CatalogSnapshot(
+            polymarket.venue,
+            polymarket.events,
+            (replace(polymarket.markets[0], subscription_ids=("pm-yes", "pm-no")),),
+        )
+        first = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=NOW,
+            adapters=(
+                _Adapter(snapshot("kalshi", "k", "km")),
+                _Adapter(polymarket),
+                _Adapter(CatalogSnapshot("limitless", (), ())),
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        first_receipt = archive_run(first.directory, self.store, now=NOW)
+        publish_run(
+            first.directory,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        constrained = replace(
+            self.strategy,
+            target_budgets={"kalshi": 1, "polymarket": 1, "limitless": 1},
+        )
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=constrained,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        self.assertEqual(second.selection.as_record()["selection"]["bundle_count"], 0)
+        self.assertEqual(
+            set(second.selection.continuity_dispositions.values()),
+            {"continuity_budget_trimmed"},
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "empty target selections"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=constrained,
+                now=later,
+            )
+
     def test_a_pointer_failure_exposes_no_partial_generation_and_retry_is_safe(self) -> None:
         run_directory = self.run_directory()
         receipt = archive_run(run_directory, self.store, now=NOW)
@@ -394,7 +694,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         )
         self.assertEqual(load_targets(pointer, venue="kalshi").asset_ids(), ("km-subscription",))
 
-    def test_empty_or_incomplete_runs_never_replace_the_current_generation(self) -> None:
+    def test_incomplete_runs_never_replace_the_current_generation(self) -> None:
         good_directory = self.run_directory()
         good_receipt = archive_run(good_directory, self.store, now=NOW)
         publish_run(
@@ -408,23 +708,19 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         pointer = self.live_root / "targeter-v2" / "current.json"
         before = pointer.read_bytes()
 
-        for offset, options, message in (
-            (1, {"empty": True}, "empty"),
-            (2, {"broken": True}, "incomplete"),
-        ):
-            run_directory = self.run_directory(now=NOW + timedelta(minutes=offset), **options)
-            receipt = archive_run(run_directory, self.store, now=NOW + timedelta(minutes=offset))
-            with self.subTest(message=message):
-                with self.assertRaises(PublicationError):
-                    publish_run(
-                        run_directory,
-                        receipt,
-                        self.store,
-                        live_root=self.live_root,
-                        strategy=self.strategy,
-                        now=NOW + timedelta(minutes=offset),
-                    )
-                self.assertEqual(pointer.read_bytes(), before)
+        later = NOW + timedelta(minutes=1)
+        run_directory = self.run_directory(now=later, broken=True)
+        receipt = archive_run(run_directory, self.store, now=later)
+        with self.assertRaises(PublicationError):
+            publish_run(
+                run_directory,
+                receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=self.strategy,
+                now=later,
+            )
+        self.assertEqual(pointer.read_bytes(), before)
 
     def test_conformance_archive_is_not_publication_authority(self) -> None:
         run_directory = self.run_directory()

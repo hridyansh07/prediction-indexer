@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "note": "Sports-first event selection. Admission uses normalized dollar/USDC moneyline volume; vendor-native contract counts remain diagnostics only.",
   "sports": [
     "soccer",
@@ -16,6 +16,9 @@
     "minimum_market_age_seconds": 1800,
     "minimum_combined_moneyline_volume_usd": 25000,
     "post_start_retention_seconds": 21600,
+    "terminal_clamp_seconds": 28800,
+    "continuity_degraded_after_seconds": 14400,
+    "continuity_hold_enabled": true,
     "maximum_bundles": 50
   },
   "target_budgets": {

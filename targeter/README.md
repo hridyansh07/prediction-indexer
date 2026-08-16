@@ -52,6 +52,16 @@ Three venues rank ahead of two. Venue coverage, relationship quality, market
 class breadth, and activity then rank admitted events under explicit
 subscription budgets.
 
+Once published, a qualifying bundle has continuity priority over newcomers. The
+targeter directly probes every market in the committed bundle because terminal
+markets disappear from live discovery. It retains the entire prior subscription
+set while any venue remains open or has unknown state, then retires the bundle
+atomically when every market is terminal or the configurable eight-hour clamp
+elapses. This preserves the interval where one venue has concluded while another
+still trades. See
+[`../docs/TARGETER_CONTINUITY_V1.md`](../docs/TARGETER_CONTINUITY_V1.md) for the
+normative contract.
+
 The dollar gate intentionally excludes values whose units are not dollars.
 Polymarket `volumeNum` and Limitless formatted USDC volume can contribute.
 Kalshi `volume_fp` is a contract count and cannot contribute unless the API
@@ -165,8 +175,9 @@ The four modes are:
 | `audit` | Verify the current generation and archive without discovery |
 
 Publication is deliberately harder than discovery. An incomplete vendor run,
-empty selection, archive verification failure, or partial local generation
-cannot replace the last valid target pointer.
+unrelated empty selection, archive verification failure, or partial local
+generation cannot replace the last valid target pointer. The only automatic
+empty generation is one proving retirement of every prior continuity bundle.
 
 ## Running locally
 

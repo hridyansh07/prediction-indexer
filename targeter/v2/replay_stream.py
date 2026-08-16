@@ -21,7 +21,7 @@ from encoder import (
     StoredIdentity,
     decode_stream,
 )
-from targeter.v2.domain import SUPPORTED_VENUES
+from targeter.v2.models import SUPPORTED_VENUES
 from targeter.v2.run_archive import (
     ArchivedRunObject,
     RunArchiveReceipt,

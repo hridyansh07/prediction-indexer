@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from targeter.targets import TargetsError
 from targeter.v2.adapters import (
     KalshiSportsAdapter,
     LimitlessSportsAdapter,
@@ -24,10 +25,22 @@ from targeter.v2.domain import (
     canonical_participant,
     isoformat,
 )
+from targeter.v2.continuity import (
+    ContinuityBundle,
+    ContinuityError,
+    ContinuityTarget,
+    TerminalProbe,
+)
 from targeter.v2.matching import match_events
 from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
 from targeter.v2.rules import assess_rules, normal_path_contradictions, template_for
-from targeter.v2.run import ShadowRun, main as shadow_main, parse_args, run_shadow
+from targeter.v2.run import (
+    ShadowRun,
+    _continuity_for_run,
+    main as shadow_main,
+    parse_args,
+    run_shadow,
+)
 from targeter.v2.run_archive import read_run_report
 from targeter.v2.selection import select_targets
 
@@ -311,6 +324,104 @@ class AdapterContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.strategy = load_strategy(STRATEGY_PATH)
         self.registry = MarketClassRegistry(self.strategy)
+
+    def test_terminal_probes_use_only_definitive_venue_signals(self) -> None:
+        kalshi = KalshiSportsAdapter(self.registry)
+        polymarket = PolymarketSportsAdapter(self.registry)
+        limitless = LimitlessSportsAdapter(self.registry)
+
+        kalshi_result = kalshi.probe_terminal(
+            FakeClient(
+                lambda *_args: {
+                    "markets": [
+                        {
+                            "ticker": "K-OPEN",
+                            "status": "active",
+                            "close_time": "2026-08-04T00:00:00Z",
+                            "expiration_time": "2026-08-04T00:00:00Z",
+                        },
+                        {
+                            "ticker": "K-DONE",
+                            "status": "finalized",
+                            "close_time": "2026-08-03T12:00:00Z",
+                            "expiration_time": "2026-08-05T12:00:00Z",
+                        },
+                    ]
+                }
+            ),
+            ("K-OPEN", "K-DONE"),
+        )
+        self.assertEqual(kalshi_result["K-OPEN"].state, "open")
+        self.assertEqual(kalshi_result["K-DONE"].state, "terminal")
+
+        polymarket_result = polymarket.probe_terminal(
+            FakeClient(
+                lambda _base, path, _params: {
+                    "id": path.rsplit("/", 1)[-1],
+                    "active": True,
+                    "acceptingOrders": path.endswith("open"),
+                }
+            ),
+            ("open", "closed"),
+        )
+        self.assertEqual(polymarket_result["open"].state, "open")
+        self.assertEqual(polymarket_result["closed"].state, "terminal")
+
+        limitless_result = limitless.probe_terminal(
+            FakeClient(
+                lambda _base, path, _params: {
+                    "slug": path.rsplit("/", 1)[-1],
+                    "tradeType": "clob",
+                    "expired": path.endswith("done"),
+                    "status": "RESOLVED" if path.endswith("done") else "FUNDED",
+                }
+            ),
+            {"l-open": "/markets/open", "l-done": "/markets/done"},
+        )
+        self.assertEqual(limitless_result["l-open"].state, "open")
+        self.assertEqual(limitless_result["l-done"].state, "terminal")
+
+    def test_failed_or_malformed_terminal_probe_is_unknown(self) -> None:
+        def failed(*_args):
+            raise RuntimeError("404")
+
+        kalshi = KalshiSportsAdapter(self.registry)
+        polymarket = PolymarketSportsAdapter(self.registry)
+        limitless = LimitlessSportsAdapter(self.registry)
+        self.assertEqual(
+            kalshi.probe_terminal(FakeClient(failed), ("missing",))["missing"].state,
+            "unknown",
+        )
+        self.assertEqual(
+            kalshi.probe_terminal(
+                FakeClient(
+                    lambda *_args: {
+                        "markets": [
+                            {
+                                "ticker": "K-ACTIVE",
+                                "status": "active",
+                                "close_time": "2026-08-03T12:00:00Z",
+                                "expected_expiration_time": "2026-08-05T12:00:00Z",
+                            }
+                        ]
+                    }
+                ),
+                ("K-ACTIVE",),
+            )["K-ACTIVE"].state,
+            "open",
+            "expected_expiration_time must not stand in for expiration_time",
+        )
+        self.assertEqual(
+            polymarket.probe_terminal(FakeClient(failed), ("missing",))["missing"].state,
+            "unknown",
+        )
+        self.assertEqual(
+            limitless.probe_terminal(
+                FakeClient(lambda *_args: {"tradeType": "clob"}),
+                {"limitless:bad": "/markets/bad"},
+            )["limitless:bad"].state,
+            "unknown",
+        )
 
     def test_kalshi_paginates_series_events_and_normalizes_a_small_shape(self) -> None:
         def handler(_base, path, params):
@@ -1061,8 +1172,374 @@ class RulesAndSelectionTests(unittest.TestCase):
         self.assertEqual(result.selected, ())
         self.assertEqual(result.budget_used, {"kalshi": 0, "polymarket": 0, "limitless": 0})
 
+    def test_retained_bundle_survives_one_terminal_leg_and_higher_ranked_newcomer(self) -> None:
+        retained = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id="prior",
+            activation_at=NOW,
+            score=1.0,
+            targets=(
+                ContinuityTarget(
+                    target_id="kalshi:old-k",
+                    venue="kalshi",
+                    venue_market_id="old-k",
+                    canonical_class="soccer.moneyline_3way",
+                    subscription_ids=("old-k-sub",),
+                    activation_at=NOW,
+                    capture_start_at=NOW - timedelta(hours=1),
+                    source_ref="/markets/old-k",
+                    probe=TerminalProbe("terminal", "status_finalized"),
+                ),
+                ContinuityTarget(
+                    target_id="polymarket:old-p",
+                    venue="polymarket",
+                    venue_market_id="old-p",
+                    canonical_class="soccer.moneyline_3way",
+                    subscription_ids=("old-p-sub",),
+                    activation_at=NOW,
+                    capture_start_at=NOW - timedelta(hours=1),
+                    source_ref="/markets/old-p",
+                    probe=TerminalProbe("open", "accepting_orders"),
+                ),
+            ),
+        )
+        constrained = replace(
+            self.strategy,
+            target_budgets={"kalshi": 1, "polymarket": 1, "limitless": 1},
+        )
+        result = select_targets(
+            (snapshot("kalshi", "k", "km"), snapshot("polymarket", "p", "pm")),
+            strategy=constrained,
+            now=NOW,
+            continuity_bundles=(retained,),
+        )
+
+        self.assertEqual(result.as_record()["selection"]["bundle_ids"], ["prior"])
+        self.assertEqual(result.targets["kalshi"][0]["target_id"], "kalshi:old-k")
+        self.assertEqual(
+            next(iter(result.allocation_rejections.values())),
+            "displaced_by_continuity_hold",
+        )
+
+    def test_held_bundle_does_not_replace_its_committed_subscription_ids(self) -> None:
+        catalogs = (
+            snapshot("kalshi", "k", "km"),
+            snapshot("polymarket", "p", "pm"),
+        )
+        fresh = select_targets(catalogs, strategy=self.strategy, now=NOW)
+        candidate = fresh.selected[0]
+        prior = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id=candidate.bundle.bundle_id,
+            activation_at=candidate.bundle.activation_at,
+            score=candidate.score,
+            targets=tuple(
+                ContinuityTarget(
+                    target_id=market.target_id,
+                    venue=market.venue,
+                    venue_market_id=market.venue_market_id,
+                    canonical_class=market.canonical_class,
+                    subscription_ids=(f"committed-{market.venue}",),
+                    activation_at=candidate.bundle.activation_at,
+                    capture_start_at=candidate.capture_start_at,
+                    source_ref=market.source_ref,
+                    probe=TerminalProbe("open", "accepting_orders"),
+                )
+                for market in candidate.eligible_markets
+            ),
+        )
+
+        held = select_targets(
+            catalogs,
+            strategy=self.strategy,
+            now=NOW,
+            continuity_bundles=(prior,),
+        )
+
+        self.assertEqual(
+            {
+                target["subscription_ids"][0]
+                for venue_targets in held.targets.values()
+                for target in venue_targets
+            },
+            {"committed-kalshi", "committed-polymarket"},
+        )
+
+    def test_past_post_start_retention_rejects_only_fresh_admission(self) -> None:
+        catalogs = (
+            snapshot("kalshi", "k", "km"),
+            snapshot("polymarket", "p", "pm"),
+        )
+        fresh = select_targets(catalogs, strategy=self.strategy, now=NOW)
+        candidate = fresh.selected[0]
+        prior = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id=candidate.bundle.bundle_id,
+            activation_at=candidate.bundle.activation_at,
+            score=candidate.score,
+            targets=tuple(
+                ContinuityTarget(
+                    target_id=market.target_id,
+                    venue=market.venue,
+                    venue_market_id=market.venue_market_id,
+                    canonical_class=market.canonical_class,
+                    subscription_ids=market.subscription_ids,
+                    activation_at=candidate.bundle.activation_at,
+                    capture_start_at=candidate.capture_start_at,
+                    source_ref=market.source_ref,
+                    probe=TerminalProbe("open", "accepting_orders"),
+                )
+                for market in candidate.eligible_markets
+            ),
+        )
+
+        later = candidate.bundle.activation_at + timedelta(hours=7)
+        result = select_targets(
+            catalogs,
+            strategy=self.strategy,
+            now=later,
+            continuity_bundles=(prior,),
+        )
+
+        current = next(
+            item for item in result.candidates if item.bundle.bundle_id == prior.bundle_id
+        )
+        self.assertIn("past_post_start_retention", current.rejection_reasons)
+        self.assertEqual(result.as_record()["selection"]["bundle_ids"], [prior.bundle_id])
+        self.assertEqual(result.continuity_dispositions[prior.bundle_id], "retained")
+
+    def test_retained_bundle_retires_only_when_all_legs_terminal_or_clamped(self) -> None:
+        def continuity(*states: str, activation: datetime = NOW) -> ContinuityBundle:
+            return ContinuityBundle(
+                base_run_id="20260803T110000.000000Z",
+                bundle_id="prior",
+                activation_at=activation,
+                score=1.0,
+                targets=tuple(
+                    ContinuityTarget(
+                        target_id=f"{venue}:old",
+                        venue=venue,
+                        venue_market_id="old",
+                        canonical_class="soccer.moneyline_3way",
+                        subscription_ids=(f"{venue}-sub",),
+                        activation_at=activation,
+                        capture_start_at=activation - timedelta(hours=1),
+                        source_ref="/markets/old",
+                        probe=TerminalProbe(state, state),
+                    )
+                    for venue, state in zip(("kalshi", "polymarket"), states, strict=True)
+                ),
+            )
+
+        partial = select_targets(
+            (), strategy=self.strategy, now=NOW + timedelta(hours=1),
+            continuity_bundles=(continuity("terminal", "unknown"),),
+        )
+        terminal = select_targets(
+            (), strategy=self.strategy, now=NOW + timedelta(hours=1),
+            continuity_bundles=(continuity("terminal", "terminal"),),
+        )
+        clamped = select_targets(
+            (), strategy=self.strategy, now=NOW,
+            continuity_bundles=(continuity("open", "unknown", activation=NOW - timedelta(hours=9)),),
+        )
+
+        self.assertEqual(partial.as_record()["selection"]["bundle_ids"], ["prior"])
+        self.assertEqual(terminal.as_record()["selection"]["bundle_ids"], [])
+        self.assertEqual(clamped.as_record()["selection"]["bundle_ids"], [])
+
+    def test_protected_budget_trims_the_lowest_score_bundle_atomically(self) -> None:
+        def retained(bundle_id: str, score: float, suffix: str) -> ContinuityBundle:
+            return ContinuityBundle(
+                base_run_id="20260803T110000.000000Z",
+                bundle_id=bundle_id,
+                activation_at=NOW,
+                score=score,
+                targets=tuple(
+                    ContinuityTarget(
+                        target_id=f"{venue}:{suffix}",
+                        venue=venue,
+                        venue_market_id=suffix,
+                        canonical_class="soccer.moneyline_3way",
+                        subscription_ids=(f"{venue}-{suffix}",),
+                        activation_at=NOW,
+                        capture_start_at=NOW - timedelta(hours=1),
+                        source_ref=f"/markets/{suffix}",
+                        probe=TerminalProbe("unknown", "probe_failed"),
+                    )
+                    for venue in ("kalshi", "polymarket")
+                ),
+            )
+
+        result = select_targets(
+            (),
+            strategy=replace(
+                self.strategy,
+                target_budgets={"kalshi": 1, "polymarket": 1, "limitless": 1},
+            ),
+            now=NOW,
+            continuity_bundles=(
+                retained("higher", 20.0, "high"),
+                retained("lower", 10.0, "low"),
+            ),
+        )
+
+        self.assertEqual(result.as_record()["selection"]["bundle_ids"], ["higher"])
+        self.assertEqual(
+            result.allocation_rejections["lower"], "continuity_budget_trimmed"
+        )
+
+    def test_unrelated_protected_venue_does_not_relabel_budget_exhaustion(self) -> None:
+        first_participants = ("Arsenal", "Chelsea")
+        second_participants = ("Liverpool", "Everton")
+        catalogs = tuple(
+            CatalogSnapshot(
+                venue,
+                (
+                    event(venue, f"{venue}-first", participants=first_participants),
+                    event(
+                        venue,
+                        f"{venue}-second",
+                        participants=second_participants,
+                        activation=START + timedelta(minutes=5),
+                    ),
+                ),
+                (
+                    market(venue, f"{venue}-first-market", f"{venue}-first"),
+                    market(venue, f"{venue}-second-market", f"{venue}-second"),
+                ),
+            )
+            for venue in ("kalshi", "polymarket")
+        )
+        limitless_hold = ContinuityBundle(
+            base_run_id="20260803T110000.000000Z",
+            bundle_id="limitless-only-hold",
+            activation_at=START,
+            score=1.0,
+            targets=(
+                ContinuityTarget(
+                    target_id="limitless:held",
+                    venue="limitless",
+                    venue_market_id="held",
+                    canonical_class="soccer.moneyline_3way",
+                    subscription_ids=("limitless-held",),
+                    activation_at=START,
+                    capture_start_at=NOW,
+                    source_ref="/markets/held",
+                    probe=TerminalProbe("open", "funded_not_expired"),
+                ),
+            ),
+        )
+
+        result = select_targets(
+            catalogs,
+            strategy=replace(
+                self.strategy,
+                target_budgets={"kalshi": 1, "polymarket": 10, "limitless": 1},
+            ),
+            now=NOW,
+            continuity_bundles=(limitless_hold,),
+        )
+
+        rejected = {
+            bundle_id: reason
+            for bundle_id, reason in result.allocation_rejections.items()
+            if bundle_id != limitless_hold.bundle_id
+        }
+        self.assertEqual(list(rejected.values()), ["target_budget_exceeded"])
+
 
 class ShadowRunTests(unittest.TestCase):
+    def test_old_corrupt_generation_still_writes_a_discovery_report(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+
+        class Adapter:
+            def __init__(self, venue: str) -> None:
+                self.venue = venue
+
+            def discover(self, _client, *, now):
+                return CatalogSnapshot(self.venue, (), ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_root = root / "live"
+            pointer = live_root / "targeter-v2" / "current.json"
+            pointer.parent.mkdir(parents=True)
+            pointer.write_text(
+                json.dumps({"run_id": "20260803T070000.000000Z"}),
+                encoding="utf-8",
+            )
+            with patch(
+                "targeter.v2.run.load_continuity_bundles",
+                side_effect=TargetsError("committed target identity mismatch"),
+            ):
+                result = run_shadow(
+                    strategy=strategy,
+                    output_root=root / "runs",
+                    cache_root=root / "cache",
+                    live_root=live_root,
+                    now=NOW,
+                    adapters=tuple(Adapter(venue) for venue in SUPPORTED_VENUES),
+                    client=object(),
+                    artifact_format="ndjson",
+                )
+
+            report = read_run_report(result.directory)
+            self.assertTrue(report["input_complete"])
+            self.assertEqual(
+                report["continuity_diagnostics"],
+                ["continuity_degraded_after_timeout: committed target identity mismatch"],
+            )
+            self.assertEqual(
+                report["continuity_degraded_base_run_id"],
+                "20260803T070000.000000Z",
+            )
+
+    def test_unreadable_recent_continuity_fails_closed_but_degrades_after_timeout(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+
+        def attempt(run_age: timedelta, error: Exception):
+            with tempfile.TemporaryDirectory() as directory:
+                live_root = Path(directory)
+                pointer = live_root / "targeter-v2" / "current.json"
+                pointer.parent.mkdir(parents=True)
+                run_time = NOW - run_age
+                run_id = run_time.strftime("%Y%m%dT%H%M%S.000000Z")
+                pointer.write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+                with patch(
+                    "targeter.v2.run.load_continuity_bundles",
+                    side_effect=error,
+                ):
+                    return _continuity_for_run(
+                        live_root=live_root,
+                        adapters=(),
+                        client=object(),
+                        strategy=strategy,
+                        now=NOW,
+                    )
+
+        with self.assertRaisesRegex(ContinuityError, "missing continuity metadata"):
+            attempt(timedelta(hours=3), ContinuityError("missing continuity metadata"))
+        bundles, diagnostics, degraded_base_run_id = attempt(
+            timedelta(hours=5), ContinuityError("missing continuity metadata")
+        )
+        self.assertEqual(bundles, ())
+        self.assertEqual(
+            diagnostics,
+            ["continuity_degraded_after_timeout: missing continuity metadata"],
+        )
+        self.assertEqual(degraded_base_run_id, "20260803T070000.000000Z")
+
+        corrupt_bundles, corrupt_diagnostics, corrupt_base_run_id = attempt(
+            timedelta(hours=5), TargetsError("committed target identity mismatch")
+        )
+        self.assertEqual(corrupt_bundles, ())
+        self.assertEqual(
+            corrupt_diagnostics,
+            ["continuity_degraded_after_timeout: committed target identity mismatch"],
+        )
+        self.assertEqual(corrupt_base_run_id, "20260803T070000.000000Z")
+
     def test_raw_response_cache_control_is_explicit_and_incompatible_with_reuse(self) -> None:
         arguments = parse_args(["--no-response-cache"])
         self.assertTrue(arguments.no_response_cache)

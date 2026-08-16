@@ -21,9 +21,9 @@ AT = datetime(2026, 8, 3, 15, tzinfo=timezone.utc)
 
 
 class EsportsRegistryAndParserTests(unittest.TestCase):
-    def test_v3_ships_only_families_with_two_reviewed_venues(self):
+    def test_v4_ships_only_families_with_two_reviewed_venues(self):
         strategy = load_strategy(STRATEGY)
-        self.assertEqual(strategy.version, 3)
+        self.assertEqual(strategy.version, 4)
         families = {family.id: family for family in strategy.game_families}
         self.assertEqual(set(families), {"league_of_legends", "counter_strike_2", "dota_2", "valorant"})
         # Selection needs two venues, so a family with no reviewed products on a

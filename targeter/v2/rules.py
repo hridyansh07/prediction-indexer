@@ -14,7 +14,7 @@ import html
 from dataclasses import dataclass
 from typing import Mapping
 
-from targeter.v2.domain import CanonicalEvent, CanonicalMarket, EventBundle, stable_id
+from targeter.v2.models import CanonicalEvent, CanonicalMarket, EventBundle, stable_id
 
 
 NORMALIZER_VERSION = 1

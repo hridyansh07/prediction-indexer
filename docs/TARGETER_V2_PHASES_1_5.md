@@ -50,6 +50,9 @@ The default contract is:
 - minimum known market age: 1,800 seconds;
 - minimum combined known moneyline lifetime volume: USD/USDC 25,000;
 - post-start retention: 21,600 seconds;
+- committed-bundle terminal clamp: 28,800 seconds;
+- continuity-metadata degraded timeout: 14,400 seconds;
+- continuity hold: enabled;
 - maximum selected bundles: 50;
 - venue subscription budgets: explicit and independently enforced.
 
@@ -226,6 +229,13 @@ a weighted scalar for allocation order, so no number of two-venue listings can
 outrank a three-venue bundle. Allocation is bundle-atomic: if adding the bundle
 exceeds any venue budget, none of it is selected. The report states
 `target_budget_exceeded` or `maximum_bundles_reached` for allocation drops.
+
+When a committed Targeter v2 generation exists, continuity and terminal
+retirement additionally follow `TARGETER_CONTINUITY_V1.md`. Currently eligible
+held bundles and exact retained prior bundles consume budget before additive
+candidates. A retained bundle is removed only when every directly probed market
+is independently terminal in the same run or its activation-based terminal
+clamp elapses. This does not weaken fresh admission gates.
 
 ## 7. Phase 5 — templates, drift, and shadow run
 

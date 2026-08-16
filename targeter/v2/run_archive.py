@@ -28,7 +28,7 @@ from archive.storage.base import (
     provider_checksum_of,
 )
 from encoder import CodecError, LogicalIdentity, StoredIdentity, logical_identity_of, stored_identity_of
-from targeter.v2.domain import SUPPORTED_VENUES, parse_timestamp
+from targeter.v2.models import SUPPORTED_VENUES, parse_timestamp
 
 
 RUN_MANIFEST_VERSION = 2
@@ -175,7 +175,7 @@ def read_run_report(run_directory: Path) -> dict[str, Any]:
         raise RunArchiveError(
             f"selection report run_id {run_id!r} does not match directory {run_directory.name!r}"
         )
-    if report.get("report_version") != 1 or report.get("mode") != "shadow":
+    if report.get("report_version") not in {1, 2} or report.get("mode") != "shadow":
         raise RunArchiveError("selection report is not a phase-5 shadow report")
     selection = report.get("selection")
     if not isinstance(selection, dict) or selection.get("publication_performed") is not False:
