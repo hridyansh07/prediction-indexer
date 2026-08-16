@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import type { DecodeExpectation } from '@prediction-indexer/rust-v1-decoder';
-import type { RunSummary } from '../shared.js';
+import {
+  continuityDispositions,
+  type ContinuityBundle,
+  type RunSummary,
+  type SelectionReport,
+} from '../shared.js';
 
 export const RUN_RE =
   /(?:^|\/)date=(\d{4}-\d{2}-\d{2})\/run=(\d{8}T\d{6}\.\d{6}Z)\/run_manifest\.json$/;
@@ -17,6 +22,25 @@ const int = (x: unknown, label: string) => {
   if (!Number.isSafeInteger(x) || (x as number) < 0)
     throw new Error(`${label} is invalid`);
   return x as number;
+};
+const text = (x: unknown, label: string) => {
+  if (typeof x !== 'string' || !x) throw new Error(`${label} is invalid`);
+  return x;
+};
+const finite = (x: unknown, label: string) => {
+  if (typeof x !== 'number' || !Number.isFinite(x))
+    throw new Error(`${label} is invalid`);
+  return x;
+};
+const uniqueStrings = (x: unknown, label: string, allowEmpty = false) => {
+  if (
+    !Array.isArray(x) ||
+    (!allowEmpty && !x.length) ||
+    x.some((item) => typeof item !== 'string' || !item) ||
+    new Set(x).size !== x.length
+  )
+    throw new Error(`${label} is invalid`);
+  return x as string[];
 };
 const timestamp = (x: unknown, label: string) => {
   if (
@@ -220,6 +244,148 @@ export interface ReportDecoder {
   ): Promise<T>;
 }
 
+interface ValidatedContinuity {
+  byBundle: Map<string, ContinuityBundle>;
+  retainedBundleIds: Set<string>;
+  dispositions: Map<string, string>;
+}
+
+function validateContinuity(report: Record<string, any>): ValidatedContinuity {
+  const result: ValidatedContinuity = {
+    byBundle: new Map(),
+    retainedBundleIds: new Set(),
+    dispositions: new Map(),
+  };
+  if (report.report_version === 1) return result;
+
+  const continuity = obj(report.continuity, 'selection report continuity');
+  exactKeys(
+    continuity,
+    ['bundles', 'retained_bundle_ids', 'dispositions'],
+    'selection report continuity',
+  );
+  if (!Array.isArray(continuity.bundles))
+    throw new Error('selection report continuity bundles are invalid');
+  for (const rawBundle of continuity.bundles) {
+    const bundle = obj(rawBundle, 'continuity bundle');
+    exactKeys(
+      bundle,
+      ['base_run_id', 'bundle_id', 'activation_at', 'score', 'targets'],
+      'continuity bundle',
+    );
+    const bundleId = text(bundle.bundle_id, 'continuity bundle_id');
+    if (result.byBundle.has(bundleId))
+      throw new Error('selection report repeats a continuity bundle');
+    text(bundle.base_run_id, 'continuity base_run_id');
+    timestamp(bundle.activation_at, 'continuity activation_at');
+    finite(bundle.score, 'continuity score');
+    if (!Array.isArray(bundle.targets) || !bundle.targets.length)
+      throw new Error('continuity bundle targets are invalid');
+    const targetIds = new Set<string>();
+    for (const rawTarget of bundle.targets) {
+      const target = obj(rawTarget, 'continuity target');
+      exactKeys(
+        target,
+        [
+          'target_id',
+          'venue',
+          'venue_market_id',
+          'canonical_class',
+          'subscription_ids',
+          'activation_at',
+          'capture_start_at',
+          'source_ref',
+          'terminal_probe',
+        ],
+        'continuity target',
+      );
+      const venue = text(target.venue, 'continuity target venue');
+      const venueMarketId = text(
+        target.venue_market_id,
+        'continuity target venue_market_id',
+      );
+      const targetId = text(target.target_id, 'continuity target_id');
+      if (
+        !supportedVenues.includes(venue) ||
+        targetId !== `${venue}:${venueMarketId}` ||
+        targetIds.has(targetId)
+      )
+        throw new Error('continuity target identity is invalid');
+      targetIds.add(targetId);
+      text(target.canonical_class, 'continuity target canonical_class');
+      uniqueStrings(
+        target.subscription_ids,
+        'continuity target subscription_ids',
+      );
+      if (
+        timestamp(target.activation_at, 'continuity target activation_at') !==
+        bundle.activation_at
+      )
+        throw new Error(
+          'continuity target activation disagrees with its bundle',
+        );
+      timestamp(target.capture_start_at, 'continuity target capture_start_at');
+      text(target.source_ref, 'continuity target source_ref');
+      const probe = obj(target.terminal_probe, 'continuity terminal_probe');
+      exactKeys(probe, ['state', 'reason'], 'continuity terminal_probe');
+      if (!['open', 'terminal', 'unknown'].includes(probe.state))
+        throw new Error('continuity terminal_probe state is invalid');
+      text(probe.reason, 'continuity terminal_probe reason');
+    }
+    result.byBundle.set(bundleId, bundle as unknown as ContinuityBundle);
+  }
+  for (const bundleId of uniqueStrings(
+    continuity.retained_bundle_ids,
+    'selection report retained_bundle_ids',
+    true,
+  )) {
+    if (!result.byBundle.has(bundleId))
+      throw new Error('retained bundle is absent from continuity evidence');
+    result.retainedBundleIds.add(bundleId);
+  }
+  const rawDispositions = obj(
+    continuity.dispositions,
+    'selection report continuity dispositions',
+  );
+  if (
+    Object.keys(rawDispositions).sort().join('\0') !==
+    [...result.byBundle.keys()].sort().join('\0')
+  )
+    throw new Error(
+      'continuity dispositions do not account for every prior bundle',
+    );
+  const allowedDispositions = new Set<string>(continuityDispositions);
+  for (const [bundleId, disposition] of Object.entries(rawDispositions)) {
+    if (
+      typeof disposition !== 'string' ||
+      !allowedDispositions.has(disposition)
+    )
+      throw new Error('continuity disposition is invalid');
+    result.dispositions.set(bundleId, disposition);
+  }
+  if (
+    !Array.isArray(report.continuity_diagnostics) ||
+    report.continuity_diagnostics.some(
+      (diagnostic: unknown) => typeof diagnostic !== 'string' || !diagnostic,
+    )
+  )
+    throw new Error('selection report continuity_diagnostics are invalid');
+  if (
+    report.continuity_degraded_base_run_id !== null &&
+    (typeof report.continuity_degraded_base_run_id !== 'string' ||
+      !report.continuity_degraded_base_run_id)
+  )
+    throw new Error(
+      'selection report continuity_degraded_base_run_id is invalid',
+    );
+  if (
+    report.continuity_degraded_base_run_id !== null &&
+    (result.byBundle.size || !report.continuity_diagnostics.length)
+  )
+    throw new Error('selection report degraded continuity state is invalid');
+  return result;
+}
+
 export async function validateReportPath(
   storedPath: string,
   file: ReportFile,
@@ -246,14 +412,14 @@ export async function validateReportPath(
     }
     const r = obj(report, 'selection report');
     if (
-      r.report_version !== 1 ||
+      ![1, 2].includes(r.report_version) ||
       r.mode !== 'shadow' ||
       r.run_id !== runId ||
       typeof r.input_complete !== 'boolean' ||
       !Array.isArray(r.catalogs) ||
       !Array.isArray(r.candidates)
     )
-      throw new Error('invalid selection report v1');
+      throw new Error('invalid selection report');
     timestamp(r.generated_at, 'selection report generated_at');
     obj(r.discovery_failures, 'selection report discovery_failures');
     if (
@@ -262,6 +428,7 @@ export async function validateReportPath(
         !['zstd', 'ndjson'].includes(r.artifact_format))
     )
       throw new Error('selection report artifact inventory is invalid');
+    const continuity = validateContinuity(r);
     const catalogVenues = new Set<string>();
     for (const rawCatalog of r.catalogs) {
       const catalog = obj(rawCatalog, 'catalog summary');
@@ -278,6 +445,10 @@ export async function validateReportPath(
     if (r.artifacts !== undefined) {
       const artifacts = obj(r.artifacts, 'selection report artifacts');
       const suffix = r.artifact_format === 'zstd' ? '.ndjson.zst' : '.ndjson';
+      const names = Object.keys(artifacts);
+      const targetRecords = supportedVenues.map(
+        (venue) => `target_records_${venue}${suffix}`,
+      );
       const expected = [
         `rule_templates${suffix}`,
         `rule_drift${suffix}`,
@@ -285,10 +456,11 @@ export async function validateReportPath(
           `catalog_${venue}_events${suffix}`,
           `catalog_${venue}_markets${suffix}`,
         ]),
+        ...(targetRecords.some((name) => names.includes(name))
+          ? targetRecords
+          : []),
       ];
-      if (
-        Object.keys(artifacts).sort().join('\0') !== expected.sort().join('\0')
-      )
+      if (names.sort().join('\0') !== expected.sort().join('\0'))
         throw new Error(
           'selection report artifact inventory is incomplete or unexpected',
         );
@@ -310,6 +482,45 @@ export async function validateReportPath(
     )
       throw new Error('selection report targets are invalid');
     obj(selection.allocation_rejections, 'selection allocation_rejections');
+    const selectedTargetIds = new Set<string>();
+    for (const venue of supportedVenues) {
+      for (const rawTarget of targets[venue]) {
+        const target = obj(rawTarget, 'selection target');
+        exactKeys(
+          target,
+          [
+            'target_id',
+            'bundle_id',
+            'canonical_class',
+            'subscription_ids',
+            'activation_at',
+            'capture_start_at',
+            'source_ref',
+            ...(r.report_version === 2 ? ['continuity_score'] : []),
+          ],
+          'selection target',
+        );
+        const targetId = text(target.target_id, 'selection target_id');
+        const bundleId = text(target.bundle_id, 'selection target bundle_id');
+        if (
+          !targetId.startsWith(`${venue}:`) ||
+          selectedTargetIds.has(targetId) ||
+          !selection.bundle_ids.includes(bundleId)
+        )
+          throw new Error('selection target identity is invalid');
+        selectedTargetIds.add(targetId);
+        text(target.canonical_class, 'selection target canonical_class');
+        uniqueStrings(
+          target.subscription_ids,
+          'selection target subscription_ids',
+        );
+        timestamp(target.activation_at, 'selection target activation_at');
+        timestamp(target.capture_start_at, 'selection target capture_start_at');
+        text(target.source_ref, 'selection target source_ref');
+        if (r.report_version === 2)
+          finite(target.continuity_score, 'selection target continuity_score');
+      }
+    }
     const candidates = new Map<string, Record<string, any>>();
     for (const rawCandidate of r.candidates) {
       const candidate = obj(rawCandidate, 'candidate');
@@ -347,10 +558,86 @@ export async function validateReportPath(
       candidates.set(candidate.bundle_id, candidate);
     }
     if (
-      selection.bundle_ids.some((id: string) => !candidates.get(id)?.eligible)
+      selection.bundle_ids.some(
+        (id: string) =>
+          !candidates.get(id)?.eligible &&
+          !continuity.retainedBundleIds.has(id),
+      )
     )
       throw new Error('selected bundle is absent or ineligible');
-    return r;
+    if (r.report_version === 2) {
+      for (const venue of supportedVenues) {
+        for (const target of targets[venue]) {
+          const continuityBundle = continuity.byBundle.get(target.bundle_id);
+          const expectedScore =
+            continuityBundle?.score ?? candidates.get(target.bundle_id)?.score;
+          if (
+            !Number.isFinite(expectedScore) ||
+            target.continuity_score !== expectedScore
+          )
+            throw new Error(
+              'selection target continuity_score disagrees with its provenance',
+            );
+        }
+      }
+      for (const [bundleId, disposition] of continuity.dispositions) {
+        const selected = selection.bundle_ids.includes(bundleId);
+        const retained = continuity.retainedBundleIds.has(bundleId);
+        if (
+          (disposition === 'retained' && (!retained || !selected)) ||
+          (disposition !== 'retained' && retained) ||
+          (disposition === 'held_current_candidate' && !selected) ||
+          ([
+            'continuity_budget_trimmed',
+            'all_markets_terminal',
+            'terminal_clamp_elapsed',
+          ].includes(disposition) &&
+            selected)
+        )
+          throw new Error(
+            'selection report continuity disposition is inconsistent',
+          );
+        if (
+          disposition === 'all_markets_terminal' &&
+          !continuity.byBundle
+            .get(bundleId)!
+            .targets.every(
+              (target) => target.terminal_probe.state === 'terminal',
+            )
+        )
+          throw new Error('all-terminal disposition has a non-terminal probe');
+      }
+      for (const bundleId of continuity.retainedBundleIds) {
+        const expected = continuity.byBundle.get(bundleId)!;
+        const selected = supportedVenues.flatMap((venue) =>
+          targets[venue].filter(
+            (target: Record<string, any>) => target.bundle_id === bundleId,
+          ),
+        );
+        if (
+          selected.length !== expected.targets.length ||
+          expected.targets.some((continuityTarget) => {
+            const target = selected.find(
+              (item: Record<string, any>) =>
+                item.target_id === continuityTarget.target_id,
+            );
+            return (
+              !target ||
+              target.canonical_class !== continuityTarget.canonical_class ||
+              target.source_ref !== continuityTarget.source_ref ||
+              target.activation_at !== continuityTarget.activation_at ||
+              target.capture_start_at !== continuityTarget.capture_start_at ||
+              JSON.stringify(target.subscription_ids) !==
+                JSON.stringify(continuityTarget.subscription_ids)
+            );
+          })
+        )
+          throw new Error(
+            'retained selection targets disagree with continuity evidence',
+          );
+      }
+    }
+    return r as SelectionReport;
   };
   if (!compressed) return parse(storedPath);
   if (!decoder) throw new Error('selection report decoder is required');
@@ -373,7 +660,7 @@ export async function validateReportPath(
     );
   }
 }
-export function summarizeReport(report: Record<string, any>): RunSummary {
+export function summarizeReport(report: SelectionReport): RunSummary {
   const cs = Array.isArray(report.candidates) ? report.candidates : [];
   const sel = new Set(
     Array.isArray(report.selection?.bundle_ids)
@@ -410,7 +697,7 @@ export function summarizeReport(report: Record<string, any>): RunSummary {
   return {
     candidates: cs.length,
     selected: sel.size,
-    rejected: cs.length - sel.size,
+    rejected: cs.filter((candidate) => !sel.has(candidate?.bundle_id)).length,
     targets: targets as number,
     catalogsComplete: cats.filter((x: any) => x?.complete === true).length,
     catalogsTotal: cats.length,

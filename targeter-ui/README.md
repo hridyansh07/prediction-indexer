@@ -2,6 +2,8 @@
 
 Read-only React/Vite + Express dashboard for the five latest committed Targeter v2 S3 runs. It has no database or persistent data sink and uses the AWS SDK v3 default credential provider chain, including OIDC/web identity. A separate orb service refreshes the short-lived Amp ID-token file consumed by that standard chain.
 
+The dashboard reads both selection report v1 and v2. For v2 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement is shown as a legitimate empty decision. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
+
 ## Configuration
 
 [`targeter-ui/.env.example`](.env.example) contains the complete server and Amp OIDC variable set with non-secret example values. Register these variables in the orb environment; the service does not automatically source the example file.
