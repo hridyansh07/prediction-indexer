@@ -24,10 +24,11 @@ from targeter.v2.continuity import (
     ContinuityBundle,
     ContinuityError,
     TerminalProbe,
+    TerminalState,
     load_continuity_bundles,
     target_ids_by_venue,
 )
-from targeter.v2.domain import (
+from targeter.v2.models import (
     CatalogSnapshot,
     SUPPORTED_VENUES,
     isoformat,
@@ -151,7 +152,10 @@ def _continuity_for_run(
         if adapter is None or not hasattr(adapter, "probe_terminal"):
             probes.update(
                 {
-                    target.target_id: TerminalProbe("unknown", "terminal_adapter_unavailable")
+                    target.target_id: TerminalProbe(
+                        TerminalState.UNKNOWN,
+                        "terminal_adapter_unavailable",
+                    )
                     for target in targets
                 }
             )
@@ -170,7 +174,10 @@ def _continuity_for_run(
                 {
                     target.target_id: venue_probes.get(
                         target.venue_market_id,
-                        TerminalProbe("unknown", "terminal_probe_missing_record"),
+                        TerminalProbe(
+                            TerminalState.UNKNOWN,
+                            "terminal_probe_missing_record",
+                        ),
                     )
                     for target in targets
                 }

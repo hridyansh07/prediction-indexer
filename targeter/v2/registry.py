@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from targeter.v2.domain import canonical_participant
+from targeter.v2.models import canonical_participant
 
 
 class StrategyError(ValueError):

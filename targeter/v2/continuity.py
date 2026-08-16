@@ -11,14 +11,18 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from targeter.targets import Target, load_targets
-from targeter.v2.domain import SUPPORTED_VENUES, isoformat, parse_timestamp
+from targeter.v2.models import SUPPORTED_VENUES, isoformat, parse_timestamp
 
 
-TERMINAL_STATES = frozenset({"open", "terminal", "unknown"})
+class TerminalState(str, Enum):
+    OPEN = "open"
+    TERMINAL = "terminal"
+    UNKNOWN = "unknown"
 
 
 class ContinuityError(ValueError):
@@ -27,17 +31,22 @@ class ContinuityError(ValueError):
 
 @dataclass(frozen=True)
 class TerminalProbe:
-    state: str
+    state: TerminalState
     reason: str
 
     def __post_init__(self) -> None:
-        if self.state not in TERMINAL_STATES:
+        if isinstance(self.state, str):
+            try:
+                object.__setattr__(self, "state", TerminalState(self.state))
+            except ValueError as error:
+                raise ValueError(f"invalid terminal probe state: {self.state}") from error
+        elif not isinstance(self.state, TerminalState):
             raise ValueError(f"invalid terminal probe state: {self.state}")
         if not self.reason:
             raise ValueError("terminal probe reason is required")
 
     def as_record(self) -> dict[str, str]:
-        return {"state": self.state, "reason": self.reason}
+        return {"state": self.state.value, "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -50,7 +59,7 @@ class ContinuityTarget:
     activation_at: datetime
     capture_start_at: datetime
     source_ref: str
-    probe: TerminalProbe = TerminalProbe("unknown", "not_probed")
+    probe: TerminalProbe = TerminalProbe(TerminalState.UNKNOWN, "not_probed")
 
     def __post_init__(self) -> None:
         if self.venue not in SUPPORTED_VENUES:
@@ -112,7 +121,7 @@ class ContinuityBundle:
 
     @property
     def all_terminal(self) -> bool:
-        return all(target.probe.state == "terminal" for target in self.targets)
+        return all(target.probe.state is TerminalState.TERMINAL for target in self.targets)
 
     def with_probes(self, probes: Mapping[str, TerminalProbe]) -> "ContinuityBundle":
         return replace(

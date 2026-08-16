@@ -7,7 +7,7 @@ Field decoding lives in :mod:`targeter.v2.parsing`, grouped by grammar:
 single-contest fixtures.
 """
 
-from targeter.v2.domain import (
+from targeter.v2.models import (
     CanonicalEvent,
     CanonicalMarket,
     CatalogSnapshot,

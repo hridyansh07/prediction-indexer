@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
-from targeter.v2.continuity import ContinuityBundle
-from targeter.v2.domain import (
+from targeter.v2.continuity import ContinuityBundle, TerminalState
+from targeter.v2.models import (
     SUPPORTED_BEST_OF,
     SUPPORTED_VENUES,
     CatalogSnapshot,
@@ -412,7 +412,10 @@ def select_targets(
         if (
             current is not None
             and current_targets == prior_targets
-            and not any(target.probe.state == "terminal" for target in bundle.targets)
+            and not any(
+                target.probe.state is TerminalState.TERMINAL
+                for target in bundle.targets
+            )
         ):
             held_candidates.append(current)
             continuity_dispositions[bundle_id] = "held_current_candidate"

@@ -13,7 +13,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from targeter.v2.domain import canonical_participant, finite_number
+from targeter.v2.models import canonical_participant, finite_number
 
 
 _LINE = re.compile(r"(?<!\d)([-+]?\d+(?:\.\d+)?)(?!\d)")

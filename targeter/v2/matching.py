@@ -9,7 +9,7 @@ from itertools import combinations
 from statistics import median
 from typing import Iterable, Mapping
 
-from targeter.v2.domain import (
+from targeter.v2.models import (
     ActivationEvidence,
     CanonicalEvent,
     CanonicalMarket,

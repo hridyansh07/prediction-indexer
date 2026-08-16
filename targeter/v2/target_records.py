@@ -27,7 +27,7 @@ from replay.catalog import (
     projection_id,
     projection_sha256,
 )
-from targeter.v2.domain import CanonicalMarket, CatalogSnapshot
+from targeter.v2.models import CanonicalMarket, CatalogSnapshot
 
 __all__ = [
     "TARGET_RECORD_VERSION",
