@@ -76,7 +76,7 @@ Publication requires all of the following:
 
 - `input_complete: true`, no discovery failures, and every catalogue summary
   complete;
-- a non-empty selected bundle set, or exact schema-v2 continuity evidence
+- a non-empty selected bundle set, or exact schema-v3 continuity evidence
   authorizing retirement of every prior bundle;
 - every selected bundle represented on at least the strategy's minimum venues;
 - target entries for exactly Kalshi, Polymarket, and Limitless, including an
@@ -108,10 +108,14 @@ Output is one immutable local generation:
 
 Each target carries its run ID, bundle ID, canonical class, activation and
 capture times, source reference, selection-report SHA-256, and archive-manifest
-identity. Target files and metadata snapshots are fsynced before `manifest.json`
-is durably published. The generation manifest records every file identity,
-target digest, metadata digest, and target count. It is validated against the
-archived selection before publication continues.
+identity. Version-3 continuity targets additionally carry the immediate prior
+generation ID and a non-null origin run ID plus the origin report and archive
+manifest identities. The origin evidence is copied unchanged through retained
+generations and must be consistent across every target in a bundle. Target files
+and metadata snapshots are fsynced before `manifest.json` is durably published.
+The generation manifest records every file identity, target digest, metadata
+digest, and target count. It is validated against the archived selection before
+publication continues.
 
 `current.json` is written last by atomic replace and directory fsync. It contains
 the run ID plus the generation-manifest path, SHA-256, and byte length. This
@@ -120,11 +124,11 @@ pointer is abandoned-but-safe and an identical retry can publish it.
 
 An incomplete run does not replace a prior pointer. An ordinarily empty run also
 requires explicit human control because silently unsubscribing every lane is too
-destructive. The sole automatic empty-publication path is a schema-v2 report
+destructive. The sole automatic empty-publication path is a schema-v3 report
 which carries the exact prior continuity bundles and proves each was retired by
 all-terminal evidence, the configured terminal clamp, or explicit protected-floor
 budget trimming. This narrow exception is what lets terminal retirement remove
-the final live bundle without weakening the empty-run guard.
+the final live bundle while retaining an explicit continuity-evidence guard.
 
 ## 4. Phase 8 — splice handoff and reload behavior
 
