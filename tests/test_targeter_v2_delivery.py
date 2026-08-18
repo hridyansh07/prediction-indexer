@@ -358,6 +358,25 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         self.assertEqual(polymarket.asset_ids(), ("pm-subscription",))
         self.assertEqual(limitless.asset_ids(), ())
         self.assertEqual(kalshi.targets[0].resolution["run_id"], run_directory.name)
+        resolution = kalshi.targets[0].resolution
+        report_object = next(
+            item
+            for item in receipt.objects
+            if item.file in {"selection_report.json", "selection_report.json.zst"}
+        )
+        self.assertEqual(resolution["version"], 3)
+        self.assertIsNone(resolution["continuity_base_run_id"])
+        self.assertEqual(resolution["continuity_origin_run_id"], run_directory.name)
+        self.assertEqual(
+            resolution["continuity_origin_report_sha256"], report_object.stored.sha256
+        )
+        self.assertEqual(
+            resolution["continuity_origin_archive_manifest_key"], receipt.manifest.key
+        )
+        self.assertEqual(
+            resolution["continuity_origin_archive_manifest_sha256"],
+            receipt.manifest.stored.sha256,
+        )
         self.assertEqual(generation.run_id, run_directory.name)
 
         audited = audit_current_publication(
@@ -407,8 +426,121 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         )
 
         pointer = self.live_root / "targeter-v2" / "current.json"
-        self.assertEqual(load_targets(pointer, venue="kalshi").asset_ids(), ("km-subscription",))
-        self.assertEqual(load_targets(pointer, venue="polymarket").asset_ids(), ("pm-subscription",))
+        kalshi = load_targets(pointer, venue="kalshi")
+        polymarket = load_targets(pointer, venue="polymarket")
+        self.assertEqual(kalshi.asset_ids(), ("km-subscription",))
+        self.assertEqual(polymarket.asset_ids(), ("pm-subscription",))
+        for target in (*kalshi.targets, *polymarket.targets):
+            self.assertEqual(target.resolution["version"], 3)
+            self.assertEqual(target.resolution["run_id"], second.run_id)
+            self.assertEqual(
+                target.resolution["continuity_base_run_id"], first_directory.name
+            )
+            self.assertEqual(
+                target.resolution["continuity_origin_run_id"], first_directory.name
+            )
+
+        third = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later + timedelta(minutes=10),
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        third_receipt = archive_run(third.directory, self.store, now=later + timedelta(minutes=10))
+        publish_run(
+            third.directory,
+            third_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=later + timedelta(minutes=10),
+        )
+        third_pointer = self.live_root / "targeter-v2" / "current.json"
+        third_target = load_targets(third_pointer, venue="kalshi").targets[0]
+        self.assertEqual(third_target.resolution["continuity_base_run_id"], second.run_id)
+        self.assertEqual(third_target.resolution["continuity_origin_run_id"], first_directory.name)
+
+    def test_held_current_candidate_uses_current_run_as_origin(self) -> None:
+        first = self.run_directory()
+        first_receipt = archive_run(first, self.store, now=NOW)
+        publish_run(
+            first,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = self.run_directory(now=later)
+        second_receipt = archive_run(second, self.store, now=later)
+        publish_run(
+            second,
+            second_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=later,
+        )
+
+        pointer = self.live_root / "targeter-v2" / "current.json"
+        target = load_targets(pointer, venue="kalshi").targets[0]
+        self.assertEqual(target.resolution["run_id"], second.name)
+        self.assertEqual(target.resolution["continuity_base_run_id"], first.name)
+        self.assertEqual(target.resolution["continuity_origin_run_id"], second.name)
+
+    def test_retained_origin_evidence_must_match_the_committed_continuity_chain(self) -> None:
+        first = self.run_directory(artifact_format="ndjson")
+        first_receipt = archive_run(first, self.store, now=NOW)
+        publish_run(
+            first,
+            first_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=self.strategy,
+            now=NOW,
+        )
+
+        later = NOW + timedelta(minutes=10)
+        second = run_shadow(
+            strategy=self.strategy,
+            output_root=self.output_root,
+            cache_root=self.root / "cache",
+            live_root=self.live_root,
+            now=later,
+            adapters=tuple(
+                _Adapter(CatalogSnapshot(venue, (), ()))
+                for venue in ("kalshi", "polymarket", "limitless")
+            ),
+            client=object(),
+            artifact_format="ndjson",
+        )
+        report_path = second.directory / "selection_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["continuity"]["bundles"][0]["origin_report_sha256"] = "0" * 64
+        report_path.write_text(
+            json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        second_receipt = archive_run(second.directory, self.store, now=later)
+
+        with self.assertRaisesRegex(PublicationError, "continuity evidence"):
+            publish_run(
+                second.directory,
+                second_receipt,
+                self.store,
+                live_root=self.live_root,
+                strategy=self.strategy,
+                now=later,
+            )
 
     def test_a_run_without_continuity_authority_cannot_replace_a_committed_generation(self) -> None:
         first_directory = self.run_directory()
@@ -587,7 +719,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 now=later,
             )
 
-    def test_budget_trimming_cannot_publish_an_empty_generation(self) -> None:
+    def test_budget_trimmed_empty_generation_publishes_an_empty_generation(self) -> None:
         polymarket = snapshot("polymarket", "p", "pm")
         polymarket = CatalogSnapshot(
             polymarket.venue,
@@ -643,15 +775,18 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         )
         second_receipt = archive_run(second.directory, self.store, now=later)
 
-        with self.assertRaisesRegex(PublicationError, "empty target selections"):
-            publish_run(
-                second.directory,
-                second_receipt,
-                self.store,
-                live_root=self.live_root,
-                strategy=constrained,
-                now=later,
-            )
+        generation = publish_run(
+            second.directory,
+            second_receipt,
+            self.store,
+            live_root=self.live_root,
+            strategy=constrained,
+            now=later,
+        )
+        self.assertEqual(generation.run_id, second.run_id)
+        pointer = self.live_root / "targeter-v2" / "current.json"
+        for venue in ("kalshi", "polymarket", "limitless"):
+            self.assertEqual(load_targets(pointer, venue=venue).asset_ids(), ())
 
     def test_a_pointer_failure_exposes_no_partial_generation_and_retry_is_safe(self) -> None:
         run_directory = self.run_directory()

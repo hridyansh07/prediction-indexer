@@ -166,7 +166,7 @@ bundle while any leg is `open` or `unknown`. Release the entire bundle only when
 leg is deliberately still subscribed while a sibling venue trades; V1 does not
 publish a one-venue residual bundle.
 
-If retirement removes the final published bundle, its schema-v2 continuity
+If retirement removes the final published bundle, its schema-v3 continuity
 evidence authorizes an empty generation. An unrelated empty discovery still
 cannot replace the live pointer.
 

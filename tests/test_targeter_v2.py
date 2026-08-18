@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from targeter.targets import TargetsError
+from targeter.targets import Target, TargetSet, TargetsError
 from targeter.v2.adapters import (
     KalshiSportsAdapter,
     LimitlessSportsAdapter,
@@ -30,6 +30,7 @@ from targeter.v2.continuity import (
     ContinuityError,
     ContinuityTarget,
     TerminalProbe,
+    load_continuity_bundles,
 )
 from targeter.v2.matching import match_events
 from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
@@ -1447,6 +1448,49 @@ class RulesAndSelectionTests(unittest.TestCase):
             if bundle_id != limitless_hold.bundle_id
         }
         self.assertEqual(list(rejected.values()), ["target_budget_exceeded"])
+
+
+class ContinuityOriginTests(unittest.TestCase):
+    def test_mixed_origins_in_one_bundle_fail_closed(self) -> None:
+        def target(venue: str, origin_run_id: str) -> Target:
+            target_id = f"{venue}:market"
+            return Target(
+                asset_id=f"{venue}-asset",
+                market_id="market",
+                note="soccer.moneyline_3way",
+                resolution={
+                    "version": 3,
+                    "source": "targeter_v2",
+                    "run_id": "20260803T120000.000000Z",
+                    "bundle_id": "bundle",
+                    "target_id": target_id,
+                    "canonical_class": "soccer.moneyline_3way",
+                    "activation_at": isoformat(NOW),
+                    "capture_start_at": isoformat(NOW - timedelta(hours=1)),
+                    "source_ref": f"/markets/{venue}",
+                    "continuity_score": 1.0,
+                    "continuity_origin_run_id": origin_run_id,
+                    "continuity_origin_report_sha256": "a" * 64,
+                    "continuity_origin_archive_manifest_key": "runs/origin/manifest.json",
+                    "continuity_origin_archive_manifest_sha256": "b" * 64,
+                },
+            )
+
+        target_sets = {
+            "kalshi": TargetSet(
+                "kalshi", (target("kalshi", "origin-one"),), "", "", "", None
+            ),
+            "polymarket": TargetSet(
+                "polymarket", (target("polymarket", "origin-two"),), "", "", "", None
+            ),
+            "limitless": TargetSet("limitless", (), "", "", "", None),
+        }
+        with patch(
+            "targeter.v2.continuity.load_targets",
+            side_effect=lambda _pointer, *, venue: target_sets[venue],
+        ):
+            with self.assertRaisesRegex(ContinuityError, "inconsistent continuity metadata"):
+                load_continuity_bundles(Path("/unused/current.json"))
 
 
 class ShadowRunTests(unittest.TestCase):

@@ -230,6 +230,8 @@ def run_shadow(
             strategy=strategy,
             now=now,
         )
+    if any(bundle.origin is None for bundle in continuity_bundles):
+        raise ContinuityError("v3 continuity origin evidence is missing")
     catalogs: list[CatalogSnapshot] = []
     failures: dict[str, str] = {}
     for adapter in adapter_set:

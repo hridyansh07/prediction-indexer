@@ -11,7 +11,7 @@ from typing import Any, BinaryIO, Iterator, Mapping
 from analysis.storage import decoded_zstd_file
 from encoder import CodecError
 from targeter.targets import Target, TargetsError
-from targeter.v2.continuity import ContinuityError, load_continuity_bundles
+from targeter.v2.continuity import ContinuityError, ContinuityOrigin, load_continuity_bundles
 from targeter.v2.models import SUPPORTED_VENUES, parse_timestamp
 from targeter.v2.registry import Strategy
 from targeter.v2.run_archive import (
@@ -66,6 +66,40 @@ def selection_report_object(receipt: RunArchiveReceipt):
     return item
 
 
+def _origin_from_record(record: Mapping[str, Any], *, prefix: str = "") -> ContinuityOrigin:
+    def required_text(field: str) -> str:
+        value = record.get(prefix + field)
+        if not isinstance(value, str) or not value:
+            raise PublicationError(
+                f"continuity origin is missing {prefix + field}"
+            )
+        return value
+
+    return ContinuityOrigin(
+        run_id=required_text("origin_run_id"),
+        report_sha256=required_text("origin_report_sha256"),
+        archive_manifest_key=required_text("origin_archive_manifest_key"),
+        archive_manifest_sha256=required_text("origin_archive_manifest_sha256"),
+    )
+
+
+def _current_origin(report: Mapping[str, Any], receipt: RunArchiveReceipt) -> ContinuityOrigin:
+    report_object = selection_report_object(receipt)
+    return ContinuityOrigin(
+        run_id=_required_report_run_id(report),
+        report_sha256=report_object.stored.sha256,
+        archive_manifest_key=receipt.manifest.key,
+        archive_manifest_sha256=receipt.manifest.stored.sha256,
+    )
+
+
+def _required_report_run_id(report: Mapping[str, Any]) -> str:
+    run_id = report.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise PublicationError("selection report has no run_id")
+    return run_id
+
+
 def selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
     try:
         report = read_run_report(run_directory)
@@ -73,8 +107,8 @@ def selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
         raise PublicationError(f"cannot read selection report: {error}") from error
     if report.get("run_id") != run_directory.name:
         raise PublicationError("selection report run_id does not match its directory")
-    if report.get("report_version") not in {1, 2} or report.get("mode") != "shadow":
-        raise PublicationError("publication requires a phase-5 shadow report")
+    if report.get("report_version") != 3 or report.get("mode") != "shadow":
+        raise PublicationError("publication requires a phase-5 v3 shadow report")
     if report.get("strategy_version") != strategy.version:
         raise PublicationError("selection report and publication strategy versions differ")
     if report.get("input_complete") is not True or report.get("discovery_failures") != {}:
@@ -146,6 +180,7 @@ def targets_from_report(
     ):
         raise PublicationError("selection report continuity state is invalid")
     continuity_by_bundle: dict[str, dict[str, Any]] = {}
+    continuity_origins: dict[str, ContinuityOrigin] = {}
     continuity_targets: dict[tuple[str, str], dict[str, Any]] = {}
     for raw_bundle in raw_continuity_bundles:
         if not isinstance(raw_bundle, dict):
@@ -167,6 +202,12 @@ def targets_from_report(
             or not raw_targets
         ):
             raise PublicationError("selection report has invalid continuity bundle")
+        try:
+            continuity_origins[bundle_id] = _origin_from_record(raw_bundle)
+        except (PublicationError, ValueError) as error:
+            raise PublicationError(
+                f"continuity bundle {bundle_id} has invalid origin evidence"
+            ) from error
         continuity_by_bundle[bundle_id] = raw_bundle
         for raw_target in raw_targets:
             if not isinstance(raw_target, dict):
@@ -332,9 +373,12 @@ def targets_from_report(
             raise PublicationError(f"selected bundle {bundle_id} has invalid eligible markets")
         selected_candidate_markets[bundle_id] = frozenset(eligible_market_ids)
     report_object = selection_report_object(receipt)
+    current_origin = _current_origin(report, receipt)
     by_venue: dict[str, list[Target]] = {venue: [] for venue in SUPPORTED_VENUES}
     bundle_venues: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
     selected_market_ids: dict[str, set[str]] = {bundle_id: set() for bundle_id in bundle_ids}
+    origin_by_bundle: dict[str, ContinuityOrigin] = {}
+    base_by_bundle: dict[str, str | None] = {}
     seen_target_ids: set[str] = set()
 
     for venue in SUPPORTED_VENUES:
@@ -409,7 +453,7 @@ def targets_from_report(
                     f"selection target {target_id!r} has invalid continuity score"
                 )
             resolution = {
-                "version": 2,
+                "version": 3,
                 "source": "targeter_v2",
                 "run_id": report["run_id"],
                 "bundle_id": bundle_id,
@@ -425,9 +469,30 @@ def targets_from_report(
                 "continuity_base_run_id": (
                     continuity_by_bundle[bundle_id]["base_run_id"]
                     if bundle_id in continuity_by_bundle
-                    else report["run_id"]
+                    else None
                 ),
             }
+            origin = (
+                continuity_origins[bundle_id]
+                if bundle_id in retained_bundle_ids
+                else current_origin
+            )
+            prior_origin = origin_by_bundle.setdefault(bundle_id, origin)
+            prior_base = base_by_bundle.setdefault(
+                bundle_id, resolution["continuity_base_run_id"]
+            )
+            if prior_origin != origin or prior_base != resolution["continuity_base_run_id"]:
+                raise PublicationError(
+                    f"selected bundle {bundle_id} has inconsistent continuity origin"
+                )
+            resolution.update(
+                {
+                    "continuity_origin_run_id": origin.run_id,
+                    "continuity_origin_report_sha256": origin.report_sha256,
+                    "continuity_origin_archive_manifest_key": origin.archive_manifest_key,
+                    "continuity_origin_archive_manifest_sha256": origin.archive_manifest_sha256,
+                }
+            )
             for asset_id in subscription_ids:
                 target = Target(
                     asset_id=asset_id,
@@ -449,7 +514,12 @@ def targets_from_report(
         and bool(continuity_by_bundle)
         and set(dispositions) == set(continuity_by_bundle)
         and all(
-            reason in {"all_markets_terminal", "terminal_clamp_elapsed"}
+            reason
+            in {
+                "all_markets_terminal",
+                "terminal_clamp_elapsed",
+                "continuity_budget_trimmed",
+            }
             for reason in dispositions.values()
         )
     )
