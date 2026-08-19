@@ -89,7 +89,7 @@ class SelectionResult:
 
     def as_record(self) -> dict[str, object]:
         return {
-            "report_version": 2,
+            "report_version": 3,
             "mode": "shadow",
             "generated_at": isoformat(self.generated_at),
             "strategy_version": self.strategy_version,

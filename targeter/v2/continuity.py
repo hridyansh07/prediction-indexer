@@ -15,8 +15,20 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from archive.storage.base import normalize_key
 from targeter.targets import Target, load_targets
 from targeter.v2.models import SUPPORTED_VENUES, isoformat, parse_timestamp
+
+
+def _required_sha256(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ContinuityError(f"published continuity metadata has invalid {field}")
+    return value
 
 
 class TerminalState(str, Enum):
@@ -100,12 +112,36 @@ class ContinuityTarget:
 
 
 @dataclass(frozen=True)
+class ContinuityOrigin:
+    run_id: str
+    report_sha256: str
+    archive_manifest_key: str
+    archive_manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.run_id or not self.archive_manifest_key:
+            raise ValueError("continuity origin identity is incomplete")
+        normalize_key(self.archive_manifest_key)
+        _required_sha256(self.report_sha256, "origin report hash")
+        _required_sha256(self.archive_manifest_sha256, "origin manifest hash")
+
+    def as_record(self) -> dict[str, str]:
+        return {
+            "origin_run_id": self.run_id,
+            "origin_report_sha256": self.report_sha256,
+            "origin_archive_manifest_key": self.archive_manifest_key,
+            "origin_archive_manifest_sha256": self.archive_manifest_sha256,
+        }
+
+
+@dataclass(frozen=True)
 class ContinuityBundle:
     base_run_id: str
     bundle_id: str
     activation_at: datetime
     score: float
     targets: tuple[ContinuityTarget, ...]
+    origin: ContinuityOrigin | None = None
 
     def __post_init__(self) -> None:
         if not self.base_run_id or not self.bundle_id or not self.targets:
@@ -139,6 +175,7 @@ class ContinuityBundle:
             "activation_at": isoformat(self.activation_at),
             "score": self.score,
             "targets": [target.as_record() for target in self.targets],
+            **(self.origin.as_record() if self.origin is not None else {}),
         }
 
 
@@ -151,23 +188,45 @@ def _required_text(record: Mapping[str, Any], field: str) -> str:
 
 def _target_metadata(target: Target, venue: str) -> tuple[str, dict[str, Any]]:
     resolution = target.resolution
-    if not isinstance(resolution, dict) or resolution.get("source") != "targeter_v2":
+    if (
+        not isinstance(resolution, dict)
+        or resolution.get("source") != "targeter_v2"
+        or resolution.get("version") != 3
+    ):
         raise ContinuityError(
-            f"published {venue} target {target.asset_id!r} has no v2 continuity metadata"
+            f"published {venue} target {target.asset_id!r} has no v3 continuity metadata"
         )
     return _required_text(resolution, "target_id"), resolution
+
+
+def _origin_from_resolution(resolution: Mapping[str, Any]) -> ContinuityOrigin:
+    return ContinuityOrigin(
+        run_id=_required_text(resolution, "continuity_origin_run_id"),
+        report_sha256=_required_sha256(
+            resolution.get("continuity_origin_report_sha256"),
+            "continuity_origin_report_sha256",
+        ),
+        archive_manifest_key=_required_text(
+            resolution, "continuity_origin_archive_manifest_key"
+        ),
+        archive_manifest_sha256=_required_sha256(
+            resolution.get("continuity_origin_archive_manifest_sha256"),
+            "continuity_origin_archive_manifest_sha256",
+        ),
+    )
 
 
 def load_continuity_bundles(pointer_path: Path) -> tuple[ContinuityBundle, ...]:
     """Reconstruct bundle ownership from one validated committed generation."""
     grouped_targets: dict[tuple[str, str], dict[str, Any]] = {}
-    bundle_metadata: dict[str, tuple[str, datetime, float]] = {}
+    bundle_metadata: dict[str, tuple[str, datetime, float, ContinuityOrigin]] = {}
     for venue in SUPPORTED_VENUES:
         target_set = load_targets(pointer_path, venue=venue)
         for target in target_set.targets:
             target_id, resolution = _target_metadata(target, venue)
             bundle_id = _required_text(resolution, "bundle_id")
             run_id = _required_text(resolution, "run_id")
+            origin = _origin_from_resolution(resolution)
             activation = parse_timestamp(resolution.get("activation_at"))
             capture_start = parse_timestamp(resolution.get("capture_start_at"))
             if activation is None or capture_start is None:
@@ -176,7 +235,7 @@ def load_continuity_bundles(pointer_path: Path) -> tuple[ContinuityBundle, ...]:
             if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
                 raise ContinuityError(f"published target {target_id!r} has invalid continuity score")
             score = float(raw_score)
-            metadata = (run_id, activation, score)
+            metadata = (run_id, activation, score, origin)
             previous_bundle = bundle_metadata.setdefault(bundle_id, metadata)
             if previous_bundle != metadata:
                 raise ContinuityError(
@@ -200,7 +259,7 @@ def load_continuity_bundles(pointer_path: Path) -> tuple[ContinuityBundle, ...]:
                 item["subscription_ids"].append(target.asset_id)
 
     bundles: list[ContinuityBundle] = []
-    for bundle_id, (run_id, activation, score) in sorted(bundle_metadata.items()):
+    for bundle_id, (run_id, activation, score, origin) in sorted(bundle_metadata.items()):
         targets = tuple(
             ContinuityTarget(
                 target_id=target_id,
@@ -215,7 +274,16 @@ def load_continuity_bundles(pointer_path: Path) -> tuple[ContinuityBundle, ...]:
             for (candidate_bundle, target_id), item in sorted(grouped_targets.items())
             if candidate_bundle == bundle_id
         )
-        bundles.append(ContinuityBundle(run_id, bundle_id, activation, score, targets))
+        bundles.append(
+            ContinuityBundle(
+                run_id,
+                bundle_id,
+                activation,
+                score,
+                targets,
+                origin,
+            )
+        )
     return tuple(bundles)
 
 
