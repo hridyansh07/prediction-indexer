@@ -30,15 +30,25 @@ export interface ContinuityTarget {
   source_ref: string;
   terminal_probe: TerminalProbe;
 }
-export interface ContinuityBundle {
+interface ContinuityBundleBase {
   base_run_id: string;
   bundle_id: string;
   activation_at: string;
   score: number;
   targets: ContinuityTarget[];
 }
-export interface ContinuityState {
-  bundles: ContinuityBundle[];
+export type ContinuityBundleV2 = ContinuityBundleBase;
+export interface ContinuityBundleV3 extends ContinuityBundleBase {
+  origin_run_id: string;
+  origin_report_sha256: string;
+  origin_archive_manifest_key: string;
+  origin_archive_manifest_sha256: string;
+}
+export type ContinuityBundle = ContinuityBundleV2 | ContinuityBundleV3;
+export interface ContinuityState<
+  Bundle extends ContinuityBundle = ContinuityBundle,
+> {
+  bundles: Bundle[];
   retained_bundle_ids: string[];
   dispositions: Record<string, ContinuityDisposition>;
 }
@@ -74,11 +84,18 @@ export interface SelectionReportV1 extends SelectionReportBase {
 }
 export interface SelectionReportV2 extends SelectionReportBase {
   report_version: 2;
-  continuity: ContinuityState;
+  continuity: ContinuityState<ContinuityBundleV2>;
   continuity_diagnostics: string[];
   continuity_degraded_base_run_id: string | null;
 }
-export type SelectionReport = SelectionReportV1 | SelectionReportV2;
+export interface SelectionReportV3 extends SelectionReportBase {
+  report_version: 3;
+  continuity: ContinuityState<ContinuityBundleV3>;
+  continuity_diagnostics: string[];
+  continuity_degraded_base_run_id: string | null;
+}
+export type ContinuitySelectionReport = SelectionReportV2 | SelectionReportV3;
+export type SelectionReport = SelectionReportV1 | ContinuitySelectionReport;
 
 export interface TargetResolutionV2 {
   version: 2;
@@ -95,6 +112,26 @@ export interface TargetResolutionV2 {
   archive_manifest_sha256: string;
   continuity_score: number;
   continuity_base_run_id: string;
+}
+export interface TargetResolutionV3 {
+  version: 3;
+  source: 'targeter_v2';
+  run_id: string;
+  bundle_id: string;
+  target_id: string;
+  canonical_class: string;
+  activation_at: string;
+  capture_start_at: string;
+  source_ref: string;
+  selection_report_sha256: string;
+  archive_manifest_key: string;
+  archive_manifest_sha256: string;
+  continuity_score: number;
+  continuity_base_run_id: string | null;
+  continuity_origin_run_id: string;
+  continuity_origin_report_sha256: string;
+  continuity_origin_archive_manifest_key: string;
+  continuity_origin_archive_manifest_sha256: string;
 }
 export interface RunView {
   runId: string;

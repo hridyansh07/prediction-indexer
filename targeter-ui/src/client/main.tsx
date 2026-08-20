@@ -3,8 +3,9 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
 import type { ContinuityTarget, RunView, Snapshot } from '../shared';
 import {
-  isLegitimateTerminalRetirement,
-  isReportV2,
+  isContinuityBundleV3,
+  isContinuityReport,
+  legitimateEmptyGenerationReason,
   selectedBundleViews,
   type SelectedBundleView,
 } from './view-model';
@@ -173,7 +174,7 @@ function Overview({ s }: { s: Snapshot }) {
 }
 function Metrics({ run, latest }: { run: RunView; latest: boolean }) {
   const m = run.summary;
-  const retained = isReportV2(run.report)
+  const retained = isContinuityReport(run.report)
     ? run.report.continuity.retained_bundle_ids.length
     : 0;
   return (
@@ -196,7 +197,7 @@ function Metrics({ run, latest }: { run: RunView; latest: boolean }) {
   );
 }
 function ContinuityObservability({ run }: { run: RunView }) {
-  if (!isReportV2(run.report)) {
+  if (!isContinuityReport(run.report)) {
     return (
       <section className="continuity-panel legacy">
         <Title
@@ -211,7 +212,7 @@ function ContinuityObservability({ run }: { run: RunView }) {
     );
   }
   const { continuity } = run.report;
-  const retirement = isLegitimateTerminalRetirement(run.report);
+  const emptyReason = legitimateEmptyGenerationReason(run.report);
   const retired = Object.values(continuity.dispositions).filter((value) =>
     ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(value),
   ).length;
@@ -219,7 +220,7 @@ function ContinuityObservability({ run }: { run: RunView }) {
     <section className="continuity-panel">
       <Title
         title="Continuity"
-        sub={`Report v2 · ${continuity.bundles.length} prior bundles observed`}
+        sub={`Report v${run.report.report_version} · ${continuity.bundles.length} prior bundles observed`}
       />
       <p className="truth-note">
         Run decision evidence only. Live subscription truth remains the
@@ -236,10 +237,11 @@ function ContinuityObservability({ run }: { run: RunView }) {
           label="Diagnostics"
         />
       </div>
-      {retirement && (
+      {emptyReason && (
         <div className="continuity-state ok">
-          Legitimate empty retirement: every prior bundle is evidenced terminal
-          or past its terminal clamp.
+          {emptyReason === 'retirement'
+            ? 'Legitimate empty retirement: every prior bundle is evidenced terminal or past its terminal clamp.'
+            : 'Legitimate empty generation: every prior bundle was explicitly continuity-budget trimmed.'}
         </div>
       )}
       {run.report.continuity_degraded_base_run_id && (
@@ -260,27 +262,46 @@ function ContinuityObservability({ run }: { run: RunView }) {
           <p className="muted">No prior committed generation was observed.</p>
         )}
       <div className="continuity-list">
-        {continuity.bundles.map((bundle) => (
-          <details
-            key={bundle.bundle_id}
-            open={bundle.targets.some(
-              (target) => target.terminal_probe.state === 'unknown',
-            )}
-          >
-            <summary>
-              <span
-                className={`decision ${continuity.dispositions[bundle.bundle_id] === 'retained' ? 'ok' : 'warn'}`}
-              >
-                {relationshipLabel(continuity.dispositions[bundle.bundle_id])}
-              </span>
-              <b>{bundle.bundle_id}</b>
-              <span>
-                Score {scoreLabel(bundle.score)} · base {bundle.base_run_id}
-              </span>
-            </summary>
-            <TerminalProbes targets={bundle.targets} />
-          </details>
-        ))}
+        {continuity.bundles.map((bundle) => {
+          const origin = isContinuityBundleV3(bundle) ? bundle : null;
+          return (
+            <details
+              key={bundle.bundle_id}
+              open={bundle.targets.some(
+                (target) => target.terminal_probe.state === 'unknown',
+              )}
+            >
+              <summary>
+                <span
+                  className={`decision ${continuity.dispositions[bundle.bundle_id] === 'retained' ? 'ok' : 'warn'}`}
+                >
+                  {relationshipLabel(continuity.dispositions[bundle.bundle_id])}
+                </span>
+                <b>{bundle.bundle_id}</b>
+                <span>
+                  Score {scoreLabel(bundle.score)} · base {bundle.base_run_id}
+                  {origin ? ` · origin ${origin.origin_run_id}` : ''}
+                </span>
+              </summary>
+              {origin && (
+                <div className="origin-evidence">
+                  <span>
+                    Origin report <code>{origin.origin_report_sha256}</code>
+                  </span>
+                  <span>
+                    Origin manifest{' '}
+                    <code>{origin.origin_archive_manifest_key}</code>
+                  </span>
+                  <span>
+                    Manifest SHA{' '}
+                    <code>{origin.origin_archive_manifest_sha256}</code>
+                  </span>
+                </div>
+              )}
+              <TerminalProbes targets={bundle.targets} />
+            </details>
+          );
+        })}
       </div>
     </section>
   );
@@ -336,7 +357,7 @@ function Metric({ n, label }: { n: any; label: string }) {
 }
 function Bundles({ run }: { run: RunView }) {
   const bundles = selectedBundleViews(run.report);
-  const terminalRetirement = isLegitimateTerminalRetirement(run.report);
+  const emptyReason = legitimateEmptyGenerationReason(run.report);
   return (
     <section>
       <Title
@@ -365,7 +386,9 @@ function Bundles({ run }: { run: RunView }) {
                   {bundle.retained ? 'RETAINED' : val(candidate?.sport)}
                 </span>
                 <strong className="score">
-                  {isReportV2(run.report) ? 'Continuity score' : 'Score'}{' '}
+                  {isContinuityReport(run.report)
+                    ? 'Continuity score'
+                    : 'Score'}{' '}
                   {scoreLabel(bundle.score)}
                 </strong>
               </div>
@@ -386,9 +409,15 @@ function Bundles({ run }: { run: RunView }) {
                     ? relationshipLabel(bundle.disposition)
                     : 'Report v1'}
                 </dd>
+                <dt>Occurrence</dt>
+                <dd>{relationshipLabel(bundle.occurrenceKind)}</dd>
                 <dt>Base run</dt>
                 <dd>
-                  <code>{bundle.continuityBaseRunId}</code>
+                  <code>{val(bundle.continuityBaseRunId)}</code>
+                </dd>
+                <dt>Origin run</dt>
+                <dd>
+                  <code>{val(bundle.continuityOriginRunId)}</code>
                 </dd>
                 <dt>{bundle.retained ? 'Admission' : 'Volume gate'}</dt>
                 <dd>
@@ -404,10 +433,12 @@ function Bundles({ run }: { run: RunView }) {
         })}
       </div>
       {!bundles.length && (
-        <p className={`empty ${terminalRetirement ? 'ok' : ''}`}>
-          {terminalRetirement
+        <p className={`empty ${emptyReason ? 'ok' : ''}`}>
+          {emptyReason === 'retirement'
             ? 'No bundles selected: all prior bundles were legitimately retired by terminal evidence or the clamp.'
-            : 'No bundles selected in this run. This report alone does not change live subscriptions.'}
+            : emptyReason === 'budget_trimmed'
+              ? 'No bundles selected: every prior bundle was explicitly continuity-budget trimmed.'
+              : 'No bundles selected in this run. This report alone does not change live subscriptions.'}
         </p>
       )}
     </section>

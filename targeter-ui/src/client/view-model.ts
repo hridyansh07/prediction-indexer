@@ -1,8 +1,9 @@
 import type {
   ContinuityBundle,
+  ContinuityBundleV3,
   ContinuityDisposition,
+  ContinuitySelectionReport,
   SelectionReport,
-  SelectionReportV2,
   SelectionTarget,
 } from '../shared';
 
@@ -14,7 +15,12 @@ export interface SelectedBundleView {
   retained: boolean;
   targets: Array<SelectionTarget & { venue: string }>;
   score: number;
-  continuityBaseRunId: string;
+  continuityBaseRunId: string | null;
+  continuityOriginRunId: string | null;
+  continuityOriginReportSha256: string | null;
+  continuityOriginArchiveManifestKey: string | null;
+  continuityOriginArchiveManifestSha256: string | null;
+  occurrenceKind: 'complete' | 'retained_reference';
 }
 
 const finiteScore = (value: unknown) =>
@@ -22,10 +28,16 @@ const finiteScore = (value: unknown) =>
     ? value
     : Number.NEGATIVE_INFINITY;
 
-export function isReportV2(
+export function isContinuityReport(
   report: SelectionReport,
-): report is SelectionReportV2 {
-  return report.report_version === 2;
+): report is ContinuitySelectionReport {
+  return report.report_version !== 1;
+}
+
+export function isContinuityBundleV3(
+  bundle: ContinuityBundle,
+): bundle is ContinuityBundleV3 {
+  return 'origin_run_id' in bundle;
 }
 
 export function selectedBundleViews(
@@ -37,12 +49,12 @@ export function selectedBundleViews(
       candidate,
     ]),
   );
-  const continuity = isReportV2(report)
+  const continuity = isContinuityReport(report)
     ? new Map(
         report.continuity.bundles.map((bundle) => [bundle.bundle_id, bundle]),
       )
     : new Map<string, ContinuityBundle>();
-  const retained = isReportV2(report)
+  const retained = isContinuityReport(report)
     ? new Set(report.continuity.retained_bundle_ids)
     : new Set<string>();
   const targets = new Map<string, Array<SelectionTarget & { venue: string }>>();
@@ -55,9 +67,11 @@ export function selectedBundleViews(
   }
 
   return report.selection.bundle_ids
-    .map((bundleId) => {
+    .map((bundleId): SelectedBundleView => {
       const candidate = candidates.get(bundleId) ?? null;
       const evidence = continuity.get(bundleId) ?? null;
+      const origin =
+        evidence && isContinuityBundleV3(evidence) ? evidence : null;
       const selectedTargets = targets.get(bundleId) ?? [];
       const score = Math.max(
         finiteScore(candidate?.score),
@@ -70,13 +84,26 @@ export function selectedBundleViews(
         bundleId,
         candidate,
         continuity: evidence,
-        disposition: isReportV2(report)
+        disposition: isContinuityReport(report)
           ? (report.continuity.dispositions[bundleId] ?? null)
           : null,
         retained: retained.has(bundleId),
         targets: selectedTargets,
         score,
-        continuityBaseRunId: evidence?.base_run_id ?? report.run_id,
+        continuityBaseRunId:
+          evidence?.base_run_id ??
+          (report.report_version === 2 ? report.run_id : null),
+        continuityOriginRunId:
+          origin?.origin_run_id ??
+          (report.report_version === 3 ? report.run_id : null),
+        continuityOriginReportSha256: origin?.origin_report_sha256 ?? null,
+        continuityOriginArchiveManifestKey:
+          origin?.origin_archive_manifest_key ?? null,
+        continuityOriginArchiveManifestSha256:
+          origin?.origin_archive_manifest_sha256 ?? null,
+        occurrenceKind: retained.has(bundleId)
+          ? 'retained_reference'
+          : 'complete',
       };
     })
     .sort(
@@ -85,20 +112,31 @@ export function selectedBundleViews(
     );
 }
 
-export function isLegitimateTerminalRetirement(
+export function legitimateEmptyGenerationReason(
   report: SelectionReport,
-): boolean {
-  if (!isReportV2(report)) return false;
+): 'retirement' | 'budget_trimmed' | null {
+  if (!isContinuityReport(report)) return null;
   const dispositions = Object.values(report.continuity.dispositions);
-  return (
+  const empty =
     report.selection.bundle_ids.length === 0 &&
     Object.values(report.selection.targets).every(
       (targets) => !targets.length,
     ) &&
     report.continuity.bundles.length > 0 &&
-    dispositions.length === report.continuity.bundles.length &&
+    dispositions.length === report.continuity.bundles.length;
+  if (!empty) return null;
+  if (
     dispositions.every((disposition) =>
       ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(disposition),
     )
-  );
+  )
+    return 'retirement';
+  if (
+    report.report_version === 3 &&
+    dispositions.every(
+      (disposition) => disposition === 'continuity_budget_trimmed',
+    )
+  )
+    return 'budget_trimmed';
+  return null;
 }

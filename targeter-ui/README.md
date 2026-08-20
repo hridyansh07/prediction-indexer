@@ -2,7 +2,7 @@
 
 Read-only React/Vite + Express dashboard for the five latest committed Targeter v2 S3 runs. It has no database or persistent data sink and uses the AWS SDK v3 default credential provider chain, including OIDC/web identity. A separate orb service refreshes the short-lived Amp ID-token file consumed by that standard chain.
 
-The dashboard reads both selection report v1 and v2. For v2 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement is shown as a legitimate empty decision. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
+The dashboard reads selection report v1, v2, and v3. For v2 and v3 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. Report v3 also shows the immutable origin run and archive identities that distinguish a complete occurrence from a retained reference. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement—and v3's explicitly validated all-budget-trimmed result—are shown as legitimate empty decisions. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
 
 ## Configuration
 
@@ -24,7 +24,7 @@ yarn build
 yarn workspace prediction-indexer-targeter-ui start
 ```
 
-`TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
+`TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1–v3 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
 
 From the repository root, use `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, and `yarn build`. The production Express server serves `dist/` and its API on `PORT`.
 
@@ -38,7 +38,7 @@ The `aws-identity` orb service runs [`scripts/refresh-amp-aws-token`](../scripts
 
 ## Identity and bounds
 
-Only `date=YYYY-MM-DD/run=<run_id>/run_manifest.json` keys are commit markers. Listing is paginated and latest runs are chosen by validated microsecond UTC run ID, never `LastModified`. Manifest v2 and report v1 structure are checked. The shared staging package verifies stored SHA-256/length. For compressed reports, the Rust protocol-v1 decoder verifies the strict Zstandard profile and logical SHA-256/length/LF count before the UI parses its output. `TARGETER_UI_DECODER_PATH` is required in S3 mode and must be an absolute path; fixture mode does not require it. Selection reports alone may be buffered after validation: stored size is limited to **16 MiB**, decoded size to **64 MiB**, and manifest to **1 MiB**. Catalogues are never downloaded. The cache is memory-only, refreshes at startup/on interval/API request, coalesces overlapping refreshes, and retains the last successful snapshot with a stale/error flag.
+Only `date=YYYY-MM-DD/run=<run_id>/run_manifest.json` keys are commit markers. Listing is paginated and latest runs are chosen by validated microsecond UTC run ID, never `LastModified`. Manifest v2 and report v1–v3 structures are checked. The shared staging package verifies stored SHA-256/length. For compressed reports, the Rust protocol-v1 decoder verifies the strict Zstandard profile and logical SHA-256/length/LF count before the UI parses its output. `TARGETER_UI_DECODER_PATH` is required in S3 mode and must be an absolute path; fixture mode does not require it. Selection reports alone may be buffered after validation: stored size is limited to **16 MiB**, decoded size to **64 MiB**, and manifest to **1 MiB**. Catalogues are never downloaded. The cache is memory-only, refreshes at startup/on interval/API request, coalesces overlapping refreshes, and retains the last successful snapshot with a stale/error flag.
 
 The displayed strategy is `configs/targeter_v2.json` from the **current checkout**. Archives do not embed the complete historical config. The UI compares report and checkout strategy versions, but correctly labels a match as evidence rather than byte-level proof of the historical settings.
 

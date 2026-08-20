@@ -32,6 +32,11 @@ const finite = (x: unknown, label: string) => {
     throw new Error(`${label} is invalid`);
   return x;
 };
+const sha256Text = (x: unknown, label: string) => {
+  if (typeof x !== 'string' || !/^[a-f0-9]{64}$/.test(x))
+    throw new Error(`${label} is invalid`);
+  return x;
+};
 const uniqueStrings = (x: unknown, label: string, allowEmpty = false) => {
   if (
     !Array.isArray(x) ||
@@ -268,9 +273,25 @@ function validateContinuity(report: Record<string, any>): ValidatedContinuity {
     throw new Error('selection report continuity bundles are invalid');
   for (const rawBundle of continuity.bundles) {
     const bundle = obj(rawBundle, 'continuity bundle');
+    const originFields =
+      report.report_version === 3
+        ? [
+            'origin_run_id',
+            'origin_report_sha256',
+            'origin_archive_manifest_key',
+            'origin_archive_manifest_sha256',
+          ]
+        : [];
     exactKeys(
       bundle,
-      ['base_run_id', 'bundle_id', 'activation_at', 'score', 'targets'],
+      [
+        'base_run_id',
+        'bundle_id',
+        'activation_at',
+        'score',
+        'targets',
+        ...originFields,
+      ],
       'continuity bundle',
     );
     const bundleId = text(bundle.bundle_id, 'continuity bundle_id');
@@ -279,6 +300,21 @@ function validateContinuity(report: Record<string, any>): ValidatedContinuity {
     text(bundle.base_run_id, 'continuity base_run_id');
     timestamp(bundle.activation_at, 'continuity activation_at');
     finite(bundle.score, 'continuity score');
+    if (report.report_version === 3) {
+      text(bundle.origin_run_id, 'continuity origin_run_id');
+      sha256Text(
+        bundle.origin_report_sha256,
+        'continuity origin_report_sha256',
+      );
+      text(
+        bundle.origin_archive_manifest_key,
+        'continuity origin_archive_manifest_key',
+      );
+      sha256Text(
+        bundle.origin_archive_manifest_sha256,
+        'continuity origin_archive_manifest_sha256',
+      );
+    }
     if (!Array.isArray(bundle.targets) || !bundle.targets.length)
       throw new Error('continuity bundle targets are invalid');
     const targetIds = new Set<string>();
@@ -412,7 +448,7 @@ export async function validateReportPath(
     }
     const r = obj(report, 'selection report');
     if (
-      ![1, 2].includes(r.report_version) ||
+      ![1, 2, 3].includes(r.report_version) ||
       r.mode !== 'shadow' ||
       r.run_id !== runId ||
       typeof r.input_complete !== 'boolean' ||
@@ -496,7 +532,7 @@ export async function validateReportPath(
             'activation_at',
             'capture_start_at',
             'source_ref',
-            ...(r.report_version === 2 ? ['continuity_score'] : []),
+            ...(r.report_version !== 1 ? ['continuity_score'] : []),
           ],
           'selection target',
         );
@@ -517,7 +553,7 @@ export async function validateReportPath(
         timestamp(target.activation_at, 'selection target activation_at');
         timestamp(target.capture_start_at, 'selection target capture_start_at');
         text(target.source_ref, 'selection target source_ref');
-        if (r.report_version === 2)
+        if (r.report_version !== 1)
           finite(target.continuity_score, 'selection target continuity_score');
       }
     }
@@ -565,7 +601,7 @@ export async function validateReportPath(
       )
     )
       throw new Error('selected bundle is absent or ineligible');
-    if (r.report_version === 2) {
+    if (r.report_version !== 1) {
       for (const venue of supportedVenues) {
         for (const target of targets[venue]) {
           const continuityBundle = continuity.byBundle.get(target.bundle_id);

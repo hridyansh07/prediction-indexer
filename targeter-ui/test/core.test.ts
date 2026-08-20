@@ -12,13 +12,18 @@ import {
   validateReportPath,
 } from '../src/server/core.js';
 import {
-  isLegitimateTerminalRetirement,
+  legitimateEmptyGenerationReason,
   selectedBundleViews,
 } from '../src/client/view-model.js';
 import {
   BASE_RUN_ID,
+  budgetTrimmedReportV3,
   degradedReportV2,
+  freshReportV3,
+  ORIGIN_MANIFEST_KEY,
+  ORIGIN_REPORT_SHA256,
   retainedReportV2,
+  retainedReportV3,
   RUN_ID,
   selectedReportV1,
   terminalRetirementReportV2,
@@ -267,6 +272,68 @@ test('validates and derives report v2 retained continuity without a current cand
   }
 });
 
+test('validates report v3 origin provenance and applies continuity semantics', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ui-continuity-v3-'));
+  let sequence = 0;
+  const validate = async (value: any) => {
+    const bytes = Buffer.from(JSON.stringify(value));
+    const path = join(directory, `report-${sequence++}`);
+    await writeFile(path, bytes);
+    return validateReportPath(path, plainFile(bytes), value.run_id, null);
+  };
+  try {
+    const retained = await validate(retainedReportV3());
+    assert.equal(retained.report_version, 3);
+    const [bundle] = selectedBundleViews(retained);
+    assert.equal(bundle.retained, true);
+    assert.equal(bundle.occurrenceKind, 'retained_reference');
+    assert.equal(bundle.continuityBaseRunId, BASE_RUN_ID);
+    assert.equal(bundle.continuityOriginRunId, BASE_RUN_ID);
+    assert.equal(bundle.continuityOriginReportSha256, ORIGIN_REPORT_SHA256);
+    assert.equal(
+      bundle.continuityOriginArchiveManifestKey,
+      ORIGIN_MANIFEST_KEY,
+    );
+
+    const fresh = await validate(freshReportV3());
+    const [freshBundle] = selectedBundleViews(fresh);
+    assert.equal(freshBundle.occurrenceKind, 'complete');
+    assert.equal(freshBundle.continuityBaseRunId, null);
+    assert.equal(freshBundle.continuityOriginRunId, RUN_ID);
+    assert.equal(freshBundle.continuityOriginReportSha256, null);
+
+    const badHash: any = structuredClone(retainedReportV3());
+    badHash.continuity.bundles[0].origin_report_sha256 = 'ABC';
+    await assert.rejects(
+      () => validate(badHash),
+      /origin_report_sha256 is invalid/,
+    );
+
+    const missingOrigin: any = structuredClone(retainedReportV3());
+    delete missingOrigin.continuity.bundles[0].origin_run_id;
+    await assert.rejects(
+      () => validate(missingOrigin),
+      /continuity bundle fields are invalid/,
+    );
+
+    const missingScore: any = structuredClone(retainedReportV3());
+    delete missingScore.selection.targets.kalshi[0].continuity_score;
+    await assert.rejects(
+      () => validate(missingScore),
+      /selection target fields are invalid/,
+    );
+
+    const badScore: any = structuredClone(retainedReportV3());
+    badScore.selection.targets.kalshi[0].continuity_score = 41;
+    await assert.rejects(
+      () => validate(badScore),
+      /continuity_score disagrees with its provenance/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('preserves report v1 selected-target compatibility', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ui-report-v1-'));
   try {
@@ -290,7 +357,7 @@ test('preserves report v1 selected-target compatibility', async () => {
   }
 });
 
-test('recognizes all-terminal and clamp retirement as a legitimate empty v2 decision', async () => {
+test('recognizes legitimate empty v2 retirement and v3 budget trimming', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ui-terminal-empty-'));
   try {
     const value = terminalRetirementReportV2();
@@ -303,11 +370,26 @@ test('recognizes all-terminal and clamp retirement as a legitimate empty v2 deci
       RUN_ID,
       null,
     );
-    assert.equal(isLegitimateTerminalRetirement(validated), true);
+    assert.equal(legitimateEmptyGenerationReason(validated), 'retirement');
     assert.deepEqual(selectedBundleViews(validated), []);
     assert.equal(
       validated.continuity.bundles[1].targets[0].terminal_probe.state,
       'unknown',
+    );
+
+    const budgetValue = budgetTrimmedReportV3();
+    const budgetBytes = Buffer.from(JSON.stringify(budgetValue));
+    const budgetPath = join(directory, 'budget-trimmed-report');
+    await writeFile(budgetPath, budgetBytes);
+    const budgetValidated = await validateReportPath(
+      budgetPath,
+      plainFile(budgetBytes),
+      RUN_ID,
+      null,
+    );
+    assert.equal(
+      legitimateEmptyGenerationReason(budgetValidated),
+      'budget_trimmed',
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

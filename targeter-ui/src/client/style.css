@@ -365,6 +365,19 @@ main {
   font-size: 11px;
   overflow-wrap: anywhere;
 }
+.origin-evidence {
+  display: grid;
+  gap: 5px;
+  margin: 0 10px 10px;
+  padding: 10px;
+  border-left: 2px solid #4d796d;
+  background: #101a1b;
+  color: #94a9a3;
+  font-size: 10px;
+}
+.origin-evidence code {
+  overflow-wrap: anywhere;
+}
 .probe-list {
   display: grid;
   gap: 5px;

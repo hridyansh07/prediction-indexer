@@ -1,14 +1,20 @@
 import type {
   ContinuityBundle,
+  ContinuityBundleV3,
   ContinuityTarget,
   SelectionReportV1,
   SelectionReportV2,
+  SelectionReportV3,
   SelectionTarget,
   TerminalProbeState,
 } from '../src/shared.js';
 
 export const RUN_ID = '20260816T120000.000001Z';
 export const BASE_RUN_ID = '20260816T110000.000001Z';
+export const ORIGIN_REPORT_SHA256 = 'a'.repeat(64);
+export const ORIGIN_MANIFEST_SHA256 = 'b'.repeat(64);
+export const ORIGIN_MANIFEST_KEY =
+  'targeter-v2/runs/date=2026-08-16/run=20260816T110000.000001Z/run_manifest.json';
 
 export function selectedReportV1(): SelectionReportV1 {
   const bundleId = 'bundle-v1-current-candidate';
@@ -187,5 +193,60 @@ export function degradedReportV2(): SelectionReportV2 {
     'continuity_degraded_after_timeout: committed generation metadata unavailable',
   ];
   report.continuity_degraded_base_run_id = BASE_RUN_ID;
+  return report;
+}
+
+function reportV3From(report: SelectionReportV2): SelectionReportV3 {
+  return {
+    ...report,
+    report_version: 3,
+    continuity: {
+      ...report.continuity,
+      bundles: report.continuity.bundles.map(
+        (bundle): ContinuityBundleV3 => ({
+          ...bundle,
+          origin_run_id: BASE_RUN_ID,
+          origin_report_sha256: ORIGIN_REPORT_SHA256,
+          origin_archive_manifest_key: ORIGIN_MANIFEST_KEY,
+          origin_archive_manifest_sha256: ORIGIN_MANIFEST_SHA256,
+        }),
+      ),
+    },
+  };
+}
+
+export function retainedReportV3(): SelectionReportV3 {
+  return reportV3From(retainedReportV2());
+}
+
+export function freshReportV3(): SelectionReportV3 {
+  const report = selectedReportV1();
+  const score = Number(report.candidates[0].score);
+  return {
+    ...report,
+    report_version: 3,
+    continuity: { bundles: [], retained_bundle_ids: [], dispositions: {} },
+    continuity_diagnostics: [],
+    continuity_degraded_base_run_id: null,
+    selection: {
+      ...report.selection,
+      targets: Object.fromEntries(
+        Object.entries(report.selection.targets).map(([venue, targets]) => [
+          venue,
+          targets.map((target) => ({ ...target, continuity_score: score })),
+        ]),
+      ),
+    },
+  };
+}
+
+export function budgetTrimmedReportV3(): SelectionReportV3 {
+  const report = reportV3From(terminalRetirementReportV2());
+  report.continuity.dispositions = Object.fromEntries(
+    report.continuity.bundles.map((bundle) => [
+      bundle.bundle_id,
+      'continuity_budget_trimmed',
+    ]),
+  );
   return report;
 }
