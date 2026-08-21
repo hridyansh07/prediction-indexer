@@ -725,15 +725,15 @@ sibling/event references, normalized target assets and relationships, planned
 capture bounds, segment intervals, and control/epoch facts. It does not copy
 catalogues, selection reports, target vendor records, control-envelope JSON, or
 data deliveries into SQLite. The reviewable schema is
-`universe/schema/v1.sql`.
+`universe/schema/v3.sql`.
 
-New Targeter manifests commit `selected_bundle_index.ndjson[.zst]` directly. If
-sync encounters an older committed run without it, sync verifies that run's
-selection report once, publishes an immutable compact derivative plus a
-source-binding `selected_bundle_index.receipt.json`, and then ingests the
-derivative. Later syncs use the committed derivative without downloading the
-report. This is the Targeter historical path; no capture-host filesystem mount
-or separate Targeter bulk-backfill format is required.
+Event Universe is strict Targeter v3-only. Sync selects the newest archived run,
+verifies its manifest-owned v3 report and native
+`selected_bundle_index.ndjson[.zst]`, resolves retained selections through exact
+immutable v3 origin manifests, and atomically replaces the active bundle set.
+There is no Universe publication pointer, legacy lazy derivative, or historical
+occurrence store. A failed newest snapshot leaves the prior active set intact;
+`/healthz` marks it stale from the archived run's `generated_at`.
 
 Historical **raw-control** rollout uses `python universe/run_backfill.py`. It
 discovers non-authoritative raw receipt mirrors in S3, reverifies each

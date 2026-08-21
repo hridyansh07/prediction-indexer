@@ -23,9 +23,10 @@ from archive.common.durable import fsync_directory
 from targeter.targets import Target, target_digest
 from targeter.v2.selected_bundles import SELECTED_BUNDLE_INDEX_VERSION
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+STALE_AFTER_SECONDS = 3_600
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
-SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
+SCHEMA_PATH = Path(__file__).with_name("schema") / "v3.sql"
 
 
 class EvidenceConflict(ValueError):
@@ -40,16 +41,15 @@ class UniverseStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > SCHEMA_VERSION:
-                raise EvidenceConflict(
-                    f"universe schema {version} is newer than supported {SCHEMA_VERSION}"
-                )
             if version == 0:
                 connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 connection.commit()
             elif version != SCHEMA_VERSION:
-                raise EvidenceConflict(f"unsupported universe schema version {version}")
+                raise EvidenceConflict(
+                    f"unsupported universe schema version {version}; "
+                    "initialize a fresh v3 database"
+                )
 
     def connect(self, *, readonly: bool = False) -> sqlite3.Connection:
         if readonly:
@@ -95,14 +95,14 @@ class UniverseStore:
             )
         return True
 
-    def ingest_selected_bundle_index(
+    def replace_active_snapshot(
         self,
         *,
-        source_key: str,
-        source_sha256: str,
-        source_kind: str,
         manifest_key: str,
         manifest_sha256: str,
+        report_key: str,
+        report_sha256: str,
+        report_byte_length: int,
         index_key: str,
         index_sha256: str,
         index_byte_length: int,
@@ -111,52 +111,66 @@ class UniverseStore:
         input_complete: bool,
         rows: Iterable[Mapping[str, Any]],
     ) -> str:
-        """Index one compact selected-bundle artifact, never its source JSON."""
-        if source_kind not in {"manifest_index", "derived_index"}:
-            raise EvidenceConflict(f"invalid selected index source kind {source_kind!r}")
-        records = [_selected_bundle_row(dict(item)) for item in rows]
+        """Atomically replace active bundles with one complete archived v3 run."""
+        if input_complete is not True:
+            raise EvidenceConflict("active snapshot input must be complete")
+        records = [_active_bundle_row(dict(item)) for item in rows]
         strategy_versions = {record["strategy_version"] for record in records}
         if len(strategy_versions) > 1:
             raise EvidenceConflict("selected bundle index mixes strategy versions")
+        seen_bundles: set[str] = set()
         for record in records:
-            if (
-                record["run_id"] != run_id
-                or record["generated_at"] != generated_at
-                or record["input_complete"] is not input_complete
-            ):
+            bundle_id = record["bundle_id"]
+            if bundle_id in seen_bundles:
+                raise EvidenceConflict(f"run {run_id} repeats bundle {bundle_id}")
+            seen_bundles.add(bundle_id)
+            if record["run_id"] != run_id or record["generated_at"] != generated_at:
                 raise EvidenceConflict(
-                    f"selected bundle {record['bundle_id']} disagrees with its run manifest"
+                    f"selected bundle {bundle_id} disagrees with its run manifest"
                 )
         generated_ns = _timestamp_ns(generated_at)
+        indexed_at_ns = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
         with self.write_transaction() as connection:
-            if not _begin_source(
-                connection, source_key, "selected_bundle_index", source_sha256
-            ):
-                return "skipped"
-            existing = connection.execute(
-                "SELECT source_key FROM targeter_sources WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            existing = connection.execute("SELECT * FROM active_snapshot").fetchone()
             if existing is not None:
-                raise EvidenceConflict(
-                    f"run {run_id} is already indexed from {existing['source_key']}"
-                )
+                if existing["run_id"] == run_id:
+                    if (
+                        existing["manifest_key"] != manifest_key
+                        or existing["manifest_sha256"] != manifest_sha256
+                        or existing["report_key"] != report_key
+                        or existing["report_sha256"] != report_sha256
+                        or existing["index_key"] != index_key
+                        or existing["index_sha256"] != index_sha256
+                    ):
+                        raise EvidenceConflict(
+                            f"active run {run_id} changed immutable identities"
+                        )
+                    return "skipped"
+                if existing["run_id"] > run_id:
+                    return "stale"
+
+            connection.execute("DELETE FROM active_bundles")
+            connection.execute("DELETE FROM subscription_sets")
+            connection.execute("DELETE FROM active_snapshot")
             connection.execute(
-                """INSERT INTO targeter_sources(
-                       run_id, source_key, source_kind, generated_at,
-                       generated_at_ns, input_complete, strategy_version,
-                       manifest_key, manifest_sha256, index_key, index_sha256,
+                """INSERT INTO active_snapshot(
+                       singleton, run_id, generated_at, generated_at_ns,
+                       indexed_at_ns, strategy_version, manifest_key,
+                       manifest_sha256, report_key, report_sha256,
+                       report_byte_length, index_key, index_sha256,
                        index_byte_length
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
-                    source_key,
-                    source_kind,
                     generated_at,
                     generated_ns,
-                    int(input_complete),
+                    indexed_at_ns,
                     next(iter(strategy_versions), None),
                     manifest_key,
                     manifest_sha256,
+                    report_key,
+                    report_sha256,
+                    report_byte_length,
                     index_key,
                     index_sha256,
                     index_byte_length,
@@ -164,23 +178,38 @@ class UniverseStore:
             )
 
             assets_by_venue: dict[str, set[str]] = {}
-            seen_bundles: set[str] = set()
             for record in records:
                 bundle_id = record["bundle_id"]
-                if bundle_id in seen_bundles:
-                    raise EvidenceConflict(f"run {run_id} repeats bundle {bundle_id}")
-                seen_bundles.add(bundle_id)
                 connection.execute(
-                    """INSERT INTO selected_bundles(
-                           run_id, bundle_id, sport, game, topology,
-                           activation_at, activation_at_ns,
-                           capture_start_at, capture_start_at_ns,
-                           planned_capture_end_at, planned_capture_end_at_ns,
+                    """INSERT INTO active_bundles(
+                           bundle_id, origin_run_id, origin_generated_at,
+                           origin_generated_at_ns, origin_manifest_key,
+                           origin_manifest_sha256, origin_report_key,
+                           origin_report_sha256, origin_report_byte_length,
+                           origin_index_key, origin_index_sha256,
+                           origin_index_byte_length, continuity_selected,
+                           continuity_disposition, sport, game, topology,
+                           activation_at, activation_at_ns, capture_start_at,
+                           capture_start_at_ns, planned_capture_end_at,
+                           planned_capture_end_at_ns,
                            post_start_retention_seconds
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                 ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        run_id,
                         bundle_id,
+                        record["origin_run_id"],
+                        record["origin_generated_at"],
+                        _timestamp_ns(record["origin_generated_at"]),
+                        record["origin_manifest_key"],
+                        record["origin_manifest_sha256"],
+                        record["origin_report_key"],
+                        record["origin_report_sha256"],
+                        record["origin_report_byte_length"],
+                        record["origin_index_key"],
+                        record["origin_index_sha256"],
+                        record["origin_index_byte_length"],
+                        int(record["continuity_selected"]),
+                        record["continuity_disposition"],
                         record["sport"],
                         record["game"],
                         record["topology"],
@@ -195,28 +224,32 @@ class UniverseStore:
                 )
                 connection.executemany(
                     """INSERT INTO bundle_participants(
-                           run_id, bundle_id, position, name, participant_key
-                       ) VALUES (?, ?, ?, ?, ?)""",
+                           bundle_id, position, name, participant_key
+                       ) VALUES (?, ?, ?, ?)""",
                     (
-                        (run_id, bundle_id, position, name, record["participant_keys"][position])
+                        (
+                            bundle_id,
+                            position,
+                            name,
+                            record["participant_keys"][position],
+                        )
                         for position, name in enumerate(record["participants"])
                     ),
                 )
                 connection.executemany(
-                    """INSERT INTO bundle_events(run_id, bundle_id, event_ref, venue)
-                       VALUES (?, ?, ?, ?)""",
+                    """INSERT INTO bundle_events(bundle_id, event_ref, venue)
+                       VALUES (?, ?, ?)""",
                     (
-                        (run_id, bundle_id, event_ref, _venue_prefix(event_ref))
+                        (bundle_id, event_ref, _venue_prefix(event_ref))
                         for event_ref in record["event_refs"]
                     ),
                 )
                 connection.executemany(
                     """INSERT INTO bundle_markets(
-                           run_id, bundle_id, target_id, venue, selected
-                       ) VALUES (?, ?, ?, ?, ?)""",
+                           bundle_id, target_id, venue, selected
+                       ) VALUES (?, ?, ?, ?)""",
                     (
                         (
-                            run_id,
                             bundle_id,
                             market["target_id"],
                             market["venue"],
@@ -228,21 +261,22 @@ class UniverseStore:
                 for target in record["targets"]:
                     connection.execute(
                         """INSERT INTO selected_targets(
-                               run_id, bundle_id, target_id, venue, canonical_class
+                               bundle_id, target_id, venue, canonical_class,
+                               source_ref
                            ) VALUES (?, ?, ?, ?, ?)""",
                         (
-                            run_id,
                             bundle_id,
                             target["target_id"],
                             target["venue"],
                             target["canonical_class"],
+                            target["source_ref"],
                         ),
                     )
                     connection.executemany(
-                        """INSERT INTO selected_target_assets(run_id, target_id, asset_id)
-                           VALUES (?, ?, ?)""",
+                        """INSERT INTO selected_target_assets(target_id, asset_id)
+                           VALUES (?, ?)""",
                         (
-                            (run_id, target["target_id"], asset_id)
+                            (target["target_id"], asset_id)
                             for asset_id in target["subscription_ids"]
                         ),
                     )
@@ -251,13 +285,12 @@ class UniverseStore:
                     )
                 connection.executemany(
                     """INSERT INTO bundle_relationships(
-                           run_id, bundle_id, relationship_index,
-                           left_market, right_market, relationship, scope,
-                           left_venue, right_venue, coverage
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           bundle_id, relationship_index, left_market,
+                           right_market, relationship, scope, left_venue,
+                           right_venue, coverage
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         (
-                            run_id,
                             bundle_id,
                             position,
                             relationship["left"],
@@ -279,19 +312,15 @@ class UniverseStore:
                 digest = target_digest(venue, frozen)
                 connection.execute(
                     """INSERT INTO subscription_sets(
-                           run_id, venue, target_digest, asset_count
-                       ) VALUES (?, ?, ?, ?)""",
-                    (run_id, venue, digest, len(assets)),
+                           venue, target_digest, asset_count
+                       ) VALUES (?, ?, ?)""",
+                    (venue, digest, len(assets)),
                 )
                 connection.executemany(
-                    """INSERT INTO subscription_assets(run_id, venue, asset_id)
-                       VALUES (?, ?, ?)""",
-                    ((run_id, venue, item) for item in sorted(assets)),
+                    """INSERT INTO subscription_assets(venue, asset_id)
+                       VALUES (?, ?)""",
+                    ((venue, item) for item in sorted(assets)),
                 )
-
-            _finish_source(
-                connection, source_key, "selected_bundle_index", source_sha256
-            )
         return "ingested"
 
     def ingest_control_receipt(
@@ -503,15 +532,19 @@ class UniverseStore:
             ).fetchone()
         return None if row is None else str(row["cursor"])
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, now_ns: int | None = None) -> dict[str, Any]:
+        observed_ns = (
+            now_ns
+            if now_ns is not None
+            else int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
+        )
         with closing(self.connect(readonly=True)) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             counts = {
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in (
                     "ingest_sources",
-                    "targeter_sources",
-                    "selected_bundles",
+                    "active_bundles",
                     "bundle_markets",
                     "selected_targets",
                     "segment_receipts",
@@ -519,85 +552,101 @@ class UniverseStore:
                     "connection_epochs",
                 )
             }
-        return {"status": "ok", "schema_version": version, "counts": counts}
+            snapshot = connection.execute("SELECT * FROM active_snapshot").fetchone()
+        active = None
+        if snapshot is not None:
+            age_seconds = max(
+                0, (observed_ns - int(snapshot["generated_at_ns"])) // 1_000_000_000
+            )
+            active = {
+                "run_id": snapshot["run_id"],
+                "generated_at": snapshot["generated_at"],
+                "indexed_at_ns": snapshot["indexed_at_ns"],
+                "age_seconds": age_seconds,
+                "stale_after_seconds": STALE_AFTER_SECONDS,
+                "stale": age_seconds >= STALE_AFTER_SECONDS,
+            }
+        return {
+            "status": "ok",
+            "schema_version": version,
+            "active_snapshot": active,
+            "counts": counts,
+        }
 
     def list_bundles(self, *, limit: int = 100) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), 1000))
         with closing(self.connect(readonly=True)) as connection:
             rows = connection.execute(
-                """WITH ranked AS (
-                       SELECT sb.bundle_id, sb.run_id, sb.sport, sb.game,
-                              sb.topology, sb.activation_at, sb.capture_start_at,
-                              sb.planned_capture_end_at, ts.generated_at,
-                              ts.generated_at_ns,
-                              ROW_NUMBER() OVER (
-                                  PARTITION BY sb.bundle_id
-                                  ORDER BY ts.generated_at_ns DESC, sb.run_id DESC
-                              ) AS position
-                       FROM selected_bundles sb
-                       JOIN targeter_sources ts USING (run_id)
-                   )
-                   SELECT bundle_id, run_id, sport, game, topology,
-                          activation_at, capture_start_at,
-                          planned_capture_end_at, generated_at
-                   FROM ranked
-                   WHERE position = 1
-                   ORDER BY generated_at_ns DESC, bundle_id
+                """SELECT ab.bundle_id, snapshot.run_id, ab.origin_run_id,
+                          ab.continuity_selected, ab.continuity_disposition,
+                          ab.sport, ab.game, ab.topology, ab.activation_at,
+                          ab.capture_start_at, ab.planned_capture_end_at,
+                          snapshot.generated_at
+                   FROM active_bundles ab
+                   CROSS JOIN active_snapshot snapshot
+                   ORDER BY ab.activation_at_ns, ab.bundle_id
                    LIMIT ?""",
                 (bounded,),
             ).fetchall()
-        return [_row_record(row) for row in rows]
+        return [
+            {
+                **_row_record(row),
+                "continuity_selected": bool(row["continuity_selected"]),
+            }
+            for row in rows
+        ]
 
     def bundle_detail(self, bundle_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
             bundle = connection.execute(
-                """SELECT sb.*, ts.generated_at, ts.input_complete,
-                          ts.source_kind, ts.manifest_key, ts.manifest_sha256,
-                          ts.index_key, ts.index_sha256, ts.index_byte_length
-                   FROM selected_bundles sb
-                   JOIN targeter_sources ts USING (run_id)
-                   WHERE sb.bundle_id = ?
-                   ORDER BY ts.generated_at_ns DESC LIMIT 1""",
+                """SELECT ab.*, snapshot.run_id, snapshot.generated_at,
+                          snapshot.indexed_at_ns, snapshot.manifest_key,
+                          snapshot.manifest_sha256, snapshot.report_key,
+                          snapshot.report_sha256, snapshot.report_byte_length,
+                          snapshot.index_key, snapshot.index_sha256,
+                          snapshot.index_byte_length
+                   FROM active_bundles ab
+                   CROSS JOIN active_snapshot snapshot
+                   WHERE ab.bundle_id = ?""",
                 (bundle_id,),
             ).fetchone()
             if bundle is None:
                 return None
-            run_id = bundle["run_id"]
             participants = connection.execute(
                 """SELECT position, name, participant_key FROM bundle_participants
-                   WHERE run_id = ? AND bundle_id = ? ORDER BY position""",
-                (run_id, bundle_id),
+                   WHERE bundle_id = ? ORDER BY position""",
+                (bundle_id,),
             ).fetchall()
             events = connection.execute(
                 """SELECT event_ref, venue FROM bundle_events
-                   WHERE run_id = ? AND bundle_id = ? ORDER BY event_ref""",
-                (run_id, bundle_id),
+                   WHERE bundle_id = ? ORDER BY event_ref""",
+                (bundle_id,),
             ).fetchall()
             markets = connection.execute(
                 """SELECT bm.target_id, bm.venue, bm.selected,
-                          st.canonical_class
+                          st.canonical_class, st.source_ref
                    FROM bundle_markets bm
                    LEFT JOIN selected_targets st
-                     ON st.run_id = bm.run_id AND st.target_id = bm.target_id
-                   WHERE bm.run_id = ? AND bm.bundle_id = ?
+                     ON st.target_id = bm.target_id
+                   WHERE bm.bundle_id = ?
                    ORDER BY bm.target_id""",
-                (run_id, bundle_id),
+                (bundle_id,),
             ).fetchall()
             relationships = connection.execute(
                 """SELECT left_market, right_market, relationship, scope,
                           left_venue, right_venue, coverage
                    FROM bundle_relationships
-                   WHERE run_id = ? AND bundle_id = ?
+                   WHERE bundle_id = ?
                    ORDER BY relationship_index""",
-                (run_id, bundle_id),
+                (bundle_id,),
             ).fetchall()
-            subscriptions = self._bundle_subscriptions(connection, run_id, bundle_id)
+            subscriptions = self._bundle_subscriptions(connection, bundle_id)
             market_records: list[dict[str, Any]] = []
             for market in markets:
                 assets = connection.execute(
                     """SELECT asset_id FROM selected_target_assets
-                       WHERE run_id = ? AND target_id = ? ORDER BY asset_id""",
-                    (run_id, market["target_id"]),
+                       WHERE target_id = ? ORDER BY asset_id""",
+                    (market["target_id"],),
                 ).fetchall()
                 market_records.append(
                     {
@@ -621,9 +670,13 @@ class UniverseStore:
                 )
             },
             "run": {
-                "run_id": run_id,
+                "run_id": bundle["run_id"],
                 "generated_at": bundle["generated_at"],
-                "input_complete": bool(bundle["input_complete"]),
+                "indexed_at_ns": bundle["indexed_at_ns"],
+            },
+            "continuity": {
+                "selected": bool(bundle["continuity_selected"]),
+                "disposition": bundle["continuity_disposition"],
             },
             "participants": [_row_record(row) for row in participants],
             "events": [_row_record(row) for row in events],
@@ -631,35 +684,45 @@ class UniverseStore:
             "relationships": [_row_record(row) for row in relationships],
             "subscriptions": subscriptions,
             "source": {
-                "kind": bundle["source_kind"],
                 "manifest_key": bundle["manifest_key"],
                 "manifest_sha256": bundle["manifest_sha256"],
+                "report_key": bundle["report_key"],
+                "report_sha256": bundle["report_sha256"],
+                "report_byte_length": bundle["report_byte_length"],
                 "index_key": bundle["index_key"],
                 "index_sha256": bundle["index_sha256"],
                 "index_byte_length": bundle["index_byte_length"],
             },
+            "origin": {
+                key.removeprefix("origin_"): bundle[key]
+                for key in (
+                    "origin_run_id",
+                    "origin_generated_at",
+                    "origin_manifest_key",
+                    "origin_manifest_sha256",
+                    "origin_report_key",
+                    "origin_report_sha256",
+                    "origin_report_byte_length",
+                    "origin_index_key",
+                    "origin_index_sha256",
+                    "origin_index_byte_length",
+                )
+            },
         }
 
     def _bundle_subscriptions(
-        self, connection: sqlite3.Connection, run_id: str, bundle_id: str
+        self, connection: sqlite3.Connection, bundle_id: str
     ) -> list[dict[str, Any]]:
         sets = connection.execute(
             """SELECT DISTINCT ss.venue, ss.target_digest, ss.asset_count
                FROM selected_targets st
-               JOIN subscription_sets ss USING (run_id, venue)
-               WHERE st.run_id = ? AND st.bundle_id = ?
+               JOIN subscription_sets ss USING (venue)
+               WHERE st.bundle_id = ?
                ORDER BY ss.venue""",
-            (run_id, bundle_id),
+            (bundle_id,),
         ).fetchall()
         output: list[dict[str, Any]] = []
         for item in sets:
-            candidate_count = int(
-                connection.execute(
-                    """SELECT COUNT(*) FROM subscription_sets
-                       WHERE venue = ? AND target_digest = ?""",
-                    (item["venue"], item["target_digest"]),
-                ).fetchone()[0]
-            )
             epochs = connection.execute(
                 """SELECT lane_id, connection_epoch, predecessor_epoch,
                           observed_start_ns, observed_end_ns, socket_status,
@@ -676,10 +739,6 @@ class UniverseStore:
                     "target_digest": item["target_digest"],
                     "asset_count": item["asset_count"],
                     "selection_status": "selected",
-                    "historical_link_status": (
-                        "exact" if candidate_count == 1 else "ambiguous"
-                    ),
-                    "candidate_run_count": candidate_count,
                     "epochs": [_row_record(row) for row in epochs],
                 }
             )
@@ -708,15 +767,11 @@ class UniverseStore:
     def segments_for_bundle(
         self, bundle_id: str, *, lane_id: str | None = None
     ) -> list[dict[str, Any]] | None:
-        """Return archived segments overlapping the latest selected bundle window."""
+        """Return archived segments overlapping the active selected bundle window."""
         with closing(self.connect(readonly=True)) as connection:
             bounds = connection.execute(
-                """SELECT sb.capture_start_at_ns, sb.planned_capture_end_at_ns
-                   FROM selected_bundles sb
-                   JOIN targeter_sources ts USING (run_id)
-                   WHERE sb.bundle_id = ?
-                   ORDER BY ts.generated_at_ns DESC, sb.run_id DESC
-                   LIMIT 1""",
+                """SELECT capture_start_at_ns, planned_capture_end_at_ns
+                   FROM active_bundles WHERE bundle_id = ?""",
                 (bundle_id,),
             ).fetchone()
         if bounds is None:
@@ -821,15 +876,28 @@ def _finish_source(
     )
 
 
-def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
+def _active_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
     expected = {
         "selected_bundle_index_version",
+        "occurrence_kind",
         "run_id",
         "generated_at",
         "input_complete",
         "strategy_version",
         "post_start_retention_seconds",
         "bundle_id",
+        "origin_run_id",
+        "origin_generated_at",
+        "origin_manifest_key",
+        "origin_manifest_sha256",
+        "origin_report_key",
+        "origin_report_sha256",
+        "origin_report_byte_length",
+        "origin_index_key",
+        "origin_index_sha256",
+        "origin_index_byte_length",
+        "continuity_selected",
+        "continuity_disposition",
         "sport",
         "game",
         "topology",
@@ -847,22 +915,52 @@ def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
         raise EvidenceConflict("selected bundle index row fields are invalid")
     if record["selected_bundle_index_version"] != SELECTED_BUNDLE_INDEX_VERSION:
         raise EvidenceConflict("unsupported selected bundle index version")
+    if record["occurrence_kind"] not in {"complete", "retained"}:
+        raise EvidenceConflict("selected bundle occurrence kind is invalid")
     for field in (
         "run_id",
         "generated_at",
         "bundle_id",
+        "origin_run_id",
+        "origin_generated_at",
+        "origin_manifest_key",
+        "origin_manifest_sha256",
+        "origin_report_key",
+        "origin_report_sha256",
+        "origin_index_key",
+        "origin_index_sha256",
         "sport",
         "activation_at",
         "capture_start_at",
         "planned_capture_end_at",
     ):
         _text(record, field, "selected bundle")
-    if not isinstance(record["input_complete"], bool):
-        raise EvidenceConflict("selected bundle input_complete must be boolean")
-    for field in ("strategy_version", "post_start_retention_seconds"):
+    if record["input_complete"] is not True:
+        raise EvidenceConflict("active selected bundle input must be complete")
+    if not isinstance(record["continuity_selected"], bool):
+        raise EvidenceConflict("selected bundle continuity flag must be boolean")
+    disposition = record["continuity_disposition"]
+    if record["occurrence_kind"] == "retained":
+        if not record["continuity_selected"] or disposition != "retained":
+            raise EvidenceConflict("retained bundle continuity provenance is invalid")
+    elif disposition not in {None, "held_current_candidate"} or (
+        record["continuity_selected"] != (disposition is not None)
+    ):
+        raise EvidenceConflict("complete bundle continuity provenance is invalid")
+    for field in (
+        "strategy_version",
+        "post_start_retention_seconds",
+        "origin_report_byte_length",
+        "origin_index_byte_length",
+    ):
         value = record[field]
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise EvidenceConflict(f"selected bundle {field} must be positive")
+        minimum = 1 if field in {"strategy_version", "post_start_retention_seconds"} else 0
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < minimum
+        ):
+            raise EvidenceConflict(f"selected bundle {field} is invalid")
     for field in ("game", "topology"):
         value = record[field]
         if value is not None and (not isinstance(value, str) or not value):
@@ -914,6 +1012,9 @@ def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
             "target_id",
             "canonical_class",
             "subscription_ids",
+            "activation_at",
+            "capture_start_at",
+            "source_ref",
         }:
             raise EvidenceConflict("selected bundle target fields are invalid")
         target_id = _text(target, "target_id", "selected bundle target")
@@ -921,6 +1022,14 @@ def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
         canonical_class = _text(
             target, "canonical_class", "selected bundle target"
         )
+        source_ref = _text(target, "source_ref", "selected bundle target")
+        if (
+            target.get("activation_at") != record["activation_at"]
+            or target.get("capture_start_at") != record["capture_start_at"]
+        ):
+            raise EvidenceConflict(
+                f"selected bundle target {target_id} timing disagrees with its bundle"
+            )
         assets = _text_list(
             target["subscription_ids"], "selected bundle target subscription_ids"
         )
@@ -937,6 +1046,9 @@ def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
                 "target_id": target_id,
                 "canonical_class": canonical_class,
                 "subscription_ids": assets,
+                "activation_at": target["activation_at"],
+                "capture_start_at": target["capture_start_at"],
+                "source_ref": source_ref,
             }
         )
     if target_ids != selected_market_ids:
@@ -972,6 +1084,19 @@ def _selected_bundle_row(record: dict[str, Any]) -> dict[str, Any]:
         raise EvidenceConflict("selected bundle capture bounds are invalid")
     if end_ns - activation_ns != record["post_start_retention_seconds"] * 1_000_000_000:
         raise EvidenceConflict("selected bundle planned end disagrees with retention policy")
+    _timestamp_ns(record["origin_generated_at"])
+    for field in (
+        "origin_manifest_sha256",
+        "origin_report_sha256",
+        "origin_index_sha256",
+    ):
+        value = record[field]
+        if (
+            len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise EvidenceConflict(f"selected bundle {field} is invalid")
     return {
         **record,
         "participants": participants,
