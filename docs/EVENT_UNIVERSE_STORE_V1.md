@@ -2,152 +2,124 @@
 
 **Status:** implemented contract on `feat/event-universe`.
 
-## 1. Purpose and decision
+## 1. Purpose
 
-Proceed with Event Universe as a sparse, durable query index over **bundles
-selected by Targeter** and the archived capture intervals relevant to them.
+Event Universe is a sparse, durable index of the **currently active bundles
+selected by Targeter**. It exists to answer:
 
-This is not a catalogue of every event or market Targeter inspected. It is not
-a second copy of Targeter's JSON archives. Its purpose is to make the following
-questions cheap and deterministic:
+- which event bundles and sibling markets are active now;
+- when and from which immutable Targeter run each bundle was first selected;
+- which targets and subscription IDs belong to it;
+- which planned capture interval bounds the event; and
+- which archived S3 segments overlap that interval.
 
-- Which event bundles did the system select?
-- Which event and sibling-market references belonged to that selected bundle?
-- Which markets were selected for capture, and with which subscription IDs?
-- What relationship edges did Targeter surface?
-- What bounded interval should a future data pull search?
-- Which immutable archived segments overlap that interval?
-- Which normalized splice controls and connection epochs exist in that span?
+It is not a catalogue of every event Targeter inspected, a Targeter run-history
+database, or a second copy of archived JSON. It stores no venue-frame rows and
+does not map individual deliveries to markets.
 
-V1 deliberately does **not** define a ReplayPlan, invoke current replay gates,
-choose where replay executes, or add a UI. Those decisions depend on a future
-data-pull and replay execution model. The existing Targeter UI can consume this
-API later without making its current data model part of this contract.
+V1 does not define a replay plan, invoke existing replay gates, choose where a
+future replay runs, add human-authored links, or add UI behavior. Those remain
+separate decisions. The API provides the bounded event and S3-location harness a
+future replay path can consume.
 
-V1 also does not add human-authored links. Humans cannot introduce markets into
-Targeter's selected bundle, so manual relationship state would add an
-unproductive second authority.
+## 2. Input contract
 
-## 2. Governing boundaries
+Universe consumes only the current Targeter v3 producer contract:
 
-### 2.1 Immutable evidence remains authoritative
+- a version-2 archived run manifest, which remains the immutable remote commit
+  marker;
+- exactly one manifest-owned Targeter report with `report_version: 3`;
+- exactly one manifest-owned `selected_bundle_index.ndjson[.zst]` with
+  `selected_bundle_index_version: 3`; and
+- `input_complete: true` in both manifest and report.
 
-SQLite is durable operational state and a query accelerator. It is not the
-evidence archive.
+The report and index are identity-verified and the deterministic index is
+reprojected from the report before admission. Rejected candidates, unselected
+catalogue records, and complete report JSON are not stored.
 
-| Evidence | Commit marker | Universe use |
-|---|---|---|
-| New Targeter run | `run_manifest.json` naming `selected_bundle_index.ndjson[.zst]` | selected bundle facts only |
-| Legacy Targeter run | original `run_manifest.json`, plus a source-binding derivative receipt | lazily project selected bundle facts once |
-| Raw segment | local production `.archive.json`; remote segment-universe receipt commits only its derivative | verified interval and controls |
-| Universe database | one SQLite transaction per immutable source | query acceleration and checkpoints |
+There is deliberately no Universe support for Targeter report/index v1 or v2.
+No v3 Universe was deployed before this contract, so nullable origins, legacy
+lazy derivation, derivative receipts, migration machinery, and mixed-version
+admission add risk without buying compatibility. A non-v3 Universe database is
+rejected and must be rebuilt.
 
-An object listing is discovery, never a commit marker. Every consumed object is
-closed-parsed and checked against its recorded stored and, where applicable,
-decoded identity. Repeating an identical source is a no-op. Reusing an
-immutable key with another identity fails closed.
+## 3. Active snapshot selection
 
-### 2.2 Capture and interpretation boundaries do not move
+Sync lists immutable Targeter run manifests and chooses the greatest canonical
+Targeter run ID. Run IDs are UTC timestamps and lexicographically time ordered.
+The latest successfully archived, complete v3 run is therefore the active
+snapshot.
 
-Event Universe does not parse venue data frames, map deliveries to markets, or
-change capture behavior. Splices still record one envelope per application
-delivery. Venue payload interpretation remains in replay or analysis.
+There is no durable Universe publication pointer. In particular, Universe does
+not consume or reinterpret Targeter's atomic `current.json` generation pointer;
+that pointer continues to govern splice publication only.
 
-The only raw rows indexed by V1 are normalized control facts. There is no row
-per data delivery and no `target_records` table.
+If the newest manifest or any evidence it references fails validation, sync
+does not fall back to an older run and does not modify the existing active
+snapshot. An identical active run is a no-op. An older run cannot replace a
+newer one. A valid newer run with no selected bundles atomically clears the
+active bundle set.
 
-## 3. Selected-bundle projection
+`/healthz` reports snapshot age and `stale` after one hour. Age is measured from
+the manifest-owned run `generated_at`, not first observation by Universe. That
+timestamp precedes archive commitment, so delayed sync is conservatively stale
+rather than incorrectly appearing fresh.
 
-Every new Targeter run writes one deterministic compact artifact:
+## 4. Selected-bundle projection
 
-```text
-selected_bundle_index.ndjson
-selected_bundle_index.ndjson.zst
-```
+For a newly selected or held-current candidate, the v3 index carries complete
+context:
 
-The configured Targeter artifact format chooses one name. The artifact is in
-the run's artifact inventory and is therefore committed by the immutable run
-manifest.
+- run and strategy version;
+- bundle ID, sport, optional game/topology, participants and participant keys;
+- activation, one-hour lookahead capture start, and bounded planned end;
+- event references and all sibling market references;
+- selected targets, canonical classes, source references, and subscription IDs;
+- relationship edges; and
+- continuity indication and `held_current_candidate` disposition when present.
 
-The projection reads `selection.bundle_ids` and emits exactly one row for each
-matching candidate. Rejected candidates and unselected catalogue records do
-not appear. Each row contains only:
+The planned end is `activation_at + post_start_retention_seconds`. It is a
+bounded search limit, not an observed event close, settlement time, or data
+completeness claim.
 
-- projection version, run ID, generation time, input completeness, and strategy
-  version;
-- bundle ID, sport, optional game/topology, participants, and participant keys;
-- activation time, capture start, and planned capture end;
-- selected bundle event references;
-- sibling market references and a selected/not-selected bit;
-- selected targets, canonical class, and normalized subscription IDs;
-- normalized relationship edges.
+The projection is deterministic. Bundles, event references, markets, targets,
+assets, and relationships are explicitly sorted. Zstandard artifacts use the
+shared `encoder` profile: exact logical bytes, level 3, checksum enabled, no
+dictionary, and exactly one frame.
 
-It contains no source report, catalogue record, target vendor record, or other
-vendor JSON.
+## 5. Continuity-retained selections
 
-Serialization is deterministic: bundles, markets, targets, event references,
-assets, and relationships are explicitly sorted. Compressed output uses the
-shared `encoder` profile: exact NDJSON, Zstandard level 3, frame checksum, no
-dictionary, exactly one frame, and logical plus stored identities.
+Targeter continuity behavior remains authoritative and unchanged. A retained
+v3 row is intentionally sparse and must provide:
 
-### 3.1 Planned capture bounds
+- `origin_run_id`;
+- exact origin report SHA-256;
+- exact origin archive-manifest key and SHA-256;
+- current retained targets and capture timing; and
+- `continuity_selected: true` with disposition `retained`.
 
-For strategy policy values recorded by the run:
+Universe resolves that immutable reference during sync. It verifies the exact
+origin manifest, report, and native v3 selected-bundle index, then requires one
+matching **complete** origin row. Current targets, activation, and capture start
+must exactly match the origin row.
 
-```text
-planned_capture_start = activation_at - pre_event_seconds
-planned_capture_end   = activation_at + post_start_retention_seconds
-```
+The active row copies normalized origin event, sibling, relationship, target,
+and planned-bound context. It also records both current snapshot provenance and
+non-null origin manifest/report/index keys, hashes, and lengths. Queries do not
+join to a prior Universe occurrence, so rebuilding or replacing the database
+cannot make an admitted origin unresolved.
 
-The projection checks that Targeter's `capture_start_at` equals the first
-expression. Current policy is one hour before activation and six hours after
-activation. Historical reports written before the policy fields existed use an
-explicit closed mapping for strategy versions 1–3; current mutable config is
-never applied retroactively.
+Missing origin objects, wrong hashes, retained-origin rows, missing bundle rows,
+or target/timing drift reject the entire incoming snapshot. Universe never
+weakens continuity, guesses an origin, or admits a nullable/unresolved record.
 
-`planned_capture_end` is a bounded search limit. It is not an observed event
-close, a settlement time, or a completeness claim.
+## 6. Raw segment locations and controls
 
-## 4. Lazy projection for committed historical runs
+Event origin and S3 segment location are separate evidence dimensions. A
+Targeter run proves what was selected; a segment-universe receipt proves which
+archived capture object covers an interval.
 
-Historical runs need no eager migration before Event Universe can start. When
-sync encounters a committed run whose manifest has no selected-bundle index:
-
-1. verify the original immutable run manifest;
-2. verify and decode its manifest-owned selection report;
-3. project only candidates named by `selection.bundle_ids`;
-4. publish `selected_bundle_index.ndjson.zst` beside that run using immutable
-   create-or-verify semantics;
-5. publish `selected_bundle_index.receipt.json` last;
-6. ingest the compact artifact.
-
-The derivative receipt binds:
-
-- the original manifest key and stored identity;
-- the selection-report key, stored identity, and decoded identity;
-- the selected-bundle projection version;
-- the compact artifact key, logical/stored identities, content metadata, and
-  compression contract.
-
-It states `authoritative_run_commit: false` and
-`authorizes_run_publication: false`. It does not modify or supersede the
-original run manifest. It commits only this derived projection.
-
-After the receipt exists, subsequent syncs verify and use the compact artifact
-without downloading or parsing the source report again. An orphan artifact
-from a crash is accepted only after strict decoding proves that its logical
-bytes equal the deterministic projection. Different bytes or metadata at the
-same key are an integrity conflict; the receipt is not published.
-
-This lazy path is also the Targeter historical path. No separate bulk Targeter
-backfill format or local Targeter archive mount is required. Running it against
-production S3 remains an explicit operational choice, not a test step.
-
-## 5. Raw segment universe derivatives
-
-The separately deployed service cannot assume access to the capture spool.
-After a production raw archive receipt has reverified its data and seal, the
-archiver can publish:
+After raw archival succeeds, the archiver may publish:
 
 ```text
 <segment>.archive-receipt-mirror.json
@@ -155,153 +127,94 @@ archiver can publish:
 <segment>.universe.json
 ```
 
-The receipt mirror preserves exact local production-receipt bytes for remote
-discovery but explicitly carries:
+The segment-universe receipt is published last. It binds the source receipt,
+archived data and seal objects, lane and segment identity, half-open interval,
+exact control lines, compression profile, and logical/stored identities. It is
+not an authoritative raw commit marker and never authorizes deletion.
 
-```json
-{"authoritative_commit_marker":false,"authorizes_deletion":false}
+Universe stores one interval/location row per verified receipt and normalized
+control/epoch facts only. It queries overlapping S3 objects using:
+
+```text
+segment.window_end_ns > bundle.capture_start_at_ns
+and segment.window_start_ns < bundle.planned_capture_end_at_ns
 ```
 
-It never authorizes raw reaping. The raw reaper continues to trust only its
-retained local production receipt.
+Events and connections may cross segment boundaries, UTC dates, and S3
+prefixes. Controls are therefore folded by `(lane_id, delivery_index)` across
+all admitted receipts and grouped by `(lane_id, connection_epoch)`. Missing
+open, close, send, or acceptance evidence stays `unknown`.
 
-The control sidecar contains exact original envelope lines whose
-`kind == "control"`, in source order. It does not parse venue frames, infer
-asset delivery, or treat transport send completion as venue acceptance.
+Historical raw backfill remains optional. `universe/run_backfill.py` discovers
+remote receipt mirrors and streams each committed S3 raw object through the
+existing strict `archive.common.verify.decode_archived_segment` decoder. It
+stages only the current segment and resumes through a SQLite checkpoint; no
+capture-spool mount or accumulated local raw history is required.
 
-`<segment>.universe.json` is published last and commits the derivative. It
-binds the source receipt/mirror identity, archive location, lane and segment
-identity, half-open segment interval, raw data and seal objects, control object,
-logical/stored identities, compression profile, and control delivery bounds.
+## 7. SQLite schema and atomicity
 
-This is a **segment universe receipt**, not a catalogue receipt. It buys an
-S3-native, immutable inventory proving which segment and control derivative the
-remote universe may index. It does not claim one segment or one UTC day contains
-a complete event.
-
-Raw archive commitment happens first. Derivative failure is reported but never
-invalidates or overwrites a successful raw archive.
-
-## 6. Time and connection semantics
-
-Events and connection epochs can cross segments, S3 date prefixes, and UTC
-midnight. Therefore V1:
-
-- queries segments by half-open interval overlap;
-- folds controls by `(lane_id, delivery_index)` across every ingested segment;
-- groups lifecycle controls by `(lane_id, connection_epoch)`;
-- preserves predecessor epochs per lane;
-- leaves missing open/close/acceptance evidence as `unknown`;
-- never truncates an open epoch at a query or UTC-day boundary.
-
-Evidence language remains narrow:
-
-| State | Required evidence |
-|---|---|
-| `selected` | compact Targeter projection names the target |
-| `socket_opened` | `connection_opened` control observed |
-| `subscription_send_completed` | `subscription_sent` control observed |
-| `venue_acceptance_observed` | explicit acceptance control observed |
-| `asset_delivery_observed` | unavailable in V1 |
-
-`target_digest` identifies a venue and sorted asset set, not a unique Targeter
-run. One matching selected generation is reported as `exact`; repeated matches
-are `ambiguous` with a candidate count. V1 never chooses a nearby run and calls
-it exact.
-
-## 7. SQLite schema and durability
-
-The complete V1 schema lives separately for review:
+The complete schema is separately reviewable at:
 
 ```text
 universe/schema/README.md
-universe/schema/v1.sql
+universe/schema/v3.sql
 ```
 
-Runtime code loads that packaged SQL; schema text does not live in
-`universe/store.py`.
+It stores:
 
-The normalized schema stores:
+- one singleton active snapshot;
+- one row per active selected bundle;
+- copied normalized event, sibling, target, asset, and relationship context;
+- exact current and origin object identities;
+- verified segment intervals and S3 keys;
+- normalized control records and folded connection epochs; and
+- ingestion checkpoints for raw-control history.
 
-- immutable ingestion source identities and checkpoints;
-- selected-bundle source/run metadata;
-- versioned selected bundles keyed by `(run_id, bundle_id)`;
-- participants and selected event references;
-- sibling market references and selected targets/assets;
-- normalized relationship edges and subscription-set identities;
-- verified segment intervals;
-- normalized control facts and folded connection epochs.
+It has no catalogue, Targeter report, vendor target-record, venue-frame,
+envelope-JSON, or arbitrary source-JSON column.
 
-It deliberately has no catalogue-event table, catalogue-market table, target
-vendor-record table, source JSON column, report JSON column, control detail JSON
-column, or envelope JSON column. Exact bytes remain in immutable object storage;
-keys and hashes route back to them.
+The complete incoming active set is validated before mutation and replaced in
+one `BEGIN IMMEDIATE` transaction. SQLite uses WAL, `synchronous=FULL`, foreign
+keys, read-only API connections, and SQLite-native online backups. Any insert or
+constraint failure rolls back the new snapshot and leaves the prior one intact.
 
-SQLite on a small burstable VM with an attached persistent SSD is appropriate
-for this sparse model. The dense per-delivery or all-catalogue model is not.
-V1 uses WAL, `synchronous=FULL`, foreign keys, a busy timeout, one
-`BEGIN IMMEDIATE` transaction per source, read-only API connections, and
-SQLite-native online backups.
+SQLite is durable operational state and a query accelerator. Immutable S3
+objects remain evidence authority. A small burstable VM with an attached
+persistent SSD is appropriate because the store scales with active selected
+bundles and control records, not 13.6 million daily venue deliveries or every
+catalogue market. The volume and backups should still be durable because a full
+rebuild is the most expensive recovery path.
 
-The database is durable state, not disposable deployment scratch. Preserve the
-volume across instance replacement, publish periodic immutable backups, test
-restores with `PRAGMA integrity_check`, and retain the source archives for
-disaster recovery. A full rebuild is possible but is expected to be the most
-expensive operational path.
+## 8. Sync and read API
 
-## 8. Incremental ingestion
+`universe/run_sync.py` is a direct one-shot script with readable JSON config and
+no argument parser or internal scheduling loop. External scheduling owns
+cadence. Each run:
 
-`universe/run_sync.py` is a direct one-shot script with no argument parser and
-no internal interval loop. It reads `configs/event_universe.json`; an external
-scheduler owns cadence.
+1. verifies and atomically projects the latest Targeter v3 snapshot; then
+2. incrementally verifies new raw segment-universe receipts.
 
-It scans:
+A Targeter failure preserves the prior active snapshot. A malformed raw receipt
+is reported without concealing later raw receipts. The process exits non-zero if
+any source fails.
 
-1. `targeter-v2/runs/` for run manifests;
-2. `raw/` for segment-universe receipts.
-
-For each Targeter manifest it consumes the manifest-committed compact index or
-uses the lazy historical path in §4. It does not download catalogue artifacts
-or target-record artifacts. It inserts only selected projection rows.
-
-For each raw receipt it verifies and decodes the bounded control sidecar,
-inserts normalized controls, and refolds the complete affected lane. Receipt
-arrival order therefore does not change final epoch state.
-
-One malformed source is reported without concealing later failures. The process
-returns non-zero if any source failed. Source key plus identity makes retries
-idempotent.
-
-Historical raw archives are optional on day one. When desired, the capture-side
-receipt-mirror job publishes metadata-only mirrors, and
-`universe/run_backfill.py` on the universe host streams committed S3 raw objects
-through the existing `archive.common.verify.decode_archived_segment` decoder.
-It stages only the current segment's control derivative, never accumulates raw
-history locally, publishes immutable sidecars/receipts, and resumes through a
-SQLite checkpoint.
-
-## 9. Read API
-
-The server is read-only JSON:
+The read-only JSON API is:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /healthz` | schema version and normalized row counts |
-| `GET /v1/bundles?limit=N` | latest selected version of each bundle |
-| `GET /v1/bundles/<bundle_id>` | latest run, participants, event refs, siblings, selected targets/assets, relationships, source identities, and subscription evidence |
-| `GET /v1/bundles/<bundle_id>/segments?lane_id=` | verified segments overlapping that bundle's planned capture bounds |
-| `GET /v1/segments?start_ns=&end_ns=&lane_id=` | verified segments overlapping an explicit interval |
-| `GET /v1/epochs?start_ns=&end_ns=&lane_id=` | folded connection epochs overlapping an interval |
+| `GET /healthz` | schema version, active run, age/staleness, and row counts |
+| `GET /v1/bundles?limit=N` | active selected bundles only |
+| `GET /v1/bundles/<bundle_id>` | current and origin provenance plus copied event, sibling, target, relationship, and subscription context |
+| `GET /v1/bundles/<bundle_id>/segments?lane_id=` | verified S3 segments overlapping the bundle bounds |
+| `GET /v1/segments?start_ns=&end_ns=&lane_id=` | verified S3 segments overlapping explicit bounds |
+| `GET /v1/epochs?start_ns=&end_ns=&lane_id=` | folded connection epochs overlapping explicit bounds |
 
-Returning the latest bundle version does not erase older selected generations;
-they remain versioned by run in SQLite for provenance and ambiguity checks.
+There is no write, replay, manual-link, historical-occurrence, or frontend
+endpoint in V1.
 
-There is no write endpoint, replay endpoint, manual-link endpoint, or frontend
-in V1.
+## 9. Deployment
 
-## 10. Deployment
-
-Recommended initial topology:
+Event Universe is deployed separately from capture and ingester processes:
 
 ```text
 small burstable VM
@@ -314,60 +227,36 @@ small burstable VM
 └── scheduled one-shot backup/upload
 ```
 
-`docker/universe.Dockerfile` is separate from capture/ingester images.
-`compose.universe.yaml` mounts only readable config and the universe volume; it
-does not mount the capture spool. The default image command starts the server,
-so operators do not construct a long command:
+`docker/universe.Dockerfile` starts the API by default. The server therefore
+requires no hand-built command:
 
 ```bash
 docker compose -f compose.universe.yaml up -d event-universe
 ```
 
-Scheduled jobs invoke the direct scripts already named in Compose. API latency
-is not a correctness requirement. Scale persistent storage before VM compute;
-monitor disk, sync failures, backup age, and integrity checks. Keep one
-sync/backfill writer at a time, database and WAL on the same filesystem, and the
-API private or behind the existing authenticated TLS proxy.
+Compose mounts persistent Universe state and readable config, not the capture
+spool. Scheduled jobs directly invoke `universe/run_sync.py`,
+`universe/run_backfill.py`, and `universe/run_backup.py`.
 
-## 11. Failure behavior
+## 10. Acceptance criteria
 
-- Native compact artifact absent: verify the report and lazily publish the
-  derivative plus receipt.
-- Derivative artifact uploaded but receipt absent: prove exact logical bytes,
-  then publish the source-binding receipt; conflict fails closed.
-- Derivative receipt present: use its compact artifact without reparsing the
-  report.
-- Source key or identity changes: fail closed; never overwrite indexed rows.
-- SQLite process dies before commit: the source transaction rolls back.
-- Identical retry after commit: return `skipped`.
-- Raw control object exists without segment-universe receipt: ignore it.
-- Segment-universe receipt names missing or drifting bytes: fail closed.
-- Connection close is absent: epoch end remains unknown.
-- Same target digest occurs in several selected runs: report ambiguity.
-- Backup dies before atomic rename: no final backup is published.
+V1 is complete when tests prove:
 
-## 12. Acceptance criteria
+1. only the newest complete archived Targeter v3 run becomes active;
+2. report/index and stored/logical identities are verified;
+3. retained selections resolve one exact complete immutable origin;
+4. missing, conflicting, or incomplete origin evidence preserves prior state;
+5. newer active sets replace older sets atomically and empty sets clear them;
+6. older runs cannot replace newer active state;
+7. staleness is visible and deterministic;
+8. no legacy report/index, lazy derivative, nullable origin, occurrence history,
+   catalogue JSON, or venue-frame row is admitted;
+9. planned bounds select every and only overlapping verified S3 segment;
+10. connection epochs fold across segment and UTC-day boundaries;
+11. historical raw backfill uses the shared strict decoder without a capture
+    filesystem mount; and
+12. backups pass an independent SQLite integrity check.
 
-V1 is complete when automated checks prove:
-
-1. new Targeter runs emit a deterministic manifest-committed selected-bundle
-   index;
-2. rejected candidates and unselected catalogue records never become universe
-   bundle rows;
-3. the SQL schema is separate and stores no source/report/vendor/control JSON;
-4. native compact ingestion does not read report, catalogue, or target-record
-   artifacts;
-5. a legacy run lazily publishes one immutable source-bound derivative and
-   later syncs use it without reparsing the report;
-6. conflicting derivative bytes or metadata fail closed;
-7. repeated selected generations remain versioned and ambiguity is visible;
-8. planned bounds select every and only overlapping verified segment;
-9. one connection epoch folds across segment and UTC-day boundaries;
-10. raw archival and historical S3 backfill use the existing strict decoder and
-    never require a capture-spool mount on the universe host;
-11. SQLite-native backup passes an independent integrity check;
-12. Targeter, archive, object-store, deployment, and Universe regressions remain
-    green.
-
-No criterion requires a ReplayPlan, current replay-gate integration, manual
-relationships, per-data-record indexing, UI work, or a production backfill run.
+No criterion requires a durable Universe pointer, ReplayPlan, current replay
+gate integration, manual relationships, UI work, per-delivery indexing, or a
+production backfill run.

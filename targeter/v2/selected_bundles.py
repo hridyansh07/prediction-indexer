@@ -8,19 +8,15 @@ relationship edges.  It deliberately contains no venue record or report JSON.
 
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 from typing import Any, Mapping
 
-from targeter.v2.domain import isoformat, parse_timestamp
+from archive.storage.base import normalize_key
+from targeter.v2.models import isoformat, parse_timestamp
 
-SELECTED_BUNDLE_INDEX_VERSION = 1
+SELECTED_BUNDLE_INDEX_VERSION = 3
 SELECTED_BUNDLE_INDEX_STEM = "selected_bundle_index"
-
-# Reports written before selection_policy was added still identify the closed
-# strategy version that produced them.  Keep legacy interpretation explicit;
-# never apply today's mutable config to historical evidence.
-_LEGACY_POST_START_RETENTION_SECONDS = {1: 21_600, 2: 21_600, 3: 21_600}
-_LEGACY_PRE_EVENT_SECONDS = {1: 3_600, 2: 3_600, 3: 3_600}
 
 
 class SelectedBundleIndexError(ValueError):
@@ -29,6 +25,8 @@ class SelectedBundleIndexError(ValueError):
 
 def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Project selected bundles from one committed Targeter report."""
+    if report.get("report_version") != 3:
+        raise SelectedBundleIndexError("selected-bundle projection requires report version 3")
     run_id = _text(report, "run_id", "report")
     generated_at = _timestamp(report, "generated_at", "report")
     input_complete = report.get("input_complete")
@@ -47,6 +45,41 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise SelectedBundleIndexError("selection.bundle_ids contains duplicates")
     selected = set(selected_ids)
 
+    continuity = report.get("continuity")
+    if not isinstance(continuity, Mapping):
+        raise SelectedBundleIndexError("report.continuity must be an object")
+    retained_ids = set(
+        _text_list(
+            continuity.get("retained_bundle_ids"),
+            "continuity.retained_bundle_ids",
+        )
+    )
+    if not retained_ids <= selected:
+        raise SelectedBundleIndexError("continuity retains an unselected bundle")
+    raw_dispositions = continuity.get("dispositions")
+    if not isinstance(raw_dispositions, Mapping) or not all(
+        isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+        for key, value in raw_dispositions.items()
+    ):
+        raise SelectedBundleIndexError("continuity.dispositions must be a text map")
+    dispositions = dict(raw_dispositions)
+    raw_continuity_bundles = continuity.get("bundles")
+    if not isinstance(raw_continuity_bundles, list):
+        raise SelectedBundleIndexError("continuity.bundles must be an array")
+    continuity_by_bundle: dict[str, Mapping[str, Any]] = {}
+    for value in raw_continuity_bundles:
+        if not isinstance(value, Mapping):
+            raise SelectedBundleIndexError("continuity bundle must be an object")
+        bundle_id = _text(value, "bundle_id", "continuity bundle")
+        if bundle_id in continuity_by_bundle:
+            raise SelectedBundleIndexError(f"continuity repeats bundle {bundle_id}")
+        continuity_by_bundle[bundle_id] = value
+    if retained_ids - set(continuity_by_bundle):
+        raise SelectedBundleIndexError("retained bundle has no continuity evidence")
+
     candidates = report.get("candidates")
     if not isinstance(candidates, list):
         raise SelectedBundleIndexError("report.candidates must be an array")
@@ -58,10 +91,11 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         if bundle_id in by_bundle:
             raise SelectedBundleIndexError(f"report repeats candidate {bundle_id}")
         by_bundle[bundle_id] = candidate
-    missing = selected - set(by_bundle)
+    missing = selected - set(by_bundle) - retained_ids
     if missing:
         raise SelectedBundleIndexError(
-            f"selected bundles have no candidate: {', '.join(sorted(missing))}"
+            "selected bundles have neither a candidate nor retained origin: "
+            f"{', '.join(sorted(missing))}"
         )
 
     targets = selection.get("targets")
@@ -94,6 +128,17 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                     f"selection target {target_id} is grouped under {venue}"
                 )
             seen_targets.add(target_id)
+            activation = _timestamp(value, "activation_at", "selection target")
+            capture_start = _timestamp(value, "capture_start_at", "selection target")
+            score = value.get("continuity_score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+            ):
+                raise SelectedBundleIndexError(
+                    f"selection target {target_id} continuity_score is invalid"
+                )
             targets_by_bundle[bundle_id].append(
                 {
                     "venue": venue,
@@ -107,11 +152,28 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                             "selection target subscription_ids",
                         )
                     ),
+                    "activation_at": isoformat(activation),
+                    "capture_start_at": isoformat(capture_start),
+                    "source_ref": _text(value, "source_ref", "selection target"),
                 }
             )
 
     rows: list[dict[str, Any]] = []
     for bundle_id in sorted(selected):
+        if bundle_id in retained_ids:
+            rows.append(
+                _retained_row(
+                    run_id=run_id,
+                    generated_at=generated_at,
+                    input_complete=input_complete,
+                    strategy_version=strategy_version,
+                    bundle_id=bundle_id,
+                    evidence=continuity_by_bundle[bundle_id],
+                    disposition=dispositions.get(bundle_id),
+                    targets=targets_by_bundle[bundle_id],
+                )
+            )
+            continue
         candidate = by_bundle[bundle_id]
         activation = _timestamp(candidate, "activation_at", f"candidate {bundle_id}")
         capture_start = _timestamp(
@@ -130,6 +192,14 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise SelectedBundleIndexError(
                 f"selected bundle {bundle_id} has no selected targets"
             )
+        for target in bundle_targets:
+            if (
+                target["activation_at"] != isoformat(activation)
+                or target["capture_start_at"] != isoformat(capture_start)
+            ):
+                raise SelectedBundleIndexError(
+                    f"selected bundle {bundle_id} target timing disagrees with its candidate"
+                )
         selected_market_ids = {item["target_id"] for item in bundle_targets}
         market_ids = _text_list(
             candidate.get("market_ids"), f"candidate {bundle_id} market_ids"
@@ -147,15 +217,24 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         participant_keys = _pair(
             candidate.get("participant_keys"), "participant_keys", bundle_id
         )
+        disposition = dispositions.get(bundle_id)
+        if disposition not in {None, "held_current_candidate"}:
+            raise SelectedBundleIndexError(
+                f"selected candidate {bundle_id} has invalid continuity disposition"
+            )
         rows.append(
             {
                 "selected_bundle_index_version": SELECTED_BUNDLE_INDEX_VERSION,
+                "occurrence_kind": "complete",
                 "run_id": run_id,
                 "generated_at": isoformat(generated_at),
                 "input_complete": input_complete,
                 "strategy_version": strategy_version,
                 "post_start_retention_seconds": retention_seconds,
                 "bundle_id": bundle_id,
+                "origin_run_id": run_id,
+                "continuity_selected": disposition is not None,
+                "continuity_disposition": disposition,
                 "sport": _text(candidate, "sport", f"candidate {bundle_id}"),
                 "game": _optional_text(candidate.get("game"), "game", bundle_id),
                 "topology": _optional_text(
@@ -184,20 +263,117 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _retained_row(
+    *,
+    run_id: str,
+    generated_at: Any,
+    input_complete: bool,
+    strategy_version: int,
+    bundle_id: str,
+    evidence: Mapping[str, Any],
+    disposition: str | None,
+    targets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if disposition != "retained":
+        raise SelectedBundleIndexError(
+            f"retained bundle {bundle_id} has invalid continuity disposition"
+        )
+    if not targets:
+        raise SelectedBundleIndexError(f"retained bundle {bundle_id} has no targets")
+    activation = _timestamp(evidence, "activation_at", f"continuity bundle {bundle_id}")
+    raw_targets = evidence.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise SelectedBundleIndexError(
+            f"continuity bundle {bundle_id} targets must be a non-empty array"
+        )
+    continuity_targets: list[dict[str, Any]] = []
+    for target in raw_targets:
+        if not isinstance(target, Mapping):
+            raise SelectedBundleIndexError(
+                f"continuity bundle {bundle_id} target must be an object"
+            )
+        target_id = _text(target, "target_id", "continuity target")
+        continuity_targets.append(
+            {
+                "venue": _text(target, "venue", "continuity target"),
+                "target_id": target_id,
+                "canonical_class": _text(
+                    target, "canonical_class", "continuity target"
+                ),
+                "subscription_ids": sorted(
+                    _text_list(
+                        target.get("subscription_ids"),
+                        "continuity target subscription_ids",
+                    )
+                ),
+                "activation_at": isoformat(
+                    _timestamp(target, "activation_at", "continuity target")
+                ),
+                "capture_start_at": isoformat(
+                    _timestamp(target, "capture_start_at", "continuity target")
+                ),
+                "source_ref": _text(target, "source_ref", "continuity target"),
+            }
+        )
+    normalized = sorted(
+        continuity_targets, key=lambda item: (item["venue"], item["target_id"])
+    )
+    if targets != normalized:
+        raise SelectedBundleIndexError(
+            f"retained bundle {bundle_id} targets disagree with continuity evidence"
+        )
+    if any(target["activation_at"] != isoformat(activation) for target in targets):
+        raise SelectedBundleIndexError(
+            f"retained bundle {bundle_id} activation disagrees across targets"
+        )
+    capture_starts = {target["capture_start_at"] for target in targets}
+    if len(capture_starts) != 1:
+        raise SelectedBundleIndexError(
+            f"retained bundle {bundle_id} capture start disagrees across targets"
+        )
+    origin_key = _text(
+        evidence,
+        "origin_archive_manifest_key",
+        f"continuity bundle {bundle_id}",
+    )
+    try:
+        normalize_key(origin_key)
+    except ValueError as error:
+        raise SelectedBundleIndexError(
+            f"continuity bundle {bundle_id} origin manifest key is invalid"
+        ) from error
+    return {
+        "selected_bundle_index_version": SELECTED_BUNDLE_INDEX_VERSION,
+        "occurrence_kind": "retained",
+        "run_id": run_id,
+        "generated_at": isoformat(generated_at),
+        "input_complete": input_complete,
+        "strategy_version": strategy_version,
+        "bundle_id": bundle_id,
+        "origin_run_id": _text(
+            evidence, "origin_run_id", f"continuity bundle {bundle_id}"
+        ),
+        "origin_report_sha256": _sha256(
+            evidence.get("origin_report_sha256"),
+            f"continuity bundle {bundle_id} origin report",
+        ),
+        "origin_archive_manifest_key": origin_key,
+        "origin_archive_manifest_sha256": _sha256(
+            evidence.get("origin_archive_manifest_sha256"),
+            f"continuity bundle {bundle_id} origin manifest",
+        ),
+        "continuity_selected": True,
+        "continuity_disposition": disposition,
+        "activation_at": isoformat(activation),
+        "capture_start_at": next(iter(capture_starts)),
+        "targets": targets,
+    }
+
+
 def _selection_policy(
     report: Mapping[str, Any], strategy_version: int
 ) -> tuple[int, int]:
     policy = report.get("selection_policy")
-    if policy is None:
-        try:
-            return (
-                _LEGACY_PRE_EVENT_SECONDS[strategy_version],
-                _LEGACY_POST_START_RETENTION_SECONDS[strategy_version],
-            )
-        except KeyError as error:
-            raise SelectedBundleIndexError(
-                f"report strategy {strategy_version} has no persisted selection policy"
-            ) from error
     if not isinstance(policy, Mapping) or set(policy) != {
         "pre_event_seconds",
         "post_start_retention_seconds",
@@ -309,6 +485,17 @@ def _positive_integer(document: Mapping[str, Any], field: str, label: str) -> in
     value = _integer(document, field, label)
     if value == 0:
         raise SelectedBundleIndexError(f"{label}.{field} must be positive")
+    return value
+
+
+def _sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SelectedBundleIndexError(f"{label} sha256 is invalid")
     return value
 
 

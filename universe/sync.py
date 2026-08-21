@@ -6,6 +6,7 @@ import hashlib
 import json
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Mapping
 
@@ -19,13 +20,9 @@ from archive.storage.base import (
 )
 from encoder import LogicalIdentity, StoredIdentity, decode_stream
 from targeter.v2.selected_bundles import (
+    SELECTED_BUNDLE_INDEX_VERSION,
     SELECTED_BUNDLE_INDEX_STEM,
     selected_bundle_rows,
-)
-from universe.selected_bundle_derivative import (
-    SelectedBundleArtifact,
-    derivative_keys,
-    ensure_selected_bundle_derivative,
 )
 from universe.store import UniverseStore
 
@@ -76,6 +73,9 @@ class _RunManifest:
     objects: tuple[_RunObject, ...]
 
 
+_VerifiedRun = tuple[_RunManifest, _RunObject, _RunObject, list[dict[str, Any]]]
+
+
 class UniverseSync:
     def __init__(
         self,
@@ -99,106 +99,205 @@ class UniverseSync:
 
     def sync_targeter(self, result: SyncResult | None = None) -> SyncResult:
         output = result or SyncResult()
-        keys = sorted(
+        keys = [
             key
             for key in self.objects.list_keys("targeter-v2/runs/")
             if key.endswith("/run_manifest.json")
-        )
-        for key in keys:
-            try:
-                manifest = self._read_run_manifest(key)
-                item, source_key, source_sha256, source_kind = (
-                    self._selected_bundle_artifact(manifest)
+        ]
+        if not keys:
+            return output
+        try:
+            key = max(keys, key=_manifest_run_id)
+            verified = self._verified_run(key)
+            manifest, report_item, index_item, rows = verified
+            run_cache = {manifest.key: verified}
+            resolved = [
+                self._resolve_active_row(
+                    manifest, report_item, index_item, row, run_cache
                 )
-                if self.database.source_is_complete(source_key, source_sha256):
-                    output.targeter_skipped += 1
-                    continue
-                status = self.database.ingest_selected_bundle_index(
-                    source_key=source_key,
-                    source_sha256=source_sha256,
-                    source_kind=source_kind,
-                    manifest_key=manifest.key,
-                    manifest_sha256=manifest.stored.sha256,
-                    index_key=item.key,
-                    index_sha256=item.stored.sha256,
-                    index_byte_length=item.stored.byte_length,
-                    run_id=manifest.run_id,
-                    generated_at=manifest.generated_at,
-                    input_complete=manifest.input_complete,
-                    rows=self._read_ndjson(item),
-                )
-                if status == "ingested":
-                    output.targeter_ingested += 1
-                else:
-                    output.targeter_skipped += 1
-            except Exception as error:  # noqa: BLE001 - one source must not hide later sources
-                output.failures.append(f"{key}: {type(error).__name__}: {error}")
+                for row in rows
+            ]
+            status = self.database.replace_active_snapshot(
+                manifest_key=manifest.key,
+                manifest_sha256=manifest.stored.sha256,
+                report_key=report_item.key,
+                report_sha256=report_item.stored.sha256,
+                report_byte_length=report_item.stored.byte_length,
+                index_key=index_item.key,
+                index_sha256=index_item.stored.sha256,
+                index_byte_length=index_item.stored.byte_length,
+                run_id=manifest.run_id,
+                generated_at=manifest.generated_at,
+                input_complete=manifest.input_complete,
+                rows=resolved,
+            )
+            if status == "ingested":
+                output.targeter_ingested += 1
+            else:
+                output.targeter_skipped += 1
+        except Exception as error:  # noqa: BLE001 - report source failure precisely
+            label = locals().get("key", "targeter-v2/runs/")
+            output.failures.append(f"{label}: {type(error).__name__}: {error}")
         return output
 
-    def _selected_bundle_artifact(
-        self, manifest: _RunManifest
-    ) -> tuple[_RunObject, str, str, str]:
-        native = [
-            item
-            for item in manifest.objects
-            if item.file
-            in {
-                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson",
-                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson.zst",
-            }
-        ]
-        if len(native) > 1:
-            raise UniverseSyncError(
-                f"run {manifest.run_id} has multiple selected-bundle indexes"
-            )
-        if native:
-            item = native[0]
-            _verify_object_metadata(self.objects, item)
-            return item, manifest.key, manifest.stored.sha256, "manifest_index"
-
-        reports = [
+    def _verified_run(
+        self,
+        key: str,
+        *,
+        expected_manifest_sha256: str | None = None,
+        expected_report_sha256: str | None = None,
+    ) -> _VerifiedRun:
+        manifest = self._read_run_manifest(
+            key, expected_sha256=expected_manifest_sha256
+        )
+        report_items = [
             item
             for item in manifest.objects
             if item.file in {"selection_report.json", "selection_report.json.zst"}
         ]
-        if len(reports) != 1:
+        index_items = [
+            item
+            for item in manifest.objects
+            if item.file in {
+                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson",
+                f"{SELECTED_BUNDLE_INDEX_STEM}.ndjson.zst",
+            }
+        ]
+        if len(report_items) != 1 or len(index_items) != 1:
             raise UniverseSyncError(
-                f"run {manifest.run_id} must name one selection report"
+                f"run {manifest.run_id} must commit one report and one selected-bundle index"
             )
-        report_item = reports[0]
-        _, receipt_key = derivative_keys(manifest.key)
-        receipt_exists = self.objects.head(receipt_key) is not None
-        if receipt_exists:
-            report_logical = None
-            rows: list[dict[str, Any]] = []
-        else:
-            _verify_object_metadata(self.objects, report_item)
-            report = self._read_json(report_item)
-            if report.get("run_id") != manifest.run_id:
+        report_item = report_items[0]
+        index_item = index_items[0]
+        if (
+            expected_report_sha256 is not None
+            and report_item.stored.sha256 != expected_report_sha256
+        ):
+            raise UniverseSyncError(
+                f"run {manifest.run_id} report identity disagrees with continuity origin"
+            )
+        _verify_object_metadata(self.objects, report_item)
+        _verify_object_metadata(self.objects, index_item)
+        report = self._read_json(report_item)
+        if (
+            report.get("report_version") != 3
+            or report.get("run_id") != manifest.run_id
+            or report.get("generated_at") != manifest.generated_at
+            or report.get("input_complete") is not True
+            or manifest.input_complete is not True
+        ):
+            raise UniverseSyncError(
+                f"run {manifest.run_id} is not a complete Targeter v3 report"
+            )
+        rows = self._read_ndjson(index_item)
+        expected_rows = selected_bundle_rows(report)
+        if rows != expected_rows:
+            raise UniverseSyncError(
+                f"run {manifest.run_id} selected-bundle index disagrees with its report"
+            )
+        if any(
+            row.get("selected_bundle_index_version")
+            != SELECTED_BUNDLE_INDEX_VERSION
+            for row in rows
+        ):
+            raise UniverseSyncError(
+                f"run {manifest.run_id} selected-bundle index is not version 3"
+            )
+        return manifest, report_item, index_item, rows
+
+    def _resolve_active_row(
+        self,
+        manifest: _RunManifest,
+        report_item: _RunObject,
+        index_item: _RunObject,
+        current: Mapping[str, Any],
+        run_cache: dict[str, _VerifiedRun],
+    ) -> dict[str, Any]:
+        occurrence = current.get("occurrence_kind")
+        if occurrence == "complete":
+            if current.get("origin_run_id") != manifest.run_id:
                 raise UniverseSyncError(
-                    f"run manifest {manifest.key} and selection report disagree on run_id"
+                    f"complete bundle {current.get('bundle_id')} has another origin run"
                 )
-            report_logical = self._logical_for(report_item)
-            rows = selected_bundle_rows(report)
-        derivative = ensure_selected_bundle_derivative(
-            self.objects,
-            manifest_key=manifest.key,
-            manifest_stored=manifest.stored,
-            report_key=report_item.key,
-            report_stored=report_item.stored,
-            report_logical=report_logical,
-            rows=rows,
-            temporary_directory=self.temporary_directory,
-        )
-        receipt_metadata = self.objects.head(receipt_key)
-        if receipt_metadata is None:
-            raise VerificationFailure(f"selected-bundle receipt vanished: {receipt_key}")
-        return (
-            _run_object_from_derivative(derivative),
-            receipt_key,
-            receipt_metadata.sha256,
-            "derived_index",
-        )
+            origin_manifest = manifest
+            origin_report_item = report_item
+            origin_index_item = index_item
+            origin = dict(current)
+        elif occurrence == "retained":
+            origin_key = _required_text(current, "origin_archive_manifest_key", "bundle")
+            expected_manifest = _required_text(
+                current, "origin_archive_manifest_sha256", "bundle"
+            )
+            expected_report = _required_text(
+                current, "origin_report_sha256", "bundle"
+            )
+            if origin_key not in run_cache:
+                run_cache[origin_key] = self._verified_run(
+                    origin_key,
+                    expected_manifest_sha256=expected_manifest,
+                    expected_report_sha256=expected_report,
+                )
+            origin_manifest, origin_report_item, origin_index_item, origin_rows = (
+                run_cache[origin_key]
+            )
+            if origin_manifest.stored.sha256 != expected_manifest:
+                raise UniverseSyncError(
+                    f"run manifest {origin_key} identity disagrees with continuity origin"
+                )
+            if origin_report_item.stored.sha256 != expected_report:
+                raise UniverseSyncError(
+                    f"run {origin_manifest.run_id} report identity disagrees "
+                    "with continuity origin"
+                )
+            if origin_manifest.run_id != current.get("origin_run_id"):
+                raise UniverseSyncError(
+                    f"retained bundle {current.get('bundle_id')} origin run_id disagrees"
+                )
+            if origin_manifest.run_id >= manifest.run_id:
+                raise UniverseSyncError(
+                    f"retained bundle {current.get('bundle_id')} origin is not older"
+                )
+            matches = [
+                row
+                for row in origin_rows
+                if row.get("bundle_id") == current.get("bundle_id")
+            ]
+            if len(matches) != 1 or matches[0].get("occurrence_kind") != "complete":
+                raise UniverseSyncError(
+                    f"retained bundle {current.get('bundle_id')} has no complete origin row"
+                )
+            origin = dict(matches[0])
+            if (
+                current.get("activation_at") != origin.get("activation_at")
+                or current.get("capture_start_at") != origin.get("capture_start_at")
+                or current.get("targets") != origin.get("targets")
+            ):
+                raise UniverseSyncError(
+                    f"retained bundle {current.get('bundle_id')} disagrees with its origin"
+                )
+        else:
+            raise UniverseSyncError("selected-bundle occurrence kind is invalid")
+
+        return {
+            **origin,
+            "occurrence_kind": occurrence,
+            "run_id": current["run_id"],
+            "generated_at": current["generated_at"],
+            "input_complete": current["input_complete"],
+            "strategy_version": current["strategy_version"],
+            "continuity_selected": current["continuity_selected"],
+            "continuity_disposition": current["continuity_disposition"],
+            "origin_run_id": origin_manifest.run_id,
+            "origin_generated_at": origin_manifest.generated_at,
+            "origin_manifest_key": origin_manifest.key,
+            "origin_manifest_sha256": origin_manifest.stored.sha256,
+            "origin_report_key": origin_report_item.key,
+            "origin_report_sha256": origin_report_item.stored.sha256,
+            "origin_report_byte_length": origin_report_item.stored.byte_length,
+            "origin_index_key": origin_index_item.key,
+            "origin_index_sha256": origin_index_item.stored.sha256,
+            "origin_index_byte_length": origin_index_item.stored.byte_length,
+        }
 
     def sync_controls(self, result: SyncResult | None = None) -> SyncResult:
         output = result or SyncResult()
@@ -230,10 +329,16 @@ class UniverseSync:
                 output.failures.append(f"{key}: {type(error).__name__}: {error}")
         return output
 
-    def _read_run_manifest(self, key: str) -> _RunManifest:
+    def _read_run_manifest(
+        self, key: str, *, expected_sha256: str | None = None
+    ) -> _RunManifest:
         metadata = self.objects.head(key)
         if metadata is None:
             raise UniverseSyncError(f"run manifest is absent: {key}")
+        if expected_sha256 is not None and metadata.sha256 != expected_sha256:
+            raise UniverseSyncError(
+                f"run manifest {key} identity disagrees with continuity origin"
+            )
         if (
             metadata.byte_length > MAX_MANIFEST_BYTES
             or metadata.content_type != JSON_CONTENT_TYPE
@@ -255,13 +360,10 @@ class UniverseSync:
         }:
             raise UniverseSyncError(f"run manifest {key} has invalid fields")
         version = document["targeter_run_manifest_version"]
-        if version not in {1, 2}:
-            raise UniverseSyncError(f"run manifest {key} has unsupported version")
+        if version != 2:
+            raise UniverseSyncError(f"run manifest {key} is not version 2")
         run_id = _required_text(document, "run_id", "run manifest")
-        expected_run_component = f"run={run_id}"
-        if expected_run_component not in key.split("/") or not key.endswith(
-            f"/{expected_run_component}/run_manifest.json"
-        ):
+        if _manifest_run_id(key) != run_id:
             raise UniverseSyncError(f"run manifest key does not match run_id {run_id}")
         generated_at = _required_text(document, "generated_at", "run manifest")
         input_complete = document["input_complete"]
@@ -271,7 +373,7 @@ class UniverseSync:
         if not isinstance(files, list) or not files:
             raise UniverseSyncError("run manifest files must be a non-empty array")
         prefix = key.rsplit("/", 1)[0]
-        objects = tuple(self._parse_run_object(prefix, value, version) for value in files)
+        objects = tuple(self._parse_run_object(prefix, value) for value in files)
         names = [item.file for item in objects]
         if len(names) != len(set(names)):
             raise UniverseSyncError(f"run manifest {key} repeats an object")
@@ -283,9 +385,9 @@ class UniverseSync:
             "selection_report.json",
             "selection_report.json.zst",
         }
-        if len(indexes) > 1 or (not indexes and len(reports) != 1):
+        if len(indexes) != 1 or len(reports) != 1:
             raise UniverseSyncError(
-                f"run manifest {key} must name one selected-bundle index or selection report"
+                f"run manifest {key} must name one selected-bundle index and one report"
             )
         return _RunManifest(
             key=key,
@@ -296,22 +398,13 @@ class UniverseSync:
             objects=objects,
         )
 
-    def _parse_run_object(
-        self, prefix: str, value: Any, version: int
-    ) -> _RunObject:
+    def _parse_run_object(self, prefix: str, value: Any) -> _RunObject:
         if not isinstance(value, dict):
             raise UniverseSyncError("run manifest object is not an object")
         name = _required_text(value, "file", "run manifest object")
         if Path(name).name != name:
             raise UniverseSyncError(f"run manifest object is not a basename: {name!r}")
         key = f"{prefix}/{name}"
-        if version == 1:
-            if set(value) != {"file", "byte_length", "sha256", "content_type"}:
-                raise UniverseSyncError(f"legacy run object {name} has invalid fields")
-            content_type = _required_text(value, "content_type", f"run object {name}")
-            stored = _stored(value, f"run object {name}")
-            return _RunObject(name, key, stored, None, content_type, None)
-
         compressed_or_ndjson = name.endswith((".ndjson", ".ndjson.zst", ".json.zst"))
         expected = (
             {"file", "content_type", "content_encoding", "decoded", "stored", "compression"}
@@ -387,7 +480,9 @@ class UniverseSync:
                 try:
                     document = json.load(decoded)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise UniverseSyncError(f"invalid selection report {item.key}: {error}") from error
+                    raise UniverseSyncError(
+                        f"invalid selection report {item.key}: {error}"
+                    ) from error
         else:
             metadata = _verify_object_metadata(self.objects, item)
             document = _read_json_bytes(
@@ -399,17 +494,6 @@ class UniverseSync:
         if not isinstance(document, dict):
             raise UniverseSyncError(f"selection report {item.key} is not an object")
         return document
-
-    def _logical_for(self, item: _RunObject) -> LogicalIdentity:
-        if item.logical is not None:
-            return item.logical
-        if item.content_encoding is not None:
-            raise UniverseSyncError(f"object {item.key} has no decoded identity")
-        with tempfile.TemporaryFile(
-            mode="w+b", dir=self.temporary_directory
-        ) as staged:
-            _copy_verified(self.objects, item.key, item.stored, staged)
-            return _logical_identity(staged)
 
     def _decoded(self, item: _RunObject):
         if item.logical is None:
@@ -469,15 +553,26 @@ class _ClosingTemporaryFile:
         self.handle.close()
 
 
-def _run_object_from_derivative(artifact: SelectedBundleArtifact) -> _RunObject:
-    return _RunObject(
-        file=artifact.file,
-        key=artifact.key,
-        stored=artifact.stored,
-        logical=artifact.logical,
-        content_type=artifact.content_type,
-        content_encoding=artifact.content_encoding,
-    )
+def _manifest_run_id(key: str) -> str:
+    parts = key.split("/")
+    if (
+        len(parts) != 5
+        or parts[:2] != ["targeter-v2", "runs"]
+        or not parts[2].startswith("date=")
+        or not parts[3].startswith("run=")
+        or parts[4] != "run_manifest.json"
+    ):
+        raise UniverseSyncError(f"invalid Targeter run manifest key: {key}")
+    run_id = parts[3].removeprefix("run=")
+    try:
+        instant = datetime.strptime(run_id, "%Y%m%dT%H%M%S.%fZ")
+    except ValueError as error:
+        raise UniverseSyncError(f"invalid Targeter run id in manifest key: {key}") from error
+    if instant.strftime("%Y%m%dT%H%M%S.%fZ") != run_id:
+        raise UniverseSyncError(f"non-canonical Targeter run id in manifest key: {key}")
+    if instant.date().isoformat() != parts[2].removeprefix("date="):
+        raise UniverseSyncError(f"Targeter run manifest date disagrees with run id: {key}")
+    return run_id
 
 
 def _iter_ndjson(source: BinaryIO, label: str) -> Iterator[dict[str, Any]]:

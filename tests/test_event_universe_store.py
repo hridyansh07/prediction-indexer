@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,13 @@ from archive.archiver.universe import UniverseArtifactError
 from archive.common.verify import decode_archived_segment
 from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.base import JSON_CONTENT_TYPE, NDJSON_CONTENT_TYPE
-from encoder import logical_identity_of, stored_identity_of
+from encoder import (
+    DEFAULT_ZSTD_LEVEL,
+    encode_stream,
+    encoder_version,
+    logical_identity_of,
+    stored_identity_of,
+)
 from splices.common.segment import Record, SegmentWriter
 from targeter.targets import Target, target_digest
 from targeter.v2.selected_bundles import selected_bundle_rows
@@ -33,6 +40,7 @@ DAY_ONE = 1_767_222_000_000_000_000  # 2025-12-31T23:00:00Z
 
 def _selection_report(run_id: str, generated_at: str) -> dict:
     return {
+        "report_version": 3,
         "run_id": run_id,
         "generated_at": generated_at,
         "input_complete": True,
@@ -85,6 +93,10 @@ def _selection_report(run_id: str, generated_at: str) -> dict:
                         "bundle_id": "bundle-1",
                         "canonical_class": "esports.series_moneyline",
                         "subscription_ids": ["K-SERIES"],
+                        "activation_at": "2026-01-01T01:00:00Z",
+                        "capture_start_at": "2026-01-01T00:00:00Z",
+                        "source_ref": "kalshi:event-a",
+                        "continuity_score": 10.0,
                     }
                 ],
                 "polymarket": [
@@ -93,30 +105,57 @@ def _selection_report(run_id: str, generated_at: str) -> dict:
                         "bundle_id": "bundle-1",
                         "canonical_class": "esports.series_moneyline",
                         "subscription_ids": ["pm-yes", "pm-no"],
+                        "activation_at": "2026-01-01T01:00:00Z",
+                        "capture_start_at": "2026-01-01T00:00:00Z",
+                        "source_ref": "polymarket:event-b",
+                        "continuity_score": 10.0,
                     }
                 ]
             },
+        },
+        "continuity": {
+            "bundles": [],
+            "retained_bundle_ids": [],
+            "dispositions": {},
         },
     }
 
 
 def _ingest_targeter(database: UniverseStore, run_id: str, generated_at: str) -> str:
     rows = selected_bundle_rows(_selection_report(run_id, generated_at))
-    source_sha256 = ("a" if run_id.endswith("1Z") else "b") * 64
+    identity = ("a" if run_id.endswith("1Z") else "b") * 64
+    manifest_key = f"targeter-v2/runs/run={run_id}/run_manifest.json"
     index_key = f"targeter-v2/runs/run={run_id}/selected_bundle_index.ndjson.zst"
-    return database.ingest_selected_bundle_index(
-        source_key=f"targeter-v2/runs/run={run_id}/run_manifest.json",
-        source_sha256=source_sha256,
-        source_kind="manifest_index",
-        manifest_key=f"targeter-v2/runs/run={run_id}/run_manifest.json",
-        manifest_sha256=source_sha256,
+    resolved = [
+        {
+            **row,
+            "origin_generated_at": generated_at,
+            "origin_manifest_key": manifest_key,
+            "origin_manifest_sha256": identity,
+            "origin_report_key": manifest_key.replace(
+                "run_manifest.json", "selection_report.json"
+            ),
+            "origin_report_sha256": "c" * 64,
+            "origin_report_byte_length": 100,
+            "origin_index_key": index_key,
+            "origin_index_sha256": "d" * 64,
+            "origin_index_byte_length": 50,
+        }
+        for row in rows
+    ]
+    return database.replace_active_snapshot(
+        manifest_key=manifest_key,
+        manifest_sha256=identity,
+        report_key=manifest_key.replace("run_manifest.json", "selection_report.json"),
+        report_sha256="c" * 64,
+        report_byte_length=100,
         index_key=index_key,
         index_sha256="d" * 64,
         index_byte_length=50,
         run_id=run_id,
         generated_at=generated_at,
         input_complete=True,
-        rows=rows,
+        rows=resolved,
     )
 
 
@@ -175,75 +214,188 @@ def _write_segment(
     return writer.data_path
 
 
-def _put(store: LocalObjectStore, key: str, payload: bytes, content_type: str):
+def _put(
+    store: LocalObjectStore,
+    key: str,
+    payload: bytes,
+    content_type: str,
+    *,
+    content_encoding: str | None = None,
+):
     identity = stored_identity_of(io.BytesIO(payload))
     store.put_immutable(
         key,
         io.BytesIO(payload),
         identity,
         content_type=content_type,
+        content_encoding=content_encoding,
     )
     return identity
 
 
+def _compressed(payload: bytes) -> tuple[bytes, dict, dict]:
+    destination = io.BytesIO()
+    encoded = encode_stream(io.BytesIO(payload), destination)
+    return destination.getvalue(), encoded.logical.as_record(), encoded.stored.as_record()
+
+
+def _compression_record() -> dict:
+    return {
+        "algorithm": "zstd",
+        "level": DEFAULT_ZSTD_LEVEL,
+        "frame_checksum": True,
+        "dictionary": None,
+        "frame_count": 1,
+        "encoder": encoder_version(),
+    }
+
+
 def _publish_targeter_run(
-    store: LocalObjectStore, *, include_selected_index: bool = False
-) -> str:
-    run_id = "20260101T000000.000001Z"
-    prefix = f"targeter-v2/runs/date=2026-01-01/run={run_id}"
-    report = _selection_report(run_id, "2026-01-01T00:00:00Z")
+    store: LocalObjectStore,
+    report: dict,
+    *,
+    index_rows: list[dict] | None = None,
+    manifest_version: int = 2,
+    compressed: bool = False,
+) -> dict[str, str | int]:
+    run_id = report["run_id"]
+    date = report["generated_at"].split("T", 1)[0]
+    prefix = f"targeter-v2/runs/date={date}/run={run_id}"
     report_payload = (
         json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode()
+    rows = selected_bundle_rows(report) if index_rows is None else index_rows
+    index_payload = b"".join(
+        (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode()
+        for row in rows
+    )
+    if compressed:
+        report_name = "selection_report.json.zst"
+        report_stored, report_logical, report_stored_record = _compressed(
+            report_payload
+        )
+        index_name = "selected_bundle_index.ndjson.zst"
+        index_stored, index_logical, index_stored_record = _compressed(index_payload)
+        encoding = "zstd"
+        compression = _compression_record()
+    else:
+        report_name = "selection_report.json"
+        report_stored = report_payload
+        report_logical = None
+        report_stored_record = None
+        index_name = "selected_bundle_index.ndjson"
+        index_stored = index_payload
+        index_logical = logical_identity_of(io.BytesIO(index_payload)).as_record()
+        index_stored_record = stored_identity_of(io.BytesIO(index_payload)).as_record()
+        encoding = None
+        compression = None
     report_identity = _put(
         store,
-        f"{prefix}/selection_report.json",
-        report_payload,
+        f"{prefix}/{report_name}",
+        report_stored,
         JSON_CONTENT_TYPE,
+        content_encoding=encoding,
     )
-    files = [
+    index_identity = _put(
+        store,
+        f"{prefix}/{index_name}",
+        index_stored,
+        NDJSON_CONTENT_TYPE,
+        content_encoding=encoding,
+    )
+    report_record = (
         {
-            "file": "selection_report.json",
+            "file": report_name,
+            "content_type": JSON_CONTENT_TYPE,
+            "content_encoding": encoding,
+            "decoded": report_logical,
+            "stored": report_stored_record,
+            "compression": compression,
+        }
+        if compressed
+        else {
+            "file": report_name,
             "byte_length": report_identity.byte_length,
             "sha256": report_identity.sha256,
             "content_type": JSON_CONTENT_TYPE,
             "content_encoding": None,
         }
+    )
+    files = [
+        report_record,
+        {
+            "file": index_name,
+            "content_type": NDJSON_CONTENT_TYPE,
+            "content_encoding": encoding,
+            "decoded": index_logical,
+            "stored": index_stored_record,
+            "compression": compression,
+        },
     ]
-    if include_selected_index:
-        index_name = "selected_bundle_index.ndjson"
-        index_payload = b"".join(
-            (
-                json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n"
-            ).encode()
-            for row in selected_bundle_rows(report)
-        )
-        index_identity = _put(
-            store,
-            f"{prefix}/{index_name}",
-            index_payload,
-            NDJSON_CONTENT_TYPE,
-        )
-        files.append(
-            {
-                "file": index_name,
-                "content_type": NDJSON_CONTENT_TYPE,
-                "content_encoding": None,
-                "decoded": logical_identity_of(io.BytesIO(index_payload)).as_record(),
-                "stored": index_identity.as_record(),
-                "compression": None,
-            }
-        )
     manifest = {
-        "targeter_run_manifest_version": 2,
+        "targeter_run_manifest_version": manifest_version,
         "run_id": run_id,
-        "generated_at": "2026-01-01T00:00:00Z",
+        "generated_at": report["generated_at"],
         "input_complete": True,
         "files": files,
     }
     payload = (json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n").encode()
-    _put(store, f"{prefix}/run_manifest.json", payload, JSON_CONTENT_TYPE)
-    return run_id
+    manifest_key = f"{prefix}/run_manifest.json"
+    manifest_identity = _put(store, manifest_key, payload, JSON_CONTENT_TYPE)
+    return {
+        "run_id": run_id,
+        "manifest_key": manifest_key,
+        "manifest_sha256": manifest_identity.sha256,
+        "report_key": f"{prefix}/{report_name}",
+        "report_sha256": report_identity.sha256,
+        "index_key": f"{prefix}/{index_name}",
+        "index_sha256": index_identity.sha256,
+    }
+
+
+def _retained_report(
+    run_id: str, generated_at: str, origin: dict[str, str | int]
+) -> dict:
+    report = _selection_report(run_id, generated_at)
+    report["candidates"] = []
+    targets = [
+        {
+            **target,
+            "venue": venue,
+            "venue_market_id": target["target_id"].split(":", 1)[1],
+            "terminal_probe": {"state": "unknown", "reason": "probe_failed"},
+        }
+        for venue, values in report["selection"]["targets"].items()
+        for target in values
+    ]
+    report["continuity"] = {
+        "bundles": [
+            {
+                "base_run_id": origin["run_id"],
+                "bundle_id": "bundle-1",
+                "activation_at": "2026-01-01T01:00:00Z",
+                "score": 10.0,
+                "targets": targets,
+                "origin_run_id": origin["run_id"],
+                "origin_report_sha256": origin["report_sha256"],
+                "origin_archive_manifest_key": origin["manifest_key"],
+                "origin_archive_manifest_sha256": origin["manifest_sha256"],
+            }
+        ],
+        "retained_bundle_ids": ["bundle-1"],
+        "dispositions": {"bundle-1": "retained"},
+    }
+    return report
+
+
+def _empty_report(run_id: str, generated_at: str) -> dict:
+    report = _selection_report(run_id, generated_at)
+    report["candidates"] = []
+    report["selection"] = {
+        "bundle_ids": [],
+        "targets": {"kalshi": [], "polymarket": []},
+    }
+    return report
 
 
 class UniverseStoreTests(unittest.TestCase):
@@ -277,7 +429,7 @@ class UniverseStoreTests(unittest.TestCase):
         )
         self.assertFalse(any("json" in column.lower() for column in columns))
 
-    def test_indexes_sibling_markets_idempotently_and_exposes_selection(self) -> None:
+    def test_replaces_active_snapshot_idempotently_and_exposes_selection(self) -> None:
         self.assertEqual(
             _ingest_targeter(
                 self.database, "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
@@ -307,98 +459,303 @@ class UniverseStoreTests(unittest.TestCase):
         self.assertEqual(selected["subscription_ids"], ["pm-no", "pm-yes"])
         self.assertEqual(len(detail["subscriptions"]), 2)
         self.assertIsNone(self.database.bundle_detail("rejected"))
-        with self.assertRaises(EvidenceConflict):
-            self.database.source_is_complete(
-                "targeter-v2/runs/run=20260101T000000.000001Z/run_manifest.json",
-                "f" * 64,
-            )
+        self.assertEqual(detail["origin"]["run_id"], detail["run"]["run_id"])
 
-    def test_repeated_target_digest_is_reported_as_ambiguous(self) -> None:
+    def test_newer_snapshot_replaces_older_and_older_cannot_replace_newer(self) -> None:
         _ingest_targeter(
             self.database, "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
         )
-        _ingest_targeter(
-            self.database, "20260101T010000.000002Z", "2026-01-01T01:00:00Z"
+        self.assertEqual(
+            _ingest_targeter(
+                self.database,
+                "20260101T010000.000002Z",
+                "2026-01-01T01:00:00Z",
+            ),
+            "ingested",
+        )
+        self.assertEqual(
+            _ingest_targeter(
+                self.database,
+                "20260101T000000.000001Z",
+                "2026-01-01T00:00:00Z",
+            ),
+            "stale",
         )
         detail = self.database.bundle_detail("bundle-1")
         assert detail is not None
         self.assertEqual(detail["run"]["run_id"], "20260101T010000.000002Z")
-        self.assertTrue(
-            all(
-                link["historical_link_status"] == "ambiguous"
-                and link["candidate_run_count"] == 2
-                for link in detail["subscriptions"]
-            )
+
+    def test_status_marks_snapshot_stale_from_run_time(self) -> None:
+        _ingest_targeter(
+            self.database, "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
         )
+        generated_ns = int(
+            datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1_000_000_000
+        )
+        fresh = self.database.status(
+            now_ns=generated_ns + (3_600 - 1) * 1_000_000_000
+        )
+        stale = self.database.status(now_ns=generated_ns + 3_600 * 1_000_000_000)
+        self.assertFalse(fresh["active_snapshot"]["stale"])
+        self.assertTrue(stale["active_snapshot"]["stale"])
 
     def test_syncs_committed_targeter_manifest_and_retries_as_a_noop(self) -> None:
         objects = LocalObjectStore(
             self.root / "objects", store_id="archive", durability=INDEPENDENT
         )
-        _publish_targeter_run(objects)
+        _publish_targeter_run(
+            objects,
+            _selection_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+        )
         first = UniverseSync(self.database, objects).sync_targeter()
         self.assertEqual(first.targeter_ingested, 1, first.as_record())
         self.assertEqual(first.failures, [])
-        subsequent = UniverseSync(self.database, objects)
-        with patch.object(
-            subsequent,
-            "_read_json",
-            side_effect=AssertionError("committed derivative must avoid the source report"),
-        ):
-            second = subsequent.sync_targeter()
+        second = UniverseSync(self.database, objects).sync_targeter()
         self.assertEqual(second.targeter_skipped, 1, second.as_record())
         detail = self.database.bundle_detail("bundle-1")
         assert detail is not None
-        self.assertEqual(detail["source"]["kind"], "derived_index")
+        self.assertTrue(detail["source"]["index_key"].endswith(".ndjson"))
         self.assertIsNone(self.database.bundle_detail("rejected"))
         keys = set(objects.list_keys("targeter-v2/runs/"))
-        self.assertTrue(any(key.endswith("/selected_bundle_index.ndjson.zst") for key in keys))
-        self.assertTrue(any(key.endswith("/selected_bundle_index.receipt.json") for key in keys))
+        self.assertTrue(any(key.endswith("/selected_bundle_index.ndjson") for key in keys))
+        self.assertFalse(any("selected_bundle_index.receipt" in key for key in keys))
 
-    def test_sync_prefers_manifest_committed_selected_index(self) -> None:
+    def test_syncs_production_zstd_report_and_index(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "zstd-objects", store_id="archive", durability=INDEPENDENT
+        )
+        _publish_targeter_run(
+            objects,
+            _selection_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+            compressed=True,
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.targeter_ingested, 1)
+        detail = self.database.bundle_detail("bundle-1")
+        assert detail is not None
+        self.assertTrue(detail["source"]["report_key"].endswith(".json.zst"))
+        self.assertTrue(detail["source"]["index_key"].endswith(".ndjson.zst"))
+
+    def test_sync_resolves_retained_selection_to_verified_origin(self) -> None:
         objects = LocalObjectStore(
             self.root / "native-objects", store_id="archive", durability=INDEPENDENT
         )
-        _publish_targeter_run(objects, include_selected_index=True)
-        sync = UniverseSync(self.database, objects)
-        with patch.object(
-            sync,
-            "_read_json",
-            side_effect=AssertionError("native index must avoid the selection report"),
-        ):
-            result = sync.sync_targeter()
+        origin = _publish_targeter_run(
+            objects,
+            _selection_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+        )
+        _publish_targeter_run(
+            objects,
+            _retained_report(
+                "20260101T001000.000002Z", "2026-01-01T00:10:00Z", origin
+            ),
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
         self.assertEqual(result.targeter_ingested, 1, result.as_record())
         self.assertEqual(result.failures, [])
         detail = self.database.bundle_detail("bundle-1")
         assert detail is not None
-        self.assertEqual(detail["source"]["kind"], "manifest_index")
-        self.assertFalse(
-            any(
-                key.endswith("/selected_bundle_index.receipt.json")
-                for key in objects.list_keys("targeter-v2/runs/")
-            )
-        )
+        self.assertEqual(detail["run"]["run_id"], "20260101T001000.000002Z")
+        self.assertEqual(detail["origin"]["run_id"], origin["run_id"])
+        self.assertTrue(detail["continuity"]["selected"])
+        self.assertEqual(detail["continuity"]["disposition"], "retained")
+        self.assertEqual(len(detail["events"]), 2)
 
-    def test_lazy_projection_fails_closed_on_existing_artifact_conflict(self) -> None:
+    def test_sync_rejects_mismatched_native_index_without_replacing_state(self) -> None:
         objects = LocalObjectStore(
             self.root / "conflict-objects", store_id="archive", durability=INDEPENDENT
         )
-        run_id = _publish_targeter_run(objects)
-        prefix = f"targeter-v2/runs/date=2026-01-01/run={run_id}"
-        _put(
+        _ingest_targeter(
+            self.database, "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+        )
+        report = _selection_report(
+            "20260101T010000.000002Z", "2026-01-01T01:00:00Z"
+        )
+        _publish_targeter_run(
             objects,
-            f"{prefix}/selected_bundle_index.ndjson.zst",
-            b"{}\n",
-            NDJSON_CONTENT_TYPE,
+            report,
+            index_rows=[],
         )
         result = UniverseSync(self.database, objects).sync_targeter()
         self.assertEqual(result.targeter_ingested, 0)
         self.assertEqual(len(result.failures), 1)
-        self.assertIn("invalid metadata", result.failures[0])
-        self.assertIsNone(self.database.bundle_detail("bundle-1"))
-        self.assertIsNone(
-            objects.head(f"{prefix}/selected_bundle_index.receipt.json")
+        self.assertIn("disagrees with its report", result.failures[0])
+        detail = self.database.bundle_detail("bundle-1")
+        assert detail is not None
+        self.assertEqual(
+            detail["run"]["run_id"], "20260101T000000.000001Z"
         )
+
+    def test_valid_empty_generation_clears_active_bundles(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "empty-objects", store_id="archive", durability=INDEPENDENT
+        )
+        _publish_targeter_run(
+            objects,
+            _selection_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+        )
+        self.assertEqual(
+            UniverseSync(self.database, objects).sync_targeter().targeter_ingested,
+            1,
+        )
+        _publish_targeter_run(
+            objects,
+            _empty_report(
+                "20260101T010000.000002Z", "2026-01-01T01:00:00Z"
+            ),
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.targeter_ingested, 1)
+        self.assertEqual(self.database.list_bundles(), [])
+        self.assertEqual(
+            self.database.status()["active_snapshot"]["run_id"],
+            "20260101T010000.000002Z",
+        )
+
+    def test_retained_selection_requires_present_origin(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "missing-origin", store_id="archive", durability=INDEPENDENT
+        )
+        missing = {
+            "run_id": "20251231T230000.000001Z",
+            "manifest_key": (
+                "targeter-v2/runs/date=2025-12-31/"
+                "run=20251231T230000.000001Z/run_manifest.json"
+            ),
+            "manifest_sha256": "a" * 64,
+            "report_sha256": "b" * 64,
+        }
+        _publish_targeter_run(
+            objects,
+            _retained_report(
+                "20260101T001000.000002Z", "2026-01-01T00:10:00Z", missing
+            ),
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.targeter_ingested, 0)
+        self.assertIn("run manifest is absent", result.failures[0])
+        self.assertEqual(self.database.list_bundles(), [])
+
+    def test_retained_selection_rejects_wrong_origin_identities(self) -> None:
+        for field, expected in (
+            ("manifest_sha256", "manifest"),
+            ("report_sha256", "report"),
+        ):
+            with self.subTest(field=field):
+                objects = LocalObjectStore(
+                    self.root / field,
+                    store_id="archive",
+                    durability=INDEPENDENT,
+                )
+                origin = _publish_targeter_run(
+                    objects,
+                    _selection_report(
+                        "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+                    ),
+                )
+                altered = {**origin, field: "f" * 64}
+                _publish_targeter_run(
+                    objects,
+                    _retained_report(
+                        "20260101T001000.000002Z",
+                        "2026-01-01T00:10:00Z",
+                        altered,
+                    ),
+                )
+                result = UniverseSync(self.database, objects).sync_targeter()
+                self.assertEqual(result.targeter_ingested, 0)
+                self.assertIn(expected, result.failures[0])
+                self.assertIn(
+                    "identity disagrees with continuity origin", result.failures[0]
+                )
+
+    def test_retained_selection_requires_matching_complete_origin_row(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "origin-row", store_id="archive", durability=INDEPENDENT
+        )
+        origin = _publish_targeter_run(
+            objects,
+            _empty_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+        )
+        _publish_targeter_run(
+            objects,
+            _retained_report(
+                "20260101T001000.000002Z", "2026-01-01T00:10:00Z", origin
+            ),
+        )
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.targeter_ingested, 0)
+        self.assertIn("has no complete origin row", result.failures[0])
+
+    def test_retained_selection_targets_must_match_origin(self) -> None:
+        objects = LocalObjectStore(
+            self.root / "origin-targets", store_id="archive", durability=INDEPENDENT
+        )
+        origin = _publish_targeter_run(
+            objects,
+            _selection_report(
+                "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+            ),
+        )
+        report = _retained_report(
+            "20260101T001000.000002Z", "2026-01-01T00:10:00Z", origin
+        )
+        report["selection"]["targets"]["kalshi"][0]["subscription_ids"] = [
+            "K-OTHER"
+        ]
+        report["continuity"]["bundles"][0]["targets"][0]["subscription_ids"] = [
+            "K-OTHER"
+        ]
+        _publish_targeter_run(objects, report)
+        result = UniverseSync(self.database, objects).sync_targeter()
+        self.assertEqual(result.targeter_ingested, 0)
+        self.assertIn("disagrees with its origin", result.failures[0])
+
+    def test_sync_rejects_legacy_report_and_manifest_versions(self) -> None:
+        report_objects = LocalObjectStore(
+            self.root / "report-v2", store_id="archive", durability=INDEPENDENT
+        )
+        report = _selection_report(
+            "20260101T000000.000001Z", "2026-01-01T00:00:00Z"
+        )
+        report["report_version"] = 2
+        _publish_targeter_run(report_objects, report, index_rows=[])
+        report_result = UniverseSync(self.database, report_objects).sync_targeter()
+        self.assertIn("not a complete Targeter v3 report", report_result.failures[0])
+
+        manifest_objects = LocalObjectStore(
+            self.root / "manifest-v1", store_id="archive", durability=INDEPENDENT
+        )
+        _publish_targeter_run(
+            manifest_objects,
+            _selection_report(
+                "20260101T010000.000002Z", "2026-01-01T01:00:00Z"
+            ),
+            manifest_version=1,
+        )
+        manifest_result = UniverseSync(
+            self.database, manifest_objects
+        ).sync_targeter()
+        self.assertIn("is not version 2", manifest_result.failures[0])
+
+    def test_existing_non_v3_database_is_rejected(self) -> None:
+        path = self.root / "legacy.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA user_version = 1")
+        with self.assertRaisesRegex(EvidenceConflict, "fresh v3 database"):
+            UniverseStore(path).initialize()
 
     def test_folds_connection_state_across_segments_and_utc_days(self) -> None:
         digest = target_digest("polymarket", (Target(asset_id="asset-a"),))
@@ -489,7 +846,7 @@ class UniverseStoreTests(unittest.TestCase):
         application = UniverseApplication(self.database)
         status, health = application.get("/healthz")
         self.assertEqual(status, 200)
-        self.assertEqual(health["schema_version"], 1)
+        self.assertEqual(health["schema_version"], 3)
         status, detail = application.get("/v1/bundles/bundle-1")
         self.assertEqual(status, 200)
         self.assertEqual(len(detail["markets"]), 3)
@@ -504,7 +861,7 @@ class UniverseStoreTests(unittest.TestCase):
                 connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
             )
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM selected_bundles").fetchone()[0], 1
+                connection.execute("SELECT COUNT(*) FROM active_bundles").fetchone()[0], 1
             )
 
     def test_backfill_reconstructs_reaped_raw_and_is_resumable(self) -> None:

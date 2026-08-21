@@ -11,27 +11,42 @@ CREATE TABLE checkpoints (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE targeter_sources (
-    run_id TEXT PRIMARY KEY,
-    source_key TEXT NOT NULL UNIQUE REFERENCES ingest_sources(source_key) DEFERRABLE INITIALLY DEFERRED,
-    source_kind TEXT NOT NULL CHECK(source_kind IN ('manifest_index', 'derived_index')),
+CREATE TABLE active_snapshot (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    run_id TEXT NOT NULL UNIQUE,
     generated_at TEXT NOT NULL,
     generated_at_ns INTEGER NOT NULL,
-    input_complete INTEGER NOT NULL CHECK(input_complete IN (0, 1)),
+    indexed_at_ns INTEGER NOT NULL,
     strategy_version INTEGER,
     manifest_key TEXT NOT NULL,
     manifest_sha256 TEXT NOT NULL,
+    report_key TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL,
+    report_byte_length INTEGER NOT NULL CHECK(report_byte_length >= 0),
     index_key TEXT NOT NULL,
     index_sha256 TEXT NOT NULL,
     index_byte_length INTEGER NOT NULL CHECK(index_byte_length >= 0),
     CHECK(strategy_version IS NULL OR strategy_version > 0)
 ) STRICT;
-CREATE INDEX targeter_sources_generated
-    ON targeter_sources(generated_at_ns DESC, run_id);
 
-CREATE TABLE selected_bundles (
-    run_id TEXT NOT NULL REFERENCES targeter_sources(run_id) ON DELETE CASCADE,
-    bundle_id TEXT NOT NULL,
+CREATE TABLE active_bundles (
+    bundle_id TEXT PRIMARY KEY,
+    origin_run_id TEXT NOT NULL,
+    origin_generated_at TEXT NOT NULL,
+    origin_generated_at_ns INTEGER NOT NULL,
+    origin_manifest_key TEXT NOT NULL,
+    origin_manifest_sha256 TEXT NOT NULL,
+    origin_report_key TEXT NOT NULL,
+    origin_report_sha256 TEXT NOT NULL,
+    origin_report_byte_length INTEGER NOT NULL CHECK(origin_report_byte_length >= 0),
+    origin_index_key TEXT NOT NULL,
+    origin_index_sha256 TEXT NOT NULL,
+    origin_index_byte_length INTEGER NOT NULL CHECK(origin_index_byte_length >= 0),
+    continuity_selected INTEGER NOT NULL CHECK(continuity_selected IN (0, 1)),
+    continuity_disposition TEXT CHECK(
+        continuity_disposition IS NULL OR
+        continuity_disposition IN ('held_current_candidate', 'retained')
+    ),
     sport TEXT NOT NULL,
     game TEXT,
     topology TEXT,
@@ -43,70 +58,59 @@ CREATE TABLE selected_bundles (
     planned_capture_end_at_ns INTEGER NOT NULL,
     post_start_retention_seconds INTEGER NOT NULL
         CHECK(post_start_retention_seconds > 0),
-    PRIMARY KEY(run_id, bundle_id),
+    CHECK(
+        (continuity_selected = 0 AND continuity_disposition IS NULL) OR
+        (continuity_selected = 1 AND continuity_disposition IS NOT NULL)
+    ),
     CHECK(capture_start_at_ns < activation_at_ns),
     CHECK(activation_at_ns < planned_capture_end_at_ns)
 ) STRICT;
-CREATE INDEX selected_bundles_window
-    ON selected_bundles(capture_start_at_ns, planned_capture_end_at_ns, bundle_id);
-CREATE INDEX selected_bundles_identity
-    ON selected_bundles(bundle_id, run_id);
+CREATE INDEX active_bundles_window
+    ON active_bundles(capture_start_at_ns, planned_capture_end_at_ns, bundle_id);
+CREATE INDEX active_bundles_origin
+    ON active_bundles(origin_run_id, bundle_id);
 
 CREATE TABLE bundle_participants (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
+    bundle_id TEXT NOT NULL REFERENCES active_bundles(bundle_id) ON DELETE CASCADE,
     position INTEGER NOT NULL CHECK(position IN (0, 1)),
     name TEXT NOT NULL,
     participant_key TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id, position),
-    FOREIGN KEY(run_id, bundle_id)
-        REFERENCES selected_bundles(run_id, bundle_id) ON DELETE CASCADE
+    PRIMARY KEY(bundle_id, position)
 ) STRICT;
 
 CREATE TABLE bundle_events (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
+    bundle_id TEXT NOT NULL REFERENCES active_bundles(bundle_id) ON DELETE CASCADE,
     event_ref TEXT NOT NULL,
     venue TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id, event_ref),
-    FOREIGN KEY(run_id, bundle_id)
-        REFERENCES selected_bundles(run_id, bundle_id) ON DELETE CASCADE
+    PRIMARY KEY(bundle_id, event_ref)
 ) STRICT;
 
 CREATE TABLE bundle_markets (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
+    bundle_id TEXT NOT NULL REFERENCES active_bundles(bundle_id) ON DELETE CASCADE,
     target_id TEXT NOT NULL,
     venue TEXT NOT NULL,
     selected INTEGER NOT NULL CHECK(selected IN (0, 1)),
-    PRIMARY KEY(run_id, bundle_id, target_id),
-    FOREIGN KEY(run_id, bundle_id)
-        REFERENCES selected_bundles(run_id, bundle_id) ON DELETE CASCADE
+    PRIMARY KEY(bundle_id, target_id)
 ) STRICT;
 
 CREATE TABLE selected_targets (
-    run_id TEXT NOT NULL,
     bundle_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
+    target_id TEXT PRIMARY KEY,
     venue TEXT NOT NULL,
     canonical_class TEXT NOT NULL,
-    PRIMARY KEY(run_id, target_id),
-    FOREIGN KEY(run_id, bundle_id, target_id)
-        REFERENCES bundle_markets(run_id, bundle_id, target_id) ON DELETE CASCADE
+    source_ref TEXT NOT NULL,
+    FOREIGN KEY(bundle_id, target_id)
+        REFERENCES bundle_markets(bundle_id, target_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE selected_target_assets (
-    run_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
+    target_id TEXT NOT NULL REFERENCES selected_targets(target_id) ON DELETE CASCADE,
     asset_id TEXT NOT NULL,
-    PRIMARY KEY(run_id, target_id, asset_id),
-    FOREIGN KEY(run_id, target_id)
-        REFERENCES selected_targets(run_id, target_id) ON DELETE CASCADE
+    PRIMARY KEY(target_id, asset_id)
 ) STRICT;
 
 CREATE TABLE bundle_relationships (
-    run_id TEXT NOT NULL,
-    bundle_id TEXT NOT NULL,
+    bundle_id TEXT NOT NULL REFERENCES active_bundles(bundle_id) ON DELETE CASCADE,
     relationship_index INTEGER NOT NULL,
     left_market TEXT NOT NULL,
     right_market TEXT NOT NULL,
@@ -115,27 +119,20 @@ CREATE TABLE bundle_relationships (
     left_venue TEXT NOT NULL,
     right_venue TEXT NOT NULL,
     coverage TEXT NOT NULL,
-    PRIMARY KEY(run_id, bundle_id, relationship_index),
-    FOREIGN KEY(run_id, bundle_id)
-        REFERENCES selected_bundles(run_id, bundle_id) ON DELETE CASCADE
+    PRIMARY KEY(bundle_id, relationship_index)
 ) STRICT;
 
 CREATE TABLE subscription_sets (
-    run_id TEXT NOT NULL REFERENCES targeter_sources(run_id) ON DELETE CASCADE,
-    venue TEXT NOT NULL,
+    venue TEXT PRIMARY KEY,
     target_digest TEXT NOT NULL,
-    asset_count INTEGER NOT NULL,
-    PRIMARY KEY(run_id, venue)
+    asset_count INTEGER NOT NULL CHECK(asset_count >= 0)
 ) STRICT;
 CREATE INDEX subscription_sets_digest ON subscription_sets(venue, target_digest);
 
 CREATE TABLE subscription_assets (
-    run_id TEXT NOT NULL,
-    venue TEXT NOT NULL,
+    venue TEXT NOT NULL REFERENCES subscription_sets(venue) ON DELETE CASCADE,
     asset_id TEXT NOT NULL,
-    PRIMARY KEY(run_id, venue, asset_id),
-    FOREIGN KEY(run_id, venue)
-        REFERENCES subscription_sets(run_id, venue) ON DELETE CASCADE
+    PRIMARY KEY(venue, asset_id)
 ) STRICT;
 
 CREATE TABLE segment_receipts (
