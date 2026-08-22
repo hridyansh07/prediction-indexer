@@ -44,6 +44,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from archive.archiver import CONFLICT, FAILED, Archiver  # noqa: E402
+from archive.archiver.canonical import (  # noqa: E402
+    CONFLICT as CANONICAL_CONFLICT,
+    FAILED as CANONICAL_FAILED,
+    CanonicalArchiver,
+)
 from archive.common.durable import write_json_durable  # noqa: E402
 from archive.archiver.manifest import (  # noqa: E402
     build_daily_manifests,
@@ -66,6 +71,12 @@ EXIT_CONFLICT = 2
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--spool-root", required=True, type=Path)
+    parser.add_argument(
+        "--canonical-root",
+        type=Path,
+        default=None,
+        help="also archive receipt-committed canonical windows from this root",
+    )
     add_store_arguments(parser)
     parser.add_argument(
         "--manifest-root",
@@ -87,6 +98,15 @@ def sweep_once(arguments: argparse.Namespace, store: ObjectStore) -> int:
     archiver = Archiver(arguments.spool_root, store)
     result = archiver.sweep()
     record = result.as_record()
+
+    canonical = None
+    if (
+        arguments.canonical_root is not None
+        and not result.halted
+        and not result.count(CONFLICT)
+    ):
+        canonical = CanonicalArchiver(arguments.canonical_root, store).sweep()
+        record["canonical"] = canonical.as_record()
 
     if arguments.manifest_root is not None:
         kind = PRODUCTION if store.durability.receipt_kind == PRODUCTION else LOCAL
@@ -110,9 +130,17 @@ def sweep_once(arguments: argparse.Namespace, store: ObjectStore) -> int:
         arguments.report.parent.mkdir(parents=True, exist_ok=True)
         write_json_durable(arguments.report, record)
 
-    if result.halted or result.count(CONFLICT):
+    if (
+        result.halted
+        or result.count(CONFLICT)
+        or (canonical is not None and (canonical.halted or canonical.count(CANONICAL_CONFLICT)))
+    ):
         return EXIT_CONFLICT
-    return EXIT_FAILURES if result.count(FAILED) else EXIT_OK
+    if result.count(FAILED) or (
+        canonical is not None and canonical.count(CANONICAL_FAILED)
+    ):
+        return EXIT_FAILURES
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:

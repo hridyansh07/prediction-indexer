@@ -77,6 +77,18 @@ class ArchiverCommandTests(CommandCase):
         self.assertEqual(record["archive"]["durability"], "local_conformance")
         self.assertEqual(record["archive"]["receipt_kind"], "local")
 
+    def test_the_same_sweep_archives_committed_canonical_windows(self) -> None:
+        source_receipt = write_canonical_receipt(self.canonical, evidence_lines=1)
+        status, record = run(
+            run_archiver.main,
+            self.archiver_arguments("--canonical-root", str(self.canonical)),
+        )
+        self.assertEqual(status, run_archiver.EXIT_OK)
+        self.assertEqual(record["canonical"]["counts"]["archived"], 1)
+        self.assertTrue(
+            source_receipt.with_name("canonical_archive_receipt.local.json").is_file()
+        )
+
     def test_the_sweep_writes_daily_manifests_when_asked(self) -> None:
         manifests = self.root / "manifests"
         status, record = run(

@@ -35,6 +35,13 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
                     "environment: *aws-archive-environment", self.service(service)
                 )
 
+    def test_archiver_sweeps_the_canonical_root_as_well_as_the_raw_spool(self) -> None:
+        for service in ("archiver", "archiver-once"):
+            with self.subTest(service=service):
+                configured = self.service(service)
+                self.assertIn("--canonical-root", configured)
+                self.assertIn("/var/lib/prediction-indexer/canonical", configured)
+
     def test_ingest_store_reaper_is_one_shot_audit_first_and_uses_the_rust_image(self) -> None:
         service = self.service("ingest-store-reaper")
         self.assertIn("<<: *ingester-service", service)

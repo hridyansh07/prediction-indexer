@@ -43,7 +43,7 @@ splices/             venue adapters — auth, subscribe, reconnect, record verba
 targeter/            v2 motivation and sports discovery/archive/publication; legacy v1
 ingester/            Rust: daily fact-store partitions, sequencing, continuity, retention
 encoder/             the shared Zstandard codec — Python and Rust, streaming only
-archive/             raw-segment archiver, immutable object store, dual-receipt reaper
+archive/             raw/canonical archiver, immutable object store, dual-receipt reaper
 analysis/             masks, outcome space, void policy, partition sums
 scripts/             analysis pipelines and historical pulls
 docs/                cross-cutting specs, deployment guide, venue API notes

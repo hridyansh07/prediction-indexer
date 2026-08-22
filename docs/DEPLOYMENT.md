@@ -43,7 +43,7 @@ credentials:
 | `ingest-store-reaper` | `ops` profile | One-shot audit/delete of closed ingest databases older than 24 hours |
 | `finalizer` | `ops` profile | Checks every minute and merges sealed windows into compressed canonical evidence |
 | `finalizer-once` | `ops` profile | The same finalization sweep, once |
-| `archiver` | `ops` profile | Hourly sweep publishing sealed segments as immutable compressed objects |
+| `archiver` | `ops` profile | Hourly sweep publishing sealed segments and committed canonical windows as immutable objects |
 | `archiver-once` | `ops` profile | The same sweep, once, for an operator or external scheduler |
 | `reaper` | `ops` profile | Hourly dual-receipt audit; deletion is opt-in |
 | `reaper-once` | `ops` profile | The same reaper sweep, once |
@@ -577,6 +577,22 @@ local raw segment and seal are untouched and remain the recovery authority.
 Exit `1` means one or more segments failed for their own reasons (a malformed
 seal, a changed byte, a transient store failure) and the sweep continued.
 
+The same sweep also discovers committed canonical windows. Those files are
+already V1 Zstandard frames, so the archiver strictly decodes them against the
+finalizer's receipt rather than recompressing them. It publishes the two exact
+frames and unchanged receipt under:
+
+```text
+canonical/date=<YYYY-MM-DD>/window=<start>/
+  evidence.ndjson.zst
+  provenance.ndjson.zst
+  receipt.json
+```
+
+Fresh object-store heads verify all three before the local window receives
+`canonical_archive_receipt.json`. The local backend uses
+`canonical_archive_receipt.local.json`, which is conformance evidence only.
+
 ### S3 archive backend
 
 Both `archiver` and `reaper` build their object store through one factory,
@@ -605,12 +621,11 @@ production `.archive.json` receipts against it.
 
 Credentials are never set in `.env`. On AWS, prefer an instance or task role
 scoped to exactly `s3:ListBucket` on the bucket and
-`s3:PutObject`/`s3:GetObject` on **both** `bucket/raw/*` and
-`bucket/targeter-v2/*`, with no delete permission. Both prefixes are required:
-sealed capture archives under `raw/`, and Targeter v2 archives run directories
-under `targeter-v2/runs/date=<date>/run=<run_id>/`. A role written for `raw/*`
-alone fails the first target-run archival with `AccessDenied`, which in turn
-means the run reaper can never reclaim disk. The exact policy documents are in
+`s3:PutObject`/`s3:GetObject` on `bucket/raw/*`, `bucket/canonical/*`, and
+`bucket/targeter-v2/*`, with no delete permission. All three prefixes are
+required: sealed capture archives under `raw/`, finalized windows under
+`canonical/`, and Targeter v2 run directories under `targeter-v2/`. The exact
+policy documents are in
 `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12.3.
 
 If the Compose host instead uses temporary or static environment credentials,
@@ -624,8 +639,9 @@ into the containers. For an EC2 instance role, ensure IMDS is reachable from
 bridge containers (including a sufficient IMDSv2 response hop limit).
 
 The bucket itself needs Block Public Access enabled, versioning on, default
-encryption on, and a policy requiring `If-None-Match: *` on writes under both
-`raw/` and `targeter-v2/` — see `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
+encryption on, and a policy requiring `If-None-Match: *` on writes under
+`raw/`, `canonical/`, and `targeter-v2/` — see
+`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
 the full checklist and the JSON.
 
 Switching `ARCHIVE_BACKEND` from `local` to `s3` does not touch the reaper's
@@ -635,9 +651,9 @@ construction. §15's rollout gate still applies — run the S3 archiver with
 reaper deletion disabled for at least 24 hours, sample every lane against
 retained local raw, and only then consider enabling destructive reaper runs.
 
-**Still out of scope.** Canonical S3 upload and object-store lifecycle expiry are
-not configured, so those tiers grow until a later sink and retention policy are
-enabled. With the local conformance backend, total local storage is *not*
+**Still out of scope.** Object-store lifecycle expiry is not configured, so the
+archive grows until a later retention policy is enabled. With the local
+conformance backend, total local storage is *not*
 bounded — the bytes have changed representation and directory, nothing more;
 an S3 backend does not bound the spool until `REAPER_MODE=delete` is enabled.
 

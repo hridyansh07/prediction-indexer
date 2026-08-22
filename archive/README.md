@@ -1,15 +1,17 @@
-# Raw archive and reaper
+# Capture archive and reaper
 
-This subsystem copies receipt-committed sealed capture segments to immutable
-object storage, verifies them, publishes local archive receipts and derived daily
-manifests, then separately audits whether local raw data may be removed. The
-archiver never deletes capture evidence. The reaper requires both a currently
-verified archive receipt/object pair and a committed canonical-ingestion receipt.
+This subsystem copies receipt-committed sealed capture segments and finalized
+canonical windows to immutable object storage. It verifies them, publishes local
+archive receipts and derived raw daily manifests, then separately audits whether
+local raw data may be removed. The archiver never deletes capture evidence. The
+reaper requires both a currently verified raw archive receipt/object pair and a
+committed canonical-ingestion receipt.
 
 ## Layout and flow
 
 ```text
-archiver/  service.py, manifest.py, cli.py   seal -> object + receipt + manifest
+archiver/  service.py, canonical.py, manifest.py, cli.py
+           raw seal -> objects + receipt + manifest; canonical receipt -> objects + receipt
 reaper/    service.py, cli.py                dual-receipt audit/deletion decision
 storage/   base.py, local.py, s3.py, factory.py
 common/    durable.py, receipts.py, seal.py, verify.py
@@ -34,7 +36,7 @@ The runtime role needs exactly:
 ```text
 s3:ListBucket                 on arn:aws:s3:::BUCKET
 s3:GetObject
-s3:PutObject                 on arn:aws:s3:::BUCKET/raw/*
+s3:PutObject                 on BUCKET/raw/*, BUCKET/canonical/*, BUCKET/targeter-v2/*
 ```
 
 Do **not** grant `s3:DeleteObject`, `s3:DeleteObjectVersion`, bucket-policy,
@@ -65,6 +67,7 @@ Direct project-root invocation is:
 
 ```bash
 .venv/bin/python -m archive.archiver.cli --spool-root data/spool \
+  --canonical-root data/canonical \
   --archive-backend s3 --s3-bucket "$ARCHIVE_S3_BUCKET" \
   --s3-region "$ARCHIVE_S3_REGION" --s3-expected-owner "$ARCHIVE_S3_EXPECTED_OWNER"
 ```
@@ -74,6 +77,14 @@ Objects are stored as
 segment, `.archive.json` is production verification authority; local conformance
 uses `.archive.local.json`, which authorizes nothing. Daily manifests are derived
 catalogs and can be rebuilt from verified receipts.
+
+Canonical windows are already encoded by the Rust finalizer. The archiver does
+not recompress them: it strictly decodes both frames against `receipt.json`, then
+immutably publishes `evidence.ndjson.zst`, `provenance.ndjson.zst`, and the exact
+receipt under `canonical/date=<date>/window=<start>/`. It writes
+`canonical_archive_receipt.json` beside the local window only after fresh heads
+verify all three objects. A local backend instead writes the non-authoritative
+`canonical_archive_receipt.local.json`.
 
 ## Streaming archived segments to replay
 

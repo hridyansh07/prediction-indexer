@@ -33,7 +33,7 @@ V1 stores NDJSON inside Zstandard frames. It does **not** use Simple Binary
 Encoding (SBE), a custom binary event schema, record blocks, or an additional
 message-framing layer.
 
-The two materialization steps are:
+The materialization and archival steps are:
 
 1. **Raw archiver:** a valid sealed splice segment becomes one independently
    addressable `.ndjson.zst` object in S3, while the original seal remains
@@ -41,13 +41,16 @@ The two materialization steps are:
 2. **Canonical ingester/finalizer:** a finalized window becomes
    `evidence.ndjson.zst`, `provenance.ndjson.zst`, and the `receipt.json` that
    commits them on the local durable filesystem.
+3. **Canonical archive sink:** a receipt-committed window is independently
+   decoded against that receipt, then its two existing Zstandard frames and
+   unchanged `receipt.json` are copied to immutable object storage. A separate
+   local canonical archive receipt is published last.
 
 The following are out of scope:
 
 - changing envelope schemas or canonical merge order;
 - normalizing venue payloads before canonical evidence is committed;
 - combining a day of segments into one Zstandard frame or S3 object;
-- uploading canonical windows to S3;
 - replay or correction-dataset policy beyond defining the verified decoder
   boundary;
 - retaining uncompressed canonical files as compatibility copies.
@@ -538,6 +541,21 @@ when:
 - finalization and verification use bounded memory for multi-gigabyte windows.
 
 After Step 2, deployment documentation and Compose paths are updated to show the
-new filenames. A later, separate sink may upload canonical windows, but it must
-consume the receipt-committed `.zst` files and is not part of either changeset
-defined here.
+new filenames. The archive sink consumes the receipt-committed `.zst` files
+without recompressing or reserializing them. Before upload it runs both files
+through the shared strict decoder with the receipt's stored and decoded
+identities and decoded-byte ceilings. It then uploads, in order:
+
+```text
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/evidence.ndjson.zst
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/provenance.ndjson.zst
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/receipt.json
+```
+
+The unchanged canonical `receipt.json` is uploaded after the two data objects.
+Fresh object-store heads must prove all three SHA-256 identities, lengths, and
+content metadata. Only then may the sink durably publish
+`canonical_archive_receipt.json` beside the local window (or the explicitly
+non-authoritative `.local.json` conformance form). A failed decode, upload,
+head, or immutable-key check leaves no canonical archive receipt and never
+modifies the committed window.

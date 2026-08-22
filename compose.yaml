@@ -403,8 +403,9 @@ services:
     volumes:
       - *data-volume
 
-  # Publishes each sealed segment as one immutable compressed object plus its
-  # unchanged seal, then writes the receipt that is the archive commit marker.
+  # Publishes each sealed segment and each receipt-committed canonical window
+  # through immutable object writes, then writes a separate local archive receipt
+  # that is the archive commit marker.
   # Never deletes anything: PHASE_4_RAW_ARCHIVE_REAPER_V1 §2 makes archival and
   # deletion separate authorities, and this is the archival one.
   #
@@ -431,6 +432,8 @@ services:
       - archive.archiver.cli
       - --spool-root
       - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
       - --archive-root
       - /var/lib/prediction-archive
       - --manifest-root
@@ -475,6 +478,8 @@ services:
       - archive.archiver.cli
       - --spool-root
       - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
       - --archive-root
       - /var/lib/prediction-archive
       - --manifest-root

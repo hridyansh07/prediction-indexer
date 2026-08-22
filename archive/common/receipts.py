@@ -48,6 +48,7 @@ __all__ = [
     "ArchiveReceipt",
     "CanonicalIndex",
     "CanonicalInput",
+    "CanonicalOutput",
     "CanonicalReceipt",
     "ReceiptError",
     "archive_receipt_path",
@@ -397,6 +398,15 @@ class CanonicalInput:
 
 
 @dataclass(frozen=True)
+class CanonicalOutput:
+    """One receipt-bound canonical Zstandard object and both of its identities."""
+
+    file: str
+    decoded: LogicalIdentity
+    stored: StoredIdentity
+
+
+@dataclass(frozen=True)
 class CanonicalReceipt:
     path: Path
     window_start_ns: int
@@ -404,6 +414,9 @@ class CanonicalReceipt:
     completeness: str
     certified: bool
     inputs: tuple[CanonicalInput, ...]
+    evidence: CanonicalOutput
+    provenance: CanonicalOutput
+    document: dict[str, Any]
 
 
 def read_canonical_receipt(path: Path) -> CanonicalReceipt:
@@ -446,12 +459,14 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
     if not isinstance(certified, bool):
         raise invalid("certified is not a boolean")
 
-    evidence = _canonical_output(document, "evidence", "evidence.ndjson.zst", directory, invalid)
-    provenance = _canonical_output(
+    evidence_document = _canonical_output(
+        document, "evidence", "evidence.ndjson.zst", directory, invalid
+    )
+    provenance_document = _canonical_output(
         document, "provenance", "provenance.ndjson.zst", directory, invalid
     )
-    evidence_decoded = _section(evidence, "decoded", invalid)
-    provenance_decoded = _section(provenance, "decoded", invalid)
+    evidence_decoded = _section(evidence_document, "decoded", invalid)
+    provenance_decoded = _section(provenance_document, "decoded", invalid)
     if _integer(evidence_decoded, "line_count", invalid) != _integer(
         provenance_decoded, "line_count", invalid
     ):
@@ -492,6 +507,26 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
         completeness=completeness,
         certified=certified,
         inputs=tuple(inputs),
+        evidence=_canonical_output_identity(evidence_document, invalid),
+        provenance=_canonical_output_identity(provenance_document, invalid),
+        document=document,
+    )
+
+
+def _canonical_output_identity(document: dict[str, Any], invalid) -> CanonicalOutput:
+    decoded = _section(document, "decoded", invalid)
+    stored = _section(document, "stored", invalid)
+    return CanonicalOutput(
+        file=_text(document, "file", invalid),
+        decoded=LogicalIdentity(
+            sha256=_digest(decoded, "sha256", invalid),
+            byte_length=_integer(decoded, "byte_length", invalid),
+            line_count=_integer(decoded, "line_count", invalid),
+        ),
+        stored=StoredIdentity(
+            sha256=_digest(stored, "sha256", invalid),
+            byte_length=_integer(stored, "byte_length", invalid),
+        ),
     )
 
 
