@@ -864,6 +864,82 @@ class UniverseStoreTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM active_bundles").fetchone()[0], 1
             )
 
+    def test_bundle_list_filters_and_orders_by_event_activation_time(self) -> None:
+        run_id = "20260101T000000.000001Z"
+        generated_at = "2026-01-01T00:00:00Z"
+        _ingest_targeter(self.database, run_id, generated_at)
+
+        def timestamp_ns(value: str) -> int:
+            return int(
+                datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                * 1_000_000_000
+            )
+
+        with self.database.connect() as connection:
+            template = dict(
+                connection.execute(
+                    "SELECT * FROM active_bundles WHERE bundle_id = 'bundle-1'"
+                ).fetchone()
+            )
+            for bundle_id, activation_at, capture_start_at, planned_end_at in (
+                (
+                    "bundle-late",
+                    "2026-01-01T03:00:00Z",
+                    "2026-01-01T02:00:00Z",
+                    "2026-01-01T09:00:00Z",
+                ),
+                (
+                    "bundle-early-a",
+                    "2026-01-01T01:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T07:00:00Z",
+                ),
+            ):
+                row = {
+                    **template,
+                    "bundle_id": bundle_id,
+                    "activation_at": activation_at,
+                    "activation_at_ns": timestamp_ns(activation_at),
+                    "capture_start_at": capture_start_at,
+                    "capture_start_at_ns": timestamp_ns(capture_start_at),
+                    "planned_capture_end_at": planned_end_at,
+                    "planned_capture_end_at_ns": timestamp_ns(planned_end_at),
+                }
+                connection.execute(
+                    f"INSERT INTO active_bundles({','.join(row)}) "
+                    f"VALUES ({','.join('?' for _ in row)})",
+                    tuple(row.values()),
+                )
+
+        start_ns = int(
+            datetime(2026, 1, 1, 1, tzinfo=timezone.utc).timestamp()
+            * 1_000_000_000
+        )
+        end_ns = int(
+            datetime(2026, 1, 1, 3, tzinfo=timezone.utc).timestamp()
+            * 1_000_000_000
+        )
+        application = UniverseApplication(self.database)
+        status, document = application.get(
+            f"/v1/bundles?activation_start_ns={start_ns}&activation_end_ns={end_ns}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [bundle["bundle_id"] for bundle in document["bundles"]],
+            ["bundle-1", "bundle-early-a"],
+        )
+        self.assertEqual(
+            [bundle["bundle_id"] for bundle in self.database.list_bundles()],
+            ["bundle-1", "bundle-early-a", "bundle-late"],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "activation_start_ns must be before activation_end_ns"
+        ):
+            application.get(
+                f"/v1/bundles?activation_start_ns={end_ns}"
+                f"&activation_end_ns={end_ns}"
+            )
+
     def test_backfill_reconstructs_reaped_raw_and_is_resumable(self) -> None:
         spool = self.root / "historical-spool"
         source = _write_segment(

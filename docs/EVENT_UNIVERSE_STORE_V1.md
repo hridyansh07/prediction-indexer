@@ -203,11 +203,17 @@ The read-only JSON API is:
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | schema version, active run, age/staleness, and row counts |
-| `GET /v1/bundles?limit=N` | active selected bundles only |
+| `GET /v1/bundles?activation_start_ns=&activation_end_ns=&limit=N` | active selected bundles, optionally filtered by event activation time |
 | `GET /v1/bundles/<bundle_id>` | current and origin provenance plus copied event, sibling, target, relationship, and subscription context |
 | `GET /v1/bundles/<bundle_id>/segments?lane_id=` | verified S3 segments overlapping the bundle bounds |
 | `GET /v1/segments?start_ns=&end_ns=&lane_id=` | verified S3 segments overlapping explicit bounds |
 | `GET /v1/epochs?start_ns=&end_ns=&lane_id=` | folded connection epochs overlapping explicit bounds |
+
+Bundle lists are ordered by event `activation_at`, then `bundle_id`, rather than
+by the Targeter run timestamp. Optional activation bounds form the half-open
+interval `[activation_start_ns, activation_end_ns)`; either bound may be omitted.
+The planned capture end remains a search bound and is not presented as the event
+end time.
 
 There is no write, replay, manual-link, historical-occurrence, or frontend
 endpoint in V1.

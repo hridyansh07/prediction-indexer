@@ -573,20 +573,50 @@ class UniverseStore:
             "counts": counts,
         }
 
-    def list_bundles(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    def list_bundles(
+        self,
+        *,
+        activation_start_ns: int | None = None,
+        activation_end_ns: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        for field, value in (
+            ("activation_start_ns", activation_start_ns),
+            ("activation_end_ns", activation_end_ns),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{field} must be a non-negative integer")
+        if (
+            activation_start_ns is not None
+            and activation_end_ns is not None
+            and activation_start_ns >= activation_end_ns
+        ):
+            raise ValueError("activation_start_ns must be before activation_end_ns")
         bounded = max(1, min(int(limit), 1000))
+        predicates: list[str] = []
+        parameters: list[Any] = []
+        if activation_start_ns is not None:
+            predicates.append("ab.activation_at_ns >= ?")
+            parameters.append(activation_start_ns)
+        if activation_end_ns is not None:
+            predicates.append("ab.activation_at_ns < ?")
+            parameters.append(activation_end_ns)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
         with closing(self.connect(readonly=True)) as connection:
             rows = connection.execute(
-                """SELECT ab.bundle_id, snapshot.run_id, ab.origin_run_id,
+                f"""SELECT ab.bundle_id, snapshot.run_id, ab.origin_run_id,
                           ab.continuity_selected, ab.continuity_disposition,
                           ab.sport, ab.game, ab.topology, ab.activation_at,
                           ab.capture_start_at, ab.planned_capture_end_at,
                           snapshot.generated_at
                    FROM active_bundles ab
                    CROSS JOIN active_snapshot snapshot
+                   {where}
                    ORDER BY ab.activation_at_ns, ab.bundle_id
                    LIMIT ?""",
-                (bounded,),
+                (*parameters, bounded),
             ).fetchall()
         return [
             {
