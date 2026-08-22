@@ -22,7 +22,17 @@ class UniverseApplication:
             return HTTPStatus.OK, self.database.status()
         if parsed.path == "/v1/bundles":
             limit = _integer_query(query, "limit", default=100)
-            return HTTPStatus.OK, {"bundles": self.database.list_bundles(limit=limit)}
+            return HTTPStatus.OK, {
+                "bundles": self.database.list_bundles(
+                    activation_start_ns=_optional_integer_query(
+                        query, "activation_start_ns"
+                    ),
+                    activation_end_ns=_optional_integer_query(
+                        query, "activation_end_ns"
+                    ),
+                    limit=limit,
+                )
+            }
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith(
             "/segments"
         ):
@@ -132,3 +142,11 @@ def _optional_query(query: dict[str, list[str]], field: str) -> str | None:
     if len(values) != 1 or not values[0]:
         raise ValueError(f"query parameter {field} must appear once and be non-empty")
     return values[0]
+
+
+def _optional_integer_query(
+    query: dict[str, list[str]], field: str
+) -> int | None:
+    if field not in query:
+        return None
+    return _integer_query(query, field)
