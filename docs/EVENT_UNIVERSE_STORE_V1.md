@@ -5,14 +5,17 @@
 ## 1. Purpose and boundary
 
 Event Universe is a durable, append-only SQL index of the **bundle selections
-Targeter made**. Its useful delta over Targeter observability is history: a
-consumer can query which selected event bundles existed at an event time or a
-Targeter selection time without downloading and scanning every archived run.
+Targeter made and their proven retirement observations**. Its useful delta over
+Targeter observability is history: a consumer can query which selected event
+bundles existed at an event time or a Targeter selection time without
+downloading and scanning every archived run.
 
 For each selected occurrence it answers:
 
 - which run selected the bundle and whether continuity retained it;
 - when the event activates and when its one-hour lookahead starts;
+- when Targeter first observed every selected market terminal, or retired the
+  bundle at its safety clamp;
 - which event, sibling-market, selected-target, subscription, and relationship
   references belong to the bundle; and
 - which immutable Targeter manifest and report contain the current occurrence
@@ -69,9 +72,10 @@ including continuity retirement that publishes an empty generation.
 
 ## 3. Deterministic selected projection
 
-Only IDs in `selection.bundle_ids` become occurrences. Rejected candidates,
-unselected catalogues, target-record artifacts, report bodies, and arbitrary
-vendor JSON do not enter SQL.
+Only IDs in `selection.bundle_ids` become selection occurrences. A prior
+selected bundle may additionally produce a retirement observation under §4.
+Rejected candidates, unselected catalogues, target-record artifacts, report
+bodies, and arbitrary vendor JSON do not enter SQL.
 
 For each selected current candidate, the projector requires and normalizes:
 
@@ -92,7 +96,7 @@ current run. This includes `held_current_candidate`: Targeter's v3 publication
 contract re-origins a current candidate even when continuity protected its
 budget position.
 
-## 4. Retained continuity and origin
+## 4. Continuity origin and retirement
 
 Targeter's v3 continuity behavior remains unchanged. In particular, retained
 targets can be absent from current candidates and catalogues, and unknown
@@ -122,10 +126,24 @@ Origin cycles, missing objects, wrong identities, a retained origin, a missing
 origin bundle, or timing/target drift reject the current occurrence's entire
 run transaction. Universe never guesses or admits unresolved origin.
 
-Dispositions for non-selected bundles (`all_markets_terminal`,
-`terminal_clamp_elapsed`, or `continuity_budget_trimmed`) do not become
-occurrences. They remain in the authoritative report; an empty run remains
-visible through run history.
+Targeter and the venues do not supply an exact event-end timestamp. In
+particular, Targeter's terminal probes classify a held market for one run but
+do not timestamp when its state changed. Universe therefore does not expose a
+misleading `ended_at` value.
+
+For `all_markets_terminal`, Universe verifies that every target in the
+continuity evidence has a `terminal` probe and records the report's
+`generated_at` as `terminal_observed_at`. The actual all-terminal transition
+happened no later than this observation, normally within one Targeter cadence.
+For `terminal_clamp_elapsed`, it records `retired_at` and the disposition but
+leaves `terminal_observed_at` null: the clamp is safe eviction, not proof of
+the event's real end.
+
+Both retirement paths require the same non-null immutable origin identities as
+a retained selection. Universe recursively verifies that complete origin and
+requires exact activation, capture-start, target, and subscription context.
+`continuity_budget_trimmed` is not an event ending and is not projected. An
+empty run and every retirement observation remain visible through run history.
 
 ## 5. Incremental sync and bounded backfill
 
@@ -175,7 +193,9 @@ It contains:
 - `bundle_contexts` and normalized child tables: content-addressed selected
   event, market, target, asset, and relationship context;
 - `selection_occurrences`: append-only `(run_id, bundle_id)` history and exact
-  complete/retained origin reference; and
+  complete/retained origin reference;
+- `bundle_retirements`: append-only all-terminal or clamp observations linked
+  to an exact complete origin and normalized context; and
 - `checkpoints`: incremental discovery progress only.
 
 It contains no report/catalogue JSON, active-snapshot table, raw segment,
@@ -220,6 +240,13 @@ selection and per-run queries; selected-time sorting is the default for bundle
 history. API source/origin objects return exact Targeter manifest/report S3 keys
 and SHA-256 identities. They do not return or infer raw capture-object locations.
 
+Selection list and detail responses include `retirement: null` until a terminal
+or clamp observation is indexed. Afterwards the object supplies `retired_at`,
+the disposition, nullable `terminal_observed_at`, and the exact retirement
+report's run ID, manifest/report S3 keys, and hashes. An all-terminal
+`terminal_observed_at` is an observation upper bound, not a fabricated exact
+match-end timestamp.
+
 The API process requires no S3 credentials. Its audit endpoint verifies the
 stored normalized projection. The sync layer additionally supports an
 authoritative audit that rereads the exact manifest/report bytes from S3 before
@@ -259,13 +286,17 @@ V1 is complete when tests prove:
 1. strict v3 manifest/report identities, including shared bounded Zstd decode;
 2. fresh latest-run bootstrap and append-only incremental history;
 3. bounded, idempotent backfill directly from existing reports;
-4. deterministic selected-only projection and context deduplication;
-5. exact recursive retained-origin resolution outside requested ranges;
-6. fail-closed origin identity, context, and target/timing checks;
+4. deterministic selected-lifecycle projection and context deduplication;
+5. exact recursive retained/retirement origin resolution outside requested
+   ranges;
+6. fail-closed origin identity, context, target/timing, and all-terminal probe
+   checks;
 7. visible incomplete and complete-empty run history without false selections;
 8. independent event-time and Targeter-time filtering with stable pagination;
 9. local SQL projection audit and authoritative source re-verification;
-10. absence of Universe archive sidecars and raw/control/replay tables or APIs;
-11. independently readable SQLite backup; and
-12. no legacy report admission, UI change, durable Universe pointer, or
+10. honest terminal-observation versus clamp semantics without a fabricated
+    exact event-end timestamp;
+11. absence of Universe archive sidecars and raw/control/replay tables or APIs;
+12. independently readable SQLite backup; and
+13. no legacy report admission, UI change, durable Universe pointer, or
     Targeter continuity weakening.

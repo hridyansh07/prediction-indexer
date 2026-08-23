@@ -273,37 +273,145 @@ def project_selected_bundles(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _retained_row(
-    *,
-    run_id: str,
-    generated_at: Any,
-    input_complete: bool,
-    strategy_version: int,
-    bundle_id: str,
-    evidence: Mapping[str, Any],
-    disposition: str | None,
-    targets: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if disposition != "retained":
-        raise SelectedBundleIndexError(
-            f"retained bundle {bundle_id} has invalid continuity disposition"
+def project_bundle_retirements(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project terminal/clamp retirement observations from one v3 report."""
+    if report.get("report_version") != 3 or report.get("mode") != "shadow":
+        raise ProjectionError("bundle retirement projection requires a v3 shadow report")
+    if report.get("input_complete") is not True:
+        raise ProjectionError("bundle retirement projection requires complete input")
+    run_id = _text(report, "run_id", "report")
+    generated_at = _timestamp(report, "generated_at", "report")
+    selection = report.get("selection")
+    if not isinstance(selection, Mapping):
+        raise ProjectionError("report.selection must be an object")
+    selected_ids = set(
+        _text_list(selection.get("bundle_ids"), "selection.bundle_ids")
+    )
+    continuity = report.get("continuity")
+    if not isinstance(continuity, Mapping):
+        raise ProjectionError("report.continuity must be an object")
+    raw_dispositions = continuity.get("dispositions")
+    if not isinstance(raw_dispositions, Mapping) or not all(
+        isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+        for key, value in raw_dispositions.items()
+    ):
+        raise ProjectionError("continuity.dispositions must be a text map")
+    raw_bundles = continuity.get("bundles")
+    if not isinstance(raw_bundles, list):
+        raise ProjectionError("continuity.bundles must be an array")
+    bundles: dict[str, Mapping[str, Any]] = {}
+    for value in raw_bundles:
+        if not isinstance(value, Mapping):
+            raise ProjectionError("continuity bundle must be an object")
+        bundle_id = _text(value, "bundle_id", "continuity bundle")
+        if bundle_id in bundles:
+            raise ProjectionError(f"continuity repeats bundle {bundle_id}")
+        bundles[bundle_id] = value
+
+    rows: list[dict[str, Any]] = []
+    for bundle_id, disposition in sorted(raw_dispositions.items()):
+        if disposition not in {"all_markets_terminal", "terminal_clamp_elapsed"}:
+            continue
+        if bundle_id in selected_ids:
+            raise ProjectionError(f"retired bundle {bundle_id} remains selected")
+        evidence = bundles.get(bundle_id)
+        if evidence is None:
+            raise ProjectionError(f"retired bundle {bundle_id} has no continuity evidence")
+        activation, targets, probe_states = _continuity_targets(
+            evidence, bundle_id, require_terminal_probes=True
         )
-    if not targets:
-        raise SelectedBundleIndexError(f"retained bundle {bundle_id} has no targets")
-    activation = _timestamp(evidence, "activation_at", f"continuity bundle {bundle_id}")
+        if any(target["activation_at"] != isoformat(activation) for target in targets):
+            raise ProjectionError(
+                f"retired bundle {bundle_id} activation disagrees across targets"
+            )
+        capture_starts = {target["capture_start_at"] for target in targets}
+        if len(capture_starts) != 1:
+            raise ProjectionError(
+                f"retired bundle {bundle_id} capture start disagrees across targets"
+            )
+        terminal_observed = disposition == "all_markets_terminal"
+        if terminal_observed and any(state != "terminal" for state in probe_states):
+            raise ProjectionError(
+                f"all-terminal bundle {bundle_id} has a non-terminal target probe"
+            )
+        origin_key = _text(
+            evidence,
+            "origin_archive_manifest_key",
+            f"continuity bundle {bundle_id}",
+        )
+        try:
+            normalize_key(origin_key)
+        except ValueError as error:
+            raise ProjectionError(
+                f"continuity bundle {bundle_id} origin manifest key is invalid"
+            ) from error
+        rows.append(
+            {
+                "projection_version": PROJECTION_VERSION,
+                "run_id": run_id,
+                "retired_at": isoformat(generated_at),
+                "bundle_id": bundle_id,
+                "origin_run_id": _text(
+                    evidence, "origin_run_id", f"continuity bundle {bundle_id}"
+                ),
+                "origin_report_sha256": _sha256(
+                    evidence.get("origin_report_sha256"),
+                    f"continuity bundle {bundle_id} origin report",
+                ),
+                "origin_archive_manifest_key": origin_key,
+                "origin_archive_manifest_sha256": _sha256(
+                    evidence.get("origin_archive_manifest_sha256"),
+                    f"continuity bundle {bundle_id} origin manifest",
+                ),
+                "disposition": disposition,
+                "terminal_observed": terminal_observed,
+                "activation_at": isoformat(activation),
+                "capture_start_at": next(iter(capture_starts)),
+                "targets": targets,
+            }
+        )
+    return rows
+
+
+def _continuity_targets(
+    evidence: Mapping[str, Any],
+    bundle_id: str,
+    *,
+    require_terminal_probes: bool,
+) -> tuple[Any, list[dict[str, Any]], list[str]]:
+    activation = _timestamp(
+        evidence, "activation_at", f"continuity bundle {bundle_id}"
+    )
     raw_targets = evidence.get("targets")
     if not isinstance(raw_targets, list) or not raw_targets:
-        raise SelectedBundleIndexError(
+        raise ProjectionError(
             f"continuity bundle {bundle_id} targets must be a non-empty array"
         )
-    continuity_targets: list[dict[str, Any]] = []
+    targets: list[dict[str, Any]] = []
+    probe_states: list[str] = []
     for target in raw_targets:
         if not isinstance(target, Mapping):
-            raise SelectedBundleIndexError(
+            raise ProjectionError(
                 f"continuity bundle {bundle_id} target must be an object"
             )
         target_id = _text(target, "target_id", "continuity target")
-        continuity_targets.append(
+        if require_terminal_probes:
+            probe = target.get("terminal_probe")
+            if (
+                not isinstance(probe, Mapping)
+                or probe.get("state") not in {"open", "terminal", "unknown"}
+                or not isinstance(probe.get("reason"), str)
+                or not probe["reason"]
+            ):
+                raise ProjectionError(
+                    f"continuity bundle {bundle_id} target {target_id} "
+                    "has an invalid terminal probe"
+                )
+            probe_states.append(str(probe["state"]))
+        targets.append(
             {
                 "venue": _text(target, "venue", "continuity target"),
                 "target_id": target_id,
@@ -325,8 +433,32 @@ def _retained_row(
                 "source_ref": _text(target, "source_ref", "continuity target"),
             }
         )
-    normalized = sorted(
-        continuity_targets, key=lambda item: (item["venue"], item["target_id"])
+    return (
+        activation,
+        sorted(targets, key=lambda item: (item["venue"], item["target_id"])),
+        probe_states,
+    )
+
+
+def _retained_row(
+    *,
+    run_id: str,
+    generated_at: Any,
+    input_complete: bool,
+    strategy_version: int,
+    bundle_id: str,
+    evidence: Mapping[str, Any],
+    disposition: str | None,
+    targets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if disposition != "retained":
+        raise SelectedBundleIndexError(
+            f"retained bundle {bundle_id} has invalid continuity disposition"
+        )
+    if not targets:
+        raise SelectedBundleIndexError(f"retained bundle {bundle_id} has no targets")
+    activation, normalized, _probe_states = _continuity_targets(
+        evidence, bundle_id, require_terminal_probes=False
     )
     if targets != normalized:
         raise SelectedBundleIndexError(

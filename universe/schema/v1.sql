@@ -135,6 +135,24 @@ CREATE INDEX selection_occurrences_context
 CREATE INDEX selection_occurrences_origin
     ON selection_occurrences(origin_run_id, bundle_id, run_id);
 
+CREATE TABLE bundle_retirements (
+    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
+    bundle_id TEXT NOT NULL,
+    origin_run_id TEXT NOT NULL,
+    context_sha256 TEXT NOT NULL
+        REFERENCES bundle_contexts(context_sha256),
+    disposition TEXT NOT NULL CHECK(
+        disposition IN ('all_markets_terminal', 'terminal_clamp_elapsed')
+    ),
+    PRIMARY KEY(run_id, bundle_id),
+    FOREIGN KEY(origin_run_id, bundle_id)
+        REFERENCES selection_occurrences(run_id, bundle_id)
+) STRICT;
+CREATE INDEX bundle_retirements_bundle
+    ON bundle_retirements(bundle_id, run_id);
+CREATE INDEX bundle_retirements_origin
+    ON bundle_retirements(origin_run_id, bundle_id, run_id);
+
 CREATE TABLE checkpoints (
     name TEXT PRIMARY KEY,
     cursor TEXT NOT NULL,

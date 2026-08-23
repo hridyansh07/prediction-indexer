@@ -19,16 +19,22 @@ from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from universe.api import UniverseApplication
 from universe.backfill import backfill_targeter_history
 from universe.config import UniverseConfigError, load_config
-from universe.projection import ProjectionError, project_selected_bundles
+from universe.projection import (
+    ProjectionError,
+    project_bundle_retirements,
+    project_selected_bundles,
+)
 from universe.store import EvidenceConflict, UniverseStore, file_sha256
 from universe.sync import UniverseSync
 
 R1 = "20260101T000000.000001Z"
 R2 = "20260101T001000.000002Z"
 R3 = "20260101T002000.000003Z"
+R4 = "20260101T040000.000004Z"
 G1 = "2026-01-01T00:00:00.000001Z"
 G2 = "2026-01-01T00:10:00.000002Z"
 G3 = "2026-01-01T00:20:00.000003Z"
+G4 = "2026-01-01T04:00:00.000004Z"
 
 
 class _Adapter:
@@ -180,6 +186,46 @@ def _retained_report(
     return report
 
 
+def _retirement_report(
+    run_id: str,
+    generated_at: str,
+    origin: dict[str, str | int],
+    *,
+    disposition: str = "all_markets_terminal",
+) -> dict:
+    report = _empty_report(run_id, generated_at)
+    source = _selection_report(str(origin["run_id"]), G1)
+    probe_state = "terminal" if disposition == "all_markets_terminal" else "unknown"
+    targets = [
+        {
+            **target,
+            "venue": venue,
+            "venue_market_id": target["target_id"].split(":", 1)[1],
+            "terminal_probe": {"state": probe_state, "reason": "test_probe"},
+        }
+        for venue, values in source["selection"]["targets"].items()
+        for target in values
+    ]
+    report["continuity"] = {
+        "bundles": [
+            {
+                "base_run_id": origin["run_id"],
+                "bundle_id": "bundle-1",
+                "activation_at": "2026-01-01T03:00:00Z",
+                "score": 10.0,
+                "targets": targets,
+                "origin_run_id": origin["run_id"],
+                "origin_report_sha256": origin["report_sha256"],
+                "origin_archive_manifest_key": origin["manifest_key"],
+                "origin_archive_manifest_sha256": origin["manifest_sha256"],
+            }
+        ],
+        "retained_bundle_ids": [],
+        "dispositions": {"bundle-1": disposition},
+    }
+    return report
+
+
 def _put(
     store: LocalObjectStore,
     key: str,
@@ -294,6 +340,30 @@ class ProjectionTests(unittest.TestCase):
         report = _selection_report(R1, G1, input_complete=False)
         with self.assertRaisesRegex(ProjectionError, "complete input"):
             project_selected_bundles(report)
+
+    def test_retirement_distinguishes_terminal_observation_from_clamp(self) -> None:
+        origin = {
+            "run_id": R1,
+            "report_sha256": "a" * 64,
+            "manifest_key": (
+                f"targeter-v2/runs/date=2026-01-01/run={R1}/run_manifest.json"
+            ),
+            "manifest_sha256": "b" * 64,
+        }
+        terminal = _retirement_report(R4, G4, origin)
+        self.assertTrue(project_bundle_retirements(terminal)[0]["terminal_observed"])
+
+        terminal["continuity"]["bundles"][0]["targets"][0]["terminal_probe"] = {
+            "state": "unknown",
+            "reason": "probe_failed",
+        }
+        with self.assertRaisesRegex(ProjectionError, "non-terminal target probe"):
+            project_bundle_retirements(terminal)
+
+        clamped = _retirement_report(
+            R4, G4, origin, disposition="terminal_clamp_elapsed"
+        )
+        self.assertFalse(project_bundle_retirements(clamped)[0]["terminal_observed"])
 
 
 class EventUniverseTests(unittest.TestCase):
@@ -439,6 +509,45 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(len(result.failures), 1)
         self.assertIn("report identity disagrees", result.failures[0])
         self.assertEqual(self.database.status()["counts"]["targeter_runs"], 0)
+
+    def test_all_terminal_continuity_records_proven_observed_end(self) -> None:
+        origin = _publish_run(self.objects, _selection_report(R1, G1))
+        retirement = _publish_run(
+            self.objects,
+            _retirement_report(R4, G4, origin),
+        )
+
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, 3, 59, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 4, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(result.origin_dependencies_ingested, 1)
+        detail = self.database.selection_detail(R1, "bundle-1")
+        assert detail is not None
+        self.assertEqual(
+            detail["retirement"],
+            {
+                "retired_at": G4,
+                "disposition": "all_markets_terminal",
+                "terminal_observed_at": G4,
+                "source": {
+                    "run_id": R4,
+                    "manifest_key": retirement["manifest_key"],
+                    "manifest_sha256": retirement["manifest_sha256"],
+                    "report_key": retirement["report_key"],
+                    "report_sha256": retirement["report_sha256"],
+                },
+            },
+        )
+        self.assertNotIn("ended_at", detail)
+        selections, _more = self.database.list_selections()
+        self.assertEqual(selections[0]["retirement"], detail["retirement"])
+        self.assertTrue(self.database.audit_run(R4)["ok"])
+        self.assertEqual(
+            self.database.status()["counts"]["bundle_retirements"], 1
+        )
 
     def test_incomplete_and_complete_empty_runs_are_visible_without_selections(self) -> None:
         _publish_run(self.objects, _empty_report(R1, G1, input_complete=False))

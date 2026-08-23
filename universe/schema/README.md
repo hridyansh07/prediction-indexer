@@ -11,7 +11,9 @@ archive:
 - content-addressed `bundle_contexts` and normalized child tables deduplicate
   selected event, sibling-market, target, asset, and relationship context;
 - `selection_occurrences` records every selected `(run_id, bundle_id)` and
-  references a non-null complete origin occurrence; and
+  references a non-null complete origin occurrence;
+- `bundle_retirements` records proven all-terminal or safety-clamp observations
+  and references their exact complete origin context; and
 - `checkpoints` records incremental S3 discovery progress.
 
 The schema has no active-snapshot, catalogue, raw segment, control, connection

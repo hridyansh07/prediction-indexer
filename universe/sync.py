@@ -19,7 +19,11 @@ from archive.storage.base import (
 )
 from encoder import LogicalIdentity, StoredIdentity, decode_stream
 from targeter.v2.models import parse_timestamp
-from universe.projection import PROJECTION_VERSION, project_selected_bundles
+from universe.projection import (
+    PROJECTION_VERSION,
+    project_bundle_retirements,
+    project_selected_bundles,
+)
 from universe.store import EvidenceConflict, UniverseStore
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -77,6 +81,7 @@ class _VerifiedRun:
     report_item: _RunObject
     report: dict[str, Any]
     projected: tuple[dict[str, Any], ...]
+    retirements: tuple[dict[str, Any], ...]
 
 
 class UniverseSync:
@@ -256,6 +261,25 @@ class UniverseSync:
                         "context": context,
                     }
                 )
+            resolved_retirements: list[dict[str, Any]] = []
+            for row in verified.retirements:
+                context = self._resolve_retirement_context(
+                    verified,
+                    row,
+                    stack=stack,
+                    force=force,
+                    result=result,
+                )
+                resolved_retirements.append(
+                    {
+                        "run_id": verified.manifest.run_id,
+                        "bundle_id": row["bundle_id"],
+                        "origin_run_id": row["origin_run_id"],
+                        "disposition": row["disposition"],
+                        "terminal_observed": row["terminal_observed"],
+                        "context": context,
+                    }
+                )
             report_logical = verified.report_item.logical
             status = self.database.ingest_run(
                 run_id=verified.manifest.run_id,
@@ -280,6 +304,7 @@ class UniverseSync:
                     else verified.report_item.stored.byte_length
                 ),
                 occurrences=resolved,
+                retirements=resolved_retirements,
             )
             if dependency and status == "ingested" and result is not None:
                 result.origin_dependencies_ingested += 1
@@ -296,24 +321,82 @@ class UniverseSync:
         force: bool,
         result: SyncResult | None,
     ) -> dict[str, Any]:
+        context = self._resolve_origin_context(
+            current,
+            row,
+            label="retained bundle",
+            stack=stack,
+            force=force,
+            result=result,
+        )
         bundle_id = _required_text(row, "bundle_id", "retained occurrence")
-        origin_run_id = _required_text(row, "origin_run_id", "retained occurrence")
+        if (
+            row.get("activation_at") != context["activation_at"]
+            or row.get("capture_start_at") != context["capture_start_at"]
+            or _projected_targets(row.get("targets")) != context["targets"]
+        ):
+            raise UniverseSyncError(
+                f"retained bundle {bundle_id} disagrees with its immutable origin"
+            )
+        return context
+
+    def _resolve_retirement_context(
+        self,
+        current: _VerifiedRun,
+        row: Mapping[str, Any],
+        *,
+        stack: set[str],
+        force: bool,
+        result: SyncResult | None,
+    ) -> dict[str, Any]:
+        context = self._resolve_origin_context(
+            current,
+            row,
+            label="retired bundle",
+            stack=stack,
+            force=force,
+            result=result,
+        )
+        bundle_id = _required_text(row, "bundle_id", "retirement")
+        if (
+            row.get("activation_at") != context["activation_at"]
+            or row.get("capture_start_at") != context["capture_start_at"]
+            or _projected_targets(row.get("targets")) != context["targets"]
+        ):
+            raise UniverseSyncError(
+                f"retired bundle {bundle_id} disagrees with its immutable origin"
+            )
+        return context
+
+    def _resolve_origin_context(
+        self,
+        current: _VerifiedRun,
+        row: Mapping[str, Any],
+        *,
+        label: str,
+        stack: set[str],
+        force: bool,
+        result: SyncResult | None,
+    ) -> dict[str, Any]:
+        evidence_label = f"{label} evidence"
+        bundle_id = _required_text(row, "bundle_id", evidence_label)
+        origin_run_id = _required_text(row, "origin_run_id", evidence_label)
         origin_key = _required_text(
-            row, "origin_archive_manifest_key", "retained occurrence"
+            row, "origin_archive_manifest_key", evidence_label
         )
         origin_manifest_sha256 = _required_text(
-            row, "origin_archive_manifest_sha256", "retained occurrence"
+            row, "origin_archive_manifest_sha256", evidence_label
         )
         origin_report_sha256 = _required_text(
-            row, "origin_report_sha256", "retained occurrence"
+            row, "origin_report_sha256", evidence_label
         )
         if origin_run_id >= current.manifest.run_id:
             raise UniverseSyncError(
-                f"retained bundle {bundle_id} origin is not older than its occurrence"
+                f"{label} {bundle_id} origin is not older than its occurrence"
             )
         if _manifest_run_id(origin_key) != origin_run_id:
             raise UniverseSyncError(
-                f"retained bundle {bundle_id} origin key disagrees with origin_run_id"
+                f"{label} {bundle_id} origin key disagrees with origin_run_id"
             )
         context = self.database.origin_context(
             run_id=origin_run_id,
@@ -341,15 +424,7 @@ class UniverseSync:
             )
         if context is None:
             raise UniverseSyncError(
-                f"retained bundle {bundle_id} has no complete origin occurrence"
-            )
-        if (
-            row.get("activation_at") != context["activation_at"]
-            or row.get("capture_start_at") != context["capture_start_at"]
-            or _projected_targets(row.get("targets")) != context["targets"]
-        ):
-            raise UniverseSyncError(
-                f"retained bundle {bundle_id} disagrees with its immutable origin"
+                f"{label} {bundle_id} has no complete origin occurrence"
             )
         return context
 
@@ -410,7 +485,12 @@ class UniverseSync:
             if manifest.input_complete
             else ()
         )
-        return _VerifiedRun(manifest, report_item, report, projected)
+        retirements = (
+            tuple(project_bundle_retirements(report))
+            if manifest.input_complete
+            else ()
+        )
+        return _VerifiedRun(manifest, report_item, report, projected, retirements)
 
     def _read_run_manifest(
         self, key: str, *, expected_sha256: str | None

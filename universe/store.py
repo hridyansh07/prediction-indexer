@@ -119,8 +119,9 @@ class UniverseStore:
         report_decoded_sha256: str,
         report_decoded_byte_length: int,
         occurrences: Iterable[Mapping[str, Any]],
+        retirements: Iterable[Mapping[str, Any]],
     ) -> str:
-        """Atomically append one verified run and its selected occurrences."""
+        """Atomically append one verified run and its lifecycle projection."""
         run_id = _nonempty(run_id, "run_id")
         generated_at = _canonical_timestamp(generated_at, "generated_at")
         if not isinstance(input_complete, bool):
@@ -159,12 +160,29 @@ class UniverseStore:
             _occurrence(dict(value), expected_run_id=run_id) for value in occurrences
         ]
         normalized.sort(key=lambda value: value["bundle_id"])
+        normalized_retirements = [
+            _retirement(dict(value), expected_run_id=run_id) for value in retirements
+        ]
+        normalized_retirements.sort(key=lambda value: value["bundle_id"])
         bundle_ids = [value["bundle_id"] for value in normalized]
+        retired_bundle_ids = [
+            value["bundle_id"] for value in normalized_retirements
+        ]
         if len(bundle_ids) != len(set(bundle_ids)):
             raise EvidenceConflict(f"run {run_id} repeats a selected bundle")
-        if not input_complete and normalized:
-            raise EvidenceConflict("incomplete Targeter runs cannot admit selections")
-        projection_entries = [_projection_entry(value) for value in normalized]
+        if len(retired_bundle_ids) != len(set(retired_bundle_ids)):
+            raise EvidenceConflict(f"run {run_id} repeats a retired bundle")
+        if set(bundle_ids) & set(retired_bundle_ids):
+            raise EvidenceConflict(f"run {run_id} selects and retires the same bundle")
+        if not input_complete and (normalized or normalized_retirements):
+            raise EvidenceConflict("incomplete Targeter runs cannot admit lifecycle rows")
+        projection_entries = [
+            *(_projection_entry(value) for value in normalized),
+            *(
+                _retirement_projection_entry(value)
+                for value in normalized_retirements
+            ),
+        ]
         projection_sha256 = _records_sha256(projection_entries)
         generated_at_ns = _timestamp_ns(generated_at)
         expected = {
@@ -184,7 +202,7 @@ class UniverseStore:
             "report_decoded_byte_length": report_decoded_byte_length,
             "projection_version": PROJECTION_VERSION,
             "projection_sha256": projection_sha256,
-            "projection_row_count": len(normalized),
+            "projection_row_count": len(projection_entries),
         }
 
         with self.write_transaction() as connection:
@@ -231,7 +249,7 @@ class UniverseStore:
                     report_decoded_byte_length,
                     PROJECTION_VERSION,
                     projection_sha256,
-                    len(normalized),
+                    len(projection_entries),
                     indexed_at_ns,
                 ),
             )
@@ -269,6 +287,38 @@ class UniverseStore:
                         value["origin_run_id"],
                         int(value["continuity_selected"]),
                         value["continuity_disposition"],
+                    ),
+                )
+            for value in normalized_retirements:
+                context = value["context"]
+                context_sha256 = value["context_sha256"]
+                self._insert_context(connection, context_sha256, context)
+                origin = connection.execute(
+                    """SELECT context_sha256, occurrence_kind, origin_run_id
+                       FROM selection_occurrences
+                       WHERE run_id = ? AND bundle_id = ?""",
+                    (value["origin_run_id"], value["bundle_id"]),
+                ).fetchone()
+                if (
+                    origin is None
+                    or origin["occurrence_kind"] != "complete"
+                    or origin["origin_run_id"] != value["origin_run_id"]
+                    or origin["context_sha256"] != context_sha256
+                ):
+                    raise EvidenceConflict(
+                        f"retired bundle {value['bundle_id']} has no exact complete origin"
+                    )
+                connection.execute(
+                    """INSERT INTO bundle_retirements(
+                           run_id, bundle_id, origin_run_id, context_sha256,
+                           disposition
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        value["bundle_id"],
+                        value["origin_run_id"],
+                        context_sha256,
+                        value["disposition"],
                     ),
                 )
         return "ingested"
@@ -464,6 +514,12 @@ class UniverseStore:
                WHERE run_id = ? ORDER BY bundle_id""",
             (run_id,),
         ).fetchall()
+        retirement_rows = connection.execute(
+            """SELECT bundle_id, context_sha256, origin_run_id, disposition
+               FROM bundle_retirements
+               WHERE run_id = ? ORDER BY bundle_id""",
+            (run_id,),
+        ).fetchall()
         entries: list[dict[str, Any]] = []
         context_ok = True
         for row in rows:
@@ -480,10 +536,22 @@ class UniverseStore:
                     "continuity_disposition": row["continuity_disposition"],
                 }
             )
+        for row in retirement_rows:
+            context = self._context(connection, row["context_sha256"])
+            actual_context_sha256 = _context_sha256(context)
+            context_ok = context_ok and actual_context_sha256 == row["context_sha256"]
+            entries.append(
+                {
+                    "bundle_id": row["bundle_id"],
+                    "context_sha256": actual_context_sha256,
+                    "origin_run_id": row["origin_run_id"],
+                    "retirement_disposition": row["disposition"],
+                }
+            )
         actual_sha256 = _records_sha256(entries)
         ok = (
             run["projection_version"] == PROJECTION_VERSION
-            and run["projection_row_count"] == len(rows)
+            and run["projection_row_count"] == len(entries)
             and run["projection_sha256"] == actual_sha256
             and context_ok
         )
@@ -494,7 +562,9 @@ class UniverseStore:
             "stored_sha256": run["projection_sha256"],
             "actual_sha256": actual_sha256,
             "stored_row_count": run["projection_row_count"],
-            "actual_row_count": len(rows),
+            "actual_row_count": len(entries),
+            "selection_row_count": len(rows),
+            "retirement_row_count": len(retirement_rows),
             "contexts_ok": context_ok,
         }
 
@@ -513,6 +583,7 @@ class UniverseStore:
                 for table in (
                     "targeter_runs",
                     "selection_occurrences",
+                    "bundle_retirements",
                     "bundle_contexts",
                     "context_targets",
                 )
@@ -777,11 +848,29 @@ _SELECTION_QUERY = """SELECT
     origin.manifest_key AS origin_manifest_key,
     origin.manifest_sha256 AS origin_manifest_sha256,
     origin.report_key AS origin_report_key,
-    origin.report_sha256 AS origin_report_sha256
+    origin.report_sha256 AS origin_report_sha256,
+    retired.run_id AS retirement_run_id,
+    retired.generated_at AS retired_at,
+    retirement.disposition AS retirement_disposition,
+    retired.manifest_key AS retirement_manifest_key,
+    retired.manifest_sha256 AS retirement_manifest_sha256,
+    retired.report_key AS retirement_report_key,
+    retired.report_sha256 AS retirement_report_sha256
 FROM selection_occurrences o
 JOIN bundle_contexts c USING (context_sha256)
 JOIN targeter_runs r ON r.run_id = o.run_id
-JOIN targeter_runs origin ON origin.run_id = o.origin_run_id"""
+JOIN targeter_runs origin ON origin.run_id = o.origin_run_id
+LEFT JOIN bundle_retirements retirement
+    ON retirement.bundle_id = o.bundle_id
+   AND retirement.run_id = (
+       SELECT candidate.run_id
+       FROM bundle_retirements candidate
+       JOIN targeter_runs candidate_run ON candidate_run.run_id = candidate.run_id
+       WHERE candidate.bundle_id = o.bundle_id
+       ORDER BY candidate_run.generated_at_ns, candidate.run_id
+       LIMIT 1
+   )
+LEFT JOIN targeter_runs retired ON retired.run_id = retirement.run_id"""
 
 
 def file_sha256(path: Path) -> tuple[str, int]:
@@ -825,6 +914,38 @@ def _occurrence(record: dict[str, Any], *, expected_run_id: str) -> dict[str, An
         or disposition != "retained"
     ):
         raise EvidenceConflict(f"retained occurrence {bundle_id} provenance is invalid")
+    context = _context_record(record["context"], expected_bundle_id=bundle_id)
+    return {
+        **record,
+        "bundle_id": bundle_id,
+        "origin_run_id": origin_run_id,
+        "context": context,
+        "context_sha256": _context_sha256(context),
+    }
+
+
+def _retirement(record: dict[str, Any], *, expected_run_id: str) -> dict[str, Any]:
+    expected = {
+        "run_id",
+        "bundle_id",
+        "origin_run_id",
+        "disposition",
+        "terminal_observed",
+        "context",
+    }
+    if set(record) != expected or record.get("run_id") != expected_run_id:
+        raise EvidenceConflict("bundle retirement fields disagree with its run")
+    bundle_id = _nonempty(record["bundle_id"], "bundle_id")
+    origin_run_id = _nonempty(record["origin_run_id"], "origin_run_id")
+    disposition = record["disposition"]
+    terminal_observed = record["terminal_observed"]
+    if (
+        origin_run_id == expected_run_id
+        or disposition not in {"all_markets_terminal", "terminal_clamp_elapsed"}
+        or not isinstance(terminal_observed, bool)
+        or terminal_observed != (disposition == "all_markets_terminal")
+    ):
+        raise EvidenceConflict(f"retired bundle {bundle_id} provenance is invalid")
     context = _context_record(record["context"], expected_bundle_id=bundle_id)
     return {
         **record,
@@ -988,6 +1109,15 @@ def _projection_entry(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _retirement_projection_entry(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "bundle_id": value["bundle_id"],
+        "context_sha256": value["context_sha256"],
+        "origin_run_id": value["origin_run_id"],
+        "retirement_disposition": value["disposition"],
+    }
+
+
 def _context_sha256(context: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(context).encode("utf-8")).hexdigest()
 
@@ -1010,6 +1140,24 @@ def _run_record(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _selection_record(row: sqlite3.Row) -> dict[str, Any]:
+    retirement = None
+    if row["retirement_run_id"] is not None:
+        retirement = {
+            "retired_at": row["retired_at"],
+            "disposition": row["retirement_disposition"],
+            "terminal_observed_at": (
+                row["retired_at"]
+                if row["retirement_disposition"] == "all_markets_terminal"
+                else None
+            ),
+            "source": {
+                "run_id": row["retirement_run_id"],
+                "manifest_key": row["retirement_manifest_key"],
+                "manifest_sha256": row["retirement_manifest_sha256"],
+                "report_key": row["retirement_report_key"],
+                "report_sha256": row["retirement_report_sha256"],
+            },
+        }
     return {
         "run_id": row["run_id"],
         "generated_at": row["generated_at"],
@@ -1022,6 +1170,7 @@ def _selection_record(row: sqlite3.Row) -> dict[str, Any]:
         "topology": row["topology"],
         "activation_at": row["activation_at"],
         "capture_start_at": row["capture_start_at"],
+        "retirement": retirement,
         "source": {
             "manifest_key": row["manifest_key"],
             "manifest_sha256": row["manifest_sha256"],

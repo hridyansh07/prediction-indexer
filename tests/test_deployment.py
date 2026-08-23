@@ -137,6 +137,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         )
         self.assertIn("CREATE TABLE selection_occurrences", schema)
         self.assertIn("CREATE TABLE bundle_contexts", schema)
+        self.assertIn("CREATE TABLE bundle_retirements", schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
             self.assertNotIn(stale, schema)
         self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
