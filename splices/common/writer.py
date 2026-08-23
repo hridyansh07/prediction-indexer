@@ -168,10 +168,28 @@ class LaneWriter:
         """
         if self._closed:
             raise RuntimeError("lane writer is closed")
+        if self._fatal is not None:
+            raise self._fatal
         if self._queue.full():
             self.queue_full_events += 1
         await self._queue.put(record)
+        # The drainer may have failed while this put was suspended. Refuse to
+        # let the producer begin another receive iteration after storage died.
+        if self._fatal is not None:
+            raise self._fatal
         self.queue_high_water = max(self.queue_high_water, self._queue.qsize())
+
+    async def wait_failed(self) -> None:
+        """Waits until the disk drainer fails, then propagates its exception.
+
+        Shielding is important: the splice cancels this watcher when it stops
+        normally, but that must not cancel the drainer before synchronous close
+        has flushed and sealed the accepted records.
+        """
+        if self._drain is None:
+            raise RuntimeError("lane writer has not been started")
+        await asyncio.shield(self._drain)
+        raise RuntimeError("lane writer stopped without an error")
 
     async def rotate_at(self, start_ns: int) -> None:
         """Queues a segment boundary in-band, exactly as the clock does.

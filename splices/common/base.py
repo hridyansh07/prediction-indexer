@@ -376,12 +376,32 @@ class BaseSplice:
         self.spool.start()
 
         try:
-            return await self._run_until_stopped(
-                started=started,
-                attempt=attempt,
-                stop_after_seconds=stop_after_seconds,
-                max_connections=max_connections,
+            capture = asyncio.create_task(
+                self._run_until_stopped(
+                    started=started,
+                    attempt=attempt,
+                    stop_after_seconds=stop_after_seconds,
+                    max_connections=max_connections,
+                )
             )
+            writer_failure = asyncio.create_task(self.spool.wait_for_writer_failure())
+            try:
+                done, _ = await asyncio.wait(
+                    (capture, writer_failure), return_when=asyncio.FIRST_COMPLETED
+                )
+                if writer_failure in done:
+                    capture.cancel()
+                    await asyncio.gather(capture, return_exceptions=True)
+                    return await writer_failure
+
+                writer_failure.cancel()
+                await asyncio.gather(writer_failure, return_exceptions=True)
+                return await capture
+            finally:
+                for task in (capture, writer_failure):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(capture, writer_failure, return_exceptions=True)
         finally:
             # Seals whatever segment is open, whether the loop ended cleanly,
             # raised, or was cancelled. Synchronous on purpose: during

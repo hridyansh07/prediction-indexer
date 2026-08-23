@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -149,6 +150,35 @@ class LaneWriterTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         with self.assertRaises(RuntimeError):
             await writer.append(_record(1, 100))
+
+    async def test_a_dead_drainer_refuses_the_next_append(self):
+        """A storage failure must not turn later backpressure into a silent park."""
+        writer = self._writer(queue_capacity=1)
+        write_started = threading.Event()
+        fail_write_now = threading.Event()
+
+        def fail_write(_records):
+            write_started.set()
+            fail_write_now.wait()
+            raise OSError("simulated full disk")
+
+        original_write = writer.segment.write_batch
+        writer.segment.write_batch = fail_write
+        self.addCleanup(setattr, writer.segment, "write_batch", original_write)
+        writer.start()
+        await writer.append(_record(1, 100))
+        self.assertTrue(await asyncio.to_thread(write_started.wait, 0.1))
+        fail_write_now.set()
+
+        for _ in range(100):
+            await asyncio.sleep(0.001)
+            if writer._drain is not None and writer._drain.done():
+                break
+        self.assertIsNotNone(writer._drain)
+        self.assertTrue(writer._drain.done(), "the injected write failure did not fire")
+
+        with self.assertRaises(OSError):
+            await asyncio.wait_for(writer.append(_record(2, 200)), timeout=0.1)
 
 
 if __name__ == "__main__":

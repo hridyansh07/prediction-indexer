@@ -184,6 +184,12 @@ class Spool:
         self.records_written += 1
         return len(line)
 
+    async def wait_for_writer_failure(self) -> None:
+        """Propagates a background storage failure to the splice run task."""
+        if self._writer is None:
+            raise SpoolError("spool has not been started")
+        await self._writer.wait_failed()
+
     def sync(self) -> None:
         """Best-effort durability point for the cancellation path.
 
