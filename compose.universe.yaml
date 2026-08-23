@@ -1,0 +1,88 @@
+name: prediction-indexer-universe
+
+x-universe-build: &universe-build
+  context: .
+  dockerfile: docker/universe.Dockerfile
+
+x-universe-config-environment: &universe-config-environment
+  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+
+x-universe-job-environment: &universe-job-environment
+  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+  AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+
+x-universe-volume: &universe-volume
+  type: bind
+  source: ${EVENT_UNIVERSE_DATA_ROOT:-./data/event-universe}
+  target: /var/lib/event-universe
+  bind:
+    create_host_path: true
+
+x-universe-config: &universe-config
+  type: bind
+  source: ./configs/event_universe.json
+  target: /etc/prediction-indexer/event_universe.json
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-universe-runtime: &universe-runtime
+  image: ${IMAGE_REGISTRY:-}prediction-indexer-universe:${IMAGE_TAG:-local}
+  build: *universe-build
+  init: true
+  user: "${PUID:-1000}:${PGID:-1000}"
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  environment: *universe-config-environment
+  volumes:
+    - *universe-volume
+    - *universe-config
+
+services:
+  event-universe:
+    <<: *universe-runtime
+    restart: unless-stopped
+    ports:
+      - "${EVENT_UNIVERSE_BIND_ADDRESS:-127.0.0.1}:${EVENT_UNIVERSE_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  event-universe-sync:
+    <<: *universe-runtime
+    profiles: [jobs]
+    restart: "no"
+    environment: *universe-job-environment
+    command: ["python", "-u", "universe/run_sync.py"]
+
+  event-universe-backfill:
+    <<: *universe-runtime
+    profiles: [jobs]
+    restart: "no"
+    environment: *universe-job-environment
+    command: ["python", "-u", "universe/run_backfill.py"]
+
+  event-universe-backup:
+    <<: *universe-runtime
+    profiles: [jobs]
+    restart: "no"
+    environment: *universe-job-environment
+    command: ["python", "-u", "universe/run_backup.py"]

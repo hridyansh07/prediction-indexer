@@ -695,6 +695,58 @@ Container logs rotate at 25 MB with five files per service by default. Override
 `LOG_MAX_SIZE` and `LOG_MAX_FILES` in `.env` if the host has a central log
 collector.
 
+## Event Universe deployment
+
+Event Universe is a separate small-server deployment, not another process on
+the capture/ingester host. `compose.universe.yaml` uses the dedicated
+`docker/universe.Dockerfile`, mounts only its persistent SQLite volume and
+`configs/event_universe.json`, and starts the read server with the image's
+default command:
+
+```bash
+docker compose -f compose.universe.yaml up -d event-universe
+```
+
+The JSON config holds the database path, API listener, S3 archive identity,
+temporary directory, and backup destination. `${ARCHIVE_S3_*}` references are
+expanded from the environment. AWS credentials continue to use boto3's standard
+provider chain; on AWS, prefer an instance role.
+
+Incremental ingestion and backup remain scheduler-owned one-shot jobs, but they
+are direct scripts with no argument parser:
+
+```bash
+python universe/run_sync.py
+python universe/run_backup.py
+```
+
+The store is intentionally sparse and append-only: it indexes historical
+Targeter-selected bundle occurrences plus normalized event, sibling-market,
+target-asset, relationship, and exact source/origin provenance. It does not copy
+catalogues, selection reports, target vendor records, control envelopes, raw
+segments, or venue deliveries into SQLite. The reviewable schema is
+`universe/schema/v1.sql`.
+
+Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
+version-2 S3 run manifests and derives selected occurrences directly from each
+manifest-owned v3 `selection_report.json[.zst]`. Existing archived v3 runs need
+no Universe sidecar or producer backfill. Retained selections recursively verify
+their exact immutable v3 origin manifests, including origins outside the
+requested range. There is no Universe publication pointer; `/healthz` derives
+the latest indexed archived run and marks it stale from that run's
+`generated_at`.
+
+Historical **selected-run** rollout uses `python universe/run_backfill.py` after
+`backfill.generated_start` and `backfill.generated_end` are explicitly set in
+the JSON config. The bounds are half-open Targeter generated times. Backfill and
+incremental sync share one idempotent projector and ingestion transaction. Raw
+segment selection and trust remain replay responsibilities; the archiver has no
+Universe sidecar or receipt-mirror service.
+
+`EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
+backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
+a private interface or authenticated reverse proxy when exposing the API.
+
 ## Clock and liveness semantics
 
 Linux containers share the host kernel's `CLOCK_MONOTONIC` and boot ID. Each

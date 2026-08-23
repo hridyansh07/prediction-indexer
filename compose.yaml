@@ -66,8 +66,12 @@ x-archive-volume: &archive-volume
 
 # Credentials remain outside `.env`: export these in the shell that invokes
 # Compose when a host is not using an AWS instance/task role. Only S3-facing
-# services receive them; venue capture has no archive authority.
+# archive services receive them; venue capture has no archive authority. The
+# non-secret archive identity fields are included for direct config scripts.
 x-aws-archive-environment: &aws-archive-environment
+  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
   AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
   AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"

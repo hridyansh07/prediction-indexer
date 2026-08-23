@@ -21,6 +21,11 @@ fi
 RUSTUP_BIN="$(command -v rustup || printf '%s' "$HOME/.cargo/bin/rustup")"
 "$RUSTUP_BIN" component add --toolchain 1.85.0 rustfmt clippy
 
+if [ ! -x "$REPO_ROOT/.venv/bin/python" ]; then
+	python3 -m venv "$REPO_ROOT/.venv"
+fi
+"$REPO_ROOT/.venv/bin/python" -m pip install -e "$REPO_ROOT"
+
 yarn install --frozen-lockfile
 yarn build:packages
 CARGO_BIN="$(command -v cargo || printf '%s' "$HOME/.cargo/bin/cargo")"

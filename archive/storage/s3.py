@@ -2,13 +2,14 @@
 
 `Archiver` and `Reaper` depend only on the `ObjectStore` protocol, so this
 module adds no methods to either — it is a second implementation of the same
-three calls `LocalObjectStore` already makes durable and testable without
+four calls `LocalObjectStore` already makes durable and testable without
 cloud credentials:
 
 ```text
 put_immutable(key, reader, expected_identity) -> ObjectMetadata
 head(key)                                     -> ObjectMetadata | None
 open(key)                                     -> bounded byte reader
+list_keys(prefix)                             -> immutable key iterator
 ```
 
 **Every write is a conditional `PutObject`.** `IfNoneMatch="*"` is what makes a
@@ -35,7 +36,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -283,6 +284,55 @@ class S3ObjectStore:
             )
         return BoundedReader(body, normalized, max_bytes)
 
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        """Yield every key below a prefix with strict pagination.
+
+        Listing is discovery only.  A consumer must still require and verify
+        the owning commit marker before treating any listed object as evidence.
+        """
+        normalized = _normalize_prefix(prefix)
+        continuation: str | None = None
+        seen_tokens: set[str] = set()
+        seen_keys: set[str] = set()
+        while True:
+            request: dict[str, Any] = {
+                "Bucket": self.bucket,
+                "Prefix": normalized,
+                "ExpectedBucketOwner": self.expected_bucket_owner,
+            }
+            if continuation is not None:
+                request["ContinuationToken"] = continuation
+            try:
+                response = self._client.list_objects_v2(**request)
+            except (ClientError, BotoCoreError) as error:
+                raise ObjectStoreError(f"listing {normalized}: {error}") from error
+            contents = response.get("Contents", [])
+            if not isinstance(contents, list):
+                raise ObjectStoreError(f"listing {normalized}: malformed Contents")
+            for entry in contents:
+                key = entry.get("Key") if isinstance(entry, dict) else None
+                if not isinstance(key, str):
+                    raise ObjectStoreError(f"listing {normalized}: object has no key")
+                normalized_key = normalize_key(key)
+                if normalized_key != key or not key.startswith(normalized) or key in seen_keys:
+                    raise ObjectStoreError(
+                        f"listing {normalized}: malformed or repeated key {key!r}"
+                    )
+                seen_keys.add(key)
+                yield normalized_key
+            truncated = response.get("IsTruncated")
+            if not isinstance(truncated, bool):
+                raise ObjectStoreError(f"listing {normalized}: malformed IsTruncated")
+            if not truncated:
+                return
+            token = response.get("NextContinuationToken")
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise ObjectStoreError(
+                    f"listing {normalized}: malformed or repeated continuation token"
+                )
+            seen_tokens.add(token)
+            continuation = token
+
     # -- head interpretation ---------------------------------------------
 
     def _metadata_from_head(self, key: str, response: dict[str, Any]) -> ObjectMetadata:
@@ -370,3 +420,9 @@ def _default_client(region: str) -> Any:
     import boto3
 
     return boto3.client("s3", region_name=region)
+
+
+def _normalize_prefix(prefix: str) -> str:
+    if prefix.endswith("/"):
+        return normalize_key(prefix[:-1]) + "/"
+    return normalize_key(prefix)

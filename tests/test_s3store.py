@@ -192,6 +192,40 @@ class FakeS3Client:
             raise _client_error("GetObject", "NoSuchKey", 404, "Not Found")
         return {"Body": _FakeStreamingBody(obj["bytes"]), "ContentLength": len(obj["bytes"])}
 
+    def list_objects_v2(
+        self,
+        *,
+        Bucket,
+        Prefix,
+        ExpectedBucketOwner,
+        ContinuationToken=None,
+    ):
+        self.calls.append(
+            (
+                "list_objects_v2",
+                {
+                    "Bucket": Bucket,
+                    "Prefix": Prefix,
+                    "ExpectedBucketOwner": ExpectedBucketOwner,
+                    "ContinuationToken": ContinuationToken,
+                },
+            )
+        )
+        self._check_owner(ExpectedBucketOwner)
+        keys = sorted(key for key in self.objects if key.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start : start + 2]
+        next_index = start + len(page)
+        return {
+            "Contents": [{"Key": key} for key in page],
+            "IsTruncated": next_index < len(keys),
+            **(
+                {"NextContinuationToken": str(next_index)}
+                if next_index < len(keys)
+                else {}
+            ),
+        }
+
     def delete_object(self, **kwargs):  # pragma: no cover - must never be reached
         self.calls.append(("delete_object", kwargs))
         return {}
@@ -256,6 +290,19 @@ class IdentityTranslationTests(unittest.TestCase):
 class HeadTests(S3Case):
     def test_head_of_an_absent_key_is_absence_not_an_error(self) -> None:
         self.assertIsNone(self.store.head(self.key))
+
+    def test_list_keys_paginates_in_key_order(self) -> None:
+        for index in range(5):
+            self.client.seed(f"raw/lane=x/{index}.ndjson.zst", str(index).encode())
+        self.client.seed("targeter-v2/runs/run_manifest.json", b"other")
+        self.assertEqual(
+            list(self.store.list_keys("raw/")),
+            [f"raw/lane=x/{index}.ndjson.zst" for index in range(5)],
+        )
+        calls = self.calls_of("list_objects_v2")
+        self.assertEqual(len(calls), 3)
+        self.assertIsNone(calls[0]["ContinuationToken"])
+        self.assertEqual(calls[1]["ContinuationToken"], "2")
 
     def test_a_present_key_translates_identity_from_the_provider_checksum(self) -> None:
         self.client.seed(self.key, self.payload, content_type="application/x-ndjson", content_encoding="zstd")
