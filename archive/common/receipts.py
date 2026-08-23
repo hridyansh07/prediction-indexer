@@ -684,7 +684,7 @@ def iter_canonical_receipts(canonical_root: Path) -> Iterator[Path]:
     """Every `receipt.json` under a canonical root, in window order."""
     root = Path(canonical_root)
     if not root.is_dir():
-        return
+        raise ReceiptError(f"canonical root {root} is not a directory")
     for date_directory in sorted(root.iterdir()):
         if not date_directory.is_dir() or not date_directory.name.startswith("date="):
             continue
@@ -712,14 +712,18 @@ class CanonicalIndex:
     def build(cls, canonical_root: Path) -> CanonicalIndex:
         by_identity: dict[tuple[str, str, str, int], Path] = {}
         faults: list[str] = []
-        for path in iter_canonical_receipts(canonical_root):
-            try:
-                receipt = read_canonical_receipt(path)
-            except ReceiptError as error:
-                faults.append(str(error))
-                continue
-            for entry in receipt.inputs:
-                by_identity.setdefault(entry.identity, path)
+        try:
+            paths = iter_canonical_receipts(canonical_root)
+            for path in paths:
+                try:
+                    receipt = read_canonical_receipt(path)
+                except ReceiptError as error:
+                    faults.append(str(error))
+                    continue
+                for entry in receipt.inputs:
+                    by_identity.setdefault(entry.identity, path)
+        except ReceiptError as error:
+            faults.append(str(error))
         return cls(by_identity=by_identity, faults=faults)
 
     def find(self, lane: str, sha256: str, data_file: str, segment_index: int) -> Path | None:

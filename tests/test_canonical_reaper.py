@@ -23,6 +23,7 @@ from archive.reaper.canonical import (
     UNEXPECTED_WINDOW_ARTIFACT,
     CanonicalReaper,
 )
+from archive.reaper.canonical_cli import build_parser as canonical_reaper_parser
 from archive.reaper.canonical_cli import main as canonical_reaper_main
 from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.s3 import S3ObjectStore
@@ -182,6 +183,12 @@ class CanonicalReaperTests(CanonicalReaperCase):
 
 
 class CanonicalReaperCommandTests(unittest.TestCase):
+    def test_parser_refuses_a_retention_floor_below_eighteen_hours(self) -> None:
+        with self.assertRaises(SystemExit):
+            canonical_reaper_parser().parse_args(
+                ["--canonical-root", "/canonical", "--retention-hours", "1"]
+            )
+
     def test_command_refuses_a_retention_floor_below_eighteen_hours(self) -> None:
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(SystemExit):
             canonical_reaper_main(
@@ -195,8 +202,22 @@ class CanonicalReaperCommandTests(unittest.TestCase):
                 ]
             )
 
+    def test_command_refuses_a_missing_canonical_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+            SystemExit, "canonical root.*is not a directory"
+        ):
+            canonical_reaper_main(
+                [
+                    "--canonical-root",
+                    str(Path(directory) / "missing"),
+                    "--archive-root",
+                    str(Path(directory) / "archive"),
+                ]
+            )
+
     def test_command_refuses_delete_against_conformance_storage(self) -> None:
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(SystemExit):
+            (Path(directory) / "canonical").mkdir()
             canonical_reaper_main(
                 [
                     "--canonical-root",
@@ -207,6 +228,13 @@ class CanonicalReaperCommandTests(unittest.TestCase):
                     "delete",
                 ]
             )
+
+    def test_missing_canonical_root_is_an_index_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            index = CanonicalIndex.build(missing)
+        self.assertEqual(len(index.faults), 1)
+        self.assertIn("is not a directory", index.faults[0])
 
 
 class CanonicalReapingThroughS3Tests(unittest.TestCase):

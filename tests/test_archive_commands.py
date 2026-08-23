@@ -89,6 +89,15 @@ class ArchiverCommandTests(CommandCase):
             source_receipt.with_name("canonical_archive_receipt.local.json").is_file()
         )
 
+    def test_an_explicit_missing_canonical_root_is_a_failed_sweep(self) -> None:
+        status, record = run(
+            run_archiver.main,
+            self.archiver_arguments("--canonical-root", str(self.canonical)),
+        )
+        self.assertEqual(status, run_archiver.EXIT_FAILURES)
+        self.assertEqual(record["canonical"]["counts"]["failed"], 1)
+        self.assertIn("is not a directory", record["canonical"]["windows"][0]["detail"])
+
     def test_the_sweep_writes_daily_manifests_when_asked(self) -> None:
         manifests = self.root / "manifests"
         status, record = run(

@@ -41,12 +41,26 @@ FAULT_REASONS = frozenset(
 )
 
 
+def _retention_hours(value: str) -> int:
+    try:
+        hours = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("retention hours must be an integer") from error
+    if hours < RETENTION_FLOOR_HOURS:
+        raise argparse.ArgumentTypeError(
+            f"retention hours must be at least {RETENTION_FLOOR_HOURS}"
+        )
+    return hours
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--canonical-root", required=True, type=Path)
     add_store_arguments(parser)
     parser.add_argument("--mode", choices=("audit", "delete"), default="audit")
-    parser.add_argument("--retention-hours", type=int, default=RETENTION_FLOOR_HOURS)
+    parser.add_argument(
+        "--retention-hours", type=_retention_hours, default=RETENTION_FLOOR_HOURS
+    )
     parser.add_argument("--interval-seconds", type=int, default=None)
     parser.add_argument("--report", type=Path, default=None)
     return parser
@@ -92,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if arguments.interval_seconds is not None and arguments.interval_seconds <= 0:
         raise SystemExit("--interval-seconds must be positive")
+    if not arguments.canonical_root.is_dir():
+        raise SystemExit(f"canonical root {arguments.canonical_root} is not a directory")
     # The shared local-store guard calls this side of the durability boundary
     # spool_root. For canonical reaping, canonical_root is the primary copy.
     arguments.spool_root = arguments.canonical_root

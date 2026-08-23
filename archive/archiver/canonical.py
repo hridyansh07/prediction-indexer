@@ -197,15 +197,18 @@ class CanonicalArchiver:
 
     def sweep(self) -> WindowSweepResult:
         result = WindowSweepResult()
-        for receipt_path in iter_canonical_receipts(self.canonical_root):
-            outcome = self.archive_window(receipt_path)
-            result.outcomes.append(outcome)
-            if outcome.status == CONFLICT:
-                result.halted = (
-                    f"window {outcome.window_start_ns}: {outcome.detail}. The canonical "
-                    "archive sweep stops on an immutable-key conflict."
-                )
-                break
+        try:
+            for receipt_path in iter_canonical_receipts(self.canonical_root):
+                outcome = self.archive_window(receipt_path)
+                result.outcomes.append(outcome)
+                if outcome.status == CONFLICT:
+                    result.halted = (
+                        f"window {outcome.window_start_ns}: {outcome.detail}. The canonical "
+                        "archive sweep stops on an immutable-key conflict."
+                    )
+                    break
+        except ReceiptError as error:
+            result.outcomes.append(WindowOutcome(0, FAILED, str(error)))
         return result
 
     def archive_window(self, receipt_path: Path) -> WindowOutcome:

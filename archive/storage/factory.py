@@ -76,10 +76,9 @@ def add_store_arguments(parser: argparse.ArgumentParser) -> None:
 def build_store(arguments: argparse.Namespace) -> ObjectStore:
     """Builds the configured backend, or refuses an unsafe or ambiguous one.
 
-    Reads `arguments.spool_root` for the local backend's `st_dev` independence
-    check — both commands already declare `--spool-root` themselves, so this
-    relies on `add_store_arguments` sharing one `Namespace` with it rather than
-    taking a second parameter that could disagree.
+    Reads the primary data roots on the shared namespace for the local
+    backend's `st_dev` independence check. Raw commands always provide
+    `spool_root`; combined canonical commands also provide `canonical_root`.
     """
     if arguments.archive_backend == S3_BACKEND:
         return _build_s3_store(arguments)
@@ -129,19 +128,26 @@ def _build_local_store(arguments: argparse.Namespace) -> LocalObjectStore:
     durability = CONFORMANCE
     if arguments.archive_durability == "independent":
         # Invariant 7 as a `st_dev` comparison rather than a promise: an
-        # archive root on the same filesystem as the spool is not a second
-        # copy whatever the flag claims, because one device failure takes
-        # both.
-        spool_device = _device_of(arguments.spool_root)
+        # archive root on the same filesystem as any primary data root is not
+        # a second copy whatever the flag claims, because one device failure
+        # takes both.
+        primary_roots = [Path(arguments.spool_root)]
+        canonical_root = getattr(arguments, "canonical_root", None)
+        if (
+            canonical_root is not None
+            and Path(canonical_root).resolve() != primary_roots[0].resolve()
+        ):
+            primary_roots.append(Path(canonical_root))
         arguments.archive_root.mkdir(parents=True, exist_ok=True)
         archive_device = _device_of(arguments.archive_root)
-        if spool_device == archive_device:
-            raise SystemExit(
-                f"refusing --archive-durability independent: {arguments.archive_root} and "
-                f"{arguments.spool_root} are on the same filesystem, so losing it loses both "
-                "copies. Point the archive at separate storage, or leave the durability class "
-                "at 'conformance'."
-            )
+        for primary_root in primary_roots:
+            if _device_of(primary_root) == archive_device:
+                raise SystemExit(
+                    f"refusing --archive-durability independent: {arguments.archive_root} and "
+                    f"{primary_root} are on the same filesystem, so losing it loses both "
+                    "copies. Point the archive at separate storage, or leave the durability "
+                    "class at 'conformance'."
+                )
         durability = INDEPENDENT
     return LocalObjectStore(
         arguments.archive_root, store_id=arguments.store_id, durability=durability
