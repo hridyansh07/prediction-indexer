@@ -97,7 +97,52 @@ class _ProbeSplice(BaseSplice):
     requires_targets = False
 
 
+class _IdleProbeSplice(_ProbeSplice):
+    """A quiet capture loop used to prove writer supervision is independent of traffic."""
+
+    async def _run_until_stopped(self, **_kwargs):
+        await asyncio.Event().wait()
+
+
 class WriterFailureProofs(unittest.IsolatedAsyncioTestCase):
+    async def test_an_idle_splice_exits_when_its_writer_dies(self) -> None:
+        """A background disk failure must reach the process even with no next frame."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            spool = Spool(
+                Path(temporary),
+                LANE,
+                segment_seconds=1800,
+                clock=lambda: HOUR_NS,
+            )
+            splice = _IdleProbeSplice(spool, None)
+            running = asyncio.create_task(splice.run())
+
+            for _ in range(100):
+                await asyncio.sleep(0.001)
+                if spool._writer is not None:
+                    break
+            self.assertIsNotNone(spool._writer)
+            writer = spool._writer
+            original_write = writer.segment.write_batch
+            failed = False
+
+            def fail_once(records):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("simulated full disk")
+                return original_write(records)
+
+            writer.segment.write_batch = fail_once
+            try:
+                await writer.append(_record(1, HOUR_NS + 1))
+            except OSError:
+                pass
+
+            with self.assertRaisesRegex(OSError, "simulated full disk"):
+                await asyncio.wait_for(running, timeout=0.2)
+
     async def test_a_writer_error_cannot_seal_past_an_accepted_record(self) -> None:
         """The queue accepted index 1, so either it lands or closing must fail."""
 
