@@ -12,7 +12,8 @@ committed canonical-ingestion receipt.
 ```text
 archiver/  service.py, canonical.py, manifest.py, cli.py
            raw seal -> objects + receipt + manifest; canonical receipt -> objects + receipt
-reaper/    service.py, cli.py                dual-receipt audit/deletion decision
+reaper/    service.py, cli.py                dual-receipt raw audit/deletion decision
+           canonical.py, canonical_cli.py    18-hour canonical frame reaper
 storage/   base.py, local.py, s3.py, factory.py
 common/    durable.py, receipts.py, seal.py, verify.py
 stream.py  verified archive objects -> replay ByteStreamer boundary
@@ -86,6 +87,21 @@ receipt under `canonical/date=<date>/window=<start>/`. It writes
 verify all three objects. A local backend instead writes the non-authoritative
 `canonical_archive_receipt.local.json`.
 
+The separate canonical reaper bounds this local canonical storage. It is audit
+only by default and requires a production receipt, an independent backend,
+fresh heads for all three archive objects, unchanged local identities, an age of
+at least 18 hours by every recorded clock, and explicit delete mode. It removes
+only the two `.ndjson.zst` frames. Both small receipts and the window directory
+remain as the finalizer's restart/watermark tombstone. Run one audit sweep with:
+
+```bash
+docker compose --profile ops run --rm canonical-reaper-once
+```
+
+After the S3 rollout has soaked and audit reports the expected reapable count,
+set `CANONICAL_REAPER_MODE=delete`; the 18-hour floor may be raised but not
+lowered.
+
 ## Streaming archived segments to replay
 
 `ArchivedSegmentByteStreamer` implements replay's structural `ByteStreamer`
@@ -104,8 +120,9 @@ prefixes are removed from logical keys, so for example
 
 ## Reaper safety and rollout
 
-Run `python -m archive.reaper.cli` in `audit` mode (the default). It re-verifies
-both archived objects and the canonical receipt before reporting eligibility.
+Run `python -m archive.reaper.cli` and
+`python -m archive.reaper.canonical_cli` in `audit` mode (the default). They
+re-verify their archived objects and receipts before reporting eligibility.
 Archive and audit for at least 24 hours, inspect every retention reason, retain
 local raw, and keep lifecycle expiry disabled. Do not enable `REAPER_MODE=delete`
 until a separate, explicit rollout enables destructive operation.

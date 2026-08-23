@@ -29,7 +29,13 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
             "AWS_SESSION_TOKEN",
         ):
             self.assertIn(variable, self.compose)
-        for service in ("archiver", "archiver-once", "reaper"):
+        for service in (
+            "archiver",
+            "archiver-once",
+            "reaper",
+            "canonical-reaper",
+            "canonical-reaper-once",
+        ):
             with self.subTest(service=service):
                 self.assertIn(
                     "environment: *aws-archive-environment", self.service(service)
@@ -41,6 +47,15 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
                 configured = self.service(service)
                 self.assertIn("--canonical-root", configured)
                 self.assertIn("/var/lib/prediction-indexer/canonical", configured)
+
+    def test_canonical_reaper_is_audit_first_with_an_eighteen_hour_floor(self) -> None:
+        for service in ("canonical-reaper", "canonical-reaper-once"):
+            with self.subTest(service=service):
+                configured = self.service(service)
+                self.assertIn("archive.reaper.canonical_cli", configured)
+                self.assertIn("${CANONICAL_REAPER_MODE:-audit}", configured)
+                self.assertIn("${CANONICAL_REAPER_RETENTION_HOURS:-18}", configured)
+                self.assertIn("--canonical-root", configured)
 
     def test_ingest_store_reaper_is_one_shot_audit_first_and_uses_the_rust_image(self) -> None:
         service = self.service("ingest-store-reaper")

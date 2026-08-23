@@ -47,7 +47,9 @@ credentials:
 | `archiver-once` | `ops` profile | The same sweep, once, for an operator or external scheduler |
 | `reaper` | `ops` profile | Hourly dual-receipt audit; deletion is opt-in |
 | `reaper-once` | `ops` profile | The same reaper sweep, once |
-| `canonical-integrity` | `ops` profile | Fully decodes and verifies committed canonical windows |
+| `canonical-reaper` | `ops` profile | Hourly 18-hour-floor audit of archived canonical frames; deletion is opt-in |
+| `canonical-reaper-once` | `ops` profile | The same canonical reaper sweep, once |
+| `canonical-integrity` | `ops` profile | Fully decodes local canonical windows and reports archived/reaped tombstones separately |
 | `targeter-v2-run-archiver` | `ops` profile, v2 override | Archives complete target-run directories that hold no receipt yet; never deletes |
 | `targeter-v2-run-reaper` | `ops` profile, v2 override | Hourly receipt-proved audit of local target-run directories; deletion is opt-in |
 
@@ -492,7 +494,7 @@ sweep is written to `ops/last_finalizer_sweep.json`.
 ```bash
 docker compose --profile ops up -d archiver        # sweeps hourly, stays up
 docker compose --profile ops run --rm archiver-once   # one sweep, then exits
-docker compose --profile ops up -d finalizer reaper   # independent receipt-coordinated loops
+docker compose --profile ops up -d finalizer reaper canonical-reaper
 ```
 
 The archiver compresses each sealed segment into one Zstandard frame, publishes
@@ -593,6 +595,31 @@ Fresh object-store heads verify all three before the local window receives
 `canonical_archive_receipt.json`. The local backend uses
 `canonical_archive_receipt.local.json`, which is conformance evidence only.
 
+Canonical deletion is a third, separate authority:
+
+```bash
+docker compose --profile ops run --rm canonical-reaper-once
+```
+
+It defaults to `CANONICAL_REAPER_MODE=audit`. A window is reapable only when a
+production canonical archive receipt binds its unchanged `receipt.json` and
+both frame identities, the backend is independently durable, all three remote
+objects pass fresh heads, and the window is at least
+`CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value below 18.
+Age is measured from the latest of window end, finalization, archive
+verification, and both receipt mtimes, so a backdated test clock cannot shorten
+retention.
+
+Delete mode removes only `evidence.ndjson.zst` and
+`provenance.ndjson.zst`. It permanently retains the window directory,
+`receipt.json`, and `canonical_archive_receipt.json`; those compact files are
+the tombstone the finalizer needs to rebuild the watermark and preserve global
+sequence/continuity after restart. Canonical integrity reports these windows as
+`windows_archived_and_reaped` and does not count their unavailable records as
+locally verified; a crash between the two unlinks is separately visible as
+`windows_partially_reaped`. Enable `CANONICAL_REAPER_MODE=delete` only after the
+same S3 soak and audit review required for raw deletion.
+
 ### S3 archive backend
 
 Both `archiver` and `reaper` build their object store through one factory,
@@ -631,8 +658,9 @@ policy documents are in
 If the Compose host instead uses temporary or static environment credentials,
 export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and (for temporary
 credentials) `AWS_SESSION_TOKEN` in the shell that invokes Compose. Compose
-forwards them only to `archiver`, `archiver-once`, `reaper`, and `reaper-once`,
-plus — when the v2 override is included — `targeter`, `targeter-v2-integrity`,
+forwards them only to `archiver`, `archiver-once`, `reaper`, `reaper-once`,
+`canonical-reaper`, and `canonical-reaper-once`, plus — when the v2 override is
+included — `targeter`, `targeter-v2-integrity`,
 `targeter-v2-run-archiver`, and `targeter-v2-run-reaper`. It does not forward
 them to venue splices or the ingester. A host `~/.aws` directory is not mounted
 into the containers. For an EC2 instance role, ensure IMDS is reachable from

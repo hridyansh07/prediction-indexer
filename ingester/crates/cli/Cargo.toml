@@ -20,6 +20,7 @@ prediction-encoder = { workspace = true }
 signal-hook = "0.3"
 
 [dev-dependencies]
+base64 = { workspace = true }
 rusqlite = { workspace = true }
 tempdir = "0.3"
 

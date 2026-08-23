@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
 use common::{
     MERGED_ORDER, WINDOW_NS, current_window, ended_window, envelope, interleaved_fixture,
     receipt_paths, seal_segment_in_window, seal_segment_with, segment_name, segment_path,
@@ -23,6 +24,75 @@ use serde_json::Value;
 use tempdir::TempDir;
 
 const POLYMARKET_AND_KALSHI: [&str; 2] = ["polymarket", "kalshi"];
+
+fn provider_checksum(hex_digest: &str) -> String {
+    let mut bytes = Vec::with_capacity(32);
+    for pair in hex_digest.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16).expect("hex") as u8;
+        let low = (pair[1] as char).to_digit(16).expect("hex") as u8;
+        bytes.push((high << 4) | low);
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn write_canonical_archive_tombstone(canonical: &Path, start_ns: u64) {
+    use sha2::{Digest, Sha256};
+
+    let directory = window_directory(canonical, start_ns);
+    let receipt_path = directory.join("receipt.json");
+    let receipt_bytes = fs::read(&receipt_path).expect("canonical receipt bytes");
+    let receipt: Value = serde_json::from_slice(&receipt_bytes).expect("canonical receipt");
+    let date = directory
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .expect("date partition");
+    let window = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("window partition");
+    let base = format!("canonical/{date}/{window}");
+
+    let compressed = |field: &str, file: &str| {
+        let sha256 = receipt[field]["stored"]["sha256"]
+            .as_str()
+            .expect("stored sha256");
+        serde_json::json!({
+            "file": file,
+            "bucket": "canonical-test-bucket",
+            "key": format!("{base}/{file}"),
+            "byte_length": receipt[field]["stored"]["byte_length"],
+            "sha256": sha256,
+            "content_type": "application/x-ndjson",
+            "content_encoding": "zstd",
+            "s3_checksum_sha256": provider_checksum(sha256),
+        })
+    };
+    let receipt_sha256 = format!("{:x}", Sha256::digest(&receipt_bytes));
+    let marker = serde_json::json!({
+        "canonical_archive_receipt_version": 1,
+        "window_start_ns": receipt["window_start_ns"],
+        "window_end_ns": receipt["window_end_ns"],
+        "evidence": compressed("evidence", "evidence.ndjson.zst"),
+        "provenance": compressed("provenance", "provenance.ndjson.zst"),
+        "canonical_receipt": {
+            "file": "receipt.json",
+            "bucket": "canonical-test-bucket",
+            "key": format!("{base}/receipt.json"),
+            "byte_length": receipt_bytes.len(),
+            "sha256": receipt_sha256,
+            "content_type": "application/json",
+            "content_encoding": null,
+            "s3_checksum_sha256": provider_checksum(&receipt_sha256),
+        },
+        "verified_at_ns": 1,
+        "archiver_version": 1,
+    });
+    let mut encoded = serde_json::to_vec_pretty(&marker).expect("archive marker");
+    encoded.push(b'\n');
+    fs::write(directory.join("canonical_archive_receipt.json"), encoded)
+        .expect("write archive marker");
+}
 
 fn finalize_raw(spool: &Path, canonical: &Path, expected: &[&str], deadline: u64) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_indexer-finalize"));
@@ -424,6 +494,75 @@ fn canonical_audit_verifies_every_compressed_record() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("audit report");
     assert_eq!(report["windows_verified"], 1);
     assert_eq!(report["evidence_records_verified"], 3);
+}
+
+#[test]
+fn archived_and_reaped_window_survives_restart_and_watermark_rebuild() {
+    let (root, spool, _) = interleaved_fixture();
+    let canonical = root.path().join("canonical");
+    finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    write_canonical_archive_tombstone(&canonical, 0);
+    let directory = window_directory(&canonical, 0);
+    fs::remove_file(directory.join("evidence.ndjson.zst")).expect("reap evidence");
+    fs::remove_file(directory.join("provenance.ndjson.zst")).expect("reap provenance");
+    fs::remove_file(canonical.join("watermark.json")).expect("remove derived watermark");
+
+    let report = finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    assert_eq!(report["windows_finalized"], 0);
+    assert_eq!(report["windows_already_committed"], 1);
+    assert_eq!(report["next_canonical_seq"], 4);
+    assert!(canonical.join("watermark.json").is_file());
+
+    let output = audit_raw(&canonical);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let audit: Value = serde_json::from_slice(&output.stdout).expect("audit report");
+    assert_eq!(audit["windows_verified"], 0);
+    assert_eq!(audit["windows_partially_reaped"], 0);
+    assert_eq!(audit["windows_archived_and_reaped"], 1);
+    assert_eq!(audit["evidence_records_verified"], 0);
+}
+
+#[test]
+fn canonical_audit_reports_an_interrupted_reap_separately() {
+    let (root, spool, _) = interleaved_fixture();
+    let canonical = root.path().join("canonical");
+    finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    write_canonical_archive_tombstone(&canonical, 0);
+    fs::remove_file(window_directory(&canonical, 0).join("evidence.ndjson.zst"))
+        .expect("reap evidence first");
+
+    let output = audit_raw(&canonical);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let audit: Value = serde_json::from_slice(&output.stdout).expect("audit report");
+    assert_eq!(audit["windows_verified"], 0);
+    assert_eq!(audit["windows_partially_reaped"], 1);
+    assert_eq!(audit["windows_archived_and_reaped"], 0);
+}
+
+#[test]
+fn missing_canonical_outputs_without_a_bound_archive_receipt_still_fail_closed() {
+    let (root, spool, _) = interleaved_fixture();
+    let canonical = root.path().join("canonical");
+    finalize(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    fs::remove_file(window_directory(&canonical, 0).join("evidence.ndjson.zst"))
+        .expect("missing evidence");
+
+    let output = finalize_raw(&spool, &canonical, &POLYMARKET_AND_KALSHI, 0);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("absent without a regular production archive receipt"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

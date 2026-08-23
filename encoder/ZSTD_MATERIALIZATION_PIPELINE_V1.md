@@ -454,7 +454,8 @@ non-zero byte lengths.
 The receipt parser fails closed unless:
 
 - every required compression field has the V1 value;
-- both stored files exist and match their stored lengths;
+- both stored files exist and match their stored lengths, or the intentional
+  canonical-reaper tombstone of §4.5 proves why they are absent;
 - decoded evidence and provenance line counts are equal;
 - the canonical sequence range agrees with the decoded evidence line count;
 - empty/non-empty sequence fields follow the rule above.
@@ -494,6 +495,41 @@ must not solve this requirement by buffering the file in memory.
 A receipt referencing a missing, truncated, corrupt, multi-frame, or logically
 mismatched object is an integrity failure. It is never treated as an open window
 and is never silently regenerated over the committed receipt.
+
+### 4.5 Canonical archive retention and local reaping
+
+Canonical archival and local deletion are separate commands. The archiver has
+no removal primitive. The canonical reaper defaults to audit and refuses a
+retention floor below **18 hours** or destructive operation without an
+independently durable backend.
+
+For a receipt-committed window the reaper requires, at decision time:
+
+1. a strict production `canonical_archive_receipt.json`; local conformance
+   receipts authorize nothing;
+2. an independently durable configured store matching that receipt;
+3. age of at least 18 hours from the latest of window end, finalization time,
+   archive verification time, canonical-receipt mtime, and archive-receipt
+   mtime;
+4. exact identity agreement between the local canonical receipt, both output
+   identities, and the archive receipt;
+5. fresh object heads verifying all three immutable archive objects; and
+6. explicit delete mode.
+
+Only `evidence.ndjson.zst` and `provenance.ndjson.zst` are removed, evidence
+first and with a directory fsync after each unlink. The canonical `receipt.json`
+and production archive receipt remain as a compact tombstone. This is required,
+not optional bookkeeping: the finalizer rebuilds its watermark, global sequence,
+continuity, and carried clock state from canonical receipts. Deleting that
+receipt would allow committed history to be forgotten and re-finalized.
+
+A crash after removing evidence but before provenance is a recognizable partial
+cleanup and may finish only after all gates are re-established. The reverse
+partial state is not produced by this reaper and fails closed. Finalizer startup
+accepts missing frames only when the strict production archive marker binds the
+unchanged local receipt and both frame identities. Canonical integrity reports
+such windows separately as archived-and-reaped; it does not claim their records
+were locally decoded and verified.
 
 ## 5. Implementation order and proof gates
 
