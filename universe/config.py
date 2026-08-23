@@ -6,11 +6,13 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from archive.storage.base import ObjectStore, normalize_key
 from archive.storage.s3 import S3ObjectStore
+from targeter.v2.models import isoformat, parse_timestamp
 
 CONFIG_VERSION = 1
 CONFIG_ENVIRONMENT_VARIABLE = "EVENT_UNIVERSE_CONFIG"
@@ -41,13 +43,24 @@ class BackupConfig:
 
 
 @dataclass(frozen=True)
+class BackfillConfig:
+    temporary_directory: Path
+    generated_start: datetime | None
+    generated_end: datetime | None
+
+
+@dataclass(frozen=True)
 class UniverseConfig:
     path: Path
     database_path: Path
     archive: ArchiveConfig
     api: ApiConfig
-    temporary_directory: Path
+    backfill: BackfillConfig
     backup: BackupConfig
+
+    @property
+    def temporary_directory(self) -> Path:
+        return self.backfill.temporary_directory
 
     def object_store(self) -> ObjectStore:
         return S3ObjectStore(
@@ -89,7 +102,11 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         document, "archive", {"bucket", "region", "expected_owner"}
     )
     api = _section(document, "api", {"host", "port"})
-    backfill = _section(document, "backfill", {"temporary_directory"})
+    backfill = _section(
+        document,
+        "backfill",
+        {"temporary_directory", "generated_start", "generated_end"},
+    )
     backup = _section(document, "backup", {"directory", "object_prefix"})
     port = api["port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
@@ -99,6 +116,20 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         raise UniverseConfigError("archive.expected_owner must be a 12-digit AWS account id")
     object_prefix = normalize_key(_text(backup, "object_prefix", "backup").rstrip("/"))
     base = source.resolve().parent
+    generated_start = _optional_timestamp(
+        backfill.get("generated_start"), "backfill.generated_start"
+    )
+    generated_end = _optional_timestamp(
+        backfill.get("generated_end"), "backfill.generated_end"
+    )
+    if (
+        generated_start is not None
+        and generated_end is not None
+        and generated_start >= generated_end
+    ):
+        raise UniverseConfigError(
+            "backfill.generated_start must be before backfill.generated_end"
+        )
     return UniverseConfig(
         path=source.resolve(),
         database_path=_path(document, "database_path", base, "config"),
@@ -111,8 +142,12 @@ def load_config(path: Path | None = None) -> UniverseConfig:
             host=_text(api, "host", "api"),
             port=port,
         ),
-        temporary_directory=_path(
-            backfill, "temporary_directory", base, "backfill"
+        backfill=BackfillConfig(
+            temporary_directory=_path(
+                backfill, "temporary_directory", base, "backfill"
+            ),
+            generated_start=generated_start,
+            generated_end=generated_end,
         ),
         backup=BackupConfig(
             directory=_path(backup, "directory", base, "backup"),
@@ -161,3 +196,12 @@ def _text(document: dict[str, Any], field: str, label: str) -> str:
 def _path(document: dict[str, Any], field: str, base: Path, label: str) -> Path:
     value = Path(_text(document, field, label))
     return value if value.is_absolute() else (base / value).resolve()
+
+
+def _optional_timestamp(value: Any, label: str) -> datetime | None:
+    if value is None:
+        return None
+    parsed = parse_timestamp(value)
+    if parsed is None or value != isoformat(parsed):
+        raise UniverseConfigError(f"{label} must be null or a canonical UTC timestamp")
+    return parsed

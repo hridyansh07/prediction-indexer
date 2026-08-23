@@ -506,23 +506,6 @@ services:
       - *data-volume
       - *archive-volume
 
-  # Optional metadata-only migration for Event Universe history. It mirrors
-  # retained production receipt documents to S3, but never reads or transfers
-  # local raw segment bytes. The remote universe backfill performs all archive
-  # decoding from S3 later.
-  archive-receipt-mirror:
-    <<: *capture-service
-    profiles:
-      - ops
-    restart: "no"
-    environment: *aws-archive-environment
-    command:
-      - python
-      - -u
-      - archive/run_receipt_mirror.py
-    volumes:
-      - *data-volume
-
   # Deletes local raw segments that two receipts prove are safe to delete.
   #
   # **Audit mode by default, and it stays that way here.** Installing Phase 4

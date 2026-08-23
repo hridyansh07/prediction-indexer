@@ -41,3 +41,4 @@ COPY docker/wait_for_target.py ./docker/wait_for_target.py
 COPY scripts/backfill_coverage.py ./scripts/backfill_coverage.py
 
 USER indexer:indexer
+

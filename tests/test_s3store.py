@@ -293,11 +293,11 @@ class HeadTests(S3Case):
 
     def test_list_keys_paginates_in_key_order(self) -> None:
         for index in range(5):
-            self.client.seed(f"raw/lane=x/{index}.universe.json", str(index).encode())
+            self.client.seed(f"raw/lane=x/{index}.ndjson.zst", str(index).encode())
         self.client.seed("targeter-v2/runs/run_manifest.json", b"other")
         self.assertEqual(
             list(self.store.list_keys("raw/")),
-            [f"raw/lane=x/{index}.universe.json" for index in range(5)],
+            [f"raw/lane=x/{index}.ndjson.zst" for index in range(5)],
         )
         calls = self.calls_of("list_objects_v2")
         self.assertEqual(len(calls), 3)

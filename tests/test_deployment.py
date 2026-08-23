@@ -32,7 +32,6 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
         for service in (
             "archiver",
             "archiver-once",
-            "archive-receipt-mirror",
             "reaper",
             "canonical-reaper",
             "canonical-reaper-once",
@@ -127,12 +126,20 @@ class EventUniverseDeploymentTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('"event_universe_config_version": 1', config)
-        mirror = (ROOT / "archive" / "run_receipt_mirror.py").read_text(
+        self.assertIn('"generated_start": null', config)
+        self.assertIn('"generated_end": null', config)
+        self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
+        self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
+
+    def test_schema_is_selected_history_without_raw_universe_tables(self) -> None:
+        schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(
             encoding="utf-8"
         )
-        self.assertIn("load_config()", mirror)
-        self.assertNotIn("argparse", mirror)
-        self.assertTrue((ROOT / "configs" / "archive_receipt_mirror.json").is_file())
+        self.assertIn("CREATE TABLE selection_occurrences", schema)
+        self.assertIn("CREATE TABLE bundle_contexts", schema)
+        for stale in ("segment_receipts", "control_records", "connection_epochs"):
+            self.assertNotIn(stale, schema)
+        self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
 
     def test_orb_setup_creates_and_installs_the_project_virtual_environment(self) -> None:
         setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")

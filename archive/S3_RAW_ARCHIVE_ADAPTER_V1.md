@@ -35,12 +35,6 @@ The adapter is complete when a successful `put_immutable` proves all of these:
 The local production archive receipt remains the archive commit marker. An S3
 response, S3 key, or ETag is not a commit marker.
 
-The Event Universe addendum may publish an immutable
-`.archive-receipt-mirror.json` wrapper after that local receipt commits. The
-wrapper preserves the exact receipt bytes for a separately deployed derivative
-worker, but declares itself non-authoritative and unable to authorize deletion.
-It does not change this adapter's raw commit marker or reaper contract.
-
 ## 2. Non-goals
 
 V1 does **not** add:
@@ -131,9 +125,9 @@ class S3ObjectStore:
 ```
 
 Do not add S3 methods to `Archiver` or `Reaper`. They continue to depend only on
-`ObjectStore`. `list_keys` is the later Event Universe discovery extension: it
-uses paginated `ListObjectsV2`, but a listed key is not a commit marker and must
-still be verified through its owning receipt or manifest.
+`ObjectStore`. `list_keys` uses paginated `ListObjectsV2`, but a listed key is
+not a commit marker and must still be verified through its owning receipt or
+manifest.
 
 Constructor inputs:
 

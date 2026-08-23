@@ -720,30 +720,28 @@ python universe/run_sync.py
 python universe/run_backup.py
 ```
 
-The store is intentionally sparse: it indexes selected Targeter bundles,
-sibling/event references, normalized target assets and relationships, planned
-capture bounds, segment intervals, and control/epoch facts. It does not copy
-catalogues, selection reports, target vendor records, control-envelope JSON, or
-data deliveries into SQLite. The reviewable schema is
-`universe/schema/v3.sql`.
+The store is intentionally sparse and append-only: it indexes historical
+Targeter-selected bundle occurrences plus normalized event, sibling-market,
+target-asset, relationship, and exact source/origin provenance. It does not copy
+catalogues, selection reports, target vendor records, control envelopes, raw
+segments, or venue deliveries into SQLite. The reviewable schema is
+`universe/schema/v1.sql`.
 
-Event Universe is strict Targeter v3-only. Sync selects the newest archived run,
-verifies its manifest-owned v3 report and native
-`selected_bundle_index.ndjson[.zst]`, resolves retained selections through exact
-immutable v3 origin manifests, and atomically replaces the active bundle set.
-There is no Universe publication pointer, legacy lazy derivative, or historical
-occurrence store. A failed newest snapshot leaves the prior active set intact;
-`/healthz` marks it stale from the archived run's `generated_at`.
+Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
+version-2 S3 run manifests and derives selected occurrences directly from each
+manifest-owned v3 `selection_report.json[.zst]`. Existing archived v3 runs need
+no Universe sidecar or producer backfill. Retained selections recursively verify
+their exact immutable v3 origin manifests, including origins outside the
+requested range. There is no Universe publication pointer; `/healthz` derives
+the latest indexed archived run and marks it stale from that run's
+`generated_at`.
 
-Historical **raw-control** rollout uses `python universe/run_backfill.py`. It
-discovers non-authoritative raw receipt mirrors in S3, reverifies each
-referenced raw and seal object, and streams the compressed raw object through
-the shared strict archive decoder. It does not mount the capture spool or
-retain decoded raw segments. Before that remote job, the opt-in capture-side
-`python archive/run_receipt_mirror.py` job mirrors retained production receipt
-documents, including receipts for raw files already reaped. It never reads or
-sends historical raw bytes through the capture host. In Compose it is the
-`archive-receipt-mirror` service under the `ops` profile.
+Historical **selected-run** rollout uses `python universe/run_backfill.py` after
+`backfill.generated_start` and `backfill.generated_end` are explicitly set in
+the JSON config. The bounds are half-open Targeter generated times. Backfill and
+incremental sync share one idempotent projector and ingestion transaction. Raw
+segment selection and trust remain replay responsibilities; the archiver has no
+Universe sidecar or receipt-mirror service.
 
 `EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
 backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use

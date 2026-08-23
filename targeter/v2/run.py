@@ -44,10 +44,6 @@ from targeter.v2.publication import (
     publish_run,
 )
 from targeter.v2.run_archive import RunArchiveError, archive_run, parse_run_id_ns
-from targeter.v2.selected_bundles import (
-    SELECTED_BUNDLE_INDEX_STEM,
-    selected_bundle_rows,
-)
 from targeter.v2.selection import SelectionResult, select_targets
 from targeter.v2.target_records import artifact_stem, target_record_rows
 
@@ -308,17 +304,6 @@ def run_shadow(
         and all(catalog.complete for catalog in catalogs)
     )
     record["input_complete"] = input_complete
-    record["selection_policy"] = {
-        "pre_event_seconds": strategy.pre_event_seconds,
-        "post_start_retention_seconds": strategy.post_start_retention_seconds,
-    }
-    name, identity = _write_artifact(
-        directory,
-        SELECTED_BUNDLE_INDEX_STEM,
-        selected_bundle_rows(record),
-        artifact_format=artifact_format,
-    )
-    artifacts[name] = identity
     name, identity = _write_artifact(
         directory,
         "rule_templates",

@@ -1,41 +1,44 @@
-"""Compact, deterministic evidence for bundles selected by Targeter v2.
+"""Deterministic SQL projection of bundles selected by Targeter v3.
 
-The full selection report remains the diagnostic authority.  This projection
-contains only the selected hot path needed by Event Universe: event identity,
-planned capture bounds, sibling references, selected targets/assets, and
-relationship edges.  It deliberately contains no venue record or report JSON.
+The immutable selection report remains authoritative. This module derives only
+the selected hot path needed by Event Universe and creates no additional S3
+artifact, so it works with every already-archived v3 report.
 """
 
 from __future__ import annotations
 
 import math
-from datetime import timedelta
 from typing import Any, Mapping
 
 from archive.storage.base import normalize_key
-from targeter.v2.models import isoformat, parse_timestamp
+from targeter.v2.models import SUPPORTED_VENUES, isoformat, parse_timestamp
 
-SELECTED_BUNDLE_INDEX_VERSION = 3
-SELECTED_BUNDLE_INDEX_STEM = "selected_bundle_index"
-
-
-class SelectedBundleIndexError(ValueError):
-    """A selection report cannot produce the compact selected-bundle index."""
+PROJECTION_VERSION = 1
 
 
-def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Project selected bundles from one committed Targeter report."""
+class ProjectionError(ValueError):
+    """A v3 selection report cannot produce selected-bundle history."""
+
+
+# Internal helpers retain the old local name to keep this projection change
+# mechanical; callers use ProjectionError.
+SelectedBundleIndexError = ProjectionError
+
+
+def project_selected_bundles(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project selected occurrences from one committed Targeter report."""
     if report.get("report_version") != 3:
-        raise SelectedBundleIndexError("selected-bundle projection requires report version 3")
+        raise ProjectionError("selected-bundle projection requires report version 3")
+    if report.get("mode") != "shadow":
+        raise ProjectionError("selected-bundle projection requires a shadow report")
     run_id = _text(report, "run_id", "report")
     generated_at = _timestamp(report, "generated_at", "report")
     input_complete = report.get("input_complete")
-    if not isinstance(input_complete, bool):
-        raise SelectedBundleIndexError("report.input_complete must be boolean")
+    if input_complete is not True:
+        raise ProjectionError("selected-bundle projection requires complete input")
     strategy_version = _integer(report, "strategy_version", "report")
-    pre_event_seconds, retention_seconds = _selection_policy(
-        report, strategy_version
-    )
+    if strategy_version == 0:
+        raise ProjectionError("report.strategy_version must be positive")
 
     selection = report.get("selection")
     if not isinstance(selection, Mapping):
@@ -43,6 +46,8 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     selected_ids = _text_list(selection.get("bundle_ids"), "selection.bundle_ids")
     if len(selected_ids) != len(set(selected_ids)):
         raise SelectedBundleIndexError("selection.bundle_ids contains duplicates")
+    if selection.get("bundle_count") != len(selected_ids):
+        raise ProjectionError("selection.bundle_count disagrees with bundle_ids")
     selected = set(selected_ids)
 
     continuity = report.get("continuity")
@@ -99,8 +104,8 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         )
 
     targets = selection.get("targets")
-    if not isinstance(targets, Mapping):
-        raise SelectedBundleIndexError("selection.targets must be an object")
+    if not isinstance(targets, Mapping) or set(targets) != set(SUPPORTED_VENUES):
+        raise ProjectionError("selection.targets must name every supported venue")
     targets_by_bundle: dict[str, list[dict[str, Any]]] = {
         bundle_id: [] for bundle_id in selected
     }
@@ -161,6 +166,10 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for bundle_id in sorted(selected):
         if bundle_id in retained_ids:
+            retained_targets = sorted(
+                targets_by_bundle[bundle_id],
+                key=lambda item: (item["venue"], item["target_id"]),
+            )
             rows.append(
                 _retained_row(
                     run_id=run_id,
@@ -170,19 +179,20 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                     bundle_id=bundle_id,
                     evidence=continuity_by_bundle[bundle_id],
                     disposition=dispositions.get(bundle_id),
-                    targets=targets_by_bundle[bundle_id],
+                    targets=retained_targets,
                 )
             )
             continue
         candidate = by_bundle[bundle_id]
+        if candidate.get("eligible") is not True:
+            raise ProjectionError(f"selected candidate {bundle_id} is not eligible")
         activation = _timestamp(candidate, "activation_at", f"candidate {bundle_id}")
         capture_start = _timestamp(
             candidate, "capture_start_at", f"candidate {bundle_id}"
         )
-        expected_start = activation - timedelta(seconds=pre_event_seconds)
-        if capture_start != expected_start:
+        if capture_start >= activation:
             raise SelectedBundleIndexError(
-                f"candidate {bundle_id} capture_start_at disagrees with its policy"
+                f"candidate {bundle_id} capture_start_at must precede activation"
             )
         bundle_targets = sorted(
             targets_by_bundle[bundle_id],
@@ -222,15 +232,18 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise SelectedBundleIndexError(
                 f"selected candidate {bundle_id} has invalid continuity disposition"
             )
+        if disposition is not None and bundle_id not in continuity_by_bundle:
+            raise ProjectionError(
+                f"held candidate {bundle_id} has no continuity evidence"
+            )
         rows.append(
             {
-                "selected_bundle_index_version": SELECTED_BUNDLE_INDEX_VERSION,
+                "projection_version": PROJECTION_VERSION,
                 "occurrence_kind": "complete",
                 "run_id": run_id,
                 "generated_at": isoformat(generated_at),
                 "input_complete": input_complete,
                 "strategy_version": strategy_version,
-                "post_start_retention_seconds": retention_seconds,
                 "bundle_id": bundle_id,
                 "origin_run_id": run_id,
                 "continuity_selected": disposition is not None,
@@ -244,9 +257,6 @@ def selected_bundle_rows(report: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "participant_keys": list(participant_keys),
                 "activation_at": isoformat(activation),
                 "capture_start_at": isoformat(capture_start),
-                "planned_capture_end_at": isoformat(
-                    activation + timedelta(seconds=retention_seconds)
-                ),
                 "event_refs": event_refs,
                 "markets": [
                     {
@@ -343,7 +353,7 @@ def _retained_row(
             f"continuity bundle {bundle_id} origin manifest key is invalid"
         ) from error
     return {
-        "selected_bundle_index_version": SELECTED_BUNDLE_INDEX_VERSION,
+        "projection_version": PROJECTION_VERSION,
         "occurrence_kind": "retained",
         "run_id": run_id,
         "generated_at": isoformat(generated_at),
@@ -368,23 +378,6 @@ def _retained_row(
         "capture_start_at": next(iter(capture_starts)),
         "targets": targets,
     }
-
-
-def _selection_policy(
-    report: Mapping[str, Any], strategy_version: int
-) -> tuple[int, int]:
-    policy = report.get("selection_policy")
-    if not isinstance(policy, Mapping) or set(policy) != {
-        "pre_event_seconds",
-        "post_start_retention_seconds",
-    }:
-        raise SelectedBundleIndexError("report.selection_policy fields are invalid")
-    return (
-        _positive_integer(policy, "pre_event_seconds", "selection_policy"),
-        _positive_integer(
-            policy, "post_start_retention_seconds", "selection_policy"
-        ),
-    )
 
 
 def _relationships(
@@ -478,13 +471,6 @@ def _integer(document: Mapping[str, Any], field: str, label: str) -> int:
     value = document.get(field)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise SelectedBundleIndexError(f"{label}.{field} must be a non-negative integer")
-    return value
-
-
-def _positive_integer(document: Mapping[str, Any], field: str, label: str) -> int:
-    value = _integer(document, field, label)
-    if value == 0:
-        raise SelectedBundleIndexError(f"{label}.{field} must be positive")
     return value
 
 

@@ -11,7 +11,9 @@
     "port": 8080
   },
   "backfill": {
-    "temporary_directory": "/var/lib/event-universe/tmp"
+    "temporary_directory": "/var/lib/event-universe/tmp",
+    "generated_start": null,
+    "generated_end": null
   },
   "backup": {
     "directory": "/var/lib/event-universe/backups",

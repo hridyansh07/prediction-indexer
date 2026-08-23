@@ -1,21 +1,23 @@
 # Event Universe schema
 
-`v3.sql` is the complete reviewable SQLite schema. Runtime code loads it as a
-package resource; SQL does not live inside `universe/store.py`.
+[`v1.sql`](v1.sql) is the complete Event Universe SQLite schema. Runtime code
+loads it as a package resource; SQL does not live inside `universe/store.py`.
 
-The database is a sparse query index, not another evidence archive:
+The database is an append-only selected-history index, not another evidence
+archive:
 
-- one atomically replaced snapshot for the latest complete archived Targeter
-  v3 run;
-- complete rows only for its active selected bundles, including verified
-  immutable origin provenance and normalized event, market, asset, and
-  relationship context;
-- one raw-segment row per immutable segment universe receipt;
-- one normalized row per control envelope, never per venue frame;
-- no report, catalogue, target-record, envelope, or other source JSON columns.
+- `targeter_runs` binds each indexed Targeter v3 run to exact manifest/report
+  identities and a deterministic SQL projection identity;
+- content-addressed `bundle_contexts` and normalized child tables deduplicate
+  selected event, sibling-market, target, asset, and relationship context;
+- `selection_occurrences` records every selected `(run_id, bundle_id)` and
+  references a non-null complete origin occurrence; and
+- `checkpoints` records incremental S3 discovery progress.
 
-Exact evidence remains in immutable object storage. Source keys and SHA-256
-identities in this schema are the route back to those bytes. The planned capture
-end is the Targeter policy bound, not an observed event close or a completeness
-claim. There is no migration from an earlier Universe schema: no Event Universe
-version was deployed before this strict v3 contract.
+The schema has no active-snapshot, catalogue, raw segment, control, connection
+epoch, venue-delivery, report JSON, or replay-plan table. Exact evidence remains
+in immutable S3. Source keys and SHA-256 identities are the route back to those
+bytes.
+
+There is no migration from an earlier Universe schema because no Event
+Universe database was deployed before this strict v3-only contract.

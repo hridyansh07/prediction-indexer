@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -67,13 +67,6 @@ from archive.common.seal import (
     sealed_segments,
 )
 from archive.common.verify import VerificationError, verify_archive
-from archive.archiver.universe import (
-    FAILED as UNIVERSE_FAILED,
-    PUBLISHED as UNIVERSE_PUBLISHED,
-    SKIPPED as UNIVERSE_SKIPPED,
-    UniverseArtifactError,
-    publish_segment_universe,
-)
 from encoder import (
     DEFAULT_ZSTD_LEVEL,
     CodecError,
@@ -115,12 +108,6 @@ class SegmentOutcome:
     #: Present when the segment was archived or re-verified by this run.
     logical_sha256: str | None = None
     stored_byte_length: int | None = None
-    #: Independent derivative status. Raw archival remains successful when
-    #: this is ``failed`` and the next sweep retries it.
-    universe_status: str | None = None
-    universe_detail: str | None = None
-    universe_receipt_key: str | None = None
-    archive_receipt_sha256: str | None = None
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -131,10 +118,6 @@ class SegmentOutcome:
             "receipt": str(self.receipt_path) if self.receipt_path else None,
             "source_sha256": self.logical_sha256,
             "stored_byte_length": self.stored_byte_length,
-            "universe_status": self.universe_status,
-            "universe_detail": self.universe_detail,
-            "universe_receipt_key": self.universe_receipt_key,
-            "archive_receipt_sha256": self.archive_receipt_sha256,
         }
 
 
@@ -165,18 +148,6 @@ class SweepResult:
             "pending": self.pending,
             "failed": self.count(FAILED),
             "conflicted": self.count(CONFLICT),
-            "universe_published": sum(
-                1 for outcome in self.outcomes
-                if outcome.universe_status == UNIVERSE_PUBLISHED
-            ),
-            "universe_skipped": sum(
-                1 for outcome in self.outcomes
-                if outcome.universe_status == UNIVERSE_SKIPPED
-            ),
-            "universe_failed": sum(
-                1 for outcome in self.outcomes
-                if outcome.universe_status == UNIVERSE_FAILED
-            ),
         }
 
     def as_record(self) -> dict[str, Any]:
@@ -267,7 +238,7 @@ class Archiver:
         try:
             existing = self._existing_receipt(segment, receipt_path)
             if existing is not None:
-                outcome = SegmentOutcome(
+                return SegmentOutcome(
                     lane,
                     data_path.name,
                     SKIPPED,
@@ -276,15 +247,7 @@ class Archiver:
                     existing.source.sha256,
                     existing.data_stored.byte_length,
                 )
-                return self._publish_universe(segment, existing, outcome)
-            outcome = self._archive(segment, receipt_path)
-            if outcome.status == ARCHIVED and self.receipt_kind == PRODUCTION:
-                return self._publish_universe(
-                    segment,
-                    read_archive_receipt(receipt_path),
-                    outcome,
-                )
-            return outcome
+            return self._archive(segment, receipt_path)
         except IntegrityConflict as error:
             return SegmentOutcome(lane, data_path.name, CONFLICT, str(error))
         except (SealError, CodecError, ObjectStoreError, VerificationError, ReceiptError) as error:
@@ -441,38 +404,6 @@ class Archiver:
 
     def _location(self) -> str:
         return self.store.store_id
-
-    def _publish_universe(
-        self,
-        segment: SealedSegment,
-        receipt: ArchiveReceipt,
-        outcome: SegmentOutcome,
-    ) -> SegmentOutcome:
-        """Attempt the derivative without changing raw archive state."""
-        if not receipt.is_production:
-            return outcome
-        try:
-            published = publish_segment_universe(
-                self.store,
-                receipt,
-                segment.data_path,
-                now_ns=self._now_ns(),
-            )
-        except (UniverseArtifactError, CodecError, ObjectStoreError, OSError) as error:
-            return replace(
-                outcome,
-                universe_status=UNIVERSE_FAILED,
-                universe_detail=str(error),
-            )
-        return replace(
-            outcome,
-            universe_status=published.status,
-            universe_detail=(
-                f"committed {published.control_count} control envelopes"
-            ),
-            universe_receipt_key=published.receipt_key,
-            archive_receipt_sha256=published.archive_receipt_sha256,
-        )
 
 
 def _as_receipt(document: dict[str, Any], path: Path) -> ArchiveReceipt:
