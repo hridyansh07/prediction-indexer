@@ -4,6 +4,8 @@ Read-only React/Vite + Express dashboard for the five latest committed Targeter 
 
 The dashboard reads selection report v1, v2, and v3. For v2 and v3 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. Report v3 also shows the immutable origin run and archive identities that distinguish a complete occurrence from a retained reference. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement—and v3's explicitly validated all-budget-trimmed result—are shown as legitimate empty decisions. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
 
+`/event-universe` is a separate historical selected-event explorer backed by the Event Universe read API. It uses run and selection indexes, immutable source/origin provenance, bundle detail, and bundle history rather than rescanning Targeter reports. It intentionally does not expose catalogues, current subscription state, receipts, raw files, replay coverage, or inferred event-end times. The page's loading, errors, and freshness are independent from the recent Targeter S3 snapshot.
+
 ## Configuration
 
 [`targeter-ui/.env.example`](.env.example) contains the complete server and Amp OIDC variable set with non-secret example values. Register these variables in the orb environment; the service does not automatically source the example file.
@@ -16,6 +18,7 @@ export TARGETER_UI_S3_BUCKET=example-archive
 export TARGETER_UI_AWS_REGION=us-east-1
 export TARGETER_UI_S3_EXPECTED_OWNER=123456789012
 export TARGETER_UI_DECODER_PATH="$PWD/encoder/rust/target/release/prediction-decode-v1"
+export TARGETER_UI_EVENT_UNIVERSE_URL=https://event-universe.internal.example
 # optional: TARGETER_UI_S3_PREFIX=targeter-v2/runs
 # optional: TARGETER_UI_REFRESH_SECONDS=60 TARGETER_UI_EXPECTED_RUN_SECONDS=600 PORT=3000
 yarn install --frozen-lockfile
@@ -25,6 +28,8 @@ yarn workspace prediction-indexer-targeter-ui start
 ```
 
 `TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1–v3 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
+
+`TARGETER_UI_EVENT_UNIVERSE_URL` is optional so the operational dashboard can run without the historical service. When set, Express exposes only the documented Universe health, run, selected-occurrence, detail, and bundle-history routes below `/api/event-universe`; arbitrary upstream paths and query fields are rejected. The proxy validates closed response schemas, applies a 5-second timeout and 2 MiB response cap by default, and returns generic errors without upstream bodies. `TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION` may hold a complete server-side Authorization header for an authenticated network proxy. It is never returned to the browser. Override the bounds with `TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS` and `TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES`.
 
 From the repository root, use `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, and `yarn build`. The production Express server serves `dist/` and its API on `PORT`.
 

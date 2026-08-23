@@ -1,6 +1,12 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
+import {
+  BrowserRouter,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+} from 'react-router-dom';
 import type { ContinuityTarget, RunView, Snapshot } from '../shared';
 import {
   isContinuityBundleV3,
@@ -9,6 +15,8 @@ import {
   selectedBundleViews,
   type SelectedBundleView,
 } from './view-model';
+import { EventUniversePage } from './event-universe';
+import { targeterSnapshotNeeded } from './app-routing';
 import './style.css';
 
 const val = (x: any, fallback = '—') =>
@@ -70,9 +78,11 @@ const relationshipLabel = (x: string) => {
   return label.charAt(0).toUpperCase() + label.slice(1);
 };
 function App() {
+  const location = useLocation();
+  const needsSnapshot = targeterSnapshotNeeded(location.pathname);
   const [s, setS] = useState<Snapshot | null>(null);
   const [error, setError] = useState('');
-  const load = async (method = 'GET') => {
+  const load = useCallback(async (method = 'GET') => {
     try {
       const r = await fetch(
         method === 'GET' ? '/api/snapshot' : '/api/refresh',
@@ -84,12 +94,13 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  };
+  }, []);
   useEffect(() => {
+    if (!needsSnapshot) return;
     void load();
     const id = setInterval(() => void load(), 15000);
     return () => clearInterval(id);
-  }, []);
+  }, [load, needsSnapshot]);
   return (
     <>
       <header>
@@ -100,31 +111,68 @@ function App() {
         <nav aria-label="Main navigation">
           <NavLink to="/">Overview</NavLink>
           <NavLink to="/events">Events</NavLink>
+          <NavLink to="/event-universe">Event Universe</NavLink>
           <NavLink to="/config">Config</NavLink>
         </nav>
-        <button onClick={() => void load('POST')} disabled={s?.refreshing}>
-          ↻ Refresh archive
-        </button>
+        {needsSnapshot && (
+          <button onClick={() => void load('POST')} disabled={s?.refreshing}>
+            ↻ Refresh archive
+          </button>
+        )}
       </header>
-      {(error || s?.lastRefreshError) && (
+      {needsSnapshot && (error || s?.lastRefreshError) && (
         <div className="alert" role="alert">
           Snapshot stale/error: {error || s?.lastRefreshError}. Last successful
           data is retained.
         </div>
       )}
       <main>
-        {s ? (
-          <Routes>
-            <Route path="/" element={<Overview s={s} />} />
-            <Route path="/events" element={<Events s={s} />} />
-            <Route path="/config" element={<Config s={s} />} />
-          </Routes>
-        ) : (
-          <div className="loading">Loading archive snapshot…</div>
-        )}
+        <Routes>
+          <Route
+            path="/"
+            element={
+              <SnapshotRoute
+                s={s}
+                render={(snapshot) => <Overview s={snapshot} />}
+              />
+            }
+          />
+          <Route
+            path="/events"
+            element={
+              <SnapshotRoute
+                s={s}
+                render={(snapshot) => <Events s={snapshot} />}
+              />
+            }
+          />
+          <Route path="/event-universe" element={<EventUniversePage />} />
+          <Route
+            path="/config"
+            element={
+              <SnapshotRoute
+                s={s}
+                render={(snapshot) => <Config s={snapshot} />}
+              />
+            }
+          />
+        </Routes>
       </main>
-      {s && <StatusFooter s={s} />}
+      {needsSnapshot && s && <StatusFooter s={s} />}
     </>
+  );
+}
+function SnapshotRoute({
+  s,
+  render,
+}: {
+  s: Snapshot | null;
+  render: (snapshot: Snapshot) => React.ReactNode;
+}) {
+  return s ? (
+    render(s)
+  ) : (
+    <div className="loading">Loading archive snapshot…</div>
   );
 }
 function Overview({ s }: { s: Snapshot }) {

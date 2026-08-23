@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { S3ReadOnlyObjectStore } from '@prediction-indexer/read-only-object-store';
 import { RustV1Decoder } from '@prediction-indexer/rust-v1-decoder';
 import { SnapshotService } from './service.js';
+import {
+  createEventUniverseRouter,
+  EventUniverseClient,
+} from './event-universe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const readConfig = () =>
@@ -68,6 +72,23 @@ const service = new SnapshotService(
   process.env.TARGETER_UI_S3_PREFIX ?? 'targeter-v2/runs',
   fixture,
 );
+const universeUrl = process.env.TARGETER_UI_EVENT_UNIVERSE_URL;
+const universe = universeUrl
+  ? new EventUniverseClient({
+      baseUrl: universeUrl,
+      authorization: process.env.TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION,
+      timeoutMs: positive(
+        process.env.TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS,
+        5000,
+        'TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS',
+      ),
+      maxResponseBytes: positive(
+        process.env.TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES,
+        2 * 1024 * 1024,
+        'TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES',
+      ),
+    })
+  : null;
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '8kb' }));
@@ -80,6 +101,7 @@ app.get('/healthz', (_q, r) =>
 );
 app.get('/api/snapshot', (_q, r) => r.json(service.snapshot));
 app.post('/api/refresh', async (_q, r) => r.json(await service.refresh()));
+app.use('/api/event-universe', createEventUniverseRouter(universe));
 const web = path.resolve(here, '../../dist');
 if (fs.existsSync(web)) {
   app.use(express.static(web));
