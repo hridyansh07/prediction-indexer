@@ -43,11 +43,13 @@ credentials:
 | `ingest-store-reaper` | `ops` profile | One-shot audit/delete of closed ingest databases older than 24 hours |
 | `finalizer` | `ops` profile | Checks every minute and merges sealed windows into compressed canonical evidence |
 | `finalizer-once` | `ops` profile | The same finalization sweep, once |
-| `archiver` | `ops` profile | Hourly sweep publishing sealed segments as immutable compressed objects |
+| `archiver` | `ops` profile | Hourly sweep publishing sealed segments and committed canonical windows as immutable objects |
 | `archiver-once` | `ops` profile | The same sweep, once, for an operator or external scheduler |
 | `reaper` | `ops` profile | Hourly dual-receipt audit; deletion is opt-in |
 | `reaper-once` | `ops` profile | The same reaper sweep, once |
-| `canonical-integrity` | `ops` profile | Fully decodes and verifies committed canonical windows |
+| `canonical-reaper` | `ops` profile | Hourly 18-hour-floor audit of archived canonical frames; deletion is opt-in |
+| `canonical-reaper-once` | `ops` profile | The same canonical reaper sweep, once |
+| `canonical-integrity` | `ops` profile | Fully decodes local canonical windows and reports archived/reaped tombstones separately |
 | `targeter-v2-run-archiver` | `ops` profile, v2 override | Archives complete target-run directories that hold no receipt yet; never deletes |
 | `targeter-v2-run-reaper` | `ops` profile, v2 override | Hourly receipt-proved audit of local target-run directories; deletion is opt-in |
 
@@ -492,7 +494,7 @@ sweep is written to `ops/last_finalizer_sweep.json`.
 ```bash
 docker compose --profile ops up -d archiver        # sweeps hourly, stays up
 docker compose --profile ops run --rm archiver-once   # one sweep, then exits
-docker compose --profile ops up -d finalizer reaper   # independent receipt-coordinated loops
+docker compose --profile ops up -d finalizer reaper canonical-reaper
 ```
 
 The archiver compresses each sealed segment into one Zstandard frame, publishes
@@ -577,6 +579,47 @@ local raw segment and seal are untouched and remain the recovery authority.
 Exit `1` means one or more segments failed for their own reasons (a malformed
 seal, a changed byte, a transient store failure) and the sweep continued.
 
+The same sweep also discovers committed canonical windows. Those files are
+already V1 Zstandard frames, so the archiver strictly decodes them against the
+finalizer's receipt rather than recompressing them. It publishes the two exact
+frames and unchanged receipt under:
+
+```text
+canonical/date=<YYYY-MM-DD>/window=<start>/
+  evidence.ndjson.zst
+  provenance.ndjson.zst
+  receipt.json
+```
+
+Fresh object-store heads verify all three before the local window receives
+`canonical_archive_receipt.json`. The local backend uses
+`canonical_archive_receipt.local.json`, which is conformance evidence only.
+
+Canonical deletion is a third, separate authority:
+
+```bash
+docker compose --profile ops run --rm canonical-reaper-once
+```
+
+It defaults to `CANONICAL_REAPER_MODE=audit`. A window is reapable only when a
+production canonical archive receipt binds its unchanged `receipt.json` and
+both frame identities, the backend is independently durable, all three remote
+objects pass fresh heads, and the window is at least
+`CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value below 18.
+Age is measured from the latest of window end, finalization, archive
+verification, and both receipt mtimes, so a backdated test clock cannot shorten
+retention.
+
+Delete mode removes only `evidence.ndjson.zst` and
+`provenance.ndjson.zst`. It permanently retains the window directory,
+`receipt.json`, and `canonical_archive_receipt.json`; those compact files are
+the tombstone the finalizer needs to rebuild the watermark and preserve global
+sequence/continuity after restart. Canonical integrity reports these windows as
+`windows_archived_and_reaped` and does not count their unavailable records as
+locally verified; a crash between the two unlinks is separately visible as
+`windows_partially_reaped`. Enable `CANONICAL_REAPER_MODE=delete` only after the
+same S3 soak and audit review required for raw deletion.
+
 ### S3 archive backend
 
 Both `archiver` and `reaper` build their object store through one factory,
@@ -605,27 +648,28 @@ production `.archive.json` receipts against it.
 
 Credentials are never set in `.env`. On AWS, prefer an instance or task role
 scoped to exactly `s3:ListBucket` on the bucket and
-`s3:PutObject`/`s3:GetObject` on **both** `bucket/raw/*` and
-`bucket/targeter-v2/*`, with no delete permission. Both prefixes are required:
-sealed capture archives under `raw/`, and Targeter v2 archives run directories
-under `targeter-v2/runs/date=<date>/run=<run_id>/`. A role written for `raw/*`
-alone fails the first target-run archival with `AccessDenied`, which in turn
-means the run reaper can never reclaim disk. The exact policy documents are in
+`s3:PutObject`/`s3:GetObject` on `bucket/raw/*`, `bucket/canonical/*`, and
+`bucket/targeter-v2/*`, with no delete permission. All three prefixes are
+required: sealed capture archives under `raw/`, finalized windows under
+`canonical/`, and Targeter v2 run directories under `targeter-v2/`. The exact
+policy documents are in
 `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12.3.
 
 If the Compose host instead uses temporary or static environment credentials,
 export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and (for temporary
 credentials) `AWS_SESSION_TOKEN` in the shell that invokes Compose. Compose
-forwards them only to `archiver`, `archiver-once`, `reaper`, and `reaper-once`,
-plus — when the v2 override is included — `targeter`, `targeter-v2-integrity`,
+forwards them only to `archiver`, `archiver-once`, `reaper`, `reaper-once`,
+`canonical-reaper`, and `canonical-reaper-once`, plus — when the v2 override is
+included — `targeter`, `targeter-v2-integrity`,
 `targeter-v2-run-archiver`, and `targeter-v2-run-reaper`. It does not forward
 them to venue splices or the ingester. A host `~/.aws` directory is not mounted
 into the containers. For an EC2 instance role, ensure IMDS is reachable from
 bridge containers (including a sufficient IMDSv2 response hop limit).
 
 The bucket itself needs Block Public Access enabled, versioning on, default
-encryption on, and a policy requiring `If-None-Match: *` on writes under both
-`raw/` and `targeter-v2/` — see `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
+encryption on, and a policy requiring `If-None-Match: *` on writes under
+`raw/`, `canonical/`, and `targeter-v2/` — see
+`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
 the full checklist and the JSON.
 
 Switching `ARCHIVE_BACKEND` from `local` to `s3` does not touch the reaper's
@@ -635,9 +679,9 @@ construction. §15's rollout gate still applies — run the S3 archiver with
 reaper deletion disabled for at least 24 hours, sample every lane against
 retained local raw, and only then consider enabling destructive reaper runs.
 
-**Still out of scope.** Canonical S3 upload and object-store lifecycle expiry are
-not configured, so those tiers grow until a later sink and retention policy are
-enabled. With the local conformance backend, total local storage is *not*
+**Still out of scope.** Object-store lifecycle expiry is not configured, so the
+archive grows until a later retention policy is enabled. With the local
+conformance backend, total local storage is *not*
 bounded — the bytes have changed representation and directory, nothing more;
 an S3 backend does not bound the spool until `REAPER_MODE=delete` is enabled.
 

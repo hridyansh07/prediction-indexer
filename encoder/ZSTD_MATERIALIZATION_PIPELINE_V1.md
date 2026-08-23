@@ -33,7 +33,7 @@ V1 stores NDJSON inside Zstandard frames. It does **not** use Simple Binary
 Encoding (SBE), a custom binary event schema, record blocks, or an additional
 message-framing layer.
 
-The two materialization steps are:
+The materialization and archival steps are:
 
 1. **Raw archiver:** a valid sealed splice segment becomes one independently
    addressable `.ndjson.zst` object in S3, while the original seal remains
@@ -41,13 +41,16 @@ The two materialization steps are:
 2. **Canonical ingester/finalizer:** a finalized window becomes
    `evidence.ndjson.zst`, `provenance.ndjson.zst`, and the `receipt.json` that
    commits them on the local durable filesystem.
+3. **Canonical archive sink:** a receipt-committed window is independently
+   decoded against that receipt, then its two existing Zstandard frames and
+   unchanged `receipt.json` are copied to immutable object storage. A separate
+   local canonical archive receipt is published last.
 
 The following are out of scope:
 
 - changing envelope schemas or canonical merge order;
 - normalizing venue payloads before canonical evidence is committed;
 - combining a day of segments into one Zstandard frame or S3 object;
-- uploading canonical windows to S3;
 - replay or correction-dataset policy beyond defining the verified decoder
   boundary;
 - retaining uncompressed canonical files as compatibility copies.
@@ -451,7 +454,8 @@ non-zero byte lengths.
 The receipt parser fails closed unless:
 
 - every required compression field has the V1 value;
-- both stored files exist and match their stored lengths;
+- both stored files exist and match their stored lengths, or the intentional
+  canonical-reaper tombstone of §4.5 proves why they are absent;
 - decoded evidence and provenance line counts are equal;
 - the canonical sequence range agrees with the decoded evidence line count;
 - empty/non-empty sequence fields follow the rule above.
@@ -491,6 +495,41 @@ must not solve this requirement by buffering the file in memory.
 A receipt referencing a missing, truncated, corrupt, multi-frame, or logically
 mismatched object is an integrity failure. It is never treated as an open window
 and is never silently regenerated over the committed receipt.
+
+### 4.5 Canonical archive retention and local reaping
+
+Canonical archival and local deletion are separate commands. The archiver has
+no removal primitive. The canonical reaper defaults to audit and refuses a
+retention floor below **18 hours** or destructive operation without an
+independently durable backend.
+
+For a receipt-committed window the reaper requires, at decision time:
+
+1. a strict production `canonical_archive_receipt.json`; local conformance
+   receipts authorize nothing;
+2. an independently durable configured store matching that receipt;
+3. age of at least 18 hours from the latest of window end, finalization time,
+   archive verification time, canonical-receipt mtime, and archive-receipt
+   mtime;
+4. exact identity agreement between the local canonical receipt, both output
+   identities, and the archive receipt;
+5. fresh object heads verifying all three immutable archive objects; and
+6. explicit delete mode.
+
+Only `evidence.ndjson.zst` and `provenance.ndjson.zst` are removed, evidence
+first and with a directory fsync after each unlink. The canonical `receipt.json`
+and production archive receipt remain as a compact tombstone. This is required,
+not optional bookkeeping: the finalizer rebuilds its watermark, global sequence,
+continuity, and carried clock state from canonical receipts. Deleting that
+receipt would allow committed history to be forgotten and re-finalized.
+
+A crash after removing evidence but before provenance is a recognizable partial
+cleanup and may finish only after all gates are re-established. The reverse
+partial state is not produced by this reaper and fails closed. Finalizer startup
+accepts missing frames only when the strict production archive marker binds the
+unchanged local receipt and both frame identities. Canonical integrity reports
+such windows separately as archived-and-reaped; it does not claim their records
+were locally decoded and verified.
 
 ## 5. Implementation order and proof gates
 
@@ -538,6 +577,21 @@ when:
 - finalization and verification use bounded memory for multi-gigabyte windows.
 
 After Step 2, deployment documentation and Compose paths are updated to show the
-new filenames. A later, separate sink may upload canonical windows, but it must
-consume the receipt-committed `.zst` files and is not part of either changeset
-defined here.
+new filenames. The archive sink consumes the receipt-committed `.zst` files
+without recompressing or reserializing them. Before upload it runs both files
+through the shared strict decoder with the receipt's stored and decoded
+identities and decoded-byte ceilings. It then uploads, in order:
+
+```text
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/evidence.ndjson.zst
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/provenance.ndjson.zst
+canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/receipt.json
+```
+
+The unchanged canonical `receipt.json` is uploaded after the two data objects.
+Fresh object-store heads must prove all three SHA-256 identities, lengths, and
+content metadata. Only then may the sink durably publish
+`canonical_archive_receipt.json` beside the local window (or the explicitly
+non-authoritative `.local.json` conformance form). A failed decode, upload,
+head, or immutable-key check leaves no canonical archive receipt and never
+modifies the committed window.

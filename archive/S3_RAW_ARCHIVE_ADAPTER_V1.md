@@ -10,9 +10,9 @@ Where this document is more specific about AWS S3 calls, this document controls.
 
 ## 1. Goal
 
-Replace `LocalObjectStore` with an AWS S3 implementation of the existing
-`ObjectStore` protocol without changing the archiver, receipt, manifest, replay,
-or reaper data model.
+Use the AWS S3 implementation of the existing `ObjectStore` protocol for raw
+segments, Targeter runs, and receipt-committed canonical windows without adding
+S3 calls to their producers.
 
 After this phase:
 
@@ -39,7 +39,6 @@ response, S3 key, or ETag is not a commit marker.
 
 V1 does **not** add:
 
-- canonical-window upload;
 - raw-object expiry or any S3 delete path;
 - multipart upload;
 - S3-compatible providers such as MinIO or R2;
@@ -60,7 +59,7 @@ policy while writing the adapter.
 | Question | V1 decision |
 |---|---|
 | Archive unit | one sealed segment per S3 data object, plus its seal object |
-| Bucket layout | two archive prefixes: `raw/lane=<lane>/date=<date>/...` for sealed capture and `targeter-v2/runs/date=<date>/run=<run_id>/...` for target runs |
+| Bucket layout | three archive prefixes: `raw/lane=<lane>/date=<date>/...`, `canonical/date=<date>/window=<start>/...`, and `targeter-v2/runs/date=<date>/run=<run_id>/...` |
 | Bucket sharing | one dedicated archive bucket per deployment |
 | Immutability | every upload uses `IfNoneMatch="*"` |
 | Integrity | explicit full-object SHA-256; ETag is ignored |
@@ -393,20 +392,22 @@ capture host for V1.
 
 ### 12.1 Archive prefixes
 
-One bucket holds two independent archive namespaces, written by different
+One bucket holds three independent archive namespaces, written by different
 commands with different cadences but under identical immutability rules:
 
 ```text
 raw/lane=<lane>/date=<date>/<segment>            sealed capture segments and seals
+canonical/date=<date>/window=<start>/<file>      finalized evidence, provenance, receipt
 targeter-v2/runs/date=<date>/run=<run_id>/<file> target-run artifacts and manifest
 ```
 
 `raw/` is written by `archive.archiver.cli` (`archive/archiver/service.py:98`).
+`canonical/` is written by that command's canonical sink after strict decode.
 `targeter-v2/` is written by `targeter/v2/run_archive.py:245`, reached from a
 scheduled `targeter/run_v2.py --mode publish|archive` and from
 `targeter.v2.run_archiver_cli`.
 
-**Every rule in this section applies to both prefixes.** They are two namespaces
+**Every rule in this section applies to all three prefixes.** They are separate namespaces
 rather than one because they have different producers, different retention
 questions, and different reapers; they are in one bucket because they share a
 durability domain and one bucket-owner identity. A policy written for `raw/`
@@ -420,12 +421,12 @@ that makes the archive immutable.
 - bucket versioning enabled as recovery defense;
 - default encryption enabled, initially SSE-S3;
 - bucket policy denies non-TLS requests;
-- bucket policy requires `If-None-Match: *` for writes under **both** `raw/`
-  and `targeter-v2/`;
-- no expiration lifecycle rule on either prefix yet;
+- bucket policy requires `If-None-Match: *` for writes under `raw/`,
+  `canonical/`, and `targeter-v2/`;
+- no expiration lifecycle rule on any archive prefix yet;
 - no application permission to delete objects or object versions.
 
-The conditional-write condition, applied to both prefixes:
+The conditional-write condition, applied to all three prefixes:
 
 ```json
 {
@@ -435,6 +436,7 @@ The conditional-write condition, applied to both prefixes:
   "Action": "s3:PutObject",
   "Resource": [
     "arn:aws:s3:::BUCKET/raw/*",
+    "arn:aws:s3:::BUCKET/canonical/*",
     "arn:aws:s3:::BUCKET/targeter-v2/*"
   ],
   "Condition": {
@@ -445,7 +447,7 @@ The conditional-write condition, applied to both prefixes:
 
 ### 12.3 Runtime role
 
-Restricted to this bucket and these two prefixes:
+Restricted to this bucket and these three prefixes:
 
 ```json
 {
@@ -463,6 +465,7 @@ Restricted to this bucket and these two prefixes:
       "Action": ["s3:PutObject", "s3:GetObject"],
       "Resource": [
         "arn:aws:s3:::BUCKET/raw/*",
+        "arn:aws:s3:::BUCKET/canonical/*",
         "arn:aws:s3:::BUCKET/targeter-v2/*"
       ]
     }
@@ -617,8 +620,8 @@ The phase is complete only when every answer is yes:
 - Does the runtime role lack S3 deletion authority?
 - Are the reapers still audit-only by default?
 - Is object lifecycle expiry still disabled?
-- Do the runtime role and the conditional-write bucket policy cover both `raw/*`
-  and `targeter-v2/*`?
+- Do the runtime role and the conditional-write bucket policy cover `raw/*`,
+  `canonical/*`, and `targeter-v2/*`?
 - Has a real target run produced `archive_receipt.json` under `targeter-v2/`?
 
 ## 17. AWS references
@@ -636,8 +639,8 @@ The phase is complete only when every answer is yes:
 
 Approve or change these before implementation:
 
-1. one dedicated bucket per deployment, holding the `raw/` and `targeter-v2/`
-   archive prefixes of §12.1 under identical immutability rules;
+1. one dedicated bucket per deployment, holding the `raw/`, `canonical/`, and
+   `targeter-v2/` archive prefixes of §12.1 under identical immutability rules;
 2. single `PutObject` only in V1, failing closed above 5 GB;
 3. SSE-S3 bucket-default encryption for the first deployment;
 4. bucket owner account ID required in configuration;

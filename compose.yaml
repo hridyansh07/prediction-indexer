@@ -65,8 +65,8 @@ x-archive-volume: &archive-volume
     create_host_path: true
 
 # Credentials remain outside `.env`: export these in the shell that invokes
-# Compose when a host is not using an AWS instance/task role. Only the three
-# S3-facing services receive them; venue capture has no archive authority.
+# Compose when a host is not using an AWS instance/task role. Only S3-facing
+# services receive them; venue capture has no archive authority.
 x-aws-archive-environment: &aws-archive-environment
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
   AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
@@ -403,8 +403,9 @@ services:
     volumes:
       - *data-volume
 
-  # Publishes each sealed segment as one immutable compressed object plus its
-  # unchanged seal, then writes the receipt that is the archive commit marker.
+  # Publishes each sealed segment and each receipt-committed canonical window
+  # through immutable object writes, then writes a separate local archive receipt
+  # that is the archive commit marker.
   # Never deletes anything: PHASE_4_RAW_ARCHIVE_REAPER_V1 §2 makes archival and
   # deletion separate authorities, and this is the archival one.
   #
@@ -431,6 +432,8 @@ services:
       - archive.archiver.cli
       - --spool-root
       - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
       - --archive-root
       - /var/lib/prediction-archive
       - --manifest-root
@@ -475,6 +478,8 @@ services:
       - archive.archiver.cli
       - --spool-root
       - /var/lib/prediction-indexer/spool
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
       - --archive-root
       - /var/lib/prediction-archive
       - --manifest-root
@@ -577,6 +582,85 @@ services:
       - "${REAPER_MODE:-audit}"
       - --report
       - /var/lib/prediction-indexer/archive-manifests/last_reaper_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  # Separately reclaims the two large canonical Zstandard frames after their
+  # production archive receipt and fresh object heads have held for at least
+  # 18 hours. Audit is the default. receipt.json and the canonical archive
+  # receipt always remain as the finalizer's restart/audit tombstone.
+  canonical-reaper:
+    <<: *capture-service
+    profiles:
+      - ops
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.reaper.canonical_cli
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --mode
+      - "${CANONICAL_REAPER_MODE:-audit}"
+      - --retention-hours
+      - "${CANONICAL_REAPER_RETENTION_HOURS:-18}"
+      - --interval-seconds
+      - "${CANONICAL_REAPER_INTERVAL_SECONDS:-3600}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_canonical_reaper_sweep.json
+    volumes:
+      - *data-volume
+      - *archive-volume
+
+  canonical-reaper-once:
+    <<: *capture-service
+    profiles:
+      - ops
+    restart: "no"
+    environment: *aws-archive-environment
+    command:
+      - python
+      - -u
+      - -m
+      - archive.reaper.canonical_cli
+      - --canonical-root
+      - /var/lib/prediction-indexer/canonical
+      - --archive-root
+      - /var/lib/prediction-archive
+      - --store-id
+      - "${ARCHIVE_STORE_ID:-local-archive}"
+      - --archive-durability
+      - "${ARCHIVE_DURABILITY:-conformance}"
+      - --archive-backend
+      - "${ARCHIVE_BACKEND:-local}"
+      - --s3-bucket
+      - "${ARCHIVE_S3_BUCKET:-}"
+      - --s3-region
+      - "${ARCHIVE_S3_REGION:-}"
+      - --s3-expected-owner
+      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --mode
+      - "${CANONICAL_REAPER_MODE:-audit}"
+      - --retention-hours
+      - "${CANONICAL_REAPER_RETENTION_HOURS:-18}"
+      - --report
+      - /var/lib/prediction-indexer/archive-manifests/last_canonical_reaper_sweep.json
     volumes:
       - *data-volume
       - *archive-volume

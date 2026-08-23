@@ -32,10 +32,11 @@ pub mod window;
 
 pub use audit::{AuditReport, audit_canonical_root};
 pub use canonical::{
-    CanonicalOutput, CompressionContract, DecodedIdentity, FinalizedWindow, InputSegment,
-    LaneFault, Receipt, RootLease, StoredIdentity, WindowOutcome, advance_delivery_continuity,
-    committed_windows, create_dir_all_durable, delivery_continuity, finalize_window, late_segments,
-    read_receipt, receipt_path, window_directory,
+    CanonicalOutput, CanonicalOutputsState, CompressionContract, DecodedIdentity, FinalizedWindow,
+    InputSegment, LaneFault, Receipt, RootLease, StoredIdentity, WindowOutcome,
+    advance_delivery_continuity, canonical_outputs_state, committed_windows,
+    create_dir_all_durable, delivery_continuity, finalize_window, late_segments, read_receipt,
+    receipt_path, window_directory,
 };
 pub use continuity::{ClassifiedLine, LaneClocks, OrderingState, SeenEpochs, WrittenLine};
 pub use merge::{LaneRecord, LaneStream, Merge, MergeFault, MergedRecord, SourceRef, TieGroups};

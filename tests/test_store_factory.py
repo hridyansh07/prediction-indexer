@@ -21,6 +21,7 @@ from archive.storage.factory import add_store_arguments, build_store
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spool-root", type=Path, required=True)
+    parser.add_argument("--canonical-root", type=Path, default=None)
     add_store_arguments(parser)
     return parser
 
@@ -83,6 +84,38 @@ class LocalBackendTests(FactoryCase):
         finally:
             store_factory._device_of = original
         self.assertEqual(store.durability, INDEPENDENT)
+
+    def test_independence_is_refused_when_archive_shares_the_canonical_disk(self) -> None:
+        canonical = self.root / "canonical"
+        canonical.mkdir()
+        original = store_factory._device_of
+        devices = {
+            str(self.spool.resolve()): 1,
+            str(canonical.resolve()): 2,
+            str(self.archive_root.resolve()): 2,
+        }
+
+        def fake_device_of(path: Path) -> int:
+            resolved = str(Path(path).resolve())
+            return devices.get(resolved, original(path))
+
+        store_factory._device_of = fake_device_of
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                build_store(
+                    self.parse(
+                        "--canonical-root",
+                        str(canonical),
+                        "--archive-root",
+                        str(self.archive_root),
+                        "--archive-durability",
+                        "independent",
+                    )
+                )
+        finally:
+            store_factory._device_of = original
+        self.assertIn(str(canonical), str(raised.exception))
+        self.assertIn("same filesystem", str(raised.exception))
 
     def test_a_live_s3_option_while_local_is_selected_fails_at_startup(self) -> None:
         with self.assertRaises(SystemExit) as raised:

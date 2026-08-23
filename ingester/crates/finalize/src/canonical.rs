@@ -26,12 +26,14 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use indexer_continuity::{Classifier, IdentityVerdict};
 use indexer_types::{CanonicalSeq, EnvelopeView, Positioned};
 use prediction_encoder::{
     CODEC_VERSION, DEFAULT_ZSTD_LEVEL, EncodeResult, StreamingEncoder, encoder_version,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::continuity::{ClassifiedLine, LaneClocks, OrderingState, SeenEpochs, WrittenLine};
 use crate::identity::AttemptIdentity;
@@ -48,8 +50,42 @@ pub const FINALIZER_VERSION: u64 = 1;
 pub const EVIDENCE_FILE: &str = "evidence.ndjson.zst";
 pub const PROVENANCE_FILE: &str = "provenance.ndjson.zst";
 const RECEIPT_FILE: &str = "receipt.json";
+const CANONICAL_ARCHIVE_RECEIPT_FILE: &str = "canonical_archive_receipt.json";
 const LEASE_FILE: &str = ".finalize.lease";
 const OPEN_SUFFIX: &str = ".open";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalOutputsState {
+    Present,
+    PartiallyReaped,
+    Archived,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalArchiveReceipt {
+    canonical_archive_receipt_version: u64,
+    window_start_ns: u64,
+    window_end_ns: u64,
+    evidence: CanonicalArchiveObject,
+    provenance: CanonicalArchiveObject,
+    canonical_receipt: CanonicalArchiveObject,
+    verified_at_ns: u64,
+    archiver_version: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalArchiveObject {
+    file: String,
+    bucket: String,
+    key: String,
+    byte_length: u64,
+    sha256: String,
+    content_type: String,
+    content_encoding: Option<String>,
+    s3_checksum_sha256: String,
+}
 
 /// Identity of the decoded NDJSON carried by a compressed canonical object.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1015,22 +1051,229 @@ pub fn read_receipt(
                 )));
             }
         }
-        let object = directory.join(&output.file);
-        let metadata = std::fs::symlink_metadata(&object)
-            .map_err(|error| invalid(format!("{}: {error}", output.file)))?;
-        if !metadata.file_type().is_file() {
-            return Err(invalid(format!("{} is not a regular file", output.file)));
+    }
+    canonical_outputs_state_from_bytes(&directory, &path, &encoded, &receipt)?;
+    Ok(Some(receipt))
+}
+
+/// Whether a committed window's large frames remain local or were deliberately
+/// reaped after archival. The compact receipts remain authoritative in either
+/// state; unexplained missing files are still corruption.
+pub fn canonical_outputs_state(
+    canonical_root: &Path,
+    receipt: &Receipt,
+) -> Result<CanonicalOutputsState, String> {
+    let directory = window_directory(canonical_root, receipt.window_start_ns);
+    let path = directory.join(RECEIPT_FILE);
+    let encoded =
+        std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let current: Receipt = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("unreadable receipt {}: {error}", path.display()))?;
+    if &current != receipt {
+        return Err(format!(
+            "unreadable receipt {}: changed after committed-window discovery",
+            path.display()
+        ));
+    }
+    canonical_outputs_state_from_bytes(&directory, &path, &encoded, receipt)
+}
+
+fn canonical_outputs_state_from_bytes(
+    directory: &Path,
+    receipt_path: &Path,
+    receipt_bytes: &[u8],
+    receipt: &Receipt,
+) -> Result<CanonicalOutputsState, String> {
+    let invalid =
+        |detail: String| format!("unreadable receipt {}: {detail}", receipt_path.display());
+    let evidence_present = canonical_output_present(directory, &receipt.evidence, &invalid)?;
+    let provenance_present = canonical_output_present(directory, &receipt.provenance, &invalid)?;
+    match (evidence_present, provenance_present) {
+        (true, true) => Ok(CanonicalOutputsState::Present),
+        (true, false) => Err(invalid(
+            "provenance.ndjson.zst is absent while evidence.ndjson.zst remains; this is not a \
+             state produced by the canonical reaper"
+                .to_owned(),
+        )),
+        (false, true) => {
+            validate_canonical_archive_tombstone(directory, receipt_bytes, receipt, &invalid)?;
+            Ok(CanonicalOutputsState::PartiallyReaped)
         }
-        if metadata.len() != output.stored.byte_length {
-            return Err(invalid(format!(
-                "{} is {} bytes, recorded as {}",
-                output.file,
-                metadata.len(),
-                output.stored.byte_length
-            )));
+        (false, false) => {
+            validate_canonical_archive_tombstone(directory, receipt_bytes, receipt, &invalid)?;
+            Ok(CanonicalOutputsState::Archived)
         }
     }
-    Ok(Some(receipt))
+}
+
+fn canonical_output_present(
+    directory: &Path,
+    output: &CanonicalOutput,
+    invalid: &impl Fn(String) -> String,
+) -> Result<bool, String> {
+    let object = directory.join(&output.file);
+    let metadata = match std::fs::symlink_metadata(&object) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(invalid(format!("{}: {error}", output.file))),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(invalid(format!("{} is not a regular file", output.file)));
+    }
+    if metadata.len() != output.stored.byte_length {
+        return Err(invalid(format!(
+            "{} is {} bytes, recorded as {}",
+            output.file,
+            metadata.len(),
+            output.stored.byte_length
+        )));
+    }
+    Ok(true)
+}
+
+fn validate_canonical_archive_tombstone(
+    directory: &Path,
+    receipt_bytes: &[u8],
+    receipt: &Receipt,
+    invalid: &impl Fn(String) -> String,
+) -> Result<(), String> {
+    let marker_path = directory.join(CANONICAL_ARCHIVE_RECEIPT_FILE);
+    let metadata = std::fs::symlink_metadata(&marker_path).map_err(|error| {
+        invalid(format!(
+            "evidence.ndjson.zst or provenance.ndjson.zst is absent without a regular \
+             production archive receipt: {error}"
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(
+            "canonical archive receipt is not a regular file".to_owned(),
+        ));
+    }
+    let encoded = std::fs::read(&marker_path).map_err(|error| {
+        invalid(format!(
+            "evidence.ndjson.zst or provenance.ndjson.zst is absent without a readable \
+             production archive receipt: {error}"
+        ))
+    })?;
+    let marker: CanonicalArchiveReceipt = serde_json::from_slice(&encoded).map_err(|error| {
+        invalid(format!(
+            "canonical outputs are absent without a valid production archive receipt: {error}"
+        ))
+    })?;
+    if marker.canonical_archive_receipt_version != 1 || marker.archiver_version != 1 {
+        return Err(invalid(
+            "canonical archive receipt has an unsupported version".to_owned(),
+        ));
+    }
+    if (marker.window_start_ns, marker.window_end_ns)
+        != (receipt.window_start_ns, receipt.window_end_ns)
+    {
+        return Err(invalid(
+            "canonical archive receipt names another window".to_owned(),
+        ));
+    }
+    let _ = marker.verified_at_ns;
+    let date = directory
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("canonical window has no date partition".to_owned()))?;
+    let window = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("canonical window has no window partition".to_owned()))?;
+    if !date.starts_with("date=") || window != format!("window={}", receipt.window_start_ns) {
+        return Err(invalid(
+            "canonical archive receipt sits outside its window partition".to_owned(),
+        ));
+    }
+    let base = format!("canonical/{date}/{window}");
+    validate_archive_object(
+        &marker.evidence,
+        EVIDENCE_FILE,
+        &format!("{base}/{EVIDENCE_FILE}"),
+        "application/x-ndjson",
+        Some("zstd"),
+        &receipt.evidence.stored,
+        invalid,
+    )?;
+    validate_archive_object(
+        &marker.provenance,
+        PROVENANCE_FILE,
+        &format!("{base}/{PROVENANCE_FILE}"),
+        "application/x-ndjson",
+        Some("zstd"),
+        &receipt.provenance.stored,
+        invalid,
+    )?;
+    let receipt_identity = StoredIdentity {
+        byte_length: receipt_bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(receipt_bytes)),
+    };
+    validate_archive_object(
+        &marker.canonical_receipt,
+        RECEIPT_FILE,
+        &format!("{base}/{RECEIPT_FILE}"),
+        "application/json",
+        None,
+        &receipt_identity,
+        invalid,
+    )?;
+    if marker.evidence.bucket != marker.provenance.bucket
+        || marker.evidence.bucket != marker.canonical_receipt.bucket
+    {
+        return Err(invalid(
+            "canonical archive objects name different buckets".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_archive_object(
+    object: &CanonicalArchiveObject,
+    expected_file: &str,
+    expected_key: &str,
+    expected_content_type: &str,
+    expected_content_encoding: Option<&str>,
+    expected_identity: &StoredIdentity,
+    invalid: &impl Fn(String) -> String,
+) -> Result<(), String> {
+    if object.file != expected_file
+        || object.key != expected_key
+        || object.content_type != expected_content_type
+        || object.content_encoding.as_deref() != expected_content_encoding
+        || object.bucket.is_empty()
+        || object.byte_length != expected_identity.byte_length
+        || object.sha256 != expected_identity.sha256
+        || !is_lower_sha256(&object.sha256)
+    {
+        return Err(invalid(format!(
+            "canonical archive object {expected_file} disagrees with receipt.json"
+        )));
+    }
+    let digest = decode_sha256_hex(&object.sha256)
+        .ok_or_else(|| invalid(format!("{expected_file} has an invalid SHA-256")))?;
+    let expected_checksum = base64::engine::general_purpose::STANDARD.encode(digest);
+    if object.s3_checksum_sha256 != expected_checksum {
+        return Err(invalid(format!(
+            "canonical archive object {expected_file} has the wrong provider checksum"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_sha256_hex(value: &str) -> Option<[u8; 32]> {
+    if !is_lower_sha256(value) {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
 }
 
 fn is_lower_sha256(value: &str) -> bool {

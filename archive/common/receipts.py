@@ -36,7 +36,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from encoder import DEFAULT_ZSTD_LEVEL, LogicalIdentity, StoredIdentity
+from encoder import (
+    DEFAULT_ZSTD_LEVEL,
+    LogicalIdentity,
+    StoredIdentity,
+    stored_identity_of,
+)
 
 __all__ = [
     "ARCHIVER_VERSION",
@@ -48,6 +53,7 @@ __all__ = [
     "ArchiveReceipt",
     "CanonicalIndex",
     "CanonicalInput",
+    "CanonicalOutput",
     "CanonicalReceipt",
     "ReceiptError",
     "archive_receipt_path",
@@ -397,13 +403,30 @@ class CanonicalInput:
 
 
 @dataclass(frozen=True)
+class CanonicalOutput:
+    """One receipt-bound canonical Zstandard object and both of its identities."""
+
+    file: str
+    decoded: LogicalIdentity
+    stored: StoredIdentity
+
+
+@dataclass(frozen=True)
 class CanonicalReceipt:
     path: Path
     window_start_ns: int
     window_end_ns: int
+    finalized_at_ns: int
     completeness: str
     certified: bool
     inputs: tuple[CanonicalInput, ...]
+    evidence: CanonicalOutput
+    provenance: CanonicalOutput
+    #: False only when a production archive receipt proves the large local
+    #: frames were intentionally reaped. ``receipt.json`` remains the canonical
+    #: commit marker and restart authority in either state.
+    outputs_present: bool
+    document: dict[str, Any]
 
 
 def read_canonical_receipt(path: Path) -> CanonicalReceipt:
@@ -411,9 +434,10 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
 
     The mirror of `canonical.rs::read_receipt`: structural validity is not
     enough, so the objects the receipt names are confirmed to exist at the
-    length it recorded. Lengths rather than digests, for the same reason the
-    Rust side gives — rehashing days of canonical output on every sweep is the
-    unbounded scan this pipeline refuses everywhere else.
+    length it recorded. The one valid absence is an archive-reaper tombstone:
+    a strict production archive receipt must bind the unchanged canonical
+    receipt and both output identities. This keeps sequence/watermark rebuild
+    state locally while allowing the large frames to leave disk.
     """
     path = Path(path)
 
@@ -433,6 +457,7 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
 
     window_start_ns = _integer(document, "window_start_ns", invalid)
     window_end_ns = _integer(document, "window_end_ns", invalid)
+    finalized_at_ns = _integer(document, "finalized_at_ns", invalid)
     if window_start_ns >= window_end_ns:
         raise invalid("window_start_ns does not precede window_end_ns")
     directory = path.parent
@@ -446,12 +471,31 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
     if not isinstance(certified, bool):
         raise invalid("certified is not a boolean")
 
-    evidence = _canonical_output(document, "evidence", "evidence.ndjson.zst", directory, invalid)
-    provenance = _canonical_output(
-        document, "provenance", "provenance.ndjson.zst", directory, invalid
+    evidence_document = _canonical_output(document, "evidence", "evidence.ndjson.zst", invalid)
+    provenance_document = _canonical_output(
+        document, "provenance", "provenance.ndjson.zst", invalid
     )
-    evidence_decoded = _section(evidence, "decoded", invalid)
-    provenance_decoded = _section(provenance, "decoded", invalid)
+    evidence = _canonical_output_identity(evidence_document, invalid)
+    provenance = _canonical_output_identity(provenance_document, invalid)
+    evidence_present = _canonical_output_present(directory, evidence, invalid)
+    provenance_present = _canonical_output_present(directory, provenance, invalid)
+    if provenance_present and not evidence_present:
+        # Evidence is removed first, then provenance. This is the sole partial
+        # crash state the canonical reaper can produce.
+        _validate_canonical_archive_tombstone(
+            path, window_start_ns, window_end_ns, evidence, provenance, invalid
+        )
+    elif not evidence_present and not provenance_present:
+        _validate_canonical_archive_tombstone(
+            path, window_start_ns, window_end_ns, evidence, provenance, invalid
+        )
+    elif evidence_present and not provenance_present:
+        raise invalid(
+            "provenance.ndjson.zst is absent while evidence.ndjson.zst remains; "
+            "this is not a state produced by the canonical reaper"
+        )
+    evidence_decoded = _section(evidence_document, "decoded", invalid)
+    provenance_decoded = _section(provenance_document, "decoded", invalid)
     if _integer(evidence_decoded, "line_count", invalid) != _integer(
         provenance_decoded, "line_count", invalid
     ):
@@ -489,9 +533,31 @@ def read_canonical_receipt(path: Path) -> CanonicalReceipt:
         path=path,
         window_start_ns=window_start_ns,
         window_end_ns=window_end_ns,
+        finalized_at_ns=finalized_at_ns,
         completeness=completeness,
         certified=certified,
         inputs=tuple(inputs),
+        evidence=evidence,
+        provenance=provenance,
+        outputs_present=evidence_present and provenance_present,
+        document=document,
+    )
+
+
+def _canonical_output_identity(document: dict[str, Any], invalid) -> CanonicalOutput:
+    decoded = _section(document, "decoded", invalid)
+    stored = _section(document, "stored", invalid)
+    return CanonicalOutput(
+        file=_text(document, "file", invalid),
+        decoded=LogicalIdentity(
+            sha256=_digest(decoded, "sha256", invalid),
+            byte_length=_integer(decoded, "byte_length", invalid),
+            line_count=_integer(decoded, "line_count", invalid),
+        ),
+        stored=StoredIdentity(
+            sha256=_digest(stored, "sha256", invalid),
+            byte_length=_integer(stored, "byte_length", invalid),
+        ),
     )
 
 
@@ -499,7 +565,6 @@ def _canonical_output(
     document: dict[str, Any],
     field: str,
     expected_name: str,
-    directory: Path,
     invalid,
 ) -> dict[str, Any]:
     output = _section(document, field, invalid)
@@ -514,7 +579,7 @@ def _canonical_output(
     _integer(decoded, "line_count", invalid)
     _digest(decoded, "sha256", invalid)
     stored = _section(output, "stored", invalid)
-    stored_length = _integer(stored, "byte_length", invalid)
+    _integer(stored, "byte_length", invalid)
     _digest(stored, "sha256", invalid)
 
     compression = _section(output, "compression", invalid)
@@ -534,23 +599,92 @@ def _canonical_output(
     if not isinstance(encoder, str) or not encoder:
         raise invalid(f"{name} has no compression.encoder")
 
-    object_path = directory / name
+    return output
+
+
+def _canonical_output_present(
+    directory: Path, output: CanonicalOutput, invalid
+) -> bool:
+    object_path = directory / output.file
     try:
         metadata = object_path.lstat()
+    except FileNotFoundError:
+        return False
     except OSError as error:
-        raise invalid(f"{name}: {error}") from error
+        raise invalid(f"{output.file}: {error}") from error
     if not stat.S_ISREG(metadata.st_mode):
-        raise invalid(f"{name} is not a regular file")
-    if metadata.st_size != stored_length:
-        raise invalid(f"{name} is {metadata.st_size} bytes, recorded as {stored_length}")
-    return output
+        raise invalid(f"{output.file} is not a regular file")
+    if metadata.st_size != output.stored.byte_length:
+        raise invalid(
+            f"{output.file} is {metadata.st_size} bytes, recorded as "
+            f"{output.stored.byte_length}"
+        )
+    return True
+
+
+def _validate_canonical_archive_tombstone(
+    path: Path,
+    window_start_ns: int,
+    window_end_ns: int,
+    evidence: CanonicalOutput,
+    provenance: CanonicalOutput,
+    invalid,
+) -> None:
+    """Prove absent outputs were archived, without making S3 a reader concern.
+
+    The destructive reaper performs fresh remote heads immediately before it
+    unlinks anything. Readers need only distinguish that intentional state from
+    unexplained local loss, so the retained production marker must bind the
+    exact local receipt bytes and both output identities.
+    """
+    # Local import avoids making the raw receipt schema depend on the canonical
+    # archiver during ordinary (outputs-present) scans.
+    from archive.archiver.canonical import (
+        PRODUCTION,
+        PRODUCTION_RECEIPT_FILE,
+        CanonicalArchiveReceiptError,
+        read_canonical_archive_receipt,
+    )
+
+    marker_path = path.with_name(PRODUCTION_RECEIPT_FILE)
+    try:
+        marker_metadata = marker_path.lstat()
+    except OSError as error:
+        raise invalid(
+            "canonical outputs are absent without a regular production archive receipt: "
+            f"{error}"
+        ) from error
+    if not stat.S_ISREG(marker_metadata.st_mode):
+        raise invalid("canonical archive receipt is not a regular file")
+    try:
+        marker = read_canonical_archive_receipt(marker_path)
+    except CanonicalArchiveReceiptError as error:
+        raise invalid(
+            "canonical outputs are absent without a valid production archive receipt: "
+            f"{error}"
+        ) from error
+    if marker.kind != PRODUCTION:
+        raise invalid("canonical outputs are absent without production archive authority")
+    if (marker.window_start_ns, marker.window_end_ns) != (window_start_ns, window_end_ns):
+        raise invalid("canonical archive receipt names another window")
+    try:
+        with path.open("rb") as handle:
+            receipt_identity = stored_identity_of(handle)
+    except OSError as error:
+        raise invalid(f"cannot identify retained receipt.json: {error}") from error
+    if marker.canonical_receipt.stored != receipt_identity:
+        raise invalid("canonical archive receipt does not bind the retained receipt.json")
+    if marker.evidence.stored != evidence.stored:
+        raise invalid("canonical archive receipt does not bind the evidence identity")
+    if marker.provenance.stored != provenance.stored:
+        raise invalid("canonical archive receipt does not bind the provenance identity")
 
 
 def iter_canonical_receipts(canonical_root: Path) -> Iterator[Path]:
     """Every `receipt.json` under a canonical root, in window order."""
     root = Path(canonical_root)
     if not root.is_dir():
-        return
+        raise ReceiptError(f"canonical root {root} is not a directory")
     for date_directory in sorted(root.iterdir()):
         if not date_directory.is_dir() or not date_directory.name.startswith("date="):
             continue
@@ -578,14 +712,18 @@ class CanonicalIndex:
     def build(cls, canonical_root: Path) -> CanonicalIndex:
         by_identity: dict[tuple[str, str, str, int], Path] = {}
         faults: list[str] = []
-        for path in iter_canonical_receipts(canonical_root):
-            try:
-                receipt = read_canonical_receipt(path)
-            except ReceiptError as error:
-                faults.append(str(error))
-                continue
-            for entry in receipt.inputs:
-                by_identity.setdefault(entry.identity, path)
+        try:
+            paths = iter_canonical_receipts(canonical_root)
+            for path in paths:
+                try:
+                    receipt = read_canonical_receipt(path)
+                except ReceiptError as error:
+                    faults.append(str(error))
+                    continue
+                for entry in receipt.inputs:
+                    by_identity.setdefault(entry.identity, path)
+        except ReceiptError as error:
+            faults.append(str(error))
         return cls(by_identity=by_identity, faults=faults)
 
     def find(self, lane: str, sha256: str, data_file: str, segment_index: int) -> Path | None:

@@ -1,4 +1,4 @@
-"""Raw archival package.
+"""Capture archival package.
 
 Ownership is split between ``archiver`` (publication), ``reaper`` (local
 deletion), ``storage`` (provider adapters), and ``common`` (shared evidence

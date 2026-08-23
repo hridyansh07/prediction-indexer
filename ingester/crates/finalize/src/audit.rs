@@ -10,12 +10,17 @@ use prediction_encoder::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::canonical::{CanonicalOutput, Receipt, committed_windows, window_directory};
+use crate::canonical::{
+    CanonicalOutput, CanonicalOutputsState, Receipt, canonical_outputs_state, committed_windows,
+    window_directory,
+};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct AuditReport {
     pub canonical_root: String,
     pub windows_verified: u64,
+    pub windows_partially_reaped: u64,
+    pub windows_archived_and_reaped: u64,
     pub evidence_records_verified: u64,
 }
 
@@ -32,14 +37,31 @@ struct ProvenanceLine {
 pub fn audit_canonical_root(canonical_root: &Path) -> Result<AuditReport, String> {
     let committed = committed_windows(canonical_root)?;
     let mut records = 0_u64;
+    let mut windows_verified = 0_u64;
+    let mut windows_partially_reaped = 0_u64;
+    let mut windows_archived_and_reaped = 0_u64;
     for receipt in committed.values() {
+        match canonical_outputs_state(canonical_root, receipt)? {
+            CanonicalOutputsState::Present => {}
+            CanonicalOutputsState::PartiallyReaped => {
+                windows_partially_reaped += 1;
+                continue;
+            }
+            CanonicalOutputsState::Archived => {
+                windows_archived_and_reaped += 1;
+                continue;
+            }
+        }
         records = records
             .checked_add(audit_window(canonical_root, receipt)?)
             .ok_or_else(|| "canonical audit record count overflows u64".to_owned())?;
+        windows_verified += 1;
     }
     Ok(AuditReport {
         canonical_root: canonical_root.display().to_string(),
-        windows_verified: committed.len() as u64,
+        windows_verified,
+        windows_partially_reaped,
+        windows_archived_and_reaped,
         evidence_records_verified: records,
     })
 }
