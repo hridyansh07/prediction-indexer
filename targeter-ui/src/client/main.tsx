@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   BrowserRouter,
+  Navigate,
   NavLink,
   Route,
   Routes,
@@ -80,6 +81,7 @@ const relationshipLabel = (x: string) => {
 function App() {
   const location = useLocation();
   const needsSnapshot = targeterSnapshotNeeded(location.pathname);
+  const universe = !needsSnapshot;
   const [s, setS] = useState<Snapshot | null>(null);
   const [error, setError] = useState('');
   const load = useCallback(async (method = 'GET') => {
@@ -106,13 +108,17 @@ function App() {
       <header>
         <div>
           <span className="eyebrow">PREDICTION INDEXER</span>
-          <h1>Targeter Operations</h1>
+          <h1>{universe ? 'Event Universe' : 'Targeter Operations'}</h1>
         </div>
         <nav aria-label="Main navigation">
-          <NavLink to="/">Overview</NavLink>
-          <NavLink to="/events">Events</NavLink>
-          <NavLink to="/event-universe">Event Universe</NavLink>
-          <NavLink to="/config">Config</NavLink>
+          <NavLink to="/" end>
+            Universe
+          </NavLink>
+          <NavLink to="/operations" end>
+            Operations
+          </NavLink>
+          <NavLink to="/operations/events">Decisions</NavLink>
+          <NavLink to="/operations/config">Config</NavLink>
         </nav>
         {needsSnapshot && (
           <button onClick={() => void load('POST')} disabled={s?.refreshing}>
@@ -128,33 +134,45 @@ function App() {
       )}
       <main>
         <Routes>
+          <Route path="/" element={<EventUniversePage />} />
           <Route
-            path="/"
+            path="/operations"
             element={
               <SnapshotRoute
                 s={s}
+                error={error}
                 render={(snapshot) => <Overview s={snapshot} />}
               />
             }
           />
           <Route
-            path="/events"
+            path="/operations/events"
             element={
               <SnapshotRoute
                 s={s}
+                error={error}
                 render={(snapshot) => <Events s={snapshot} />}
               />
             }
           />
-          <Route path="/event-universe" element={<EventUniversePage />} />
           <Route
-            path="/config"
+            path="/operations/config"
             element={
               <SnapshotRoute
                 s={s}
+                error={error}
                 render={(snapshot) => <Config s={snapshot} />}
               />
             }
+          />
+          <Route path="/event-universe" element={<Navigate to="/" replace />} />
+          <Route
+            path="/events"
+            element={<Navigate to="/operations/events" replace />}
+          />
+          <Route
+            path="/config"
+            element={<Navigate to="/operations/config" replace />}
           />
         </Routes>
       </main>
@@ -164,16 +182,27 @@ function App() {
 }
 function SnapshotRoute({
   s,
+  error,
   render,
 }: {
   s: Snapshot | null;
+  error: string;
   render: (snapshot: Snapshot) => React.ReactNode;
 }) {
-  return s ? (
-    render(s)
-  ) : (
-    <div className="loading">Loading archive snapshot…</div>
-  );
+  if (s) return render(s);
+  if (error)
+    return (
+      <section className="operations-unavailable">
+        <span className="eyebrow">OPERATIONS BACKEND</span>
+        <h2>Targeter cadence is not connected</h2>
+        <p>
+          Event Universe is available independently. Recent cadence
+          observability will return after its server API replaces direct archive
+          hydration.
+        </p>
+      </section>
+    );
+  return <div className="loading">Loading operations snapshot…</div>;
 }
 function Overview({ s }: { s: Snapshot }) {
   const [selectedRunId, setSelectedRunId] = useState(s.runs[0]?.runId ?? '');

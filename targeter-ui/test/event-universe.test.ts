@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import {
   EventUniverseClient,
   universePublicFailure,
@@ -11,6 +12,7 @@ import {
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
 import { targeterSnapshotNeeded } from '../src/client/app-routing.js';
+import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
   UniverseSelection,
   UniverseSelectionDetail,
@@ -265,8 +267,89 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
 });
 
 test('Event Universe routing is independent from Targeter snapshot availability', () => {
-  assert.equal(targeterSnapshotNeeded('/'), true);
-  assert.equal(targeterSnapshotNeeded('/events'), true);
+  assert.equal(targeterSnapshotNeeded('/'), false);
   assert.equal(targeterSnapshotNeeded('/event-universe'), false);
-  assert.equal(targeterSnapshotNeeded('/event-universe/bundle'), false);
+  assert.equal(targeterSnapshotNeeded('/operations'), true);
+  assert.equal(targeterSnapshotNeeded('/operations/events'), true);
+  assert.equal(targeterSnapshotNeeded('/operations/config'), true);
+  assert.equal(targeterSnapshotNeeded('/events'), false);
+});
+
+test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
+  let upstreamUrl = '';
+  let upstreamAuthorization = '';
+  const response = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
+    ),
+    {
+      TARGETER_UI_EVENT_UNIVERSE_URL: 'https://universe.internal/base',
+      TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION: 'Bearer server-only',
+    },
+    (async (input, init) => {
+      upstreamUrl = String(input);
+      upstreamAuthorization =
+        new Headers(init?.headers).get('authorization') ?? '';
+      return json({ selections: [], sort: 'selected', next_cursor: null });
+    }) as typeof fetch,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    selections: [],
+    sort: 'selected',
+    next_cursor: null,
+  });
+  assert.equal(
+    upstreamUrl,
+    'https://universe.internal/base/v1/selections?sort=selected&limit=25',
+  );
+  assert.equal(upstreamAuthorization, 'Bearer server-only');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+
+  const unconfigured = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/healthz',
+    ),
+    {},
+    (async () => {
+      throw new Error('must not fetch');
+    }) as typeof fetch,
+  );
+  assert.equal(unconfigured.status, 503);
+
+  const forbidden = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/segments',
+    ),
+    { TARGETER_UI_EVENT_UNIVERSE_URL: 'https://universe.internal' },
+    (async () => {
+      throw new Error('must not fetch');
+    }) as typeof fetch,
+  );
+  assert.equal(forbidden.status, 404);
+  assert.deepEqual(await forbidden.json(), {
+    error: 'Event Universe route not found',
+  });
+});
+
+test('Vercel builds only the client and routes Universe before the SPA fallback', async () => {
+  const config = JSON.parse(
+    await readFile(new URL('../../vercel.json', import.meta.url), 'utf8'),
+  ) as {
+    buildCommand: string;
+    outputDirectory: string;
+    rewrites: Array<{ source: string; destination: string }>;
+  };
+  assert.equal(
+    config.buildCommand,
+    'yarn workspace prediction-indexer-targeter-ui build:client',
+  );
+  assert.equal(config.outputDirectory, 'targeter-ui/dist');
+  assert.deepEqual(config.rewrites, [
+    {
+      source: '/api/event-universe/:path*',
+      destination: '/api/event-universe-proxy?__universe_path=/:path*',
+    },
+    { source: '/(.*)', destination: '/index.html' },
+  ]);
 });

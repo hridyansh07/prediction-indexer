@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "yarn build && yarn start",
     "build": "tsc -p tsconfig.server.json && vite build",
+    "build:client": "vite build",
     "format": "prettier --write .",
     "lint": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",

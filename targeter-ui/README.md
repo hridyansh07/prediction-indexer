@@ -1,10 +1,14 @@
-# Targeter v2 observability UI
+# Event Universe and Targeter observability UI
 
-Read-only React/Vite + Express dashboard for the five latest committed Targeter v2 S3 runs. It has no database or persistent data sink and uses the AWS SDK v3 default credential provider chain, including OIDC/web identity. A separate orb service refreshes the short-lived Amp ID-token file consumed by that standard chain.
+Read-only React/Vite UI for historical Event Universe exploration and recent Targeter operations. Event Universe is the primary experience at `/`; the existing Targeter cadence dashboard is secondary at `/operations`.
+
+The browser hydrates Event Universe exclusively through the same-origin `/api/event-universe/...` contract. It never receives Universe credentials or talks to S3. The historical explorer uses run and selection indexes, immutable source/origin provenance, bundle detail, and bundle history rather than rescanning Targeter reports. It intentionally does not expose catalogues, current subscription state, receipts, raw files, replay coverage, or inferred event-end times.
+
+The long-running Express server can additionally populate `/operations` from the five latest committed Targeter v2 S3 runs. It has no database or persistent data sink and uses the AWS SDK v3 default credential provider chain, including OIDC/web identity. A separate orb service refreshes the short-lived Amp ID-token file consumed by that standard chain.
 
 The dashboard reads selection report v1, v2, and v3. For v2 and v3 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. Report v3 also shows the immutable origin run and archive identities that distinguish a complete occurrence from a retained reference. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement—and v3's explicitly validated all-budget-trimmed result—are shown as legitimate empty decisions. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
 
-`/event-universe` is a separate historical selected-event explorer backed by the Event Universe read API. It uses run and selection indexes, immutable source/origin provenance, bundle detail, and bundle history rather than rescanning Targeter reports. It intentionally does not expose catalogues, current subscription state, receipts, raw files, replay coverage, or inferred event-end times. The page's loading, errors, and freshness are independent from the recent Targeter S3 snapshot.
+Universe loading, errors, and freshness are independent from the recent Targeter S3 snapshot. Legacy `/event-universe`, `/events`, and `/config` paths redirect to `/`, `/operations/events`, and `/operations/config` respectively.
 
 ## Configuration
 
@@ -30,6 +34,23 @@ yarn workspace prediction-indexer-targeter-ui start
 `TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1–v3 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
 
 `TARGETER_UI_EVENT_UNIVERSE_URL` is optional so the operational dashboard can run without the historical service. When set, Express exposes only the documented Universe health, run, selected-occurrence, detail, and bundle-history routes below `/api/event-universe`; arbitrary upstream paths and query fields are rejected. The proxy validates closed response schemas, applies a 5-second timeout and 2 MiB response cap by default, and returns generic errors without upstream bodies. `TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION` may hold a complete server-side Authorization header for an authenticated network proxy. It is never returned to the browser. Override the bounds with `TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS` and `TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES`.
+
+## Vercel deployment
+
+Vercel hosts only the static Vite application and a thin same-origin Event Universe proxy. Event Universe and Targeter remain on their existing servers. Create the Vercel project from the repository root; the checked-in [`vercel.json`](../vercel.json) selects the client-only build, serves `targeter-ui/dist`, forwards `/api/event-universe/...` to the proxy function, and supplies the SPA fallback.
+
+Configure only these server-side Vercel variables:
+
+```text
+TARGETER_UI_EVENT_UNIVERSE_URL=https://universe.example.com
+TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION=Bearer replace-with-server-side-token  # optional
+TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS=5000                                     # optional
+TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES=2097152                          # optional
+```
+
+Do not prefix them with `VITE_`: that would expose them to browser JavaScript. Do not configure AWS, S3 bucket, OIDC, web-identity-token, staging-root, or Rust decoder variables in Vercel. Those remain specific to the long-running operations server.
+
+On Vercel, `/` is the fully functional Event Universe explorer. `/operations` clearly reports that Targeter cadence is not connected because direct S3 snapshot hydration does not run there. Moving cadence behind a provider-neutral server API is intentionally deferred; storage credentials and switchable storage adapters do not belong in the browser.
 
 From the repository root, use `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, and `yarn build`. The production Express server serves `dist/` and its API on `PORT`.
 

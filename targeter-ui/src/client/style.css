@@ -643,6 +643,18 @@ pre {
   background: #382226;
   color: #ffd4d4;
 }
+.operations-unavailable {
+  max-width: 720px;
+  margin: 80px auto;
+  padding: 38px;
+  border: 1px solid #4e4131;
+  border-radius: 10px;
+  background: #181713;
+  text-align: center;
+}
+.operations-unavailable p {
+  color: #a9a18f;
+}
 .universe-layout {
   display: grid;
   grid-template-columns: minmax(420px, 0.9fr) minmax(460px, 1.1fr);

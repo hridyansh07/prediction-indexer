@@ -1,2 +1,2 @@
 export const targeterSnapshotNeeded = (pathname: string) =>
-  !pathname.startsWith('/event-universe');
+  pathname === '/operations' || pathname.startsWith('/operations/');

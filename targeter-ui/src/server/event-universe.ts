@@ -195,71 +195,61 @@ export class EventUniverseClient {
 
 export function createEventUniverseRouter(client: EventUniverseClient | null) {
   const router = Router();
-  const proxy =
-    <T>(load: (client: EventUniverseClient, request: Request) => Promise<T>) =>
-    async (request: Request, response: ExpressResponse) => {
-      if (!client) return response.status(503).json(SAFE_ERROR);
-      try {
-        return response.json(await load(client, request));
-      } catch (error) {
-        const failure = universePublicFailure(error);
-        return response.status(failure.status).json(failure.body);
-      }
-    };
-  router.get(
-    '/healthz',
-    proxy((active, request) => {
-      requireNoQuery(request);
-      return active.health();
-    }),
-  );
-  router.get(
-    '/v1/runs',
-    proxy((active, request) => active.runs(requestQuery(request))),
-  );
-  router.get(
-    '/v1/selections',
-    proxy((active, request) => active.selections(requestQuery(request))),
-  );
-  router.get(
-    '/v1/runs/:runId',
-    proxy((active, request) => {
-      requireNoQuery(request);
-      return active.run(pathValue(request, 'runId'));
-    }),
-  );
-  router.get(
-    '/v1/runs/:runId/selections',
-    proxy((active, request) =>
-      active.runSelections(pathValue(request, 'runId'), requestQuery(request)),
-    ),
-  );
-  router.get(
-    '/v1/runs/:runId/selections/:bundleId',
-    proxy((active, request) => {
-      requireNoQuery(request);
-      return active.selection(
-        pathValue(request, 'runId'),
-        pathValue(request, 'bundleId'),
+  router.use(async (request: Request, response: ExpressResponse) => {
+    if (!client) return response.status(503).json(SAFE_ERROR);
+    if (request.method !== 'GET')
+      return response.status(405).json({ error: 'Method not allowed' });
+    try {
+      return response.json(
+        await dispatchEventUniverseRequest(
+          client,
+          request.path,
+          requestQuery(request),
+        ),
       );
-    }),
-  );
-  router.get(
-    '/v1/bundles/:bundleId/history',
-    proxy((active, request) =>
-      active.bundleHistory(
-        pathValue(request, 'bundleId'),
-        requestQuery(request),
-      ),
-    ),
-  );
-  router.use((_request, response) =>
-    response.status(404).json({ error: 'Event Universe route not found' }),
-  );
+    } catch (error) {
+      const failure = universePublicFailure(error);
+      return response.status(failure.status).json(failure.body);
+    }
+  });
   return router;
 }
 
+export async function dispatchEventUniverseRequest(
+  client: EventUniverseClient,
+  pathname: string,
+  query: URLSearchParams,
+) {
+  if (pathname === '/healthz') {
+    requireNoQuery(query);
+    return client.health();
+  }
+  if (pathname === '/v1/runs') return client.runs(query);
+  if (pathname === '/v1/selections') return client.selections(query);
+
+  let match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
+  if (match) {
+    requireNoQuery(query);
+    return client.run(pathSegment(match[1]));
+  }
+  match = /^\/v1\/runs\/([^/]+)\/selections$/.exec(pathname);
+  if (match) return client.runSelections(pathSegment(match[1]), query);
+  match = /^\/v1\/runs\/([^/]+)\/selections\/([^/]+)$/.exec(pathname);
+  if (match) {
+    requireNoQuery(query);
+    return client.selection(pathSegment(match[1]), pathSegment(match[2]));
+  }
+  match = /^\/v1\/bundles\/([^/]+)\/history$/.exec(pathname);
+  if (match) return client.bundleHistory(pathSegment(match[1]), query);
+  throw new UniverseRouteNotFoundError();
+}
+
 export function universePublicFailure(error: unknown) {
+  if (error instanceof UniverseRouteNotFoundError)
+    return {
+      status: 404,
+      body: { error: 'Event Universe route not found' },
+    } as const;
   if (error instanceof UniverseRequestError)
     return { status: 400, body: INVALID_ERROR } as const;
   return {
@@ -273,14 +263,19 @@ export function requestQuery(request: Pick<Request, 'originalUrl'>) {
   return new URLSearchParams(query);
 }
 
-function requireNoQuery(request: Request) {
-  if ([...requestQuery(request)].length) throw new UniverseRequestError();
+function requireNoQuery(query: URLSearchParams) {
+  if ([...query].length) throw new UniverseRequestError();
 }
 
-function pathValue(request: Request, field: string) {
-  const value = request.params[field];
-  if (typeof value !== 'string') throw new UniverseRequestError();
-  return value;
+function pathSegment(value: string) {
+  try {
+    const decoded = decodeURIComponent(value);
+    if (!decoded || decoded.includes('/')) throw new UniverseRequestError();
+    return decoded;
+  } catch (error) {
+    if (error instanceof UniverseRequestError) throw error;
+    throw new UniverseRequestError();
+  }
 }
 
 export function validateUniverseQuery(
@@ -347,6 +342,7 @@ async function readBounded(response: Response, limit: number) {
 }
 
 class UniverseRequestError extends Error {}
+class UniverseRouteNotFoundError extends Error {}
 class UniverseUpstreamError extends Error {}
 class UniverseTimeoutError extends UniverseUpstreamError {}
 

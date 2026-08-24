@@ -10,10 +10,10 @@
   "scripts": {
     "build:packages": "yarn workspace @prediction-indexer/read-only-object-store build && yarn workspace @prediction-indexer/rust-v1-decoder build",
     "build": "yarn build:packages && yarn workspace prediction-indexer-targeter-ui build",
-    "format": "prettier --write package.json eslint.config.mjs archive/node encoder/node targeter-ui",
-    "lint": "prettier --check package.json eslint.config.mjs archive/node encoder/node targeter-ui && eslint archive/node encoder/node targeter-ui",
-    "lint:fix": "prettier --write package.json eslint.config.mjs archive/node encoder/node targeter-ui && eslint archive/node encoder/node targeter-ui --fix",
-    "typecheck": "yarn workspaces run typecheck",
+    "format": "prettier --write package.json vercel.json eslint.config.mjs api archive/node encoder/node targeter-ui",
+    "lint": "prettier --check package.json vercel.json eslint.config.mjs api archive/node encoder/node targeter-ui && eslint api archive/node encoder/node targeter-ui",
+    "lint:fix": "prettier --write package.json vercel.json eslint.config.mjs api archive/node encoder/node targeter-ui && eslint api archive/node encoder/node targeter-ui --fix",
+    "typecheck": "yarn workspaces run typecheck && tsc --noEmit -p api/tsconfig.json",
     "test": "yarn build:packages && yarn workspaces run test && yarn test:codec-integration",
     "test:codec-integration": "CARGO_BIN=\"$(command -v cargo || printf '%s' \"$HOME/.cargo/bin/cargo\")\"; \"$CARGO_BIN\" build --manifest-path encoder/rust/Cargo.toml --bin prediction-decode-v1 && PREDICTION_DECODER_TEST_BINARY=\"$PWD/encoder/rust/target/debug/prediction-decode-v1\" yarn workspace @prediction-indexer/rust-v1-decoder test:integration"
   },
