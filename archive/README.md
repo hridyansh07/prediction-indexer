@@ -68,10 +68,10 @@ docker compose --profile ops run --rm archiver-once
 Direct project-root invocation is:
 
 ```bash
+export ARCHIVE_BACKEND=s3
+export ARCHIVE_S3_BUCKET ARCHIVE_S3_REGION ARCHIVE_S3_EXPECTED_OWNER
 .venv/bin/python -m archive.archiver.cli --spool-root data/spool \
-  --canonical-root data/canonical \
-  --archive-backend s3 --s3-bucket "$ARCHIVE_S3_BUCKET" \
-  --s3-region "$ARCHIVE_S3_REGION" --s3-expected-owner "$ARCHIVE_S3_EXPECTED_OWNER"
+  --canonical-root data/canonical
 ```
 
 ## Production GCS prerequisites
@@ -91,10 +91,15 @@ Default Credentials; no GCP credential belongs in `.env`.
 Direct project-root invocation is:
 
 ```bash
+export ARCHIVE_BACKEND=gcs
+export ARCHIVE_GCS_BUCKET
 .venv/bin/python -m archive.archiver.cli --spool-root data/spool \
-  --canonical-root data/canonical \
-  --archive-backend gcs --gcs-bucket "$ARCHIVE_GCS_BUCKET"
+  --canonical-root data/canonical
 ```
+
+Direct Python invocations read the process environment; they do not parse a
+`.env` file. Compose reads the repository-root `.env` and passes these values to
+the container.
 
 Objects are stored as
 `raw/lane=<lane>/date=<date>/<segment>.{ndjson.zst,seal.json}`. Beside each local

@@ -2,23 +2,21 @@
 """Archive sealed segments to an object store. One sweep, or on an interval.
 
 ```sh
+ARCHIVE_BACKEND=local ARCHIVE_ROOT=/var/lib/prediction-archive \
 python -m archive.archiver.cli --spool-root  /var/lib/prediction-indexer/spool \
-                               --archive-root /var/lib/prediction-archive \
                                --manifest-root /var/lib/prediction-indexer/manifests
 ```
 
-Or, against an S3 backend (`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`):
+Or configure S3 in the environment (`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`):
 
 ```sh
-python -m archive.archiver.cli --spool-root /var/lib/prediction-indexer/spool \
-                               --archive-backend s3 \
-                               --s3-bucket my-archive-bucket \
-                               --s3-region us-east-1 \
-                               --s3-expected-owner 123456789012
+ARCHIVE_BACKEND=s3 ARCHIVE_S3_BUCKET=my-archive-bucket \
+ARCHIVE_S3_REGION=us-east-1 ARCHIVE_S3_EXPECTED_OWNER=123456789012 \
+python -m archive.archiver.cli --spool-root /var/lib/prediction-indexer/spool
 ```
 
 Both commands build their backend through `archive/storage/factory.py`, the one
-place `--archive-backend local|s3` is interpreted.
+place archive environment configuration is interpreted.
 
 Watch mode calls the same sweep implementation on a timer. It must not, and does
 not, introduce different eligibility logic — a scheduler running the one-shot
@@ -57,7 +55,7 @@ from archive.archiver.manifest import (  # noqa: E402
 )
 from archive.storage.base import ObjectStore  # noqa: E402
 from archive.common.receipts import LOCAL, PRODUCTION  # noqa: E402
-from archive.storage.factory import add_store_arguments, build_store  # noqa: E402
+from archive.storage.factory import build_store  # noqa: E402
 
 #: §8.1's recommended sweep interval. The archive *unit* stays one sealed
 #: segment however many an hour discovers.
@@ -77,7 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="also archive receipt-committed canonical windows from this root",
     )
-    add_store_arguments(parser)
     parser.add_argument(
         "--manifest-root",
         type=Path,
@@ -90,7 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"run continuously, sweeping every N seconds (recommended {DEFAULT_INTERVAL_SECONDS})",
     )
-    parser.add_argument("--report", type=Path, default=None, help="write the sweep result as JSON")
+    parser.add_argument(
+        "--report", type=Path, default=None, help="write the sweep result as JSON"
+    )
     return parser
 
 
@@ -133,7 +132,10 @@ def sweep_once(arguments: argparse.Namespace, store: ObjectStore) -> int:
     if (
         result.halted
         or result.count(CONFLICT)
-        or (canonical is not None and (canonical.halted or canonical.count(CANONICAL_CONFLICT)))
+        or (
+            canonical is not None
+            and (canonical.halted or canonical.count(CANONICAL_CONFLICT))
+        )
     ):
         return EXIT_CONFLICT
     if result.count(FAILED) or (
@@ -147,7 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.interval_seconds is not None and arguments.interval_seconds <= 0:
         raise SystemExit("--interval-seconds must be positive")
-    store = build_store(arguments)
+    primary_roots = [arguments.spool_root]
+    if arguments.canonical_root is not None:
+        primary_roots.append(arguments.canonical_root)
+    store = build_store(primary_roots)
 
     if arguments.interval_seconds is None:
         return sweep_once(arguments, store)

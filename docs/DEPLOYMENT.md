@@ -654,11 +654,13 @@ start with only some of them set, and separately refuses to start if any of
 them is non-empty while `ARCHIVE_BACKEND` is still `local` — both are
 configuration mistakes worth failing loudly on rather than guessing past.
 `ARCHIVE_GCS_BUCKET` is required for `gcs`; the factory rejects mixed provider
-options rather than guessing. `ARCHIVE_ROOT`, `ARCHIVE_STORE_ID` and
-`ARCHIVE_DURABILITY` stay in the Compose command for all backends. The factory
-ignores them once S3 or GCS is selected, and either cloud backend is always the
-`independent_durable` class. `ARCHIVE_DURABILITY` cannot downgrade it, and the
-archiver writes provider-neutral production `.archive.json` receipts.
+options rather than guessing. All provider configuration reaches the process
+through environment values rather than repeated command arguments. Compose
+passes `ARCHIVE_ROOT`, `ARCHIVE_STORE_ID`, and `ARCHIVE_DURABILITY` for all
+backends; the factory ignores them once S3 or GCS is selected, and either cloud
+backend is always the `independent_durable` class. `ARCHIVE_DURABILITY` cannot
+downgrade it, and the archiver writes provider-neutral production
+`.archive.json` receipts.
 
 Credentials are never set in `.env`. On AWS, prefer an instance or task role
 scoped to exactly `s3:ListBucket` on the bucket and

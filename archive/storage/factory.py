@@ -1,171 +1,154 @@
-"""Configure the ObjectStore shared by archive and reaper commands.
-
-Local-only options are ignored by cloud backends so Compose can use one static
-command line. Options for an unselected cloud provider are rejected rather
-than silently connecting to a different archive than the operator intended.
-"""
+"""Build the shared ObjectStore from process environment configuration."""
 
 from __future__ import annotations
 
-import argparse
+import os
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from archive.storage.base import CONFORMANCE, INDEPENDENT, ObjectStore, ObjectStoreError
 from archive.storage.gcs import GCSObjectStore
 from archive.storage.local import LocalObjectStore
 from archive.storage.s3 import S3ObjectStore
 
-__all__ = ["GCS_BACKEND", "LOCAL_BACKEND", "S3_BACKEND", "add_store_arguments", "build_store"]
+__all__ = ["GCS_BACKEND", "LOCAL_BACKEND", "S3_BACKEND", "build_store"]
 
 LOCAL_BACKEND = "local"
 S3_BACKEND = "s3"
 GCS_BACKEND = "gcs"
 
 
-def add_store_arguments(parser: argparse.ArgumentParser) -> None:
-    """Adds the one shared backend contract (§11) to a command's parser."""
-    parser.add_argument(
-        "--archive-backend",
-        choices=(LOCAL_BACKEND, S3_BACKEND, GCS_BACKEND),
-        default=LOCAL_BACKEND,
-        help="which ObjectStore backend this command writes to and reads from",
+def build_store(
+    primary_roots: Iterable[Path],
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ObjectStore:
+    """Build the configured backend or refuse an unsafe or ambiguous one."""
+    configuration = os.environ if environ is None else environ
+    backend = configuration.get("ARCHIVE_BACKEND", LOCAL_BACKEND)
+    if backend == S3_BACKEND:
+        return _build_s3_store(configuration)
+    if backend == GCS_BACKEND:
+        return _build_gcs_store(configuration)
+    if backend != LOCAL_BACKEND:
+        raise SystemExit(f"ARCHIVE_BACKEND must be local, s3, or gcs; got {backend!r}")
+    return _build_local_store(
+        configuration, tuple(Path(path) for path in primary_roots)
     )
-    parser.add_argument(
-        "--archive-root",
-        type=Path,
-        default=None,
-        help="local backend only: where the object store writes",
-    )
-    parser.add_argument(
-        "--archive-durability",
-        choices=("conformance", "independent"),
-        default="conformance",
-        help="local backend only; cloud backends are always independent",
-    )
-    parser.add_argument(
-        "--store-id",
-        default=None,
-        help="local backend only: names this archive in receipts",
-    )
-    parser.add_argument("--s3-bucket", default="", help="s3 backend only: the dedicated bucket name")
-    parser.add_argument("--s3-region", default="", help="s3 backend only: the bucket's AWS region")
-    parser.add_argument(
-        "--s3-expected-owner",
-        default="",
-        help="s3 backend only: the bucket owner's 12-digit AWS account id",
-    )
-    parser.add_argument("--gcs-bucket", default="", help="gcs backend only: archive bucket")
 
 
-def build_store(arguments: argparse.Namespace) -> ObjectStore:
-    """Builds the configured backend, or refuses an unsafe or ambiguous one.
-
-    Reads the primary data roots on the shared namespace for the local
-    backend's `st_dev` independence check. Raw commands always provide
-    `spool_root`; combined canonical commands also provide `canonical_root`.
-    """
-    if arguments.archive_backend == S3_BACKEND:
-        return _build_s3_store(arguments)
-    if arguments.archive_backend == GCS_BACKEND:
-        return _build_gcs_store(arguments)
-    return _build_local_store(arguments)
-
-
-def _build_gcs_store(arguments: argparse.Namespace) -> GCSObjectStore:
-    if not arguments.gcs_bucket:
-        raise SystemExit("--archive-backend gcs requires --gcs-bucket")
+def _build_gcs_store(configuration: Mapping[str, str]) -> GCSObjectStore:
+    bucket = configuration.get("ARCHIVE_GCS_BUCKET", "")
+    if not bucket:
+        raise SystemExit("ARCHIVE_BACKEND=gcs requires ARCHIVE_GCS_BUCKET")
     live_s3_options = [
         name
         for name, value in (
-            ("--s3-bucket", arguments.s3_bucket),
-            ("--s3-region", arguments.s3_region),
-            ("--s3-expected-owner", arguments.s3_expected_owner),
+            ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
+            ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
+            (
+                "ARCHIVE_S3_EXPECTED_OWNER",
+                configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
+            ),
         )
         if value
     ]
     if live_s3_options:
         raise SystemExit(
-            "--archive-backend gcs cannot be combined with " + ", ".join(live_s3_options)
+            "ARCHIVE_BACKEND=gcs cannot be combined with " + ", ".join(live_s3_options)
         )
     try:
-        return GCSObjectStore(arguments.gcs_bucket)
+        return GCSObjectStore(bucket)
     except (ValueError, ObjectStoreError) as error:
         raise SystemExit(f"invalid GCS archive configuration: {error}") from error
 
 
-def _build_s3_store(arguments: argparse.Namespace) -> S3ObjectStore:
-    if arguments.gcs_bucket:
-        raise SystemExit("--archive-backend s3 cannot be combined with --gcs-bucket")
+def _build_s3_store(configuration: Mapping[str, str]) -> S3ObjectStore:
+    if configuration.get("ARCHIVE_GCS_BUCKET", ""):
+        raise SystemExit(
+            "ARCHIVE_BACKEND=s3 cannot be combined with ARCHIVE_GCS_BUCKET"
+        )
     required = (
-        ("--s3-bucket", arguments.s3_bucket),
-        ("--s3-region", arguments.s3_region),
-        ("--s3-expected-owner", arguments.s3_expected_owner),
+        ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
+        ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
+        (
+            "ARCHIVE_S3_EXPECTED_OWNER",
+            configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
+        ),
     )
     missing = [name for name, value in required if not value]
     if missing:
         raise SystemExit(
-            f"--archive-backend s3 requires {', '.join(missing)}; the S3 adapter never infers "
+            f"ARCHIVE_BACKEND=s3 requires {', '.join(missing)}; the S3 adapter never infers "
             "bucket, region, or account configuration."
         )
     try:
-        return S3ObjectStore(
-            arguments.s3_bucket, arguments.s3_region, arguments.s3_expected_owner
-        )
+        return S3ObjectStore(required[0][1], required[1][1], required[2][1])
     except ValueError as error:
         raise SystemExit(f"invalid S3 archive configuration: {error}") from error
 
 
-def _build_local_store(arguments: argparse.Namespace) -> LocalObjectStore:
+def _build_local_store(
+    configuration: Mapping[str, str], primary_roots: tuple[Path, ...]
+) -> LocalObjectStore:
     live_s3_options = {
         name: value
         for name, value in (
-            ("--s3-bucket", arguments.s3_bucket),
-            ("--s3-region", arguments.s3_region),
-            ("--s3-expected-owner", arguments.s3_expected_owner),
+            ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
+            ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
+            (
+                "ARCHIVE_S3_EXPECTED_OWNER",
+                configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
+            ),
         )
         if value
     }
     if live_s3_options:
-        offered = ", ".join(f"{name}={value!r}" for name, value in live_s3_options.items())
+        offered = ", ".join(
+            f"{name}={value!r}" for name, value in live_s3_options.items()
+        )
         raise SystemExit(
-            f"--archive-backend local was selected but {offered} was also set. Refusing to "
-            "guess which backend is really wanted: pass --archive-backend s3, or clear the "
+            f"ARCHIVE_BACKEND=local was selected but {offered} was also set. Refusing to "
+            "guess which backend is really wanted: set ARCHIVE_BACKEND=s3, or clear the "
             "S3 options."
         )
-    if arguments.gcs_bucket:
+    if configuration.get("ARCHIVE_GCS_BUCKET", ""):
         raise SystemExit(
-            "--archive-backend local was selected but --gcs-bucket was also set. Pass "
-            "--archive-backend gcs or clear the GCS option."
+            "ARCHIVE_BACKEND=local was selected but ARCHIVE_GCS_BUCKET was also set. Set "
+            "ARCHIVE_BACKEND=gcs or clear ARCHIVE_GCS_BUCKET."
         )
-    if arguments.archive_root is None:
-        raise SystemExit("--archive-backend local requires --archive-root")
+    archive_root_value = configuration.get("ARCHIVE_ROOT", "")
+    if not archive_root_value:
+        raise SystemExit("ARCHIVE_BACKEND=local requires ARCHIVE_ROOT")
+    archive_root = Path(archive_root_value)
 
     durability = CONFORMANCE
-    if arguments.archive_durability == "independent":
+    durability_name = configuration.get("ARCHIVE_DURABILITY", "conformance")
+    if durability_name not in ("conformance", "independent"):
+        raise SystemExit(
+            "ARCHIVE_DURABILITY must be conformance or independent; got "
+            f"{durability_name!r}"
+        )
+    if durability_name == "independent":
         # Invariant 7 as a `st_dev` comparison rather than a promise: an
         # archive root on the same filesystem as any primary data root is not
         # a second copy whatever the flag claims, because one device failure
         # takes both.
-        primary_roots = [Path(arguments.spool_root)]
-        canonical_root = getattr(arguments, "canonical_root", None)
-        if (
-            canonical_root is not None
-            and Path(canonical_root).resolve() != primary_roots[0].resolve()
-        ):
-            primary_roots.append(Path(canonical_root))
-        arguments.archive_root.mkdir(parents=True, exist_ok=True)
-        archive_device = _device_of(arguments.archive_root)
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_device = _device_of(archive_root)
         for primary_root in primary_roots:
             if _device_of(primary_root) == archive_device:
                 raise SystemExit(
-                    f"refusing --archive-durability independent: {arguments.archive_root} and "
+                    f"refusing ARCHIVE_DURABILITY=independent: {archive_root} and "
                     f"{primary_root} are on the same filesystem, so losing it loses both "
                     "copies. Point the archive at separate storage, or leave the durability "
                     "class at 'conformance'."
                 )
         durability = INDEPENDENT
     return LocalObjectStore(
-        arguments.archive_root, store_id=arguments.store_id, durability=durability
+        archive_root,
+        store_id=configuration.get("ARCHIVE_STORE_ID") or None,
+        durability=durability,
     )
 
 

@@ -659,7 +659,7 @@ run-length blocks), because everything else in the decoder rests on it.
 **The `st_dev` check makes invariant 7 enforceable rather than advisory.** §5.3
 gates deletion on a declared durability class, which is configuration and can
 therefore be declared wrongly. Both commands additionally refuse
-`--archive-durability independent` when the archive root and the spool resolve
+`ARCHIVE_DURABILITY=independent` when the archive root and the spool resolve
 to the same filesystem: a second copy that dies with the first is not a
 durability domain whatever the flag says. The reaper *library* has no such check,
 per §5.3's allowance for tests against a temporary backend — which is where the

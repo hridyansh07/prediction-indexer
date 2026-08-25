@@ -69,6 +69,10 @@ x-archive-volume: &archive-volume
 # Only archive services receive cloud archive configuration; venue capture has
 # no archive authority.
 x-cloud-archive-environment: &cloud-archive-environment
+  ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
+  ARCHIVE_ROOT: /var/lib/prediction-archive
+  ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
+  ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
   ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
   ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
   ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
@@ -439,28 +443,8 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
       - --manifest-root
       - /var/lib/prediction-indexer/archive-manifests
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      # --archive-root, --store-id and --archive-durability above are local-only
-      # and stay in this static command whichever backend is selected;
-      # archive/storage/factory.py ignores them for cloud backends. Provider
-      # flags default to empty and are validated against ARCHIVE_BACKEND.
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --interval-seconds
       - "${ARCHIVER_INTERVAL_SECONDS:-3600}"
       - --report
@@ -486,24 +470,8 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
       - --manifest-root
       - /var/lib/prediction-indexer/archive-manifests
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --report
       - /var/lib/prediction-indexer/archive-manifests/last_archive_sweep.json
     volumes:
@@ -533,22 +501,6 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --mode
       - "${REAPER_MODE:-audit}"
       - --interval-seconds
@@ -574,22 +526,6 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --mode
       - "${REAPER_MODE:-audit}"
       - --report
@@ -614,22 +550,6 @@ services:
       - archive.reaper.canonical_cli
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --mode
       - "${CANONICAL_REAPER_MODE:-audit}"
       - --retention-hours
@@ -655,22 +575,6 @@ services:
       - archive.reaper.canonical_cli
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-      - --gcs-bucket
-      - "${ARCHIVE_GCS_BUCKET:-}"
       - --mode
       - "${CANONICAL_REAPER_MODE:-audit}"
       - --retention-hours

@@ -2,22 +2,21 @@
 """Delete local Targeter v2 run artifacts that an archive receipt proves are safe.
 
 ```sh
+ARCHIVE_BACKEND=local ARCHIVE_ROOT=/var/lib/prediction-archive \
 python -m targeter.v2.run_reaper_cli \
     --output-root /var/lib/prediction-indexer/targeter-v2-runs \
-    --live-root   /var/lib/prediction-indexer/live \
-    --archive-root /var/lib/prediction-archive
+    --live-root   /var/lib/prediction-indexer/live
 ```
 
-Or against S3 with `--archive-backend s3` in place of `--archive-root` and
-`--archive-durability`; both this command and `run_archiver_cli` build their
-store through `archive/storage/factory.py`, the same factory the raw archive
-commands use.
+This command and `run_archiver_cli` build their store from environment values
+through `archive/storage/factory.py`, the same factory the raw archive commands
+use.
 
 **Audit mode is the default and stays the default.** Installing this code does
 not make run deletion active. Deleting requires all of:
 
 ```text
---archive-durability independent   the archive is a separate durability domain
+ARCHIVE_DURABILITY=independent     the archive is a separate durability domain
 --mode delete                      the operator explicitly enabled deletion
 ```
 
@@ -43,7 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from archive.common.durable import write_json_durable  # noqa: E402
-from archive.storage.factory import add_store_arguments, build_store  # noqa: E402
+from archive.storage.factory import build_store  # noqa: E402
 from targeter.v2.run_reaper import (  # noqa: E402
     ARCHIVE_OBJECT_UNVERIFIED,
     AUDIT_MODE,
@@ -80,7 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--live-root", required=True, type=Path)
-    add_store_arguments(parser)
     parser.add_argument(
         "--mode",
         choices=("audit", "delete"),
@@ -96,7 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
             f"({RETENTION_FLOOR_HOURS} is the minimum; it may be raised)"
         ),
     )
-    parser.add_argument("--report", type=Path, default=None, help="write decisions as JSON")
+    parser.add_argument(
+        "--report", type=Path, default=None, help="write decisions as JSON"
+    )
     return parser
 
 
@@ -146,12 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             f"--retention-hours must be at least {RETENTION_FLOOR_HOURS}; a shorter "
             "floor stops protecting a run before the next scheduled audit can read it"
         )
-    # The shared archive factory calls this root `spool_root` because raw
-    # capture introduced the adapter. For run reaping the analogous primary
-    # copy is output_root, so the same-filesystem guard must compare the
-    # archive against that directory.
-    arguments.spool_root = arguments.output_root
-    store = build_store(arguments)
+    store = build_store((arguments.output_root,))
     return sweep_once(arguments, store)
 
 

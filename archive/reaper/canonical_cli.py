@@ -25,7 +25,7 @@ from archive.reaper.canonical import (  # noqa: E402
     UNEXPECTED_WINDOW_ARTIFACT,
     CanonicalReaper,
 )
-from archive.storage.factory import add_store_arguments, build_store  # noqa: E402
+from archive.storage.factory import build_store  # noqa: E402
 
 EXIT_OK = 0
 EXIT_RETAINED_FAULT = 1
@@ -45,7 +45,9 @@ def _retention_hours(value: str) -> int:
     try:
         hours = int(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("retention hours must be an integer") from error
+        raise argparse.ArgumentTypeError(
+            "retention hours must be an integer"
+        ) from error
     if hours < RETENTION_FLOOR_HOURS:
         raise argparse.ArgumentTypeError(
             f"retention hours must be at least {RETENTION_FLOOR_HOURS}"
@@ -56,7 +58,6 @@ def _retention_hours(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--canonical-root", required=True, type=Path)
-    add_store_arguments(parser)
     parser.add_argument("--mode", choices=("audit", "delete"), default="audit")
     parser.add_argument(
         "--retention-hours", type=_retention_hours, default=RETENTION_FLOOR_HOURS
@@ -101,17 +102,14 @@ def sweep_once(arguments: argparse.Namespace, store) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.retention_hours < RETENTION_FLOOR_HOURS:
-        raise SystemExit(
-            f"--retention-hours must be at least {RETENTION_FLOOR_HOURS}"
-        )
+        raise SystemExit(f"--retention-hours must be at least {RETENTION_FLOOR_HOURS}")
     if arguments.interval_seconds is not None and arguments.interval_seconds <= 0:
         raise SystemExit("--interval-seconds must be positive")
     if not arguments.canonical_root.is_dir():
-        raise SystemExit(f"canonical root {arguments.canonical_root} is not a directory")
-    # The shared local-store guard calls this side of the durability boundary
-    # spool_root. For canonical reaping, canonical_root is the primary copy.
-    arguments.spool_root = arguments.canonical_root
-    store = build_store(arguments)
+        raise SystemExit(
+            f"canonical root {arguments.canonical_root} is not a directory"
+        )
+    store = build_store((arguments.canonical_root,))
     if arguments.interval_seconds is None:
         return sweep_once(arguments, store)
 

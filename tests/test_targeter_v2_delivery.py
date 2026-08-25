@@ -39,16 +39,18 @@ def _inventory_entry(name: str) -> dict:
         "content_encoding": "zstd" if name.endswith(".zst") else None,
         "decoded": {"sha256": digest, "byte_length": 1, "line_count": 1},
         "stored": {"sha256": digest, "byte_length": 1},
-        "compression": {
-            "algorithm": "zstd",
-            "level": 3,
-            "frame_checksum": True,
-            "dictionary": None,
-            "frame_count": 1,
-            "encoder": "test",
-        }
-        if name.endswith(".zst")
-        else None,
+        "compression": (
+            {
+                "algorithm": "zstd",
+                "level": 3,
+                "frame_checksum": True,
+                "dictionary": None,
+                "frame_count": 1,
+                "encoder": "test",
+            }
+            if name.endswith(".zst")
+            else None
+        ),
     }
 
 
@@ -123,8 +125,16 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         artifact_format: str = "zstd",
     ) -> Path:
         catalogs = (
-            CatalogSnapshot("kalshi", (), ()) if empty else snapshot("kalshi", "k", "km"),
-            CatalogSnapshot("polymarket", (), ()) if empty else snapshot("polymarket", "p", "pm"),
+            (
+                CatalogSnapshot("kalshi", (), ())
+                if empty
+                else snapshot("kalshi", "k", "km")
+            ),
+            (
+                CatalogSnapshot("polymarket", (), ())
+                if empty
+                else snapshot("polymarket", "p", "pm")
+            ),
         )
         adapters = [_Adapter(catalog) for catalog in catalogs]
         if broken:
@@ -159,7 +169,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             receipt.document,
         )
 
-    def test_v2_receipt_requires_decoded_identity_for_every_ndjson_artifact(self) -> None:
+    def test_v2_receipt_requires_decoded_identity_for_every_ndjson_artifact(
+        self,
+    ) -> None:
         run_directory = self.run_directory()
         receipt = archive_run(run_directory, self.store, now=NOW)
         document = json.loads(json.dumps(receipt.document))
@@ -216,7 +228,8 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             )
         manifest_path = run_directory / "run_manifest.json"
         manifest_path.write_text(
-            json.dumps(legacy_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            json.dumps(legacy_manifest, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
             encoding="utf-8",
         )
         prefix = f"targeter-v2/runs/date={NOW:%Y-%m-%d}/run={run_directory.name}"
@@ -338,7 +351,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             )
         )
 
-    def test_phase7_publishes_one_atomic_generation_consumable_by_every_splice(self) -> None:
+    def test_phase7_publishes_one_atomic_generation_consumable_by_every_splice(
+        self,
+    ) -> None:
         run_directory = self.run_directory()
         receipt = archive_run(run_directory, self.store, now=NOW)
         generation = publish_run(
@@ -386,9 +401,13 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             strategy=self.strategy,
         )
         self.assertEqual(audited.run_id, run_directory.name)
-        self.assertEqual(audited.venue_counts, {"kalshi": 1, "limitless": 0, "polymarket": 1})
+        self.assertEqual(
+            audited.venue_counts, {"kalshi": 1, "limitless": 0, "polymarket": 1}
+        )
 
-    def test_a_later_run_retains_the_exact_published_bundle_when_discovery_no_longer_sees_it(self) -> None:
+    def test_a_later_run_retains_the_exact_published_bundle_when_discovery_no_longer_sees_it(
+        self,
+    ) -> None:
         first_directory = self.run_directory()
         first_receipt = archive_run(first_directory, self.store, now=NOW)
         publish_run(
@@ -453,7 +472,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             client=object(),
             artifact_format="ndjson",
         )
-        third_receipt = archive_run(third.directory, self.store, now=later + timedelta(minutes=10))
+        third_receipt = archive_run(
+            third.directory, self.store, now=later + timedelta(minutes=10)
+        )
         publish_run(
             third.directory,
             third_receipt,
@@ -464,8 +485,12 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         )
         third_pointer = self.live_root / "targeter-v2" / "current.json"
         third_target = load_targets(third_pointer, venue="kalshi").targets[0]
-        self.assertEqual(third_target.resolution["continuity_base_run_id"], second.run_id)
-        self.assertEqual(third_target.resolution["continuity_origin_run_id"], first_directory.name)
+        self.assertEqual(
+            third_target.resolution["continuity_base_run_id"], second.run_id
+        )
+        self.assertEqual(
+            third_target.resolution["continuity_origin_run_id"], first_directory.name
+        )
 
     def test_held_current_candidate_uses_current_run_as_origin(self) -> None:
         first = self.run_directory()
@@ -497,7 +522,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         self.assertEqual(target.resolution["continuity_base_run_id"], first.name)
         self.assertEqual(target.resolution["continuity_origin_run_id"], second.name)
 
-    def test_retained_origin_evidence_must_match_the_committed_continuity_chain(self) -> None:
+    def test_retained_origin_evidence_must_match_the_committed_continuity_chain(
+        self,
+    ) -> None:
         first = self.run_directory(artifact_format="ndjson")
         first_receipt = archive_run(first, self.store, now=NOW)
         publish_run(
@@ -542,7 +569,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 now=later,
             )
 
-    def test_a_run_without_continuity_authority_cannot_replace_a_committed_generation(self) -> None:
+    def test_a_run_without_continuity_authority_cannot_replace_a_committed_generation(
+        self,
+    ) -> None:
         first_directory = self.run_directory()
         first_receipt = archive_run(first_directory, self.store, now=NOW)
         publish_run(
@@ -579,7 +608,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 now=later,
             )
 
-    def test_all_terminal_evidence_can_publish_an_empty_retirement_generation(self) -> None:
+    def test_all_terminal_evidence_can_publish_an_empty_retirement_generation(
+        self,
+    ) -> None:
         first_directory = self.run_directory()
         first_receipt = archive_run(first_directory, self.store, now=NOW)
         publish_run(
@@ -620,7 +651,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         for venue in ("kalshi", "polymarket", "limitless"):
             self.assertEqual(load_targets(pointer, venue=venue).asset_ids(), ())
 
-    def test_empty_retirement_rejects_a_terminal_disposition_with_open_probes(self) -> None:
+    def test_empty_retirement_rejects_a_terminal_disposition_with_open_probes(
+        self,
+    ) -> None:
         first_directory = self.run_directory()
         first_receipt = archive_run(first_directory, self.store, now=NOW)
         publish_run(
@@ -697,7 +730,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["continuity"]["retained_bundle_ids"] = []
         for bundle_id in report["continuity"]["dispositions"]:
-            report["continuity"]["dispositions"][bundle_id] = "continuity_budget_trimmed"
+            report["continuity"]["dispositions"][
+                bundle_id
+            ] = "continuity_budget_trimmed"
         report["selection"]["bundle_ids"] = []
         report["selection"]["bundle_count"] = 0
         report["selection"]["targets"] = {
@@ -719,7 +754,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 now=later,
             )
 
-    def test_budget_trimmed_empty_generation_publishes_an_empty_generation(self) -> None:
+    def test_budget_trimmed_empty_generation_publishes_an_empty_generation(
+        self,
+    ) -> None:
         polymarket = snapshot("polymarket", "p", "pm")
         polymarket = CatalogSnapshot(
             polymarket.venue,
@@ -788,7 +825,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         for venue in ("kalshi", "polymarket", "limitless"):
             self.assertEqual(load_targets(pointer, venue=venue).asset_ids(), ())
 
-    def test_a_pointer_failure_exposes_no_partial_generation_and_retry_is_safe(self) -> None:
+    def test_a_pointer_failure_exposes_no_partial_generation_and_retry_is_safe(
+        self,
+    ) -> None:
         run_directory = self.run_directory()
         receipt = archive_run(run_directory, self.store, now=NOW)
         from targeter.v2 import publication
@@ -800,7 +839,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 raise OSError("pointer fsync failed")
             return original(path, document)
 
-        with patch("targeter.v2.publication.write_json_durable", side_effect=fail_pointer):
+        with patch(
+            "targeter.v2.publication.write_json_durable", side_effect=fail_pointer
+        ):
             with self.assertRaisesRegex(OSError, "pointer fsync"):
                 publish_run(
                     run_directory,
@@ -814,7 +855,13 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         pointer = self.live_root / "targeter-v2" / "current.json"
         self.assertFalse(pointer.exists())
         self.assertTrue(
-            (self.live_root / "targeter-v2" / "generations" / run_directory.name / "manifest.json").exists()
+            (
+                self.live_root
+                / "targeter-v2"
+                / "generations"
+                / run_directory.name
+                / "manifest.json"
+            ).exists()
         )
         with self.assertRaises(TargetsError):
             load_targets(pointer, venue="kalshi")
@@ -827,7 +874,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             strategy=self.strategy,
             now=NOW + timedelta(minutes=1),
         )
-        self.assertEqual(load_targets(pointer, venue="kalshi").asset_ids(), ("km-subscription",))
+        self.assertEqual(
+            load_targets(pointer, venue="kalshi").asset_ids(), ("km-subscription",)
+        )
 
     def test_incomplete_runs_never_replace_the_current_generation(self) -> None:
         good_directory = self.run_directory()
@@ -872,12 +921,16 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 now=NOW,
             )
 
-    def test_publication_rejects_a_selection_target_forged_outside_the_catalog(self) -> None:
+    def test_publication_rejects_a_selection_target_forged_outside_the_catalog(
+        self,
+    ) -> None:
         run_directory = self.run_directory(artifact_format="ndjson")
         report_path = run_directory / "selection_report.json"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["selection"]["targets"]["kalshi"][0]["subscription_ids"] = ["forged-id"]
-        report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+        )
         receipt = archive_run(run_directory, self.store, now=NOW)
         with self.assertRaisesRegex(PublicationError, "catalog"):
             publish_run(
@@ -940,7 +993,9 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         escaped_metadata = generation.directory.parent / "outside.json"
         escaped_metadata.write_bytes(original_metadata.read_bytes())
         target_document["metadata_path"] = "../outside.json"
-        target_path.write_text(json.dumps(target_document, sort_keys=True) + "\n", encoding="utf-8")
+        target_path.write_text(
+            json.dumps(target_document, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
         manifest = json.loads(generation.manifest_path.read_text(encoding="utf-8"))
         target_bytes = target_path.read_bytes()
@@ -949,14 +1004,18 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             "byte_length": len(target_bytes),
             "sha256": hashlib.sha256(target_bytes).hexdigest(),
         }
-        generation.manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+        generation.manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+        )
         manifest_bytes = generation.manifest_path.read_bytes()
         pointer = json.loads(generation.pointer_path.read_text(encoding="utf-8"))
         pointer["manifest"] = {
             "byte_length": len(manifest_bytes),
             "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         }
-        generation.pointer_path.write_text(json.dumps(pointer, sort_keys=True) + "\n", encoding="utf-8")
+        generation.pointer_path.write_text(
+            json.dumps(pointer, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
         with self.assertRaisesRegex(TargetsError, "metadata snapshot path escapes"):
             load_targets(generation.pointer_path, venue="kalshi")
@@ -989,24 +1048,28 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         ):
             status = main(
                 [
-                    "--mode", "publish",
-                    "--strategy", str(STRATEGY_PATH),
-                    "--output-root", str(self.output_root),
-                    "--live-root", str(self.live_root),
-                    "--archive-backend", "s3",
-                    "--s3-bucket", "targeter-test-bucket",
-                    "--s3-region", "us-east-1",
-                    "--s3-expected-owner", "123456789012",
+                    "--mode",
+                    "publish",
+                    "--strategy",
+                    str(STRATEGY_PATH),
+                    "--output-root",
+                    str(self.output_root),
+                    "--live-root",
+                    str(self.live_root),
                 ]
             )
         self.assertEqual(status, 0)
         self.assertTrue((run_directory / "archive_receipt.json").is_file())
         self.assertEqual(
-            load_targets(self.live_root / "targeter-v2" / "current.json", venue="kalshi").asset_ids(),
+            load_targets(
+                self.live_root / "targeter-v2" / "current.json", venue="kalshi"
+            ).asset_ids(),
             ("km-subscription",),
         )
 
-    def test_publish_command_archives_incomplete_evidence_but_does_not_publish(self) -> None:
+    def test_publish_command_archives_incomplete_evidence_but_does_not_publish(
+        self,
+    ) -> None:
         from targeter.v2.run import main
 
         run_directory = self.run_directory(broken=True)
@@ -1034,14 +1097,14 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         ):
             status = main(
                 [
-                    "--mode", "publish",
-                    "--strategy", str(STRATEGY_PATH),
-                    "--output-root", str(self.output_root),
-                    "--live-root", str(self.live_root),
-                    "--archive-backend", "s3",
-                    "--s3-bucket", "bucket",
-                    "--s3-region", "us-east-1",
-                    "--s3-expected-owner", "123456789012",
+                    "--mode",
+                    "publish",
+                    "--strategy",
+                    str(STRATEGY_PATH),
+                    "--output-root",
+                    str(self.output_root),
+                    "--live-root",
+                    str(self.live_root),
                 ]
             )
         self.assertEqual(status, 1)
@@ -1062,19 +1125,22 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             now=NOW,
         )
         with (
-            patch("targeter.v2.run.run_shadow", side_effect=AssertionError("discovery ran")),
+            patch(
+                "targeter.v2.run.run_shadow",
+                side_effect=AssertionError("discovery ran"),
+            ),
             patch("targeter.v2.run.build_store", return_value=self.store),
         ):
             status = main(
                 [
-                    "--mode", "audit",
-                    "--strategy", str(STRATEGY_PATH),
-                    "--output-root", str(self.output_root),
-                    "--live-root", str(self.live_root),
-                    "--archive-backend", "s3",
-                    "--s3-bucket", "bucket",
-                    "--s3-region", "us-east-1",
-                    "--s3-expected-owner", "123456789012",
+                    "--mode",
+                    "audit",
+                    "--strategy",
+                    str(STRATEGY_PATH),
+                    "--output-root",
+                    str(self.output_root),
+                    "--live-root",
+                    str(self.live_root),
                 ]
             )
         self.assertEqual(status, 0)
@@ -1087,9 +1153,12 @@ class TargeterV2DeliveryTests(unittest.TestCase):
             with patch("targeter.v2.run.run_shadow") as discovery:
                 status = main(
                     [
-                        "--mode", "shadow",
-                        "--strategy", str(STRATEGY_PATH),
-                        "--output-root", str(self.output_root),
+                        "--mode",
+                        "shadow",
+                        "--strategy",
+                        str(STRATEGY_PATH),
+                        "--output-root",
+                        str(self.output_root),
                     ]
                 )
         self.assertEqual(status, 2)
@@ -1134,7 +1203,9 @@ class CoverageLedgerTests(unittest.TestCase):
             for item in self.ledger_document()["sightings"]
         }
 
-    def test_publishing_records_a_first_sighting_for_every_subscribed_asset(self) -> None:
+    def test_publishing_records_a_first_sighting_for_every_subscribed_asset(
+        self,
+    ) -> None:
         generation = self.publish()
         subscribed = {
             (venue, asset)
@@ -1144,9 +1215,13 @@ class CoverageLedgerTests(unittest.TestCase):
             ).asset_ids()
         }
         self.assertEqual(subscribed, set(self.sightings()))
-        self.assertEqual(generation.newly_seen, {"kalshi": 1, "limitless": 0, "polymarket": 1})
+        self.assertEqual(
+            generation.newly_seen, {"kalshi": 1, "limitless": 0, "polymarket": 1}
+        )
 
-    def test_the_ledger_is_where_gate_one_looks_and_carries_the_fields_it_reads(self) -> None:
+    def test_the_ledger_is_where_gate_one_looks_and_carries_the_fields_it_reads(
+        self,
+    ) -> None:
         # `_AuditState.observe_coverage` (replay/gate1.py:414-423) rejects a
         # document without `sightings` and keys each entry on venue + asset_id;
         # `gate1_object` admits it only at exactly this path.
@@ -1168,19 +1243,24 @@ class CoverageLedgerTests(unittest.TestCase):
         # The fixture market is created a day before the run.
         self.assertAlmostEqual(kalshi["discovery_lag_seconds"], 86_400, delta=1)
 
-    def test_a_later_generation_never_overwrites_an_existing_first_sighting(self) -> None:
+    def test_a_later_generation_never_overwrites_an_existing_first_sighting(
+        self,
+    ) -> None:
         self.publish()
         before = self.sightings()[("kalshi", "km-subscription")]["first_seen_at"]
         later = self.publish(now=NOW + timedelta(hours=3))
         after = self.sightings()[("kalshi", "km-subscription")]["first_seen_at"]
         self.assertEqual(before, after)
         # Nothing new to see, so the second publication claims no fresh coverage.
-        self.assertEqual(later.newly_seen, {"kalshi": 0, "limitless": 0, "polymarket": 0})
+        self.assertEqual(
+            later.newly_seen, {"kalshi": 0, "limitless": 0, "polymarket": 0}
+        )
 
     def test_a_venue_selecting_nothing_contributes_no_sightings(self) -> None:
         self.publish()
         self.assertNotIn(
-            "limitless", {venue for venue, _ in self.sightings()},
+            "limitless",
+            {venue for venue, _ in self.sightings()},
             "an unsubscribed venue must not claim coverage it does not have",
         )
 
@@ -1220,9 +1300,13 @@ class CoverageBackfillTests(unittest.TestCase):
         document = json.loads(
             (self.case.live_root / "coverage.json").read_text(encoding="utf-8")
         )
-        return {(item["venue"], item["asset_id"]): item for item in document["sightings"]}
+        return {
+            (item["venue"], item["asset_id"]): item for item in document["sightings"]
+        }
 
-    def test_a_ledger_deleted_after_the_fact_is_rebuilt_from_the_generations(self) -> None:
+    def test_a_ledger_deleted_after_the_fact_is_rebuilt_from_the_generations(
+        self,
+    ) -> None:
         self.publish_at(NOW)
         self.publish_at(NOW + timedelta(hours=6))
         expected = self.sightings()
@@ -1234,7 +1318,9 @@ class CoverageBackfillTests(unittest.TestCase):
         # A rebuild from empty must *report* what it wrote. Counting only the
         # repairs made a first run indistinguishable from a no-op second one,
         # which is the one thing an operator reads this summary to tell apart.
-        self.assertEqual(summary["recorded"], {"kalshi": 1, "limitless": 0, "polymarket": 1})
+        self.assertEqual(
+            summary["recorded"], {"kalshi": 1, "limitless": 0, "polymarket": 1}
+        )
         self.assertEqual(summary["sightings"], 2)
         self.assertEqual(summary["repaired"], 0)
         rebuilt = self.sightings()
@@ -1271,7 +1357,9 @@ class CoverageBackfillTests(unittest.TestCase):
                 }
             ],
         }
-        (self.case.live_root / "coverage.json").write_text(json.dumps(stale), encoding="utf-8")
+        (self.case.live_root / "coverage.json").write_text(
+            json.dumps(stale), encoding="utf-8"
+        )
 
         summary = self.backfill()
         self.assertEqual(summary["repaired"], 1)
@@ -1286,8 +1374,12 @@ class CoverageBackfillTests(unittest.TestCase):
         once = (self.case.live_root / "coverage.json").read_text(encoding="utf-8")
         second = self.backfill()
         self.assertEqual(second["repaired"], 0)
-        self.assertEqual(second["recorded"], {"kalshi": 0, "limitless": 0, "polymarket": 0})
-        twice = json.loads((self.case.live_root / "coverage.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            second["recorded"], {"kalshi": 0, "limitless": 0, "polymarket": 0}
+        )
+        twice = json.loads(
+            (self.case.live_root / "coverage.json").read_text(encoding="utf-8")
+        )
         self.assertEqual(json.loads(once)["sightings"], twice["sightings"])
 
     def test_a_reaped_run_still_yields_its_sighting(self) -> None:
@@ -1295,9 +1387,12 @@ class CoverageBackfillTests(unittest.TestCase):
         # Coverage must survive that, because the generation is the evidence for
         # what was subscribed; the run directory only carries created_at.
         self.publish_at(NOW)
-        run_directory = self.case.output_root / sorted(
-            item.name for item in self.case.output_root.iterdir() if item.is_dir()
-        )[0]
+        run_directory = (
+            self.case.output_root
+            / sorted(
+                item.name for item in self.case.output_root.iterdir() if item.is_dir()
+            )[0]
+        )
         for artifact in run_directory.iterdir():
             if artifact.name != "archive_receipt.json":
                 artifact.unlink()
@@ -1307,7 +1402,9 @@ class CoverageBackfillTests(unittest.TestCase):
         self.assertEqual(summary["unreadable"], [])
         sighting = self.sightings()[("kalshi", "km-subscription")]
         self.assertEqual(sighting["first_seen_at"][:19], NOW.isoformat()[:19])
-        self.assertIsNone(sighting["created_at"], "a reaped catalogue cannot supply one")
+        self.assertIsNone(
+            sighting["created_at"], "a reaped catalogue cannot supply one"
+        )
 
 
 if __name__ == "__main__":

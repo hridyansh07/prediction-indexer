@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from archive.archiver.canonical import CanonicalArchiver, read_canonical_archive_receipt
 from archive.common.receipts import CanonicalIndex, ReceiptError, read_canonical_receipt
@@ -29,7 +30,6 @@ from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.s3 import S3ObjectStore
 from tests.archive_fixtures import BASE_NS, WINDOW_SECONDS, write_canonical_receipt
 from tests.test_s3store import BUCKET, OWNER, REGION, FakeS3Client
-
 
 NANOSECONDS = 1_000_000_000
 HOUR_NS = 3600 * NANOSECONDS
@@ -77,7 +77,9 @@ class CanonicalReaperTests(CanonicalReaperCase):
         self.assertTrue(self.evidence.is_file())
         self.assertTrue(self.provenance.is_file())
 
-    def test_delete_removes_only_large_frames_and_leaves_restart_tombstone(self) -> None:
+    def test_delete_removes_only_large_frames_and_leaves_restart_tombstone(
+        self,
+    ) -> None:
         expected_bytes = self.evidence.stat().st_size + self.provenance.stat().st_size
         decision = self.only(self.reaper().sweep())
         self.assertEqual(decision.decision, REAPED)
@@ -100,7 +102,9 @@ class CanonicalReaperTests(CanonicalReaperCase):
         decision = self.only(
             self.reaper(now_ns=self.archive_ns + RETENTION_FLOOR_NS - 1).sweep()
         )
-        self.assertEqual((decision.decision, decision.reason), (RETAINED, RETENTION_FLOOR))
+        self.assertEqual(
+            (decision.decision, decision.reason), (RETAINED, RETENTION_FLOOR)
+        )
         self.assertTrue(self.evidence.is_file())
 
     def test_receipt_mtime_can_only_extend_retention(self) -> None:
@@ -124,7 +128,9 @@ class CanonicalReaperTests(CanonicalReaperCase):
                 now_ns=lambda: self.now_ns,
             ).sweep()
         )
-        self.assertEqual((decision.decision, decision.reason), (RETAINED, DURABILITY_GATE))
+        self.assertEqual(
+            (decision.decision, decision.reason), (RETAINED, DURABILITY_GATE)
+        )
         self.assertTrue(self.evidence.is_file())
 
     def test_missing_remote_object_retains_local_frames(self) -> None:
@@ -142,10 +148,14 @@ class CanonicalReaperTests(CanonicalReaperCase):
         data[-1] ^= 0xFF
         self.evidence.write_bytes(data)
         decision = self.only(self.reaper().sweep())
-        self.assertEqual((decision.decision, decision.reason), (RETAINED, LOCAL_WINDOW_CHANGED))
+        self.assertEqual(
+            (decision.decision, decision.reason), (RETAINED, LOCAL_WINDOW_CHANGED)
+        )
         self.assertTrue(self.evidence.is_file())
 
-    def test_partial_cleanup_finishes_only_after_fresh_remote_verification(self) -> None:
+    def test_partial_cleanup_finishes_only_after_fresh_remote_verification(
+        self,
+    ) -> None:
         self.evidence.unlink()
         receipt = read_canonical_archive_receipt(self.archive_receipt)
         remote = Path(self.store.root) / receipt.provenance.key
@@ -154,7 +164,9 @@ class CanonicalReaperTests(CanonicalReaperCase):
         self.assertEqual(decision.reason, ARCHIVE_OBJECT_UNVERIFIED)
         self.assertTrue(self.provenance.is_file())
 
-    def test_partial_cleanup_can_finish_after_all_proofs_are_reestablished(self) -> None:
+    def test_partial_cleanup_can_finish_after_all_proofs_are_reestablished(
+        self,
+    ) -> None:
         self.evidence.unlink()
         decision = self.only(self.reaper().sweep())
         self.assertEqual(decision.decision, REAPED)
@@ -173,7 +185,9 @@ class CanonicalReaperTests(CanonicalReaperCase):
         self.assertEqual(decision.reason, UNEXPECTED_WINDOW_ARTIFACT)
         self.assertTrue(self.evidence.is_file())
 
-    def test_changed_tombstone_receipt_is_not_accepted_as_committed_history(self) -> None:
+    def test_changed_tombstone_receipt_is_not_accepted_as_committed_history(
+        self,
+    ) -> None:
         self.reaper().sweep()
         document = json.loads(self.archive_receipt.read_text(encoding="utf-8"))
         document["canonical_receipt"]["sha256"] = "a" * 64
@@ -183,6 +197,22 @@ class CanonicalReaperTests(CanonicalReaperCase):
 
 
 class CanonicalReaperCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "ARCHIVE_BACKEND": "local",
+                "ARCHIVE_DURABILITY": "conformance",
+                "ARCHIVE_STORE_ID": "local-archive",
+                "ARCHIVE_S3_BUCKET": "",
+                "ARCHIVE_S3_REGION": "",
+                "ARCHIVE_S3_EXPECTED_OWNER": "",
+                "ARCHIVE_GCS_BUCKET": "",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_parser_refuses_a_retention_floor_below_eighteen_hours(self) -> None:
         with self.assertRaises(SystemExit):
             canonical_reaper_parser().parse_args(
@@ -191,39 +221,37 @@ class CanonicalReaperCommandTests(unittest.TestCase):
 
     def test_command_refuses_a_retention_floor_below_eighteen_hours(self) -> None:
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(SystemExit):
+            os.environ["ARCHIVE_ROOT"] = str(Path(directory) / "archive")
             canonical_reaper_main(
                 [
                     "--canonical-root",
                     str(Path(directory) / "canonical"),
-                    "--archive-root",
-                    str(Path(directory) / "archive"),
                     "--retention-hours",
                     "17",
                 ]
             )
 
     def test_command_refuses_a_missing_canonical_root(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
-            SystemExit, "canonical root.*is not a directory"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(SystemExit, "canonical root.*is not a directory"),
         ):
+            os.environ["ARCHIVE_ROOT"] = str(Path(directory) / "archive")
             canonical_reaper_main(
                 [
                     "--canonical-root",
                     str(Path(directory) / "missing"),
-                    "--archive-root",
-                    str(Path(directory) / "archive"),
                 ]
             )
 
     def test_command_refuses_delete_against_conformance_storage(self) -> None:
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(SystemExit):
             (Path(directory) / "canonical").mkdir()
+            os.environ["ARCHIVE_ROOT"] = str(Path(directory) / "archive")
             canonical_reaper_main(
                 [
                     "--canonical-root",
                     str(Path(directory) / "canonical"),
-                    "--archive-root",
-                    str(Path(directory) / "archive"),
                     "--mode",
                     "delete",
                 ]
@@ -264,6 +292,7 @@ class CanonicalReapingThroughS3Tests(unittest.TestCase):
             self.assertEqual(decision.decision, REAPED, result.as_record())
             self.assertFalse(source_receipt.with_name("evidence.ndjson.zst").exists())
             self.assertTrue(source_receipt.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

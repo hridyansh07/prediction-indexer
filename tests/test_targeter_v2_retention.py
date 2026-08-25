@@ -63,7 +63,6 @@ from targeter.v2.run_reaper import (
 from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from tests.test_targeter_v2_delivery import _Adapter
 
-
 ROOT = Path(__file__).resolve().parents[1]
 HOUR = timedelta(hours=1)
 RECEIPT = "archive_receipt.json"
@@ -137,6 +136,21 @@ class TargetRunCase(unittest.TestCase):
             store_id="targeter-test-bucket",
             durability=self.durability,
         )
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "ARCHIVE_BACKEND": "local",
+                "ARCHIVE_ROOT": str(self.root / "object-store"),
+                "ARCHIVE_DURABILITY": "conformance",
+                "ARCHIVE_STORE_ID": "targeter-test-bucket",
+                "ARCHIVE_S3_BUCKET": "",
+                "ARCHIVE_S3_REGION": "",
+                "ARCHIVE_S3_EXPECTED_OWNER": "",
+                "ARCHIVE_GCS_BUCKET": "",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     # -- fixtures ----------------------------------------------------------
 
@@ -190,7 +204,9 @@ class TargetRunCase(unittest.TestCase):
         )
         return directory
 
-    def reaper(self, *, destructive: bool = True, retention_ns: int = 0) -> TargetRunReaper:
+    def reaper(
+        self, *, destructive: bool = True, retention_ns: int = 0
+    ) -> TargetRunReaper:
         return TargetRunReaper(
             self.output_root,
             self.live_root,
@@ -234,7 +250,9 @@ class RetentionTests(TargetRunCase):
     def test_a_conformance_receipt_authorizes_nothing(self) -> None:
         self.published()
         directory = self.run_directory()
-        conformance = LocalObjectStore(self.root / "conformance", durability=CONFORMANCE)
+        conformance = LocalObjectStore(
+            self.root / "conformance", durability=CONFORMANCE
+        )
         archive_run(directory, conformance, now=NOW)
         self.assertTrue((directory / "archive_receipt.local.json").is_file())
 
@@ -288,7 +306,9 @@ class RetentionTests(TargetRunCase):
         self.assertEqual(decision.reason, ARCHIVE_OBJECT_UNVERIFIED)
         self.assertTrue((directory / "selection_report.json").exists())
 
-    def test_a_changed_local_artifact_retains_even_with_a_verified_archive(self) -> None:
+    def test_a_changed_local_artifact_retains_even_with_a_verified_archive(
+        self,
+    ) -> None:
         self.published()
         directory = self.archived()
         drift = directory / "rule_drift.ndjson"
@@ -341,7 +361,9 @@ class RetentionTests(TargetRunCase):
     def test_a_run_inside_the_retention_floor_is_retained(self) -> None:
         self.published()
         directory = self.archived()
-        decision = self.decide(directory, retention_ns=RETENTION_FLOOR_HOURS * 3600 * 10**9)
+        decision = self.decide(
+            directory, retention_ns=RETENTION_FLOOR_HOURS * 3600 * 10**9
+        )
         self.assertEqual(decision.decision, RETAINED)
         self.assertEqual(decision.reason, RETENTION_FLOOR)
         self.assertTrue((directory / "selection_report.json").exists())
@@ -388,9 +410,7 @@ class ClockTests(TargetRunCase):
     def test_a_run_id_that_names_no_instant_is_unreadable(self) -> None:
         self.assertIsNone(parse_run_id_ns("not-a-run"))
         self.assertIsNone(parse_run_id_ns("20261301T000000.000000Z"))
-        self.assertEqual(
-            parse_run_id_ns("19700101T000000.000001Z"), 1_000
-        )
+        self.assertEqual(parse_run_id_ns("19700101T000000.000001Z"), 1_000)
 
     def test_the_floor_uses_the_latest_of_every_available_clock(self) -> None:
         """`--now` can backdate a run id and its receipt, but not the host."""
@@ -501,7 +521,9 @@ class DeletionTests(TargetRunCase):
         self.assertIn("partial cleanup", decision.detail)
         self.assertEqual(self.artifacts(directory), {RECEIPT})
 
-    def test_a_partial_cleanup_is_not_finished_when_the_archive_stops_verifying(self) -> None:
+    def test_a_partial_cleanup_is_not_finished_when_the_archive_stops_verifying(
+        self,
+    ) -> None:
         directory = self.candidate()
         (directory / "selection_report.json").unlink()
         key = json.loads((directory / RECEIPT).read_text())["objects"][0]["key"]
@@ -619,18 +641,20 @@ class ArchiveSweepTests(TargetRunCase):
         self.assertIn("rule_drift.ndjson", outcome.detail)
         self.assertFalse((directory / RECEIPT).exists())
 
-    def test_an_incomplete_run_past_the_floor_is_a_fault_an_operator_must_clear(self) -> None:
+    def test_an_incomplete_run_past_the_floor_is_a_fault_an_operator_must_clear(
+        self,
+    ) -> None:
         directory = self.run_directory()
         (directory / "rule_drift.ndjson").unlink()
         stale = self._clock_at(directory, hours=INCOMPLETE_RUN_FLOOR_HOURS + 2)
 
-        outcome = self.only_outcome(
-            self.sweeper(now_ns=stale).sweep([directory])
-        )
+        outcome = self.only_outcome(self.sweeper(now_ns=stale).sweep([directory]))
         self.assertEqual(outcome.status, FAILED)
         self.assertIn("died before finishing", outcome.detail)
 
-    def test_a_stray_temp_file_does_not_stop_a_complete_run_being_archived(self) -> None:
+    def test_a_stray_temp_file_does_not_stop_a_complete_run_being_archived(
+        self,
+    ) -> None:
         """The sweep archives; refusing strays is the reaper's job, not this one."""
         directory = self.run_directory()
         (directory / ".selection_report.json.a1b2c3d4").write_text("partial")
@@ -656,9 +680,7 @@ class ArchiveSweepTests(TargetRunCase):
         self.run_directory()
         record = self.sweeper().sweep().as_record()
 
-        self.assertEqual(
-            set(record), {"lease_acquired", "counts", "halted", "runs"}
-        )
+        self.assertEqual(set(record), {"lease_acquired", "counts", "halted", "runs"})
         self.assertEqual(
             set(record["counts"]),
             {"discovered", "archived", "skipped", "pending", "failed", "conflicted"},
@@ -726,7 +748,23 @@ class SeparationTests(unittest.TestCase):
                     for option in action.option_strings
                 }
                 self.assertNotIn("--interval-seconds", options)
-                source = (ROOT / "targeter" / "v2" / f"{module.__name__.rsplit('.', 1)[-1]}.py").read_text()
+                self.assertFalse(
+                    options
+                    & {
+                        "--archive-backend",
+                        "--archive-root",
+                        "--archive-durability",
+                        "--store-id",
+                        "--s3-bucket",
+                        "--gcs-bucket",
+                    }
+                )
+                source = (
+                    ROOT
+                    / "targeter"
+                    / "v2"
+                    / f"{module.__name__.rsplit('.', 1)[-1]}.py"
+                ).read_text()
                 self.assertNotIn("signal.signal", source)
 
     def test_the_archive_package_never_imports_targeter(self) -> None:
@@ -754,10 +792,6 @@ class ReaperCommandTests(TargetRunCase):
             str(self.output_root),
             "--live-root",
             str(self.live_root),
-            "--archive-root",
-            str(self.root / "object-store"),
-            "--store-id",
-            "targeter-test-bucket",
             "--retention-hours",
             str(RETENTION_FLOOR_HOURS),
             *extra,
@@ -775,10 +809,11 @@ class ReaperCommandTests(TargetRunCase):
         self.published()
         directory = self.archived()
         self.age_out(directory)
-        with self.independent_backend():
-            status, record = run_command(
-                run_reaper_cli.main, self.arguments("--archive-durability", "independent")
-            )
+        with (
+            self.independent_backend(),
+            mock.patch.dict(os.environ, {"ARCHIVE_DURABILITY": "independent"}),
+        ):
+            status, record = run_command(run_reaper_cli.main, self.arguments())
 
         self.assertEqual(status, run_reaper_cli.EXIT_OK)
         self.assertFalse(record["destructive"])
@@ -788,7 +823,9 @@ class ReaperCommandTests(TargetRunCase):
         self.assertEqual(record["counts"]["reaped"], 0)
         self.assertTrue((directory / "selection_report.json").exists())
 
-    def test_delete_mode_against_a_conformance_store_is_refused_at_startup(self) -> None:
+    def test_delete_mode_against_a_conformance_store_is_refused_at_startup(
+        self,
+    ) -> None:
         self.published()
         directory = self.archived()
         self.age_out(directory)
@@ -806,7 +843,7 @@ class ReaperCommandTests(TargetRunCase):
     def test_the_live_root_is_not_optional(self) -> None:
         with self.assertRaises(SystemExit):
             run_reaper_cli.build_parser().parse_args(
-                ["--output-root", str(self.output_root), "--archive-root", str(self.root)]
+                ["--output-root", str(self.output_root)]
             )
 
     def test_an_unreadable_pointer_exits_non_zero(self) -> None:
@@ -837,16 +874,19 @@ class ReaperCommandTests(TargetRunCase):
         # why the command refuses to delete against one.
         self.assertEqual(record["archive"]["durability"], "local_conformance")
 
-    def test_delete_mode_reaps_only_once_the_backend_is_declared_independent(self) -> None:
+    def test_delete_mode_reaps_only_once_the_backend_is_declared_independent(
+        self,
+    ) -> None:
         self.published()
         directory = self.archived()
         self.age_out(directory)
-        with self.independent_backend():
+        with (
+            self.independent_backend(),
+            mock.patch.dict(os.environ, {"ARCHIVE_DURABILITY": "independent"}),
+        ):
             status, record = run_command(
                 run_reaper_cli.main,
-                self.arguments(
-                    "--mode", "delete", "--archive-durability", "independent"
-                ),
+                self.arguments("--mode", "delete"),
             )
 
         self.assertEqual(status, run_reaper_cli.EXIT_OK)
@@ -863,10 +903,6 @@ class ArchiveSweepCommandTests(TargetRunCase):
         return [
             "--output-root",
             str(self.output_root),
-            "--archive-root",
-            str(self.root / "object-store"),
-            "--store-id",
-            "targeter-test-bucket",
             *extra,
         ]
 

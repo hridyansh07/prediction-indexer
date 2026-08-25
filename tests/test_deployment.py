@@ -6,7 +6,6 @@ import re
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -29,6 +28,10 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
+            "ARCHIVE_BACKEND",
+            "ARCHIVE_ROOT",
+            "ARCHIVE_STORE_ID",
+            "ARCHIVE_DURABILITY",
             "ARCHIVE_GCS_BUCKET",
         ):
             self.assertIn(variable, self.compose)
@@ -44,7 +47,8 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
                 self.assertIn(
                     "environment: *cloud-archive-environment", self.service(service)
                 )
-                self.assertIn("--gcs-bucket", self.service(service))
+                self.assertNotIn("--gcs-bucket", self.service(service))
+                self.assertNotIn("--archive-backend", self.service(service))
 
     def test_archiver_sweeps_the_canonical_root_as_well_as_the_raw_spool(self) -> None:
         for service in ("archiver", "archiver-once"):
@@ -62,7 +66,9 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
                 self.assertIn("${CANONICAL_REAPER_RETENTION_HOURS:-18}", configured)
                 self.assertIn("--canonical-root", configured)
 
-    def test_ingest_store_reaper_is_one_shot_audit_first_and_uses_the_rust_image(self) -> None:
+    def test_ingest_store_reaper_is_one_shot_audit_first_and_uses_the_rust_image(
+        self,
+    ) -> None:
         service = self.service("ingest-store-reaper")
         self.assertIn("<<: *ingester-service", service)
         self.assertIn('restart: "no"', service)
@@ -75,7 +81,9 @@ class TargeterV2DeploymentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.override_path = ROOT / "compose.targeter-v2.yaml"
 
-    def test_production_override_is_one_shot_and_switches_every_targeted_splice(self) -> None:
+    def test_production_override_is_one_shot_and_switches_every_targeted_splice(
+        self,
+    ) -> None:
         document = self.override_path.read_text(encoding="utf-8")
         self.assertIn("targeter/run_v2.py", document)
         self.assertIn("--mode", document)
@@ -84,7 +92,29 @@ class TargeterV2DeploymentTests(unittest.TestCase):
         self.assertNotIn("--interval-seconds", document)
         self.assertGreaterEqual(document.count("/live/targeter-v2/current.json"), 8)
 
-    def test_documentation_supplies_a_periodic_one_shot_command_and_audit_gate(self) -> None:
+    def test_archive_provider_configuration_is_environment_only(self) -> None:
+        document = self.override_path.read_text(encoding="utf-8")
+        self.assertIn("environment: &targeter-v2-archive-environment", document)
+        for variable in (
+            "ARCHIVE_BACKEND",
+            "ARCHIVE_ROOT",
+            "ARCHIVE_DURABILITY",
+            "ARCHIVE_S3_BUCKET",
+            "ARCHIVE_GCS_BUCKET",
+        ):
+            self.assertIn(variable, document)
+        for option in (
+            "--archive-backend",
+            "--archive-root",
+            "--archive-durability",
+            "--s3-bucket",
+            "--gcs-bucket",
+        ):
+            self.assertNotIn(option, document)
+
+    def test_documentation_supplies_a_periodic_one_shot_command_and_audit_gate(
+        self,
+    ) -> None:
         deployment = (ROOT / "docs" / "TARGETER_V2_PHASES_6_10.md").read_text(
             encoding="utf-8"
         )
@@ -111,25 +141,26 @@ class EventUniverseDeploymentTests(unittest.TestCase):
             "  event-universe-sync:", 1
         )[0]
         self.assertNotIn("AWS_ACCESS_KEY_ID", server)
-        runtime = compose.split("x-universe-runtime:", 1)[1].split(
-            "\nservices:", 1
-        )[0]
+        runtime = compose.split("x-universe-runtime:", 1)[1].split("\nservices:", 1)[0]
         self.assertIn("environment: *universe-config-environment", runtime)
-        self.assertEqual(
-            compose.count("    environment: *universe-job-environment"), 3
-        )
+        self.assertEqual(compose.count("    environment: *universe-job-environment"), 3)
 
-    def test_jobs_are_direct_configured_scripts_without_an_argument_parser(self) -> None:
+    def test_jobs_are_direct_configured_scripts_without_an_argument_parser(
+        self,
+    ) -> None:
         universe = ROOT / "universe"
         self.assertFalse((universe / "cli.py").exists())
-        for name in ("run_server.py", "run_sync.py", "run_backfill.py", "run_backup.py"):
+        for name in (
+            "run_server.py",
+            "run_sync.py",
+            "run_backfill.py",
+            "run_backup.py",
+        ):
             source = (universe / name).read_text(encoding="utf-8")
             with self.subTest(name=name):
                 self.assertIn("load_config()", source)
                 self.assertNotIn("argparse", source)
-        config = (ROOT / "configs" / "event_universe.json").read_text(
-            encoding="utf-8"
-        )
+        config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
         self.assertIn('"event_universe_config_version": 1', config)
         self.assertIn('"generated_start": null', config)
         self.assertIn('"generated_end": null', config)
@@ -137,9 +168,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
 
     def test_schema_is_selected_history_without_raw_universe_tables(self) -> None:
-        schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(
-            encoding="utf-8"
-        )
+        schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(encoding="utf-8")
         self.assertIn("CREATE TABLE selection_occurrences", schema)
         self.assertIn("CREATE TABLE bundle_contexts", schema)
         self.assertIn("CREATE TABLE bundle_retirements", schema)
@@ -147,7 +176,9 @@ class EventUniverseDeploymentTests(unittest.TestCase):
             self.assertNotIn(stale, schema)
         self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
 
-    def test_orb_setup_creates_and_installs_the_project_virtual_environment(self) -> None:
+    def test_orb_setup_creates_and_installs_the_project_virtual_environment(
+        self,
+    ) -> None:
         setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")
         self.assertIn('python3 -m venv "$REPO_ROOT/.venv"', setup)
         self.assertIn('"$REPO_ROOT/.venv/bin/python" -m pip install -e', setup)

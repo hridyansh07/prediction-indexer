@@ -256,9 +256,12 @@ Two commands, deliberately separate, mirroring `archive/PHASE_4_RAW_ARCHIVE_REAP
 §7.1: uploading must never be the last step before deleting.
 
 ```bash
-python -m targeter.v2.run_archiver_cli --output-root … --archive-root …
-python -m targeter.v2.run_reaper_cli   --output-root … --live-root … --archive-root …
+python -m targeter.v2.run_archiver_cli --output-root …
+python -m targeter.v2.run_reaper_cli   --output-root … --live-root …
 ```
+
+Both commands obtain the archive backend and provider details from the
+`ARCHIVE_*` process environment. Compose supplies those values from `.env`.
 
 ### 7.1 The archiver sweep
 

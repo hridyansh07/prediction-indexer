@@ -15,9 +15,14 @@ from typing import Any, Iterable
 
 from archive.common.durable import write_json_durable
 from archive.storage.base import ObjectStoreError
-from archive.storage.factory import add_store_arguments, build_store
+from archive.storage.factory import build_store
 from analysis.storage import write_json_zstd, write_ndjson, write_ndjson_zstd
-from encoder import DEFAULT_ZSTD_LEVEL, encoder_version, logical_identity_of, stored_identity_of
+from encoder import (
+    DEFAULT_ZSTD_LEVEL,
+    encoder_version,
+    logical_identity_of,
+    stored_identity_of,
+)
 from targeter.targets import TargetsError
 from targeter.v2.adapters import durable_client, live_adapters
 from targeter.v2.continuity import (
@@ -46,7 +51,6 @@ from targeter.v2.publication import (
 from targeter.v2.run_archive import RunArchiveError, archive_run, parse_run_id_ns
 from targeter.v2.selection import SelectionResult, select_targets
 from targeter.v2.target_records import artifact_stem, target_record_rows
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STRATEGY = PROJECT_ROOT / "configs" / "targeter_v2.json"
@@ -82,7 +86,9 @@ def _write_artifact(
     artifact_format: str,
 ) -> tuple[str, dict[str, Any]]:
     if artifact_format not in ARTIFACT_FORMATS:
-        raise ValueError(f"artifact_format must be one of {', '.join(ARTIFACT_FORMATS)}")
+        raise ValueError(
+            f"artifact_format must be one of {', '.join(ARTIFACT_FORMATS)}"
+        )
     name = f"{stem}.ndjson.zst" if artifact_format == "zstd" else f"{stem}.ndjson"
     path = directory / name
     if artifact_format == "zstd":
@@ -203,13 +209,16 @@ def run_shadow(
     max_limitless_pages: int | None = None,
 ) -> ShadowRun:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    adapter_set = tuple(adapters or live_adapters(
-        strategy,
-        max_kalshi_series=max_kalshi_series,
-        max_kalshi_pages=max_kalshi_pages,
-        max_polymarket_pages=max_polymarket_pages,
-        max_limitless_pages=max_limitless_pages,
-    ))
+    adapter_set = tuple(
+        adapters
+        or live_adapters(
+            strategy,
+            max_kalshi_series=max_kalshi_series,
+            max_kalshi_pages=max_kalshi_pages,
+            max_polymarket_pages=max_polymarket_pages,
+            max_limitless_pages=max_limitless_pages,
+        )
+    )
     http = client or durable_client(
         cache_root,
         force_refresh=force_refresh,
@@ -295,7 +304,9 @@ def run_shadow(
     record["discovery_failures"] = dict(sorted(failures.items()))
     record["continuity_diagnostics"] = continuity_diagnostics
     record["continuity_degraded_base_run_id"] = continuity_degraded_base_run_id
-    record["target_record_diagnostics"] = dict(sorted(target_record_diagnostics.items()))
+    record["target_record_diagnostics"] = dict(
+        sorted(target_record_diagnostics.items())
+    )
     catalog_venues = [catalog.venue for catalog in catalogs]
     input_complete = (
         not failures
@@ -383,7 +394,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "ndjson preserves plain files for shadow inspection."
         ),
     )
-    add_store_arguments(parser)
     cache_mode = parser.add_mutually_exclusive_group()
     cache_mode.add_argument(
         "--reuse-cache",
@@ -403,7 +413,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "run artifacts; do not persist raw HTTP response bodies."
         ),
     )
-    parser.add_argument("--now", help="Deterministic ISO-8601 run time for probes/tests.")
+    parser.add_argument(
+        "--now", help="Deterministic ISO-8601 run time for probes/tests."
+    )
     parser.add_argument("--max-kalshi-series", type=int)
     parser.add_argument("--max-kalshi-pages", type=int)
     parser.add_argument("--max-polymarket-pages", type=int)
@@ -417,12 +429,7 @@ def _optional_positive(value: int | None, name: str) -> None:
 
 
 def _configured_store(arguments: argparse.Namespace):
-    # The shared archive factory calls this root ``spool_root`` because raw
-    # capture introduced the adapter.  For target-run archival the analogous
-    # primary copy is output_root; the same-filesystem guard must compare the
-    # archive against that directory.
-    arguments.spool_root = arguments.output_root
-    return build_store(arguments)
+    return build_store((arguments.output_root,))
 
 
 def main(argv: list[str] | None = None) -> int:

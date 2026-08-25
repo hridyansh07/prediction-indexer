@@ -349,31 +349,31 @@ Create one `archive/storage/factory.py`. Both `archive/archiver/cli.py` and
 `archive/reaper/cli.py` must use it so the two commands cannot interpret backend
 configuration differently.
 
-CLI contract:
+Environment contract:
 
 ```text
---archive-backend local|s3             default: local
+ARCHIVE_BACKEND=local|s3                default: local
 
 local only:
---archive-root PATH
---archive-durability conformance|independent
---store-id TEXT
+ARCHIVE_ROOT=PATH
+ARCHIVE_DURABILITY=conformance|independent
+ARCHIVE_STORE_ID=TEXT
 
 s3 only:
---s3-bucket NAME
---s3-region REGION
---s3-expected-owner 12_DIGIT_ACCOUNT_ID
+ARCHIVE_S3_BUCKET=NAME
+ARCHIVE_S3_REGION=REGION
+ARCHIVE_S3_EXPECTED_OWNER=12_DIGIT_ACCOUNT_ID
 ```
 
 Validation:
 
 - local preserves the current `st_dev` safety check;
 - S3 requires all three S3 fields and always returns `INDEPENDENT`;
-- `--archive-durability` cannot downgrade or upgrade S3;
+- `ARCHIVE_DURABILITY` cannot downgrade or upgrade S3;
 - S3 `store_id` cannot be overridden;
-- the static Compose command may still pass its local archive root and local
-  store ID while S3 is selected; the factory ignores them for S3, and tests
-  prove they do not affect the bucket or durability class;
+- Compose may still pass its local archive root and local store ID while S3 is
+  selected; the factory ignores them for S3, and tests prove they do not affect
+  the bucket or durability class;
 - non-empty S3 options while `local` is selected fail at startup, rather than
   making an operator think two backends are active.
 
