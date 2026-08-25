@@ -2,13 +2,14 @@
 
 `Archiver` and `Reaper` depend only on the `ObjectStore` protocol, so this
 module adds no methods to either — it is a second implementation of the same
-four calls `LocalObjectStore` already makes durable and testable without
+small contract `LocalObjectStore` already makes durable and testable without
 cloud credentials:
 
 ```text
 put_immutable(key, reader, expected_identity) -> ObjectMetadata
 head(key)                                     -> ObjectMetadata | None
 open(key)                                     -> bounded byte reader
+open_verified(expectation)                    -> verified byte reader
 list_keys(prefix)                             -> immutable key iterator
 ```
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 from typing import Any, BinaryIO, Iterator
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -44,9 +46,11 @@ from archive.storage.base import (
     INDEPENDENT,
     BoundedReader,
     IntegrityConflict,
+    ObjectExpectation,
     ObjectMetadata,
     ObjectStoreError,
     VerificationFailure,
+    VerifiedReader,
     normalize_key,
     provider_checksum_of,
 )
@@ -107,8 +111,14 @@ def _validate_expected_identity(identity: StoredIdentity) -> None:
             f"expected sha256 {sha256!r} is not a lowercase 64-character hex digest"
         )
     byte_length = identity.byte_length
-    if not isinstance(byte_length, int) or isinstance(byte_length, bool) or byte_length < 0:
-        raise ObjectStoreError(f"expected byte_length {byte_length!r} is not a non-negative integer")
+    if (
+        not isinstance(byte_length, int)
+        or isinstance(byte_length, bool)
+        or byte_length < 0
+    ):
+        raise ObjectStoreError(
+            f"expected byte_length {byte_length!r} is not a non-negative integer"
+        )
 
 
 class S3ObjectStore:
@@ -119,6 +129,8 @@ class S3ObjectStore:
     arbitrary endpoint URL, and the default client resolves credentials
     through boto3's normal provider chain.
     """
+
+    provider = "s3"
 
     #: Fixed for V1 (§3): an S3 backend is always an independent durability
     #: domain, never inferred, never downgraded by configuration.
@@ -168,7 +180,9 @@ class S3ObjectStore:
                 # §7: the role holds `s3:ListBucket`, so a missing key is a 404
                 # and a 403 here is a configuration or authorization failure,
                 # never absence.
-                raise ObjectStoreError(f"heading {normalized}: access denied ({error})") from error
+                raise ObjectStoreError(
+                    f"heading {normalized}: access denied ({error})"
+                ) from error
             raise ObjectStoreError(f"heading {normalized}: {error}") from error
         except BotoCoreError as error:
             raise ObjectStoreError(f"heading {normalized}: {error}") from error
@@ -191,7 +205,9 @@ class S3ObjectStore:
                 f"limit of {MAX_SINGLE_PUT_BYTES} bytes; multipart upload is out of scope"
             )
         if not reader.seekable():
-            raise ObjectStoreError(f"{normalized}: put_immutable requires a seekable reader")
+            raise ObjectStoreError(
+                f"{normalized}: put_immutable requires a seekable reader"
+            )
 
         # An O(1) file operation, not a read: it proves the reader holds
         # exactly the promised byte count before one byte is uploaded, and
@@ -241,9 +257,13 @@ class S3ObjectStore:
                 raise VerificationFailure(
                     f"{normalized}: S3 rejected the declared checksum ({code})"
                 ) from error
-            raise ObjectStoreError(f"{normalized}: PutObject failed: {error}") from error
+            raise ObjectStoreError(
+                f"{normalized}: PutObject failed: {error}"
+            ) from error
         except BotoCoreError as error:
-            raise ObjectStoreError(f"{normalized}: PutObject failed: {error}") from error
+            raise ObjectStoreError(
+                f"{normalized}: PutObject failed: {error}"
+            ) from error
 
         metadata = self.head(normalized)
         if metadata is None or not self._matches_request(
@@ -268,7 +288,9 @@ class S3ObjectStore:
         except (ClientError, BotoCoreError) as error:
             # Unlike `head`, a 404 here is a fault: the caller asked to open a
             # specific key, so its absence is not folded into any other status.
-            raise ObjectStoreError(f"{normalized}: GetObject failed: {error}") from error
+            raise ObjectStoreError(
+                f"{normalized}: GetObject failed: {error}"
+            ) from error
 
         body = response["Body"]
         content_length = response.get("ContentLength")
@@ -283,6 +305,62 @@ class S3ObjectStore:
                 f"{max_bytes} byte limit before any byte was returned"
             )
         return BoundedReader(body, normalized, max_bytes)
+
+    def open_verified(self, expected: ObjectExpectation) -> VerifiedReader:
+        normalized = normalize_key(expected.key)
+        expected_checksum = provider_checksum_of(expected.stored.sha256)
+        if (
+            expected.provider_checksum_algorithm != "SHA256"
+            or expected.provider_checksum != expected_checksum
+        ):
+            raise VerificationFailure(
+                f"{normalized}: receipt has invalid S3 SHA256 checksum evidence"
+            )
+        try:
+            response = self._client.get_object(
+                Bucket=self.bucket,
+                Key=normalized,
+                ChecksumMode="ENABLED",
+                ExpectedBucketOwner=self.expected_bucket_owner,
+            )
+        except ClientError as error:
+            code, status = _error_code_and_status(error)
+            if status == 404 or code in ("404", "NoSuchKey"):
+                raise VerificationFailure(
+                    f"{normalized}: receipted S3 object is absent"
+                ) from error
+            raise ObjectStoreError(
+                f"{normalized}: GetObject failed: {error}"
+            ) from error
+        except BotoCoreError as error:
+            raise ObjectStoreError(
+                f"{normalized}: GetObject failed: {error}"
+            ) from error
+
+        body = response["Body"]
+        actual = (
+            response.get("ContentLength"),
+            response.get("ChecksumSHA256"),
+            response.get("ContentType"),
+            response.get("ContentEncoding"),
+        )
+        wanted = (
+            expected.stored.byte_length,
+            expected.provider_checksum,
+            expected.content_type,
+            expected.content_encoding,
+        )
+        checksum_type = response.get("ChecksumType")
+        if actual != wanted or checksum_type not in (None, _FULL_OBJECT_CHECKSUM_TYPE):
+            body.close()
+            raise VerificationFailure(
+                f"{normalized}: GetObject metadata disagrees with its receipt"
+            )
+        return VerifiedReader(
+            body,
+            expected,
+            provider_hasher=hashlib.sha256(),
+        )
 
     def list_keys(self, prefix: str) -> Iterator[str]:
         """Yield every key below a prefix with strict pagination.
@@ -314,7 +392,11 @@ class S3ObjectStore:
                 if not isinstance(key, str):
                     raise ObjectStoreError(f"listing {normalized}: object has no key")
                 normalized_key = normalize_key(key)
-                if normalized_key != key or not key.startswith(normalized) or key in seen_keys:
+                if (
+                    normalized_key != key
+                    or not key.startswith(normalized)
+                    or key in seen_keys
+                ):
                     raise ObjectStoreError(
                         f"listing {normalized}: malformed or repeated key {key!r}"
                     )
@@ -383,7 +465,9 @@ class S3ObjectStore:
                 f"{key}: PutObject returned 412 but the object is now absent; the next sweep "
                 "must retry from the beginning"
             )
-        if self._matches_request(metadata, expected_identity, content_type, content_encoding):
+        if self._matches_request(
+            metadata, expected_identity, content_type, content_encoding
+        ):
             return metadata
         raise IntegrityConflict(
             f"key {key} already holds a different object than this put requested "
@@ -409,7 +493,8 @@ class S3ObjectStore:
         return (
             metadata.byte_length == expected_identity.byte_length
             and metadata.sha256 == expected_identity.sha256
-            and metadata.provider_checksum == provider_checksum_of(expected_identity.sha256)
+            and metadata.provider_checksum
+            == provider_checksum_of(expected_identity.sha256)
             and metadata.provider_checksum_algorithm == "SHA256"
             and metadata.content_type == content_type
             and metadata.content_encoding == content_encoding

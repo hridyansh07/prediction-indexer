@@ -194,10 +194,13 @@ docker compose -f compose.yaml -f compose.targeter-v2.yaml up --no-deps -d \
 ```
 
 Add `--profile kalshi splice-kalshi` only on a host with working Kalshi
-credentials. Production publication defaults to the S3 backend and refuses
-missing bucket, region, or expected-owner configuration. Instance/task roles
-are preferred; exported AWS credentials are forwarded only to S3-facing
-services.
+credentials. Production publication defaults to S3, but native GCS is selected
+with `TARGETER_ARCHIVE_BACKEND=gcs` and `ARCHIVE_GCS_BUCKET`. GCS uses
+Application Default Credentials; on GCE, prefer an attached service account.
+The provider-neutral Targeter production run receipt is version 3 and records
+the store provider/location plus each object's provider checksum. GCS CRC32C is
+not treated as SHA-256: the shared GCS adapter recomputes SHA-256 from a complete
+generation-pinned readback before the receipt can be published.
 
 ## 6. Phase 10 — audit and rollout gate
 

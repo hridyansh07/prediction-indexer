@@ -618,15 +618,15 @@ sequence/continuity after restart. Canonical integrity reports these windows as
 `windows_archived_and_reaped` and does not count their unavailable records as
 locally verified; a crash between the two unlinks is separately visible as
 `windows_partially_reaped`. Enable `CANONICAL_REAPER_MODE=delete` only after the
-same S3 soak and audit review required for raw deletion.
+same cloud-backend soak and audit review required for raw deletion.
 
-### S3 archive backend
+### Cloud archive backends
 
 Both `archiver` and `reaper` build their object store through one factory,
 `archive/storage/factory.py`, which reads `ARCHIVE_BACKEND` (`local`, the
-default, or `s3`). Full detail — bucket layout, IAM policy, integrity
-contract, rollout gate — is `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`; this is the
-operator summary.
+default, `s3`, or `gcs`). The provider contracts are
+`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` and
+`archive/GCS_RAW_ARCHIVE_ADAPTER_V1.md`; this is the operator summary.
 
 ```dotenv
 ARCHIVE_BACKEND=s3
@@ -635,16 +635,30 @@ ARCHIVE_S3_REGION=us-east-1
 ARCHIVE_S3_EXPECTED_OWNER=123456789012   # the bucket-owning account, 12 digits
 ```
 
+For native Google Cloud Storage:
+
+```dotenv
+ARCHIVE_BACKEND=gcs
+ARCHIVE_GCS_BUCKET=my-dedicated-archive-bucket
+```
+
+GCS has no server-side SHA-256. The adapter uses a CRC32C-checked conditional
+resumable create, then downloads the exact object generation to recompute
+SHA-256 from the stored bytes. It rechecks both generation and metageneration
+before returning verified metadata. This makes a GCS `head` a full-object read,
+but preserves the same stored-byte SHA-256 proof without trusting custom
+metadata.
+
 All three `ARCHIVE_S3_*` values are required together; the factory refuses to
 start with only some of them set, and separately refuses to start if any of
 them is non-empty while `ARCHIVE_BACKEND` is still `local` — both are
 configuration mistakes worth failing loudly on rather than guessing past.
-`ARCHIVE_ROOT`, `ARCHIVE_STORE_ID` and `ARCHIVE_DURABILITY` stay in the
-Compose command either way; the factory ignores them once S3 is selected
-(they have no S3 equivalent to keep the command line identical across
-backends), and an S3 backend is always the `independent_durable` class —
-`ARCHIVE_DURABILITY` cannot downgrade it, and the archiver always writes
-production `.archive.json` receipts against it.
+`ARCHIVE_GCS_BUCKET` is required for `gcs`; the factory rejects mixed provider
+options rather than guessing. `ARCHIVE_ROOT`, `ARCHIVE_STORE_ID` and
+`ARCHIVE_DURABILITY` stay in the Compose command for all backends. The factory
+ignores them once S3 or GCS is selected, and either cloud backend is always the
+`independent_durable` class. `ARCHIVE_DURABILITY` cannot downgrade it, and the
+archiver writes provider-neutral production `.archive.json` receipts.
 
 Credentials are never set in `.env`. On AWS, prefer an instance or task role
 scoped to exactly `s3:ListBucket` on the bucket and
@@ -672,18 +686,27 @@ encryption on, and a policy requiring `If-None-Match: *` on writes under
 `archive/S3_RAW_ARCHIVE_ADAPTER_V1.md` §12 for
 the full checklist and the JSON.
 
-Switching `ARCHIVE_BACKEND` from `local` to `s3` does not touch the reaper's
-own gate: `REAPER_MODE=delete` is still explicit, and S3's fixed
-`INDEPENDENT` durability satisfies condition 3 of the six above by
-construction. §15's rollout gate still applies — run the S3 archiver with
-reaper deletion disabled for at least 24 hours, sample every lane against
-retained local raw, and only then consider enabling destructive reaper runs.
+On GCE, attach a dedicated service account to the VM and let the container use
+Application Default Credentials. Grant a bucket-scoped custom role containing
+only `storage.objects.create`, `storage.objects.get`, and
+`storage.objects.list`, or combine the bucket-level predefined Storage Object
+Creator and Storage Object Viewer roles. Do not grant object deletion or update.
+Use a private, dedicated regional GCS bucket with uniform bucket-level access
+and public access prevention. Keep lifecycle expiry disabled during rollout. No
+GCP credential file or value belongs in `.env`.
+
+Switching `ARCHIVE_BACKEND` from `local` to `s3` or `gcs` does not touch the
+reaper's own gate: `REAPER_MODE=delete` is still explicit, and the backend's
+fixed `INDEPENDENT` durability satisfies condition 3 of the six above by
+construction. Run the selected archiver with reaper deletion disabled for at
+least 24 hours, sample every lane against retained local raw, and only then
+consider enabling destructive reaper runs.
 
 **Still out of scope.** Object-store lifecycle expiry is not configured, so the
 archive grows until a later retention policy is enabled. With the local
 conformance backend, total local storage is *not*
 bounded — the bytes have changed representation and directory, nothing more;
-an S3 backend does not bound the spool until `REAPER_MODE=delete` is enabled.
+a cloud backend does not bound the spool until `REAPER_MODE=delete` is enabled.
 
 Back up `spool/` first. The ingest store and canonical evidence are both derived
 and rebuildable from it; the spool cannot be reconstructed from either. Measured: about 6.8 GB/day uncompressed

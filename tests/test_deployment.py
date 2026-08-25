@@ -21,25 +21,30 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
         end = start + next_service.start() if next_service else len(self.compose)
         return self.compose[start:end]
 
-    def test_every_s3_facing_service_receives_the_standard_aws_environment(self) -> None:
-        self.assertIn("x-aws-archive-environment: &aws-archive-environment", self.compose)
+    def test_every_cloud_archive_service_receives_the_shared_environment(self) -> None:
+        self.assertIn(
+            "x-cloud-archive-environment: &cloud-archive-environment", self.compose
+        )
         for variable in (
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
+            "ARCHIVE_GCS_BUCKET",
         ):
             self.assertIn(variable, self.compose)
         for service in (
             "archiver",
             "archiver-once",
             "reaper",
+            "reaper-once",
             "canonical-reaper",
             "canonical-reaper-once",
         ):
             with self.subTest(service=service):
                 self.assertIn(
-                    "environment: *aws-archive-environment", self.service(service)
+                    "environment: *cloud-archive-environment", self.service(service)
                 )
+                self.assertIn("--gcs-bucket", self.service(service))
 
     def test_archiver_sweeps_the_canonical_root_as_well_as_the_raw_spool(self) -> None:
         for service in ("archiver", "archiver-once"):

@@ -65,6 +65,7 @@ pub enum CanonicalOutputsState {
 #[serde(deny_unknown_fields)]
 struct CanonicalArchiveReceipt {
     canonical_archive_receipt_version: u64,
+    store: Option<CanonicalArchiveStore>,
     window_start_ns: u64,
     window_end_ns: u64,
     evidence: CanonicalArchiveObject,
@@ -76,15 +77,24 @@ struct CanonicalArchiveReceipt {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CanonicalArchiveStore {
+    provider: String,
+    location: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CanonicalArchiveObject {
     file: String,
-    bucket: String,
+    bucket: Option<String>,
     key: String,
     byte_length: u64,
     sha256: String,
     content_type: String,
     content_encoding: Option<String>,
-    s3_checksum_sha256: String,
+    s3_checksum_sha256: Option<String>,
+    provider_checksum: Option<String>,
+    provider_checksum_algorithm: Option<String>,
 }
 
 /// Identity of the decoded NDJSON carried by a compressed canonical object.
@@ -1160,7 +1170,7 @@ fn validate_canonical_archive_tombstone(
             "canonical outputs are absent without a valid production archive receipt: {error}"
         ))
     })?;
-    if marker.canonical_archive_receipt_version != 1 || marker.archiver_version != 1 {
+    if !matches!(marker.canonical_archive_receipt_version, 1 | 2) || marker.archiver_version != 1 {
         return Err(invalid(
             "canonical archive receipt has an unsupported version".to_owned(),
         ));
@@ -1188,8 +1198,10 @@ fn validate_canonical_archive_tombstone(
         ));
     }
     let base = format!("canonical/{date}/{window}");
+    let version = marker.canonical_archive_receipt_version;
     validate_archive_object(
         &marker.evidence,
+        version,
         EVIDENCE_FILE,
         &format!("{base}/{EVIDENCE_FILE}"),
         "application/x-ndjson",
@@ -1199,6 +1211,7 @@ fn validate_canonical_archive_tombstone(
     )?;
     validate_archive_object(
         &marker.provenance,
+        version,
         PROVENANCE_FILE,
         &format!("{base}/{PROVENANCE_FILE}"),
         "application/x-ndjson",
@@ -1212,6 +1225,7 @@ fn validate_canonical_archive_tombstone(
     };
     validate_archive_object(
         &marker.canonical_receipt,
+        version,
         RECEIPT_FILE,
         &format!("{base}/{RECEIPT_FILE}"),
         "application/json",
@@ -1219,12 +1233,24 @@ fn validate_canonical_archive_tombstone(
         &receipt_identity,
         invalid,
     )?;
-    if marker.evidence.bucket != marker.provenance.bucket
-        || marker.evidence.bucket != marker.canonical_receipt.bucket
-    {
-        return Err(invalid(
-            "canonical archive objects name different buckets".to_owned(),
-        ));
+    if version == 1 {
+        if marker.store.is_some()
+            || marker.evidence.bucket != marker.provenance.bucket
+            || marker.evidence.bucket != marker.canonical_receipt.bucket
+        {
+            return Err(invalid(
+                "legacy canonical archive receipt has invalid store identity".to_owned(),
+            ));
+        }
+    } else {
+        let store = marker.store.as_ref().ok_or_else(|| {
+            invalid("provider-neutral canonical archive receipt has no store identity".to_owned())
+        })?;
+        if store.provider.is_empty() || store.location.is_empty() {
+            return Err(invalid(
+                "provider-neutral canonical archive store identity is empty".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1232,6 +1258,7 @@ fn validate_canonical_archive_tombstone(
 #[allow(clippy::too_many_arguments)]
 fn validate_archive_object(
     object: &CanonicalArchiveObject,
+    receipt_version: u64,
     expected_file: &str,
     expected_key: &str,
     expected_content_type: &str,
@@ -1243,7 +1270,6 @@ fn validate_archive_object(
         || object.key != expected_key
         || object.content_type != expected_content_type
         || object.content_encoding.as_deref() != expected_content_encoding
-        || object.bucket.is_empty()
         || object.byte_length != expected_identity.byte_length
         || object.sha256 != expected_identity.sha256
         || !is_lower_sha256(&object.sha256)
@@ -1252,12 +1278,32 @@ fn validate_archive_object(
             "canonical archive object {expected_file} disagrees with receipt.json"
         )));
     }
-    let digest = decode_sha256_hex(&object.sha256)
-        .ok_or_else(|| invalid(format!("{expected_file} has an invalid SHA-256")))?;
-    let expected_checksum = base64::engine::general_purpose::STANDARD.encode(digest);
-    if object.s3_checksum_sha256 != expected_checksum {
+    if receipt_version == 1 {
+        let digest = decode_sha256_hex(&object.sha256)
+            .ok_or_else(|| invalid(format!("{expected_file} has an invalid SHA-256")))?;
+        let expected_checksum = base64::engine::general_purpose::STANDARD.encode(digest);
+        if object.bucket.as_deref().is_none_or(str::is_empty)
+            || object.s3_checksum_sha256.as_deref() != Some(&expected_checksum)
+            || object.provider_checksum.is_some()
+            || object.provider_checksum_algorithm.is_some()
+        {
+            return Err(invalid(format!(
+                "canonical archive object {expected_file} has the wrong provider checksum"
+            )));
+        }
+    } else if object.bucket.is_some()
+        || object.s3_checksum_sha256.is_some()
+        || object
+            .provider_checksum
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || object
+            .provider_checksum_algorithm
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
         return Err(invalid(format!(
-            "canonical archive object {expected_file} has the wrong provider checksum"
+            "canonical archive object {expected_file} has invalid provider checksum evidence"
         )));
     }
     Ok(())

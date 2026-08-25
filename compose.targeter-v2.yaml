@@ -24,6 +24,7 @@ x-targeter-v2-runtime: &targeter-v2-runtime
     AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
     AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
     AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
   volumes: &targeter-v2-volumes
     - type: bind
       source: ${CAPTURE_DATA_ROOT:-./data}
@@ -79,6 +80,8 @@ services:
       - "${ARCHIVE_S3_REGION:-}"
       - --s3-expected-owner
       - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --gcs-bucket
+      - "${ARCHIVE_GCS_BUCKET:-}"
 
   # All subscription-driven lanes resolve one atomic generation pointer.  A
   # splice keeps its last valid TargetSet if a future pointer fails validation.
@@ -229,6 +232,8 @@ services:
       - "${ARCHIVE_S3_REGION:-}"
       - --s3-expected-owner
       - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --gcs-bucket
+      - "${ARCHIVE_GCS_BUCKET:-}"
       - --report
       - /var/lib/prediction-indexer/ops/last_targeter_v2_archive_sweep.json
 
@@ -272,6 +277,8 @@ services:
       - "${ARCHIVE_S3_REGION:-}"
       - --s3-expected-owner
       - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --gcs-bucket
+      - "${ARCHIVE_GCS_BUCKET:-}"
       - --mode
       - "${TARGETER_RUN_REAPER_MODE:-audit}"
       - --retention-hours
@@ -312,3 +319,5 @@ services:
       - "${ARCHIVE_S3_REGION:-}"
       - --s3-expected-owner
       - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+      - --gcs-bucket
+      - "${ARCHIVE_GCS_BUCKET:-}"

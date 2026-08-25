@@ -5,8 +5,10 @@ selection is therefore an adapter decision:
 
 - NFS/local: `DirectoryByteStreamer`
 - tests and exact fixtures: `MemoryByteStreamer`
-- receipt-committed raw S3 objects: `archive.ArchivedSegmentByteStreamer`
-- receipt-committed Targeter records: `targeter.v2.replay_stream.ArchivedTargetRecordByteStreamer`
+- receipt-committed raw objects: `archive.ArchivedSegmentByteStreamer`
+- receipt-committed canonical windows: `archive.ArchivedCanonicalByteStreamer`
+- complete Targeter runs: `targeter.v2.replay_stream.ArchivedTargeterRunByteStreamer`
+- capture-window Targeter records: `targeter.v2.replay_stream.ArchivedTargetRecordByteStreamer`
 
 `CompositeByteStreamer` snapshots disjoint adapters into one lexically ordered
 dataset and rejects duplicate logical keys. Gate 1 can therefore consume raw

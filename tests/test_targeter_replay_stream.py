@@ -30,6 +30,7 @@ from replay.gate1 import Gate1Auditor
 from replay.stream import CompositeByteStreamer, MemoryByteStreamer
 from targeter.v2.replay_stream import (
     ArchivedTargetRecordByteStreamer,
+    ArchivedTargeterRunByteStreamer,
     RunReceiptSelectionError,
     select_run_receipts,
 )
@@ -38,7 +39,6 @@ from targeter.v2.run_archive import (
     parse_run_archive_receipt,
     parse_run_id_ns,
 )
-
 
 OWNER = "test-archive"
 RUN_IDS = (
@@ -104,6 +104,7 @@ class RunArchiveFixture:
         rows: bytes | None = None,
         compressed: bool = True,
         include_target_records: bool = True,
+        store_selection: bool = False,
     ) -> RunArchiveReceipt:
         date = datetime.strptime(run_id[:8], "%Y%m%d").date().isoformat()
         prefix = f"targeter-v2/runs/date={date}/run={run_id}"
@@ -116,9 +117,19 @@ class RunArchiveFixture:
             content_encoding=None,
         )
         objects: list[dict[str, object]] = [selection_entry]
+        if store_selection:
+            self.store.put_immutable(
+                selection_entry["key"],
+                io.BytesIO(selection),
+                _stored(selection),
+                content_type=JSON_CONTENT_TYPE,
+                content_encoding=None,
+            )
 
         if include_target_records:
-            logical_bytes = rows if rows is not None else _target_record("asset", run_id=run_id)
+            logical_bytes = (
+                rows if rows is not None else _target_record("asset", run_id=run_id)
+            )
             if compressed:
                 sink = io.BytesIO()
                 encoded = encode_stream(io.BytesIO(logical_bytes), sink)
@@ -150,15 +161,18 @@ class RunArchiveFixture:
                 content_encoding=encoding,
             )
 
-        manifest_bytes = json.dumps(
-            {
-                "targeter_run_manifest_version": 2,
-                "run_id": run_id,
-                "files": [item["file"] for item in objects],
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode() + b"\n"
+        manifest_bytes = (
+            json.dumps(
+                {
+                    "targeter_run_manifest_version": 2,
+                    "run_id": run_id,
+                    "files": [item["file"] for item in objects],
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
         manifest_stored = _stored(manifest_bytes)
         manifest_entry = _entry(
             name="run_manifest.json",
@@ -344,6 +358,35 @@ class ArchivedTargetRecordByteStreamerTests(unittest.TestCase):
             )
         self.assertFalse(list(self.root.glob("target-record-replay-*")))
 
+    def test_complete_run_streamer_exposes_every_receipted_artifact(self) -> None:
+        receipt = self.fixture.receipt(RUN_IDS[0], store_selection=True)
+        streamer = ArchivedTargeterRunByteStreamer(
+            self.fixture.store, (receipt,), temp_root=self.root, chunk_size=7
+        )
+
+        self.assertEqual(len(streamer.object_keys()), len(receipt.objects))
+        selection_key = next(
+            key
+            for key in streamer.object_keys()
+            if key.endswith("selection_report.json")
+        )
+        target_key = next(
+            key
+            for key in streamer.object_keys()
+            if key.endswith("target_records_polymarket.ndjson")
+        )
+        manifest_key = next(
+            key for key in streamer.object_keys() if key.endswith("run_manifest.json")
+        )
+        self.assertEqual(
+            b"".join(streamer.iter_bytes(selection_key)), b'{"report_version":1}\n'
+        )
+        self.assertEqual(
+            b"".join(streamer.iter_bytes(target_key)),
+            _target_record("asset", run_id=RUN_IDS[0]),
+        )
+        self.assertTrue(b"".join(streamer.iter_bytes(manifest_key)))
+
     def test_unrelated_missing_run_objects_do_not_block_target_records(self) -> None:
         predecessor = self.fixture.receipt(RUN_IDS[0])
         current = self.fixture.receipt(RUN_IDS[1])
@@ -388,7 +431,9 @@ class ArchivedTargetRecordByteStreamerTests(unittest.TestCase):
         predecessor = self.fixture.receipt(RUN_IDS[0])
         current = self.fixture.receipt(RUN_IDS[1])
         target = next(
-            item for item in predecessor.objects if item.file.startswith("target_records_")
+            item
+            for item in predecessor.objects
+            if item.file.startswith("target_records_")
         )
         changed_target = replace(target, logical=None)
         objects = tuple(
@@ -413,7 +458,9 @@ class ArchivedTargetRecordByteStreamerTests(unittest.TestCase):
         self.assertEqual(checks["fee_model_evidence"]["status"], "PASS")
         self.assertEqual(checks["discovery_coverage"]["status"], "PASS")
         target_inputs = [
-            item for item in report["input"]["objects"] if "target_records_" in item["key"]
+            item
+            for item in report["input"]["objects"]
+            if "target_records_" in item["key"]
         ]
         self.assertEqual(len(target_inputs), 2)
         self.assertTrue(all(item["key"].endswith(".ndjson") for item in target_inputs))

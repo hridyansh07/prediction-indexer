@@ -20,6 +20,7 @@ from archive.storage import (
     INDEPENDENT,
     IntegrityConflict,
     LocalObjectStore,
+    ObjectExpectation,
     ObjectKeyError,
     ObjectStoreError,
     VerificationFailure,
@@ -76,7 +77,9 @@ class ImmutablePutTests(unittest.TestCase):
         metadata = self.put()
         self.assertEqual(metadata.byte_length, len(self.payload))
         self.assertEqual(metadata.sha256, identity(self.payload).sha256)
-        self.assertEqual(metadata.provider_checksum, provider_checksum_of(metadata.sha256))
+        self.assertEqual(
+            metadata.provider_checksum, provider_checksum_of(metadata.sha256)
+        )
         self.assertEqual(metadata.provider_checksum_algorithm, "SHA256")
         self.assertEqual(metadata.content_type, "application/x-ndjson")
         self.assertEqual(metadata.content_encoding, "zstd")
@@ -101,7 +104,9 @@ class ImmutablePutTests(unittest.TestCase):
                 content_encoding="identity",
             )
 
-    def test_matching_bytes_with_missing_metadata_are_repaired_for_a_retry(self) -> None:
+    def test_matching_bytes_with_missing_metadata_are_repaired_for_a_retry(
+        self,
+    ) -> None:
         self.store.put_immutable(
             self.key, io.BytesIO(self.payload), identity(self.payload)
         )
@@ -110,14 +115,18 @@ class ImmutablePutTests(unittest.TestCase):
         self.assertEqual(repaired.content_encoding, "zstd")
         self.assertEqual(self.store.head(self.key), repaired)
 
-    def test_structurally_invalid_attributes_fail_as_an_object_store_error(self) -> None:
+    def test_structurally_invalid_attributes_fail_as_an_object_store_error(
+        self,
+    ) -> None:
         self.put()
         attributes = self.store._metadata_path(self.key)
         attributes.write_text("[]\n", encoding="utf-8")
         with self.assertRaises(ObjectStoreError):
             self.store.head(self.key)
 
-    def test_a_concurrent_same_byte_publish_with_different_metadata_is_a_conflict(self) -> None:
+    def test_a_concurrent_same_byte_publish_with_different_metadata_is_a_conflict(
+        self,
+    ) -> None:
         original = objectstore._link_exclusive
 
         def publish_the_other_request(temporary: Path, final: Path) -> None:
@@ -142,7 +151,9 @@ class ImmutablePutTests(unittest.TestCase):
         with self.assertRaises(VerificationFailure):
             self.put()
 
-    def test_a_different_value_at_the_same_key_is_a_conflict_and_preserves_the_first(self) -> None:
+    def test_a_different_value_at_the_same_key_is_a_conflict_and_preserves_the_first(
+        self,
+    ) -> None:
         self.put()
         with self.assertRaises(IntegrityConflict):
             self.put(b'{"line":"different"}\n')
@@ -151,14 +162,20 @@ class ImmutablePutTests(unittest.TestCase):
 
     def test_bytes_that_disagree_with_the_promised_identity_are_refused(self) -> None:
         with self.assertRaises(VerificationFailure):
-            self.store.put_immutable(self.key, io.BytesIO(b"other\n"), identity(self.payload))
+            self.store.put_immutable(
+                self.key, io.BytesIO(b"other\n"), identity(self.payload)
+            )
         self.assertIsNone(self.store.head(self.key))
         self.assertEqual(self.temporaries(), [])
 
     def test_head_of_an_absent_key_is_absence_not_an_error(self) -> None:
-        self.assertIsNone(self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst"))
+        self.assertIsNone(
+            self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst")
+        )
 
-    def test_head_detects_post_write_mutation_rather_than_echoing_metadata(self) -> None:
+    def test_head_detects_post_write_mutation_rather_than_echoing_metadata(
+        self,
+    ) -> None:
         self.put()
         path = Path(self.store.root) / self.key
         os.chmod(path, 0o644)
@@ -229,6 +246,40 @@ class ImmutablePutTests(unittest.TestCase):
             handle.write(b"extra\n")
         with self.assertRaises(VerificationFailure):
             with self.store.open(self.key, max_bytes=len(self.payload)) as reader:
+                while reader.read(8):
+                    pass
+
+    def test_verified_read_streams_once_and_requires_complete_consumption(self) -> None:
+        metadata = self.put()
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        with self.store.open_verified(expected) as reader:
+            self.assertEqual(b"".join(reader), self.payload)
+        with self.assertRaisesRegex(VerificationFailure, "not consumed to EOF"):
+            with self.store.open_verified(expected) as reader:
+                reader.read(1)
+
+    def test_verified_read_rejects_bytes_that_drifted_from_the_receipt(self) -> None:
+        metadata = self.put()
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        path = Path(self.store.root) / self.key
+        path.write_bytes(b"x" * len(self.payload))
+
+        with self.assertRaises(VerificationFailure):
+            with self.store.open_verified(expected) as reader:
                 while reader.read(8):
                     pass
 
@@ -352,11 +403,17 @@ class CrashWindowTests(unittest.TestCase):
             self.attempt()
         finally:
             objectstore._fsync_directory = original
-        self.assertTrue(synced, "the retry accepted an existing key without syncing its directory")
+        self.assertTrue(
+            synced, "the retry accepted an existing key without syncing its directory"
+        )
 
-    def test_a_retry_after_a_crash_republishes_the_same_object_idempotently(self) -> None:
+    def test_a_retry_after_a_crash_republishes_the_same_object_idempotently(
+        self,
+    ) -> None:
         original = objectstore._fsync_directory
-        objectstore._fsync_directory = lambda *_: (_ for _ in ()).throw(OSError("crash"))
+        objectstore._fsync_directory = lambda *_: (_ for _ in ()).throw(
+            OSError("crash")
+        )
         try:
             with self.assertRaises(OSError):
                 self.attempt()
@@ -377,9 +434,13 @@ class DurabilityClassTests(unittest.TestCase):
             self.assertFalse(store.durability.independent)
             self.assertEqual(store.durability.receipt_kind, "local")
 
-    def test_independence_is_configured_explicitly_and_changes_the_receipt_kind(self) -> None:
+    def test_independence_is_configured_explicitly_and_changes_the_receipt_kind(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            store = LocalObjectStore(Path(directory) / "archive", durability=INDEPENDENT)
+            store = LocalObjectStore(
+                Path(directory) / "archive", durability=INDEPENDENT
+            )
             self.assertTrue(store.durability.independent)
             self.assertEqual(store.durability.receipt_kind, "production")
 

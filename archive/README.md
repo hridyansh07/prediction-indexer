@@ -10,19 +10,20 @@ committed canonical-ingestion receipt.
 ## Layout and flow
 
 ```text
-archiver/  service.py, canonical.py, manifest.py, cli.py
+archiver/  service.py, canonical.py, manifest.py, publish.py, cli.py
            raw seal -> objects + receipt + manifest; canonical receipt -> objects + receipt
 reaper/    service.py, cli.py                dual-receipt raw audit/deletion decision
            canonical.py, canonical_cli.py    18-hour canonical frame reaper
-storage/   base.py, local.py, s3.py, factory.py
+storage/   base.py, factory.py      provider-neutral contract and configuration
+           local.py, s3.py, gcs.py  provider adapters
 common/    durable.py, receipts.py, seal.py, verify.py
 stream.py  verified archive objects -> replay ByteStreamer boundary
 ```
 
 Input must be a final `.ndjson` segment with its valid `.seal.json` commit
 marker; open or unsealed data is ineligible. Install the project package and
-Python dependencies first. S3 operation additionally requires `boto3`/botocore
-(included by the project install): `.venv/bin/python -m pip install -e .`.
+Python dependencies first. S3 and GCS dependencies are included by the project
+install: `.venv/bin/python -m pip install -e .`.
 
 ## Production S3 prerequisites
 
@@ -73,6 +74,28 @@ Direct project-root invocation is:
   --s3-region "$ARCHIVE_S3_REGION" --s3-expected-owner "$ARCHIVE_S3_EXPECTED_OWNER"
 ```
 
+## Production GCS prerequisites
+
+GCS does not provide server-side SHA-256. The native adapter calculates SHA-256
+while streaming a CRC32C-checked upload and attaches that identity to the
+object. Receipt verification then streams the exact generation once to prove
+the metadata against its bytes. See
+[`GCS_RAW_ARCHIVE_ADAPTER_V1.md`](GCS_RAW_ARCHIVE_ADAPTER_V1.md)
+for the complete integrity, IAM, bucket, and rollout contract.
+
+On GCE, use a dedicated attached service account with only
+`storage.objects.create`, `storage.objects.get`, and `storage.objects.list` on
+the archive bucket. Do not grant object deletion. The client uses Application
+Default Credentials; no GCP credential belongs in `.env`.
+
+Direct project-root invocation is:
+
+```bash
+.venv/bin/python -m archive.archiver.cli --spool-root data/spool \
+  --canonical-root data/canonical \
+  --archive-backend gcs --gcs-bucket "$ARCHIVE_GCS_BUCKET"
+```
+
 Objects are stored as
 `raw/lane=<lane>/date=<date>/<segment>.{ndjson.zst,seal.json}`. Beside each local
 segment, `.archive.json` is production verification authority; local conformance
@@ -98,21 +121,28 @@ remain as the finalizer's restart/watermark tombstone. Run one audit sweep with:
 docker compose --profile ops run --rm canonical-reaper-once
 ```
 
-After the S3 rollout has soaked and audit reports the expected reapable count,
+After the selected cloud-backend rollout has soaked and audit reports the
+expected reapable count,
 set `CANONICAL_REAPER_MODE=delete`; the 18-hour floor may be raised but not
 lowered.
 
 ## Streaming archived segments to replay
 
-`ArchivedSegmentByteStreamer` implements replay's structural `ByteStreamer`
-contract (`object_keys`, `iter_bytes`) without making replay aware of S3 or
-Zstandard. Supply validated archive receipts from the local spool; the adapter
-re-verifies their objects, stages each compressed segment, performs the strict
-single-frame decode, and yields exact `.ndjson` bytes only after stored and
-logical identities pass. Seal objects are likewise fully staged and verified
-before exposure.
+Archive retrieval uses one provider-neutral verified stream. The selected store
+adapter checks receipt SHA-256, length, provider checksum, content metadata, and
+immutable generation/version while downloading each selected object once.
+Plain objects and strict single-frame Zstandard decodes stay private until the
+complete stored and logical identities pass, then implement replay's structural
+`ByteStreamer` contract (`object_keys`, `iter_bytes`).
 
-The caller supplies receipts because they are the archive commit markers. S3
+`ArchivedSegmentByteStreamer` exposes raw NDJSON and seals.
+`ArchivedCanonicalByteStreamer` exposes decoded canonical evidence and
+provenance plus exact `receipt.json`. `ArchivedTargeterRunByteStreamer` exposes
+every receipted Targeter run artifact, while `ArchivedTargetRecordByteStreamer`
+retains the capture-window-specific target-record view. Replay remains unaware
+of S3, GCS, receipts, and Zstandard.
+
+The caller supplies receipts because they are the archive commit markers. Cloud
 prefix listings and daily manifests are not accepted as substitutes. Storage
 prefixes are removed from logical keys, so for example
 `raw/lane=kalshi/date=2026-07-30/a.ndjson.zst` appears to replay as
@@ -136,7 +166,8 @@ controls.
 
 1. Implement `storage.base.ObjectStore` in a new adapter using immutable,
    conditional publication and bounded streaming reads.
-2. Return provider-verified SHA-256 metadata and declare durability explicitly.
+2. Return SHA-256 verified from actual provider bytes, separate provider
+   checksum evidence, and an explicit durability declaration.
 3. Preserve key normalization, identity checks, errors, and no-delete behavior.
 4. Add one import/selection branch in `storage/factory.py` and export the adapter
    intentionally from `storage/__init__.py`.
@@ -144,5 +175,6 @@ controls.
    crash-boundary, and deployment tests.
 
 Normative detail: [raw archive/reaper spec](PHASE_4_RAW_ARCHIVE_REAPER_V1.md),
-[S3 adapter spec](S3_RAW_ARCHIVE_ADAPTER_V1.md), and
+[S3 adapter spec](S3_RAW_ARCHIVE_ADAPTER_V1.md),
+[GCS adapter spec](GCS_RAW_ARCHIVE_ADAPTER_V1.md), and
 [deployment guide](../docs/DEPLOYMENT.md).

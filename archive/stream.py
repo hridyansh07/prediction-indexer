@@ -9,24 +9,23 @@ from a local directory without learning about S3, receipts, or Zstandard.
 
 from __future__ import annotations
 
-import hashlib
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
 from archive.common.receipts import ArchiveReceipt
-from archive.common.verify import decode_archived_segment, verify_archive
-from archive.storage.base import ObjectStore, VerificationFailure, normalize_key
+from archive.retrieval import ArchivedObject, ArchivedObjectByteStreamer
+from archive.storage.base import (
+    JSON_CONTENT_TYPE,
+    NDJSON_CONTENT_TYPE,
+    ZSTD_CONTENT_ENCODING,
+    ObjectExpectation,
+    ObjectStore,
+    VerificationFailure,
+    normalize_key,
+)
 from encoder import DEFAULT_BUFFER_BYTES
 
 __all__ = ["ArchivedSegmentByteStreamer"]
-
-
-@dataclass(frozen=True)
-class _ArchivedObject:
-    receipt: ArchiveReceipt
-    kind: str
 
 
 class ArchivedSegmentByteStreamer:
@@ -54,58 +53,76 @@ class ArchivedSegmentByteStreamer:
         self.store = store
         self.temp_root = Path(temp_root) if temp_root is not None else None
         self.chunk_size = int(chunk_size)
-        self._objects: dict[str, _ArchivedObject] = {}
+        self._objects: dict[str, ArchivedObject] = {}
         for receipt in receipts:
-            self._add(receipt, "data", _logical_key(receipt.data_key, receipt.source_file))
-            self._add(receipt, "seal", _logical_key(receipt.seal_key, receipt.seal_file))
+            self._validate_store(receipt)
+            self._add(
+                ArchivedObject(
+                    _logical_key(receipt.data_key, receipt.source_file),
+                    ObjectExpectation(
+                        receipt.data_key,
+                        receipt.data_stored,
+                        receipt.provider_checksum,
+                        receipt.provider_checksum_algorithm,
+                        NDJSON_CONTENT_TYPE,
+                        ZSTD_CONTENT_ENCODING,
+                    ),
+                    receipt.source,
+                )
+            )
+            self._add(
+                ArchivedObject(
+                    _logical_key(receipt.seal_key, receipt.seal_file),
+                    ObjectExpectation(
+                        receipt.seal_key,
+                        receipt.seal_stored,
+                        receipt.seal_provider_checksum,
+                        receipt.seal_provider_checksum_algorithm,
+                        JSON_CONTENT_TYPE,
+                        None,
+                    ),
+                )
+            )
+        self._streamer = ArchivedObjectByteStreamer(
+            store,
+            self._objects.values(),
+            temp_root=self.temp_root,
+            chunk_size=self.chunk_size,
+        )
 
     def object_keys(self) -> tuple[str, ...]:
-        return tuple(sorted(self._objects))
+        return self._streamer.object_keys()
 
     def iter_bytes(self, key: str) -> Iterator[bytes]:
         try:
-            archived = self._objects[key]
-        except KeyError as error:
-            raise VerificationFailure(f"unknown archived replay object key: {key}") from error
+            yield from self._streamer.iter_bytes(key)
+        except VerificationFailure as error:
+            if "unknown archived object key" in str(error):
+                raise VerificationFailure(
+                    f"unknown archived replay object key: {key}"
+                ) from error
+            raise
 
-        with tempfile.TemporaryDirectory(
-            prefix="archive-replay-",
-            dir=self.temp_root,
-        ) as directory:
-            staged = Path(directory) / Path(key).name
-            if archived.kind == "data":
-                decode_archived_segment(self.store, archived.receipt, staged)
-            else:
-                self._stage_seal(archived.receipt, staged)
+    def _add(self, item: ArchivedObject) -> None:
+        if item.logical_key in self._objects:
+            raise ValueError(
+                f"duplicate archived replay object key: {item.logical_key}"
+            )
+        self._objects[item.logical_key] = item
 
-            with staged.open("rb") as source:
-                while chunk := source.read(self.chunk_size):
-                    yield chunk
-
-    def _add(self, receipt: ArchiveReceipt, kind: str, key: str) -> None:
-        if key in self._objects:
-            raise ValueError(f"duplicate archived replay object key: {key}")
-        self._objects[key] = _ArchivedObject(receipt=receipt, kind=kind)
-
-    def _stage_seal(self, receipt: ArchiveReceipt, destination: Path) -> None:
-        verify_archive(self.store, receipt)
-        digest = hashlib.sha256()
-        byte_length = 0
-        with self.store.open(
-            receipt.seal_key,
-            max_bytes=receipt.seal_stored.byte_length,
-        ) as source, destination.open("xb") as sink:
-            while chunk := source.read(self.chunk_size):
-                sink.write(chunk)
-                digest.update(chunk)
-                byte_length += len(chunk)
-        if (
-            byte_length != receipt.seal_stored.byte_length
-            or digest.hexdigest() != receipt.seal_stored.sha256
-        ):
-            destination.unlink(missing_ok=True)
+    def _validate_store(self, receipt: ArchiveReceipt) -> None:
+        if receipt.location != self.store.store_id:
             raise VerificationFailure(
-                f"archived seal {receipt.seal_key} disagrees with its receipt identity"
+                f"archive receipt names {receipt.location!r}, not {self.store.store_id!r}"
+            )
+        if (
+            receipt.is_production
+            and receipt.provider is not None
+            and receipt.provider != self.store.provider
+        ):
+            raise VerificationFailure(
+                f"archive receipt names provider {receipt.provider!r}, not "
+                f"{self.store.provider!r}"
             )
 
 

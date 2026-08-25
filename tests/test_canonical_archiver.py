@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from archive import ArchivedCanonicalByteStreamer
 from archive.archiver.canonical import (
     ARCHIVED,
     FAILED,
@@ -32,7 +33,9 @@ class CanonicalArchiverCase(unittest.TestCase):
         self.source_receipt = write_canonical_receipt(self.canonical, evidence_lines=2)
         options = {} if self.durability is None else {"durability": self.durability}
         self.store = LocalObjectStore(self.root / "archive", **options)
-        self.archiver = CanonicalArchiver(self.canonical, self.store, now_ns=lambda: 123)
+        self.archiver = CanonicalArchiver(
+            self.canonical, self.store, now_ns=lambda: 123
+        )
 
     @property
     def archive_receipt(self) -> Path:
@@ -43,14 +46,20 @@ class CanonicalArchiverCase(unittest.TestCase):
         )
         return self.source_receipt.with_name(suffix)
 
-    def test_committed_window_archives_existing_zstd_outputs_and_receipt_last(self) -> None:
+    def test_committed_window_archives_existing_zstd_outputs_and_receipt_last(
+        self,
+    ) -> None:
         result = self.archiver.sweep()
         self.assertEqual(result.counts["archived"], 1, result.as_record())
 
         receipt = read_canonical_archive_receipt(self.archive_receipt)
         keys = canonical_object_keys(self.source_receipt)
         self.assertEqual(
-            (receipt.evidence.key, receipt.provenance.key, receipt.canonical_receipt.key),
+            (
+                receipt.evidence.key,
+                receipt.provenance.key,
+                receipt.canonical_receipt.key,
+            ),
             keys,
         )
         self.assertEqual(receipt.verified_at_ns, 123)
@@ -66,6 +75,35 @@ class CanonicalArchiverCase(unittest.TestCase):
         with self.store.open(keys[2]) as archived_receipt:
             self.assertEqual(archived_receipt.read(), self.source_receipt.read_bytes())
 
+    def test_retrieves_canonical_evidence_provenance_and_receipt(self) -> None:
+        self.archiver.sweep()
+        receipt = read_canonical_archive_receipt(self.archive_receipt)
+        streamer = ArchivedCanonicalByteStreamer(
+            self.store, (receipt,), temp_root=self.root, chunk_size=7
+        )
+        evidence_key = next(
+            key for key in streamer.object_keys() if key.endswith("/evidence.ndjson")
+        )
+        provenance_key = next(
+            key for key in streamer.object_keys() if key.endswith("/provenance.ndjson")
+        )
+        receipt_key = next(
+            key for key in streamer.object_keys() if key.endswith("/receipt.json")
+        )
+
+        self.assertEqual(
+            b"".join(streamer.iter_bytes(evidence_key)),
+            b'{"canonical":0}\n{"canonical":1}\n',
+        )
+        self.assertEqual(
+            b"".join(streamer.iter_bytes(provenance_key)),
+            b'{"canonical_seq":1}\n{"canonical_seq":2}\n',
+        )
+        self.assertEqual(
+            b"".join(streamer.iter_bytes(receipt_key)),
+            self.source_receipt.read_bytes(),
+        )
+
     def test_corrupt_zstd_is_rejected_before_any_archive_receipt(self) -> None:
         evidence = self.source_receipt.with_name("evidence.ndjson.zst")
         evidence.write_bytes(evidence.read_bytes()[:-1])
@@ -73,7 +111,9 @@ class CanonicalArchiverCase(unittest.TestCase):
         self.assertEqual(outcome.status, FAILED)
         self.assertFalse(self.archive_receipt.exists())
 
-    def test_existing_receipt_is_idempotent_only_after_remote_reverification(self) -> None:
+    def test_existing_receipt_is_idempotent_only_after_remote_reverification(
+        self,
+    ) -> None:
         self.archiver.sweep()
         before = self.archive_receipt.read_bytes()
         result = self.archiver.sweep()
@@ -90,7 +130,9 @@ class CanonicalArchiverCase(unittest.TestCase):
             def put_immutable(self, key, reader, expected_identity, **kwargs):
                 if key.endswith("/receipt.json"):
                     raise ObjectStoreError("receipt upload failed")
-                return self.inner.put_immutable(key, reader, expected_identity, **kwargs)
+                return self.inner.put_immutable(
+                    key, reader, expected_identity, **kwargs
+                )
 
             def head(self, key):
                 return self.inner.head(key)
@@ -109,14 +151,23 @@ class CanonicalArchiverCase(unittest.TestCase):
 class ProductionCanonicalArchiverTests(CanonicalArchiverCase):
     durability = INDEPENDENT
 
-    def test_production_receipt_records_provider_checksums_for_all_objects(self) -> None:
+    def test_production_receipt_records_provider_checksums_for_all_objects(
+        self,
+    ) -> None:
         self.archiver.sweep()
         document = json.loads(self.archive_receipt.read_text(encoding="utf-8"))
-        self.assertEqual(document["canonical_archive_receipt_version"], 1)
+        self.assertEqual(document["canonical_archive_receipt_version"], 2)
         self.assertNotIn("local_canonical_archive_receipt_version", document)
+        self.assertEqual(
+            document["store"],
+            {
+                "provider": self.store.provider,
+                "location": self.store.store_id,
+            },
+        )
         for field in ("evidence", "provenance", "canonical_receipt"):
-            self.assertEqual(document[field]["bucket"], self.store.store_id)
-            self.assertTrue(document[field]["s3_checksum_sha256"])
+            self.assertTrue(document[field]["provider_checksum"])
+            self.assertTrue(document[field]["provider_checksum_algorithm"])
 
 
 class CanonicalArchivalThroughS3Tests(unittest.TestCase):

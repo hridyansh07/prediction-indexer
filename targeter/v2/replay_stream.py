@@ -2,34 +2,28 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Iterable, Iterator
+from typing import Iterable, Iterator
 
+from archive.retrieval import ArchivedObject, ArchivedObjectByteStreamer, verify_object
 from archive.storage.base import (
     NDJSON_CONTENT_TYPE,
+    ObjectExpectation,
     ObjectStore,
     VerificationFailure,
 )
-from encoder import (
-    DEFAULT_BUFFER_BYTES,
-    LogicalIdentity,
-    StoredIdentity,
-    decode_stream,
-)
+from encoder import DEFAULT_BUFFER_BYTES
 from targeter.v2.models import SUPPORTED_VENUES
 from targeter.v2.run_archive import (
     ArchivedRunObject,
     RunArchiveReceipt,
     parse_run_id_ns,
-    verify_run_archive_objects,
 )
 
 __all__ = [
+    "ArchivedTargeterRunByteStreamer",
     "ArchivedTargetRecordByteStreamer",
     "RunReceiptSelection",
     "RunReceiptSelectionError",
@@ -49,12 +43,6 @@ class RunReceiptSelection:
     @property
     def receipts(self) -> tuple[RunArchiveReceipt, ...]:
         return (self.predecessor, *self.in_window)
-
-
-@dataclass(frozen=True)
-class _TargetRecordObject:
-    receipt: RunArchiveReceipt
-    archived: ArchivedRunObject
 
 
 def select_run_receipts(
@@ -99,6 +87,56 @@ def select_run_receipts(
     return RunReceiptSelection(predecessor=predecessor, in_window=in_window)
 
 
+class ArchivedTargeterRunByteStreamer:
+    """Every receipt-owned artifact from one or more complete Targeter runs."""
+
+    def __init__(
+        self,
+        store: ObjectStore,
+        receipts: Iterable[RunArchiveReceipt],
+        *,
+        temp_root: Path | None = None,
+        chunk_size: int = DEFAULT_BUFFER_BYTES,
+    ) -> None:
+        self.store = store
+        objects: list[ArchivedObject] = []
+        self._manifests: dict[str, ObjectExpectation] = {}
+        self._expectations: dict[str, ObjectExpectation] = {}
+        for receipt in receipts:
+            _validate_receipt(store, receipt)
+            manifest = _expectation(receipt.manifest)
+            for item in receipt.objects:
+                logical_key = _logical_key(item)
+                if logical_key in self._manifests:
+                    raise ValueError(
+                        f"duplicate archived Targeter run key: {logical_key}"
+                    )
+                self._manifests[logical_key] = manifest
+                expected = _expectation(item)
+                self._expectations[logical_key] = expected
+                objects.append(ArchivedObject(logical_key, expected, item.logical))
+        self._streamer = ArchivedObjectByteStreamer(
+            store,
+            objects,
+            temp_root=temp_root,
+            chunk_size=chunk_size,
+        )
+
+    def object_keys(self) -> tuple[str, ...]:
+        return self._streamer.object_keys()
+
+    def iter_bytes(self, key: str) -> Iterator[bytes]:
+        try:
+            manifest = self._manifests[key]
+        except KeyError as error:
+            raise VerificationFailure(
+                f"unknown archived Targeter run object key: {key}"
+            ) from error
+        if manifest.key != self._expectations[key].key:
+            verify_object(self.store, manifest)
+        yield from self._streamer.iter_bytes(key)
+
+
 class ArchivedTargetRecordByteStreamer:
     """Verified target-record artifacts for one capture window.
 
@@ -128,148 +166,98 @@ class ArchivedTargetRecordByteStreamer:
             start_ns=start_ns,
             end_ns=end_ns,
         )
-        self._objects: dict[str, _TargetRecordObject] = {}
+        self._runs = ArchivedTargeterRunByteStreamer(
+            store,
+            self.selection.receipts,
+            temp_root=self.temp_root,
+            chunk_size=self.chunk_size,
+        )
+        keys: set[str] = set()
         for receipt in self.selection.receipts:
-            self._add_receipt(receipt)
-        self._keys = tuple(sorted(self._objects))
+            expected_names = {
+                f"target_records_{venue}.ndjson" for venue in SUPPORTED_VENUES
+            } | {f"target_records_{venue}.ndjson.zst" for venue in SUPPORTED_VENUES}
+            for archived in receipt.objects:
+                if archived.file not in expected_names:
+                    continue
+                _validate_target_record(receipt, archived)
+                logical_key = _logical_key(archived)
+                if logical_key in keys:
+                    raise ValueError(
+                        f"duplicate archived target-record key: {logical_key}"
+                    )
+                keys.add(logical_key)
+        self._keys = tuple(sorted(keys))
 
     def object_keys(self) -> tuple[str, ...]:
         return self._keys
 
     def iter_bytes(self, key: str) -> Iterator[bytes]:
-        try:
-            selected = self._objects[key]
-        except KeyError as error:
+        if key not in self._keys:
             raise VerificationFailure(
                 f"unknown archived target-record object key: {key}"
-            ) from error
+            )
+        yield from self._runs.iter_bytes(key)
 
-        verify_run_archive_objects(
-            self.store,
-            selected.receipt,
-            (selected.receipt.manifest, selected.archived),
+
+def _validate_receipt(store: ObjectStore, receipt: RunArchiveReceipt) -> None:
+    if not receipt.is_production:
+        raise VerificationFailure(
+            f"Targeter retrieval requires a production run receipt: {receipt.path}"
         )
-        with tempfile.TemporaryDirectory(
-            prefix="target-record-replay-",
-            dir=self.temp_root,
-        ) as directory:
-            staged = Path(directory) / Path(key).name
-            if selected.archived.content_encoding == "zstd":
-                self._decode(selected.archived, staged)
-            else:
-                self._copy_plain(selected.archived, staged)
-            with staged.open("rb") as source:
-                while chunk := source.read(self.chunk_size):
-                    yield chunk
-
-    def _add_receipt(self, receipt: RunArchiveReceipt) -> None:
-        if not receipt.is_production:
-            raise VerificationFailure(
-                f"target records require a production run receipt: {receipt.path}"
-            )
-        if receipt.location != self.store.store_id:
-            raise VerificationFailure(
-                f"run receipt {receipt.run_id} names {receipt.location!r}, not "
-                f"store {self.store.store_id!r}"
-            )
-        if not self.store.durability.independent:
-            raise VerificationFailure("target records require an independent archive store")
-        date = datetime.strptime(receipt.run_id[:8], "%Y%m%d").date()
-        expected_prefix = (
-            f"targeter-v2/runs/date={date.isoformat()}/run={receipt.run_id}"
+    if receipt.location != store.store_id:
+        raise VerificationFailure(
+            f"run receipt {receipt.run_id} names {receipt.location!r}, not "
+            f"store {store.store_id!r}"
         )
-        if receipt.prefix != expected_prefix:
-            raise VerificationFailure(
-                f"run receipt {receipt.run_id} has unexpected prefix {receipt.prefix!r}"
-            )
-
-        expected_names = {
-            f"target_records_{venue}.ndjson" for venue in SUPPORTED_VENUES
-        } | {
-            f"target_records_{venue}.ndjson.zst" for venue in SUPPORTED_VENUES
-        }
-        for archived in receipt.objects:
-            if archived.file not in expected_names:
-                continue
-            if archived.key != f"{receipt.prefix}/{archived.file}":
-                raise VerificationFailure(
-                    f"target-record key disagrees with run prefix: {archived.key}"
-                )
-            if archived.logical is None:
-                raise VerificationFailure(
-                    f"target-record object lacks decoded identity: {archived.key}"
-                )
-            if archived.content_type != NDJSON_CONTENT_TYPE:
-                raise VerificationFailure(
-                    f"target-record object has wrong content type: {archived.key}"
-                )
-            logical_key = archived.key.removesuffix(".zst")
-            if logical_key in self._objects:
-                raise ValueError(f"duplicate archived target-record key: {logical_key}")
-            self._objects[logical_key] = _TargetRecordObject(receipt, archived)
-
-    def _decode(self, archived: ArchivedRunObject, destination: Path) -> None:
-        logical = _required_logical(archived)
-        with self.store.open(
-            archived.key,
-            max_bytes=archived.stored.byte_length,
-        ) as source, _private_file(destination) as sink:
-            decode_stream(
-                source,
-                sink,
-                expected_logical=logical,
-                expected_stored=archived.stored,
-                max_decoded_bytes=logical.byte_length,
-            )
-
-    def _copy_plain(self, archived: ArchivedRunObject, destination: Path) -> None:
-        logical = _required_logical(archived)
-        stored_digest = hashlib.sha256()
-        logical_digest = hashlib.sha256()
-        byte_length = 0
-        line_count = 0
-        with self.store.open(
-            archived.key,
-            max_bytes=archived.stored.byte_length,
-        ) as source, _private_file(destination) as sink:
-            while chunk := source.read(self.chunk_size):
-                _write_all(sink, chunk)
-                stored_digest.update(chunk)
-                logical_digest.update(chunk)
-                byte_length += len(chunk)
-                line_count += chunk.count(b"\n")
-        observed_stored = StoredIdentity(stored_digest.hexdigest(), byte_length)
-        observed_logical = LogicalIdentity(
-            logical_digest.hexdigest(), byte_length, line_count
+    if receipt.provider is not None and receipt.provider != store.provider:
+        raise VerificationFailure(
+            f"run receipt {receipt.run_id} names provider {receipt.provider!r}, not "
+            f"{store.provider!r}"
         )
-        if observed_stored != archived.stored or observed_logical != logical:
-            destination.unlink(missing_ok=True)
-            raise VerificationFailure(
-                f"plain target-record object disagrees with its receipt: {archived.key}"
-            )
+    if not store.durability.independent:
+        raise VerificationFailure(
+            "Targeter retrieval requires an independent archive store"
+        )
+    date = datetime.strptime(receipt.run_id[:8], "%Y%m%d").date()
+    expected_prefix = f"targeter-v2/runs/date={date.isoformat()}/run={receipt.run_id}"
+    if receipt.prefix != expected_prefix:
+        raise VerificationFailure(
+            f"run receipt {receipt.run_id} has unexpected prefix {receipt.prefix!r}"
+        )
 
 
-def _required_logical(archived: ArchivedRunObject) -> LogicalIdentity:
+def _validate_target_record(
+    receipt: RunArchiveReceipt, archived: ArchivedRunObject
+) -> None:
+    if archived.key != f"{receipt.prefix}/{archived.file}":
+        raise VerificationFailure(
+            f"target-record key disagrees with run prefix: {archived.key}"
+        )
     if archived.logical is None:
         raise VerificationFailure(
             f"target-record object lacks decoded identity: {archived.key}"
         )
-    return archived.logical
+    if archived.content_type != NDJSON_CONTENT_TYPE:
+        raise VerificationFailure(
+            f"target-record object has wrong content type: {archived.key}"
+        )
 
 
-def _private_file(path: Path) -> BinaryIO:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    return os.fdopen(descriptor, "wb")
+def _expectation(archived: ArchivedRunObject) -> ObjectExpectation:
+    return ObjectExpectation(
+        archived.key,
+        archived.stored,
+        archived.provider_checksum,
+        archived.provider_checksum_algorithm,
+        archived.content_type,
+        archived.content_encoding,
+    )
 
 
-def _write_all(sink: BinaryIO, chunk: bytes) -> None:
-    view = memoryview(chunk)
-    while view:
-        written = sink.write(view)
-        if written is None:
-            return
-        if written <= 0 or written > len(view):
-            raise VerificationFailure(
-                f"target-record staging write made invalid progress: {written}"
-            )
-        view = view[written:]
+def _logical_key(archived: ArchivedRunObject) -> str:
+    return (
+        archived.key.removesuffix(".zst")
+        if archived.content_encoding == "zstd"
+        else archived.key
+    )

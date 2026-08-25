@@ -3,6 +3,13 @@
 Status: **implemented**. This document specifies the smallest production
 S3 adapter for the Phase 4 raw archiver and reaper.
 
+The S3 request and checksum contract below remains current. Provider-neutral
+receipt version 2 and the shared `local`/`s3`/`gcs` factory supersede this
+document's original statements that production receipts are S3-only version 1.
+New S3 receipts identify `store.provider` as `s3`, use the bucket as
+`store.location`, and record `ChecksumSHA256` through the generic provider
+checksum fields. Strict readers retain the version 1 shape described here.
+
 This specification is subordinate to
 [`PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](PHASE_4_RAW_ARCHIVE_REAPER_V1.md) and
 [`ZSTD_MATERIALIZATION_PIPELINE_V1.md`](../encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md).
@@ -46,7 +53,8 @@ V1 does **not** add:
 - Object Lock;
 - automatic destructive reaper scheduling;
 - replay orchestration;
-- a new receipt version or a legacy reader.
+- a new receipt version or a legacy reader in the original S3 changeset (both
+  were added later for provider-neutral receipt version 2);
 
 The adapter targets an AWS S3 **general purpose bucket**. Directory buckets are
 out of scope because the conditional-write contract is different.
@@ -143,8 +151,8 @@ S3ObjectStore(
 Rules:
 
 - `bucket`, `region`, and the 12-digit `expected_bucket_owner` are required.
-- `store_id` is exactly `bucket`, because the current production receipt field
-  is named `bucket` and `Archiver` fills it from `store.store_id`.
+- `store_id` is exactly `bucket`; provider-neutral receipts persist it as the
+  store location.
 - Every S3 request includes `ExpectedBucketOwner`.
 - The default client is `boto3.client("s3", region_name=region)`.
 - Supplying `client` is only for unit tests; production configuration must not
@@ -572,7 +580,7 @@ Do not run the conflict test in a production prefix.
 
 - successful S3 archival writes `.archive.json`, never
   `.archive.local.json`;
-- receipt `bucket` is the configured S3 bucket;
+- receipt `store` is `{provider: "s3", location: <configured bucket>}`;
 - data and seal receipt identities come from fresh S3 heads;
 - upload, head, checksum, or metadata failure leaves raw, seal, and derivative
   intact and writes no receipt;

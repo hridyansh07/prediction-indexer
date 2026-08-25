@@ -14,7 +14,8 @@ import unittest
 from pathlib import Path
 
 from archive.storage import factory as store_factory
-from archive.storage import CONFORMANCE, INDEPENDENT, LocalObjectStore, S3ObjectStore
+from archive.storage import CONFORMANCE, INDEPENDENT, GCSObjectStore, LocalObjectStore, S3ObjectStore
+from archive.storage import gcs as gcs_store
 from archive.storage.factory import add_store_arguments, build_store
 
 
@@ -220,6 +221,43 @@ class S3BackendTests(FactoryCase):
         self.assertIsInstance(store, S3ObjectStore)
         self.assertEqual(store.store_id, "prediction-indexer-raw")
         self.assertEqual(store.durability, INDEPENDENT)
+
+
+class GCSBackendTests(FactoryCase):
+    def test_gcs_requires_a_bucket(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            build_store(self.parse("--archive-backend", "gcs"))
+        self.assertIn("--gcs-bucket", str(raised.exception))
+
+    def test_gcs_builds_an_independent_store_with_adc(self) -> None:
+        original = gcs_store._default_client
+        gcs_store._default_client = lambda: object()
+        try:
+            store = build_store(
+                self.parse(
+                    "--archive-backend", "gcs", "--gcs-bucket", "prediction-archive"
+                )
+            )
+        finally:
+            gcs_store._default_client = original
+        self.assertIsInstance(store, GCSObjectStore)
+        self.assertEqual(store.provider, "gcs")
+        self.assertEqual(store.store_id, "prediction-archive")
+        self.assertEqual(store.durability, INDEPENDENT)
+
+    def test_gcs_rejects_s3_configuration(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            build_store(
+                self.parse(
+                    "--archive-backend",
+                    "gcs",
+                    "--gcs-bucket",
+                    "prediction-archive",
+                    "--s3-bucket",
+                    "wrong-provider",
+                )
+            )
+        self.assertIn("cannot be combined", str(raised.exception))
 
 
 if __name__ == "__main__":

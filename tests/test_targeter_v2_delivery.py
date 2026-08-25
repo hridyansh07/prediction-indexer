@@ -242,7 +242,7 @@ class TargeterV2DeliveryTests(unittest.TestCase):
         before = manifest_path.read_bytes()
         receipt = archive_run(run_directory, self.store, now=NOW)
         self.assertEqual(manifest_path.read_bytes(), before)
-        self.assertEqual(receipt.document["targeter_run_archive_receipt_version"], 2)
+        self.assertEqual(receipt.document["targeter_run_archive_receipt_version"], 3)
         verify_run_archive(self.store, receipt)
 
     def _strip_target_records(self, run_directory: Path) -> dict:
