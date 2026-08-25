@@ -102,6 +102,23 @@ class _FailingManifestStore:
         return self.delegate.open(key, max_bytes=max_bytes)
 
 
+class _FailingVerificationStore:
+    def __init__(self, delegate: LocalObjectStore) -> None:
+        self.delegate = delegate
+        self.store_id = delegate.store_id
+        self.provider = delegate.provider
+        self.durability = delegate.durability
+
+    def put_immutable(self, key, reader, expected_identity, **kwargs):
+        return self.delegate.put_immutable(key, reader, expected_identity, **kwargs)
+
+    def head(self, key):
+        raise ObjectStoreError("injected post-upload verification failure")
+
+    def open(self, key, *, max_bytes=None):
+        return self.delegate.open(key, max_bytes=max_bytes)
+
+
 class TargeterV2DeliveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -350,6 +367,15 @@ class TargeterV2DeliveryTests(unittest.TestCase):
                 f"targeter-v2/runs/date={NOW:%Y-%m-%d}/run={run_directory.name}/run_manifest.json"
             )
         )
+
+    def test_failed_remote_verification_publishes_no_local_receipt(self) -> None:
+        run_directory = self.run_directory()
+        failing = _FailingVerificationStore(self.store)
+
+        with self.assertRaisesRegex(ObjectStoreError, "post-upload verification"):
+            archive_run(run_directory, failing, now=NOW)
+
+        self.assertFalse((run_directory / "archive_receipt.json").exists())
 
     def test_phase7_publishes_one_atomic_generation_consumable_by_every_splice(
         self,

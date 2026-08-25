@@ -21,7 +21,7 @@ x-targeter-v2-runtime: &targeter-v2-runtime
     - no-new-privileges:true
   stop_grace_period: 30s
   environment: &targeter-v2-archive-environment
-    ARCHIVE_BACKEND: "${TARGETER_ARCHIVE_BACKEND:-s3}"
+    ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
     ARCHIVE_ROOT: /var/lib/prediction-archive
     ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
     ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"

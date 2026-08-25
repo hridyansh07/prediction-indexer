@@ -658,9 +658,9 @@ def archive_run(
         document["store"] = {"provider": store.provider, "location": store.store_id}
     else:
         document["store"] = store.store_id
-    write_json_durable(receipt_path, document)
     receipt = parse_run_archive_receipt(document, path=receipt_path)
     verify_run_archive(store, receipt)
+    write_json_durable(receipt_path, document)
     return receipt
 
 

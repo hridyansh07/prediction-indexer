@@ -74,15 +74,10 @@ ARCHIVE_BACKEND=gcs
 ARCHIVE_GCS_BUCKET=my-dedicated-archive-bucket
 ```
 
-For Targeter v2, also set:
-
-```dotenv
-TARGETER_ARCHIVE_BACKEND=gcs
-```
-
 `ARCHIVE_GCS_BUCKET` is required for `gcs` and rejected for `local` or `s3`.
 S3 options are likewise rejected when GCS is selected. The bucket name is the
-store location persisted in provider-neutral production receipts.
+store location persisted in provider-neutral production receipts. The same
+`ARCHIVE_BACKEND` configures raw, canonical, and Targeter archive consumers.
 
 The client uses Application Default Credentials. On Compute Engine, attach a
 dedicated service account to the VM. Outside GCP, prefer Workload Identity

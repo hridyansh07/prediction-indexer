@@ -95,6 +95,8 @@ class TargeterV2DeploymentTests(unittest.TestCase):
     def test_archive_provider_configuration_is_environment_only(self) -> None:
         document = self.override_path.read_text(encoding="utf-8")
         self.assertIn("environment: &targeter-v2-archive-environment", document)
+        self.assertIn('ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"', document)
+        self.assertNotIn("TARGETER_ARCHIVE_BACKEND", document)
         for variable in (
             "ARCHIVE_BACKEND",
             "ARCHIVE_ROOT",

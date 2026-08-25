@@ -194,9 +194,10 @@ docker compose -f compose.yaml -f compose.targeter-v2.yaml up --no-deps -d \
 ```
 
 Add `--profile kalshi splice-kalshi` only on a host with working Kalshi
-credentials. Production publication defaults to S3, but native GCS is selected
-with `TARGETER_ARCHIVE_BACKEND=gcs` and `ARCHIVE_GCS_BUCKET`. GCS uses
-Application Default Credentials; on GCE, prefer an attached service account.
+credentials. Targeter uses the same `ARCHIVE_BACKEND` as raw and canonical
+archival; select native GCS with `ARCHIVE_BACKEND=gcs` and
+`ARCHIVE_GCS_BUCKET`. GCS uses Application Default Credentials; on GCE, prefer
+an attached service account.
 The provider-neutral Targeter production run receipt is version 3 and records
 the store provider/location plus each object's provider checksum. GCS CRC32C is
 not treated as SHA-256: the shared GCS adapter recomputes SHA-256 from a complete
