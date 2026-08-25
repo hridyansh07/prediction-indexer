@@ -5,6 +5,7 @@ deletion), ``storage`` (provider adapters), and ``common`` (shared evidence
 validation and durable filesystem primitives).
 """
 
+from archive.canonical_stream import ArchivedCanonicalByteStreamer
 from archive.stream import ArchivedSegmentByteStreamer
 
-__all__ = ["ArchivedSegmentByteStreamer"]
+__all__ = ["ArchivedCanonicalByteStreamer", "ArchivedSegmentByteStreamer"]

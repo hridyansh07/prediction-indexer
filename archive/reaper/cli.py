@@ -2,20 +2,19 @@
 """Delete local raw segments that two receipts prove are safe to delete.
 
 ```sh
+ARCHIVE_BACKEND=local ARCHIVE_ROOT=/var/lib/prediction-archive \
 python -m archive.reaper.cli --spool-root     /var/lib/prediction-indexer/spool \
-                             --canonical-root /var/lib/prediction-indexer/canonical \
-                             --archive-root   /var/lib/prediction-archive
+                             --canonical-root /var/lib/prediction-indexer/canonical
 ```
 
-Or, against an S3 backend, with `--archive-backend s3` in place of `--archive-root`
-and `--archive-durability` (both commands share `archive/storage/factory.py`'s
-reading of `--archive-backend local|s3`; see `run_archiver.py`).
+Both archive commands share `archive/storage/factory.py`'s reading of
+`ARCHIVE_BACKEND` and its provider-specific environment values.
 
 **Audit mode is the default and stays the default.** Installing this code does
 not make raw deletion active. Deleting requires all of:
 
 ```text
---archive-durability independent   the archive is a separate durability domain
+ARCHIVE_DURABILITY=independent     the archive is a separate durability domain
 --mode delete                      the operator explicitly enabled deletion
 ```
 
@@ -41,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from archive.reaper import AUDIT_MODE, RETAINED, Reaper  # noqa: E402
 from archive.common.durable import write_json_durable  # noqa: E402
-from archive.storage.factory import add_store_arguments, build_store  # noqa: E402
+from archive.storage.factory import build_store  # noqa: E402
 
 EXIT_OK = 0
 EXIT_RETAINED_FAULT = 1
@@ -52,7 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--spool-root", required=True, type=Path)
     parser.add_argument("--canonical-root", required=True, type=Path)
-    add_store_arguments(parser)
     parser.add_argument(
         "--delete",
         action="store_true",
@@ -71,7 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"run continuously, sweeping every N seconds (recommended {DEFAULT_INTERVAL_SECONDS})",
     )
-    parser.add_argument("--report", type=Path, default=None, help="write decisions as JSON")
+    parser.add_argument(
+        "--report", type=Path, default=None, help="write decisions as JSON"
+    )
     return parser
 
 
@@ -113,7 +113,8 @@ def sweep_once(arguments: argparse.Namespace, store) -> int:
     unverifiable = [
         decision
         for decision in faults
-        if decision.reason in ("archive_receipt_invalid", "archive_object_unverified", "io_error")
+        if decision.reason
+        in ("archive_receipt_invalid", "archive_object_unverified", "io_error")
     ]
     if unverifiable or result.canonical_faults:
         return EXIT_RETAINED_FAULT
@@ -125,8 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.interval_seconds is not None and arguments.interval_seconds <= 0:
         raise SystemExit("--interval-seconds must be positive")
     if arguments.delete and arguments.mode != "audit":
-        raise SystemExit("--delete is a compatibility alias; do not combine it with --mode delete")
-    store = build_store(arguments)
+        raise SystemExit(
+            "--delete is a compatibility alias; do not combine it with --mode delete"
+        )
+    store = build_store((arguments.spool_root, arguments.canonical_root))
 
     if arguments.interval_seconds is None:
         return sweep_once(arguments, store)

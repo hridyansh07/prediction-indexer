@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +23,11 @@ from archive.reaper import cli as run_reaper
 from archive.archiver import Archiver
 from archive.storage.local import LocalObjectStore
 from encoder import stored_identity_of
-from tests.archive_fixtures import canonical_input_for, write_canonical_receipt, write_sealed_segment
+from tests.archive_fixtures import (
+    canonical_input_for,
+    write_canonical_receipt,
+    write_sealed_segment,
+)
 
 
 def run(main, arguments: list[str]) -> tuple[int, dict]:
@@ -42,14 +47,29 @@ class CommandCase(unittest.TestCase):
         self.canonical = self.root / "canonical"
         self.archive_root = self.root / "archive"
         self.segment = write_sealed_segment(self.spool)
-        self.seal = self.segment.with_name(self.segment.name[: -len(".ndjson")] + ".seal.json")
+        self.seal = self.segment.with_name(
+            self.segment.name[: -len(".ndjson")] + ".seal.json"
+        )
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "ARCHIVE_BACKEND": "local",
+                "ARCHIVE_ROOT": str(self.archive_root),
+                "ARCHIVE_DURABILITY": "conformance",
+                "ARCHIVE_STORE_ID": "local-archive",
+                "ARCHIVE_S3_BUCKET": "",
+                "ARCHIVE_S3_REGION": "",
+                "ARCHIVE_S3_EXPECTED_OWNER": "",
+                "ARCHIVE_GCS_BUCKET": "",
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def archiver_arguments(self, *extra: str) -> list[str]:
         return [
             "--spool-root",
             str(self.spool),
-            "--archive-root",
-            str(self.archive_root),
             *extra,
         ]
 
@@ -59,13 +79,31 @@ class CommandCase(unittest.TestCase):
             str(self.spool),
             "--canonical-root",
             str(self.canonical),
-            "--archive-root",
-            str(self.archive_root),
             *extra,
         ]
 
 
 class ArchiverCommandTests(CommandCase):
+    def test_provider_configuration_is_not_a_command_argument(self) -> None:
+        options = {
+            option
+            for action in run_archiver.build_parser()._actions
+            for option in action.option_strings
+        }
+        self.assertFalse(
+            options
+            & {
+                "--archive-backend",
+                "--archive-root",
+                "--archive-durability",
+                "--store-id",
+                "--s3-bucket",
+                "--s3-region",
+                "--s3-expected-owner",
+                "--gcs-bucket",
+            }
+        )
+
     def test_interval_must_be_positive(self) -> None:
         with self.assertRaisesRegex(SystemExit, "must be positive"):
             run(run_archiver.main, self.archiver_arguments("--interval-seconds", "0"))
@@ -101,13 +139,16 @@ class ArchiverCommandTests(CommandCase):
     def test_the_sweep_writes_daily_manifests_when_asked(self) -> None:
         manifests = self.root / "manifests"
         status, record = run(
-            run_archiver.main, self.archiver_arguments("--manifest-root", str(manifests))
+            run_archiver.main,
+            self.archiver_arguments("--manifest-root", str(manifests)),
         )
         self.assertEqual(status, run_archiver.EXIT_OK)
         # A conformance archive produces conformance receipts, so its manifest
         # is a catalog over a test archive and says so.
         manifest = json.loads(
-            (manifests / "date=2026-07-30" / "manifest.json").read_text(encoding="utf-8")
+            (manifests / "date=2026-07-30" / "manifest.json").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertEqual(manifest["receipt_kind"], "local")
         self.assertFalse(manifest["authorizes_deletion"])
@@ -127,36 +168,65 @@ class ArchiverCommandTests(CommandCase):
 
         data_key, _ = object_keys(read_sealed_segment("polymarket", self.segment))
         store.put_immutable(
-            data_key, io.BytesIO(b"squatter"), stored_identity_of(io.BytesIO(b"squatter"))
+            data_key,
+            io.BytesIO(b"squatter"),
+            stored_identity_of(io.BytesIO(b"squatter")),
         )
         status, record = run(run_archiver.main, self.archiver_arguments())
         self.assertEqual(status, run_archiver.EXIT_CONFLICT)
         self.assertIsNotNone(record["halted"])
 
-    def test_independence_is_refused_when_the_archive_shares_the_capture_disk(self) -> None:
+    def test_independence_is_refused_when_the_archive_shares_the_capture_disk(
+        self,
+    ) -> None:
         """Invariant 7, as a `st_dev` comparison rather than a promise."""
-        with self.assertRaises(SystemExit) as raised:
-            run(run_archiver.main, self.archiver_arguments("--archive-durability", "independent"))
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_DURABILITY": "independent"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run(run_archiver.main, self.archiver_arguments())
         self.assertIn("same filesystem", str(raised.exception))
 
-    def test_the_s3_backend_requires_its_fields_through_the_real_cli(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
-            run(run_archiver.main, self.archiver_arguments("--archive-backend", "s3"))
-        self.assertIn("--s3-bucket", str(raised.exception))
+    def test_the_s3_backend_requires_its_environment(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "s3"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run(run_archiver.main, self.archiver_arguments())
+        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
 
-    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
-            run(run_archiver.main, self.archiver_arguments("--s3-bucket", "oops"))
-        self.assertIn("--s3-bucket", str(raised.exception))
+    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(
+        self,
+    ) -> None:
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_S3_BUCKET": "oops"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run(run_archiver.main, self.archiver_arguments())
+        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
 
 
 class ReaperCommandTests(CommandCase):
     def setUp(self) -> None:
         super().setUp()
         Archiver(self.spool, LocalObjectStore(self.archive_root)).sweep()
-        write_canonical_receipt(self.canonical, inputs=[canonical_input_for(self.segment)])
+        write_canonical_receipt(
+            self.canonical, inputs=[canonical_input_for(self.segment)]
+        )
 
-    def test_the_default_run_deletes_nothing_and_reports_the_durability_gate(self) -> None:
+    def test_provider_configuration_is_not_a_command_argument(self) -> None:
+        options = {
+            option
+            for action in run_reaper.build_parser()._actions
+            for option in action.option_strings
+        }
+        self.assertFalse(
+            options & {"--archive-backend", "--archive-root", "--s3-bucket"}
+        )
+
+    def test_the_default_run_deletes_nothing_and_reports_the_durability_gate(
+        self,
+    ) -> None:
         status, record = run(run_reaper.main, self.reaper_arguments())
         self.assertEqual(status, run_reaper.EXIT_OK)
         self.assertFalse(record["destructive"])
@@ -195,17 +265,22 @@ class ReaperCommandTests(CommandCase):
         with (
             mock.patch.object(run_reaper.signal, "signal", side_effect=install),
             mock.patch.object(run_reaper, "sweep_once", side_effect=sweep),
-            mock.patch.object(run_reaper.time, "monotonic", side_effect=[0.0, 2.0, 2.0]),
+            mock.patch.object(
+                run_reaper.time, "monotonic", side_effect=[0.0, 2.0, 2.0]
+            ),
         ):
             status = run_reaper.main(self.reaper_arguments("--interval-seconds", "1"))
         self.assertEqual(status, run_reaper.EXIT_OK)
         self.assertEqual(sweeps, 2)
 
     def test_delete_is_refused_when_the_archive_shares_the_capture_disk(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_DURABILITY": "independent"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
             run(
                 run_reaper.main,
-                self.reaper_arguments("--archive-durability", "independent", "--delete"),
+                self.reaper_arguments("--delete"),
             )
         self.assertIn("same filesystem", str(raised.exception))
         self.assertTrue(self.segment.exists())
@@ -218,14 +293,22 @@ class ReaperCommandTests(CommandCase):
         self.assertEqual(record["decisions"][0]["decision"], "retained")
 
     def test_the_s3_backend_requires_its_fields_through_the_real_cli(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
-            run(run_reaper.main, self.reaper_arguments("--archive-backend", "s3"))
-        self.assertIn("--s3-bucket", str(raised.exception))
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "s3"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run(run_reaper.main, self.reaper_arguments())
+        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
 
-    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
-            run(run_reaper.main, self.reaper_arguments("--s3-bucket", "oops"))
-        self.assertIn("--s3-bucket", str(raised.exception))
+    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(
+        self,
+    ) -> None:
+        with (
+            mock.patch.dict(os.environ, {"ARCHIVE_S3_BUCKET": "oops"}),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            run(run_reaper.main, self.reaper_arguments())
+        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
 
 
 if __name__ == "__main__":

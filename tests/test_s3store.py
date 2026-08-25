@@ -42,7 +42,9 @@ def identity(payload: bytes) -> StoredIdentity:
     return stored_identity_of(io.BytesIO(payload))
 
 
-def _client_error(operation: str, code: str, status: int, message: str | None = None) -> ClientError:
+def _client_error(
+    operation: str, code: str, status: int, message: str | None = None
+) -> ClientError:
     response = {
         "Error": {"Code": code, "Message": message or code},
         "ResponseMetadata": {"HTTPStatusCode": status},
@@ -109,11 +111,20 @@ class FakeS3Client:
 
     def _check_owner(self, expected_bucket_owner: str | None) -> None:
         if expected_bucket_owner != self.expected_bucket_owner:
-            raise _client_error("Request", "AccessDenied", 403, "wrong ExpectedBucketOwner")
+            raise _client_error(
+                "Request", "AccessDenied", 403, "wrong ExpectedBucketOwner"
+            )
 
     def head_object(self, *, Bucket, Key, ChecksumMode=None, ExpectedBucketOwner=None):
         self.calls.append(
-            ("head_object", {"Bucket": Bucket, "Key": Key, "ExpectedBucketOwner": ExpectedBucketOwner})
+            (
+                "head_object",
+                {
+                    "Bucket": Bucket,
+                    "Key": Key,
+                    "ExpectedBucketOwner": ExpectedBucketOwner,
+                },
+            )
         )
         self._check_owner(ExpectedBucketOwner)
         if Key in self.denied_keys:
@@ -164,14 +175,23 @@ class FakeS3Client:
         assert IfNoneMatch == "*", "put_immutable must always send IfNoneMatch=*"
         data = Body.read()
         if len(data) != ContentLength:
-            raise _client_error("PutObject", "IncompleteBody", 400, "declared length disagreed")
+            raise _client_error(
+                "PutObject", "IncompleteBody", 400, "declared length disagreed"
+            )
         if Key in self.conflicted_keys:
-            raise _client_error("PutObject", "ConditionalRequestConflict", 409, "conflict")
+            raise _client_error(
+                "PutObject", "ConditionalRequestConflict", 409, "conflict"
+            )
         if Key in self.objects:
             raise _client_error(
-                "PutObject", "PreconditionFailed", 412, "At least one pre-condition failed"
+                "PutObject",
+                "PreconditionFailed",
+                412,
+                "At least one pre-condition failed",
             )
-        actual_checksum = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
+        actual_checksum = base64.b64encode(hashlib.sha256(data).digest()).decode(
+            "ascii"
+        )
         if ChecksumSHA256 != actual_checksum:
             raise _client_error("PutObject", "BadDigest", 400, "checksum mismatch")
         self.objects[Key] = {
@@ -182,15 +202,36 @@ class FakeS3Client:
         }
         return {"ResponseMetadata": {"HTTPStatusCode": 200}, "ETag": '"deadbeef"'}
 
-    def get_object(self, *, Bucket, Key, ExpectedBucketOwner):
+    def get_object(self, *, Bucket, Key, ExpectedBucketOwner, ChecksumMode=None):
         self.calls.append(
-            ("get_object", {"Bucket": Bucket, "Key": Key, "ExpectedBucketOwner": ExpectedBucketOwner})
+            (
+                "get_object",
+                {
+                    "Bucket": Bucket,
+                    "Key": Key,
+                    "ChecksumMode": ChecksumMode,
+                    "ExpectedBucketOwner": ExpectedBucketOwner,
+                },
+            )
         )
         self._check_owner(ExpectedBucketOwner)
         obj = self.objects.get(Key)
         if obj is None:
             raise _client_error("GetObject", "NoSuchKey", 404, "Not Found")
-        return {"Body": _FakeStreamingBody(obj["bytes"]), "ContentLength": len(obj["bytes"])}
+        response = {
+            "Body": _FakeStreamingBody(obj["bytes"]),
+            "ContentLength": len(obj["bytes"]),
+        }
+        if ChecksumMode == "ENABLED":
+            response.update(
+                {
+                    "ChecksumSHA256": obj["checksum"],
+                    "ChecksumType": "FULL_OBJECT",
+                    "ContentType": obj["content_type"],
+                    "ContentEncoding": obj["content_encoding"],
+                }
+            )
+        return response
 
     def list_objects_v2(
         self,
@@ -244,7 +285,9 @@ class S3Case(unittest.TestCase):
 
     def put(self, payload: bytes | None = None, key: str | None = None, **kwargs):
         payload = self.payload if payload is None else payload
-        return self.store.put_immutable(key or self.key, io.BytesIO(payload), identity(payload), **kwargs)
+        return self.store.put_immutable(
+            key or self.key, io.BytesIO(payload), identity(payload), **kwargs
+        )
 
     def calls_of(self, op: str) -> list[dict]:
         return [kwargs for name, kwargs in self.client.calls if name == op]
@@ -305,12 +348,19 @@ class HeadTests(S3Case):
         self.assertEqual(calls[1]["ContinuationToken"], "2")
 
     def test_a_present_key_translates_identity_from_the_provider_checksum(self) -> None:
-        self.client.seed(self.key, self.payload, content_type="application/x-ndjson", content_encoding="zstd")
+        self.client.seed(
+            self.key,
+            self.payload,
+            content_type="application/x-ndjson",
+            content_encoding="zstd",
+        )
         metadata = self.store.head(self.key)
         assert metadata is not None
         self.assertEqual(metadata.byte_length, len(self.payload))
         self.assertEqual(metadata.sha256, identity(self.payload).sha256)
-        self.assertEqual(metadata.provider_checksum, provider_checksum_of(metadata.sha256))
+        self.assertEqual(
+            metadata.provider_checksum, provider_checksum_of(metadata.sha256)
+        )
         self.assertEqual(metadata.provider_checksum_algorithm, "SHA256")
         self.assertEqual(metadata.content_type, "application/x-ndjson")
         self.assertEqual(metadata.content_encoding, "zstd")
@@ -364,9 +414,14 @@ class PutImmutableTests(S3Case):
 
     def test_an_identical_existing_object_succeeds_after_412(self) -> None:
         self.client.seed(
-            self.key, self.payload, content_type="application/x-ndjson", content_encoding="zstd"
+            self.key,
+            self.payload,
+            content_type="application/x-ndjson",
+            content_encoding="zstd",
         )
-        metadata = self.put(content_type="application/x-ndjson", content_encoding="zstd")
+        metadata = self.put(
+            content_type="application/x-ndjson", content_encoding="zstd"
+        )
         self.assertEqual(metadata.sha256, identity(self.payload).sha256)
         self.assertEqual(len(self.calls_of("put_object")), 1)
         self.assertEqual(len(self.calls_of("head_object")), 1)
@@ -376,7 +431,9 @@ class PutImmutableTests(S3Case):
         with self.assertRaises(IntegrityConflict):
             self.put()
 
-    def test_matching_bytes_with_different_metadata_becomes_integrity_conflict(self) -> None:
+    def test_matching_bytes_with_different_metadata_becomes_integrity_conflict(
+        self,
+    ) -> None:
         self.client.seed(self.key, self.payload, content_type="text/plain")
         with self.assertRaises(IntegrityConflict):
             self.put(content_type="application/x-ndjson")
@@ -404,18 +461,24 @@ class PutImmutableTests(S3Case):
         self.assertEqual(metadata.sha256, identity(self.payload).sha256)
 
     def test_an_incorrect_reader_length_fails_before_any_request(self) -> None:
-        wrong = StoredIdentity(sha256=identity(self.payload).sha256, byte_length=len(self.payload) + 5)
+        wrong = StoredIdentity(
+            sha256=identity(self.payload).sha256, byte_length=len(self.payload) + 5
+        )
         with self.assertRaises(VerificationFailure):
             self.store.put_immutable(self.key, io.BytesIO(self.payload), wrong)
         self.assertEqual(self.client.calls, [])
 
     def test_a_non_seekable_reader_is_refused(self) -> None:
         with self.assertRaises(ObjectStoreError):
-            self.store.put_immutable(self.key, _NonSeekableReader(self.payload), identity(self.payload))
+            self.store.put_immutable(
+                self.key, _NonSeekableReader(self.payload), identity(self.payload)
+            )
         self.assertEqual(self.client.calls, [])
 
     def test_a_byte_length_above_the_single_put_limit_is_refused(self) -> None:
-        oversized = StoredIdentity(sha256="a" * 64, byte_length=MAX_SINGLE_PUT_BYTES + 1)
+        oversized = StoredIdentity(
+            sha256="a" * 64, byte_length=MAX_SINGLE_PUT_BYTES + 1
+        )
         with self.assertRaises(ObjectStoreError):
             self.store.put_immutable(self.key, io.BytesIO(b""), oversized)
         self.assertEqual(self.client.calls, [])
@@ -469,7 +532,9 @@ class OpenTests(S3Case):
         with self.assertRaises(ObjectStoreError):
             self.store.open(self.key, max_bytes=-1)
 
-    def test_a_content_length_exceeding_max_bytes_fails_before_any_byte_is_returned(self) -> None:
+    def test_a_content_length_exceeding_max_bytes_fails_before_any_byte_is_returned(
+        self,
+    ) -> None:
         self.client.seed(self.key, self.payload)
         with self.assertRaises(VerificationFailure):
             self.store.open(self.key, max_bytes=len(self.payload) - 1)
@@ -491,7 +556,9 @@ class NoDeleteTests(S3Case):
         self.store.head(self.key)
         with self.store.open(self.key) as reader:
             reader.read()
-        delete_calls = [name for name, _ in self.client.calls if name.startswith("delete")]
+        delete_calls = [
+            name for name, _ in self.client.calls if name.startswith("delete")
+        ]
         self.assertEqual(delete_calls, [])
 
 
@@ -499,7 +566,9 @@ class SharedContractTests(S3Case):
     """§13 Step 1.4 — the same properties `LocalObjectStore` proves, over S3."""
 
     def test_a_new_key_commits_durably_with_recalculated_identity(self) -> None:
-        metadata = self.put(content_type="application/x-ndjson", content_encoding="zstd")
+        metadata = self.put(
+            content_type="application/x-ndjson", content_encoding="zstd"
+        )
         self.assertEqual(metadata.byte_length, len(self.payload))
         self.assertEqual(metadata.sha256, identity(self.payload).sha256)
         self.assertEqual(self.store.head(self.key), metadata)
@@ -509,7 +578,9 @@ class SharedContractTests(S3Case):
         second = self.put()
         self.assertEqual(first, second)
 
-    def test_a_different_value_at_the_same_key_is_a_conflict_and_preserves_the_first(self) -> None:
+    def test_a_different_value_at_the_same_key_is_a_conflict_and_preserves_the_first(
+        self,
+    ) -> None:
         self.put()
         with self.assertRaises(IntegrityConflict):
             self.put(b'{"line":"different"}\n')
@@ -517,12 +588,16 @@ class SharedContractTests(S3Case):
             self.assertEqual(reader.read(), self.payload)
 
     def test_bytes_that_disagree_with_the_promised_identity_are_refused(self) -> None:
-        mismatched = StoredIdentity(sha256=identity(b"other\n").sha256, byte_length=len(self.payload))
+        mismatched = StoredIdentity(
+            sha256=identity(b"other\n").sha256, byte_length=len(self.payload)
+        )
         with self.assertRaises(VerificationFailure):
             self.store.put_immutable(self.key, io.BytesIO(self.payload), mismatched)
 
     def test_head_of_an_absent_key_is_absence_not_an_error(self) -> None:
-        self.assertIsNone(self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst"))
+        self.assertIsNone(
+            self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst")
+        )
 
 
 if __name__ == "__main__":

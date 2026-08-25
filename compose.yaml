@@ -64,17 +64,22 @@ x-archive-volume: &archive-volume
   bind:
     create_host_path: true
 
-# Credentials remain outside `.env`: export these in the shell that invokes
-# Compose when a host is not using an AWS instance/task role. Only S3-facing
-# archive services receive them; venue capture has no archive authority. The
-# non-secret archive identity fields are included for direct config scripts.
-x-aws-archive-environment: &aws-archive-environment
+# Credentials remain outside `.env`: AWS credentials are exported only when a
+# host lacks an instance/task role; GCS uses Application Default Credentials.
+# Only archive services receive cloud archive configuration; venue capture has
+# no archive authority.
+x-cloud-archive-environment: &cloud-archive-environment
+  ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
+  ARCHIVE_ROOT: /var/lib/prediction-archive
+  ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
+  ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
   ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
   ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
   ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
   AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
   AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+  ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
 
 services:
   targeter:
@@ -428,7 +433,7 @@ services:
     <<: *capture-service
     profiles:
       - ops
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -438,27 +443,8 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
       - --manifest-root
       - /var/lib/prediction-indexer/archive-manifests
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      # --archive-root, --store-id and --archive-durability above are local-only
-      # and stay in this static command whichever backend is selected;
-      # archive/storage/factory.py ignores them for S3 (S3_RAW_ARCHIVE_ADAPTER_V1
-      # §11). The three --s3-* flags default to empty, which is a no-op for the
-      # local backend and validated only when ARCHIVE_BACKEND=s3.
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --interval-seconds
       - "${ARCHIVER_INTERVAL_SECONDS:-3600}"
       - --report
@@ -474,7 +460,7 @@ services:
     profiles:
       - ops
     restart: "no"
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -484,22 +470,8 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
       - --manifest-root
       - /var/lib/prediction-indexer/archive-manifests
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --report
       - /var/lib/prediction-indexer/archive-manifests/last_archive_sweep.json
     volumes:
@@ -513,13 +485,13 @@ services:
   # needs `REAPER_MODE=delete` (or the manual `--delete` compatibility alias)
   # and an independent backend. A local backend additionally needs
   # `ARCHIVE_DURABILITY=independent` and a different filesystem from the spool;
-  # an S3 backend is independent by construction. Until the explicit destructive
+  # a cloud backend is independent by construction. Until the explicit destructive
   # run, local raw data remains the recovery authority.
   reaper:
     <<: *capture-service
     profiles:
       - ops
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -529,20 +501,6 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --mode
       - "${REAPER_MODE:-audit}"
       - --interval-seconds
@@ -558,7 +516,7 @@ services:
     profiles:
       - ops
     restart: "no"
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -568,20 +526,6 @@ services:
       - /var/lib/prediction-indexer/spool
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --mode
       - "${REAPER_MODE:-audit}"
       - --report
@@ -598,7 +542,7 @@ services:
     <<: *capture-service
     profiles:
       - ops
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -606,20 +550,6 @@ services:
       - archive.reaper.canonical_cli
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --mode
       - "${CANONICAL_REAPER_MODE:-audit}"
       - --retention-hours
@@ -637,7 +567,7 @@ services:
     profiles:
       - ops
     restart: "no"
-    environment: *aws-archive-environment
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
@@ -645,20 +575,6 @@ services:
       - archive.reaper.canonical_cli
       - --canonical-root
       - /var/lib/prediction-indexer/canonical
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --archive-backend
-      - "${ARCHIVE_BACKEND:-local}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --mode
       - "${CANONICAL_REAPER_MODE:-audit}"
       - --retention-hours

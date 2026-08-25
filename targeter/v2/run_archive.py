@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from archive.archiver.publish import ArchiveFile, publish_files
 from archive.common.durable import confirm_durable, write_json_durable
 from analysis.storage import decoded_zstd_file, read_json_zstd
 from archive.storage.base import (
@@ -27,12 +28,17 @@ from archive.storage.base import (
     VerificationFailure,
     provider_checksum_of,
 )
-from encoder import CodecError, LogicalIdentity, StoredIdentity, logical_identity_of, stored_identity_of
+from encoder import (
+    CodecError,
+    LogicalIdentity,
+    StoredIdentity,
+    logical_identity_of,
+    stored_identity_of,
+)
 from targeter.v2.models import SUPPORTED_VENUES, parse_timestamp
 
-
 RUN_MANIFEST_VERSION = 2
-RUN_ARCHIVE_RECEIPT_VERSION = 2
+RUN_ARCHIVE_RECEIPT_VERSION = 3
 LOCAL_RUN_ARCHIVE_RECEIPT_VERSION = 2
 RUN_MANIFEST_FILE = "run_manifest.json"
 PRODUCTION_RECEIPT_FILE = "archive_receipt.json"
@@ -63,7 +69,9 @@ def parse_run_id_ns(name: str) -> int | None:
     except ValueError:
         return None
     delta = moment.replace(tzinfo=timezone.utc) - _EPOCH
-    return (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
+    return (
+        delta.days * 86_400 + delta.seconds
+    ) * 1_000_000_000 + delta.microseconds * 1_000
 
 
 def discover_runs(output_root: Path) -> list[Path]:
@@ -115,6 +123,7 @@ class RunArchiveReceipt:
     kind: str
     path: Path
     run_id: str
+    provider: str | None
     location: str
     prefix: str
     manifest: ArchivedRunObject
@@ -165,7 +174,9 @@ def read_run_report(run_directory: Path) -> dict[str, Any]:
                 expected_stored=StoredIdentity.from_record(compressed["stored"]),
             )
         except (CodecError, OSError, ValueError) as error:
-            raise RunArchiveError(f"invalid compressed selection report: {error}") from error
+            raise RunArchiveError(
+                f"invalid compressed selection report: {error}"
+            ) from error
         if not isinstance(report, dict):
             raise RunArchiveError("selection report is not a JSON object")
     else:
@@ -178,7 +189,10 @@ def read_run_report(run_directory: Path) -> dict[str, Any]:
     if report.get("report_version") not in {1, 2, 3} or report.get("mode") != "shadow":
         raise RunArchiveError("selection report is not a phase-5 shadow report")
     selection = report.get("selection")
-    if not isinstance(selection, dict) or selection.get("publication_performed") is not False:
+    if (
+        not isinstance(selection, dict)
+        or selection.get("publication_performed") is not False
+    ):
         raise RunArchiveError("selection report already claims publication")
     if not isinstance(report.get("input_complete"), bool):
         raise RunArchiveError("selection report input_complete must be boolean")
@@ -189,7 +203,9 @@ def read_run_report(run_directory: Path) -> dict[str, Any]:
     has_format = "artifact_format" in report
     has_inventory = "artifacts" in report
     if has_format != has_inventory:
-        raise RunArchiveError("selection report must carry both artifact_format and artifacts")
+        raise RunArchiveError(
+            "selection report must carry both artifact_format and artifacts"
+        )
     if has_inventory:
         _artifact_inventory(report)
     return report
@@ -200,7 +216,9 @@ def _report_files(run_directory: Path) -> dict[str, dict[str, Any] | None]:
     plain_path = Path(run_directory) / SELECTION_REPORT_FILE
     if metadata_path.is_file():
         if plain_path.exists():
-            raise RunArchiveError("run contains both compressed and plain selection reports")
+            raise RunArchiveError(
+                "run contains both compressed and plain selection reports"
+            )
         metadata = _read_json(metadata_path, "selection report metadata")
         _require_exact_keys(
             metadata,
@@ -230,7 +248,9 @@ def _report_files(run_directory: Path) -> dict[str, dict[str, Any] | None]:
             or report["content_encoding"] != "zstd"
             or not _valid_compression(report["compression"])
         ):
-            raise RunArchiveError("selection report metadata has invalid content metadata")
+            raise RunArchiveError(
+                "selection report metadata has invalid content metadata"
+            )
         _require_exact_keys(
             report["decoded"],
             {"sha256", "byte_length", "line_count"},
@@ -245,7 +265,9 @@ def _report_files(run_directory: Path) -> dict[str, dict[str, Any] | None]:
             LogicalIdentity.from_record(report["decoded"])
             StoredIdentity.from_record(report["stored"])
         except CodecError as error:
-            raise RunArchiveError(f"selection report metadata identity is invalid: {error}") from error
+            raise RunArchiveError(
+                f"selection report metadata identity is invalid: {error}"
+            ) from error
         if not (Path(run_directory) / SELECTION_REPORT_ZSTD_FILE).is_file():
             raise RunArchiveError("compressed selection report is missing")
         return {
@@ -285,7 +307,9 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
         raise RunArchiveError("selection report catalogs must be an array")
     for summary in catalogues:
         if not isinstance(summary, dict) or summary.get("venue") not in {
-            "kalshi", "polymarket", "limitless"
+            "kalshi",
+            "polymarket",
+            "limitless",
         }:
             raise RunArchiveError("selection report has an invalid catalog summary")
         venue = str(summary["venue"])
@@ -293,7 +317,9 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
             {f"catalog_{venue}_events{suffix}", f"catalog_{venue}_markets{suffix}"}
         )
     if set(raw) != expected:
-        raise RunArchiveError("selection report artifact inventory is incomplete or unexpected")
+        raise RunArchiveError(
+            "selection report artifact inventory is incomplete or unexpected"
+        )
     for name, entry in raw.items():
         if not isinstance(entry, dict) or Path(name).name != name:
             raise RunArchiveError(f"selection report artifact {name!r} is invalid")
@@ -307,7 +333,9 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
             entry.get("content_type") != content_type
             or entry.get("content_encoding") != content_encoding
         ):
-            raise RunArchiveError(f"selection report artifact {name} has invalid content metadata")
+            raise RunArchiveError(
+                f"selection report artifact {name} has invalid content metadata"
+            )
         try:
             _require_exact_keys(
                 entry.get("decoded"),
@@ -322,11 +350,15 @@ def _artifact_inventory(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
             LogicalIdentity.from_record(entry.get("decoded"))
             StoredIdentity.from_record(entry.get("stored"))
         except CodecError as error:
-            raise RunArchiveError(f"selection report artifact {name} has invalid identity: {error}") from error
+            raise RunArchiveError(
+                f"selection report artifact {name} has invalid identity: {error}"
+            ) from error
         compression = entry.get("compression")
         if content_encoding == "zstd":
             if not _valid_compression(compression):
-                raise RunArchiveError(f"selection report artifact {name} has invalid compression")
+                raise RunArchiveError(
+                    f"selection report artifact {name} has invalid compression"
+                )
         elif compression is not None:
             raise RunArchiveError(f"plain artifact {name} must not claim compression")
     return raw
@@ -347,7 +379,9 @@ def _legacy_artifact_names(report: dict[str, Any]) -> set[str]:
     names = {"rule_templates.ndjson", "rule_drift.ndjson"}
     for summary in report.get("catalogs", []):
         if not isinstance(summary, dict) or summary.get("venue") not in {
-            "kalshi", "polymarket", "limitless"
+            "kalshi",
+            "polymarket",
+            "limitless",
         }:
             raise RunArchiveError("selection report has an invalid catalog summary")
         venue = str(summary["venue"])
@@ -395,7 +429,9 @@ def _source_files(run_directory: Path, report: dict[str, Any]) -> tuple[Path, ..
         try:
             mode = path.lstat().st_mode
         except OSError as error:
-            raise RunArchiveError(f"cannot stat run artifact {path}: {error}") from error
+            raise RunArchiveError(
+                f"cannot stat run artifact {path}: {error}"
+            ) from error
         if not stat.S_ISREG(mode):
             raise RunArchiveError(f"run artifact is not a regular file: {path}")
         if path.name not in source_names:
@@ -454,11 +490,15 @@ def _artifact_record(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             ):
                 pass
         except (CodecError, OSError) as error:
-            raise RunArchiveError(f"run artifact {path.name} is not valid Zstd NDJSON: {error}") from error
+            raise RunArchiveError(
+                f"run artifact {path.name} is not valid Zstd NDJSON: {error}"
+            ) from error
     else:
         with path.open("rb") as source:
             if logical_identity_of(source) != logical:
-                raise RunArchiveError(f"run artifact logical identity drifted: {path.name}")
+                raise RunArchiveError(
+                    f"run artifact logical identity drifted: {path.name}"
+                )
     return {"file": path.name, **entry}
 
 
@@ -477,12 +517,12 @@ def build_run_manifest(run_directory: Path) -> tuple[dict[str, Any], Path]:
     if path.exists():
         existing = _read_json(path, "run manifest")
         legacy = (
-            _legacy_run_manifest(report, files)
-            if "artifacts" not in report
-            else None
+            _legacy_run_manifest(report, files) if "artifacts" not in report else None
         )
         if existing != document and existing != legacy:
-            raise RunArchiveError("existing run manifest disagrees with current run artifacts")
+            raise RunArchiveError(
+                "existing run manifest disagrees with current run artifacts"
+            )
         confirm_durable(path)
         return existing, path
     else:
@@ -539,10 +579,12 @@ def archive_run(
 
     _manifest_document, manifest_path = build_run_manifest(run_directory)
     _date, prefix = _date_and_prefix(report, run_directory.name)
-    uploaded: list[ArchivedRunObject] = []
     source_files = list(_source_files(run_directory, report)) + [manifest_path]
     inventory = _artifact_inventory(report) if "artifacts" in report else {}
     report_files = _report_files(run_directory)
+    prepared: list[
+        tuple[ArchiveFile, LogicalIdentity | None, dict[str, Any] | None]
+    ] = []
     for path in source_files:
         stored = _identity(path)
         key = f"{prefix}/{path.name}"
@@ -558,19 +600,32 @@ def archive_run(
             )
         )
         compression = artifact.get("compression") if artifact is not None else None
-        with path.open("rb") as reader:
-            metadata = store.put_immutable(
-                key,
-                reader,
-                stored,
-                content_type=content_type,
-                content_encoding=content_encoding,
+        prepared.append(
+            (
+                ArchiveFile(path, key, stored, content_type, content_encoding),
+                logical,
+                compression,
             )
-        _verify_metadata(metadata, stored, content_type, content_encoding, key)
+        )
+
+    published = publish_files(
+        store, (archive_file for archive_file, _logical, _compression in prepared)
+    )
+    uploaded: list[ArchivedRunObject] = []
+    for (archive_file, logical, compression), remote in zip(
+        prepared, published, strict=True
+    ):
+        _verify_metadata(
+            remote,
+            archive_file.identity,
+            archive_file.content_type,
+            archive_file.content_encoding,
+            archive_file.key,
+        )
         uploaded.append(
             _archived_object(
-                path.name,
-                metadata,
+                archive_file.path.name,
+                remote,
                 logical=logical,
                 compression=compression,
             )
@@ -578,7 +633,6 @@ def archive_run(
 
     manifest = next(item for item in uploaded if item.file == RUN_MANIFEST_FILE)
     instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    location_field = "bucket" if kind == "production" else "store"
     version_field = (
         "targeter_run_archive_receipt_version"
         if kind == "production"
@@ -591,7 +645,6 @@ def archive_run(
             else LOCAL_RUN_ARCHIVE_RECEIPT_VERSION
         ),
         "run_id": run_directory.name,
-        location_field: store.store_id,
         "prefix": prefix,
         "archived_at_ns": int(instant.timestamp() * 1_000_000_000),
         "manifest": _object_record(manifest, production=kind == "production"),
@@ -601,9 +654,13 @@ def archive_run(
         "durability": store.durability.name,
         "authorizes_publication": kind == "production",
     }
-    write_json_durable(receipt_path, document)
+    if kind == "production":
+        document["store"] = {"provider": store.provider, "location": store.store_id}
+    else:
+        document["store"] = store.store_id
     receipt = parse_run_archive_receipt(document, path=receipt_path)
     verify_run_archive(store, receipt)
+    write_json_durable(receipt_path, document)
     return receipt
 
 
@@ -615,11 +672,13 @@ def _verify_metadata(
     key: str,
 ) -> None:
     if not metadata.matches_request(stored, content_type, content_encoding):
-        raise VerificationFailure(f"archived targeter object {key} failed identity verification")
-    if metadata.provider_checksum_algorithm != "SHA256":
-        raise VerificationFailure(f"archived targeter object {key} lacks a SHA256 checksum")
-    if metadata.provider_checksum != provider_checksum_of(stored.sha256):
-        raise VerificationFailure(f"archived targeter object {key} has the wrong provider checksum")
+        raise VerificationFailure(
+            f"archived targeter object {key} failed identity verification"
+        )
+    if not metadata.provider_checksum or not metadata.provider_checksum_algorithm:
+        raise VerificationFailure(
+            f"archived targeter object {key} lacks provider checksum evidence"
+        )
 
 
 def _archived_object(
@@ -661,7 +720,9 @@ def _object_record(item: ArchivedRunObject, *, production: bool) -> dict[str, An
 
 
 def read_run_archive_receipt(path: Path) -> RunArchiveReceipt:
-    return parse_run_archive_receipt(_read_json(Path(path), "run archive receipt"), path=Path(path))
+    return parse_run_archive_receipt(
+        _read_json(Path(path), "run archive receipt"), path=Path(path)
+    )
 
 
 def parse_run_archive_receipt(document: Any, *, path: Path) -> RunArchiveReceipt:
@@ -670,29 +731,49 @@ def parse_run_archive_receipt(document: Any, *, path: Path) -> RunArchiveReceipt
     production = "targeter_run_archive_receipt_version" in document
     local = "local_targeter_run_archive_receipt_version" in document
     if production == local:
-        raise RunArchiveError("run archive receipt must name exactly one receipt version")
+        raise RunArchiveError(
+            "run archive receipt must name exactly one receipt version"
+        )
     if production:
         version = document["targeter_run_archive_receipt_version"]
         if version not in {
             1,
+            2,
             RUN_ARCHIVE_RECEIPT_VERSION,
         }:
             raise RunArchiveError("unsupported targeter run archive receipt version")
         if path.name != PRODUCTION_RECEIPT_FILE:
-            raise RunArchiveError("production run archive receipt has the wrong filename")
+            raise RunArchiveError(
+                "production run archive receipt has the wrong filename"
+            )
         kind = "production"
-        location_field = "bucket"
         version_field = "targeter_run_archive_receipt_version"
+        if version == 3:
+            store = document.get("store")
+            if not isinstance(store, dict) or set(store) != {"provider", "location"}:
+                raise RunArchiveError(
+                    "version-3 run archive receipt has invalid store identity"
+                )
+            provider = _text(store, "provider")
+            location = _text(store, "location")
+            location_field = "store"
+        else:
+            provider = None
+            location_field = "bucket"
+            location = _text(document, location_field)
     else:
         version = document["local_targeter_run_archive_receipt_version"]
         if version not in {
             1,
             LOCAL_RUN_ARCHIVE_RECEIPT_VERSION,
         }:
-            raise RunArchiveError("unsupported local targeter run archive receipt version")
+            raise RunArchiveError(
+                "unsupported local targeter run archive receipt version"
+            )
         if path.name != LOCAL_RECEIPT_FILE:
             raise RunArchiveError("local run archive receipt has the wrong filename")
         kind = "local"
+        provider = "local"
         location_field = "store"
         version_field = "local_targeter_run_archive_receipt_version"
 
@@ -713,11 +794,14 @@ def parse_run_archive_receipt(document: Any, *, path: Path) -> RunArchiveReceipt
     )
 
     run_id = _text(document, "run_id")
-    location = _text(document, location_field)
+    if not production:
+        location = _text(document, location_field)
     prefix = _text(document, "prefix")
     archived_at_ns = _integer(document, "archived_at_ns")
     if document.get("authorizes_publication") is not production:
-        raise RunArchiveError("run archive receipt publication authority is inconsistent")
+        raise RunArchiveError(
+            "run archive receipt publication authority is inconsistent"
+        )
     raw_objects = document.get("objects")
     if not isinstance(raw_objects, list) or not raw_objects:
         raise RunArchiveError("run archive receipt objects must be a non-empty array")
@@ -732,24 +816,33 @@ def parse_run_archive_receipt(document: Any, *, path: Path) -> RunArchiveReceipt
     object_files = {item.file for item in objects}
     report_files = object_files & {SELECTION_REPORT_FILE, SELECTION_REPORT_ZSTD_FILE}
     if len(report_files) != 1:
-        raise RunArchiveError("run archive receipt must contain exactly one selection report")
+        raise RunArchiveError(
+            "run archive receipt must contain exactly one selection report"
+        )
     if SELECTION_REPORT_ZSTD_FILE in report_files:
         if SELECTION_REPORT_METADATA_FILE not in object_files:
-            raise RunArchiveError("compressed selection report has no metadata commit marker")
+            raise RunArchiveError(
+                "compressed selection report has no metadata commit marker"
+            )
     elif SELECTION_REPORT_METADATA_FILE in object_files:
-        raise RunArchiveError("plain selection report must not have compressed-report metadata")
+        raise RunArchiveError(
+            "plain selection report must not have compressed-report metadata"
+        )
     manifest = _parse_object(
         document.get("manifest"), production=production, version=version
     )
     matching = [item for item in objects if item.file == RUN_MANIFEST_FILE]
     if len(matching) != 1 or matching[0] != manifest:
-        raise RunArchiveError("run archive receipt manifest does not match its object list")
+        raise RunArchiveError(
+            "run archive receipt manifest does not match its object list"
+        )
     if any(not item.key.startswith(prefix + "/") for item in objects):
         raise RunArchiveError("run archive object escapes the recorded prefix")
     return RunArchiveReceipt(
         kind=kind,
         path=path,
         run_id=run_id,
+        provider=provider,
         location=location,
         prefix=prefix,
         manifest=manifest,
@@ -786,21 +879,26 @@ def _parse_object(
         "content_type",
         "content_encoding",
     }
-    if version == 2 and normalized:
+    if version >= 2 and normalized:
         expected_keys.update({"decoded", "compression"})
     if production:
         expected_keys.update({"provider_checksum", "provider_checksum_algorithm"})
     _require_exact_keys(value, expected_keys, f"run archive object {name}")
-    if content_type != expected_type or value.get("content_encoding") != expected_encoding:
+    if (
+        content_type != expected_type
+        or value.get("content_encoding") != expected_encoding
+    ):
         raise RunArchiveError(f"run archive object {name} has invalid content metadata")
     if version == 1 and expected_encoding is not None:
-        raise RunArchiveError("version-1 run archive receipts cannot name compressed artifacts")
+        raise RunArchiveError(
+            "version-1 run archive receipts cannot name compressed artifacts"
+        )
     stored = StoredIdentity(
         sha256=_digest(value, "sha256"), byte_length=_integer(value, "byte_length")
     )
     logical = None
     compression = None
-    if version == 2 and normalized:
+    if version >= 2 and normalized:
         try:
             _require_exact_keys(
                 value.get("decoded"),
@@ -809,7 +907,9 @@ def _parse_object(
             )
             logical = LogicalIdentity.from_record(value.get("decoded"))
         except CodecError as error:
-            raise RunArchiveError(f"run archive object {name} has invalid decoded identity") from error
+            raise RunArchiveError(
+                f"run archive object {name} has invalid decoded identity"
+            ) from error
         compression = value.get("compression")
         if expected_encoding == "zstd" and not _valid_compression(compression):
             raise RunArchiveError(f"run archive object {name} has invalid compression")
@@ -824,12 +924,17 @@ def _parse_object(
     if production:
         provider_checksum = _text(value, "provider_checksum")
         provider_algorithm = _text(value, "provider_checksum_algorithm")
-        if provider_algorithm != "SHA256" or provider_checksum != provider_checksum_of(
-            stored.sha256
+        if version < 3 and (
+            provider_algorithm != "SHA256"
+            or provider_checksum != provider_checksum_of(stored.sha256)
         ):
-            raise RunArchiveError(f"run archive object {name} has invalid provider checksum")
+            raise RunArchiveError(
+                f"run archive object {name} has invalid provider checksum"
+            )
     elif "provider_checksum" in value or "provider_checksum_algorithm" in value:
-        raise RunArchiveError("local run archive receipt must not claim provider checksums")
+        raise RunArchiveError(
+            "local run archive receipt must not claim provider checksums"
+        )
     return ArchivedRunObject(
         file=name,
         key=key,
@@ -866,8 +971,18 @@ def verify_run_archive_objects(
         raise VerificationFailure(
             f"run archive receipt names {receipt.location!r}, not store {store.store_id!r}"
         )
+    if (
+        receipt.is_production
+        and receipt.provider is not None
+        and receipt.provider != store.provider
+    ):
+        raise VerificationFailure(
+            f"run archive receipt names provider {receipt.provider!r}, not {store.provider!r}"
+        )
     if receipt.is_production and not store.durability.independent:
-        raise VerificationFailure("production run archive receipt requires an independent store")
+        raise VerificationFailure(
+            "production run archive receipt requires an independent store"
+        )
     inventory = {item.key: item for item in receipt.objects}
     for item in objects:
         if inventory.get(item.key) != item:
@@ -888,7 +1003,9 @@ def verify_run_archive_objects(
             metadata.provider_checksum != item.provider_checksum
             or metadata.provider_checksum_algorithm != item.provider_checksum_algorithm
         ):
-            raise VerificationFailure(f"archived targeter object checksum drifted: {item.key}")
+            raise VerificationFailure(
+                f"archived targeter object checksum drifted: {item.key}"
+            )
 
 
 def validate_local_run(run_directory: Path, receipt: RunArchiveReceipt) -> None:
@@ -898,27 +1015,35 @@ def validate_local_run(run_directory: Path, receipt: RunArchiveReceipt) -> None:
     for item in receipt.objects:
         path = run_directory / item.file
         if not path.is_file() or _identity(path) != item.stored:
-            raise RunArchiveError(f"local run artifact does not match archive receipt: {item.file}")
+            raise RunArchiveError(
+                f"local run artifact does not match archive receipt: {item.file}"
+            )
 
 
 def _text(document: dict[str, Any], field: str) -> str:
     value = document.get(field)
     if not isinstance(value, str) or not value:
-        raise RunArchiveError(f"run archive receipt field {field} must be non-empty text")
+        raise RunArchiveError(
+            f"run archive receipt field {field} must be non-empty text"
+        )
     return value
 
 
 def _integer(document: dict[str, Any], field: str) -> int:
     value = document.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise RunArchiveError(f"run archive receipt field {field} must be non-negative integer")
+        raise RunArchiveError(
+            f"run archive receipt field {field} must be non-negative integer"
+        )
     return value
 
 
 def _digest(document: dict[str, Any], field: str) -> str:
     value = _text(document, field)
-    if len(value) != 64 or value != value.lower() or any(
-        character not in "0123456789abcdef" for character in value
+    if (
+        len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise RunArchiveError(f"run archive receipt field {field} is not a SHA-256")
     return value
@@ -926,7 +1051,11 @@ def _digest(document: dict[str, Any], field: str) -> str:
 
 def _require_exact_keys(value: Any, expected: set[str], description: str) -> None:
     if not isinstance(value, dict) or set(value) != expected:
-        missing = sorted(expected - set(value)) if isinstance(value, dict) else sorted(expected)
+        missing = (
+            sorted(expected - set(value))
+            if isinstance(value, dict)
+            else sorted(expected)
+        )
         unexpected = sorted(set(value) - expected) if isinstance(value, dict) else []
         raise RunArchiveError(
             f"{description} has invalid fields; missing={missing}, unexpected={unexpected}"

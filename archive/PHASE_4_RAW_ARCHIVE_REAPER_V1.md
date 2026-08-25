@@ -205,6 +205,7 @@ The write-side storage protocol is deliberately smaller than an S3 client:
 put_immutable(key, reader, expected_identity) -> object metadata
 head(key)                                      -> object metadata or absent
 open(key)                                      -> bounded byte reader
+open_verified(expectation)                     -> receipt-verified byte reader
 ```
 
 `expected_identity` is known before publication. The adapter verifies that the
@@ -219,7 +220,9 @@ key, byte_length, sha256, provider checksum, content type, content encoding
 ```
 
 The provider checksum is separate from normalized lowercase SHA-256. An S3 ETag
-is never a provider SHA-256 checksum.
+is never a provider SHA-256 checksum. GCS CRC32C is recorded as provider
+evidence but cannot replace SHA-256; the GCS adapter recomputes SHA-256 through
+a complete generation-pinned readback.
 
 Keys are normalized relative POSIX paths. Empty components, `.`, `..`, absolute
 paths, backslashes, and traversal outside the configured root are rejected.
@@ -236,6 +239,12 @@ paths, backslashes, and traversal outside the configured root are rejected.
 
 `head` used for receipt verification must obtain or calculate actual object
 length and SHA-256. It may not simply echo metadata supplied at `put` time.
+
+Replay uses `open_verified` instead of `head` followed by `open`. The adapter
+checks receipt-owned length, SHA-256, provider checksum, content metadata, and
+the provider's immutable generation/version while one bounded stream is
+consumed. Leaving that stream before EOF is a verification failure. `head`
+retains its complete re-verification semantics for audits and deletion gates.
 
 ### 5.3 LocalObjectStore
 
@@ -257,7 +266,9 @@ declares an explicitly configured independent durability class. A directory on
 the same capture volume remains suitable for tests and compression-ratio probes,
 but losing that volume would otherwise lose both copies at once.
 
-The production S3 archive receipt in the Zstd specification remains unchanged.
+Legacy production S3 archive receipt version 1 remains readable. New
+independently durable stores publish provider-neutral production receipt version
+2 as specified by the Zstd and provider-adapter specifications.
 Local conformance metadata must not be serialized so that it can be mistaken for
 an S3-verified `archive_receipt_version: 1`. Tests may exercise the reaper library
 against a temporary backend, but the deployment CLI keeps the durability gate.
@@ -319,12 +330,13 @@ For one segment:
 7. Publish data and seal through immutable object-store writes.
 8. Call `head` for both objects and verify their actual remote identities and
    provider checksums.
-9. Encode the normative archive receipt from §3.3 of the Zstd specification for
-   S3, or the explicitly non-authoritative local conformance receipt from §5.3.
+9. Encode the normative provider-neutral production archive receipt from §3.3
+   of the Zstd specification, or the explicitly non-authoritative local
+   conformance receipt from §5.3.
 10. Write the selected receipt through `.open`, fsync it, rename it to its final
     `.archive.json` or `.archive.local.json` name, and fsync the directory.
 
-For S3, Step 10 is the sole archive commit. A local conformance receipt proves
+For an independent cloud backend, Step 10 is the sole archive commit. A local conformance receipt proves
 the same control flow in tests but does not enable production deletion.
 
 ### 6.4 Retry and existing receipts
@@ -366,10 +378,11 @@ integrity failure rather than an isolated malformed source.
 
 ### 6.6 Archive receipt and daily manifest
 
-Production archive receipts use the exact `archive_receipt_version: 1` schema in
-the Zstd specification. Hex digests are lowercase, byte counts are integers,
-times are UTC Unix nanoseconds, and the S3 checksum is the exact
-service-returned SHA-256 representation in addition to normalized hex.
+New production archive receipts use the exact `archive_receipt_version: 2`
+schema in the Zstd specification. Hex digests are lowercase, byte counts are
+integers, times are UTC Unix nanoseconds, and provider checksum evidence is
+recorded separately from normalized SHA-256. Strict readers retain legacy
+version 1 support.
 
 The daily manifest is a derived replay catalog built only from revalidated
 archive receipts. It contains one entry per segment with lane, window, data key,
@@ -646,7 +659,7 @@ run-length blocks), because everything else in the decoder rests on it.
 **The `st_dev` check makes invariant 7 enforceable rather than advisory.** §5.3
 gates deletion on a declared durability class, which is configuration and can
 therefore be declared wrongly. Both commands additionally refuse
-`--archive-durability independent` when the archive root and the spool resolve
+`ARCHIVE_DURABILITY=independent` when the archive root and the spool resolve
 to the same filesystem: a second copy that dies with the first is not a
 durability domain whatever the flag says. The reaper *library* has no such check,
 per §5.3's allowance for tests against a temporary backend — which is where the
@@ -675,9 +688,9 @@ to rely on it, not inherited from an attempt that did not finish.
 
 - **Two receipt kinds are chosen by the backend, never by the caller.** A store
   declaring `local_conformance` writes `.archive.local.json`; only an explicitly
-  independent one writes `archive_receipt_version: 1`. A caller that *could*
-  choose would eventually choose wrongly, and §5.3's whole concern is a
-  conformance artifact being read as deletion authority. The local receipt also
+  independent one writes a production receipt (version 2 for new receipts). A
+  caller that *could* choose would eventually choose wrongly, and §5.3's whole
+  concern is a conformance artifact being read as deletion authority. The local receipt also
   carries `authorizes_deletion: false` and is refused outright if renamed to the
   production filename.
 - **The reaper discovers receipts, not segments.** A partially reaped segment has
@@ -730,9 +743,8 @@ were run inside it.
 
 ## Not done, deliberately
 
-- No S3 adapter (§1.1). The protocol carries the expected identity a conditional
-  write needs, and `LocalObjectStore` passes the identity, conflict, retry and
-  crash tests an S3 adapter will have to pass unchanged.
+- No object-store lifecycle expiry. S3 and GCS adapters now implement the same
+  identity, conflict, retry, receipt-last, and no-delete boundary.
 - `canonical/` remains uncompressed until Zstd Step 2, so `spool/` is bounded by
   Phase 4 only once a genuinely separate backend is configured; on the local
   conformance backend the bytes have changed representation and directory and

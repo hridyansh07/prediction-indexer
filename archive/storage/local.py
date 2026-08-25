@@ -7,6 +7,7 @@ The write-side protocol is deliberately much smaller than an S3 client
 put_immutable(key, reader, expected_identity) -> ObjectMetadata
 head(key)                                     -> ObjectMetadata | None
 open(key)                                     -> bounded byte reader
+open_verified(expectation)                    -> verified byte reader
 list_keys(prefix)                             -> immutable key iterator
 ```
 
@@ -50,11 +51,13 @@ from archive.storage.base import (
     JSON_CONTENT_TYPE,
     METADATA_DIRECTORY,
     NDJSON_CONTENT_TYPE,
+    ObjectExpectation,
     ObjectKeyError,
     ObjectMetadata,
     ObjectStore,
     ObjectStoreError,
     VerificationFailure,
+    VerifiedReader,
     ZSTD_CONTENT_ENCODING,
     normalize_key,
     provider_checksum_of,
@@ -162,6 +165,8 @@ class LocalObjectStore:
     store that repeats the caller's claim back can only ever confirm it.
     """
 
+    provider = "local"
+
     def __init__(
         self,
         root: Path | str,
@@ -223,8 +228,13 @@ class LocalObjectStore:
                     # local-only recovery state: repair it from the identical
                     # retry. Any present-but-different value is an immutable
                     # request conflict, just as it is for one atomic S3 put.
-                    if stored_attributes == (None, None) and requested_attributes != (None, None):
-                        self._write_attributes(normalized, content_type, content_encoding)
+                    if stored_attributes == (None, None) and requested_attributes != (
+                        None,
+                        None,
+                    ):
+                        self._write_attributes(
+                            normalized, content_type, content_encoding
+                        )
                         repaired = self.head(normalized)
                         if repaired is None:
                             raise VerificationFailure(
@@ -265,7 +275,9 @@ class LocalObjectStore:
             )
 
         _create_directories_durable(path.parent, self.root)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.open")
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.open"
+        )
         digest = hashlib.sha256()
         length = 0
         try:
@@ -361,7 +373,9 @@ class LocalObjectStore:
             or after.st_size != length
         )
         if mutated:
-            raise VerificationFailure(f"object {normalized} changed while it was being read")
+            raise VerificationFailure(
+                f"object {normalized} changed while it was being read"
+            )
 
         content_type, content_encoding = self._read_attributes(normalized)
         return ObjectMetadata(
@@ -379,13 +393,76 @@ class LocalObjectStore:
         path = self._path_for(normalized)
         try:
             handle = open(
-                os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb", closefd=True
+                os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)),
+                "rb",
+                closefd=True,
             )
         except FileNotFoundError as error:
             raise ObjectStoreError(f"object {normalized} is absent") from error
         except OSError as error:
             raise ObjectStoreError(f"opening {normalized}: {error}") from error
         return BoundedReader(handle, normalized, max_bytes)
+
+    def open_verified(self, expected: ObjectExpectation) -> VerifiedReader:
+        normalized = normalize_key(expected.key)
+        if expected.provider_checksum_algorithm not in (None, "SHA256"):
+            raise VerificationFailure(
+                f"{normalized}: receipt has unsupported local checksum evidence"
+            )
+        if (
+            expected.provider_checksum is not None
+            and expected.provider_checksum
+            != provider_checksum_of(expected.stored.sha256)
+        ):
+            raise VerificationFailure(
+                f"{normalized}: receipt has invalid local SHA256 checksum evidence"
+            )
+        path = self._path_for(normalized)
+        try:
+            before = os.stat(path, follow_symlinks=False)
+            if not _is_regular_file(before):
+                raise ObjectStoreError(f"key {normalized} is not a regular file")
+            attributes = self._read_attributes(normalized)
+            if before.st_size != expected.stored.byte_length or attributes != (
+                expected.content_type,
+                expected.content_encoding,
+            ):
+                raise VerificationFailure(
+                    f"{normalized}: local object metadata disagrees with its receipt"
+                )
+            handle = open(
+                os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)),
+                "rb",
+                closefd=True,
+            )
+        except (ObjectStoreError, VerificationFailure):
+            raise
+        except FileNotFoundError as error:
+            raise VerificationFailure(f"object {normalized} is absent") from error
+        except OSError as error:
+            raise ObjectStoreError(f"opening {normalized}: {error}") from error
+
+        def recheck() -> None:
+            try:
+                after = os.stat(path, follow_symlinks=False)
+            except OSError as error:
+                raise ObjectStoreError(f"rechecking {normalized}: {error}") from error
+            if (
+                before.st_ino != after.st_ino
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_size != after.st_size
+                or self._read_attributes(normalized) != attributes
+            ):
+                raise VerificationFailure(
+                    f"object {normalized} changed while it was being retrieved"
+                )
+
+        return VerifiedReader(
+            handle,
+            expected,
+            provider_hasher=hashlib.sha256(),
+            on_verified=recheck,
+        )
 
     def list_keys(self, prefix: str) -> Iterator[str]:
         """List immutable object keys below one normalized prefix.
@@ -424,7 +501,9 @@ class LocalObjectStore:
             + _json_or_null(content_encoding)
             + "}\n"
         ).encode("utf-8")
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.open")
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.open"
+        )
         try:
             with temporary.open("wb") as handle:
                 handle.write(payload)
@@ -441,9 +520,13 @@ class LocalObjectStore:
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise ObjectStoreError(f"unreadable attributes for {key}: {error}") from error
+            raise ObjectStoreError(
+                f"unreadable attributes for {key}: {error}"
+            ) from error
         if not isinstance(document, dict):
-            raise ObjectStoreError(f"unreadable attributes for {key}: document is not an object")
+            raise ObjectStoreError(
+                f"unreadable attributes for {key}: document is not an object"
+            )
         content_type = document.get("content_type")
         content_encoding = document.get("content_encoding")
         if content_type is not None and not isinstance(content_type, str):

@@ -20,7 +20,15 @@ x-targeter-v2-runtime: &targeter-v2-runtime
   security_opt:
     - no-new-privileges:true
   stop_grace_period: 30s
-  environment: &targeter-v2-aws-environment
+  environment: &targeter-v2-archive-environment
+    ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
+    ARCHIVE_ROOT: /var/lib/prediction-archive
+    ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
+    ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
+    ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+    ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+    ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+    ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
     AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
     AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
     AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
@@ -43,7 +51,7 @@ services:
     # Runtime hardening and image/build settings are inherited from the base
     # targeter service. Repeating cap_drop/security_opt here would make the
     # Compose merge contain duplicate unique-sequence entries.
-    environment: *targeter-v2-aws-environment
+    environment: *targeter-v2-archive-environment
     volumes: *targeter-v2-volumes
     restart: "no"
     command:
@@ -65,20 +73,6 @@ services:
       - /var/lib/prediction-indexer/targeter-v2-runs
       - --live-root
       - /var/lib/prediction-indexer/live
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --archive-backend
-      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
 
   # All subscription-driven lanes resolve one atomic generation pointer.  A
   # splice keeps its last valid TargetSet if a future pointer fails validation.
@@ -215,20 +209,6 @@ services:
       - targeter.v2.run_archiver_cli
       - --output-root
       - /var/lib/prediction-indexer/targeter-v2-runs
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --archive-backend
-      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --report
       - /var/lib/prediction-indexer/ops/last_targeter_v2_archive_sweep.json
 
@@ -258,20 +238,6 @@ services:
       - /var/lib/prediction-indexer/targeter-v2-runs
       - --live-root
       - /var/lib/prediction-indexer/live
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --archive-backend
-      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"
       - --mode
       - "${TARGETER_RUN_REAPER_MODE:-audit}"
       - --retention-hours
@@ -298,17 +264,3 @@ services:
       - /var/lib/prediction-indexer/targeter-v2-runs
       - --live-root
       - /var/lib/prediction-indexer/live
-      - --archive-root
-      - /var/lib/prediction-archive
-      - --archive-backend
-      - "${TARGETER_ARCHIVE_BACKEND:-s3}"
-      - --archive-durability
-      - "${ARCHIVE_DURABILITY:-conformance}"
-      - --store-id
-      - "${ARCHIVE_STORE_ID:-local-archive}"
-      - --s3-bucket
-      - "${ARCHIVE_S3_BUCKET:-}"
-      - --s3-region
-      - "${ARCHIVE_S3_REGION:-}"
-      - --s3-expected-owner
-      - "${ARCHIVE_S3_EXPECTED_OWNER:-}"

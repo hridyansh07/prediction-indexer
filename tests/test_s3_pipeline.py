@@ -60,8 +60,7 @@ class ArchivalThroughS3Tests(S3PipelineCase):
         self.assertFalse(local_receipt.exists())
 
         document = json.loads(self.receipt_path.read_text(encoding="utf-8"))
-        self.assertEqual(document["object"]["bucket"], BUCKET)
-        self.assertEqual(document["seal"]["bucket"], BUCKET)
+        self.assertEqual(document["store"], {"provider": "s3", "location": BUCKET})
 
         receipt = read_archive_receipt(self.receipt_path)
         self.assertTrue(receipt.is_production)

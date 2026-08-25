@@ -65,7 +65,7 @@ __all__ = [
     "read_canonical_receipt",
 ]
 
-ARCHIVE_RECEIPT_VERSION = 1
+ARCHIVE_RECEIPT_VERSION = 2
 LOCAL_ARCHIVE_RECEIPT_VERSION = 1
 ARCHIVER_VERSION = 1
 
@@ -111,11 +111,12 @@ class ArchiveReceipt:
     seal_stored: StoredIdentity
     data_key: str
     data_stored: StoredIdentity
-    #: `bucket` for a production receipt, the store identifier for a local one.
+    provider: str | None
     location: str
-    #: The provider's own checksum representation. `None` for a local receipt,
-    #: which makes no provider claim at all.
     provider_checksum: str | None
+    provider_checksum_algorithm: str | None
+    seal_provider_checksum: str | None
+    seal_provider_checksum_algorithm: str | None
     content_encoding: str
     compression: dict[str, Any]
     verified_at_ns: int
@@ -151,17 +152,30 @@ def build_archive_receipt(
     seal_stored: StoredIdentity,
     data_key: str,
     data_stored: StoredIdentity,
+    provider: str,
     location: str,
     provider_checksum: str | None,
+    provider_checksum_algorithm: str | None,
+    seal_provider_checksum: str | None,
+    seal_provider_checksum_algorithm: str | None,
     encoder: str,
     verified_at_ns: int,
 ) -> dict[str, Any]:
     """Serializes whichever receipt the backend's durability class permits."""
     if kind == PRODUCTION:
-        if not provider_checksum:
-            raise ReceiptError("a production archive receipt requires a provider checksum")
+        if not all(
+            (
+                provider,
+                provider_checksum,
+                provider_checksum_algorithm,
+                seal_provider_checksum,
+                seal_provider_checksum_algorithm,
+            )
+        ):
+            raise ReceiptError("a production archive receipt requires provider identity and checksums")
         return {
             "archive_receipt_version": ARCHIVE_RECEIPT_VERSION,
+            "store": {"provider": provider, "location": location},
             "lane_id": lane_id,
             "window_start_ns": window_start_ns,
             "window_end_ns": window_end_ns,
@@ -177,15 +191,16 @@ def build_archive_receipt(
                 "file": seal_file,
                 "byte_length": seal_stored.byte_length,
                 "sha256": seal_stored.sha256,
-                "bucket": location,
                 "key": seal_key,
+                "provider_checksum": seal_provider_checksum,
+                "provider_checksum_algorithm": seal_provider_checksum_algorithm,
             },
             "object": {
-                "bucket": location,
                 "key": data_key,
                 "byte_length": data_stored.byte_length,
                 "sha256": data_stored.sha256,
-                "s3_checksum_sha256": provider_checksum,
+                "provider_checksum": provider_checksum,
+                "provider_checksum_algorithm": provider_checksum_algorithm,
                 "content_encoding": "zstd",
             },
             "compression": compression_contract(encoder),
@@ -260,13 +275,36 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
         raise invalid("receipt names no archive receipt version")
     kind = PRODUCTION if production else LOCAL
     version_field = "archive_receipt_version" if production else "local_archive_receipt_version"
-    if document[version_field] != 1:
+    version = document[version_field]
+    supported_versions = {1, ARCHIVE_RECEIPT_VERSION} if production else {1}
+    if version not in supported_versions:
         raise invalid(f"unsupported {version_field} {document[version_field]!r}")
     # The filename and the version must agree, or a local receipt renamed to
     # `.archive.json` would read as deletion authority.
     expected_suffix = ARCHIVE_RECEIPT_SUFFIX if production else LOCAL_ARCHIVE_RECEIPT_SUFFIX
     if not path.name.endswith(expected_suffix):
         raise invalid(f"a {kind} receipt does not belong at {path.name}")
+    if production and version == ARCHIVE_RECEIPT_VERSION:
+        _require_exact_keys(
+            document,
+            {
+                "archive_receipt_version",
+                "store",
+                "lane_id",
+                "window_start_ns",
+                "window_end_ns",
+                "segment_id",
+                "segment_index",
+                "source",
+                "seal",
+                "object",
+                "compression",
+                "verified_at_ns",
+                "archiver_version",
+            },
+            "receipt",
+            invalid,
+        )
 
     lane_id = _text(document, "lane_id", invalid)
     segment_id = _text(document, "segment_id", invalid)
@@ -283,6 +321,13 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
         raise invalid(f"unsupported archiver_version {archiver_version}")
 
     source = _section(document, "source", invalid)
+    if production and version == ARCHIVE_RECEIPT_VERSION:
+        _require_exact_keys(
+            source,
+            {"file", "byte_length", "line_count", "sha256"},
+            "source",
+            invalid,
+        )
     source_file = _basename(source, "file", invalid)
     if not source_file.endswith(".ndjson"):
         raise invalid(f"source file {source_file!r} is not a segment")
@@ -293,6 +338,20 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
     )
 
     seal = _section(document, "seal", invalid)
+    if production and version == ARCHIVE_RECEIPT_VERSION:
+        _require_exact_keys(
+            seal,
+            {
+                "file",
+                "byte_length",
+                "sha256",
+                "key",
+                "provider_checksum",
+                "provider_checksum_algorithm",
+            },
+            "seal",
+            invalid,
+        )
     seal_file = _basename(seal, "file", invalid)
     if not seal_file.endswith(".seal.json"):
         raise invalid(f"seal file {seal_file!r} is not a sidecar")
@@ -313,6 +372,20 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
     seal_key = _text(seal, "key", invalid)
 
     data = _section(document, "object", invalid)
+    if production and version == ARCHIVE_RECEIPT_VERSION:
+        _require_exact_keys(
+            data,
+            {
+                "key",
+                "byte_length",
+                "sha256",
+                "provider_checksum",
+                "provider_checksum_algorithm",
+                "content_encoding",
+            },
+            "object",
+            invalid,
+        )
     data_key = _text(data, "key", invalid)
     data_stored = StoredIdentity(
         sha256=_digest(data, "sha256", invalid),
@@ -322,24 +395,43 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
     if content_encoding != "zstd":
         raise invalid(f"content_encoding {content_encoding!r} is not zstd")
 
-    location_field = "bucket" if production else "store"
-    location = _text(data, location_field, invalid)
-    if _text(seal, location_field, invalid) != location:
-        raise invalid("the seal and data objects name different locations")
-
+    provider = "local"
+    location = ""
     provider_checksum: str | None = None
+    provider_checksum_algorithm: str | None = None
+    seal_provider_checksum: str | None = None
+    seal_provider_checksum_algorithm: str | None = None
     if production:
-        provider_checksum = _text(data, "s3_checksum_sha256", invalid)
-        # The service-returned representation and the normalized hex digest are
-        # two claims about one object; a receipt whose own two claims disagree
-        # cannot verify anything else.
-        try:
-            decoded = base64.b64decode(provider_checksum, validate=True)
-        except Exception as error:  # noqa: BLE001 - any decode failure is the same fault
-            raise invalid(f"s3_checksum_sha256 is not base64: {error}") from error
-        if decoded.hex() != data_stored.sha256:
-            raise invalid("s3_checksum_sha256 disagrees with the recorded sha256")
+        if version == 1:
+            provider = None
+            location = _text(data, "bucket", invalid)
+            if _text(seal, "bucket", invalid) != location:
+                raise invalid("the seal and data objects name different locations")
+            provider_checksum = _text(data, "s3_checksum_sha256", invalid)
+            provider_checksum_algorithm = "SHA256"
+            seal_provider_checksum = base64.b64encode(bytes.fromhex(seal_stored.sha256)).decode("ascii")
+            seal_provider_checksum_algorithm = "SHA256"
+            try:
+                decoded = base64.b64decode(provider_checksum, validate=True)
+            except Exception as error:  # noqa: BLE001 - any decode failure is the same fault
+                raise invalid(f"s3_checksum_sha256 is not base64: {error}") from error
+            if decoded.hex() != data_stored.sha256:
+                raise invalid("s3_checksum_sha256 disagrees with the recorded sha256")
+        else:
+            store = _section(document, "store", invalid)
+            _require_exact_keys(store, {"provider", "location"}, "store", invalid)
+            provider = _text(store, "provider", invalid)
+            location = _text(store, "location", invalid)
+            provider_checksum = _text(data, "provider_checksum", invalid)
+            provider_checksum_algorithm = _text(data, "provider_checksum_algorithm", invalid)
+            seal_provider_checksum = _text(seal, "provider_checksum", invalid)
+            seal_provider_checksum_algorithm = _text(
+                seal, "provider_checksum_algorithm", invalid
+            )
     else:
+        location = _text(data, "store", invalid)
+        if _text(seal, "store", invalid) != location:
+            raise invalid("the seal and data objects name different locations")
         for forbidden in ("bucket", "s3_checksum_sha256"):
             if forbidden in data or forbidden in seal:
                 raise invalid(f"a local conformance receipt must not carry {forbidden!r}")
@@ -347,6 +439,20 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
             raise invalid("a local conformance receipt must record that it authorizes nothing")
 
     compression = _section(document, "compression", invalid)
+    if production and version == ARCHIVE_RECEIPT_VERSION:
+        _require_exact_keys(
+            compression,
+            {
+                "algorithm",
+                "level",
+                "frame_checksum",
+                "dictionary",
+                "frame_count",
+                "encoder",
+            },
+            "compression",
+            invalid,
+        )
     expected = compression_contract(compression.get("encoder", ""))
     for field, value in expected.items():
         if field == "encoder":
@@ -371,14 +477,25 @@ def parse_archive_receipt(document: Any, *, path: Path) -> ArchiveReceipt:
         seal_stored=seal_stored,
         data_key=data_key,
         data_stored=data_stored,
+        provider=provider,
         location=location,
         provider_checksum=provider_checksum,
+        provider_checksum_algorithm=provider_checksum_algorithm,
+        seal_provider_checksum=seal_provider_checksum,
+        seal_provider_checksum_algorithm=seal_provider_checksum_algorithm,
         content_encoding=content_encoding,
         compression=compression,
         verified_at_ns=verified_at_ns,
         archiver_version=archiver_version,
         document=document,
     )
+
+
+def _require_exact_keys(
+    value: dict[str, Any], expected: set[str], label: str, invalid
+) -> None:
+    if set(value) != expected:
+        raise invalid(f"{label} fields are {sorted(value)!r}, expected {sorted(expected)!r}")
 
 
 # -- canonical receipts --------------------------------------------------------

@@ -240,6 +240,7 @@ class FailingStore:
 
     def __init__(self, inner, *, fail_put=None, fail_head=None, corrupt_head=False) -> None:
         self.inner = inner
+        self.provider = inner.provider
         self.store_id = inner.store_id
         self.durability = inner.durability
         self._fail_put = fail_put
@@ -549,8 +550,12 @@ class ProductionReceiptTests(ArchiveCase):
     def test_the_receipt_carries_the_normative_production_fields(self) -> None:
         self.archiver.sweep()
         document = json.loads(self.receipt_path.read_text(encoding="utf-8"))
-        self.assertEqual(document["archive_receipt_version"], 1)
+        self.assertEqual(document["archive_receipt_version"], 2)
         self.assertNotIn("local_archive_receipt_version", document)
+        self.assertEqual(document["store"], {
+            "provider": self.store.provider,
+            "location": self.store.store_id,
+        })
         self.assertEqual(document["object"]["content_encoding"], "zstd")
         self.assertEqual(document["compression"], {
             "algorithm": "zstd",
@@ -561,8 +566,8 @@ class ProductionReceiptTests(ArchiveCase):
             "encoder": document["compression"]["encoder"],
         })
         self.assertTrue(document["compression"]["encoder"].startswith("python-zstandard/"))
-        self.assertIn("bucket", document["object"])
-        self.assertIn("s3_checksum_sha256", document["object"])
+        self.assertIn("provider_checksum", document["object"])
+        self.assertIn("provider_checksum_algorithm", document["object"])
         receipt = read_archive_receipt(self.receipt_path)
         self.assertTrue(receipt.is_production)
         verify_archive(self.store, receipt)
@@ -570,10 +575,11 @@ class ProductionReceiptTests(ArchiveCase):
     def test_a_provider_checksum_that_disagrees_with_its_own_digest_is_refused(self) -> None:
         self.archiver.sweep()
         document = json.loads(self.receipt_path.read_text(encoding="utf-8"))
-        document["object"]["s3_checksum_sha256"] = "AAAA" + document["object"]["s3_checksum_sha256"][4:]
+        document["object"]["provider_checksum"] = "AAAA"
         self.receipt_path.write_text(json.dumps(document), encoding="utf-8")
-        with self.assertRaises(ReceiptError):
-            read_archive_receipt(self.receipt_path)
+        receipt = read_archive_receipt(self.receipt_path)
+        with self.assertRaises(VerificationError):
+            verify_archive(self.store, receipt)
 
 
 class ReceiptLocationTests(ArchiveCase):

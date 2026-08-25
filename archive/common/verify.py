@@ -58,6 +58,15 @@ def verify_archive(store: ObjectStore, receipt: ArchiveReceipt) -> ArchiveVerifi
             f"{store.store_id!r}. A receipt verifies only against the location it names, even "
             "when the same keys and bytes exist elsewhere."
         )
+    if (
+        receipt.is_production
+        and receipt.provider is not None
+        and receipt.provider != store.provider
+    ):
+        raise VerificationError(
+            f"receipt {receipt.path.name} names provider {receipt.provider!r}; this store is "
+            f"{store.provider!r}"
+        )
     data = _head(store, receipt.data_key)
     if not data.matches(receipt.data_stored):
         raise VerificationError(
@@ -75,32 +84,34 @@ def verify_archive(store: ObjectStore, receipt: ArchiveReceipt) -> ArchiveVerifi
         )
 
     if receipt.is_production:
-        expected = provider_checksum_of(receipt.data_stored.sha256)
-        if receipt.provider_checksum != expected:
+        if (
+            data.provider_checksum != receipt.provider_checksum
+            or data.provider_checksum_algorithm != receipt.provider_checksum_algorithm
+        ):
             raise VerificationError(
-                f"receipt {receipt.path.name} records a provider checksum that is not the "
-                "base64 form of its own sha256"
+                f"the store reports different provider checksum evidence for {receipt.data_key}"
             )
-        if data.provider_checksum != expected:
+        if (
+            seal.provider_checksum != receipt.seal_provider_checksum
+            or seal.provider_checksum_algorithm != receipt.seal_provider_checksum_algorithm
+        ):
             raise VerificationError(
-                f"the store reports provider checksum {data.provider_checksum!r} for "
-                f"{receipt.data_key}, not the receipted {expected!r}"
+                f"the store reports different provider checksum evidence for {receipt.seal_key}"
             )
-        # §10's production tightening: both objects must carry a retrievable
-        # full-object SHA-256, and both must carry the metadata the archiver
-        # actually requested rather than whatever the object happens to have.
-        # The seal's own checksum is proved here rather than recorded in the
-        # receipt (`document`), so its algorithm is checked the same way.
-        if data.provider_checksum_algorithm != "SHA256":
-            raise VerificationError(
-                f"archive object {receipt.data_key} reports checksum algorithm "
-                f"{data.provider_checksum_algorithm!r}, not SHA256"
-            )
-        if seal.provider_checksum_algorithm != "SHA256":
-            raise VerificationError(
-                f"archived seal {receipt.seal_key} reports checksum algorithm "
-                f"{seal.provider_checksum_algorithm!r}, not SHA256"
-            )
+        # Version 1 was explicitly the S3 SHA-256 contract. Keep validating it
+        # strictly while version 2 allows a provider-native checksum because
+        # ObjectMetadata.sha256 has already been established from the actual
+        # stored bytes (a generation-pinned readback on GCS).
+        if receipt.document["archive_receipt_version"] == 1:
+            expected = provider_checksum_of(receipt.data_stored.sha256)
+            if receipt.provider_checksum != expected:
+                raise VerificationError(
+                    f"receipt {receipt.path.name} has an invalid S3 SHA256 checksum"
+                )
+            if data.provider_checksum_algorithm != "SHA256":
+                raise VerificationError(
+                    f"archive object {receipt.data_key} has no S3 SHA256 proof"
+                )
         if data.content_type != NDJSON_CONTENT_TYPE:
             raise VerificationError(
                 f"archive object {receipt.data_key} has content type {data.content_type!r}, "

@@ -194,10 +194,14 @@ docker compose -f compose.yaml -f compose.targeter-v2.yaml up --no-deps -d \
 ```
 
 Add `--profile kalshi splice-kalshi` only on a host with working Kalshi
-credentials. Production publication defaults to the S3 backend and refuses
-missing bucket, region, or expected-owner configuration. Instance/task roles
-are preferred; exported AWS credentials are forwarded only to S3-facing
-services.
+credentials. Targeter uses the same `ARCHIVE_BACKEND` as raw and canonical
+archival; select native GCS with `ARCHIVE_BACKEND=gcs` and
+`ARCHIVE_GCS_BUCKET`. GCS uses Application Default Credentials; on GCE, prefer
+an attached service account.
+The provider-neutral Targeter production run receipt is version 3 and records
+the store provider/location plus each object's provider checksum. GCS CRC32C is
+not treated as SHA-256: the shared GCS adapter recomputes SHA-256 from a complete
+generation-pinned readback before the receipt can be published.
 
 ## 6. Phase 10 — audit and rollout gate
 
@@ -253,9 +257,12 @@ Two commands, deliberately separate, mirroring `archive/PHASE_4_RAW_ARCHIVE_REAP
 §7.1: uploading must never be the last step before deleting.
 
 ```bash
-python -m targeter.v2.run_archiver_cli --output-root … --archive-root …
-python -m targeter.v2.run_reaper_cli   --output-root … --live-root … --archive-root …
+python -m targeter.v2.run_archiver_cli --output-root …
+python -m targeter.v2.run_reaper_cli   --output-root … --live-root …
 ```
+
+Both commands obtain the archive backend and provider details from the
+`ARCHIVE_*` process environment. Compose supplies those values from `.env`.
 
 ### 7.1 The archiver sweep
 

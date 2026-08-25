@@ -10,13 +10,13 @@ archive receipt last.
 
 from __future__ import annotations
 
-import base64
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from archive.archiver.publish import ArchiveFile, publish_files
 from archive.common.durable import confirm_durable, write_json_durable
 from archive.common.receipts import (
     LOCAL,
@@ -35,7 +35,6 @@ from archive.storage.base import (
     ObjectMetadata,
     ObjectStore,
     ObjectStoreError,
-    provider_checksum_of,
 )
 from encoder import CodecError, StoredIdentity, decode_stream, stored_identity_of
 
@@ -47,7 +46,8 @@ CONFLICT = "conflict"
 KEY_PREFIX = "canonical"
 PRODUCTION_RECEIPT_FILE = "canonical_archive_receipt.json"
 LOCAL_RECEIPT_FILE = "canonical_archive_receipt.local.json"
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
+LOCAL_RECEIPT_VERSION = 1
 ARCHIVER_VERSION = 1
 
 __all__ = [
@@ -81,6 +81,7 @@ class CanonicalObject:
     stored: StoredIdentity
     location: str
     provider_checksum: str | None
+    provider_checksum_algorithm: str | None
     content_type: str
     content_encoding: str | None
 
@@ -91,6 +92,7 @@ class CanonicalArchiveReceipt:
     path: Path
     window_start_ns: int
     window_end_ns: int
+    provider: str | None
     location: str
     evidence: CanonicalObject
     provenance: CanonicalObject
@@ -147,8 +149,10 @@ def canonical_object_keys(
     path = Path(receipt_path)
     window = path.parent.name
     date = path.parent.parent.name
-    if path.name != "receipt.json" or not window.startswith("window=") or not date.startswith(
-        "date="
+    if (
+        path.name != "receipt.json"
+        or not window.startswith("window=")
+        or not date.startswith("date=")
     ):
         raise CanonicalArchiveReceiptError(
             f"canonical receipt {path} is not under date=<date>/window=<start>/receipt.json"
@@ -217,7 +221,9 @@ class CanonicalArchiver:
         try:
             source = read_canonical_receipt(path)
             marker = path.with_name(
-                PRODUCTION_RECEIPT_FILE if self.receipt_kind == PRODUCTION else LOCAL_RECEIPT_FILE
+                PRODUCTION_RECEIPT_FILE
+                if self.receipt_kind == PRODUCTION
+                else LOCAL_RECEIPT_FILE
             )
             if marker.is_file():
                 existing = read_canonical_archive_receipt(marker)
@@ -248,15 +254,21 @@ class CanonicalArchiver:
         if marker.kind != self.receipt_kind:
             raise CanonicalArchiveReceiptError("canonical archive receipt kind changed")
         if marker.location != self.store.store_id:
-            raise CanonicalArchiveReceiptError("canonical archive receipt names another store")
+            raise CanonicalArchiveReceiptError(
+                "canonical archive receipt names another store"
+            )
         if (marker.window_start_ns, marker.window_end_ns) != (
             source.window_start_ns,
             source.window_end_ns,
         ):
-            raise CanonicalArchiveReceiptError("canonical archive receipt names another window")
+            raise CanonicalArchiveReceiptError(
+                "canonical archive receipt names another window"
+            )
         expected_keys = canonical_object_keys(source.path)
         if tuple(item.key for item in _objects(marker)) != expected_keys:
-            raise CanonicalArchiveReceiptError("canonical archive receipt names unexpected keys")
+            raise CanonicalArchiveReceiptError(
+                "canonical archive receipt names unexpected keys"
+            )
         receipt_identity = _file_identity(source.path)
         expected = (source.evidence.stored, source.provenance.stored, receipt_identity)
         if tuple(item.stored for item in _objects(marker)) != expected:
@@ -271,39 +283,35 @@ class CanonicalArchiver:
 
         receipt_identity = _file_identity(source.path)
         keys = canonical_object_keys(source.path)
-        paths = (
-            source.path.parent / source.evidence.file,
-            source.path.parent / source.provenance.file,
-            source.path,
+        metadata = publish_files(
+            self.store,
+            (
+                ArchiveFile(
+                    source.path.parent / source.evidence.file,
+                    keys[0],
+                    source.evidence.stored,
+                    NDJSON_CONTENT_TYPE,
+                    ZSTD_CONTENT_ENCODING,
+                ),
+                ArchiveFile(
+                    source.path.parent / source.provenance.file,
+                    keys[1],
+                    source.provenance.stored,
+                    NDJSON_CONTENT_TYPE,
+                    ZSTD_CONTENT_ENCODING,
+                ),
+                ArchiveFile(source.path, keys[2], receipt_identity, JSON_CONTENT_TYPE),
+            ),
         )
-        identities = (source.evidence.stored, source.provenance.stored, receipt_identity)
-        metadata = []
-        for path, key, identity, content_type, content_encoding in zip(
-            paths,
-            keys,
-            identities,
-            (NDJSON_CONTENT_TYPE, NDJSON_CONTENT_TYPE, JSON_CONTENT_TYPE),
-            (ZSTD_CONTENT_ENCODING, ZSTD_CONTENT_ENCODING, None),
-            strict=True,
-        ):
-            with path.open("rb") as reader:
-                metadata.append(
-                    self.store.put_immutable(
-                        key,
-                        reader,
-                        identity,
-                        content_type=content_type,
-                        content_encoding=content_encoding,
-                    )
-                )
 
         document = _build_receipt(
             kind=self.receipt_kind,
             source=source,
             keys=keys,
             receipt_identity=receipt_identity,
+            provider=self.store.provider,
             location=self.store.store_id,
-            metadata=tuple(metadata),
+            metadata=metadata,
             verified_at_ns=0,
         )
         parsed = parse_canonical_archive_receipt(document, path=marker)
@@ -324,12 +332,12 @@ def _build_receipt(
     source: CanonicalReceipt,
     keys: tuple[str, str, str],
     receipt_identity: StoredIdentity,
+    provider: str,
     location: str,
     metadata: tuple[ObjectMetadata, ObjectMetadata, ObjectMetadata],
     verified_at_ns: int,
 ) -> dict[str, Any]:
     production = kind == PRODUCTION
-    location_field = "bucket" if production else "store"
 
     def entry(
         file: str,
@@ -341,7 +349,6 @@ def _build_receipt(
     ) -> dict[str, Any]:
         value = {
             "file": file,
-            location_field: location,
             "key": key,
             "byte_length": identity.byte_length,
             "sha256": identity.sha256,
@@ -349,7 +356,10 @@ def _build_receipt(
             "content_encoding": ZSTD_CONTENT_ENCODING if compressed else None,
         }
         if production:
-            value["s3_checksum_sha256"] = remote.provider_checksum
+            value["provider_checksum"] = remote.provider_checksum
+            value["provider_checksum_algorithm"] = remote.provider_checksum_algorithm
+        else:
+            value["store"] = location
         return value
 
     document = {
@@ -357,11 +367,15 @@ def _build_receipt(
             "canonical_archive_receipt_version"
             if production
             else "local_canonical_archive_receipt_version"
-        ): RECEIPT_VERSION,
+        ): (RECEIPT_VERSION if production else LOCAL_RECEIPT_VERSION),
         "window_start_ns": source.window_start_ns,
         "window_end_ns": source.window_end_ns,
         "evidence": entry(
-            source.evidence.file, keys[0], source.evidence.stored, metadata[0], compressed=True
+            source.evidence.file,
+            keys[0],
+            source.evidence.stored,
+            metadata[0],
+            compressed=True,
         ),
         "provenance": entry(
             source.provenance.file,
@@ -376,8 +390,12 @@ def _build_receipt(
         "verified_at_ns": verified_at_ns,
         "archiver_version": ARCHIVER_VERSION,
     }
+    if production:
+        document["store"] = {"provider": provider, "location": location}
     if not production:
-        document.update({"durability": "local_conformance", "authorizes_deletion": False})
+        document.update(
+            {"durability": "local_conformance", "authorizes_deletion": False}
+        )
     return document
 
 
@@ -386,7 +404,9 @@ def read_canonical_archive_receipt(path: Path) -> CanonicalArchiveReceipt:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise CanonicalArchiveReceiptError(f"unreadable canonical archive receipt {path}: {error}")
+        raise CanonicalArchiveReceiptError(
+            f"unreadable canonical archive receipt {path}: {error}"
+        )
     return parse_canonical_archive_receipt(document, path=path)
 
 
@@ -394,7 +414,9 @@ def parse_canonical_archive_receipt(
     document: Any, *, path: Path
 ) -> CanonicalArchiveReceipt:
     def invalid(detail: str) -> CanonicalArchiveReceiptError:
-        return CanonicalArchiveReceiptError(f"invalid canonical archive receipt {path}: {detail}")
+        return CanonicalArchiveReceiptError(
+            f"invalid canonical archive receipt {path}: {detail}"
+        )
 
     if not isinstance(document, dict):
         raise invalid("receipt is not an object")
@@ -408,7 +430,8 @@ def parse_canonical_archive_receipt(
         if production
         else document["local_canonical_archive_receipt_version"]
     )
-    if version != RECEIPT_VERSION:
+    supported_versions = {1, RECEIPT_VERSION} if production else {1}
+    if version not in supported_versions:
         raise invalid(f"unsupported version {version!r}")
     expected_name = PRODUCTION_RECEIPT_FILE if production else LOCAL_RECEIPT_FILE
     if path.name != expected_name:
@@ -423,13 +446,17 @@ def parse_canonical_archive_receipt(
         "archiver_version",
     }
     expected_fields = common_fields | (
-        {"canonical_archive_receipt_version"}
-        if production
-        else {
-            "local_canonical_archive_receipt_version",
-            "durability",
-            "authorizes_deletion",
-        }
+        {"canonical_archive_receipt_version", "store"}
+        if production and version == RECEIPT_VERSION
+        else (
+            {"canonical_archive_receipt_version"}
+            if production
+            else {
+                "local_canonical_archive_receipt_version",
+                "durability",
+                "authorizes_deletion",
+            }
+        )
     )
     _require_fields(document, expected_fields, "receipt", invalid)
     start = _integer(document, "window_start_ns", invalid)
@@ -438,9 +465,26 @@ def parse_canonical_archive_receipt(
         raise invalid("window_start_ns must precede window_end_ns")
     if path.parent.name != f"window={start}":
         raise invalid("window_start_ns disagrees with the receipt path")
-    location_field = "bucket" if production else "store"
+    if production and version == RECEIPT_VERSION:
+        store = document.get("store")
+        if not isinstance(store, dict) or set(store) != {"provider", "location"}:
+            raise invalid("store must contain exactly provider and location")
+        provider = _text(store, "provider", invalid)
+        location = _text(store, "location", invalid)
+        location_field = None
+    else:
+        provider = None if production else "local"
+        location = ""
+        location_field = "bucket" if production else "store"
     evidence = _parse_object(
-        document, "evidence", "evidence.ndjson.zst", location_field, production, True, invalid
+        document,
+        "evidence",
+        "evidence.ndjson.zst",
+        location_field,
+        production,
+        version,
+        True,
+        invalid,
     )
     provenance = _parse_object(
         document,
@@ -448,16 +492,32 @@ def parse_canonical_archive_receipt(
         "provenance.ndjson.zst",
         location_field,
         production,
+        version,
         True,
         invalid,
     )
     canonical_receipt = _parse_object(
-        document, "canonical_receipt", "receipt.json", location_field, production, False, invalid
+        document,
+        "canonical_receipt",
+        "receipt.json",
+        location_field,
+        production,
+        version,
+        False,
+        invalid,
     )
-    if len({item.location for item in (evidence, provenance, canonical_receipt)}) != 1:
-        raise invalid("objects name different archive locations")
+    if location_field is not None:
+        if (
+            len({item.location for item in (evidence, provenance, canonical_receipt)})
+            != 1
+        ):
+            raise invalid("objects name different archive locations")
+        location = evidence.location
     expected_keys = canonical_object_keys(path.with_name("receipt.json"))
-    if tuple(item.key for item in (evidence, provenance, canonical_receipt)) != expected_keys:
+    if (
+        tuple(item.key for item in (evidence, provenance, canonical_receipt))
+        != expected_keys
+    ):
         raise invalid("object keys disagree with the canonical window path")
     if not production:
         if document.get("authorizes_deletion") is not False:
@@ -471,7 +531,8 @@ def parse_canonical_archive_receipt(
         path=path,
         window_start_ns=start,
         window_end_ns=end,
-        location=evidence.location,
+        provider=provider,
+        location=location,
         evidence=evidence,
         provenance=provenance,
         canonical_receipt=canonical_receipt,
@@ -484,8 +545,9 @@ def _parse_object(
     document: dict[str, Any],
     field: str,
     expected_file: str,
-    location_field: str,
+    location_field: str | None,
     production: bool,
+    version: int,
     compressed: bool,
     invalid,
 ) -> CanonicalObject:
@@ -494,15 +556,19 @@ def _parse_object(
         raise invalid(f"{field} is not an object")
     expected_fields = {
         "file",
-        location_field,
         "key",
         "byte_length",
         "sha256",
         "content_type",
         "content_encoding",
     }
+    if location_field is not None:
+        expected_fields.add(location_field)
     if production:
-        expected_fields.add("s3_checksum_sha256")
+        if version == 1:
+            expected_fields.add("s3_checksum_sha256")
+        else:
+            expected_fields.update({"provider_checksum", "provider_checksum_algorithm"})
     _require_fields(value, expected_fields, field, invalid)
     file = _text(value, "file", invalid)
     if file != expected_file:
@@ -519,20 +585,24 @@ def _parse_object(
         sha256=_digest(value, "sha256", invalid),
         byte_length=_integer(value, "byte_length", invalid),
     )
-    checksum = _text(value, "s3_checksum_sha256", invalid) if production else None
-    if checksum is not None:
-        try:
-            decoded = base64.b64decode(checksum, validate=True)
-        except Exception as error:  # noqa: BLE001
-            raise invalid(f"{field}.s3_checksum_sha256 is invalid: {error}") from error
-        if decoded.hex() != stored.sha256:
-            raise invalid(f"{field}.s3_checksum_sha256 disagrees with sha256")
+    checksum = None
+    checksum_algorithm = None
+    if production:
+        if version == 1:
+            checksum = _text(value, "s3_checksum_sha256", invalid)
+            checksum_algorithm = "SHA256"
+        else:
+            checksum = _text(value, "provider_checksum", invalid)
+            checksum_algorithm = _text(value, "provider_checksum_algorithm", invalid)
     return CanonicalObject(
         file=file,
         key=_text(value, "key", invalid),
         stored=stored,
-        location=_text(value, location_field, invalid),
+        location=(
+            _text(value, location_field, invalid) if location_field is not None else ""
+        ),
         provider_checksum=checksum,
+        provider_checksum_algorithm=checksum_algorithm,
         content_type=content_type,
         content_encoding=content_encoding,
     )
@@ -545,23 +615,39 @@ def verify_canonical_archive(
         raise CanonicalArchiveVerificationError(
             f"receipt names {receipt.location!r}; configured store is {store.store_id!r}"
         )
+    if (
+        receipt.kind == PRODUCTION
+        and receipt.provider is not None
+        and receipt.provider != store.provider
+    ):
+        raise CanonicalArchiveVerificationError(
+            f"receipt names provider {receipt.provider!r}; configured store is {store.provider!r}"
+        )
     for item in _objects(receipt):
         remote = store.head(item.key)
         if remote is None:
             raise CanonicalArchiveVerificationError(
                 f"canonical archive object {item.key} is absent"
             )
-        if not remote.matches_request(item.stored, item.content_type, item.content_encoding):
+        if not remote.matches_request(
+            item.stored, item.content_type, item.content_encoding
+        ):
             raise CanonicalArchiveVerificationError(
                 f"canonical archive object {item.key} disagrees with its receipt"
             )
         if receipt.kind == PRODUCTION:
-            expected = provider_checksum_of(item.stored.sha256)
-            if item.provider_checksum != expected or remote.provider_checksum != expected:
+            if (
+                item.provider_checksum != remote.provider_checksum
+                or item.provider_checksum_algorithm
+                != remote.provider_checksum_algorithm
+            ):
                 raise CanonicalArchiveVerificationError(
                     f"canonical archive object {item.key} has the wrong provider checksum"
                 )
-            if remote.provider_checksum_algorithm != "SHA256":
+            if (
+                receipt.document["canonical_archive_receipt_version"] == 1
+                and remote.provider_checksum_algorithm != "SHA256"
+            ):
                 raise CanonicalArchiveVerificationError(
                     f"canonical archive object {item.key} has no full-object SHA256 proof"
                 )

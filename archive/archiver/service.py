@@ -1,32 +1,7 @@
-"""Raw-segment archiver: one sealed segment, one ordered commit, one receipt.
+"""Archive each sealed raw segment independently and commit it with a receipt.
 
-```text
-1  parse and structurally validate the seal against its path
-2  create a unique <segment>.ndjson.zst.open
-3  stream the raw bytes through the encoder, calculating both identities
-4  compare logical sha256, byte length and LF count with the seal
-5  fsync the derivative, rename it, fsync the directory
-6  calculate the unchanged seal object's length and digest
-7  publish data and seal through immutable object-store writes
-8  head both objects and verify their actual remote identities
-9  encode the receipt the backend's durability class permits
-10 write it through .open, fsync, rename, fsync the directory
-```
-
-**Step 10 is the archive commit.** A compressed file is not one. A successful
-upload is not one. A key existing in the store is not one. Everything before the
-receipt is a derivative that may be deleted and rebuilt, which is what makes a
-crash at any step recoverable without a decision about what half-happened.
-
-**This module never deletes raw input.** Not on success, not after verification,
-not as a callback. Deletion is a separate authority with a separate command and
-a second receipt — see `archive/reaper/service.py` and §7.
-
-The unit is one segment. An hourly sweep may process hundreds, but their frames
-and commit boundaries never mix: one malformed segment must not erase or rewrite
-another's successful receipt. The exception is an immutable-key conflict, which
-stops the sweep, because a key holding unexpected content means the namespace or
-the store is wrong rather than one file being bad.
+The archiver materializes Zstd, publishes data and seal through ``ObjectStore``,
+verifies them, and writes the receipt last. It never deletes source evidence.
 """
 
 from __future__ import annotations
@@ -38,15 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from archive.archiver.publish import ArchiveFile, publish_files
 from archive.common.durable import confirm_durable, fsync_directory, write_json_durable
-from archive.storage.base import (
-    JSON_CONTENT_TYPE,
-    NDJSON_CONTENT_TYPE,
-    ZSTD_CONTENT_ENCODING,
-    IntegrityConflict,
-    ObjectStore,
-    ObjectStoreError,
-)
 from archive.common.receipts import (
     LOCAL,
     PRODUCTION,
@@ -67,6 +35,14 @@ from archive.common.seal import (
     sealed_segments,
 )
 from archive.common.verify import VerificationError, verify_archive
+from archive.storage.base import (
+    JSON_CONTENT_TYPE,
+    NDJSON_CONTENT_TYPE,
+    ZSTD_CONTENT_ENCODING,
+    IntegrityConflict,
+    ObjectStore,
+    ObjectStoreError,
+)
 from encoder import (
     DEFAULT_ZSTD_LEVEL,
     CodecError,
@@ -202,14 +178,18 @@ class Archiver:
         production shape against a conformance store, which is precisely the
         confusion the two filenames exist to prevent.
         """
-        return PRODUCTION if self.store.durability.receipt_kind == "production" else LOCAL
+        return (
+            PRODUCTION if self.store.durability.receipt_kind == "production" else LOCAL
+        )
 
     # -- sweep -------------------------------------------------------------
 
     def sweep(self, segments: Iterable[tuple[str, Path]] | None = None) -> SweepResult:
         """One complete pass. A key conflict stops it; nothing else does."""
         result = SweepResult(pending=len(pending_segments(self.spool_root)))
-        discovered = sealed_segments(self.spool_root) if segments is None else list(segments)
+        discovered = (
+            sealed_segments(self.spool_root) if segments is None else list(segments)
+        )
         for lane, data_path in discovered:
             outcome = self.archive_segment(lane, data_path)
             result.outcomes.append(outcome)
@@ -250,10 +230,18 @@ class Archiver:
             return self._archive(segment, receipt_path)
         except IntegrityConflict as error:
             return SegmentOutcome(lane, data_path.name, CONFLICT, str(error))
-        except (SealError, CodecError, ObjectStoreError, VerificationError, ReceiptError) as error:
+        except (
+            SealError,
+            CodecError,
+            ObjectStoreError,
+            VerificationError,
+            ReceiptError,
+        ) as error:
             return SegmentOutcome(lane, data_path.name, FAILED, str(error))
         except OSError as error:
-            return SegmentOutcome(lane, data_path.name, FAILED, f"local I/O failure: {error}")
+            return SegmentOutcome(
+                lane, data_path.name, FAILED, f"local I/O failure: {error}"
+            )
 
     def _existing_receipt(
         self, segment: SealedSegment, receipt_path: Path
@@ -269,7 +257,10 @@ class Archiver:
             return None
         receipt = read_archive_receipt(receipt_path)
 
-        if receipt.lane_id != segment.lane or receipt.source_file != segment.data_path.name:
+        if (
+            receipt.lane_id != segment.lane
+            or receipt.source_file != segment.data_path.name
+        ):
             raise ReceiptError(
                 f"archive receipt {receipt_path.name} names {receipt.lane_id}/"
                 f"{receipt.source_file}, not {segment.lane}/{segment.data_path.name}"
@@ -347,21 +338,21 @@ class Archiver:
         seal_identity = _file_identity(segment.seal_path)
         data_key, seal_key = object_keys(segment, prefix=self.key_prefix)
 
-        with derivative.open("rb") as reader:
-            data_metadata = self.store.put_immutable(
-                data_key,
-                reader,
-                result.stored,
-                content_type=NDJSON_CONTENT_TYPE,
-                content_encoding=ZSTD_CONTENT_ENCODING,
-            )
-        with segment.seal_path.open("rb") as reader:
-            self.store.put_immutable(
-                seal_key,
-                reader,
-                seal_identity,
-                content_type=JSON_CONTENT_TYPE,
-            )
+        data_metadata, seal_metadata = publish_files(
+            self.store,
+            (
+                ArchiveFile(
+                    derivative,
+                    data_key,
+                    result.stored,
+                    NDJSON_CONTENT_TYPE,
+                    ZSTD_CONTENT_ENCODING,
+                ),
+                ArchiveFile(
+                    segment.seal_path, seal_key, seal_identity, JSON_CONTENT_TYPE
+                ),
+            ),
+        )
 
         document = build_archive_receipt(
             kind=self.receipt_kind,
@@ -377,10 +368,12 @@ class Archiver:
             seal_stored=seal_identity,
             data_key=data_key,
             data_stored=result.stored,
+            provider=self.store.provider,
             location=self._location(),
-            provider_checksum=(
-                data_metadata.provider_checksum if self.receipt_kind == PRODUCTION else None
-            ),
+            provider_checksum=data_metadata.provider_checksum,
+            provider_checksum_algorithm=data_metadata.provider_checksum_algorithm,
+            seal_provider_checksum=seal_metadata.provider_checksum,
+            seal_provider_checksum_algorithm=seal_metadata.provider_checksum_algorithm,
             encoder=encoder_version(),
             verified_at_ns=0,
         )

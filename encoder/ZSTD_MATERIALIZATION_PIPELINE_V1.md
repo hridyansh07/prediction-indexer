@@ -8,8 +8,10 @@ The implementation-level contract for Step 1 is
 [`PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](../archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md). It binds
 the shared codec, object-store boundary, archiver, reaper, deployment safety gate,
 and test-first acceptance criteria into one changeset.
-The production AWS implementation of that backend is specified in
-[`S3_RAW_ARCHIVE_ADAPTER_V1.md`](../archive/S3_RAW_ARCHIVE_ADAPTER_V1.md).
+The production AWS and Google Cloud implementations of that backend are
+specified in
+[`S3_RAW_ARCHIVE_ADAPTER_V1.md`](../archive/S3_RAW_ARCHIVE_ADAPTER_V1.md) and
+[`GCS_RAW_ARCHIVE_ADAPTER_V1.md`](../archive/GCS_RAW_ARCHIVE_ADAPTER_V1.md).
 
 This document refines `SEALED_CAPTURE_PIPELINE_V1.md` without changing its
 evidence model. A splice still commits exact NDJSON with a seal, and the
@@ -36,8 +38,8 @@ message-framing layer.
 The materialization and archival steps are:
 
 1. **Raw archiver:** a valid sealed splice segment becomes one independently
-   addressable `.ndjson.zst` object in S3, while the original seal remains
-   available beside it.
+   addressable `.ndjson.zst` object in immutable storage, while the original
+   seal remains available beside it.
 2. **Canonical ingester/finalizer:** a finalized window becomes
    `evidence.ndjson.zst`, `provenance.ndjson.zst`, and the `receipt.json` that
    commits them on the local durable filesystem.
@@ -206,7 +208,7 @@ does not publish a receipt.
 
 ### 3.3 Archive receipt
 
-The archive receipt uses this shape; field names are normative:
+Legacy S3 archive receipt version 1 uses this shape; field names are normative:
 
 ```json
 {
@@ -250,9 +252,62 @@ The archive receipt uses this shape; field names are normative:
 }
 ```
 
-Hexadecimal SHA-256 fields use lowercase 64-character hex. The S3 checksum field
-records the exact service-returned representation in addition to the normalized
-hex digest. Times are UTC Unix nanoseconds.
+New production receipts use `archive_receipt_version: 2`. Version 2 replaces
+per-object `bucket` and `s3_checksum_sha256` fields with one top-level store
+identity and provider-neutral checksum evidence:
+
+```json
+{
+  "archive_receipt_version": 2,
+  "store": {"provider": "gcs", "location": "archive-bucket"},
+  "lane_id": "polymarket",
+  "window_start_ns": 0,
+  "window_end_ns": 0,
+  "segment_id": "...",
+  "segment_index": 0,
+  "source": {
+    "file": "<segment>.ndjson",
+    "byte_length": 0,
+    "line_count": 0,
+    "sha256": "..."
+  },
+  "seal": {
+    "file": "<segment>.seal.json",
+    "byte_length": 0,
+    "sha256": "...",
+    "key": "raw/lane=polymarket/date=YYYY-MM-DD/<segment>.seal.json",
+    "provider_checksum": "...",
+    "provider_checksum_algorithm": "CRC32C"
+  },
+  "object": {
+    "key": "raw/lane=polymarket/date=YYYY-MM-DD/<segment>.ndjson.zst",
+    "byte_length": 0,
+    "sha256": "...",
+    "provider_checksum": "...",
+    "provider_checksum_algorithm": "CRC32C",
+    "content_encoding": "zstd"
+  },
+  "compression": {
+    "algorithm": "zstd",
+    "level": 3,
+    "frame_checksum": true,
+    "dictionary": null,
+    "frame_count": 1,
+    "encoder": "python-zstandard/<version>"
+  },
+  "verified_at_ns": 0,
+  "archiver_version": 1
+}
+```
+
+For S3 version 2 receipts, `provider` is `s3`, the algorithm is `SHA256`, and
+the provider checksum is S3's exact base64 representation. For GCS, `provider`
+is `gcs`, the algorithm is `CRC32C`, and the checksum is GCS's exact base64
+representation. In every case the lowercase SHA-256 is independently derived
+from the actual stored bytes. GCS requires a complete generation-pinned
+readback because its object metadata has no SHA-256. All version 2 schemas are
+closed and reject unknown fields. Strict readers retain version 1 support.
+Times are UTC Unix nanoseconds.
 
 The local receipt is immutable once committed. A valid existing receipt causes
 the segment to be skipped only after its structure, local source identity, and
@@ -296,18 +351,19 @@ investigation/replay policy in the sealed-capture specification.
 A raw archive object is never yielded directly to replay. The decoder:
 
 1. obtains the expected identities from the manifest/receipt and original seal;
-2. downloads the compressed object into a bounded-memory staged file while
-   calculating its stored length and SHA-256;
-3. verifies the stored identity and S3 checksum;
-4. decodes exactly one frame with the seal's `byte_length` as a hard maximum and
+2. opens one provider-pinned verified stream, calculating stored SHA-256 and the
+   provider checksum while the object is downloaded once;
+3. verifies provider metadata, stored identity, and checksum at end-of-stream;
+4. concurrently decodes exactly one frame into a private staged logical file,
+   with the seal's `byte_length` as a hard maximum and
    exact expected final length;
 5. calculates logical SHA-256 and LF count during decode;
 6. verifies all logical values against both the archive receipt and seal;
 7. only then exposes the staged decoded segment as trusted replay evidence.
 
-This may use disk twice but never buffers a segment in memory and never exposes
-partially verified records. A limit breach aborts before writing byte
-`seal.byte_length + 1` to the decoded staging file.
+This never buffers a segment in memory, never downloads a selected object twice,
+and never exposes partially verified records. A limit breach aborts before
+writing byte `seal.byte_length + 1` to the decoded staging file.
 
 ## 4. Step 2 — canonical ingester/finalizer
 
