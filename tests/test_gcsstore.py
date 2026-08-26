@@ -14,8 +14,10 @@ from archive.archiver.canonical import (
     read_canonical_archive_receipt,
 )
 from archive.common.receipts import ReceiptError, read_archive_receipt
+from archive.common.verify import verify_archive
 from archive.storage.base import (
     IntegrityConflict,
+    ObjectExpectation,
     ObjectStoreError,
     VerificationFailure,
 )
@@ -179,14 +181,44 @@ class GCSStoreTests(unittest.TestCase):
             (crc(self.data), "CRC32C"),
         )
 
-    def test_head_streams_generation_pinned_raw_bytes_not_custom_metadata(self):
+    def test_verify_uses_provider_metadata_without_downloading_the_object(self):
         self.client.seed(self.key, self.data)
-        result = self.store.head(self.key)
-        self.assertEqual(result.sha256, identity(self.data).sha256)
-        self.assertEqual(
-            self.client.opens[-1][1], self.client.objects[self.key]["generation"]
+        metadata = self.store.head(self.key)
+        assert metadata is not None
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
         )
-        self.assertTrue(self.client.opens[-1][3]["raw_download"])
+        self.client.opens.clear()
+
+        result = self.store.verify(expected)
+
+        self.assertEqual(result.sha256, identity(self.data).sha256)
+        self.assertEqual(self.client.opens, [])
+
+    def test_verify_rejects_receipt_drift_without_downloading_the_object(self):
+        self.client.seed(self.key, self.data)
+        metadata = self.store.head(self.key)
+        assert metadata is not None
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        self.client.objects[self.key]["crc"] = crc(b"different")
+        self.client.opens.clear()
+
+        with self.assertRaises(VerificationFailure):
+            self.store.verify(expected)
+
+        self.assertEqual(self.client.opens, [])
 
     def test_head_absence_and_errors(self):
         self.assertIsNone(self.store.head(self.key))
@@ -197,19 +229,29 @@ class GCSStoreTests(unittest.TestCase):
         finally:
             FakeBlob.reload = original
 
-    def test_head_rejects_provider_crc_or_length_mismatch(self):
+    def test_head_rejects_malformed_provider_crc_or_length(self):
         self.client.seed(self.key, self.data)
-        self.client.objects[self.key]["crc"] = "AAAAAA=="
+        self.client.objects[self.key]["crc"] = "not-base64"
+        with self.assertRaises(VerificationFailure):
+            self.store.head(self.key)
+        self.client.objects[self.key]["crc"] = crc(self.data)
+        self.client.objects[self.key]["size"] = -1
         with self.assertRaises(VerificationFailure):
             self.store.head(self.key)
 
-    def test_head_rejects_identity_metadata_that_disagrees_with_the_bytes(self):
+    def test_head_rejects_invalid_identity_metadata(self):
         self.client.seed(self.key, self.data)
-        self.client.objects[self.key]["metadata"][SHA256_METADATA] = "0" * 64
+        self.client.objects[self.key]["metadata"][SHA256_METADATA] = "invalid"
+        with self.assertRaises(VerificationFailure):
+            self.store.head(self.key)
+        self.client.objects[self.key]["metadata"] = {
+            SHA256_METADATA: identity(self.data).sha256,
+            BYTE_LENGTH_METADATA: str(len(self.data) + 1),
+        }
         with self.assertRaises(VerificationFailure):
             self.store.head(self.key)
 
-    def test_head_rejects_a_key_whose_live_generation_changes_during_readback(self):
+    def test_unreceipted_retry_reads_back_and_rejects_generation_change(self):
         self.client.seed(self.key, self.data)
         original = FakeBlob.open
 
@@ -221,11 +263,11 @@ class GCSStoreTests(unittest.TestCase):
         FakeBlob.open = replace_after_open
         try:
             with self.assertRaises(VerificationFailure):
-                self.store.head(self.key)
+                self.put()
         finally:
             FakeBlob.open = original
 
-    def test_head_rejects_metadata_changes_during_readback(self):
+    def test_unreceipted_retry_reads_back_and_rejects_metadata_change(self):
         self.client.seed(self.key, self.data)
         original = FakeBlob.open
 
@@ -237,9 +279,22 @@ class GCSStoreTests(unittest.TestCase):
         FakeBlob.open = change_metadata_after_open
         try:
             with self.assertRaises(VerificationFailure):
-                self.store.head(self.key)
+                self.put()
         finally:
             FakeBlob.open = original
+
+    def test_unreceipted_identical_retry_keeps_full_readback(self):
+        self.client.seed(self.key, self.data)
+        self.client.opens.clear()
+
+        self.put()
+
+        reads = [entry for entry in self.client.opens if entry[2] == "rb"]
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(
+            reads[0][1], self.client.objects[self.key]["generation"]
+        )
+        self.assertTrue(reads[0][3]["raw_download"])
 
     def test_existing_identical_is_idempotent_but_differences_conflict(self):
         first = self.put()
@@ -292,6 +347,22 @@ class GCSStoreTests(unittest.TestCase):
             FakeBlob.open = original
         self.assertEqual(self.client.objects, {})
 
+    def test_server_checksum_rejection_publishes_no_object_metadata(self):
+        original = FakeBlob.open
+
+        def reject_checksum(blob, mode, **kwargs):
+            if mode == "wb":
+                raise FakeError(400)
+            return original(blob, mode, **kwargs)
+
+        FakeBlob.open = reject_checksum
+        try:
+            with self.assertRaisesRegex(VerificationFailure, "checksum"):
+                self.put()
+        finally:
+            FakeBlob.open = original
+        self.assertEqual(self.client.objects, {})
+
 
 class GCSArchivePipelineTests(unittest.TestCase):
     def setUp(self):
@@ -315,6 +386,17 @@ class GCSArchivePipelineTests(unittest.TestCase):
         self.assertEqual(
             document["store"], {"provider": "gcs", "location": "archive-bucket"}
         )
+        self.assertEqual(
+            [entry[2] for entry in self.client.opens], ["wb", "wb"]
+        )
+
+        self.client.opens.clear()
+        verify_archive(self.store, receipt)
+        self.assertEqual(self.client.opens, [])
+
+        repeated = Archiver(spool, self.store).archive_segment("polymarket", segment)
+        self.assertEqual(repeated.status, "skipped")
+        self.assertEqual(self.client.opens, [])
 
         document["unexpected"] = True
         outcome.receipt_path.write_text(json.dumps(document), encoding="utf-8")
@@ -356,6 +438,14 @@ class GCSArchivePipelineTests(unittest.TestCase):
         )
         for field in ("evidence", "provenance", "canonical_receipt"):
             self.assertEqual(document[field]["provider_checksum_algorithm"], "CRC32C")
+        self.assertEqual(
+            [entry[2] for entry in self.client.opens], ["wb", "wb", "wb"]
+        )
+
+        self.client.opens.clear()
+        repeated = CanonicalArchiver(canonical, self.store).archive_window(source)
+        self.assertEqual(repeated.status, "skipped")
+        self.assertEqual(self.client.opens, [])
 
         receipt = read_canonical_archive_receipt(outcome.receipt_path)
         streamer = ArchivedCanonicalByteStreamer(

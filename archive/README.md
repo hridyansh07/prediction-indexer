@@ -171,9 +171,9 @@ controls.
 
 1. Implement `storage.base.ObjectStore` in a new adapter using immutable,
    conditional publication and bounded streaming reads.
-2. Return SHA-256 verified from actual provider bytes, separate provider
-   checksum evidence, and an explicit durability declaration through `head`;
-   implement receipt comparison through the shared `verify` boundary.
+2. Return the application SHA-256, separate provider checksum evidence, and an
+   explicit durability declaration through `head`; implement provider-specific
+   receipt comparison through the shared `verify` boundary.
 3. Preserve key normalization, identity checks, errors, and no-delete behavior.
 4. Add one import/selection branch in `storage/factory.py` and export the adapter
    intentionally from `storage/__init__.py`.

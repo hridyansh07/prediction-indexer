@@ -642,12 +642,13 @@ ARCHIVE_BACKEND=gcs
 ARCHIVE_GCS_BUCKET=my-dedicated-archive-bucket
 ```
 
-GCS has no server-side SHA-256. The adapter uses a CRC32C-checked conditional
-resumable create, then downloads the exact object generation to recompute
-SHA-256 from the stored bytes. It rechecks both generation and metageneration
-before returning verified metadata. This makes a GCS `head` a full-object read,
-but preserves the same stored-byte SHA-256 proof without trusting custom
-metadata.
+GCS has no server-side SHA-256. The adapter calculates SHA-256 over the exact
+conditional resumable-upload stream while the GCS client and service validate
+CRC32C. It stores that SHA-256 and byte length as custom metadata and records
+the service-returned CRC32C separately in the receipt. Normal `head`, archive
+verification, and reaper checks compare current provider metadata with that
+closed receipt without downloading object bodies. Retrieval pins a generation
+and verifies SHA-256 plus CRC32C while consuming the complete object.
 
 All three `ARCHIVE_S3_*` values are required together; the factory refuses to
 start with only some of them set, and separately refuses to start if any of

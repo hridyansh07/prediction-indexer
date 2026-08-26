@@ -221,9 +221,10 @@ key, byte_length, sha256, provider checksum, content type, content encoding
 ```
 
 The provider checksum is separate from normalized lowercase SHA-256. An S3 ETag
-is never a provider SHA-256 checksum. GCS CRC32C is recorded as provider
-evidence but cannot replace SHA-256; the GCS adapter recomputes SHA-256 through
-a complete generation-pinned readback.
+is never a provider SHA-256 checksum. GCS records the SHA-256 calculated over
+the exact upload stream as custom metadata and records the service-validated
+CRC32C separately as provider evidence. Normal GCS verification compares both
+with the receipt without downloading the object body.
 
 Keys are normalized relative POSIX paths. Empty components, `.`, `..`, absolute
 paths, backslashes, and traversal outside the configured root are rejected.
@@ -238,18 +239,18 @@ paths, backslashes, and traversal outside the configured root are rejected.
 - Transport or verification failure: return failure; never report the key as
   committed.
 
-`head` used for receipt verification must obtain or calculate actual object
-length and SHA-256. It may not simply echo metadata supplied at `put` time.
-`verify` compares that provider-authenticated result with one complete receipt
-expectation; archive consumers map their strict receipt schemas into this one
-operation rather than reproducing identity, checksum, and content-metadata
-comparisons.
+`head` used for receipt verification must obtain current provider metadata. S3
+returns server SHA-256; GCS returns server CRC32C and the application SHA-256
+bound to its checksum-validated immutable upload. `verify` compares that
+provider-specific result with one complete receipt expectation; archive
+consumers map their strict receipt schemas into this one operation rather than
+reproducing identity, checksum, and content-metadata comparisons.
 
 Replay uses `open_verified` instead of `head` followed by `open`. The adapter
 checks receipt-owned length, SHA-256, provider checksum, content metadata, and
 the provider's immutable generation/version while one bounded stream is
 consumed. Leaving that stream before EOF is a verification failure. `head`
-retains its complete re-verification semantics for audits and deletion gates.
+remains metadata-only where the provider supplies sufficient receipt evidence.
 
 ### 5.3 LocalObjectStore
 

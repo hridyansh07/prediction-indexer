@@ -200,8 +200,10 @@ archival; select native GCS with `ARCHIVE_BACKEND=gcs` and
 an attached service account.
 The provider-neutral Targeter production run receipt is version 3 and records
 the store provider/location plus each object's provider checksum. GCS CRC32C is
-not treated as SHA-256: the shared GCS adapter recomputes SHA-256 from a complete
-generation-pinned readback before the receipt can be published.
+not treated as SHA-256: the shared GCS adapter binds the application SHA-256 to
+the checksum-validated immutable upload and records service-returned CRC32C as
+separate provider evidence. Normal receipt verification is metadata-only;
+retrieval verifies both checksums while consuming the complete object.
 
 ## 6. Phase 10 — audit and rollout gate
 

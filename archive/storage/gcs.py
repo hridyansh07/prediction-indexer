@@ -143,10 +143,20 @@ class GCSObjectStore:
             raise ObjectStoreError(
                 f"{key}: reading uploaded metadata failed: {error}"
             ) from error
-        return self._uploaded_metadata(key, blob, expected_identity)
+        return self._uploaded_metadata(
+            key,
+            blob,
+            expected_identity,
+            content_type,
+            content_encoding,
+        )
 
     def head(self, key: str) -> ObjectMetadata | None:
         key = normalize_key(key)
+        blob = self._reload_blob(key)
+        return None if blob is None else self._metadata_from_blob(key, blob)
+
+    def _reload_blob(self, key: str) -> Any | None:
         blob = self._client.bucket(self.bucket).blob(key)
         try:
             blob.reload()
@@ -154,10 +164,7 @@ class GCSObjectStore:
             if _status(error) == 404:
                 return None
             raise ObjectStoreError(f"heading {key}: {error}") from error
-        generation = blob.generation
-        if generation is None:
-            raise ObjectStoreError(f"{key}: GCS returned no generation")
-        return self._verify_blob(key, blob, generation)
+        return blob
 
     def verify(self, expected: ObjectExpectation) -> ObjectMetadata:
         return verify_metadata(self.head(expected.key), expected)
@@ -196,26 +203,10 @@ class GCSObjectStore:
         blob = self._client.bucket(self.bucket).blob(key)
         try:
             blob.reload()
+            metadata = self._metadata_from_blob(key, blob)
+            verify_metadata(metadata, expected)
             generation = blob.generation
             metageneration = blob.metageneration
-            if generation is None or metageneration is None:
-                raise VerificationFailure(
-                    f"{key}: GCS returned no generation or metageneration"
-                )
-            if (
-                blob.size != expected.stored.byte_length
-                or blob.crc32c != expected.provider_checksum
-                or blob.metadata
-                != {
-                    SHA256_METADATA: expected.stored.sha256,
-                    BYTE_LENGTH_METADATA: str(expected.stored.byte_length),
-                }
-                or blob.content_type != expected.content_type
-                or blob.content_encoding != expected.content_encoding
-            ):
-                raise VerificationFailure(
-                    f"{key}: GCS object metadata disagrees with its receipt"
-                )
             handle = self._pinned_blob(key, generation).open("rb", raw_download=True)
         except (ObjectStoreError, VerificationFailure):
             raise
@@ -276,26 +267,69 @@ class GCSObjectStore:
 
     @staticmethod
     def _uploaded_metadata(
-        key: str, blob: Any, expected: StoredIdentity
+        key: str,
+        blob: Any,
+        expected: StoredIdentity,
+        content_type: str | None,
+        content_encoding: str | None,
     ) -> ObjectMetadata:
-        custom = blob.metadata
-        if (
-            blob.size != expected.byte_length
-            or not isinstance(blob.crc32c, str)
-            or custom
-            != {
-                SHA256_METADATA: expected.sha256,
-                BYTE_LENGTH_METADATA: str(expected.byte_length),
-            }
-        ):
+        metadata = GCSObjectStore._metadata_from_blob(key, blob)
+        if not metadata.matches_request(expected, content_type, content_encoding):
             raise VerificationFailure(
                 f"{key}: uploaded GCS metadata disagrees with the request"
             )
+        return metadata
+
+    @staticmethod
+    def _metadata_from_blob(key: str, blob: Any) -> ObjectMetadata:
+        provider_crc = blob.crc32c
+        length = blob.size
+        if blob.generation is None or blob.metageneration is None:
+            raise VerificationFailure(
+                f"{key}: GCS returned no generation or metageneration"
+            )
+        if (
+            not isinstance(provider_crc, str)
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length < 0
+        ):
+            raise VerificationFailure(f"{key}: GCS returned malformed length or CRC32C")
+        try:
+            decoded_crc = base64.b64decode(provider_crc, validate=True)
+        except Exception as error:
+            raise VerificationFailure(f"{key}: GCS returned malformed CRC32C") from error
+        if len(decoded_crc) != 4:
+            raise VerificationFailure(f"{key}: GCS returned malformed CRC32C")
+        custom = blob.metadata
+        if not isinstance(custom, dict) or set(custom) != {
+            SHA256_METADATA,
+            BYTE_LENGTH_METADATA,
+        }:
+            raise VerificationFailure(f"{key}: GCS identity metadata is malformed")
+        sha256 = custom[SHA256_METADATA]
+        try:
+            custom_length = int(custom[BYTE_LENGTH_METADATA])
+        except (TypeError, ValueError) as error:
+            raise VerificationFailure(
+                f"{key}: GCS identity metadata is malformed"
+            ) from error
+        identity = StoredIdentity(sha256=sha256, byte_length=custom_length)
+        try:
+            _validate_identity(identity)
+        except ObjectStoreError as error:
+            raise VerificationFailure(
+                f"{key}: GCS identity metadata is malformed"
+            ) from error
+        if custom[BYTE_LENGTH_METADATA] != str(length):
+            raise VerificationFailure(
+                f"{key}: GCS identity metadata disagrees with object length"
+            )
         return ObjectMetadata(
             key,
-            expected.byte_length,
-            expected.sha256,
-            blob.crc32c,
+            length,
+            sha256,
+            provider_crc,
             "CRC32C",
             blob.content_type,
             blob.content_encoding,
@@ -304,17 +338,8 @@ class GCSObjectStore:
     def _verify_blob(
         self, key: str, metadata_blob: Any, generation: Any
     ) -> ObjectMetadata:
-        provider_crc = metadata_blob.crc32c
-        length = metadata_blob.size
+        metadata = self._metadata_from_blob(key, metadata_blob)
         metageneration = metadata_blob.metageneration
-        if (
-            not isinstance(provider_crc, str)
-            or not isinstance(length, int)
-            or length < 0
-        ):
-            raise VerificationFailure(f"{key}: GCS returned malformed length or CRC32C")
-        if metageneration is None:
-            raise VerificationFailure(f"{key}: GCS returned no metageneration")
         try:
             with self._pinned_blob(key, generation).open(
                 "rb", raw_download=True
@@ -324,14 +349,14 @@ class GCSObjectStore:
             raise ObjectStoreError(
                 f"reading generation {generation} of {key}: {error}"
             ) from error
-        if actual_length != length or crc32c != provider_crc:
+        if (
+            actual_length != metadata.byte_length
+            or crc32c != metadata.provider_checksum
+        ):
             raise VerificationFailure(
                 f"{key}: generation-pinned bytes disagree with GCS metadata"
             )
-        if metadata_blob.metadata != {
-            SHA256_METADATA: sha256,
-            BYTE_LENGTH_METADATA: str(actual_length),
-        }:
+        if sha256 != metadata.sha256:
             raise VerificationFailure(
                 f"{key}: GCS identity metadata disagrees with its bytes"
             )
@@ -348,15 +373,7 @@ class GCSObjectStore:
             )
         if current.metageneration != metageneration:
             raise VerificationFailure(f"{key}: metadata changed during verification")
-        return ObjectMetadata(
-            key,
-            actual_length,
-            sha256,
-            crc32c,
-            "CRC32C",
-            metadata_blob.content_type,
-            metadata_blob.content_encoding,
-        )
+        return metadata
 
     @staticmethod
     def _identity(reader: BinaryIO) -> tuple[str, str, int]:
@@ -374,11 +391,12 @@ class GCSObjectStore:
         content_type: str | None,
         content_encoding: str | None,
     ) -> ObjectMetadata:
-        metadata = self.head(key)
-        if metadata is None:
+        blob = self._reload_blob(key)
+        if blob is None:
             raise ObjectStoreError(
                 f"{key}: conditional create failed but object is absent"
             )
+        metadata = self._verify_blob(key, blob, blob.generation)
         if metadata.matches_request(identity, content_type, content_encoding):
             return metadata
         raise IntegrityConflict(f"key {key} already holds different bytes or metadata")
