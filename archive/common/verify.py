@@ -30,7 +30,7 @@ from archive.storage.base import (
     ObjectStore,
     VerificationFailure,
 )
-from archive.storage.verification import verify_objects
+from archive.storage.verification import verify_metadata_objects
 from archive.common.receipts import ArchiveReceipt
 from encoder import LogicalIdentity, decode_stream
 
@@ -71,7 +71,7 @@ def verify_archive(store: ObjectStore, receipt: ArchiveReceipt) -> ArchiveVerifi
         )
     if receipt.is_production:
         try:
-            data, seal = verify_objects(
+            data, seal = verify_metadata_objects(
                 store,
                 (
                     ObjectExpectation(

@@ -167,13 +167,38 @@ it is not an independent durability domain and cannot authorize deletion; even a
 separate local device lacks S3's service-side conditional-write and checksum
 controls.
 
+## Object-store consumer contract
+
+Other packages consume `storage.base.ObjectStore` through this provider-neutral
+surface:
+
+```text
+put_immutable(key, reader, identity, content metadata) -> ObjectMetadata
+head(key)                                               -> ObjectMetadata | None
+verify_metadata(expectation)                            -> ObjectMetadata
+verify(expectation)                                     -> None
+open(key, max_bytes)                                    -> bounded reader
+open_verified(expectation)                              -> verified reader
+list_keys(prefix)                                       -> key iterator
+```
+
+`verify_metadata` is the normal archive and reaper proof. `verify` consumes the
+complete object for an explicit deep audit. Retrieval uses `open_verified` so
+the required bytes are verified while they are consumed. `head` and `list_keys`
+are discovery operations and do not establish receipt authority by themselves.
+The shared value and error types are `StoredIdentity`, `ObjectExpectation`,
+`ObjectMetadata`, `DurabilityClass`, `ObjectStoreError`, `VerificationFailure`,
+`IntegrityConflict`, and `ObjectKeyError`. The protocol intentionally exposes no
+overwrite, move, or delete operation.
+
 ## Adding a backend
 
 1. Implement `storage.base.ObjectStore` in a new adapter using immutable,
    conditional publication and bounded streaming reads.
 2. Return the application SHA-256, separate provider checksum evidence, and an
    explicit durability declaration through `head`; implement provider-specific
-   receipt comparison through the shared `verify` boundary.
+   receipt comparison through `verify_metadata` and complete-byte verification
+   through `verify`/`open_verified`.
 3. Preserve key normalization, identity checks, errors, and no-delete behavior.
 4. Add one import/selection branch in `storage/factory.py` and export the adapter
    intentionally from `storage/__init__.py`.

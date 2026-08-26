@@ -181,7 +181,7 @@ class GCSStoreTests(unittest.TestCase):
             (crc(self.data), "CRC32C"),
         )
 
-    def test_verify_uses_provider_metadata_without_downloading_the_object(self):
+    def test_verify_metadata_uses_provider_metadata_without_downloading_the_object(self):
         self.client.seed(self.key, self.data)
         metadata = self.store.head(self.key)
         assert metadata is not None
@@ -195,12 +195,12 @@ class GCSStoreTests(unittest.TestCase):
         )
         self.client.opens.clear()
 
-        result = self.store.verify(expected)
+        result = self.store.verify_metadata(expected)
 
         self.assertEqual(result.sha256, identity(self.data).sha256)
         self.assertEqual(self.client.opens, [])
 
-    def test_verify_rejects_receipt_drift_without_downloading_the_object(self):
+    def test_verify_metadata_rejects_receipt_drift_without_downloading_the_object(self):
         self.client.seed(self.key, self.data)
         metadata = self.store.head(self.key)
         assert metadata is not None
@@ -216,9 +216,29 @@ class GCSStoreTests(unittest.TestCase):
         self.client.opens.clear()
 
         with self.assertRaises(VerificationFailure):
-            self.store.verify(expected)
+            self.store.verify_metadata(expected)
 
         self.assertEqual(self.client.opens, [])
+
+    def test_verify_reads_the_complete_generation_pinned_object(self):
+        self.client.seed(self.key, self.data)
+        metadata = self.store.head(self.key)
+        assert metadata is not None
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        self.client.opens.clear()
+
+        self.assertIsNone(self.store.verify(expected))
+
+        reads = [entry for entry in self.client.opens if entry[2] == "rb"]
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(reads[0][1], self.client.objects[self.key]["generation"])
 
     def test_head_absence_and_errors(self):
         self.assertIsNone(self.store.head(self.key))

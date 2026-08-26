@@ -27,7 +27,7 @@ from archive.storage import (
     VerificationFailure,
     normalize_key,
     provider_checksum_of,
-    verify_objects,
+    verify_metadata_objects,
 )
 from encoder import stored_identity_of
 
@@ -175,7 +175,7 @@ class ImmutablePutTests(unittest.TestCase):
             self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst")
         )
 
-    def test_verify_checks_one_complete_receipt_expectation(self) -> None:
+    def test_verify_metadata_checks_one_complete_receipt_expectation(self) -> None:
         metadata = self.put()
         expected = ObjectExpectation(
             metadata.key,
@@ -185,7 +185,7 @@ class ImmutablePutTests(unittest.TestCase):
             metadata.content_type,
             metadata.content_encoding,
         )
-        self.assertEqual(self.store.verify(expected), metadata)
+        self.assertEqual(self.store.verify_metadata(expected), metadata)
 
         failures = (
             replace(expected, stored=identity(b"different")),
@@ -198,12 +198,24 @@ class ImmutablePutTests(unittest.TestCase):
             with self.subTest(mismatch=mismatch), self.assertRaises(
                 VerificationFailure
             ):
-                self.store.verify(mismatch)
+                self.store.verify_metadata(mismatch)
 
         with self.assertRaisesRegex(VerificationFailure, "absent"):
-            self.store.verify(replace(expected, key="raw/absent.ndjson.zst"))
+            self.store.verify_metadata(replace(expected, key="raw/absent.ndjson.zst"))
 
-    def test_verify_objects_preserves_receipt_order(self) -> None:
+    def test_verify_reads_one_complete_receipt_owned_object(self) -> None:
+        metadata = self.put()
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        self.assertIsNone(self.store.verify(expected))
+
+    def test_verify_metadata_objects_preserves_receipt_order(self) -> None:
         first = self.put()
         second_key = "raw/lane=polymarket/date=2026-07-31/seal.json"
         second_payload = b'{"sealed":true}\n'
@@ -224,7 +236,9 @@ class ImmutablePutTests(unittest.TestCase):
             )
             for item in (first, second)
         )
-        self.assertEqual(verify_objects(self.store, expectations), (first, second))
+        self.assertEqual(
+            verify_metadata_objects(self.store, expectations), (first, second)
+        )
 
     def test_head_detects_post_write_mutation_rather_than_echoing_metadata(
         self,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from encoder import DEFAULT_BUFFER_BYTES
+
 from archive.storage.base import (
     ObjectExpectation,
     ObjectMetadata,
@@ -11,10 +13,10 @@ from archive.storage.base import (
     VerificationFailure,
 )
 
-__all__ = ["verify_metadata", "verify_objects"]
+__all__ = ["verify_metadata_objects"]
 
 
-def verify_metadata(
+def match_metadata(
     metadata: ObjectMetadata | None,
     expected: ObjectExpectation,
 ) -> ObjectMetadata:
@@ -54,8 +56,15 @@ def verify_metadata(
     return metadata
 
 
-def verify_objects(
+def verify_metadata_objects(
     store: ObjectStore, expectations: Iterable[ObjectExpectation]
 ) -> tuple[ObjectMetadata, ...]:
-    """Verify receipt objects in caller-defined deterministic order."""
-    return tuple(store.verify(expected) for expected in expectations)
+    """Verify receipt metadata in caller-defined deterministic order."""
+    return tuple(store.verify_metadata(expected) for expected in expectations)
+
+
+def consume_verified(store: ObjectStore, expected: ObjectExpectation) -> None:
+    """Consume one complete verified object without exposing its bytes."""
+    with store.open_verified(expected) as reader:
+        while reader.read(DEFAULT_BUFFER_BYTES):
+            pass

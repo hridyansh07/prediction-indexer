@@ -38,7 +38,7 @@ from archive.storage.base import (
     ObjectStoreError,
     VerificationFailure,
 )
-from archive.storage.verification import verify_objects
+from archive.storage.verification import verify_metadata_objects
 from encoder import CodecError, StoredIdentity, decode_stream, stored_identity_of
 
 ARCHIVED = "archived"
@@ -638,7 +638,7 @@ def verify_canonical_archive(
         for item in _objects(receipt)
     )
     try:
-        verify_objects(store, expectations)
+        verify_metadata_objects(store, expectations)
     except VerificationFailure as error:
         raise CanonicalArchiveVerificationError(str(error)) from error
 

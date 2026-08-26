@@ -40,11 +40,12 @@ stored-byte identity and records the service-returned CRC32C separately as:
 }
 ```
 
-Normal `head` and `verify` operations are metadata-only. They require a current
-generation and metageneration and compare GCS length and CRC32C plus custom
-SHA-256, custom length, content type, and content encoding with the receipt.
-The closed local receipt remains the commit marker; object metadata or a
-successful upload alone is not one.
+Normal `head` and `verify_metadata` operations are metadata-only. They require a
+current generation and metageneration and compare GCS length and CRC32C plus
+custom SHA-256, custom length, content type, and content encoding with the
+receipt. `verify` is the explicit full-byte audit operation. The closed local
+receipt remains the commit marker; object metadata or a successful upload alone
+is not one.
 
 Retrieval does not call `head` and then download the same object again. It loads
 metadata, pins the named generation, and returns one verified stream that

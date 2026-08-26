@@ -98,6 +98,9 @@ class _FailingManifestStore:
     def head(self, key):
         return self.delegate.head(key)
 
+    def verify_metadata(self, expected):
+        return self.delegate.verify_metadata(expected)
+
     def verify(self, expected):
         return self.delegate.verify(expected)
 
@@ -118,8 +121,11 @@ class _FailingVerificationStore:
     def head(self, key):
         raise ObjectStoreError("injected post-upload verification failure")
 
-    def verify(self, expected):
+    def verify_metadata(self, expected):
         return self.head(expected.key)
+
+    def verify(self, expected):
+        return self.delegate.verify(expected)
 
     def open(self, key, *, max_bytes=None):
         return self.delegate.open(key, max_bytes=max_bytes)

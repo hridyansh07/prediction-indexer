@@ -20,7 +20,7 @@ from archive.storage.base import (
     VerifiedReader,
     normalize_key,
 )
-from archive.storage.verification import verify_metadata
+from archive.storage.verification import consume_verified, match_metadata
 from encoder import DEFAULT_BUFFER_BYTES, StoredIdentity
 
 __all__ = ["GCSObjectStore"]
@@ -166,8 +166,11 @@ class GCSObjectStore:
             raise ObjectStoreError(f"heading {key}: {error}") from error
         return blob
 
-    def verify(self, expected: ObjectExpectation) -> ObjectMetadata:
-        return verify_metadata(self.head(expected.key), expected)
+    def verify_metadata(self, expected: ObjectExpectation) -> ObjectMetadata:
+        return match_metadata(self.head(expected.key), expected)
+
+    def verify(self, expected: ObjectExpectation) -> None:
+        consume_verified(self, expected)
 
     def open(self, key: str, *, max_bytes: int | None = None) -> BoundedReader:
         if max_bytes is not None and max_bytes < 0:
@@ -204,7 +207,7 @@ class GCSObjectStore:
         try:
             blob.reload()
             metadata = self._metadata_from_blob(key, blob)
-            verify_metadata(metadata, expected)
+            match_metadata(metadata, expected)
             generation = blob.generation
             metageneration = blob.metageneration
             handle = self._pinned_blob(key, generation).open("rb", raw_download=True)

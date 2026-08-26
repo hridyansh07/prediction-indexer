@@ -89,9 +89,7 @@ class ArchivedObjectByteStreamer:
 
 def verify_object(store: ObjectStore, expected: ObjectExpectation) -> None:
     """Consume one exact object without exposing or retaining its bytes."""
-    with store.open_verified(expected) as source:
-        while source.read(DEFAULT_BUFFER_BYTES):
-            pass
+    store.verify(expected)
 
 
 def _copy_plain(

@@ -204,7 +204,8 @@ The write-side storage protocol is deliberately smaller than an S3 client:
 ```text
 put_immutable(key, reader, expected_identity) -> object metadata
 head(key)                                      -> object metadata or absent
-verify(expectation)                            -> verified object metadata
+verify_metadata(expectation)                   -> verified object metadata
+verify(expectation)                            -> complete byte verification
 open(key)                                      -> bounded byte reader
 open_verified(expectation)                     -> receipt-verified byte reader
 ```
@@ -241,10 +242,11 @@ paths, backslashes, and traversal outside the configured root are rejected.
 
 `head` used for receipt verification must obtain current provider metadata. S3
 returns server SHA-256; GCS returns server CRC32C and the application SHA-256
-bound to its checksum-validated immutable upload. `verify` compares that
-provider-specific result with one complete receipt expectation; archive
+bound to its checksum-validated immutable upload. `verify_metadata` compares
+that provider-specific result with one complete receipt expectation; archive
 consumers map their strict receipt schemas into this one operation rather than
-reproducing identity, checksum, and content-metadata comparisons.
+reproducing identity, checksum, and content-metadata comparisons. `verify`
+consumes a complete `open_verified` stream for an explicit deep audit.
 
 Replay uses `open_verified` instead of `head` followed by `open`. The adapter
 checks receipt-owned length, SHA-256, provider checksum, content metadata, and

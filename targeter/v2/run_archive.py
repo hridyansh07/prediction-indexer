@@ -29,7 +29,7 @@ from archive.storage.base import (
     VerificationFailure,
     provider_checksum_of,
 )
-from archive.storage.verification import verify_objects
+from archive.storage.verification import verify_metadata_objects
 from encoder import (
     CodecError,
     LogicalIdentity,
@@ -617,13 +617,6 @@ def archive_run(
     for (archive_file, logical, compression), remote in zip(
         prepared, published, strict=True
     ):
-        _verify_metadata(
-            remote,
-            archive_file.identity,
-            archive_file.content_type,
-            archive_file.content_encoding,
-            archive_file.key,
-        )
         uploaded.append(
             _archived_object(
                 archive_file.path.name,
@@ -664,23 +657,6 @@ def archive_run(
     verify_run_archive(store, receipt)
     write_json_durable(receipt_path, document)
     return receipt
-
-
-def _verify_metadata(
-    metadata: ObjectMetadata,
-    stored: StoredIdentity,
-    content_type: str,
-    content_encoding: str | None,
-    key: str,
-) -> None:
-    if not metadata.matches_request(stored, content_type, content_encoding):
-        raise VerificationFailure(
-            f"archived targeter object {key} failed identity verification"
-        )
-    if not metadata.provider_checksum or not metadata.provider_checksum_algorithm:
-        raise VerificationFailure(
-            f"archived targeter object {key} lacks provider checksum evidence"
-        )
 
 
 def _archived_object(
@@ -992,7 +968,7 @@ def verify_run_archive_objects(
             raise VerificationFailure(
                 f"targeter object is not an exact member of the run receipt: {item.key}"
             )
-    verify_objects(
+    verify_metadata_objects(
         store,
         (
             ObjectExpectation(

@@ -54,7 +54,7 @@ from archive.storage.base import (
     normalize_key,
     provider_checksum_of,
 )
-from archive.storage.verification import verify_metadata
+from archive.storage.verification import consume_verified, match_metadata
 from encoder import StoredIdentity
 
 __all__ = [
@@ -189,8 +189,11 @@ class S3ObjectStore:
             raise ObjectStoreError(f"heading {normalized}: {error}") from error
         return self._metadata_from_head(normalized, response)
 
-    def verify(self, expected: ObjectExpectation) -> ObjectMetadata:
-        return verify_metadata(self.head(expected.key), expected)
+    def verify_metadata(self, expected: ObjectExpectation) -> ObjectMetadata:
+        return match_metadata(self.head(expected.key), expected)
+
+    def verify(self, expected: ObjectExpectation) -> None:
+        consume_verified(self, expected)
 
     def put_immutable(
         self,

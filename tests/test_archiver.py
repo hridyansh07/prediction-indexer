@@ -262,11 +262,14 @@ class FailingStore:
             return replace(metadata, sha256="f" * 64)
         return metadata
 
-    def verify(self, expected):
+    def verify_metadata(self, expected):
         metadata = self.head(expected.key)
-        from archive.storage.verification import verify_metadata
+        from archive.storage.verification import match_metadata
 
-        return verify_metadata(metadata, expected)
+        return match_metadata(metadata, expected)
+
+    def verify(self, expected):
+        return self.inner.verify(expected)
 
     def open(self, key, **kwargs):
         return self.inner.open(key, **kwargs)
