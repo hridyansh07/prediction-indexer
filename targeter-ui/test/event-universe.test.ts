@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
+import express from 'express';
 import {
+  createEventUniverseRouter,
   EventUniverseClient,
   universePublicFailure,
+  validateCadence,
   validateUniverseQuery,
 } from '../src/server/event-universe.js';
 import {
@@ -11,9 +15,16 @@ import {
   retirementExplanation,
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
-import { targeterSnapshotNeeded } from '../src/client/app-routing.js';
+import { targeterCadenceNeeded } from '../src/client/app-routing.js';
+import {
+  cadenceRunEmptyMessage,
+  cadenceStatusLabel,
+} from '../src/client/cadence-view-model.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
+  CadenceFreshnessState,
+  UniverseCadence,
+  UniverseCadenceRun,
   UniverseSelection,
   UniverseSelectionDetail,
 } from '../src/event-universe.js';
@@ -49,7 +60,9 @@ const selection = (
   },
   ...overrides,
 });
-const detail = (): UniverseSelectionDetail => ({
+const detail = (
+  overrides: Partial<UniverseSelectionDetail> = {},
+): UniverseSelectionDetail => ({
   ...selection(),
   context: {
     bundle_id: 'bundle alpha',
@@ -97,6 +110,45 @@ const detail = (): UniverseSelectionDetail => ({
       },
     ],
   },
+  ...overrides,
+});
+const run = (
+  overrides: Partial<UniverseCadenceRun> = {},
+): UniverseCadenceRun => ({
+  run_id: '20260820T120000.000001Z',
+  generated_at: '2026-08-20T12:00:00Z',
+  generated_at_ns: 1,
+  input_complete: true,
+  report_version: 3,
+  strategy_version: 2,
+  manifest_key: source.manifest_key,
+  manifest_sha256: sha,
+  manifest_byte_length: 100,
+  report_key: source.report_key,
+  report_sha256: sha,
+  report_byte_length: 80,
+  report_decoded_sha256: sha,
+  report_decoded_byte_length: 120,
+  projection_version: 1,
+  projection_sha256: sha,
+  projection_row_count: 1,
+  indexed_at_ns: 2,
+  selections: [detail()],
+  ...overrides,
+});
+const cadence = (
+  state: CadenceFreshnessState = 'current',
+  runs: UniverseCadenceRun[] = [run()],
+): UniverseCadence => ({
+  cadence_projection_version: 1,
+  observed_at: '2026-08-20T12:05:18Z',
+  freshness: {
+    state,
+    expected_run_seconds: 600,
+    latest_run_age_seconds: state === 'unavailable' ? null : 318,
+    latest_indexed_at: state === 'unavailable' ? null : '2026-08-20T12:01:00Z',
+  },
+  runs,
 });
 const json = (value: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(value), {
@@ -181,7 +233,9 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
         );
       })) as typeof fetch,
   });
-  const timeout = await timedOut.health().catch((error) => error);
+  const timeout = await timedOut
+    .cadence(new URLSearchParams())
+    .catch((error) => error);
   assert.deepEqual(universePublicFailure(timeout), {
     status: 504,
     body: { error: 'Event Universe unavailable' },
@@ -193,7 +247,9 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
     fetch: (async () =>
       json({ secret: 'upstream-body-must-not-leak' })) as typeof fetch,
   });
-  const tooLarge = await oversize.health().catch((error) => error);
+  const tooLarge = await oversize
+    .cadence(new URLSearchParams())
+    .catch((error) => error);
   assert.deepEqual(universePublicFailure(tooLarge), {
     status: 502,
     body: { error: 'Event Universe unavailable' },
@@ -210,7 +266,9 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
       baseUrl: 'https://universe.internal',
       fetch: (async () => response) as typeof fetch,
     });
-    const error = await failed.health().catch((reason) => reason);
+    const error = await failed
+      .cadence(new URLSearchParams())
+      .catch((reason) => reason);
     assert.deepEqual(universePublicFailure(error).body, {
       error: 'Event Universe unavailable',
     });
@@ -266,13 +324,115 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
   );
 });
 
-test('Event Universe routing is independent from Targeter snapshot availability', () => {
-  assert.equal(targeterSnapshotNeeded('/'), false);
-  assert.equal(targeterSnapshotNeeded('/event-universe'), false);
-  assert.equal(targeterSnapshotNeeded('/operations'), true);
-  assert.equal(targeterSnapshotNeeded('/operations/events'), true);
-  assert.equal(targeterSnapshotNeeded('/operations/config'), true);
-  assert.equal(targeterSnapshotNeeded('/events'), false);
+test('Event Universe routing is independent from Targeter cadence availability', () => {
+  assert.equal(targeterCadenceNeeded('/'), false);
+  assert.equal(targeterCadenceNeeded('/event-universe'), false);
+  assert.equal(targeterCadenceNeeded('/operations'), true);
+  assert.equal(targeterCadenceNeeded('/operations/selections'), true);
+  assert.equal(targeterCadenceNeeded('/events'), false);
+});
+
+test('cadence proxy allows only a bounded limit and validates selection detail', async () => {
+  let requested = '';
+  let fetches = 0;
+  const client = new EventUniverseClient({
+    baseUrl: 'https://universe.internal/base',
+    fetch: (async (input) => {
+      fetches++;
+      requested = String(input);
+      return json(cadence());
+    }) as typeof fetch,
+  });
+  const result = await client.cadence(new URLSearchParams({ limit: '5' }));
+  assert.equal(
+    requested,
+    'https://universe.internal/base/v1/targeter/cadence?limit=5',
+  );
+  assert.equal(result.runs[0].selections[0].context.participants[0], 'Alpha');
+  assert.equal(result.freshness.state, 'current');
+
+  for (const query of [
+    'limit=6',
+    'limit=5&limit=4',
+    'cursor=forbidden',
+    'limit=0',
+  ]) {
+    assert.throws(() => client.cadence(new URLSearchParams(query)));
+  }
+  assert.equal(fetches, 1);
+});
+
+test('Express cadence proxy rejects non-GET refreshes before upstream access', async () => {
+  let fetches = 0;
+  const client = new EventUniverseClient({
+    baseUrl: 'https://universe.internal',
+    fetch: (async () => {
+      fetches++;
+      return json(cadence());
+    }) as typeof fetch,
+  });
+  const app = express();
+  app.use('/api/event-universe', createEventUniverseRouter(client));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/event-universe/v1/targeter/cadence?limit=5`,
+      { method: 'POST' },
+    );
+    assert.equal(response.status, 405);
+    assert.deepEqual(await response.json(), { error: 'Method not allowed' });
+    assert.equal(fetches, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('cadence schema and view model cover every freshness state and empty runs', () => {
+  for (const state of ['current', 'late'] as const) {
+    assert.equal(validateCadence(cadence(state)).freshness.state, state);
+    assert.equal(cadenceStatusLabel(state), `CADENCE ${state.toUpperCase()}`);
+  }
+  const unavailable = cadence('unavailable', []);
+  assert.deepEqual(validateCadence(unavailable).runs, []);
+  assert.equal(cadenceStatusLabel('unavailable'), 'CADENCE UNAVAILABLE');
+
+  const completeEmpty = run({ selections: [], projection_row_count: 0 });
+  assert.match(cadenceRunEmptyMessage(completeEmpty), /complete indexed run/);
+  assert.match(
+    cadenceRunEmptyMessage(
+      run({ input_complete: false, selections: [], projection_row_count: 0 }),
+    ),
+    /incomplete input/,
+  );
+
+  assert.throws(() =>
+    validateCadence({
+      ...cadence(),
+      unexpected_decision_summary: {},
+    }),
+  );
+  assert.throws(() =>
+    validateCadence({
+      ...cadence('unavailable', []),
+      freshness: {
+        ...cadence('unavailable', []).freshness,
+        state: 'live',
+      },
+    }),
+  );
+  assert.throws(() =>
+    validateCadence({
+      ...cadence(),
+      runs: [run({ selections: [detail({ run_id: 'wrong-run' })] })],
+    }),
+  );
 });
 
 test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
@@ -283,8 +443,8 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
       'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
     ),
     {
-      TARGETER_UI_EVENT_UNIVERSE_URL: 'https://universe.internal/base',
-      TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION: 'Bearer server-only',
+      UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
+      UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
     },
     (async (input, init) => {
       upstreamUrl = String(input);
@@ -306,6 +466,22 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   assert.equal(upstreamAuthorization, 'Bearer server-only');
   assert.equal(response.headers.get('cache-control'), 'no-store');
 
+  const cadenceResponse = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/targeter/cadence&limit=5',
+    ),
+    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
+    (async (input) => {
+      assert.equal(
+        String(input),
+        'https://universe.internal/v1/targeter/cadence?limit=5',
+      );
+      return json(cadence());
+    }) as typeof fetch,
+  );
+  assert.equal(cadenceResponse.status, 200);
+  assert.equal((await cadenceResponse.json()).cadence_projection_version, 1);
+
   const unconfigured = await handleEventUniverseProxy(
     new Request(
       'https://ui.example/api/event-universe-proxy?__universe_path=/healthz',
@@ -321,7 +497,7 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
     new Request(
       'https://ui.example/api/event-universe-proxy?__universe_path=/v1/segments',
     ),
-    { TARGETER_UI_EVENT_UNIVERSE_URL: 'https://universe.internal' },
+    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
     (async () => {
       throw new Error('must not fetch');
     }) as typeof fetch,
@@ -330,6 +506,32 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   assert.deepEqual(await forbidden.json(), {
     error: 'Event Universe route not found',
   });
+});
+
+test('cadence refresh is GET-only and Targeter UI has no direct archive dependency', async () => {
+  const [client, server, packageDocument] = await Promise.all([
+    readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../package.json', import.meta.url), 'utf8'),
+  ]);
+  assert.match(client, /\/api\/event-universe\/v1\/targeter\/cadence\?limit=5/);
+  assert.match(client, /method: 'GET'/);
+  for (const removed of [
+    '/api/refresh',
+    '/api/snapshot',
+    'TARGETER_UI_S3',
+    'RustV1Decoder',
+    'S3ReadOnlyObjectStore',
+    'SnapshotService',
+  ]) {
+    assert.doesNotMatch(`${client}\n${server}`, new RegExp(removed));
+  }
+  const dependencies = JSON.parse(packageDocument).dependencies;
+  assert.equal(
+    dependencies['@prediction-indexer/read-only-object-store'],
+    undefined,
+  );
+  assert.equal(dependencies['@prediction-indexer/rust-v1-decoder'], undefined);
 });
 
 test('Vercel builds only the client and routes Universe before the SPA fallback', async () => {

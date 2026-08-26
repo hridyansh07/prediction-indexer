@@ -1,2 +1,2 @@
-export const targeterSnapshotNeeded = (pathname: string) =>
+export const targeterCadenceNeeded = (pathname: string) =>
   pathname === '/operations' || pathname.startsWith('/operations/');

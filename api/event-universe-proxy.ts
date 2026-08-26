@@ -5,10 +5,10 @@ import {
 } from '../targeter-ui/src/server/event-universe.js';
 
 interface UniverseProxyEnvironment {
-  TARGETER_UI_EVENT_UNIVERSE_URL?: string;
-  TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION?: string;
-  TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS?: string;
-  TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES?: string;
+  UNIVERSE_API_BASE_URL?: string;
+  UNIVERSE_API_AUTHORIZATION?: string;
+  UNIVERSE_API_TIMEOUT_MS?: string;
+  UNIVERSE_API_MAX_RESPONSE_BYTES?: string;
 }
 
 export async function GET(request: Request) {
@@ -20,7 +20,7 @@ export async function handleEventUniverseProxy(
   environment: UniverseProxyEnvironment,
   fetchImpl: typeof fetch,
 ) {
-  const baseUrl = environment.TARGETER_UI_EVENT_UNIVERSE_URL;
+  const baseUrl = environment.UNIVERSE_API_BASE_URL;
   if (!baseUrl) return json(503, { error: 'Event Universe is not configured' });
 
   const requestUrl = new URL(request.url);
@@ -33,13 +33,10 @@ export async function handleEventUniverseProxy(
   try {
     const client = new EventUniverseClient({
       baseUrl,
-      authorization: environment.TARGETER_UI_EVENT_UNIVERSE_AUTHORIZATION,
-      timeoutMs: positive(
-        environment.TARGETER_UI_EVENT_UNIVERSE_TIMEOUT_MS,
-        5000,
-      ),
+      authorization: environment.UNIVERSE_API_AUTHORIZATION,
+      timeoutMs: positive(environment.UNIVERSE_API_TIMEOUT_MS, 5000),
       maxResponseBytes: positive(
-        environment.TARGETER_UI_EVENT_UNIVERSE_MAX_RESPONSE_BYTES,
+        environment.UNIVERSE_API_MAX_RESPONSE_BYTES,
         2 * 1024 * 1024,
       ),
       fetch: fetchImpl,

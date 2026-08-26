@@ -133,6 +133,26 @@ export interface UniverseRunPage {
   next_cursor: string | null;
 }
 
+export type CadenceFreshnessState = 'current' | 'late' | 'unavailable';
+
+export interface UniverseCadenceFreshness {
+  state: CadenceFreshnessState;
+  expected_run_seconds: number;
+  latest_run_age_seconds: number | null;
+  latest_indexed_at: string | null;
+}
+
+export interface UniverseCadenceRun extends UniverseRun {
+  selections: UniverseSelectionDetail[];
+}
+
+export interface UniverseCadence {
+  cadence_projection_version: 1;
+  observed_at: string;
+  freshness: UniverseCadenceFreshness;
+  runs: UniverseCadenceRun[];
+}
+
 export interface UniverseHealth {
   status: 'ok';
   schema_version: number;

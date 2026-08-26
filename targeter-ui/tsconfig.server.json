@@ -10,5 +10,5 @@
     "rootDir": "src",
     "resolveJsonModule": true
   },
-  "include": ["src/server", "src/shared.ts"]
+  "include": ["src/server", "src/event-universe.ts"]
 }

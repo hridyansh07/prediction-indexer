@@ -6,6 +6,8 @@ import {
 import type {
   RetirementDisposition,
   UniverseAudit,
+  UniverseCadence,
+  UniverseCadenceRun,
   UniverseContext,
   UniverseHealth,
   UniverseOrigin,
@@ -35,6 +37,7 @@ const RUN_QUERY = new Set([
   'limit',
   'cursor',
 ]);
+const CADENCE_QUERY = new Set(['limit']);
 const TIMESTAMP_FIELDS = new Set([
   'activation_start',
   'activation_end',
@@ -134,6 +137,13 @@ export class EventUniverseClient {
     );
   }
 
+  cadence(query: URLSearchParams) {
+    const validated = validateUniverseQuery(query, CADENCE_QUERY);
+    const limit = validated.get('limit');
+    if (limit !== null && Number(limit) > 5) throw new UniverseRequestError();
+    return this.get('v1/targeter/cadence', validated, validateCadence);
+  }
+
   private async get<T>(
     path: string,
     query: URLSearchParams,
@@ -226,6 +236,7 @@ export async function dispatchEventUniverseRequest(
   }
   if (pathname === '/v1/runs') return client.runs(query);
   if (pathname === '/v1/selections') return client.selections(query);
+  if (pathname === '/v1/targeter/cadence') return client.cadence(query);
 
   let match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
   if (match) {
@@ -715,6 +726,83 @@ function validateRunPage(value: unknown): UniverseRunPage {
   return {
     runs: array(item.runs, validateRun),
     next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
+  };
+}
+
+export function validateCadence(value: unknown): UniverseCadence {
+  const item = object(
+    value,
+    ['cadence_projection_version', 'observed_at', 'freshness', 'runs'],
+    'cadence projection',
+  );
+  if (item.cadence_projection_version !== 1) throw new UniverseUpstreamError();
+  const freshness = object(
+    item.freshness,
+    [
+      'state',
+      'expected_run_seconds',
+      'latest_run_age_seconds',
+      'latest_indexed_at',
+    ],
+    'cadence freshness',
+  );
+  const state = text(freshness.state);
+  if (!['current', 'late', 'unavailable'].includes(state))
+    throw new UniverseUpstreamError();
+  const expectedRunSeconds = integer(freshness.expected_run_seconds);
+  if (expectedRunSeconds === 0) throw new UniverseUpstreamError();
+  const latestRunAgeSeconds =
+    freshness.latest_run_age_seconds === null
+      ? null
+      : integer(freshness.latest_run_age_seconds);
+  const latestIndexedAt =
+    freshness.latest_indexed_at === null
+      ? null
+      : timestamp(freshness.latest_indexed_at);
+  const runs = array(item.runs, (value): UniverseCadenceRun => {
+    const run = object(value, [...RUN_KEYS, 'selections'], 'cadence run');
+    const { selections, ...runFields } = run;
+    const validatedRun = validateRun(runFields);
+    const validatedSelections = array(selections, validateSelectionDetail);
+    if (
+      validatedSelections.some(
+        (selection) => selection.run_id !== validatedRun.run_id,
+      )
+    )
+      throw new UniverseUpstreamError();
+    return { ...validatedRun, selections: validatedSelections };
+  });
+  if (
+    runs.length > 5 ||
+    runs.some(
+      (run, index) =>
+        index > 0 &&
+        Date.parse(runs[index - 1].generated_at) < Date.parse(run.generated_at),
+    ) ||
+    new Set(runs.map((run) => run.run_id)).size !== runs.length
+  )
+    throw new UniverseUpstreamError();
+  if (
+    (state === 'unavailable' &&
+      (runs.length !== 0 ||
+        latestRunAgeSeconds !== null ||
+        latestIndexedAt !== null)) ||
+    (state !== 'unavailable' &&
+      (runs.length === 0 ||
+        latestRunAgeSeconds === null ||
+        latestIndexedAt === null))
+  )
+    throw new UniverseUpstreamError();
+  return {
+    cadence_projection_version: 1,
+    observed_at: timestamp(item.observed_at),
+    freshness: {
+      state: state as UniverseCadence['freshness']['state'],
+      expected_run_seconds: expectedRunSeconds,
+      latest_run_age_seconds: latestRunAgeSeconds,
+      latest_indexed_at: latestIndexedAt,
+    },
+    runs,
   };
 }
 function validateAudit(value: unknown): UniverseAudit {

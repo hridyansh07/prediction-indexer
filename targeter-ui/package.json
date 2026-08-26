@@ -16,8 +16,6 @@
     "start": "node dist-server/server/index.js"
   },
   "dependencies": {
-    "@prediction-indexer/read-only-object-store": "0.1.0",
-    "@prediction-indexer/rust-v1-decoder": "0.1.0",
     "express": "^5.1.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

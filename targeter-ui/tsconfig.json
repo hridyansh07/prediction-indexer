@@ -16,5 +16,5 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src/client", "src/shared.ts"]
+  "include": ["src/client", "src/event-universe.ts"]
 }
