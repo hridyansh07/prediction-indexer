@@ -208,6 +208,7 @@ verify_metadata(expectation)                   -> verified object metadata
 verify(expectation)                            -> complete byte verification
 open(key)                                      -> bounded byte reader
 open_verified(expectation)                     -> receipt-verified byte reader
+list_keys(prefix)                              -> key iterator
 ```
 
 `expected_identity` is known before publication. The adapter verifies that the
@@ -336,8 +337,7 @@ For one segment:
 5. Fsync the derivative, rename it to `.ndjson.zst`, and fsync the directory.
 6. Calculate the unchanged seal object's byte length and SHA-256.
 7. Publish data and seal through immutable object-store writes.
-8. Call `head` for both objects and verify their actual remote identities and
-   provider checksums.
+8. Call `verify_metadata` for both objects with their complete expectations.
 9. Encode the normative provider-neutral production archive receipt from §3.3
    of the Zstd specification, or the explicitly non-authoritative local
    conformance receipt from §5.3.

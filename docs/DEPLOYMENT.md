@@ -591,9 +591,10 @@ canonical/date=<YYYY-MM-DD>/window=<start>/
   receipt.json
 ```
 
-Fresh object-store heads verify all three before the local window receives
-`canonical_archive_receipt.json`. The local backend uses
-`canonical_archive_receipt.local.json`, which is conformance evidence only.
+Fresh object-store metadata verifies all three complete object expectations
+before the local window receives `canonical_archive_receipt.json`. The local
+backend uses `canonical_archive_receipt.local.json`, which is conformance
+evidence only.
 
 Canonical deletion is a third, separate authority:
 
@@ -604,8 +605,9 @@ docker compose --profile ops run --rm canonical-reaper-once
 It defaults to `CANONICAL_REAPER_MODE=audit`. A window is reapable only when a
 production canonical archive receipt binds its unchanged `receipt.json` and
 both frame identities, the backend is independently durable, all three remote
-objects pass fresh heads, and the window is at least
-`CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value below 18.
+objects pass fresh metadata verification against that receipt, and the window
+is at least `CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value
+below 18.
 Age is measured from the latest of window end, finalization, archive
 verification, and both receipt mtimes, so a backdated test clock cannot shorten
 retention.

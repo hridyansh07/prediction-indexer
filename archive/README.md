@@ -77,9 +77,10 @@ export ARCHIVE_S3_BUCKET ARCHIVE_S3_REGION ARCHIVE_S3_EXPECTED_OWNER
 ## Production GCS prerequisites
 
 GCS does not provide server-side SHA-256. The native adapter calculates SHA-256
-while streaming a CRC32C-checked upload and attaches that identity to the
-object. Receipt verification then streams the exact generation once to prove
-the metadata against its bytes. See
+over the exact CRC32C-checked upload stream and attaches that identity to the
+object. Normal receipt verification compares current generation-pinned
+metadata, including that SHA-256 and the service-returned CRC32C, without a body
+download. Retrieval and explicit deep audit verify the complete byte stream. See
 [`GCS_RAW_ARCHIVE_ADAPTER_V1.md`](GCS_RAW_ARCHIVE_ADAPTER_V1.md)
 for the complete integrity, IAM, bucket, and rollout contract.
 
