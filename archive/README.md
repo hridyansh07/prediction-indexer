@@ -77,9 +77,10 @@ export ARCHIVE_S3_BUCKET ARCHIVE_S3_REGION ARCHIVE_S3_EXPECTED_OWNER
 ## Production GCS prerequisites
 
 GCS does not provide server-side SHA-256. The native adapter calculates SHA-256
-while streaming a CRC32C-checked upload and attaches that identity to the
-object. Receipt verification then streams the exact generation once to prove
-the metadata against its bytes. See
+over the exact CRC32C-checked upload stream and attaches that identity to the
+object. Normal receipt verification compares current generation-pinned
+metadata, including that SHA-256 and the service-returned CRC32C, without a body
+download. Retrieval and explicit deep audit verify the complete byte stream. See
 [`GCS_RAW_ARCHIVE_ADAPTER_V1.md`](GCS_RAW_ARCHIVE_ADAPTER_V1.md)
 for the complete integrity, IAM, bucket, and rollout contract.
 
@@ -167,12 +168,38 @@ it is not an independent durability domain and cannot authorize deletion; even a
 separate local device lacks S3's service-side conditional-write and checksum
 controls.
 
+## Object-store consumer contract
+
+Other packages consume `storage.base.ObjectStore` through this provider-neutral
+surface:
+
+```text
+put_immutable(key, reader, identity, content metadata) -> ObjectMetadata
+head(key)                                               -> ObjectMetadata | None
+verify_metadata(expectation)                            -> ObjectMetadata
+verify(expectation)                                     -> None
+open(key, max_bytes)                                    -> bounded reader
+open_verified(expectation)                              -> verified reader
+list_keys(prefix)                                       -> key iterator
+```
+
+`verify_metadata` is the normal archive and reaper proof. `verify` consumes the
+complete object for an explicit deep audit. Retrieval uses `open_verified` so
+the required bytes are verified while they are consumed. `head` and `list_keys`
+are discovery operations and do not establish receipt authority by themselves.
+The shared value and error types are `StoredIdentity`, `ObjectExpectation`,
+`ObjectMetadata`, `DurabilityClass`, `ObjectStoreError`, `VerificationFailure`,
+`IntegrityConflict`, and `ObjectKeyError`. The protocol intentionally exposes no
+overwrite, move, or delete operation.
+
 ## Adding a backend
 
 1. Implement `storage.base.ObjectStore` in a new adapter using immutable,
    conditional publication and bounded streaming reads.
-2. Return SHA-256 verified from actual provider bytes, separate provider
-   checksum evidence, and an explicit durability declaration.
+2. Return the application SHA-256, separate provider checksum evidence, and an
+   explicit durability declaration through `head`; implement provider-specific
+   receipt comparison through `verify_metadata` and complete-byte verification
+   through `verify`/`open_verified`.
 3. Preserve key normalization, identity checks, errors, and no-delete behavior.
 4. Add one import/selection branch in `storage/factory.py` and export the adapter
    intentionally from `storage/__init__.py`.

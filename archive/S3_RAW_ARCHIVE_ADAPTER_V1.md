@@ -127,15 +127,27 @@ class S3ObjectStore:
 
     def head(self, key: str) -> ObjectMetadata | None: ...
 
+    def verify_metadata(
+        self, expected: ObjectExpectation
+    ) -> ObjectMetadata: ...
+
+    def verify(self, expected: ObjectExpectation) -> None: ...
+
     def open(self, key: str, *, max_bytes: int | None = None) -> BinaryIO: ...
+
+    def open_verified(
+        self, expected: ObjectExpectation
+    ) -> BinaryIO: ...
 
     def list_keys(self, prefix: str) -> Iterator[str]: ...
 ```
 
 Do not add S3 methods to `Archiver` or `Reaper`. They continue to depend only on
-`ObjectStore`. `list_keys` uses paginated `ListObjectsV2`, but a listed key is
-not a commit marker and must still be verified through its owning receipt or
-manifest.
+`ObjectStore`. Normal archive and reaper checks call `verify_metadata` with a
+complete receipt expectation; explicit deep audits call `verify`, and retrieval
+uses `open_verified` to verify bytes while consuming them. `list_keys` uses
+paginated `ListObjectsV2`, but a listed key is not a commit marker and must still
+be verified through its owning receipt or manifest.
 
 Constructor inputs:
 
@@ -188,8 +200,9 @@ Never derive identity from:
 
 ## 7. `head` algorithm
 
-`head(key)` is the only way the archiver, manifest builder, and reaper ask S3
-what currently exists.
+`head(key)` is the provider metadata primitive beneath discovery and
+`verify_metadata`. Archive consumers do not reproduce these comparisons; they
+pass a complete `ObjectExpectation` to `verify_metadata`.
 
 Perform exactly this operation:
 
@@ -317,9 +330,11 @@ Rules:
 - 404 is `ObjectStoreError` here, because a caller asked to open a specific key;
 - the codec still verifies the full stored SHA-256 while decoding.
 
-`verify_archive` calls `head` before replay opens an object. The staged decode
-path remains unchanged: a destination filename appears only after stored and
-logical identities both verify.
+Replay calls `open_verified` rather than `head` followed by `open`. The staged
+decode path remains unchanged: the adapter verifies provider metadata and the
+complete downloaded stream while the codec verifies logical identity, and a
+destination filename appears only after both stored and logical identities
+verify.
 
 ## 10. Production verification tightening
 
@@ -514,7 +529,8 @@ Add the four Gate 0 regressions from §4, then fix only those behaviors.
 1. Add boto3 and `archive/storage/s3.py`.
 2. Build a small injected fake S3 client. It must model success, 404, 403, 409,
    412, checksum mismatch, metadata mismatch, and streaming `GetObject`.
-3. Implement `head`, then `put_immutable`, then `open` in that order.
+3. Implement `head`, `put_immutable`, and `open`, then the shared
+   `verify_metadata`, `verify`, and `open_verified` contract.
 4. Re-run the existing object-store contract against both
    `LocalObjectStore` and the fake-backed `S3ObjectStore` where applicable.
 
@@ -532,7 +548,8 @@ Add the four Gate 0 regressions from §4, then fix only those behaviors.
 Run against a disposable AWS test bucket with a unique key path:
 
 1. put one data object and one seal;
-2. head both and compare full-object SHA-256 and length;
+2. verify metadata for both against their full-object SHA-256, length, provider
+   checksum, and content metadata expectations;
 3. read and decode the data to exact NDJSON;
 4. retry the identical puts and observe idempotent success;
 5. attempt different bytes at the same key and observe `IntegrityConflict`;
@@ -581,9 +598,9 @@ Do not run the conflict test in a production prefix.
 - successful S3 archival writes `.archive.json`, never
   `.archive.local.json`;
 - receipt `store` is `{provider: "s3", location: <configured bucket>}`;
-- data and seal receipt identities come from fresh S3 heads;
-- upload, head, checksum, or metadata failure leaves raw, seal, and derivative
-  intact and writes no receipt;
+- data and seal receipt identities pass fresh S3 metadata verification;
+- upload, metadata verification, checksum, or content-metadata failure leaves
+  raw, seal, and derivative intact and writes no receipt;
 - a receipt naming another bucket cannot verify;
 - manifest build excludes a transiently unavailable object without crashing;
 - stale manifests disappear when their last valid entry disappears;

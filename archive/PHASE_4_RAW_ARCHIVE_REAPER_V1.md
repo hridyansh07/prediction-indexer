@@ -204,8 +204,11 @@ The write-side storage protocol is deliberately smaller than an S3 client:
 ```text
 put_immutable(key, reader, expected_identity) -> object metadata
 head(key)                                      -> object metadata or absent
+verify_metadata(expectation)                   -> verified object metadata
+verify(expectation)                            -> complete byte verification
 open(key)                                      -> bounded byte reader
 open_verified(expectation)                     -> receipt-verified byte reader
+list_keys(prefix)                              -> key iterator
 ```
 
 `expected_identity` is known before publication. The adapter verifies that the
@@ -220,9 +223,10 @@ key, byte_length, sha256, provider checksum, content type, content encoding
 ```
 
 The provider checksum is separate from normalized lowercase SHA-256. An S3 ETag
-is never a provider SHA-256 checksum. GCS CRC32C is recorded as provider
-evidence but cannot replace SHA-256; the GCS adapter recomputes SHA-256 through
-a complete generation-pinned readback.
+is never a provider SHA-256 checksum. GCS records the SHA-256 calculated over
+the exact upload stream as custom metadata and records the service-validated
+CRC32C separately as provider evidence. Normal GCS verification compares both
+with the receipt without downloading the object body.
 
 Keys are normalized relative POSIX paths. Empty components, `.`, `..`, absolute
 paths, backslashes, and traversal outside the configured root are rejected.
@@ -237,14 +241,19 @@ paths, backslashes, and traversal outside the configured root are rejected.
 - Transport or verification failure: return failure; never report the key as
   committed.
 
-`head` used for receipt verification must obtain or calculate actual object
-length and SHA-256. It may not simply echo metadata supplied at `put` time.
+`head` used for receipt verification must obtain current provider metadata. S3
+returns server SHA-256; GCS returns server CRC32C and the application SHA-256
+bound to its checksum-validated immutable upload. `verify_metadata` compares
+that provider-specific result with one complete receipt expectation; archive
+consumers map their strict receipt schemas into this one operation rather than
+reproducing identity, checksum, and content-metadata comparisons. `verify`
+consumes a complete `open_verified` stream for an explicit deep audit.
 
 Replay uses `open_verified` instead of `head` followed by `open`. The adapter
 checks receipt-owned length, SHA-256, provider checksum, content metadata, and
 the provider's immutable generation/version while one bounded stream is
 consumed. Leaving that stream before EOF is a verification failure. `head`
-retains its complete re-verification semantics for audits and deletion gates.
+remains metadata-only where the provider supplies sufficient receipt evidence.
 
 ### 5.3 LocalObjectStore
 
@@ -328,8 +337,7 @@ For one segment:
 5. Fsync the derivative, rename it to `.ndjson.zst`, and fsync the directory.
 6. Calculate the unchanged seal object's byte length and SHA-256.
 7. Publish data and seal through immutable object-store writes.
-8. Call `head` for both objects and verify their actual remote identities and
-   provider checksums.
+8. Call `verify_metadata` for both objects with their complete expectations.
 9. Encode the normative provider-neutral production archive receipt from §3.3
    of the Zstd specification, or the explicitly non-authoritative local
    conformance receipt from §5.3.

@@ -32,10 +32,13 @@ from archive.storage.base import (
     NDJSON_CONTENT_TYPE,
     ZSTD_CONTENT_ENCODING,
     IntegrityConflict,
+    ObjectExpectation,
     ObjectMetadata,
     ObjectStore,
     ObjectStoreError,
+    VerificationFailure,
 )
+from archive.storage.verification import verify_metadata_objects
 from encoder import CodecError, StoredIdentity, decode_stream, stored_identity_of
 
 ARCHIVED = "archived"
@@ -623,34 +626,21 @@ def verify_canonical_archive(
         raise CanonicalArchiveVerificationError(
             f"receipt names provider {receipt.provider!r}; configured store is {store.provider!r}"
         )
-    for item in _objects(receipt):
-        remote = store.head(item.key)
-        if remote is None:
-            raise CanonicalArchiveVerificationError(
-                f"canonical archive object {item.key} is absent"
-            )
-        if not remote.matches_request(
-            item.stored, item.content_type, item.content_encoding
-        ):
-            raise CanonicalArchiveVerificationError(
-                f"canonical archive object {item.key} disagrees with its receipt"
-            )
-        if receipt.kind == PRODUCTION:
-            if (
-                item.provider_checksum != remote.provider_checksum
-                or item.provider_checksum_algorithm
-                != remote.provider_checksum_algorithm
-            ):
-                raise CanonicalArchiveVerificationError(
-                    f"canonical archive object {item.key} has the wrong provider checksum"
-                )
-            if (
-                receipt.document["canonical_archive_receipt_version"] == 1
-                and remote.provider_checksum_algorithm != "SHA256"
-            ):
-                raise CanonicalArchiveVerificationError(
-                    f"canonical archive object {item.key} has no full-object SHA256 proof"
-                )
+    expectations = tuple(
+        ObjectExpectation(
+            item.key,
+            item.stored,
+            item.provider_checksum if receipt.kind == PRODUCTION else None,
+            item.provider_checksum_algorithm if receipt.kind == PRODUCTION else None,
+            item.content_type,
+            item.content_encoding,
+        )
+        for item in _objects(receipt)
+    )
+    try:
+        verify_metadata_objects(store, expectations)
+    except VerificationFailure as error:
+        raise CanonicalArchiveVerificationError(str(error)) from error
 
 
 def _objects(receipt: CanonicalArchiveReceipt) -> tuple[CanonicalObject, ...]:

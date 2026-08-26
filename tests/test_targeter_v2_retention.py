@@ -92,6 +92,13 @@ class _CountingStore:
         self.heads += 1
         return self.delegate.head(key)
 
+    def verify_metadata(self, expected):
+        self.heads += 1
+        return self.delegate.verify_metadata(expected)
+
+    def verify(self, expected):
+        return self.delegate.verify(expected)
+
     def open(self, key, *, max_bytes=None):
         return self.delegate.open(key, max_bytes=max_bytes)
 
@@ -112,6 +119,12 @@ class _ConflictingStore:
 
     def head(self, key):
         return self.delegate.head(key)
+
+    def verify_metadata(self, expected):
+        return self.delegate.verify_metadata(expected)
+
+    def verify(self, expected):
+        return self.delegate.verify(expected)
 
     def open(self, key, *, max_bytes=None):
         return self.delegate.open(key, max_bytes=max_bytes)

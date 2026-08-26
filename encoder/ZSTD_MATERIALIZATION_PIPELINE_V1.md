@@ -184,17 +184,19 @@ For each eligible segment, the archiver performs these steps in order:
    the containing directory.
 6. Upload the compressed data and unchanged seal using conditional/immutable
    writes.
-7. Read the remote object attributes and verify the compressed byte length and
-   explicit S3 SHA-256 checksum. Verify the seal object's byte length and
-   SHA-256 as well.
+7. Verify current provider metadata for both objects against their complete
+   expectations: stored identity, provider checksum, content type, and content
+   encoding.
 8. Write and fsync `<segment>.archive.json.open`, rename it to
    `<segment>.archive.json`, and fsync the directory. The archive receipt is the
    local proof that remote verification completed.
 
-The data upload requests S3 SHA-256 checksum validation and compares the returned
-checksum with the locally calculated stored SHA-256. An ETag is never accepted
-as a SHA-256 digest. User-defined object metadata may duplicate identities for
-operations, but metadata alone is not verification.
+S3 uploads request server-side SHA-256 validation and compare the returned
+checksum with the locally calculated stored SHA-256. GCS uploads calculate
+SHA-256 over the exact upload stream while the client and service validate
+CRC32C, then retain that SHA-256 as custom metadata alongside the
+service-returned CRC32C. An ETag is never accepted as a SHA-256 digest. In both
+cases the closed receipt is the commit marker; provider metadata alone is not.
 
 The data object uses `Content-Type: application/x-ndjson` and
 `Content-Encoding: zstd`. Readers still use the receipt and seal, not HTTP
@@ -303,11 +305,14 @@ identity and provider-neutral checksum evidence:
 For S3 version 2 receipts, `provider` is `s3`, the algorithm is `SHA256`, and
 the provider checksum is S3's exact base64 representation. For GCS, `provider`
 is `gcs`, the algorithm is `CRC32C`, and the checksum is GCS's exact base64
-representation. In every case the lowercase SHA-256 is independently derived
-from the actual stored bytes. GCS requires a complete generation-pinned
-readback because its object metadata has no SHA-256. All version 2 schemas are
-closed and reject unknown fields. Strict readers retain version 1 support.
-Times are UTC Unix nanoseconds.
+representation. In every case the lowercase SHA-256 is calculated over the
+exact bytes supplied to the immutable upload. S3 verifies that SHA-256
+server-side. GCS binds it to the checksum-validated upload as custom metadata
+and returns CRC32C as separate provider evidence, so normal receipt verification
+does not download the object body. Retrieval or an explicit deep audit verifies
+the complete downloaded stream. All version 2 schemas are closed and reject
+unknown fields. Strict readers retain version 1 support. Times are UTC Unix
+nanoseconds.
 
 The local receipt is immutable once committed. A valid existing receipt causes
 the segment to be skipped only after its structure, local source identity, and
@@ -569,7 +574,8 @@ For a receipt-committed window the reaper requires, at decision time:
    mtime;
 4. exact identity agreement between the local canonical receipt, both output
    identities, and the archive receipt;
-5. fresh object heads verifying all three immutable archive objects; and
+5. fresh metadata verification of all three immutable archive objects against
+   the archive receipt; and
 6. explicit delete mode.
 
 Only `evidence.ndjson.zst` and `provenance.ndjson.zst` are removed, evidence
@@ -645,9 +651,9 @@ canonical/date=<YYYY-MM-DD>/window=<window_start_ns>/receipt.json
 ```
 
 The unchanged canonical `receipt.json` is uploaded after the two data objects.
-Fresh object-store heads must prove all three SHA-256 identities, lengths, and
-content metadata. Only then may the sink durably publish
+Fresh object-store metadata must verify all three complete receipt expectations.
+Only then may the sink durably publish
 `canonical_archive_receipt.json` beside the local window (or the explicitly
 non-authoritative `.local.json` conformance form). A failed decode, upload,
-head, or immutable-key check leaves no canonical archive receipt and never
-modifies the committed window.
+metadata verification, or immutable-key check leaves no canonical archive
+receipt and never modifies the committed window.

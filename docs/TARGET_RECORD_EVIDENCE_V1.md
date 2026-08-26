@@ -521,9 +521,9 @@ Still open:
   should not touch.** This document adds an artifact to a run directory and
   repoints checks at it; the adapter changes where bytes come from. The only
   shared surface is that gate 1's inputs are now all archived, which the adapter
-  benefits from and does not depend on. Note for that work: `ObjectStore` has no
-  list operation (`archive/storage/base.py:101-111`), and driving `object_keys`
-  from archive receipts is likely better than `list_objects_v2`, because receipts
-  are already the commit marker and give window scoping for free.
+  benefits from and does not depend on. `ObjectStore` now has a provider-neutral
+  list operation, but driving `object_keys` from archive receipts remains better
+  than provider listings because receipts are the commit marker and give window
+  scoping for free.
 - Kalshi fee terms. No storage decision creates a field the venue does not
   publish; §6.1 defers the interpretation rather than resolving it.

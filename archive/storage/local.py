@@ -6,6 +6,8 @@ The write-side protocol is deliberately much smaller than an S3 client
 ```text
 put_immutable(key, reader, expected_identity) -> ObjectMetadata
 head(key)                                     -> ObjectMetadata | None
+verify_metadata(expectation)                  -> ObjectMetadata
+verify(expectation)                           -> None
 open(key)                                     -> bounded byte reader
 open_verified(expectation)                    -> verified byte reader
 list_keys(prefix)                             -> immutable key iterator
@@ -62,6 +64,7 @@ from archive.storage.base import (
     normalize_key,
     provider_checksum_of,
 )
+from archive.storage.verification import consume_verified, match_metadata
 
 __all__ = [
     "CONFORMANCE",
@@ -387,6 +390,12 @@ class LocalObjectStore:
             content_type=content_type,
             content_encoding=content_encoding,
         )
+
+    def verify_metadata(self, expected: ObjectExpectation) -> ObjectMetadata:
+        return match_metadata(self.head(expected.key), expected)
+
+    def verify(self, expected: ObjectExpectation) -> None:
+        consume_verified(self, expected)
 
     def open(self, key: str, *, max_bytes: int | None = None) -> BoundedReader:
         normalized = normalize_key(key)

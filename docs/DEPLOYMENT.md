@@ -591,9 +591,10 @@ canonical/date=<YYYY-MM-DD>/window=<start>/
   receipt.json
 ```
 
-Fresh object-store heads verify all three before the local window receives
-`canonical_archive_receipt.json`. The local backend uses
-`canonical_archive_receipt.local.json`, which is conformance evidence only.
+Fresh object-store metadata verifies all three complete object expectations
+before the local window receives `canonical_archive_receipt.json`. The local
+backend uses `canonical_archive_receipt.local.json`, which is conformance
+evidence only.
 
 Canonical deletion is a third, separate authority:
 
@@ -604,8 +605,9 @@ docker compose --profile ops run --rm canonical-reaper-once
 It defaults to `CANONICAL_REAPER_MODE=audit`. A window is reapable only when a
 production canonical archive receipt binds its unchanged `receipt.json` and
 both frame identities, the backend is independently durable, all three remote
-objects pass fresh heads, and the window is at least
-`CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value below 18.
+objects pass fresh metadata verification against that receipt, and the window
+is at least `CANONICAL_REAPER_RETENTION_HOURS` old. The command refuses a value
+below 18.
 Age is measured from the latest of window end, finalization, archive
 verification, and both receipt mtimes, so a backdated test clock cannot shorten
 retention.
@@ -642,12 +644,13 @@ ARCHIVE_BACKEND=gcs
 ARCHIVE_GCS_BUCKET=my-dedicated-archive-bucket
 ```
 
-GCS has no server-side SHA-256. The adapter uses a CRC32C-checked conditional
-resumable create, then downloads the exact object generation to recompute
-SHA-256 from the stored bytes. It rechecks both generation and metageneration
-before returning verified metadata. This makes a GCS `head` a full-object read,
-but preserves the same stored-byte SHA-256 proof without trusting custom
-metadata.
+GCS has no server-side SHA-256. The adapter calculates SHA-256 over the exact
+conditional resumable-upload stream while the GCS client and service validate
+CRC32C. It stores that SHA-256 and byte length as custom metadata and records
+the service-returned CRC32C separately in the receipt. Normal `head`, archive
+verification, and reaper checks compare current provider metadata with that
+closed receipt without downloading object bodies. Retrieval pins a generation
+and verifies SHA-256 plus CRC32C while consuming the complete object.
 
 All three `ARCHIVE_S3_*` values are required together; the factory refuses to
 start with only some of them set, and separately refuses to start if any of

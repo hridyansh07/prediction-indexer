@@ -137,6 +137,12 @@ class CanonicalArchiverCase(unittest.TestCase):
             def head(self, key):
                 return self.inner.head(key)
 
+            def verify_metadata(self, expected):
+                return self.inner.verify_metadata(expected)
+
+            def verify(self, expected):
+                return self.inner.verify(expected)
+
             def open(self, key, **kwargs):
                 return self.inner.open(key, **kwargs)
 
