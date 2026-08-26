@@ -272,6 +272,8 @@ function RunMetrics({
       />
       <div className="metrics">
         <Metric n={run.selections.length} label="Selected bundles" />
+        <Metric n={run.counts.candidates} label="Candidates" />
+        <Metric n={run.counts.rejected} label="Rejected" />
         <Metric
           n={
             run.selections.filter(
@@ -313,7 +315,7 @@ function RunSelections({ run }: { run: UniverseCadenceRun }) {
     <section>
       <Title
         title="Selected bundles"
-        sub="Universe selection detail; candidate and rejection data are not exposed"
+        sub="Verified selected lifecycle detail from the cadence projection"
       />
       {run.selections.length ? (
         <div className="cards">

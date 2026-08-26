@@ -1,11 +1,6 @@
 {
   "event_universe_config_version": 1,
   "database_path": "/var/lib/event-universe/event-universe.sqlite3",
-  "archive": {
-    "bucket": "${ARCHIVE_S3_BUCKET}",
-    "region": "${ARCHIVE_S3_REGION}",
-    "expected_owner": "${ARCHIVE_S3_EXPECTED_OWNER}"
-  },
   "api": {
     "host": "0.0.0.0",
     "port": 8080

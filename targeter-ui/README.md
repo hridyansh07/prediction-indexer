@@ -36,9 +36,10 @@ GET /api/event-universe/v1/targeter/cadence?limit=5
 Refreshes are GET-only. The status is exactly `CADENCE CURRENT`, `CADENCE LATE`,
 or `CADENCE UNAVAILABLE`, as supplied by Universe. It is an indexed cadence
 observation, not proof of `current.json` publication or splice health. The
-current API contains selected occurrence detail but no rejected candidates,
-catalogue summaries, decision diagnostics, or broader candidate metrics, so
-the UI does not infer or display them.
+API includes selected occurrence detail plus bounded catalogue, candidate,
+rejection, admission, continuity, terminal-probe, and diagnostic projections.
+The UI uses the server's semantic counts and never reinterprets raw Targeter
+reports.
 
 ## Routes
 

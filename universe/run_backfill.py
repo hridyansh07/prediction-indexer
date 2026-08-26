@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill one configured Targeter v3 generated-time range from S3."""
+"""Backfill one configured Targeter v3 generated-time range from ObjectStore."""
 
 import json
 import sys

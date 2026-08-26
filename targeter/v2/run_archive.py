@@ -38,6 +38,7 @@ from encoder import (
     stored_identity_of,
 )
 from targeter.v2.models import SUPPORTED_VENUES, parse_timestamp
+from targeter.v2.manifest import RunManifestError, parse_run_manifest
 
 RUN_MANIFEST_VERSION = 2
 RUN_ARCHIVE_RECEIPT_VERSION = 3
@@ -515,6 +516,15 @@ def build_run_manifest(run_directory: Path) -> tuple[dict[str, Any], Path]:
         "input_complete": report["input_complete"],
         "files": [_artifact_record(path, report) for path in files],
     }
+    generated_date = str(report["generated_at"]).split("T", 1)[0]
+    manifest_key = (
+        f"targeter-v2/runs/date={generated_date}/run={run_directory.name}/"
+        f"{RUN_MANIFEST_FILE}"
+    )
+    try:
+        parse_run_manifest(document, key=manifest_key)
+    except RunManifestError as error:
+        raise RunArchiveError(f"generated run manifest is invalid: {error}") from error
     path = run_directory / RUN_MANIFEST_FILE
     if path.exists():
         existing = _read_json(path, "run manifest")

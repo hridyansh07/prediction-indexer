@@ -735,10 +735,13 @@ default command:
 docker compose -f compose.universe.yaml up -d event-universe
 ```
 
-The JSON config holds the database path, API listener, S3 archive identity,
-temporary directory, and backup destination. `${ARCHIVE_S3_*}` references are
-expanded from the environment. AWS credentials continue to use boto3's standard
-provider chain; on AWS, prefer an instance role.
+The JSON config holds the database path, API listener, temporary directory, and
+backup destination. Object-store selection is environment-owned and uses the
+same provider-neutral `ARCHIVE_BACKEND` factory as Targeter and the archivers.
+For local operation, `EVENT_UNIVERSE_ARCHIVE_ROOT` is mounted at
+`/var/lib/archive`. For S3 set all three `ARCHIVE_S3_*` values; for GCS set
+`ARCHIVE_GCS_BUCKET`. AWS credentials use boto3's standard provider chain and
+GCS uses Application Default Credentials; prefer attached workload identities.
 
 Incremental ingestion and backup remain scheduler-owned one-shot jobs, but they
 are direct scripts with no argument parser:
@@ -748,15 +751,19 @@ python universe/run_sync.py
 python universe/run_backup.py
 ```
 
-The store is intentionally sparse and append-only: it indexes historical
+The durable store is intentionally sparse and append-only: it indexes historical
 Targeter-selected bundle occurrences plus normalized event, sibling-market,
-target-asset, relationship, and exact source/origin provenance. It does not copy
-catalogues, selection reports, target vendor records, control envelopes, raw
-segments, or venue deliveries into SQLite. The reviewable schema is
-`universe/schema/v1.sql`.
+target-asset, relationship, and exact source/origin provenance. A separate
+disposable `cadence_runs` cache keeps exactly the newest five run projections,
+including incomplete and empty runs. It contains compact catalogue, candidate,
+rejection, admission, continuity, terminal-probe, and diagnostic evidence; it
+does not copy raw catalogues or selection reports. The archive remains
+authoritative and the cache is rebuildable. The durable selected-history schema
+is `universe/schema/v1.sql`; `universe/schema/v2.sql` adds only this disposable
+cache and upgrades existing v1 databases in place.
 
 Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
-version-2 S3 run manifests and derives selected occurrences directly from each
+version-2 run manifests and derives selected occurrences directly from each
 manifest-owned v3 `selection_report.json[.zst]`. Existing archived v3 runs need
 no Universe sidecar or producer backfill. Retained selections recursively verify
 their exact immutable v3 origin manifests, including origins outside the
@@ -774,6 +781,9 @@ Universe sidecar or receipt-mirror service.
 `EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
 backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
 a private interface or authenticated reverse proxy when exposing the API.
+`GET /v1/targeter/cadence` serves the newest-five cache in descending run order;
+its current/late state describes archive cadence only, not publication or splice
+health.
 
 ## Clock and liveness semantics
 

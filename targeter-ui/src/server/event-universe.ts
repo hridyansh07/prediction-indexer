@@ -404,6 +404,44 @@ const array = <T>(value: unknown, validate: Validator<T>) => {
   if (!Array.isArray(value)) throw new UniverseUpstreamError();
   return value.map(validate);
 };
+const jsonValue = (value: unknown, depth = 0): unknown => {
+  if (depth > 12) throw new UniverseUpstreamError();
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  )
+    return value;
+  if (Array.isArray(value))
+    return value.map((item) => jsonValue(item, depth + 1));
+  if (value && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        jsonValue(item, depth + 1),
+      ]),
+    );
+  throw new UniverseUpstreamError();
+};
+const jsonObject = (value: unknown) => {
+  const result = jsonValue(value);
+  if (!result || typeof result !== 'object' || Array.isArray(result))
+    throw new UniverseUpstreamError();
+  return result as Record<string, unknown>;
+};
+const textRecord = (value: unknown) => {
+  const record = jsonObject(value);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, text(item)]),
+  );
+};
+const numberRecord = (value: unknown) => {
+  const record = jsonObject(value);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, number(item)]),
+  );
+};
 
 function validateSource(
   value: unknown,
@@ -760,8 +798,27 @@ export function validateCadence(value: unknown): UniverseCadence {
       ? null
       : timestamp(freshness.latest_indexed_at);
   const runs = array(item.runs, (value): UniverseCadenceRun => {
-    const run = object(value, [...RUN_KEYS, 'selections'], 'cadence run');
-    const { selections, ...runFields } = run;
+    const operationalKeys = [
+      'catalogs',
+      'discovery_failures',
+      'counts',
+      'reason_summaries',
+      'match_rejections',
+      'candidates',
+      'selected_targets',
+      'budget_used',
+      'continuity',
+      'diagnostics',
+    ];
+    const run = object(
+      value,
+      [...RUN_KEYS, 'selections', ...operationalKeys],
+      'cadence run',
+    );
+    const { selections, ...allRunFields } = run;
+    const runFields = Object.fromEntries(
+      Object.entries(allRunFields).filter(([key]) => RUN_KEYS.includes(key)),
+    );
     const validatedRun = validateRun(runFields);
     const validatedSelections = array(selections, validateSelectionDetail);
     if (
@@ -770,7 +827,67 @@ export function validateCadence(value: unknown): UniverseCadence {
       )
     )
       throw new UniverseUpstreamError();
-    return { ...validatedRun, selections: validatedSelections };
+    const counts = object(
+      run.counts,
+      ['candidates', 'eligible', 'selected', 'rejected', 'retained', 'retired'],
+      'cadence counts',
+    );
+    const catalogs = array(run.catalogs, (value) => {
+      const catalog = object(
+        value,
+        [
+          'venue',
+          'complete',
+          'events',
+          'markets',
+          'requests',
+          'diagnostics',
+          'classification_diagnostic_count',
+          'classification_diagnostics_by_code',
+        ],
+        'cadence catalog',
+      );
+      return {
+        venue: text(catalog.venue),
+        complete: boolean(catalog.complete),
+        events: integer(catalog.events),
+        markets: integer(catalog.markets),
+        requests: integer(catalog.requests),
+        diagnostics: strings(catalog.diagnostics),
+        classification_diagnostic_count: integer(
+          catalog.classification_diagnostic_count,
+        ),
+        classification_diagnostics_by_code: numberRecord(
+          catalog.classification_diagnostics_by_code,
+        ),
+      };
+    });
+    return {
+      ...validatedRun,
+      catalogs,
+      discovery_failures: textRecord(run.discovery_failures),
+      counts: Object.fromEntries(
+        Object.entries(counts).map(([key, value]) => [key, integer(value)]),
+      ) as UniverseCadenceRun['counts'],
+      reason_summaries: Object.fromEntries(
+        Object.entries(jsonObject(run.reason_summaries)).map(([key, value]) => [
+          key,
+          numberRecord(value),
+        ]),
+      ),
+      match_rejections: array(run.match_rejections, jsonObject),
+      candidates: array(run.candidates, jsonObject),
+      selected_targets: Object.fromEntries(
+        Object.entries(jsonObject(run.selected_targets)).map(([key, value]) => [
+          key,
+          array(value, jsonObject),
+        ]),
+      ),
+      budget_used: numberRecord(run.budget_used),
+      continuity: jsonObject(run.continuity),
+      diagnostics: jsonObject(run.diagnostics),
+      selections: validatedSelections,
+    };
   });
   if (
     runs.length > 5 ||

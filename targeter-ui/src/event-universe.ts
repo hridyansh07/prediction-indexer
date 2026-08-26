@@ -143,6 +143,32 @@ export interface UniverseCadenceFreshness {
 }
 
 export interface UniverseCadenceRun extends UniverseRun {
+  catalogs: Array<{
+    venue: string;
+    complete: boolean;
+    events: number;
+    markets: number;
+    requests: number;
+    diagnostics: string[];
+    classification_diagnostic_count: number;
+    classification_diagnostics_by_code: Record<string, number>;
+  }>;
+  discovery_failures: Record<string, string>;
+  counts: {
+    candidates: number;
+    eligible: number;
+    selected: number;
+    rejected: number;
+    retained: number;
+    retired: number;
+  };
+  reason_summaries: Record<string, Record<string, number>>;
+  match_rejections: Array<Record<string, unknown>>;
+  candidates: Array<Record<string, unknown>>;
+  selected_targets: Record<string, Array<Record<string, unknown>>>;
+  budget_used: Record<string, number>;
+  continuity: Record<string, unknown>;
+  diagnostics: Record<string, unknown>;
   selections: UniverseSelectionDetail[];
 }
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -16,8 +15,17 @@ from archive.storage.base import (
     ObjectStore,
 )
 from archive.storage.verification import verify_metadata_objects
-from encoder import LogicalIdentity, StoredIdentity
+from encoder import StoredIdentity
+from targeter.v2.manifest import (
+    RunManifest,
+    RunManifestError,
+    RunObject,
+    manifest_run_id,
+    manifest_run_instant,
+    parse_run_manifest,
+)
 from targeter.v2.models import parse_timestamp
+from universe.cadence import project_cadence_run
 from universe.projection import (
     PROJECTION_VERSION,
     project_bundle_retirements,
@@ -55,29 +63,10 @@ class SyncResult:
 
 
 @dataclass(frozen=True)
-class _RunObject:
-    file: str
-    key: str
-    stored: StoredIdentity
-    logical: LogicalIdentity | None
-    content_type: str
-    content_encoding: str | None
-
-
-@dataclass(frozen=True)
-class _RunManifest:
-    key: str
-    stored: StoredIdentity
-    run_id: str
-    generated_at: str
-    input_complete: bool
-    objects: tuple[_RunObject, ...]
-
-
-@dataclass(frozen=True)
 class _VerifiedRun:
-    manifest: _RunManifest
-    report_item: _RunObject
+    manifest: RunManifest
+    manifest_stored: StoredIdentity
+    report_item: RunObject
     report: dict[str, Any]
     projected: tuple[dict[str, Any], ...]
     retirements: tuple[dict[str, Any], ...]
@@ -115,11 +104,11 @@ class UniverseSync:
             result.discovered = len(keys)
             if not keys:
                 return result
-            key = max(keys, key=_manifest_run_id)
+            key = max(keys, key=manifest_run_id)
             self._ingest_direct(key, result)
             if not result.failures:
                 self.database.set_checkpoint(
-                    INCREMENTAL_CHECKPOINT, _manifest_run_instant(key).date().isoformat()
+                    INCREMENTAL_CHECKPOINT, manifest_run_instant(key).date().isoformat()
                 )
             return result
 
@@ -142,7 +131,7 @@ class UniverseSync:
             before = len(result.failures)
             self._ingest_direct(key, result)
             if len(result.failures) != before:
-                failed_dates.append(_manifest_run_instant(key).date())
+                failed_dates.append(manifest_run_instant(key).date())
         next_floor = min(failed_dates) if failed_dates else ceiling
         self.database.set_checkpoint(INCREMENTAL_CHECKPOINT, next_floor.isoformat())
         return result
@@ -159,7 +148,7 @@ class UniverseSync:
             keys = [
                 key
                 for key in self._manifest_keys_for_dates(start.date(), last_date)
-                if start <= _manifest_run_instant(key) < end
+                if start <= manifest_run_instant(key) < end
             ]
         except Exception as error:  # noqa: BLE001
             result.failures.append(
@@ -172,7 +161,7 @@ class UniverseSync:
         return result
 
     def audit_run(self, run_id: str) -> dict[str, Any]:
-        """Reverify one run and every retained origin against immutable S3 bytes."""
+        """Reverify one run and every retained origin against immutable store bytes."""
         detail = self.database.run_detail(run_id)
         if detail is None:
             raise UniverseSyncError(f"Targeter run {run_id} is not indexed")
@@ -198,7 +187,7 @@ class UniverseSync:
             )
             if status == "ingested":
                 result.ingested += 1
-                detail = self.database.run_detail(_manifest_run_id(key))
+                detail = self.database.run_detail(manifest_run_id(key))
                 if detail is not None and detail["input_complete"] is False:
                     result.incomplete += 1
             else:
@@ -287,8 +276,8 @@ class UniverseSync:
                 report_version=verified.report["report_version"],
                 strategy_version=verified.report["strategy_version"],
                 manifest_key=verified.manifest.key,
-                manifest_sha256=verified.manifest.stored.sha256,
-                manifest_byte_length=verified.manifest.stored.byte_length,
+                manifest_sha256=verified.manifest_stored.sha256,
+                manifest_byte_length=verified.manifest_stored.byte_length,
                 report_key=verified.report_item.key,
                 report_sha256=verified.report_item.stored.sha256,
                 report_byte_length=verified.report_item.stored.byte_length,
@@ -302,6 +291,7 @@ class UniverseSync:
                     if report_logical is not None
                     else verified.report_item.stored.byte_length
                 ),
+                cadence=project_cadence_run(verified.report),
                 occurrences=resolved,
                 retirements=resolved_retirements,
             )
@@ -393,7 +383,7 @@ class UniverseSync:
             raise UniverseSyncError(
                 f"{label} {bundle_id} origin is not older than its occurrence"
             )
-        if _manifest_run_id(origin_key) != origin_run_id:
+        if manifest_run_id(origin_key) != origin_run_id:
             raise UniverseSyncError(
                 f"{label} {bundle_id} origin key disagrees with origin_run_id"
             )
@@ -434,7 +424,7 @@ class UniverseSync:
         expected_manifest_sha256: str | None,
         expected_report_sha256: str | None,
     ) -> _VerifiedRun:
-        manifest = self._read_run_manifest(
+        manifest, manifest_stored = self._read_run_manifest(
             key, expected_sha256=expected_manifest_sha256
         )
         report_items = [
@@ -449,7 +439,7 @@ class UniverseSync:
         report_item = report_items[0]
         verify_metadata_objects(
             self.objects,
-            (_object_expectation(item) for item in manifest.objects),
+            (item.expectation() for item in manifest.objects),
         )
         if (
             expected_report_sha256 is not None
@@ -479,7 +469,7 @@ class UniverseSync:
                 f"run {manifest.run_id} has an invalid strategy_version"
             )
         generated = parse_timestamp(manifest.generated_at)
-        if generated is None or generated != _manifest_run_instant(key):
+        if generated is None or generated != manifest_run_instant(key):
             raise UniverseSyncError(
                 f"run {manifest.run_id} generated_at disagrees with its run id"
             )
@@ -493,11 +483,13 @@ class UniverseSync:
             if manifest.input_complete
             else ()
         )
-        return _VerifiedRun(manifest, report_item, report, projected, retirements)
+        return _VerifiedRun(
+            manifest, manifest_stored, report_item, report, projected, retirements
+        )
 
     def _read_run_manifest(
         self, key: str, *, expected_sha256: str | None
-    ) -> _RunManifest:
+    ) -> tuple[RunManifest, StoredIdentity]:
         metadata = self.objects.head(key)
         if metadata is None:
             raise UniverseSyncError(f"run manifest is absent: {key}")
@@ -519,95 +511,13 @@ class UniverseSync:
             ),
             max_decoded_bytes=MAX_MANIFEST_BYTES,
         )
-        if not isinstance(document, dict) or set(document) != {
-            "targeter_run_manifest_version",
-            "run_id",
-            "generated_at",
-            "input_complete",
-            "files",
-        }:
-            raise UniverseSyncError(f"run manifest {key} has invalid fields")
-        if document["targeter_run_manifest_version"] != 2:
-            raise UniverseSyncError(f"run manifest {key} is not version 2")
-        run_id = _required_text(document, "run_id", "run manifest")
-        if _manifest_run_id(key) != run_id:
-            raise UniverseSyncError(f"run manifest key does not match run_id {run_id}")
-        generated_at = _required_text(document, "generated_at", "run manifest")
-        input_complete = document["input_complete"]
-        if not isinstance(input_complete, bool):
-            raise UniverseSyncError("run manifest input_complete must be boolean")
-        files = document["files"]
-        if not isinstance(files, list) or not files:
-            raise UniverseSyncError("run manifest files must be a non-empty array")
-        prefix = key.rsplit("/", 1)[0]
-        objects = tuple(self._parse_run_object(prefix, value) for value in files)
-        names = [item.file for item in objects]
-        if len(names) != len(set(names)):
-            raise UniverseSyncError(f"run manifest {key} repeats an object")
-        return _RunManifest(
-            key,
-            metadata.stored,
-            run_id,
-            generated_at,
-            input_complete,
-            objects,
-        )
+        try:
+            manifest = parse_run_manifest(document, key=key)
+        except RunManifestError as error:
+            raise UniverseSyncError(str(error)) from error
+        return manifest, metadata.stored
 
-    def _parse_run_object(self, prefix: str, value: Any) -> _RunObject:
-        if not isinstance(value, dict):
-            raise UniverseSyncError("run manifest object must be an object")
-        name = _required_text(value, "file", "run manifest object")
-        if Path(name).name != name:
-            raise UniverseSyncError(f"run manifest object is not a basename: {name!r}")
-        key = f"{prefix}/{name}"
-        rich = name.endswith((".ndjson", ".ndjson.zst", ".json.zst"))
-        expected = (
-            {
-                "file",
-                "content_type",
-                "content_encoding",
-                "decoded",
-                "stored",
-                "compression",
-            }
-            if rich
-            else {
-                "file",
-                "byte_length",
-                "sha256",
-                "content_type",
-                "content_encoding",
-            }
-        )
-        if set(value) != expected:
-            raise UniverseSyncError(f"run object {name} has invalid fields")
-        content_type = _required_text(value, "content_type", f"run object {name}")
-        encoding = value.get("content_encoding")
-        if encoding not in {None, "zstd"}:
-            raise UniverseSyncError(f"run object {name} has invalid content encoding")
-        if rich:
-            stored_record = value.get("stored")
-            logical_record = value.get("decoded")
-            if not isinstance(stored_record, dict) or not isinstance(logical_record, dict):
-                raise UniverseSyncError(f"run object {name} has invalid identities")
-            stored = _stored(stored_record, f"run object {name} stored")
-            logical = _logical(logical_record, f"run object {name} decoded")
-            if name.endswith(".zst") != (encoding == "zstd"):
-                raise UniverseSyncError(f"run object {name} suffix and encoding disagree")
-            compression = value.get("compression")
-            if encoding == "zstd":
-                if not _valid_compression(compression):
-                    raise UniverseSyncError(
-                        f"run object {name} has invalid compression"
-                    )
-            elif compression is not None:
-                raise UniverseSyncError(f"plain run object {name} claims compression")
-        else:
-            stored = _stored(value, f"run object {name}")
-            logical = None
-        return _RunObject(name, key, stored, logical, content_type, encoding)
-
-    def _read_json(self, item: _RunObject) -> dict[str, Any]:
+    def _read_json(self, item: RunObject) -> dict[str, Any]:
         if item.content_type != JSON_CONTENT_TYPE:
             raise UniverseSyncError(f"selection report {item.key} is not JSON")
         decoded_bytes = (
@@ -620,7 +530,7 @@ class UniverseSync:
             )
         document = read_verified_json(
             self.objects,
-            _object_expectation(item),
+            item.expectation(),
             logical=item.logical,
             max_decoded_bytes=MAX_SELECTION_REPORT_BYTES,
             temp_root=self.temporary_directory,
@@ -636,8 +546,8 @@ class UniverseSync:
             if key.endswith("/run_manifest.json")
         ]
         for key in keys:
-            _manifest_run_id(key)
-        return sorted(set(keys), key=_manifest_run_id)
+            manifest_run_id(key)
+        return sorted(set(keys), key=manifest_run_id)
 
     def _manifest_keys_for_dates(self, start: date, end: date) -> list[str]:
         keys: list[str] = []
@@ -646,10 +556,10 @@ class UniverseSync:
             prefix = f"targeter-v2/runs/date={cursor.isoformat()}/"
             for key in self.objects.list_keys(prefix):
                 if key.endswith("/run_manifest.json"):
-                    _manifest_run_id(key)
+                    manifest_run_id(key)
                     keys.append(key)
             cursor += timedelta(days=1)
-        return sorted(set(keys), key=_manifest_run_id)
+        return sorted(set(keys), key=manifest_run_id)
 
 
 def _complete_context(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -704,111 +614,11 @@ def _projected_targets(value: Any) -> list[dict[str, Any]]:
     return sorted(output, key=lambda item: (item["venue"], item["target_id"]))
 
 
-def _manifest_run_id(key: str) -> str:
-    parts = key.split("/")
-    if (
-        len(parts) != 5
-        or parts[:2] != ["targeter-v2", "runs"]
-        or not parts[2].startswith("date=")
-        or not parts[3].startswith("run=")
-        or parts[4] != "run_manifest.json"
-    ):
-        raise UniverseSyncError(f"invalid Targeter run manifest key: {key}")
-    run_id = parts[3].removeprefix("run=")
-    instant = _run_id_instant(run_id)
-    if instant.date().isoformat() != parts[2].removeprefix("date="):
-        raise UniverseSyncError(f"Targeter run manifest date disagrees with run id: {key}")
-    return run_id
-
-
-def _manifest_run_instant(key: str) -> datetime:
-    return _run_id_instant(_manifest_run_id(key))
-
-
-def _run_id_instant(run_id: str) -> datetime:
-    try:
-        instant = datetime.strptime(run_id, "%Y%m%dT%H%M%S.%fZ").replace(
-            tzinfo=timezone.utc
-        )
-    except ValueError as error:
-        raise UniverseSyncError(f"invalid Targeter run id: {run_id}") from error
-    if instant.strftime("%Y%m%dT%H%M%S.%fZ") != run_id:
-        raise UniverseSyncError(f"non-canonical Targeter run id: {run_id}")
-    return instant
-
-
-def _object_expectation(item: _RunObject) -> ObjectExpectation:
-    return ObjectExpectation(
-        item.key,
-        item.stored,
-        None,
-        None,
-        item.content_type,
-        item.content_encoding,
-    )
-
-
 def _required_text(document: Mapping[str, Any], field: str, label: str) -> str:
     value = document.get(field)
     if not isinstance(value, str) or not value:
         raise UniverseSyncError(f"{label} {field} must be non-empty text")
     return value
-
-
-def _stored(document: Mapping[str, Any], label: str) -> StoredIdentity:
-    return StoredIdentity(
-        sha256=_digest(document.get("sha256"), label),
-        byte_length=_integer(document.get("byte_length"), label),
-    )
-
-
-def _logical(document: Mapping[str, Any], label: str) -> LogicalIdentity:
-    if set(document) != {"sha256", "byte_length", "line_count"}:
-        raise UniverseSyncError(f"{label} has invalid identity fields")
-    return LogicalIdentity(
-        sha256=_digest(document.get("sha256"), label),
-        byte_length=_integer(document.get("byte_length"), label),
-        line_count=_integer(document.get("line_count"), label),
-    )
-
-
-def _digest(value: Any, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or value != value.lower()
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise UniverseSyncError(f"{label} has invalid sha256")
-    return value
-
-
-def _integer(value: Any, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise UniverseSyncError(f"{label} has an invalid count")
-    return value
-
-
-def _valid_compression(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value)
-        == {
-            "algorithm",
-            "level",
-            "frame_checksum",
-            "dictionary",
-            "frame_count",
-            "encoder",
-        }
-        and value["algorithm"] == "zstd"
-        and value["level"] == 3
-        and value["frame_checksum"] is True
-        and value["dictionary"] is None
-        and value["frame_count"] == 1
-        and isinstance(value["encoder"], str)
-        and bool(value["encoder"])
-    )
 
 
 def _date(value: str, label: str) -> date:

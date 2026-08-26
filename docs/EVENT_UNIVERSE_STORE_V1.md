@@ -21,23 +21,25 @@ For each selected occurrence it answers:
 - which immutable Targeter manifest and report contain the current occurrence
   and its proven origin.
 
-It is not:
+The durable history remains intentionally narrow. A separate disposable cache
+supports the cadence UI with the newest five run projections. It is not:
 
 - a catalogue of everything Targeter inspected;
-- a latest-only replacement for Targeter observability;
+- a historical archive of Targeter observability;
 - a second JSON archive;
 - a row-level index of captured venue deliveries;
 - an authority for choosing usable raw segments, continuity, or replay gates;
-- a replay plan, replay executor, or UI; or
+- a replay plan or replay executor; or
 - a place for human-authored market links.
 
 Replay remains responsible for locating and validating raw/canonical evidence
 for an event interval. Event Universe supplies selected-event context and exact
-Targeter S3 provenance, not a claim that any raw segment is replayable.
+Targeter object-store provenance, not a claim that any raw segment is replayable.
 
 ## 2. Source and version contract
 
-The sole commit marker is an immutable S3 Targeter run manifest at:
+The sole commit marker is an immutable Targeter run manifest in the configured
+provider-neutral ObjectStore at:
 
 ```text
 targeter-v2/runs/date=YYYY-MM-DD/run=<run_id>/run_manifest.json
@@ -52,19 +54,21 @@ V1 accepts only:
   input-completeness, and strategy version; and
 - canonical run keys and run timestamps that identify the same UTC instant.
 
-Every consumed object is checked against the manifest's byte length, SHA-256,
-content metadata, and provider SHA-256 checksum. Zstandard reports are decoded
-through the shared strict streaming `encoder` with the manifest's stored and
-logical identities and decoded-size bound.
+Every consumed object is checked through the shared ObjectStore against the
+manifest's byte length, SHA-256, content metadata, and provider checksum
+evidence. Zstandard reports are decoded through the shared strict streaming
+`encoder` with the manifest's stored and logical identities and decoded-size
+bound. Universe contains no provider-specific read, hashing, staging, or decode
+implementation.
 
 Existing archived v3 runs already satisfy this source contract. Universe
 derives its projection directly from their report. It does not require, create,
 or upload `selected_bundle_index`, `.universe.json`, `.control.ndjson.zst`, a
 receipt mirror, or any other Universe-specific archive artifact.
 
-Targeter report v1/v2 and archive-manifest v1 are rejected. There was no
-deployed Universe database to migrate, so V1 has no mixed-version admission,
-nullable origin, or schema migration path. Create a fresh schema-v1 database.
+Targeter report v1/v2 and archive-manifest v1 are rejected. V1 has no
+mixed-version admission or nullable origin. Schema v2 upgrades an existing v1
+database only by adding the rebuildable cadence cache.
 
 An incomplete v3 run is retained as visible run history with zero admitted
 selections. A complete v3 run may also legitimately contain zero selections,
@@ -74,8 +78,9 @@ including continuity retirement that publishes an empty generation.
 
 Only IDs in `selection.bundle_ids` become selection occurrences. A prior
 selected bundle may additionally produce a retirement observation under §4.
-Rejected candidates, unselected catalogues, target-record artifacts, report
-bodies, and arbitrary vendor JSON do not enter SQL.
+Rejected candidates, unselected catalogues, and diagnostics do not enter the
+durable normalized history. Compact semantic summaries enter only the
+newest-five `cadence_runs` cache; report bodies and arbitrary vendor JSON do not.
 
 For each selected current candidate, the projector requires and normalizes:
 
@@ -184,6 +189,7 @@ The separately reviewable schema is:
 ```text
 universe/schema/README.md
 universe/schema/v1.sql
+universe/schema/v2.sql
 ```
 
 It contains:
@@ -196,7 +202,9 @@ It contains:
   complete/retained origin reference;
 - `bundle_retirements`: append-only all-terminal or clamp observations linked
   to an exact complete origin and normalized context; and
-- `checkpoints`: incremental discovery progress only.
+- `checkpoints`: incremental discovery progress only; and
+- `cadence_runs`: content-identified newest-five operational projections,
+  deleted by rotation without affecting durable selected history.
 
 It contains no report/catalogue JSON, active-snapshot table, raw segment,
 control-envelope, connection-epoch, venue-delivery, or replay-plan table.
@@ -207,8 +215,9 @@ transactions, and SQLite-native online backup followed by `integrity_check`.
 Contexts are deduplicated by canonical SHA-256. Re-materializing normalized SQL
 rows must reproduce each stored context and run-projection hash.
 
-Immutable S3 remains evidence authority. SQL is durable operational state and
-a query accelerator; keep it on an attached persistent volume and back it up
+The immutable ObjectStore remains evidence authority. Selected-history SQL is
+durable operational state and a query accelerator; keep it on an attached
+persistent volume and back it up
 because replaying all historical reports is the expensive recovery path. A
 small burstable instance is appropriate because row growth follows selected
 bundles and runs, not all catalogues or 13.6 million daily deliveries.
@@ -225,9 +234,10 @@ cursors:
 | `GET /v1/runs/<run_id>` | Source identities, projection identity, and local SQL audit |
 | `GET /v1/runs/<run_id>/audit` | Re-materialize and verify that run's SQL projection |
 | `GET /v1/runs/<run_id>/selections` | Occurrences selected in one run |
-| `GET /v1/runs/<run_id>/selections/<bundle_id>` | Full context plus current and origin S3 provenance |
+| `GET /v1/runs/<run_id>/selections/<bundle_id>` | Full context plus current and origin object provenance |
 | `GET /v1/selections` | Cross-run selected history |
 | `GET /v1/bundles/<bundle_id>/history` | One bundle's selected occurrence history |
+| `GET /v1/targeter/cadence` | Newest-five operational projection and archive-cadence freshness |
 
 Selection queries support:
 
@@ -237,19 +247,20 @@ Selection queries support:
 
 RFC 3339 bounds are half-open. Activation sorting is the default for general
 selection and per-run queries; selected-time sorting is the default for bundle
-history. API source/origin objects return exact Targeter manifest/report S3 keys
-and SHA-256 identities. They do not return or infer raw capture-object locations.
+history. API source/origin objects return exact Targeter manifest/report object
+keys and SHA-256 identities. They do not return or infer raw capture-object
+locations.
 
 Selection list and detail responses include `retirement: null` until a terminal
 or clamp observation is indexed. Afterwards the object supplies `retired_at`,
 the disposition, nullable `terminal_observed_at`, and the exact retirement
-report's run ID, manifest/report S3 keys, and hashes. An all-terminal
+report's run ID, manifest/report object keys, and hashes. An all-terminal
 `terminal_observed_at` is an observation upper bound, not a fabricated exact
 match-end timestamp.
 
-The API process requires no S3 credentials. Its audit endpoint verifies the
-stored normalized projection. The sync layer additionally supports an
-authoritative audit that rereads the exact manifest/report bytes from S3 before
+The API process requires no object-store credentials or mount. Its audit
+endpoint verifies the stored normalized projection. The sync layer additionally supports an
+authoritative audit that rereads the exact manifest/report bytes before
 requiring the SQL audit to pass.
 
 ## 8. Deployment
@@ -298,5 +309,7 @@ V1 is complete when tests prove:
     exact event-end timestamp;
 11. absence of Universe archive sidecars and raw/control/replay tables or APIs;
 12. independently readable SQLite backup; and
-13. no legacy report admission, UI change, durable Universe pointer, or
-    Targeter continuity weakening.
+13. no legacy report admission, durable Universe pointer, or Targeter
+    continuity weakening; and
+14. provider-neutral retrieval plus exact newest-five cache rotation and API
+    ordering.

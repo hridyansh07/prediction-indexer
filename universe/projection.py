@@ -1,7 +1,7 @@
 """Deterministic SQL projection of bundles selected by Targeter v3.
 
 The immutable selection report remains authoritative. This module derives only
-the selected hot path needed by Event Universe and creates no additional S3
+the selected hot path needed by Event Universe and creates no additional archive
 artifact, so it works with every already-archived v3 report.
 """
 
