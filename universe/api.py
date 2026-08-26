@@ -28,6 +28,11 @@ class UniverseApplication:
             return HTTPStatus.OK, self._runs(query)
         if parsed.path == "/v1/selections":
             return HTTPStatus.OK, self._selections(query)
+        if parsed.path == "/v1/targeter/cadence":
+            _only(query, {"limit"})
+            return HTTPStatus.OK, self.database.cadence_snapshot(
+                limit=_integer(query, "limit", default=5)
+            )
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
             bundle_id = _path_value(
                 parsed.path.removeprefix("/v1/bundles/").removesuffix("/history"),

@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, Mapping
 
+from archive import read_verified_json
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
-    ObjectMetadata,
+    ObjectExpectation,
     ObjectStore,
-    VerificationFailure,
-    provider_checksum_of,
 )
-from encoder import LogicalIdentity, StoredIdentity, decode_stream
+from archive.storage.verification import verify_metadata_objects
+from encoder import LogicalIdentity, StoredIdentity
 from targeter.v2.models import parse_timestamp
 from universe.projection import (
     PROJECTION_VERSION,
@@ -448,6 +447,10 @@ class UniverseSync:
                 f"run {manifest.run_id} must commit exactly one selection report"
             )
         report_item = report_items[0]
+        verify_metadata_objects(
+            self.objects,
+            (_object_expectation(item) for item in manifest.objects),
+        )
         if (
             expected_report_sha256 is not None
             and report_item.stored.sha256 != expected_report_sha256
@@ -502,15 +505,19 @@ class UniverseSync:
             raise UniverseSyncError(
                 f"run manifest {key} identity disagrees with continuity origin"
             )
-        if (
-            metadata.byte_length > MAX_MANIFEST_BYTES
-            or metadata.content_type != JSON_CONTENT_TYPE
-            or metadata.content_encoding is not None
-        ):
+        if metadata.byte_length > MAX_MANIFEST_BYTES:
             raise UniverseSyncError(f"run manifest {key} has invalid content metadata")
-        _verify_provider_identity(metadata, key)
-        document = _read_json_bytes(
-            self.objects, key, metadata, maximum=MAX_MANIFEST_BYTES
+        document = read_verified_json(
+            self.objects,
+            ObjectExpectation(
+                key,
+                metadata.stored,
+                metadata.provider_checksum,
+                metadata.provider_checksum_algorithm,
+                JSON_CONTENT_TYPE,
+                None,
+            ),
+            max_decoded_bytes=MAX_MANIFEST_BYTES,
         )
         if not isinstance(document, dict) or set(document) != {
             "targeter_run_manifest_version",
@@ -611,52 +618,16 @@ class UniverseSync:
                 f"selection report {item.key} exceeds "
                 f"{MAX_SELECTION_REPORT_BYTES} decoded bytes"
             )
-        if item.content_encoding == "zstd":
-            if item.logical is None:
-                raise UniverseSyncError(
-                    f"selection report {item.key} lacks a decoded identity"
-                )
-            with self._decoded(item) as decoded:
-                try:
-                    document = json.load(decoded)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise UniverseSyncError(
-                        f"invalid selection report {item.key}: {error}"
-                    ) from error
-        else:
-            metadata = _verify_object_metadata(self.objects, item)
-            document = _read_json_bytes(
-                self.objects,
-                item.key,
-                metadata,
-                maximum=MAX_SELECTION_REPORT_BYTES,
-            )
+        document = read_verified_json(
+            self.objects,
+            _object_expectation(item),
+            logical=item.logical,
+            max_decoded_bytes=MAX_SELECTION_REPORT_BYTES,
+            temp_root=self.temporary_directory,
+        )
         if not isinstance(document, dict):
             raise UniverseSyncError(f"selection report {item.key} is not an object")
         return document
-
-    def _decoded(self, item: _RunObject) -> "_ClosingTemporaryFile":
-        if item.logical is None:
-            raise UniverseSyncError(f"object {item.key} has no decoded identity")
-        metadata = _verify_object_metadata(self.objects, item)
-        _verify_provider_identity(metadata, item.key)
-        staged = tempfile.TemporaryFile(mode="w+b", dir=self.temporary_directory)
-        try:
-            with self.objects.open(
-                item.key, max_bytes=item.stored.byte_length
-            ) as source:
-                decode_stream(
-                    source,
-                    staged,
-                    expected_logical=item.logical,
-                    expected_stored=item.stored,
-                    max_decoded_bytes=item.logical.byte_length,
-                )
-            staged.seek(0)
-            return _ClosingTemporaryFile(staged)
-        except Exception:
-            staged.close()
-            raise
 
     def _all_manifest_keys(self) -> list[str]:
         keys = [
@@ -679,17 +650,6 @@ class UniverseSync:
                     keys.append(key)
             cursor += timedelta(days=1)
         return sorted(set(keys), key=_manifest_run_id)
-
-
-class _ClosingTemporaryFile:
-    def __init__(self, handle: BinaryIO) -> None:
-        self.handle = handle
-
-    def __enter__(self) -> BinaryIO:
-        return self.handle
-
-    def __exit__(self, *_: object) -> None:
-        self.handle.close()
 
 
 def _complete_context(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -777,47 +737,15 @@ def _run_id_instant(run_id: str) -> datetime:
     return instant
 
 
-def _verify_object_metadata(store: ObjectStore, item: _RunObject) -> ObjectMetadata:
-    metadata = store.head(item.key)
-    if metadata is None or not metadata.matches_request(
-        item.stored, item.content_type, item.content_encoding
-    ):
-        raise VerificationFailure(
-            f"manifest-committed object {item.key} does not match its identity"
-        )
-    _verify_provider_identity(metadata, item.key)
-    return metadata
-
-
-def _verify_provider_identity(metadata: ObjectMetadata, key: str) -> None:
-    if (
-        metadata.provider_checksum_algorithm != "SHA256"
-        or metadata.provider_checksum != provider_checksum_of(metadata.sha256)
-    ):
-        raise VerificationFailure(f"object {key} lacks its committed SHA256 checksum")
-
-
-def _read_json_bytes(
-    store: ObjectStore,
-    key: str,
-    metadata: ObjectMetadata,
-    *,
-    maximum: int,
-) -> Any:
-    if metadata.byte_length > maximum:
-        raise UniverseSyncError(f"JSON object {key} exceeds {maximum} bytes")
-    digest = hashlib.sha256()
-    payload = bytearray()
-    with store.open(key, max_bytes=metadata.byte_length) as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-            payload.extend(chunk)
-    if len(payload) != metadata.byte_length or digest.hexdigest() != metadata.sha256:
-        raise VerificationFailure(f"JSON object {key} changed between head and read")
-    try:
-        return json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise UniverseSyncError(f"invalid JSON object {key}: {error}") from error
+def _object_expectation(item: _RunObject) -> ObjectExpectation:
+    return ObjectExpectation(
+        item.key,
+        item.stored,
+        None,
+        None,
+        item.content_type,
+        item.content_encoding,
+    )
 
 
 def _required_text(document: Mapping[str, Any], field: str, label: str) -> str:

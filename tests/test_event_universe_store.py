@@ -661,6 +661,12 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(detail["origin"]["run_id"], R1)
         self.assertIn("report_key", detail["source"])
+        status, cadence = app.get("/v1/targeter/cadence")
+        self.assertEqual(status, 200)
+        self.assertEqual(cadence["cadence_projection_version"], 1)
+        self.assertEqual(cadence["freshness"]["state"], "late")
+        self.assertEqual([run["run_id"] for run in cadence["runs"]], [R2, R1])
+        self.assertEqual(cadence["runs"][0]["selections"][0]["bundle_id"], "bundle-1")
         self.assertEqual(app.get("/v1/segments")[0], 404)
         with sqlite3.connect(self.database.path) as connection:
             tables = {

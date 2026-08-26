@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from archive.storage.base import ObjectStore, normalize_key
-from archive.storage.s3 import S3ObjectStore
+from archive.storage.factory import build_store
 from targeter.v2.models import isoformat, parse_timestamp
 
 CONFIG_VERSION = 1
@@ -63,10 +63,14 @@ class UniverseConfig:
         return self.backfill.temporary_directory
 
     def object_store(self) -> ObjectStore:
-        return S3ObjectStore(
-            self.archive.bucket,
-            self.archive.region,
-            self.archive.expected_owner,
+        environment = dict(os.environ)
+        environment.setdefault("ARCHIVE_BACKEND", "s3")
+        environment.setdefault("ARCHIVE_S3_BUCKET", self.archive.bucket)
+        environment.setdefault("ARCHIVE_S3_REGION", self.archive.region)
+        environment.setdefault("ARCHIVE_S3_EXPECTED_OWNER", self.archive.expected_owner)
+        return build_store(
+            (self.database_path, self.backup.directory),
+            environ=environment,
         )
 
 

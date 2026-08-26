@@ -20,6 +20,7 @@ from universe.projection import PROJECTION_VERSION
 
 SCHEMA_VERSION = 1
 STALE_AFTER_SECONDS = 3_600
+TARGETER_CADENCE_SECONDS = 600
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
 
@@ -613,6 +614,41 @@ class UniverseStore:
             "schema_version": version,
             "latest_run": latest_record,
             "counts": counts,
+        }
+
+    def cadence_snapshot(
+        self, *, limit: int = 5, now_ns: int | None = None
+    ) -> dict[str, Any]:
+        """Return the bounded Targeter cadence view for the dashboard."""
+        bounded = min(_limit(limit), 5)
+        runs, _more = self.list_runs(limit=bounded)
+        runs = list(reversed(runs))
+        observed_ns = now_ns if now_ns is not None else time.time_ns()
+        latest = runs[0] if runs else None
+        age_seconds = (
+            max(0, (observed_ns - _timestamp_ns(latest["generated_at"])) // 1_000_000_000)
+            if latest is not None
+            else None
+        )
+        return {
+            "cadence_projection_version": 1,
+            "observed_at": _isoformat_ns(observed_ns),
+            "freshness": {
+                "state": (
+                    "unavailable"
+                    if latest is None
+                    else "late"
+                    if age_seconds is not None
+                    and age_seconds >= TARGETER_CADENCE_SECONDS * 2
+                    else "current"
+                ),
+                "expected_run_seconds": TARGETER_CADENCE_SECONDS,
+                "latest_run_age_seconds": age_seconds,
+                "latest_indexed_at": (
+                    _isoformat_ns(latest["indexed_at_ns"]) if latest is not None else None
+                ),
+            },
+            "runs": [_cadence_run(self, run) for run in runs],
         }
 
     def list_runs(
@@ -1249,6 +1285,23 @@ def _timestamp_ns(value: str) -> int:
         (delta.days * 86_400 + delta.seconds) * 1_000_000_000
         + delta.microseconds * 1_000
     )
+
+
+def _isoformat_ns(value: int) -> str:
+    return isoformat(
+        datetime.fromtimestamp(value / 1_000_000_000, tz=timezone.utc)
+    )
+
+
+def _cadence_run(database: UniverseStore, run: Mapping[str, Any]) -> dict[str, Any]:
+    selections, _more = database.list_selections(run_id=run["run_id"], limit=1000)
+    return {
+        **run,
+        "selections": [
+            database.selection_detail(run["run_id"], selection["bundle_id"])
+            for selection in selections
+        ],
+    }
 
 
 def _sha256(value: Any, label: str) -> str:
