@@ -442,6 +442,31 @@ const numberRecord = (value: unknown) => {
     Object.entries(record).map(([key, item]) => [key, number(item)]),
   );
 };
+const integerRecord = (value: unknown) => {
+  const record = jsonObject(value);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, integer(item)]),
+  );
+};
+const stringListRecord = (value: unknown) => {
+  const record = jsonObject(value);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, strings(item)]),
+  );
+};
+const partialObject = (value: unknown, keys: string[], label: string) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new UniverseUpstreamError(`${label} is invalid`);
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !keys.includes(key)))
+    throw new UniverseUpstreamError(`${label} fields are invalid`);
+  return record;
+};
+const optional = <T>(
+  record: Record<string, unknown>,
+  key: string,
+  validate: Validator<T>,
+) => (key in record ? validate(record[key]) : undefined);
 
 function validateSource(
   value: unknown,
@@ -767,6 +792,303 @@ function validateRunPage(value: unknown): UniverseRunPage {
   };
 }
 
+const CONTINUITY_DISPOSITIONS = [
+  'held_current_candidate',
+  'retained',
+  'continuity_budget_trimmed',
+  'all_markets_terminal',
+  'terminal_clamp_elapsed',
+] as const;
+
+function continuityDisposition(value: unknown) {
+  const result = text(value);
+  if (!CONTINUITY_DISPOSITIONS.includes(result as never))
+    throw new UniverseUpstreamError();
+  return result as UniverseCadenceRun['continuity']['dispositions'][string];
+}
+
+function validateCadenceRelationship(value: unknown) {
+  const item = object(
+    value,
+    [
+      'bundle_id',
+      'left',
+      'right',
+      'relationship',
+      'scope',
+      'left_venue',
+      'right_venue',
+      'cross_venue',
+      'coverage',
+    ],
+    'cadence relationship',
+  );
+  return {
+    bundle_id: text(item.bundle_id),
+    left: text(item.left),
+    right: text(item.right),
+    relationship: text(item.relationship),
+    scope: text(item.scope),
+    left_venue: text(item.left_venue),
+    right_venue: text(item.right_venue),
+    cross_venue: boolean(item.cross_venue),
+    coverage: text(item.coverage),
+  };
+}
+
+function validateCadenceCandidate(value: unknown) {
+  const item = partialObject(
+    value,
+    [
+      'bundle_id',
+      'sport',
+      'game',
+      'topology',
+      'participants',
+      'participant_keys',
+      'event_refs',
+      'activation_at',
+      'capture_start_at',
+      'score',
+      'score_components',
+      'eligible',
+      'event_status',
+      'rejection_reasons',
+      'admission',
+      'market_exclusions',
+      'eligible_market_ids',
+      'selected',
+      'allocation_rejection',
+      'relationship_analysis',
+    ],
+    'cadence candidate',
+  );
+  const eventStatus = optional(item, 'event_status', text);
+  if (eventStatus && !['ELIGIBLE', 'REJECTED'].includes(eventStatus))
+    throw new UniverseUpstreamError();
+  const admission = optional(item, 'admission', (value) => {
+    const record = partialObject(
+      value,
+      [
+        'combined_moneyline_volume_usd',
+        'minimum_moneyline_volume_usd',
+        'moneyline_volume_usd_by_venue',
+        'moneyline_volume_usd_coverage',
+      ],
+      'cadence admission',
+    );
+    const coverage = optional(
+      record,
+      'moneyline_volume_usd_coverage',
+      (value) => {
+        const venues = jsonObject(value);
+        return Object.fromEntries(
+          Object.entries(venues).map(([venue, counts]) => {
+            const values = object(
+              counts,
+              ['known_markets', 'unknown_markets'],
+              'cadence volume coverage',
+            );
+            return [
+              venue,
+              {
+                known_markets: integer(values.known_markets),
+                unknown_markets: integer(values.unknown_markets),
+              },
+            ];
+          }),
+        );
+      },
+    );
+    return {
+      combined_moneyline_volume_usd: optional(
+        record,
+        'combined_moneyline_volume_usd',
+        number,
+      ),
+      minimum_moneyline_volume_usd: optional(
+        record,
+        'minimum_moneyline_volume_usd',
+        number,
+      ),
+      moneyline_volume_usd_by_venue: optional(
+        record,
+        'moneyline_volume_usd_by_venue',
+        numberRecord,
+      ),
+      moneyline_volume_usd_coverage: coverage,
+    };
+  });
+  const relationship = object(
+    item.relationship_analysis,
+    Object.keys(jsonObject(item.relationship_analysis)),
+    'cadence relationship analysis',
+  );
+  if (
+    Object.keys(relationship).some(
+      (key) =>
+        !['relationships', 'diagnostics', 'outcome_spaces'].includes(key),
+    )
+  )
+    throw new UniverseUpstreamError();
+  return {
+    bundle_id: text(item.bundle_id),
+    sport: optional(item, 'sport', text),
+    game: optional(item, 'game', nullableText),
+    topology: optional(item, 'topology', nullableText),
+    participants: optional(item, 'participants', strings),
+    participant_keys: optional(item, 'participant_keys', strings),
+    event_refs: optional(item, 'event_refs', strings),
+    activation_at: optional(item, 'activation_at', timestamp),
+    capture_start_at: optional(item, 'capture_start_at', timestamp),
+    score: optional(item, 'score', number),
+    score_components: optional(item, 'score_components', numberRecord),
+    eligible: optional(item, 'eligible', boolean),
+    event_status: eventStatus as 'ELIGIBLE' | 'REJECTED' | undefined,
+    rejection_reasons: optional(item, 'rejection_reasons', strings),
+    admission,
+    market_exclusions: optional(item, 'market_exclusions', stringListRecord),
+    eligible_market_ids: optional(item, 'eligible_market_ids', strings),
+    selected: boolean(item.selected),
+    allocation_rejection:
+      item.allocation_rejection === null
+        ? null
+        : text(item.allocation_rejection),
+    relationship_analysis: {
+      relationships: optional(relationship, 'relationships', (value) =>
+        array(value, validateCadenceRelationship),
+      ),
+      diagnostics: optional(relationship, 'diagnostics', strings),
+      outcome_spaces: optional(relationship, 'outcome_spaces', (value) =>
+        array(value, jsonObject),
+      ),
+    },
+  };
+}
+
+function validateCadenceMatchRejection(value: unknown) {
+  const item = partialObject(
+    value,
+    [
+      'sport',
+      'game',
+      'topology',
+      'participant_keys',
+      'event_refs',
+      'reason',
+      'details',
+    ],
+    'cadence match rejection',
+  );
+  return {
+    sport: text(item.sport),
+    game: nullableText(item.game),
+    topology: nullableText(item.topology),
+    participant_keys: strings(item.participant_keys),
+    event_refs: strings(item.event_refs),
+    reason: text(item.reason),
+    details: jsonObject(item.details),
+  };
+}
+
+function validateCadenceSelectedTarget(value: unknown) {
+  const item = object(
+    value,
+    [
+      'target_id',
+      'bundle_id',
+      'canonical_class',
+      'subscription_ids',
+      'activation_at',
+      'capture_start_at',
+      'source_ref',
+      'continuity_score',
+    ],
+    'cadence selected target',
+  );
+  return {
+    target_id: text(item.target_id),
+    bundle_id: text(item.bundle_id),
+    canonical_class: text(item.canonical_class),
+    subscription_ids: strings(item.subscription_ids),
+    activation_at: timestamp(item.activation_at),
+    capture_start_at: timestamp(item.capture_start_at),
+    source_ref: text(item.source_ref),
+    continuity_score: number(item.continuity_score),
+  };
+}
+
+function validateCadenceContinuityBundle(value: unknown) {
+  const item = object(
+    value,
+    [
+      'base_run_id',
+      'bundle_id',
+      'activation_at',
+      'score',
+      'origin_run_id',
+      'disposition',
+      'targets',
+    ],
+    'cadence continuity bundle',
+  );
+  const bundleId = text(item.bundle_id);
+  const activationAt = timestamp(item.activation_at);
+  const targets = array(item.targets, (value) => {
+    const target = object(
+      value,
+      [
+        'target_id',
+        'venue',
+        'canonical_class',
+        'subscription_ids',
+        'activation_at',
+        'capture_start_at',
+        'source_ref',
+        'terminal_probe',
+      ],
+      'cadence continuity target',
+    );
+    const probe = object(
+      target.terminal_probe,
+      ['state', 'reason'],
+      'cadence terminal probe',
+    );
+    const state = text(probe.state);
+    if (!['open', 'terminal', 'unknown'].includes(state))
+      throw new UniverseUpstreamError();
+    const targetActivation = timestamp(target.activation_at);
+    if (targetActivation !== activationAt) throw new UniverseUpstreamError();
+    return {
+      target_id: text(target.target_id),
+      venue: text(target.venue),
+      canonical_class: text(target.canonical_class),
+      subscription_ids: strings(target.subscription_ids),
+      activation_at: targetActivation,
+      capture_start_at: timestamp(target.capture_start_at),
+      source_ref: text(target.source_ref),
+      terminal_probe: {
+        state: state as 'open' | 'terminal' | 'unknown',
+        reason: text(probe.reason),
+      },
+    };
+  });
+  if (
+    targets.length === 0 ||
+    new Set(targets.map((target) => target.target_id)).size !== targets.length
+  )
+    throw new UniverseUpstreamError();
+  return {
+    base_run_id: text(item.base_run_id),
+    bundle_id: bundleId,
+    activation_at: activationAt,
+    score: number(item.score),
+    origin_run_id: text(item.origin_run_id),
+    disposition: continuityDisposition(item.disposition),
+    targets,
+  };
+}
+
 export function validateCadence(value: unknown): UniverseCadence {
   const item = object(
     value,
@@ -857,35 +1179,122 @@ export function validateCadence(value: unknown): UniverseCadence {
         classification_diagnostic_count: integer(
           catalog.classification_diagnostic_count,
         ),
-        classification_diagnostics_by_code: numberRecord(
+        classification_diagnostics_by_code: integerRecord(
           catalog.classification_diagnostics_by_code,
         ),
       };
     });
+    const reasonSummaries = object(
+      run.reason_summaries,
+      [
+        'candidate_rejections',
+        'allocation_rejections',
+        'continuity_dispositions',
+      ],
+      'cadence reason summaries',
+    );
+    const candidates = array(run.candidates, validateCadenceCandidate);
+    const selectedTargets = Object.fromEntries(
+      Object.entries(jsonObject(run.selected_targets)).map(([key, value]) => [
+        key,
+        array(value, validateCadenceSelectedTarget),
+      ]),
+    );
+    const continuity = object(
+      run.continuity,
+      ['bundles', 'retained_bundle_ids', 'dispositions'],
+      'cadence continuity',
+    );
+    const continuityBundles = array(
+      continuity.bundles,
+      validateCadenceContinuityBundle,
+    );
+    const retainedBundleIds = strings(continuity.retained_bundle_ids);
+    const dispositions = Object.fromEntries(
+      Object.entries(jsonObject(continuity.dispositions)).map(
+        ([key, value]) => [key, continuityDisposition(value)],
+      ),
+    );
+    const diagnostics = object(
+      run.diagnostics,
+      ['continuity', 'continuity_degraded_base_run_id', 'target_records'],
+      'cadence diagnostics',
+    );
+    const validatedCounts = Object.fromEntries(
+      Object.entries(counts).map(([key, value]) => [key, integer(value)]),
+    ) as UniverseCadenceRun['counts'];
+    if (
+      new Set(catalogs.map((catalog) => catalog.venue)).size !==
+        catalogs.length ||
+      new Set(candidates.map((candidate) => candidate.bundle_id)).size !==
+        candidates.length ||
+      new Set(retainedBundleIds).size !== retainedBundleIds.length ||
+      new Set(continuityBundles.map((bundle) => bundle.bundle_id)).size !==
+        continuityBundles.length ||
+      continuityBundles.some(
+        (bundle) => dispositions[bundle.bundle_id] !== bundle.disposition,
+      ) ||
+      Object.entries(selectedTargets).some(([, targets]) =>
+        targets.some(
+          (target) =>
+            !validatedSelections.some(
+              (selection) => selection.bundle_id === target.bundle_id,
+            ),
+        ),
+      ) ||
+      validatedCounts.candidates !== candidates.length ||
+      validatedCounts.eligible !==
+        candidates.filter((candidate) => candidate.eligible).length ||
+      validatedCounts.rejected !==
+        candidates.filter((candidate) => !candidate.eligible).length ||
+      validatedCounts.selected !== validatedSelections.length ||
+      validatedCounts.retained !== retainedBundleIds.length ||
+      validatedCounts.retained !==
+        validatedSelections.filter(
+          (selection) => selection.occurrence_kind === 'retained',
+        ).length ||
+      validatedCounts.retired !==
+        Object.values(dispositions).filter((value) =>
+          ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(value),
+        ).length
+    )
+      throw new UniverseUpstreamError();
     return {
       ...validatedRun,
       catalogs,
       discovery_failures: textRecord(run.discovery_failures),
-      counts: Object.fromEntries(
-        Object.entries(counts).map(([key, value]) => [key, integer(value)]),
-      ) as UniverseCadenceRun['counts'],
-      reason_summaries: Object.fromEntries(
-        Object.entries(jsonObject(run.reason_summaries)).map(([key, value]) => [
-          key,
-          numberRecord(value),
-        ]),
+      counts: validatedCounts,
+      reason_summaries: {
+        candidate_rejections: integerRecord(
+          reasonSummaries.candidate_rejections,
+        ),
+        allocation_rejections: integerRecord(
+          reasonSummaries.allocation_rejections,
+        ),
+        continuity_dispositions: integerRecord(
+          reasonSummaries.continuity_dispositions,
+        ),
+      },
+      match_rejections: array(
+        run.match_rejections,
+        validateCadenceMatchRejection,
       ),
-      match_rejections: array(run.match_rejections, jsonObject),
-      candidates: array(run.candidates, jsonObject),
-      selected_targets: Object.fromEntries(
-        Object.entries(jsonObject(run.selected_targets)).map(([key, value]) => [
-          key,
-          array(value, jsonObject),
-        ]),
-      ),
+      candidates,
+      selected_targets: selectedTargets,
       budget_used: numberRecord(run.budget_used),
-      continuity: jsonObject(run.continuity),
-      diagnostics: jsonObject(run.diagnostics),
+      continuity: {
+        bundles: continuityBundles,
+        retained_bundle_ids: retainedBundleIds,
+        dispositions,
+      },
+      diagnostics: {
+        continuity: strings(diagnostics.continuity),
+        continuity_degraded_base_run_id:
+          diagnostics.continuity_degraded_base_run_id === null
+            ? null
+            : text(diagnostics.continuity_degraded_base_run_id),
+        target_records: stringListRecord(diagnostics.target_records),
+      },
       selections: validatedSelections,
     };
   });

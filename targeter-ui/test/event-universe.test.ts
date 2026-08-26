@@ -136,8 +136,8 @@ const run = (
   catalogs: [],
   discovery_failures: {},
   counts: {
-    candidates: 1,
-    eligible: 1,
+    candidates: 0,
+    eligible: 0,
     selected: 1,
     rejected: 0,
     retained: 0,
@@ -457,6 +457,112 @@ test('cadence schema and view model cover every freshness state and empty runs',
       ...cadence(),
       runs: [run({ selections: [detail({ run_id: 'wrong-run' })] })],
     }),
+  );
+});
+
+test('cadence validates operational decision evidence and terminal probes', () => {
+  const candidate = {
+    bundle_id: 'bundle alpha',
+    sport: 'esports',
+    participants: ['Alpha', 'Beta'],
+    score: 12.5,
+    eligible: true,
+    event_status: 'ELIGIBLE',
+    rejection_reasons: [],
+    selected: true,
+    allocation_rejection: null,
+    relationship_analysis: { relationships: [], diagnostics: [] },
+  };
+  const continuityBundle = {
+    base_run_id: '20260820T110000.000001Z',
+    bundle_id: 'bundle alpha',
+    activation_at: '2026-08-20T14:00:00Z',
+    score: 12.5,
+    origin_run_id: '20260820T110000.000001Z',
+    disposition: 'retained',
+    targets: [
+      {
+        target_id: 'kalshi:market-a',
+        venue: 'kalshi',
+        canonical_class: 'esports.series_moneyline',
+        subscription_ids: ['asset-a'],
+        activation_at: '2026-08-20T14:00:00Z',
+        capture_start_at: '2026-08-20T13:00:00Z',
+        source_ref: 'kalshi:event-a',
+        terminal_probe: { state: 'unknown', reason: 'probe_failed' },
+      },
+    ],
+  };
+  const valid = run({
+    candidates: [candidate],
+    counts: {
+      candidates: 1,
+      eligible: 1,
+      selected: 1,
+      rejected: 0,
+      retained: 0,
+      retired: 0,
+    },
+    continuity: {
+      bundles: [],
+      retained_bundle_ids: [],
+      dispositions: {},
+    },
+  });
+  assert.equal(
+    validateCadence(cadence('current', [valid])).runs[0].candidates[0].score,
+    12.5,
+  );
+
+  assert.throws(() =>
+    validateCadence(
+      cadence('current', [
+        run({
+          candidates: [candidate],
+          continuity: {
+            bundles: [
+              { ...continuityBundle, disposition: 'unknown_disposition' },
+            ],
+            retained_bundle_ids: ['bundle alpha'],
+            dispositions: { 'bundle alpha': 'unknown_disposition' },
+          },
+        }),
+      ]),
+    ),
+  );
+  assert.equal(
+    validateCadence(
+      cadence('current', [
+        run({
+          candidates: [candidate],
+          continuity: {
+            bundles: [continuityBundle],
+            retained_bundle_ids: ['bundle alpha'],
+            dispositions: { 'bundle alpha': 'retained' },
+          },
+          selections: [
+            detail({
+              occurrence_kind: 'retained',
+              continuity_disposition: 'retained',
+              origin: {
+                ...source,
+                run_id: '20260820T110000.000001Z',
+                generated_at: '2026-08-20T11:00:00Z',
+              },
+            }),
+          ],
+          counts: {
+            candidates: 1,
+            eligible: 1,
+            selected: 1,
+            rejected: 0,
+            retained: 1,
+            retired: 0,
+          },
+        }),
+      ]),
+    ).runs[0].continuity.bundles[0].targets[0].terminal_probe.state,
+    'unknown',
   );
 });
 

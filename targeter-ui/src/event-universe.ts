@@ -142,17 +142,120 @@ export interface UniverseCadenceFreshness {
   latest_indexed_at: string | null;
 }
 
+export type CadenceContinuityDisposition =
+  | 'held_current_candidate'
+  | 'retained'
+  | 'continuity_budget_trimmed'
+  | 'all_markets_terminal'
+  | 'terminal_clamp_elapsed';
+
+export type CadenceTerminalProbeState = 'open' | 'terminal' | 'unknown';
+
+export interface UniverseCadenceCatalog {
+  venue: string;
+  complete: boolean;
+  events: number;
+  markets: number;
+  requests: number;
+  diagnostics: string[];
+  classification_diagnostic_count: number;
+  classification_diagnostics_by_code: Record<string, number>;
+}
+
+export interface UniverseCadenceRelationship {
+  bundle_id: string;
+  left: string;
+  right: string;
+  relationship: string;
+  scope: string;
+  left_venue: string;
+  right_venue: string;
+  cross_venue: boolean;
+  coverage: string;
+}
+
+export interface UniverseCadenceCandidate {
+  bundle_id: string;
+  sport?: string;
+  game?: string | null;
+  topology?: string | null;
+  participants?: string[];
+  participant_keys?: string[];
+  event_refs?: string[];
+  activation_at?: string;
+  capture_start_at?: string;
+  score?: number;
+  score_components?: Record<string, number>;
+  eligible?: boolean;
+  event_status?: 'ELIGIBLE' | 'REJECTED';
+  rejection_reasons?: string[];
+  admission?: {
+    combined_moneyline_volume_usd?: number;
+    minimum_moneyline_volume_usd?: number;
+    moneyline_volume_usd_by_venue?: Record<string, number>;
+    moneyline_volume_usd_coverage?: Record<
+      string,
+      { known_markets: number; unknown_markets: number }
+    >;
+  };
+  market_exclusions?: Record<string, string[]>;
+  eligible_market_ids?: string[];
+  selected: boolean;
+  allocation_rejection: string | null;
+  relationship_analysis: {
+    relationships?: UniverseCadenceRelationship[];
+    diagnostics?: string[];
+    outcome_spaces?: Array<Record<string, unknown>>;
+  };
+}
+
+export interface UniverseCadenceMatchRejection {
+  sport: string;
+  game: string | null;
+  topology: string | null;
+  participant_keys: string[];
+  event_refs: string[];
+  reason: string;
+  details: Record<string, unknown>;
+}
+
+export interface UniverseCadenceSelectedTarget {
+  target_id: string;
+  bundle_id: string;
+  canonical_class: string;
+  subscription_ids: string[];
+  activation_at: string;
+  capture_start_at: string;
+  source_ref: string;
+  continuity_score: number;
+}
+
+export interface UniverseCadenceContinuityTarget {
+  target_id: string;
+  venue: string;
+  canonical_class: string;
+  subscription_ids: string[];
+  activation_at: string;
+  capture_start_at: string;
+  source_ref: string;
+  terminal_probe: {
+    state: CadenceTerminalProbeState;
+    reason: string;
+  };
+}
+
+export interface UniverseCadenceContinuityBundle {
+  base_run_id: string;
+  bundle_id: string;
+  activation_at: string;
+  score: number;
+  origin_run_id: string;
+  disposition: CadenceContinuityDisposition;
+  targets: UniverseCadenceContinuityTarget[];
+}
+
 export interface UniverseCadenceRun extends UniverseRun {
-  catalogs: Array<{
-    venue: string;
-    complete: boolean;
-    events: number;
-    markets: number;
-    requests: number;
-    diagnostics: string[];
-    classification_diagnostic_count: number;
-    classification_diagnostics_by_code: Record<string, number>;
-  }>;
+  catalogs: UniverseCadenceCatalog[];
   discovery_failures: Record<string, string>;
   counts: {
     candidates: number;
@@ -162,13 +265,25 @@ export interface UniverseCadenceRun extends UniverseRun {
     retained: number;
     retired: number;
   };
-  reason_summaries: Record<string, Record<string, number>>;
-  match_rejections: Array<Record<string, unknown>>;
-  candidates: Array<Record<string, unknown>>;
-  selected_targets: Record<string, Array<Record<string, unknown>>>;
+  reason_summaries: {
+    candidate_rejections: Record<string, number>;
+    allocation_rejections: Record<string, number>;
+    continuity_dispositions: Record<string, number>;
+  };
+  match_rejections: UniverseCadenceMatchRejection[];
+  candidates: UniverseCadenceCandidate[];
+  selected_targets: Record<string, UniverseCadenceSelectedTarget[]>;
   budget_used: Record<string, number>;
-  continuity: Record<string, unknown>;
-  diagnostics: Record<string, unknown>;
+  continuity: {
+    bundles: UniverseCadenceContinuityBundle[];
+    retained_bundle_ids: string[];
+    dispositions: Record<string, CadenceContinuityDisposition>;
+  };
+  diagnostics: {
+    continuity: string[];
+    continuity_degraded_base_run_id: string | null;
+    target_records: Record<string, string[]>;
+  };
   selections: UniverseSelectionDetail[];
 }
 

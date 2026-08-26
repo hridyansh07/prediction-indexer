@@ -10,6 +10,7 @@ import {
 } from 'react-router-dom';
 import type {
   UniverseCadence,
+  UniverseCadenceCandidate,
   UniverseCadenceRun,
   UniverseSelectionDetail,
 } from '../event-universe';
@@ -57,6 +58,19 @@ const label = (value: string | null | undefined) =>
         .replaceAll('_', ' ')
         .replace(/\b\w/g, (character) => character.toUpperCase())
     : '—';
+
+const score = (value: number | undefined) =>
+  value === undefined
+    ? '—'
+    : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+const compactCurrency = (value: number | undefined) =>
+  value === undefined
+    ? '—'
+    : `$${value.toLocaleString('en-US', {
+        notation: 'compact',
+        maximumFractionDigits: 1,
+      })}`;
 
 async function loadCadence() {
   const response = await fetch(CADENCE_ENDPOINT, {
@@ -111,7 +125,7 @@ function App() {
           <NavLink to="/operations" end>
             Cadence
           </NavLink>
-          <NavLink to="/operations/selections">Selections</NavLink>
+          <NavLink to="/operations/selections">Decisions</NavLink>
         </nav>
         {needsCadence && (
           <button onClick={() => void refresh()} disabled={refreshing}>
@@ -236,8 +250,11 @@ function CadenceOverview({ cadence }: { cadence: UniverseCadence }) {
             run={run}
             latest={run.run_id === cadence.runs[0]?.run_id}
           />
+          <CatalogObservability run={run} />
+          <ContinuityObservability run={run} />
           <RunProvenance run={run} />
           <RunSelections run={run} />
+          <RejectionSummary run={run} />
         </>
       ) : (
         <section className="empty">
@@ -290,6 +307,151 @@ function RunMetrics({
   );
 }
 
+function CatalogObservability({ run }: { run: UniverseCadenceRun }) {
+  const failures = Object.entries(run.discovery_failures);
+  return (
+    <section>
+      <Title
+        title="Discovery inputs"
+        sub={`${run.catalogs.filter((catalog) => catalog.complete).length}/${run.catalogs.length} catalogues complete`}
+      />
+      <div className="catalog-grid">
+        {run.catalogs.map((catalog) => (
+          <article className="catalog" key={catalog.venue}>
+            <div className="row">
+              <b>{catalog.venue}</b>
+              <span className={catalog.complete ? 'ok' : 'warn'}>
+                {catalog.complete ? 'COMPLETE' : 'INCOMPLETE'}
+              </span>
+            </div>
+            <span>
+              {catalog.events} events · {catalog.markets} markets ·{' '}
+              {catalog.requests} requests
+            </span>
+            {!!catalog.classification_diagnostic_count && (
+              <small className="warn">
+                {catalog.classification_diagnostic_count} classification
+                diagnostics
+              </small>
+            )}
+            {catalog.diagnostics.map((diagnostic) => (
+              <small key={diagnostic}>{diagnostic}</small>
+            ))}
+          </article>
+        ))}
+      </div>
+      {!!failures.length && (
+        <ul className="diagnostics">
+          {failures.map(([venue, failure]) => (
+            <li key={venue}>
+              {venue}: {failure}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function ContinuityObservability({ run }: { run: UniverseCadenceRun }) {
+  const legitimateRetirement =
+    run.selections.length === 0 &&
+    run.continuity.bundles.length > 0 &&
+    run.continuity.bundles.every((bundle) =>
+      ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(
+        bundle.disposition,
+      ),
+    );
+  const budgetTrimmed =
+    run.selections.length === 0 &&
+    run.continuity.bundles.length > 0 &&
+    run.continuity.bundles.every(
+      (bundle) => bundle.disposition === 'continuity_budget_trimmed',
+    );
+  return (
+    <section className="continuity-panel">
+      <Title
+        title="Continuity decisions"
+        sub={`${run.continuity.bundles.length} prior bundles observed`}
+      />
+      <p className="truth-note">
+        Archived run evidence only. This projection does not verify current.json
+        publication or splice health.
+      </p>
+      <div className="continuity-metrics">
+        <Metric n={run.counts.retained} label="Bundles retained" />
+        <Metric n={run.counts.retired} label="Terminal/clamp retirements" />
+        <Metric n={run.diagnostics.continuity.length} label="Diagnostics" />
+      </div>
+      {legitimateRetirement && (
+        <div className="continuity-state ok">
+          Legitimate empty generation: every prior bundle was retired by
+          all-terminal evidence or the safety clamp.
+        </div>
+      )}
+      {budgetTrimmed && (
+        <div className="continuity-state warn">
+          Empty generation: every prior bundle was continuity-budget trimmed.
+        </div>
+      )}
+      {run.diagnostics.continuity_degraded_base_run_id && (
+        <div className="continuity-state warn">
+          DEGRADED BASE RUN{' '}
+          <code>{run.diagnostics.continuity_degraded_base_run_id}</code>
+        </div>
+      )}
+      {!!run.diagnostics.continuity.length && (
+        <ul className="diagnostics">
+          {run.diagnostics.continuity.map((diagnostic) => (
+            <li key={diagnostic}>{diagnostic}</li>
+          ))}
+        </ul>
+      )}
+      <div className="continuity-list">
+        {[...run.continuity.bundles]
+          .sort(
+            (left, right) =>
+              right.score - left.score ||
+              left.bundle_id.localeCompare(right.bundle_id),
+          )
+          .map((bundle) => (
+            <details
+              key={bundle.bundle_id}
+              open={bundle.targets.some(
+                (target) => target.terminal_probe.state === 'unknown',
+              )}
+            >
+              <summary>
+                <span
+                  className={`decision ${bundle.disposition === 'retained' ? 'ok' : 'warn'}`}
+                >
+                  {label(bundle.disposition)}
+                </span>
+                <b>{bundle.bundle_id}</b>
+                <span>
+                  Score {score(bundle.score)} · base {bundle.base_run_id} ·
+                  origin {bundle.origin_run_id}
+                </span>
+              </summary>
+              <ul className="probe-list">
+                {bundle.targets.map((target) => (
+                  <li key={target.target_id}>
+                    <span className={`probe ${target.terminal_probe.state}`}>
+                      {target.terminal_probe.state.toUpperCase()}
+                    </span>
+                    <b>{target.venue}</b>
+                    <code>{target.target_id}</code>
+                    <span>{target.terminal_probe.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ))}
+      </div>
+    </section>
+  );
+}
+
 function RunProvenance({ run }: { run: UniverseCadenceRun }) {
   return (
     <section>
@@ -306,23 +468,63 @@ function RunProvenance({ run }: { run: UniverseCadenceRun }) {
         <code>manifest {run.manifest_sha256}</code>
         <code>report {run.report_sha256}</code>
       </div>
+      <div className="run-proof">
+        <span>
+          Budget used:{' '}
+          {Object.entries(run.budget_used)
+            .map(([venue, used]) => `${venue} ${used}`)
+            .join(' · ') || 'none'}
+        </span>
+        {Object.entries(run.diagnostics.target_records).map(
+          ([venue, diagnostics]) =>
+            diagnostics.map((diagnostic) => (
+              <span className="warn" key={`${venue}-${diagnostic}`}>
+                {venue} target records: {diagnostic}
+              </span>
+            )),
+        )}
+      </div>
     </section>
   );
 }
 
 function RunSelections({ run }: { run: UniverseCadenceRun }) {
+  const evidence = new Map(
+    run.candidates.map((candidate) => [candidate.bundle_id, candidate]),
+  );
+  const continuityScores = new Map(
+    run.continuity.bundles.map((bundle) => [bundle.bundle_id, bundle.score]),
+  );
+  const selections = [...run.selections].sort((left, right) => {
+    const leftScore =
+      evidence.get(left.bundle_id)?.score ??
+      continuityScores.get(left.bundle_id) ??
+      Number.NEGATIVE_INFINITY;
+    const rightScore =
+      evidence.get(right.bundle_id)?.score ??
+      continuityScores.get(right.bundle_id) ??
+      Number.NEGATIVE_INFINITY;
+    return (
+      rightScore - leftScore || left.bundle_id.localeCompare(right.bundle_id)
+    );
+  });
   return (
     <section>
       <Title
         title="Selected bundles"
         sub="Verified selected lifecycle detail from the cadence projection"
       />
-      {run.selections.length ? (
+      {selections.length ? (
         <div className="cards">
-          {run.selections.map((selection) => (
+          {selections.map((selection) => (
             <SelectionCard
               key={`${selection.run_id}-${selection.bundle_id}`}
               selection={selection}
+              candidate={evidence.get(selection.bundle_id)}
+              decisionScore={
+                evidence.get(selection.bundle_id)?.score ??
+                continuityScores.get(selection.bundle_id)
+              }
             />
           ))}
         </div>
@@ -333,7 +535,145 @@ function RunSelections({ run }: { run: UniverseCadenceRun }) {
   );
 }
 
-function SelectionCard({ selection }: { selection: UniverseSelectionDetail }) {
+function RejectionSummary({ run }: { run: UniverseCadenceRun }) {
+  const reasons = Object.entries({
+    ...run.reason_summaries.candidate_rejections,
+    ...run.reason_summaries.allocation_rejections,
+  }).sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  );
+  return (
+    <section>
+      <Title
+        title="Rejected and unallocated"
+        sub={`${run.counts.rejected} admission rejections · ${run.match_rejections.length} match rejections`}
+      />
+      {reasons.length ? (
+        <div className="reasonbar">
+          {reasons.map(([reason, count]) => (
+            <div key={reason}>
+              <b>{count}</b>
+              <span>{label(reason)}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="muted">No candidate or allocation rejection reasons.</p>
+      )}
+      {!!run.match_rejections.length && (
+        <details className="detail-group">
+          <summary>
+            {run.match_rejections.length} unmatched event groups
+          </summary>
+          <ul className="diagnostics">
+            {run.match_rejections.map((rejection, index) => (
+              <li key={`${rejection.reason}-${index}`}>
+                {rejection.participant_keys.join(' vs ')} ·{' '}
+                {label(rejection.reason)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </section>
+  );
+}
+
+function CandidateDecisionCard({
+  run,
+  candidate,
+  state,
+}: {
+  run: UniverseCadenceRun;
+  candidate: UniverseCadenceCandidate;
+  state: string;
+}) {
+  const targetEntries = Object.entries(run.selected_targets).flatMap(
+    ([venue, targets]) =>
+      targets
+        .filter((target) => target.bundle_id === candidate.bundle_id)
+        .map((target) => ({ venue, target })),
+  );
+  return (
+    <details className="decision-card">
+      <summary>
+        <span className={`decision ${state === 'rejected' ? 'warn' : 'ok'}`}>
+          {label(state)}
+        </span>
+        <b>{candidate.participants?.join(' vs ') || candidate.bundle_id}</b>
+        <span>
+          Score {score(candidate.score)} · {label(candidate.event_status)} ·{' '}
+          {run.run_id}
+        </span>
+      </summary>
+      <div className="detail">
+        <h4>Decision reasons</h4>
+        <pre>
+          {JSON.stringify(
+            [
+              ...(candidate.rejection_reasons ?? []),
+              ...(candidate.allocation_rejection
+                ? [candidate.allocation_rejection]
+                : []),
+            ],
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Admission</h4>
+        <pre>
+          {JSON.stringify(
+            candidate.admission
+              ? {
+                  combined_moneyline_volume_usd:
+                    candidate.admission.combined_moneyline_volume_usd,
+                  minimum_moneyline_volume_usd:
+                    candidate.admission.minimum_moneyline_volume_usd,
+                }
+              : {},
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Markets</h4>
+        <pre>
+          {JSON.stringify(candidate.eligible_market_ids ?? [], null, 2)}
+        </pre>
+        <h4>Selected targets</h4>
+        <pre>
+          {JSON.stringify(
+            targetEntries.map(({ venue, target }) => ({
+              venue,
+              target_id: target.target_id,
+              subscriptions: target.subscription_ids,
+              continuity_score: target.continuity_score,
+            })),
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Relationships</h4>
+        <pre>
+          {JSON.stringify(
+            candidate.relationship_analysis.relationships ?? [],
+            null,
+            2,
+          )}
+        </pre>
+      </div>
+    </details>
+  );
+}
+
+function SelectionCard({
+  selection,
+  candidate,
+  decisionScore,
+}: {
+  selection: UniverseSelectionDetail;
+  candidate?: UniverseCadenceCandidate;
+  decisionScore?: number;
+}) {
   const context = selection.context;
   const participants = context.participants.join(' vs ') || selection.bundle_id;
   const venues = [
@@ -345,7 +685,7 @@ function SelectionCard({ selection }: { selection: UniverseSelectionDetail }) {
     >
       <div className="row">
         <span className="tag">{selection.occurrence_kind.toUpperCase()}</span>
-        <strong>{label(selection.continuity_disposition)}</strong>
+        <strong className="score">Score {score(decisionScore)}</strong>
       </div>
       <h3>{participants}</h3>
       <code>{selection.bundle_id}</code>
@@ -371,7 +711,16 @@ function SelectionCard({ selection }: { selection: UniverseSelectionDetail }) {
             ? label(selection.retirement.disposition)
             : 'Not observed'}
         </dd>
+        <dt>Volume gate</dt>
+        <dd>
+          {candidate?.admission
+            ? `${compactCurrency(candidate.admission.combined_moneyline_volume_usd)} / ${compactCurrency(candidate.admission.minimum_moneyline_volume_usd)}`
+            : 'Retained from prior committed targets'}
+        </dd>
       </dl>
+      <p className="muted">
+        Continuity: {label(selection.continuity_disposition)}
+      </p>
       <p className="note">{occurrenceExplanation(selection)}</p>
       {selection.retirement && (
         <p className="retirement-copy">{retirementExplanation(selection)}</p>
@@ -458,52 +807,85 @@ function RelationshipDetails({
 
 function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
   const [query, setQuery] = useState('');
-  const [occurrence, setOccurrence] = useState('all');
+  const [decision, setDecision] = useState('all');
   const [runId, setRunId] = useState('all');
   const [venue, setVenue] = useState('all');
   const rows = useMemo(
     () =>
       cadence.runs.flatMap((run) =>
-        run.selections.map((selection) => ({ run, selection })),
+        run.candidates.map((candidate) => ({
+          run,
+          candidate,
+          state: candidate.selected
+            ? 'selected'
+            : candidate.eligible
+              ? 'not-selected'
+              : 'rejected',
+        })),
       ),
     [cadence],
   );
   const venues = [
     ...new Set(
-      rows.flatMap(({ selection }) =>
-        selection.context.targets.map((target) => target.venue),
+      rows.flatMap(({ run, candidate }) =>
+        Object.entries(run.selected_targets)
+          .filter(([, targets]) =>
+            targets.some((target) => target.bundle_id === candidate.bundle_id),
+          )
+          .map(([value]) => value),
       ),
     ),
   ].sort();
-  const shown = rows.filter(({ run, selection }) => {
-    const haystack = [
-      selection.bundle_id,
-      selection.sport,
-      selection.game,
-      selection.topology,
-      ...selection.context.participants,
-      ...selection.context.event_refs,
-      ...selection.context.targets.flatMap((target) => [
-        target.venue,
-        target.target_id,
-      ]),
-    ]
-      .join(' ')
-      .toLowerCase();
-    return (
-      haystack.includes(query.toLowerCase()) &&
-      (occurrence === 'all' || occurrence === selection.occurrence_kind) &&
-      (runId === 'all' || runId === run.run_id) &&
-      (venue === 'all' ||
-        selection.context.targets.some((target) => target.venue === venue))
+  const shown = rows
+    .filter(({ run, candidate, state }) => {
+      const haystack = [
+        candidate.bundle_id,
+        candidate.sport,
+        candidate.game,
+        candidate.topology,
+        ...(candidate.participants ?? []),
+        ...(candidate.event_refs ?? []),
+        ...(candidate.rejection_reasons ?? []),
+        ...Object.entries(run.selected_targets)
+          .filter(([, targets]) =>
+            targets.some((target) => target.bundle_id === candidate.bundle_id),
+          )
+          .flatMap(([targetVenue, targets]) => [
+            targetVenue,
+            ...targets
+              .filter((target) => target.bundle_id === candidate.bundle_id)
+              .map((target) => target.target_id),
+          ]),
+      ]
+        .join(' ')
+        .toLowerCase();
+      return (
+        haystack.includes(query.toLowerCase()) &&
+        (decision === 'all' || decision === state) &&
+        (runId === 'all' || runId === run.run_id) &&
+        (venue === 'all' ||
+          Object.entries(run.selected_targets).some(
+            ([targetVenue, targets]) =>
+              targetVenue === venue &&
+              targets.some(
+                (target) => target.bundle_id === candidate.bundle_id,
+              ),
+          ))
+      );
+    })
+    .sort(
+      (left, right) =>
+        (right.candidate.score ?? Number.NEGATIVE_INFINITY) -
+          (left.candidate.score ?? Number.NEGATIVE_INFINITY) ||
+        right.run.run_id.localeCompare(left.run.run_id) ||
+        left.candidate.bundle_id.localeCompare(right.candidate.bundle_id),
     );
-  });
 
   return (
     <section>
       <Title
-        title="Recent selected bundles"
-        sub={`${shown.length} of ${rows.length} selections across indexed cadence runs`}
+        title="Targeter decisions"
+        sub={`${shown.length} of ${rows.length} candidate decisions across indexed cadence runs`}
       />
       <div className="filters">
         <label>
@@ -515,14 +897,15 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
           />
         </label>
         <label>
-          Occurrence
+          Decision
           <select
-            value={occurrence}
-            onChange={(event) => setOccurrence(event.target.value)}
+            value={decision}
+            onChange={(event) => setDecision(event.target.value)}
           >
             <option value="all">All</option>
-            <option value="complete">Complete</option>
-            <option value="retained">Retained</option>
+            <option value="selected">Selected</option>
+            <option value="not-selected">Eligible, not allocated</option>
+            <option value="rejected">Rejected</option>
           </select>
         </label>
         <label>
@@ -554,10 +937,12 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
       </div>
       {shown.length ? (
         <div className="eventlist">
-          {shown.map(({ selection }) => (
-            <SelectionCard
-              key={`${selection.run_id}-${selection.bundle_id}`}
-              selection={selection}
+          {shown.map(({ run, candidate, state }) => (
+            <CandidateDecisionCard
+              key={`${run.run_id}-${candidate.bundle_id}`}
+              run={run}
+              candidate={candidate}
+              state={state}
             />
           ))}
         </div>
