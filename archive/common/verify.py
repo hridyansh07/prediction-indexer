@@ -25,10 +25,12 @@ from archive.storage.base import (
     JSON_CONTENT_TYPE,
     NDJSON_CONTENT_TYPE,
     ZSTD_CONTENT_ENCODING,
+    ObjectExpectation,
     ObjectMetadata,
     ObjectStore,
-    provider_checksum_of,
+    VerificationFailure,
 )
+from archive.storage.verification import verify_objects
 from archive.common.receipts import ArchiveReceipt
 from encoder import LogicalIdentity, decode_stream
 
@@ -67,6 +69,33 @@ def verify_archive(store: ObjectStore, receipt: ArchiveReceipt) -> ArchiveVerifi
             f"receipt {receipt.path.name} names provider {receipt.provider!r}; this store is "
             f"{store.provider!r}"
         )
+    if receipt.is_production:
+        try:
+            data, seal = verify_objects(
+                store,
+                (
+                    ObjectExpectation(
+                        receipt.data_key,
+                        receipt.data_stored,
+                        receipt.provider_checksum,
+                        receipt.provider_checksum_algorithm,
+                        NDJSON_CONTENT_TYPE,
+                        ZSTD_CONTENT_ENCODING,
+                    ),
+                    ObjectExpectation(
+                        receipt.seal_key,
+                        receipt.seal_stored,
+                        receipt.seal_provider_checksum,
+                        receipt.seal_provider_checksum_algorithm,
+                        JSON_CONTENT_TYPE,
+                        None,
+                    ),
+                ),
+            )
+        except VerificationFailure as error:
+            raise VerificationError(str(error)) from error
+        return ArchiveVerification(data=data, seal=seal)
+
     data = _head(store, receipt.data_key)
     if not data.matches(receipt.data_stored):
         raise VerificationError(
@@ -75,65 +104,10 @@ def verify_archive(store: ObjectStore, receipt: ArchiveReceipt) -> ArchiveVerifi
             f"with sha256 {receipt.data_stored.sha256}"
         )
     seal = _head(store, receipt.seal_key)
-    # The seal object is the *unchanged* local seal bytes, stored uncompressed.
-    # Comparing its digest is how "the seal object decodes to the exact seal
-    # bytes" is established without a second copy of the parser.
     if not seal.matches(receipt.seal_stored):
         raise VerificationError(
             f"archived seal {receipt.seal_key} does not match the receipt's seal identity"
         )
-
-    if receipt.is_production:
-        if (
-            data.provider_checksum != receipt.provider_checksum
-            or data.provider_checksum_algorithm != receipt.provider_checksum_algorithm
-        ):
-            raise VerificationError(
-                f"the store reports different provider checksum evidence for {receipt.data_key}"
-            )
-        if (
-            seal.provider_checksum != receipt.seal_provider_checksum
-            or seal.provider_checksum_algorithm != receipt.seal_provider_checksum_algorithm
-        ):
-            raise VerificationError(
-                f"the store reports different provider checksum evidence for {receipt.seal_key}"
-            )
-        # Version 1 was explicitly the S3 SHA-256 contract. Keep validating it
-        # strictly while version 2 allows a provider-native checksum because
-        # ObjectMetadata.sha256 has already been established from the actual
-        # stored bytes (a generation-pinned readback on GCS).
-        if receipt.document["archive_receipt_version"] == 1:
-            expected = provider_checksum_of(receipt.data_stored.sha256)
-            if receipt.provider_checksum != expected:
-                raise VerificationError(
-                    f"receipt {receipt.path.name} has an invalid S3 SHA256 checksum"
-                )
-            if data.provider_checksum_algorithm != "SHA256":
-                raise VerificationError(
-                    f"archive object {receipt.data_key} has no S3 SHA256 proof"
-                )
-        if data.content_type != NDJSON_CONTENT_TYPE:
-            raise VerificationError(
-                f"archive object {receipt.data_key} has content type {data.content_type!r}, "
-                f"not {NDJSON_CONTENT_TYPE!r}"
-            )
-        if data.content_encoding != ZSTD_CONTENT_ENCODING:
-            raise VerificationError(
-                f"archive object {receipt.data_key} has content encoding "
-                f"{data.content_encoding!r}, not {ZSTD_CONTENT_ENCODING!r}"
-            )
-        if seal.content_type != JSON_CONTENT_TYPE:
-            raise VerificationError(
-                f"archived seal {receipt.seal_key} has content type {seal.content_type!r}, "
-                f"not {JSON_CONTENT_TYPE!r}"
-            )
-        if seal.content_encoding is not None:
-            raise VerificationError(
-                f"archived seal {receipt.seal_key} declares content encoding "
-                f"{seal.content_encoding!r}"
-            )
-        return ArchiveVerification(data=data, seal=seal)
-
     if data.content_encoding not in (None, "zstd"):
         raise VerificationError(
             f"archive object {receipt.data_key} declares content encoding "

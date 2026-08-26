@@ -204,6 +204,7 @@ The write-side storage protocol is deliberately smaller than an S3 client:
 ```text
 put_immutable(key, reader, expected_identity) -> object metadata
 head(key)                                      -> object metadata or absent
+verify(expectation)                            -> verified object metadata
 open(key)                                      -> bounded byte reader
 open_verified(expectation)                     -> receipt-verified byte reader
 ```
@@ -239,6 +240,10 @@ paths, backslashes, and traversal outside the configured root are rejected.
 
 `head` used for receipt verification must obtain or calculate actual object
 length and SHA-256. It may not simply echo metadata supplied at `put` time.
+`verify` compares that provider-authenticated result with one complete receipt
+expectation; archive consumers map their strict receipt schemas into this one
+operation rather than reproducing identity, checksum, and content-metadata
+comparisons.
 
 Replay uses `open_verified` instead of `head` followed by `open`. The adapter
 checks receipt-owned length, SHA-256, provider checksum, content metadata, and

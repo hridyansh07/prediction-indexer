@@ -121,6 +121,18 @@ For the first rollout:
 Starting capture or archival does not authorize reaping. A failed upload or
 readback publishes no receipt and leaves local evidence intact.
 
+### Deferred reaper optimizations
+
+The provider-neutral verification boundary is intentionally complete before it
+is optimized. Follow-up work must preserve the same receipt and deletion gates:
+
+- route or filter historical S3 receipts separately from current GCS receipts
+  during a provider transition;
+- make an already-reaped raw tombstone complete the decision with zero object
+  requests, and run other cheap local eligibility checks before GCS readback;
+- add credentialed GCS raw, canonical, and Targeter reaper acceptance coverage,
+  including request-count regressions that prevent repeated full downloads.
+
 ## 5. Receipt compatibility
 
 Provider-neutral production receipt versions are:

@@ -54,6 +54,7 @@ from archive.storage.base import (
     normalize_key,
     provider_checksum_of,
 )
+from archive.storage.verification import verify_metadata
 from encoder import StoredIdentity
 
 __all__ = [
@@ -187,6 +188,9 @@ class S3ObjectStore:
         except BotoCoreError as error:
             raise ObjectStoreError(f"heading {normalized}: {error}") from error
         return self._metadata_from_head(normalized, response)
+
+    def verify(self, expected: ObjectExpectation) -> ObjectMetadata:
+        return verify_metadata(self.head(expected.key), expected)
 
     def put_immutable(
         self,

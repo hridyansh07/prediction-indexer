@@ -23,11 +23,13 @@ from analysis.storage import decoded_zstd_file, read_json_zstd
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
     NDJSON_CONTENT_TYPE,
+    ObjectExpectation,
     ObjectMetadata,
     ObjectStore,
     VerificationFailure,
     provider_checksum_of,
 )
+from archive.storage.verification import verify_objects
 from encoder import (
     CodecError,
     LogicalIdentity,
@@ -984,28 +986,26 @@ def verify_run_archive_objects(
             "production run archive receipt requires an independent store"
         )
     inventory = {item.key: item for item in receipt.objects}
-    for item in objects:
+    selected = tuple(objects)
+    for item in selected:
         if inventory.get(item.key) != item:
             raise VerificationFailure(
                 f"targeter object is not an exact member of the run receipt: {item.key}"
             )
-        metadata = store.head(item.key)
-        if metadata is None:
-            raise VerificationFailure(f"archived targeter object is absent: {item.key}")
-        _verify_metadata(
-            metadata,
-            item.stored,
-            item.content_type,
-            item.content_encoding,
-            item.key,
-        )
-        if receipt.is_production and (
-            metadata.provider_checksum != item.provider_checksum
-            or metadata.provider_checksum_algorithm != item.provider_checksum_algorithm
-        ):
-            raise VerificationFailure(
-                f"archived targeter object checksum drifted: {item.key}"
+    verify_objects(
+        store,
+        (
+            ObjectExpectation(
+                item.key,
+                item.stored,
+                item.provider_checksum if receipt.is_production else None,
+                item.provider_checksum_algorithm if receipt.is_production else None,
+                item.content_type,
+                item.content_encoding,
             )
+            for item in selected
+        ),
+    )
 
 
 def validate_local_run(run_directory: Path, receipt: RunArchiveReceipt) -> None:

@@ -8,6 +8,7 @@ exercised in code review.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 import os
 import tempfile
@@ -26,6 +27,7 @@ from archive.storage import (
     VerificationFailure,
     normalize_key,
     provider_checksum_of,
+    verify_objects,
 )
 from encoder import stored_identity_of
 
@@ -172,6 +174,57 @@ class ImmutablePutTests(unittest.TestCase):
         self.assertIsNone(
             self.store.head("raw/lane=x/date=2026-07-31/nothing.ndjson.zst")
         )
+
+    def test_verify_checks_one_complete_receipt_expectation(self) -> None:
+        metadata = self.put()
+        expected = ObjectExpectation(
+            metadata.key,
+            metadata.stored,
+            metadata.provider_checksum,
+            metadata.provider_checksum_algorithm,
+            metadata.content_type,
+            metadata.content_encoding,
+        )
+        self.assertEqual(self.store.verify(expected), metadata)
+
+        failures = (
+            replace(expected, stored=identity(b"different")),
+            replace(expected, provider_checksum="AAAA"),
+            replace(expected, provider_checksum_algorithm="CRC32C"),
+            replace(expected, content_type="application/json"),
+            replace(expected, content_encoding=None),
+        )
+        for mismatch in failures:
+            with self.subTest(mismatch=mismatch), self.assertRaises(
+                VerificationFailure
+            ):
+                self.store.verify(mismatch)
+
+        with self.assertRaisesRegex(VerificationFailure, "absent"):
+            self.store.verify(replace(expected, key="raw/absent.ndjson.zst"))
+
+    def test_verify_objects_preserves_receipt_order(self) -> None:
+        first = self.put()
+        second_key = "raw/lane=polymarket/date=2026-07-31/seal.json"
+        second_payload = b'{"sealed":true}\n'
+        second = self.store.put_immutable(
+            second_key,
+            io.BytesIO(second_payload),
+            identity(second_payload),
+            content_type="application/json",
+        )
+        expectations = tuple(
+            ObjectExpectation(
+                item.key,
+                item.stored,
+                item.provider_checksum,
+                item.provider_checksum_algorithm,
+                item.content_type,
+                item.content_encoding,
+            )
+            for item in (first, second)
+        )
+        self.assertEqual(verify_objects(self.store, expectations), (first, second))
 
     def test_head_detects_post_write_mutation_rather_than_echoing_metadata(
         self,

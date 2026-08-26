@@ -20,6 +20,7 @@ from archive.storage.base import (
     VerifiedReader,
     normalize_key,
 )
+from archive.storage.verification import verify_metadata
 from encoder import DEFAULT_BUFFER_BYTES, StoredIdentity
 
 __all__ = ["GCSObjectStore"]
@@ -157,6 +158,9 @@ class GCSObjectStore:
         if generation is None:
             raise ObjectStoreError(f"{key}: GCS returned no generation")
         return self._verify_blob(key, blob, generation)
+
+    def verify(self, expected: ObjectExpectation) -> ObjectMetadata:
+        return verify_metadata(self.head(expected.key), expected)
 
     def open(self, key: str, *, max_bytes: int | None = None) -> BoundedReader:
         if max_bytes is not None and max_bytes < 0:
