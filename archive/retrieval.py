@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Iterator
 
-from archive.storage.base import ObjectExpectation, ObjectStore, VerificationFailure
+from archive.storage.base import (
+    JSON_CONTENT_TYPE,
+    ObjectExpectation,
+    ObjectStore,
+    VerificationFailure,
+)
 from encoder import DEFAULT_BUFFER_BYTES, LogicalIdentity, decode_stream
 
-__all__ = ["ArchivedObject", "ArchivedObjectByteStreamer", "verify_object"]
+__all__ = [
+    "ArchivedObject",
+    "ArchivedObjectByteStreamer",
+    "read_verified_json",
+    "verify_object",
+]
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,64 @@ class ArchivedObjectByteStreamer:
 def verify_object(store: ObjectStore, expected: ObjectExpectation) -> None:
     """Consume one exact object without exposing or retaining its bytes."""
     store.verify(expected)
+
+
+def read_verified_json(
+    store: ObjectStore,
+    expected: ObjectExpectation,
+    *,
+    logical: LogicalIdentity | None = None,
+    max_decoded_bytes: int,
+    temp_root: Path | None = None,
+) -> object:
+    """Read one bounded JSON object after verified storage and decoding.
+
+    The object is streamed through ``open_verified`` and, for Zstandard,
+    ``decode_stream`` into a private temporary file. The returned JSON value is
+    parsed only after the complete stored and decoded identities pass. This
+    helper deliberately knows nothing about any archive family's schema.
+    """
+    if max_decoded_bytes < 0:
+        raise ValueError("max_decoded_bytes must not be negative")
+    if expected.content_type != JSON_CONTENT_TYPE:
+        raise VerificationFailure(
+            f"{expected.key}: verified JSON requires application/json content type"
+        )
+    if expected.content_encoding == "zstd" and logical is None:
+        raise VerificationFailure(
+            f"{expected.key}: compressed JSON lacks a logical identity"
+        )
+    if expected.content_encoding not in (None, "zstd"):
+        raise VerificationFailure(
+            f"{expected.key}: unsupported JSON content encoding "
+            f"{expected.content_encoding!r}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="archive-json-", dir=temp_root) as directory:
+        staged = Path(directory) / Path(expected.key).name
+        archived = ArchivedObject(staged.name, expected, logical)
+        with store.open_verified(expected) as source, _private_file(staged) as sink:
+            if expected.content_encoding == "zstd":
+                assert logical is not None
+                decode_stream(
+                    source,
+                    sink,
+                    expected_logical=logical,
+                    expected_stored=expected.stored,
+                    max_decoded_bytes=max_decoded_bytes,
+                )
+            else:
+                if expected.stored.byte_length > max_decoded_bytes:
+                    raise VerificationFailure(
+                        f"{expected.key}: JSON object exceeds the "
+                        f"{max_decoded_bytes}-byte maximum"
+                    )
+                _copy_plain(source, sink, archived, DEFAULT_BUFFER_BYTES)
+        try:
+            with staged.open("r", encoding="utf-8") as source:
+                return json.load(source)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise VerificationFailure(f"{expected.key}: invalid JSON: {error}") from error
 
 
 def _copy_plain(
