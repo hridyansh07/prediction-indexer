@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from archive import ArchivedSegmentByteStreamer
+from archive import ArchivedSegmentByteStreamer, read_verified_json
 from archive.archiver import Archiver
 from archive.common.receipts import read_archive_receipt
-from archive.storage.base import ObjectKeyError, VerificationFailure
+from archive.storage.base import ObjectExpectation, ObjectKeyError, VerificationFailure
+from archive.storage.local import LocalObjectStore
+from encoder import encode_stream, stored_identity_of
 from archive.storage.s3 import S3ObjectStore
 from encoder import CodecError
 from tests.archive_fixtures import write_sealed_segment
@@ -76,6 +79,67 @@ class ArchivedSegmentByteStreamerTests(unittest.TestCase):
         streamer = ArchivedSegmentByteStreamer(self.store, [self.receipt])
         with self.assertRaises(VerificationFailure):
             next(streamer.iter_bytes("lane=polymarket/date=2026-07-30/missing.ndjson"))
+
+
+class VerifiedJsonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.store = LocalObjectStore(self.root / "archive")
+
+    def test_reads_plain_json_through_verified_bounded_path(self) -> None:
+        payload = b'{"cadence": "current"}'
+        key = "targeter-v2/run/report.json"
+        metadata = self.store.put_immutable(
+            key,
+            io.BytesIO(payload),
+            stored_identity_of(io.BytesIO(payload)),
+            content_type="application/json",
+        )
+        result = read_verified_json(
+            self.store,
+            ObjectExpectation(
+                key,
+                metadata.stored,
+                metadata.provider_checksum,
+                metadata.provider_checksum_algorithm,
+                metadata.content_type,
+                metadata.content_encoding,
+            ),
+            max_decoded_bytes=len(payload),
+            temp_root=self.root,
+        )
+        self.assertEqual(result, {"cadence": "current"})
+
+    def test_reads_zstd_json_after_decoding_to_private_staging(self) -> None:
+        logical_bytes = b'{"cadence": "current"}\n'
+        encoded = io.BytesIO()
+        encoded_result = encode_stream(io.BytesIO(logical_bytes), encoded)
+        stored = encoded_result.stored
+        key = "targeter-v2/run/report.json.zst"
+        metadata = self.store.put_immutable(
+            key,
+            io.BytesIO(encoded.getvalue()),
+            stored,
+            content_type="application/json",
+            content_encoding="zstd",
+        )
+        result = read_verified_json(
+            self.store,
+            ObjectExpectation(
+                key,
+                metadata.stored,
+                metadata.provider_checksum,
+                metadata.provider_checksum_algorithm,
+                metadata.content_type,
+                metadata.content_encoding,
+            ),
+            logical=encoded_result.logical,
+            max_decoded_bytes=len(logical_bytes),
+            temp_root=self.root,
+        )
+        self.assertEqual(result, {"cadence": "current"})
 
 
 if __name__ == "__main__":

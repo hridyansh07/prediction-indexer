@@ -6,6 +6,11 @@ validation and durable filesystem primitives).
 """
 
 from archive.canonical_stream import ArchivedCanonicalByteStreamer
+from archive.retrieval import read_verified_json
 from archive.stream import ArchivedSegmentByteStreamer
 
-__all__ = ["ArchivedCanonicalByteStreamer", "ArchivedSegmentByteStreamer"]
+__all__ = [
+    "ArchivedCanonicalByteStreamer",
+    "ArchivedSegmentByteStreamer",
+    "read_verified_json",
+]
