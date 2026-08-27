@@ -340,7 +340,10 @@ class LimitlessSportsAdapter:
                 classification_diagnostics.append(TargeterDiagnostic(
                     "game_classification_conflict", self.venue,
                     f"/markets/{record.get('slug') or record.get('id')}",
-                    "error", True,
+                    # Same rule as the Polymarket adapter: the record is degraded
+                    # to no family below and still captured, so this diagnostic
+                    # must not force the catalogue incomplete via models.py.
+                    "warning", False,
                     {"title": str(record.get("title") or ""), "metadata": {
                         key: metadata[key] for key in ("esportTitle", "videogameSlug") if metadata.get(key)
                     }},
