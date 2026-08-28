@@ -84,14 +84,15 @@ class _Client:
     network_requests = 0
     cache_hits = 0
 
-    def __init__(self, events):
+    def __init__(self, events, next_cursor=""):
         self.events = events
+        self.next_cursor = next_cursor
 
     def get_json(self, _base, _path, *, params=None, headers=None):
         self.network_requests += 1
         return {
             "events": self.events if params["tag_slug"] == "esports" else [],
-            "next_cursor": "",
+            "next_cursor": self.next_cursor,
         }
 
 
@@ -133,7 +134,13 @@ class EsportsAdapterContractTests(unittest.TestCase):
             self.assertEqual((len(bundles), rejected), (1, ()), game)
             self.assertTrue(derive_bundle_relationships(bundles[0]).relationships, game)
 
-    def test_polymarket_tag_prefix_disagreement_is_complete_conflict_matrix(self):
+    def test_polymarket_tag_prefix_disagreement_excludes_event_but_keeps_catalog_complete(self):
+        """One unclassifiable event is excluded; the catalogue stays publishable.
+
+        A single title the two-factor classifier cannot resolve says nothing
+        about whether the enumeration was exhaustive, so it must not block
+        publication and stall capture for every other market.
+        """
         cases = (
             self._event("wrong-tag", "Dota 2", "valorant"),
             self._event("missing-game-tag", "Dota 2", "esports"),
@@ -141,9 +148,19 @@ class EsportsAdapterContractTests(unittest.TestCase):
         )
         for event in cases:
             snapshot = PolymarketSportsAdapter(self.registry).discover(_Client([event]), now=AT)
-            self.assertFalse(snapshot.complete)
+            self.assertTrue(snapshot.complete)
             self.assertFalse(snapshot.events)
-            self.assertEqual(snapshot.classification_diagnostics[0].code, "game_classification_conflict")
+            diagnostic = snapshot.classification_diagnostics[0]
+            self.assertEqual(diagnostic.code, "game_classification_conflict")
+            self.assertEqual(diagnostic.severity, "warning")
+            self.assertFalse(diagnostic.completeness_effect)
+
+    def test_a_probe_page_cap_still_marks_the_polymarket_catalog_incomplete(self):
+        """The distinction the fix rests on: unread pages still block."""
+        snapshot = PolymarketSportsAdapter(self.registry, max_pages_per_tag=1).discover(
+            _Client([self._event("ok", "Dota 2", "dota-2")], next_cursor="MTA="), now=AT
+        )
+        self.assertFalse(snapshot.complete)
 
     def test_conflicting_format_excludes_event_with_exact_diagnostic(self):
         event = self._event("format-conflict", "Dota 2", "dota-2", "Best of 5")

@@ -161,17 +161,21 @@ class PolymarketSportsAdapter:
                 self.registry, title, tags
             )
             if classification_conflict:
+                # One event the two-factor classifier cannot resolve is evidence
+                # about that event, not about the enumeration. Excluding it and
+                # continuing keeps every other market capturable; a catalogue is
+                # incomplete only when a page was never read (the probe caps
+                # above), never because one title failed to classify.
                 classification_diagnostics.append(
                     TargeterDiagnostic(
                         code="game_classification_conflict",
                         venue=self.venue,
                         source_ref=f"/events/{raw_event.get('id')}",
-                        severity="error",
-                        completeness_effect=True,
+                        severity="warning",
+                        completeness_effect=False,
                         details={"title": title, "tags": sorted(tags)},
                     )
                 )
-                complete = False
                 continue
 
             if family:
