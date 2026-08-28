@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -93,6 +93,10 @@ class UniverseSync:
         latest = self.database.latest_run()
         checkpoint = self.database.checkpoint(INCREMENTAL_CHECKPOINT)
         observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        for missing_key in self.database.missing_cadence_manifest_keys():
+            self._ingest_direct(missing_key, result)
+        if result.failures:
+            return result
         if checkpoint is None and latest is None:
             try:
                 keys = self._all_manifest_keys()
@@ -437,10 +441,18 @@ class UniverseSync:
                 f"run {manifest.run_id} must commit exactly one selection report"
             )
         report_item = report_items[0]
-        verify_metadata_objects(
+        metadata = verify_metadata_objects(
             self.objects,
             (item.expectation() for item in manifest.objects),
         )
+        bound_expectations = {
+            item.key: replace(
+                item.expectation(),
+                provider_checksum=observed.provider_checksum,
+                provider_checksum_algorithm=observed.provider_checksum_algorithm,
+            )
+            for item, observed in zip(manifest.objects, metadata, strict=True)
+        }
         if (
             expected_report_sha256 is not None
             and report_item.stored.sha256 != expected_report_sha256
@@ -448,7 +460,7 @@ class UniverseSync:
             raise UniverseSyncError(
                 f"run {manifest.run_id} report identity disagrees with continuity origin"
             )
-        report = self._read_json(report_item)
+        report = self._read_json(report_item, bound_expectations[report_item.key])
         if (
             report.get("report_version") != 3
             or report.get("mode") != "shadow"
@@ -517,7 +529,9 @@ class UniverseSync:
             raise UniverseSyncError(str(error)) from error
         return manifest, metadata.stored
 
-    def _read_json(self, item: RunObject) -> dict[str, Any]:
+    def _read_json(
+        self, item: RunObject, expected: ObjectExpectation | None = None
+    ) -> dict[str, Any]:
         if item.content_type != JSON_CONTENT_TYPE:
             raise UniverseSyncError(f"selection report {item.key} is not JSON")
         decoded_bytes = (
@@ -530,7 +544,7 @@ class UniverseSync:
             )
         document = read_verified_json(
             self.objects,
-            item.expectation(),
+            expected or item.expectation(),
             logical=item.logical,
             max_decoded_bytes=MAX_SELECTION_REPORT_BYTES,
             temp_root=self.temporary_directory,
