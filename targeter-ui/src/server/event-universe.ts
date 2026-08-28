@@ -837,7 +837,7 @@ function validateCadenceRelationship(value: unknown) {
 }
 
 function validateCadenceCandidate(value: unknown) {
-  const item = partialObject(
+  const item = object(
     value,
     [
       'bundle_id',
@@ -863,11 +863,11 @@ function validateCadenceCandidate(value: unknown) {
     ],
     'cadence candidate',
   );
-  const eventStatus = optional(item, 'event_status', text);
-  if (eventStatus && !['ELIGIBLE', 'REJECTED'].includes(eventStatus))
+  const eventStatus = text(item.event_status);
+  if (!['ELIGIBLE', 'REJECTED'].includes(eventStatus))
     throw new UniverseUpstreamError();
-  const admission = optional(item, 'admission', (value) => {
-    const record = partialObject(
+  const admission = ((value: unknown) => {
+    const record = object(
       value,
       [
         'combined_moneyline_volume_usd',
@@ -877,48 +877,34 @@ function validateCadenceCandidate(value: unknown) {
       ],
       'cadence admission',
     );
-    const coverage = optional(
-      record,
-      'moneyline_volume_usd_coverage',
-      (value) => {
-        const venues = jsonObject(value);
-        return Object.fromEntries(
-          Object.entries(venues).map(([venue, counts]) => {
-            const values = object(
-              counts,
-              ['known_markets', 'unknown_markets'],
-              'cadence volume coverage',
-            );
-            return [
-              venue,
-              {
-                known_markets: integer(values.known_markets),
-                unknown_markets: integer(values.unknown_markets),
-              },
-            ];
-          }),
+    const venues = jsonObject(record.moneyline_volume_usd_coverage);
+    const coverage = Object.fromEntries(
+      Object.entries(venues).map(([venue, counts]) => {
+        const values = object(
+          counts,
+          ['known_markets', 'unknown_markets'],
+          'cadence volume coverage',
         );
-      },
+        return [
+          venue,
+          {
+            known_markets: integer(values.known_markets),
+            unknown_markets: integer(values.unknown_markets),
+          },
+        ];
+      }),
     );
     return {
-      combined_moneyline_volume_usd: optional(
-        record,
-        'combined_moneyline_volume_usd',
-        number,
+      combined_moneyline_volume_usd: number(
+        record.combined_moneyline_volume_usd,
       ),
-      minimum_moneyline_volume_usd: optional(
-        record,
-        'minimum_moneyline_volume_usd',
-        number,
-      ),
-      moneyline_volume_usd_by_venue: optional(
-        record,
-        'moneyline_volume_usd_by_venue',
-        numberRecord,
+      minimum_moneyline_volume_usd: number(record.minimum_moneyline_volume_usd),
+      moneyline_volume_usd_by_venue: numberRecord(
+        record.moneyline_volume_usd_by_venue,
       ),
       moneyline_volume_usd_coverage: coverage,
     };
-  });
+  })(item.admission);
   const relationship = object(
     item.relationship_analysis,
     Object.keys(jsonObject(item.relationship_analysis)),
@@ -931,32 +917,34 @@ function validateCadenceCandidate(value: unknown) {
     )
   )
     throw new UniverseUpstreamError();
+  if (!('relationships' in relationship)) throw new UniverseUpstreamError();
   return {
     bundle_id: text(item.bundle_id),
-    sport: optional(item, 'sport', text),
-    game: optional(item, 'game', nullableText),
-    topology: optional(item, 'topology', nullableText),
-    participants: optional(item, 'participants', strings),
-    participant_keys: optional(item, 'participant_keys', strings),
-    event_refs: optional(item, 'event_refs', strings),
-    activation_at: optional(item, 'activation_at', timestamp),
-    capture_start_at: optional(item, 'capture_start_at', timestamp),
-    score: optional(item, 'score', number),
-    score_components: optional(item, 'score_components', numberRecord),
-    eligible: optional(item, 'eligible', boolean),
-    event_status: eventStatus as 'ELIGIBLE' | 'REJECTED' | undefined,
-    rejection_reasons: optional(item, 'rejection_reasons', strings),
+    sport: text(item.sport),
+    game: nullableText(item.game),
+    topology: nullableText(item.topology),
+    participants: strings(item.participants),
+    participant_keys: strings(item.participant_keys),
+    event_refs: strings(item.event_refs),
+    activation_at: timestamp(item.activation_at),
+    capture_start_at: timestamp(item.capture_start_at),
+    score: number(item.score),
+    score_components: numberRecord(item.score_components),
+    eligible: boolean(item.eligible),
+    event_status: eventStatus as 'ELIGIBLE' | 'REJECTED',
+    rejection_reasons: strings(item.rejection_reasons),
     admission,
-    market_exclusions: optional(item, 'market_exclusions', stringListRecord),
-    eligible_market_ids: optional(item, 'eligible_market_ids', strings),
+    market_exclusions: stringListRecord(item.market_exclusions),
+    eligible_market_ids: strings(item.eligible_market_ids),
     selected: boolean(item.selected),
     allocation_rejection:
       item.allocation_rejection === null
         ? null
         : text(item.allocation_rejection),
     relationship_analysis: {
-      relationships: optional(relationship, 'relationships', (value) =>
-        array(value, validateCadenceRelationship),
+      relationships: array(
+        relationship.relationships,
+        validateCadenceRelationship,
       ),
       diagnostics: optional(relationship, 'diagnostics', strings),
       outcome_spaces: optional(relationship, 'outcome_spaces', (value) =>
@@ -981,13 +969,13 @@ function validateCadenceMatchRejection(value: unknown) {
     'cadence match rejection',
   );
   return {
-    sport: text(item.sport),
-    game: nullableText(item.game),
-    topology: nullableText(item.topology),
-    participant_keys: strings(item.participant_keys),
-    event_refs: strings(item.event_refs),
-    reason: text(item.reason),
-    details: jsonObject(item.details),
+    sport: optional(item, 'sport', text),
+    game: optional(item, 'game', nullableText),
+    topology: optional(item, 'topology', nullableText),
+    participant_keys: optional(item, 'participant_keys', strings),
+    event_refs: optional(item, 'event_refs', strings),
+    reason: optional(item, 'reason', text),
+    details: optional(item, 'details', jsonObject),
   };
 }
 
@@ -1019,7 +1007,7 @@ function validateCadenceSelectedTarget(value: unknown) {
 }
 
 function validateCadenceContinuityBundle(value: unknown) {
-  const item = object(
+  const item = partialObject(
     value,
     [
       'base_run_id',
@@ -1032,6 +1020,15 @@ function validateCadenceContinuityBundle(value: unknown) {
     ],
     'cadence continuity bundle',
   );
+  for (const key of [
+    'base_run_id',
+    'bundle_id',
+    'activation_at',
+    'score',
+    'disposition',
+    'targets',
+  ])
+    if (!(key in item)) throw new UniverseUpstreamError();
   const bundleId = text(item.bundle_id);
   const activationAt = timestamp(item.activation_at);
   const targets = array(item.targets, (value) => {
@@ -1083,7 +1080,7 @@ function validateCadenceContinuityBundle(value: unknown) {
     bundle_id: bundleId,
     activation_at: activationAt,
     score: number(item.score),
-    origin_run_id: text(item.origin_run_id),
+    origin_run_id: optional(item, 'origin_run_id', text),
     disposition: continuityDisposition(item.disposition),
     targets,
   };

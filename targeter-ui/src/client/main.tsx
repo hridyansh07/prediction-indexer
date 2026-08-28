@@ -19,8 +19,10 @@ import {
   retirementExplanation,
 } from './event-universe-view-model';
 import {
+  candidateDecisionState,
   cadenceRunEmptyMessage,
   cadenceStatusLabel,
+  selectionDecisionEvidence,
 } from './cadence-view-model';
 import { EventUniversePage } from './event-universe';
 import { targeterCadenceNeeded } from './app-routing';
@@ -71,6 +73,26 @@ const compactCurrency = (value: number | undefined) =>
         notation: 'compact',
         maximumFractionDigits: 1,
       })}`;
+
+const candidateVenues = (
+  run: UniverseCadenceRun,
+  candidate: UniverseCadenceCandidate,
+) =>
+  [
+    ...new Set([
+      ...candidate.eligible_market_ids.map(
+        (marketId) => marketId.split(':', 1)[0],
+      ),
+      ...Object.keys(candidate.market_exclusions).map(
+        (marketId) => marketId.split(':', 1)[0],
+      ),
+      ...Object.entries(run.selected_targets)
+        .filter(([, targets]) =>
+          targets.some((target) => target.bundle_id === candidate.bundle_id),
+        )
+        .map(([venue]) => venue),
+    ]),
+  ].filter(Boolean);
 
 async function loadCadence() {
   const response = await fetch(CADENCE_ENDPOINT, {
@@ -334,6 +356,13 @@ function CatalogObservability({ run }: { run: UniverseCadenceRun }) {
                 diagnostics
               </small>
             )}
+            {Object.entries(catalog.classification_diagnostics_by_code).map(
+              ([code, count]) => (
+                <small className="warn" key={code}>
+                  {label(code)}: {count}
+                </small>
+              ),
+            )}
             {catalog.diagnostics.map((diagnostic) => (
               <small key={diagnostic}>{diagnostic}</small>
             ))}
@@ -430,7 +459,7 @@ function ContinuityObservability({ run }: { run: UniverseCadenceRun }) {
                 <b>{bundle.bundle_id}</b>
                 <span>
                   Score {score(bundle.score)} · base {bundle.base_run_id} ·
-                  origin {bundle.origin_run_id}
+                  origin {bundle.origin_run_id ?? 'not supplied'}
                 </span>
               </summary>
               <ul className="probe-list">
@@ -489,21 +518,11 @@ function RunProvenance({ run }: { run: UniverseCadenceRun }) {
 }
 
 function RunSelections({ run }: { run: UniverseCadenceRun }) {
-  const evidence = new Map(
-    run.candidates.map((candidate) => [candidate.bundle_id, candidate]),
-  );
-  const continuityScores = new Map(
-    run.continuity.bundles.map((bundle) => [bundle.bundle_id, bundle.score]),
-  );
   const selections = [...run.selections].sort((left, right) => {
     const leftScore =
-      evidence.get(left.bundle_id)?.score ??
-      continuityScores.get(left.bundle_id) ??
-      Number.NEGATIVE_INFINITY;
+      selectionDecisionEvidence(run, left).score ?? Number.NEGATIVE_INFINITY;
     const rightScore =
-      evidence.get(right.bundle_id)?.score ??
-      continuityScores.get(right.bundle_id) ??
-      Number.NEGATIVE_INFINITY;
+      selectionDecisionEvidence(run, right).score ?? Number.NEGATIVE_INFINITY;
     return (
       rightScore - leftScore || left.bundle_id.localeCompare(right.bundle_id)
     );
@@ -516,17 +535,17 @@ function RunSelections({ run }: { run: UniverseCadenceRun }) {
       />
       {selections.length ? (
         <div className="cards">
-          {selections.map((selection) => (
-            <SelectionCard
-              key={`${selection.run_id}-${selection.bundle_id}`}
-              selection={selection}
-              candidate={evidence.get(selection.bundle_id)}
-              decisionScore={
-                evidence.get(selection.bundle_id)?.score ??
-                continuityScores.get(selection.bundle_id)
-              }
-            />
-          ))}
+          {selections.map((selection) => {
+            const evidence = selectionDecisionEvidence(run, selection);
+            return (
+              <SelectionCard
+                key={`${selection.run_id}-${selection.bundle_id}`}
+                selection={selection}
+                candidate={evidence.candidate}
+                decisionScore={evidence.score}
+              />
+            );
+          })}
         </div>
       ) : (
         <p className="empty">{cadenceRunEmptyMessage(run)}</p>
@@ -568,8 +587,19 @@ function RejectionSummary({ run }: { run: UniverseCadenceRun }) {
           <ul className="diagnostics">
             {run.match_rejections.map((rejection, index) => (
               <li key={`${rejection.reason}-${index}`}>
-                {rejection.participant_keys.join(' vs ')} ·{' '}
-                {label(rejection.reason)}
+                {rejection.participant_keys?.join(' vs ') ||
+                  'Unidentified group'}{' '}
+                · {label(rejection.reason)}
+                {!!rejection.event_refs?.length && (
+                  <>
+                    {' '}
+                    · <code>{rejection.event_refs.join(', ')}</code>
+                  </>
+                )}
+                {rejection.details &&
+                  Object.keys(rejection.details).length > 0 && (
+                    <pre>{JSON.stringify(rejection.details, null, 2)}</pre>
+                  )}
               </li>
             ))}
           </ul>
@@ -586,7 +616,7 @@ function CandidateDecisionCard({
 }: {
   run: UniverseCadenceRun;
   candidate: UniverseCadenceCandidate;
-  state: string;
+  state: ReturnType<typeof candidateDecisionState>;
 }) {
   const targetEntries = Object.entries(run.selected_targets).flatMap(
     ([venue, targets]) =>
@@ -597,17 +627,25 @@ function CandidateDecisionCard({
   return (
     <details className="decision-card">
       <summary>
-        <span className={`decision ${state === 'rejected' ? 'warn' : 'ok'}`}>
-          {label(state)}
+        <span
+          className={`decision ${state === 'rejected' || state === 'decision-unavailable' ? 'warn' : 'ok'}`}
+        >
+          {state === 'decision-unavailable'
+            ? 'Decision unavailable — incomplete input'
+            : label(state)}
         </span>
-        <b>{candidate.participants?.join(' vs ') || candidate.bundle_id}</b>
+        <b>{candidate.participants.join(' vs ') || candidate.bundle_id}</b>
         <span>
           Score {score(candidate.score)} · {label(candidate.event_status)} ·{' '}
           {run.run_id}
         </span>
       </summary>
       <div className="detail">
-        <h4>Decision reasons</h4>
+        <h4>
+          {state === 'decision-unavailable'
+            ? 'Candidate assessment reasons'
+            : 'Decision reasons'}
+        </h4>
         <pre>
           {JSON.stringify(
             [
@@ -623,22 +661,26 @@ function CandidateDecisionCard({
         <h4>Admission</h4>
         <pre>
           {JSON.stringify(
-            candidate.admission
-              ? {
-                  combined_moneyline_volume_usd:
-                    candidate.admission.combined_moneyline_volume_usd,
-                  minimum_moneyline_volume_usd:
-                    candidate.admission.minimum_moneyline_volume_usd,
-                }
-              : {},
+            {
+              combined: compactCurrency(
+                candidate.admission.combined_moneyline_volume_usd,
+              ),
+              minimum: compactCurrency(
+                candidate.admission.minimum_moneyline_volume_usd,
+              ),
+              by_venue: candidate.admission.moneyline_volume_usd_by_venue,
+              coverage: candidate.admission.moneyline_volume_usd_coverage,
+            },
             null,
             2,
           )}
         </pre>
+        <h4>Score components</h4>
+        <pre>{JSON.stringify(candidate.score_components, null, 2)}</pre>
         <h4>Markets</h4>
-        <pre>
-          {JSON.stringify(candidate.eligible_market_ids ?? [], null, 2)}
-        </pre>
+        <pre>{JSON.stringify(candidate.eligible_market_ids, null, 2)}</pre>
+        <h4>Market exclusions</h4>
+        <pre>{JSON.stringify(candidate.market_exclusions, null, 2)}</pre>
         <h4>Selected targets</h4>
         <pre>
           {JSON.stringify(
@@ -647,6 +689,9 @@ function CandidateDecisionCard({
               target_id: target.target_id,
               subscriptions: target.subscription_ids,
               continuity_score: target.continuity_score,
+              activation_at: target.activation_at,
+              capture_start_at: target.capture_start_at,
+              source_ref: target.source_ref,
             })),
             null,
             2,
@@ -655,7 +700,21 @@ function CandidateDecisionCard({
         <h4>Relationships</h4>
         <pre>
           {JSON.stringify(
-            candidate.relationship_analysis.relationships ?? [],
+            candidate.relationship_analysis.relationships,
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Relationship diagnostics</h4>
+        <pre>
+          {JSON.stringify(
+            {
+              diagnostics:
+                candidate.relationship_analysis.diagnostics ?? 'not supplied',
+              outcome_spaces:
+                candidate.relationship_analysis.outcome_spaces ??
+                'not supplied',
+            },
             null,
             2,
           )}
@@ -816,24 +875,14 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
         run.candidates.map((candidate) => ({
           run,
           candidate,
-          state: candidate.selected
-            ? 'selected'
-            : candidate.eligible
-              ? 'not-selected'
-              : 'rejected',
+          state: candidateDecisionState(run, candidate),
         })),
       ),
     [cadence],
   );
   const venues = [
     ...new Set(
-      rows.flatMap(({ run, candidate }) =>
-        Object.entries(run.selected_targets)
-          .filter(([, targets]) =>
-            targets.some((target) => target.bundle_id === candidate.bundle_id),
-          )
-          .map(([value]) => value),
-      ),
+      rows.flatMap(({ run, candidate }) => candidateVenues(run, candidate)),
     ),
   ].sort();
   const shown = rows
@@ -843,9 +892,10 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
         candidate.sport,
         candidate.game,
         candidate.topology,
-        ...(candidate.participants ?? []),
-        ...(candidate.event_refs ?? []),
-        ...(candidate.rejection_reasons ?? []),
+        ...candidate.participants,
+        ...candidate.event_refs,
+        ...candidate.rejection_reasons,
+        ...candidate.eligible_market_ids,
         ...Object.entries(run.selected_targets)
           .filter(([, targets]) =>
             targets.some((target) => target.bundle_id === candidate.bundle_id),
@@ -863,20 +913,12 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
         haystack.includes(query.toLowerCase()) &&
         (decision === 'all' || decision === state) &&
         (runId === 'all' || runId === run.run_id) &&
-        (venue === 'all' ||
-          Object.entries(run.selected_targets).some(
-            ([targetVenue, targets]) =>
-              targetVenue === venue &&
-              targets.some(
-                (target) => target.bundle_id === candidate.bundle_id,
-              ),
-          ))
+        (venue === 'all' || candidateVenues(run, candidate).includes(venue))
       );
     })
     .sort(
       (left, right) =>
-        (right.candidate.score ?? Number.NEGATIVE_INFINITY) -
-          (left.candidate.score ?? Number.NEGATIVE_INFINITY) ||
+        right.candidate.score - left.candidate.score ||
         right.run.run_id.localeCompare(left.run.run_id) ||
         left.candidate.bundle_id.localeCompare(right.candidate.bundle_id),
     );
@@ -906,6 +948,9 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
             <option value="selected">Selected</option>
             <option value="not-selected">Eligible, not allocated</option>
             <option value="rejected">Rejected</option>
+            <option value="decision-unavailable">
+              Decision unavailable — incomplete input
+            </option>
           </select>
         </label>
         <label>
@@ -947,7 +992,7 @@ function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
           ))}
         </div>
       ) : (
-        <p className="empty">No indexed selections match these filters.</p>
+        <p className="empty">No candidate decisions match these filters.</p>
       )}
     </section>
   );

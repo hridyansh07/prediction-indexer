@@ -17,8 +17,10 @@ import {
 } from '../src/client/event-universe-view-model.js';
 import { targeterCadenceNeeded } from '../src/client/app-routing.js';
 import {
+  candidateDecisionState,
   cadenceRunEmptyMessage,
   cadenceStatusLabel,
+  selectionDecisionEvidence,
 } from '../src/client/cadence-view-model.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
@@ -460,15 +462,94 @@ test('cadence schema and view model cover every freshness state and empty runs',
   );
 });
 
+test('cadence view models distinguish incomplete decisions and retained evidence', () => {
+  const candidate = {
+    bundle_id: 'bundle alpha',
+    sport: 'esports',
+    game: 'counter_strike_2',
+    topology: 'series',
+    participants: ['Alpha', 'Beta'],
+    participant_keys: ['alpha', 'beta'],
+    event_refs: ['kalshi:event-a'],
+    activation_at: '2026-08-20T14:00:00Z',
+    capture_start_at: '2026-08-20T13:00:00Z',
+    score: 3,
+    score_components: {},
+    eligible: false,
+    event_status: 'REJECTED' as const,
+    rejection_reasons: ['volume_gate'],
+    admission: {
+      combined_moneyline_volume_usd: 100,
+      minimum_moneyline_volume_usd: 25000,
+      moneyline_volume_usd_by_venue: {},
+      moneyline_volume_usd_coverage: {},
+    },
+    market_exclusions: {},
+    eligible_market_ids: [],
+    selected: false,
+    allocation_rejection: null,
+    relationship_analysis: { relationships: [] },
+  };
+  const incomplete = run({ input_complete: false, candidates: [candidate] });
+  assert.equal(
+    candidateDecisionState(incomplete, candidate),
+    'decision-unavailable',
+  );
+
+  const retainedSelection = detail({
+    occurrence_kind: 'retained',
+    continuity_disposition: 'retained',
+  });
+  const retainedRun = run({
+    candidates: [candidate],
+    continuity: {
+      bundles: [
+        {
+          base_run_id: '20260820T110000.000001Z',
+          bundle_id: candidate.bundle_id,
+          activation_at: candidate.activation_at,
+          score: 91,
+          disposition: 'retained',
+          targets: [],
+        },
+      ],
+      retained_bundle_ids: [candidate.bundle_id],
+      dispositions: { [candidate.bundle_id]: 'retained' },
+    },
+    selections: [retainedSelection],
+  });
+  assert.deepEqual(selectionDecisionEvidence(retainedRun, retainedSelection), {
+    score: 91,
+    candidate: undefined,
+  });
+});
+
 test('cadence validates operational decision evidence and terminal probes', () => {
   const candidate = {
     bundle_id: 'bundle alpha',
     sport: 'esports',
+    game: 'counter_strike_2',
+    topology: 'series',
     participants: ['Alpha', 'Beta'],
+    participant_keys: ['alpha', 'beta'],
+    event_refs: ['kalshi:event-a'],
+    activation_at: '2026-08-20T14:00:00Z',
+    capture_start_at: '2026-08-20T13:00:00Z',
     score: 12.5,
+    score_components: { venue_coverage: 1000 },
     eligible: true,
     event_status: 'ELIGIBLE',
     rejection_reasons: [],
+    admission: {
+      combined_moneyline_volume_usd: 30000,
+      minimum_moneyline_volume_usd: 25000,
+      moneyline_volume_usd_by_venue: { kalshi: 30000 },
+      moneyline_volume_usd_coverage: {
+        kalshi: { known_markets: 1, unknown_markets: 0 },
+      },
+    },
+    market_exclusions: {},
+    eligible_market_ids: ['kalshi:market-a'],
     selected: true,
     allocation_rejection: null,
     relationship_analysis: { relationships: [], diagnostics: [] },
@@ -495,6 +576,20 @@ test('cadence validates operational decision evidence and terminal probes', () =
   };
   const valid = run({
     candidates: [candidate],
+    selected_targets: {
+      kalshi: [
+        {
+          target_id: 'kalshi:market-a',
+          bundle_id: 'bundle alpha',
+          canonical_class: 'esports.series_moneyline',
+          subscription_ids: ['asset-a'],
+          activation_at: '2026-08-20T14:00:00Z',
+          capture_start_at: '2026-08-20T13:00:00Z',
+          source_ref: 'kalshi:event-a',
+          continuity_score: 12.5,
+        },
+      ],
+    },
     counts: {
       candidates: 1,
       eligible: 1,
@@ -511,6 +606,11 @@ test('cadence validates operational decision evidence and terminal probes', () =
   });
   assert.equal(
     validateCadence(cadence('current', [valid])).runs[0].candidates[0].score,
+    12.5,
+  );
+  assert.equal(
+    validateCadence(cadence('current', [valid])).runs[0].selected_targets
+      .kalshi[0].continuity_score,
     12.5,
   );
 

@@ -176,47 +176,47 @@ export interface UniverseCadenceRelationship {
 
 export interface UniverseCadenceCandidate {
   bundle_id: string;
-  sport?: string;
-  game?: string | null;
-  topology?: string | null;
-  participants?: string[];
-  participant_keys?: string[];
-  event_refs?: string[];
-  activation_at?: string;
-  capture_start_at?: string;
-  score?: number;
-  score_components?: Record<string, number>;
-  eligible?: boolean;
-  event_status?: 'ELIGIBLE' | 'REJECTED';
-  rejection_reasons?: string[];
-  admission?: {
-    combined_moneyline_volume_usd?: number;
-    minimum_moneyline_volume_usd?: number;
-    moneyline_volume_usd_by_venue?: Record<string, number>;
-    moneyline_volume_usd_coverage?: Record<
+  sport: string;
+  game: string | null;
+  topology: string | null;
+  participants: string[];
+  participant_keys: string[];
+  event_refs: string[];
+  activation_at: string;
+  capture_start_at: string;
+  score: number;
+  score_components: Record<string, number>;
+  eligible: boolean;
+  event_status: 'ELIGIBLE' | 'REJECTED';
+  rejection_reasons: string[];
+  admission: {
+    combined_moneyline_volume_usd: number;
+    minimum_moneyline_volume_usd: number;
+    moneyline_volume_usd_by_venue: Record<string, number>;
+    moneyline_volume_usd_coverage: Record<
       string,
       { known_markets: number; unknown_markets: number }
     >;
   };
-  market_exclusions?: Record<string, string[]>;
-  eligible_market_ids?: string[];
+  market_exclusions: Record<string, string[]>;
+  eligible_market_ids: string[];
   selected: boolean;
   allocation_rejection: string | null;
   relationship_analysis: {
-    relationships?: UniverseCadenceRelationship[];
+    relationships: UniverseCadenceRelationship[];
     diagnostics?: string[];
     outcome_spaces?: Array<Record<string, unknown>>;
   };
 }
 
 export interface UniverseCadenceMatchRejection {
-  sport: string;
-  game: string | null;
-  topology: string | null;
-  participant_keys: string[];
-  event_refs: string[];
-  reason: string;
-  details: Record<string, unknown>;
+  sport?: string;
+  game?: string | null;
+  topology?: string | null;
+  participant_keys?: string[];
+  event_refs?: string[];
+  reason?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface UniverseCadenceSelectedTarget {
@@ -249,7 +249,7 @@ export interface UniverseCadenceContinuityBundle {
   bundle_id: string;
   activation_at: string;
   score: number;
-  origin_run_id: string;
+  origin_run_id?: string;
   disposition: CadenceContinuityDisposition;
   targets: UniverseCadenceContinuityTarget[];
 }
