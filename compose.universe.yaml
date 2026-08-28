@@ -5,14 +5,17 @@ x-universe-build: &universe-build
   dockerfile: docker/universe.Dockerfile
 
 x-universe-config-environment: &universe-config-environment
+  ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
+  ARCHIVE_ROOT: /var/lib/archive
+  ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-}"
+  ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
   ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
   ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
   ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+  ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
 
 x-universe-job-environment: &universe-job-environment
-  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
-  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
-  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+  <<: *universe-config-environment
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
   AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
   AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
@@ -24,6 +27,13 @@ x-universe-volume: &universe-volume
   bind:
     create_host_path: true
 
+x-universe-archive-volume: &universe-archive-volume
+  type: bind
+  source: ${EVENT_UNIVERSE_ARCHIVE_ROOT:-./data/archive}
+  target: /var/lib/archive
+  bind:
+    create_host_path: true
+
 x-universe-config: &universe-config
   type: bind
   source: ./configs/event_universe.json
@@ -31,6 +41,11 @@ x-universe-config: &universe-config
   read_only: true
   bind:
     create_host_path: false
+
+x-universe-job-volumes: &universe-job-volumes
+  - *universe-volume
+  - *universe-archive-volume
+  - *universe-config
 
 x-universe-runtime: &universe-runtime
   image: ${IMAGE_REGISTRY:-}prediction-indexer-universe:${IMAGE_TAG:-local}
@@ -44,7 +59,6 @@ x-universe-runtime: &universe-runtime
     - ALL
   security_opt:
     - no-new-privileges:true
-  environment: *universe-config-environment
   volumes:
     - *universe-volume
     - *universe-config
@@ -71,6 +85,7 @@ services:
     profiles: [jobs]
     restart: "no"
     environment: *universe-job-environment
+    volumes: *universe-job-volumes
     command: ["python", "-u", "universe/run_sync.py"]
 
   event-universe-backfill:
@@ -78,6 +93,7 @@ services:
     profiles: [jobs]
     restart: "no"
     environment: *universe-job-environment
+    volumes: *universe-job-volumes
     command: ["python", "-u", "universe/run_backfill.py"]
 
   event-universe-backup:
@@ -85,4 +101,5 @@ services:
     profiles: [jobs]
     restart: "no"
     environment: *universe-job-environment
+    volumes: *universe-job-volumes
     command: ["python", "-u", "universe/run_backup.py"]

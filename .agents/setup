@@ -2,8 +2,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-export AWS_WEB_IDENTITY_TOKEN_FILE="$REPO_ROOT/.amp/runtime/aws-oidc-token"
-install -d -m 0700 "$(dirname "$AWS_WEB_IDENTITY_TOKEN_FILE")"
 
 if ! command -v docker >/dev/null 2>&1; then
 	sudo install -m 0755 -d /etc/apt/keyrings
@@ -28,8 +26,4 @@ fi
 
 yarn install --frozen-lockfile
 yarn build:packages
-CARGO_BIN="$(command -v cargo || printf '%s' "$HOME/.cargo/bin/cargo")"
-"$CARGO_BIN" build --release \
-	--manifest-path encoder/rust/Cargo.toml \
-	--bin prediction-decode-v1
 git config core.hooksPath .githooks

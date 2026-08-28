@@ -24,13 +24,6 @@ class UniverseConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class ArchiveConfig:
-    bucket: str
-    region: str
-    expected_owner: str
-
-
-@dataclass(frozen=True)
 class ApiConfig:
     host: str
     port: int
@@ -53,7 +46,6 @@ class BackfillConfig:
 class UniverseConfig:
     path: Path
     database_path: Path
-    archive: ArchiveConfig
     api: ApiConfig
     backfill: BackfillConfig
     backup: BackupConfig
@@ -63,15 +55,7 @@ class UniverseConfig:
         return self.backfill.temporary_directory
 
     def object_store(self) -> ObjectStore:
-        environment = dict(os.environ)
-        environment.setdefault("ARCHIVE_BACKEND", "s3")
-        environment.setdefault("ARCHIVE_S3_BUCKET", self.archive.bucket)
-        environment.setdefault("ARCHIVE_S3_REGION", self.archive.region)
-        environment.setdefault("ARCHIVE_S3_EXPECTED_OWNER", self.archive.expected_owner)
-        return build_store(
-            (self.database_path, self.backup.directory),
-            environ=environment,
-        )
+        return build_store((self.database_path.parent,))
 
 
 def load_config(path: Path | None = None) -> UniverseConfig:
@@ -92,7 +76,6 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         {
             "event_universe_config_version",
             "database_path",
-            "archive",
             "api",
             "backfill",
             "backup",
@@ -102,9 +85,6 @@ def load_config(path: Path | None = None) -> UniverseConfig:
     if document["event_universe_config_version"] != CONFIG_VERSION:
         raise UniverseConfigError("unsupported Event Universe config version")
 
-    archive = _section(
-        document, "archive", {"bucket", "region", "expected_owner"}
-    )
     api = _section(document, "api", {"host", "port"})
     backfill = _section(
         document,
@@ -115,9 +95,6 @@ def load_config(path: Path | None = None) -> UniverseConfig:
     port = api["port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise UniverseConfigError("api.port must be an integer between 1 and 65535")
-    expected_owner = _text(archive, "expected_owner", "archive")
-    if len(expected_owner) != 12 or not expected_owner.isdigit():
-        raise UniverseConfigError("archive.expected_owner must be a 12-digit AWS account id")
     object_prefix = normalize_key(_text(backup, "object_prefix", "backup").rstrip("/"))
     base = source.resolve().parent
     generated_start = _optional_timestamp(
@@ -137,11 +114,6 @@ def load_config(path: Path | None = None) -> UniverseConfig:
     return UniverseConfig(
         path=source.resolve(),
         database_path=_path(document, "database_path", base, "config"),
-        archive=ArchiveConfig(
-            bucket=_text(archive, "bucket", "archive"),
-            region=_text(archive, "region", "archive"),
-            expected_owner=expected_owner,
-        ),
         api=ApiConfig(
             host=_text(api, "host", "api"),
             port=port,

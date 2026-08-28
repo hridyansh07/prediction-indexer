@@ -1,7 +1,9 @@
 # Event Universe schema
 
-[`v1.sql`](v1.sql) is the complete Event Universe SQLite schema. Runtime code
-loads it as a package resource; SQL does not live inside `universe/store.py`.
+[`v1.sql`](v1.sql) is the durable selected-history schema. [`v2.sql`](v2.sql)
+adds the disposable newest-five cadence cache. Runtime code applies both as
+package resources and upgrades existing v1 databases transactionally; SQL does
+not live inside `universe/store.py`.
 
 The database is an append-only selected-history index, not another evidence
 archive:
@@ -14,12 +16,15 @@ archive:
   references a non-null complete origin occurrence;
 - `bundle_retirements` records proven all-terminal or safety-clamp observations
   and references their exact complete origin context; and
-- `checkpoints` records incremental S3 discovery progress.
+- `checkpoints` records incremental object-store discovery progress; and
+- `cadence_runs` caches compact operational projections for exactly the newest
+  five runs, including incomplete and empty runs.
 
-The schema has no active-snapshot, catalogue, raw segment, control, connection
-epoch, venue-delivery, report JSON, or replay-plan table. Exact evidence remains
-in immutable S3. Source keys and SHA-256 identities are the route back to those
-bytes.
+The schema has no active-snapshot, raw catalogue, raw segment, control,
+connection-epoch, venue-delivery, report JSON, or replay-plan table. Exact
+evidence remains in the immutable configured ObjectStore. Source keys and
+SHA-256 identities are the route back to those bytes.
 
-There is no migration from an earlier Universe schema because no Event
-Universe database was deployed before this strict v3-only contract.
+V1 selected-history rows remain unchanged. The v2 migration creates only the
+rebuildable cache; sync repopulates missing newest-run projections from verified
+Targeter reports.

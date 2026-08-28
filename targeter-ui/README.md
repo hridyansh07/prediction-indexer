@@ -1,47 +1,75 @@
-# Targeter v2 observability UI
+# Event Universe and Targeter cadence UI
 
-Read-only React/Vite + Express dashboard for the five latest committed Targeter v2 S3 runs. It has no database or persistent data sink and uses the AWS SDK v3 default credential provider chain, including OIDC/web identity. A separate orb service refreshes the short-lived Amp ID-token file consumed by that standard chain.
+Read-only React/Vite UI for historical Event Universe exploration and recent
+Targeter cadence observability. Event Universe is the primary experience at
+`/`; the bounded five-run cadence projection is available at `/operations`.
 
-The dashboard reads both selection report v1 and v2. For v2 it validates and displays committed-generation continuity evidence, including exact retained bundles, disposition, terminal probes, degraded-base diagnostics, and continuity provenance. A retained bundle does not need to exist in current discovery candidates or catalogues: its exact targets come from the validated committed generation. All-terminal and terminal-clamp retirement is shown as a legitimate empty decision. These archived shadow reports are observability evidence only; `targeter-v2/current.json` and the immutable generation it names remain the sole live subscription truth.
+The browser hydrates both views exclusively through the same-origin
+`/api/event-universe/...` proxy. The UI does not list an archive, download
+Targeter reports, decode Zstandard, stage private files, or hold cloud-storage
+credentials. Event Universe owns report verification and lifecycle projection.
 
-## Configuration
+## Server configuration
 
-[`targeter-ui/.env.example`](.env.example) contains the complete server and Amp OIDC variable set with non-secret example values. Register these variables in the orb environment; the service does not automatically source the example file.
+[`targeter-ui/.env.example`](.env.example) contains the non-secret examples:
+
+```text
+UNIVERSE_API_BASE_URL=https://universe.example.com
+UNIVERSE_API_AUTHORIZATION=Bearer replace-with-server-side-token  # optional
+UNIVERSE_API_TIMEOUT_MS=5000                                     # optional
+UNIVERSE_API_MAX_RESPONSE_BYTES=2097152                          # optional
+PORT=3000                                                        # Express only
+```
+
+All Universe variables are server-only. Do not prefix them with `VITE_`; doing
+so would expose them to browser JavaScript. The proxy accepts only documented
+paths and query fields, validates closed response schemas, applies bounded
+timeouts and response sizes, and returns generic failures without upstream
+bodies or credentials.
+
+The cadence dashboard consumes only:
+
+```text
+GET /api/event-universe/v1/targeter/cadence?limit=5
+```
+
+Refreshes are GET-only. The status is exactly `CADENCE CURRENT`, `CADENCE LATE`,
+or `CADENCE UNAVAILABLE`, as supplied by Universe. It is an indexed cadence
+observation, not proof of `current.json` publication or splice health. The
+API includes selected occurrence detail plus bounded catalogue, candidate,
+rejection, admission, continuity, terminal-probe, and diagnostic projections.
+The UI uses the server's semantic counts and never reinterprets raw Targeter
+reports.
+
+## Routes
+
+- `/` — historical selected-event explorer
+- `/operations` — five-run Targeter cadence timeline and selected bundles
+- `/operations/selections` — filters across selections in those cadence runs
+- `/api/event-universe/...` — narrow same-origin Universe proxy
+
+Legacy Event Universe and operations paths redirect to these routes.
+
+## Vercel
+
+Create the Vercel project from the repository root. [`vercel.json`](../vercel.json)
+builds only the Vite client, serves `targeter-ui/dist`, forwards the same-origin
+Universe routes through the Vercel function, and supplies the SPA fallback.
+Configure the same `UNIVERSE_API_*` server-side variables in Vercel. No AWS,
+S3, OIDC, archive-prefix, staging, or decoder variables belong in Vercel.
+
+## Local and orb operation
 
 ```sh
-export AWS_OIDC_AUDIENCE=sts.amazonaws.com
-export AWS_ROLE_ARN=arn:aws:iam::123456789012:role/prediction-indexer-targeter-ui
-export AWS_ROLE_SESSION_NAME=prediction-indexer-targeter-ui
-export TARGETER_UI_S3_BUCKET=example-archive
-export TARGETER_UI_AWS_REGION=us-east-1
-export TARGETER_UI_S3_EXPECTED_OWNER=123456789012
-export TARGETER_UI_DECODER_PATH="$PWD/encoder/rust/target/release/prediction-decode-v1"
-# optional: TARGETER_UI_S3_PREFIX=targeter-v2/runs
-# optional: TARGETER_UI_REFRESH_SECONDS=60 TARGETER_UI_EXPECTED_RUN_SECONDS=600 PORT=3000
 yarn install --frozen-lockfile
-cargo build --release --manifest-path encoder/rust/Cargo.toml --bin prediction-decode-v1
-yarn build
+yarn workspace prediction-indexer-targeter-ui build
 yarn workspace prediction-indexer-targeter-ui start
 ```
 
-`TARGETER_UI_MAX_RUNS` defaults to and is fixed at `5`. AWS credentials are never returned by the API or rendered. For local visual work only, `TARGETER_UI_FIXTURE_PATH=/absolute/reports.json` replaces S3; the file is an array of decoded selection report v1 objects (or `{ "runs": [...] }`). Fixture mode is never automatic.
+The production Express server serves `dist/`, `/healthz`, and the same strict
+Universe proxy on `PORT`. In an Amp orb, register `UNIVERSE_API_BASE_URL` and any
+optional authorization as project secrets, then run `amp orb services ensure`.
 
-From the repository root, use `yarn lint`, `yarn lint:fix`, `yarn test`, `yarn typecheck`, and `yarn build`. The production Express server serves `dist/` and its API on `PORT`.
-
-Repository setup configures `.githooks/pre-commit` through the local `core.hooksPath`. The hook runs the root `yarn lint` gate and blocks commits containing unformatted or lint-invalid Node/UI code. Developers who do not run `.agents/setup` can enable it with `git config core.hooksPath .githooks`.
-
-## IAM / OIDC
-
-The workload identity needs only `s3:ListBucket` on the bucket constrained with `s3:prefix` to `targeter-v2/runs/*`, and `s3:GetObject` on `arn:aws:s3:::BUCKET/targeter-v2/runs/*`. Its OIDC trust policy should constrain the provider subject/audience to this workload. Do not grant Put/Delete. Every list/get includes the configured expected bucket owner.
-
-The `aws-identity` orb service runs [`scripts/refresh-amp-aws-token`](../scripts/refresh-amp-aws-token) immediately and every 45 minutes. The token path is derived as `<repository>/.amp/runtime/aws-oidc-token`, so `AWS_WEB_IDENTITY_TOKEN_FILE` does not need to be configured. The script asks Amp for a one-hour ID token, writes it with mode `0600`, and atomically replaces that file; it never prints or persists the token anywhere else. The AWS SDK reads the exported path and uses `AWS_ROLE_ARN` to call `AssumeRoleWithWebIdentity`. The UI service waits for the first non-empty token file before starting. A transient mint failure leaves the previous token file untouched and retries after 30 seconds instead of exiting into the service manager's rapid-restart limit. On orb resume, `.agents/resume` hydrates missing project environment entries and mints a fresh token synchronously before reconciling the declared services, so the UI cannot be restarted against a stale, merely non-empty token file.
-
-## Identity and bounds
-
-Only `date=YYYY-MM-DD/run=<run_id>/run_manifest.json` keys are commit markers. Listing is paginated and latest runs are chosen by validated microsecond UTC run ID, never `LastModified`. Manifest v2 and report v1 structure are checked. The shared staging package verifies stored SHA-256/length. For compressed reports, the Rust protocol-v1 decoder verifies the strict Zstandard profile and logical SHA-256/length/LF count before the UI parses its output. `TARGETER_UI_DECODER_PATH` is required in S3 mode and must be an absolute path; fixture mode does not require it. Selection reports alone may be buffered after validation: stored size is limited to **16 MiB**, decoded size to **64 MiB**, and manifest to **1 MiB**. Catalogues are never downloaded. The cache is memory-only, refreshes at startup/on interval/API request, coalesces overlapping refreshes, and retains the last successful snapshot with a stale/error flag.
-
-The displayed strategy is `configs/targeter_v2.json` from the **current checkout**. Archives do not embed the complete historical config. The UI compares report and checkout strategy versions, but correctly labels a match as evidence rather than byte-level proof of the historical settings.
-
-## Amp orb
-
-Register the required AWS and archive environment variables in the Amp project before creating the orb, then run `amp orb services ensure`. Project variables added later are available to newly created orbs, not an already-running orb. `.agents/setup` builds `prediction-decode-v1`; `.amp/services.yaml` passes that binary's exact repository path to the UI, starts the token refresher, and exposes port 3000 through an Amp portal. The token lives only under the gitignored `.amp/runtime/` directory; no AWS access key or web-identity token belongs in Git or `.env.example`.
+From the repository root, use `yarn lint`, `yarn typecheck`, `yarn test`, and
+`yarn build`. Repository setup configures `.githooks/pre-commit`; it runs the
+root lint gate before each commit.

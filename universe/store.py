@@ -16,15 +16,15 @@ from typing import Any, Iterable, Iterator, Mapping
 from archive.common.durable import fsync_directory
 from archive.storage.base import normalize_key
 from targeter.v2.models import isoformat, parse_timestamp
+from universe.cadence import CADENCE_PROJECTION_VERSION, validate_cadence_projection
 from universe.projection import PROJECTION_VERSION
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STALE_AFTER_SECONDS = 3_600
 TARGETER_CADENCE_SECONDS = 600
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
-
-
+SCHEMA_V2_PATH = Path(__file__).with_name("schema") / "v2.sql"
 class EvidenceConflict(ValueError):
     """Immutable source evidence or its SQL projection is inconsistent."""
 
@@ -38,14 +38,96 @@ class UniverseStore:
         with closing(self.connect()) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 0:
-                connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                connection.commit()
+                objects = self._schema_objects(connection)
+                if not objects:
+                    self._execute_schema_transaction(connection, SCHEMA_PATH)
+                else:
+                    self._validate_recoverable_schema(connection)
+                version = 1
+            if version == 1:
+                self._validate_recoverable_schema(connection)
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    cadence = connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cadence_runs'"
+                    ).fetchone()
+                    if cadence is None:
+                        self._execute_statements(connection, SCHEMA_V2_PATH)
+                    else:
+                        connection.execute(
+                            "CREATE INDEX IF NOT EXISTS cadence_runs_generated "
+                            "ON cadence_runs(generated_at_ns DESC, run_id DESC)"
+                        )
+                    connection.execute("PRAGMA user_version = 2")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
             elif version != SCHEMA_VERSION:
                 raise EvidenceConflict(
                     f"unsupported Event Universe schema version {version}; "
                     "initialize a fresh v1 database"
                 )
+
+    @staticmethod
+    def _schema_objects(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
+        return {
+            (str(row[0]), str(row[1])): " ".join(str(row[2]).split())
+            for row in connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'view', 'trigger') AND sql IS NOT NULL "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+
+    @classmethod
+    def _expected_schema(cls, *paths: Path) -> dict[tuple[str, str], str]:
+        with closing(sqlite3.connect(":memory:")) as expected:
+            expected.execute("PRAGMA foreign_keys = ON")
+            for path in paths:
+                expected.executescript(path.read_text(encoding="utf-8"))
+            return cls._schema_objects(expected)
+
+    @classmethod
+    def _validate_recoverable_schema(cls, connection: sqlite3.Connection) -> None:
+        actual = cls._schema_objects(connection)
+        expected_v1 = cls._expected_schema(SCHEMA_PATH)
+        expected_v2 = cls._expected_schema(SCHEMA_PATH, SCHEMA_V2_PATH)
+        cadence_keys = {
+            ("table", "cadence_runs"),
+            ("index", "cadence_runs_generated"),
+        }
+        if any(actual.get(key) != definition for key, definition in expected_v1.items()):
+            raise EvidenceConflict("database contains an invalid Event Universe v1 schema")
+        extras = set(actual) - set(expected_v1)
+        if not extras <= cadence_keys:
+            raise EvidenceConflict("database contains unexpected Event Universe schema objects")
+        cadence_table = ("table", "cadence_runs")
+        cadence_index = ("index", "cadence_runs_generated")
+        if cadence_index in actual and cadence_table not in actual:
+            raise EvidenceConflict("cadence index exists without its table")
+        for key in extras:
+            if actual[key] != expected_v2[key]:
+                raise EvidenceConflict("existing cadence_runs table has an invalid schema")
+
+    @staticmethod
+    def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
+        for statement in path.read_text(encoding="utf-8").split(";"):
+            if statement.strip():
+                connection.execute(statement)
+
+    @classmethod
+    def _execute_schema_transaction(
+        cls, connection: sqlite3.Connection, path: Path
+    ) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cls._execute_statements(connection, path)
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def connect(self, *, readonly: bool = False) -> sqlite3.Connection:
         if readonly:
@@ -79,15 +161,37 @@ class UniverseStore:
     def known_manifest(self, key: str, sha256: str) -> bool:
         with closing(self.connect(readonly=True)) as connection:
             row = connection.execute(
-                """SELECT manifest_sha256 FROM targeter_runs
-                   WHERE manifest_key = ?""",
+                """SELECT r.manifest_sha256,
+                          EXISTS(
+                              SELECT 1 FROM cadence_runs c WHERE c.run_id = r.run_id
+                          ) AS has_cadence,
+                          r.run_id IN (
+                              SELECT run_id FROM targeter_runs
+                              ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
+                          ) AS needs_cadence
+                   FROM targeter_runs r WHERE r.manifest_key = ?""",
                 (key,),
             ).fetchone()
         if row is None:
             return False
         if row["manifest_sha256"] != sha256:
             raise EvidenceConflict(f"immutable manifest {key!r} changed identity")
-        return True
+        return bool(row["has_cadence"]) or not bool(row["needs_cadence"])
+
+    def missing_cadence_manifest_keys(self) -> list[str]:
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                """WITH newest AS (
+                       SELECT run_id, manifest_key, generated_at_ns
+                       FROM targeter_runs
+                       ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
+                   )
+                   SELECT r.manifest_key FROM newest r
+                   LEFT JOIN cadence_runs c USING (run_id)
+                   WHERE c.run_id IS NULL
+                   ORDER BY r.generated_at_ns DESC, r.run_id DESC"""
+            ).fetchall()
+        return [str(row["manifest_key"]) for row in rows]
 
     def latest_run(self) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
@@ -119,6 +223,7 @@ class UniverseStore:
         report_byte_length: int,
         report_decoded_sha256: str,
         report_decoded_byte_length: int,
+        cadence: Mapping[str, Any],
         occurrences: Iterable[Mapping[str, Any]],
         retirements: Iterable[Mapping[str, Any]],
     ) -> str:
@@ -186,6 +291,11 @@ class UniverseStore:
         ]
         projection_sha256 = _records_sha256(projection_entries)
         generated_at_ns = _timestamp_ns(generated_at)
+        cadence = validate_cadence_projection(cadence)
+        cadence_json = json.dumps(
+            cadence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        cadence_sha256 = hashlib.sha256(cadence_json.encode("utf-8")).hexdigest()
         expected = {
             "run_id": run_id,
             "generated_at": generated_at,
@@ -220,6 +330,28 @@ class UniverseStore:
                     raise EvidenceConflict(
                         f"Targeter run {run_id} SQL projection failed audit"
                     )
+                cached = connection.execute(
+                    "SELECT payload_sha256 FROM cadence_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if cached is not None and cached["payload_sha256"] != cadence_sha256:
+                    raise EvidenceConflict(
+                        f"Targeter run {run_id} cadence projection conflicts with prior ingestion"
+                    )
+                if cached is None:
+                    connection.execute(
+                        """INSERT INTO cadence_runs(
+                               run_id, generated_at_ns, projection_version,
+                               payload_json, payload_sha256
+                           ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            run_id,
+                            generated_at_ns,
+                            CADENCE_PROJECTION_VERSION,
+                            cadence_json,
+                            cadence_sha256,
+                        ),
+                    )
+                    _trim_cadence(connection)
                 return "skipped"
 
             indexed_at_ns = time.time_ns()
@@ -252,6 +384,19 @@ class UniverseStore:
                     projection_sha256,
                     len(projection_entries),
                     indexed_at_ns,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO cadence_runs(
+                       run_id, generated_at_ns, projection_version,
+                       payload_json, payload_sha256
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    generated_at_ns,
+                    CADENCE_PROJECTION_VERSION,
+                    cadence_json,
+                    cadence_sha256,
                 ),
             )
             for value in normalized:
@@ -322,6 +467,7 @@ class UniverseStore:
                         value["disposition"],
                     ),
                 )
+            _trim_cadence(connection)
         return "ingested"
 
     def _insert_context(
@@ -621,8 +767,29 @@ class UniverseStore:
     ) -> dict[str, Any]:
         """Return the bounded Targeter cadence view for the dashboard."""
         bounded = min(_limit(limit), 5)
-        runs, _more = self.list_runs(limit=bounded)
-        runs = list(reversed(runs))
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                """SELECT r.*, c.payload_json, c.payload_sha256
+                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
+                   ORDER BY c.generated_at_ns DESC, c.run_id DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+            runs = []
+            for row in rows:
+                payload_json = str(row["payload_json"])
+                if (
+                    hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                    != row["payload_sha256"]
+                ):
+                    raise EvidenceConflict(
+                        f"Targeter run {row['run_id']} cadence projection failed its identity"
+                    )
+                payload = validate_cadence_projection(json.loads(payload_json))
+                selections = self._selection_details(connection, str(row["run_id"]))
+                run = _run_record(row)
+                run.pop("payload_json", None)
+                run.pop("payload_sha256", None)
+                runs.append({**payload, **run, "selections": selections})
         observed_ns = now_ns if now_ns is not None else time.time_ns()
         latest = runs[0] if runs else None
         age_seconds = (
@@ -648,8 +815,22 @@ class UniverseStore:
                     _isoformat_ns(latest["indexed_at_ns"]) if latest is not None else None
                 ),
             },
-            "runs": [_cadence_run(self, run) for run in runs],
+            "runs": runs,
         }
+
+    def _selection_details(
+        self, connection: sqlite3.Connection, run_id: str
+    ) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            f"{_SELECTION_QUERY} WHERE o.run_id = ? ORDER BY o.bundle_id", (run_id,)
+        ).fetchall()
+        return [
+            {
+                **_selection_record(row),
+                "context": self._context(connection, row["context_sha256"]),
+            }
+            for row in rows
+        ]
 
     def list_runs(
         self,
@@ -1276,6 +1457,15 @@ def _canonical_timestamp(value: Any, label: str) -> str:
     return canonical
 
 
+def _trim_cadence(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """DELETE FROM cadence_runs WHERE run_id NOT IN (
+               SELECT run_id FROM cadence_runs
+               ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
+           )"""
+    )
+
+
 def _timestamp_ns(value: str) -> int:
     parsed = parse_timestamp(value)
     if parsed is None:
@@ -1291,17 +1481,6 @@ def _isoformat_ns(value: int) -> str:
     return isoformat(
         datetime.fromtimestamp(value / 1_000_000_000, tz=timezone.utc)
     )
-
-
-def _cadence_run(database: UniverseStore, run: Mapping[str, Any]) -> dict[str, Any]:
-    selections, _more = database.list_selections(run_id=run["run_id"], limit=1000)
-    return {
-        **run,
-        "selections": [
-            database.selection_detail(run["run_id"], selection["bundle_id"])
-            for selection in selections
-        ],
-    }
 
 
 def _sha256(value: Any, label: str) -> str:

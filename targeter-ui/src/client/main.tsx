@@ -1,25 +1,44 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
-import type { ContinuityTarget, RunView, Snapshot } from '../shared';
 import {
-  isLegitimateTerminalRetirement,
-  isReportV2,
-  selectedBundleViews,
-  type SelectedBundleView,
-} from './view-model';
+  BrowserRouter,
+  Navigate,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+} from 'react-router-dom';
+import type {
+  UniverseCadence,
+  UniverseCadenceCandidate,
+  UniverseCadenceRun,
+  UniverseSelectionDetail,
+} from '../event-universe';
+import {
+  occurrenceExplanation,
+  retirementExplanation,
+} from './event-universe-view-model';
+import {
+  candidateDecisionState,
+  cadenceRunEmptyMessage,
+  cadenceStatusLabel,
+  selectionDecisionEvidence,
+} from './cadence-view-model';
+import { EventUniversePage } from './event-universe';
+import { targeterCadenceNeeded } from './app-routing';
 import './style.css';
 
-const val = (x: any, fallback = '—') =>
-  x === undefined || x === null || x === '' ? fallback : String(x);
-const list = (x: any): any[] => (Array.isArray(x) ? x : []);
-const date = (x: any) => {
-  const d = new Date(x);
-  return Number.isNaN(d.valueOf()) ? val(x) : d.toLocaleString();
+const CADENCE_ENDPOINT = '/api/event-universe/v1/targeter/cadence?limit=5';
+
+const date = (value: string | null | undefined) => {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
 };
-const relativeTime = (x: any) => {
-  const timestamp = new Date(x).valueOf();
-  if (Number.isNaN(timestamp)) return val(x);
+
+const relativeTime = (value: string) => {
+  const timestamp = new Date(value).valueOf();
+  if (Number.isNaN(timestamp)) return value;
   const seconds = (timestamp - Date.now()) / 1000;
   const absolute = Math.abs(seconds);
   if (absolute < 60) return 'just now';
@@ -34,125 +53,214 @@ const relativeTime = (x: any) => {
     unit as Intl.RelativeTimeFormatUnit,
   );
 };
-const numericScore = (x: any) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
-};
-const scoreLabel = (x: any) => {
-  const n = numericScore(x);
-  return Number.isFinite(n)
-    ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+
+const label = (value: string | null | undefined) =>
+  value
+    ? value
+        .replaceAll('_', ' ')
+        .replace(/\b\w/g, (character) => character.toUpperCase())
     : '—';
-};
-const compactCurrency = (x: any) => {
-  const n = Number(x);
-  return Number.isFinite(n)
-    ? `$${n.toLocaleString('en-US', {
+
+const score = (value: number | undefined) =>
+  value === undefined
+    ? '—'
+    : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+const compactCurrency = (value: number | undefined) =>
+  value === undefined
+    ? '—'
+    : `$${value.toLocaleString('en-US', {
         notation: 'compact',
         maximumFractionDigits: 1,
-      })}`
-    : '—';
-};
-const relationshipSummary = (candidate: any) => {
-  const counts = new Map<string, number>();
-  for (const item of list(candidate.relationship_analysis?.relationships)) {
-    if (typeof item?.relationship !== 'string' || !item.relationship) continue;
-    counts.set(item.relationship, (counts.get(item.relationship) ?? 0) + 1);
-  }
-  return [...counts.entries()].sort(
-    ([left, leftCount], [right, rightCount]) =>
-      rightCount - leftCount || left.localeCompare(right),
-  );
-};
-const relationshipLabel = (x: string) => {
-  const label = x.toLowerCase().replaceAll('_', ' ');
-  return label.charAt(0).toUpperCase() + label.slice(1);
-};
+      })}`;
+
+const candidateVenues = (
+  run: UniverseCadenceRun,
+  candidate: UniverseCadenceCandidate,
+) =>
+  [
+    ...new Set([
+      ...candidate.eligible_market_ids.map(
+        (marketId) => marketId.split(':', 1)[0],
+      ),
+      ...Object.keys(candidate.market_exclusions).map(
+        (marketId) => marketId.split(':', 1)[0],
+      ),
+      ...Object.entries(run.selected_targets)
+        .filter(([, targets]) =>
+          targets.some((target) => target.bundle_id === candidate.bundle_id),
+        )
+        .map(([venue]) => venue),
+    ]),
+  ].filter(Boolean);
+
+async function loadCadence() {
+  const response = await fetch(CADENCE_ENDPOINT, {
+    method: 'GET',
+    headers: { accept: 'application/json' },
+  });
+  if (!response.ok) throw new Error('Targeter cadence is unavailable.');
+  return (await response.json()) as UniverseCadence;
+}
+
 function App() {
-  const [s, setS] = useState<Snapshot | null>(null);
+  const location = useLocation();
+  const needsCadence = targeterCadenceNeeded(location.pathname);
+  const [cadence, setCadence] = useState<UniverseCadence | null>(null);
   const [error, setError] = useState('');
-  const load = async (method = 'GET') => {
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
     try {
-      const r = await fetch(
-        method === 'GET' ? '/api/snapshot' : '/api/refresh',
-        { method },
-      );
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      setS(await r.json());
+      setCadence(await loadCadence());
       setError('');
-    } catch (e) {
-      setError(String(e));
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : 'Targeter cadence is unavailable.',
+      );
+    } finally {
+      setRefreshing(false);
     }
-  };
-  useEffect(() => {
-    void load();
-    const id = setInterval(() => void load(), 15000);
-    return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!needsCadence) return;
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 60_000);
+    return () => window.clearInterval(interval);
+  }, [needsCadence, refresh]);
+
   return (
     <>
       <header>
         <div>
           <span className="eyebrow">PREDICTION INDEXER</span>
-          <h1>Targeter Operations</h1>
+          <h1>{needsCadence ? 'Targeter Cadence' : 'Event Universe'}</h1>
         </div>
         <nav aria-label="Main navigation">
-          <NavLink to="/">Overview</NavLink>
-          <NavLink to="/events">Events</NavLink>
-          <NavLink to="/config">Config</NavLink>
+          <NavLink to="/" end>
+            Universe
+          </NavLink>
+          <NavLink to="/operations" end>
+            Cadence
+          </NavLink>
+          <NavLink to="/operations/selections">Decisions</NavLink>
         </nav>
-        <button onClick={() => void load('POST')} disabled={s?.refreshing}>
-          ↻ Refresh archive
-        </button>
+        {needsCadence && (
+          <button onClick={() => void refresh()} disabled={refreshing}>
+            ↻ Refresh cadence
+          </button>
+        )}
       </header>
-      {(error || s?.lastRefreshError) && (
+      {needsCadence && error && cadence && (
         <div className="alert" role="alert">
-          Snapshot stale/error: {error || s?.lastRefreshError}. Last successful
-          data is retained.
+          {error} The last successful cadence projection remains displayed.
         </div>
       )}
       <main>
-        {s ? (
-          <Routes>
-            <Route path="/" element={<Overview s={s} />} />
-            <Route path="/events" element={<Events s={s} />} />
-            <Route path="/config" element={<Config s={s} />} />
-          </Routes>
-        ) : (
-          <div className="loading">Loading archive snapshot…</div>
-        )}
+        <Routes>
+          <Route path="/" element={<EventUniversePage />} />
+          <Route
+            path="/operations"
+            element={
+              <CadenceRoute cadence={cadence} error={error}>
+                {(projection) => <CadenceOverview cadence={projection} />}
+              </CadenceRoute>
+            }
+          />
+          <Route
+            path="/operations/selections"
+            element={
+              <CadenceRoute cadence={cadence} error={error}>
+                {(projection) => <SelectionExplorer cadence={projection} />}
+              </CadenceRoute>
+            }
+          />
+          <Route path="/event-universe" element={<Navigate to="/" replace />} />
+          <Route
+            path="/operations/events"
+            element={<Navigate to="/operations/selections" replace />}
+          />
+          <Route
+            path="/operations/config"
+            element={<Navigate to="/operations" replace />}
+          />
+          <Route
+            path="/events"
+            element={<Navigate to="/operations/selections" replace />}
+          />
+          <Route
+            path="/config"
+            element={<Navigate to="/operations" replace />}
+          />
+        </Routes>
       </main>
-      {s && <StatusFooter s={s} />}
+      {needsCadence && cadence && <CadenceFooter cadence={cadence} />}
     </>
   );
 }
-function Overview({ s }: { s: Snapshot }) {
-  const [selectedRunId, setSelectedRunId] = useState(s.runs[0]?.runId ?? '');
+
+function CadenceRoute({
+  cadence,
+  error,
+  children,
+}: {
+  cadence: UniverseCadence | null;
+  error: string;
+  children: (projection: UniverseCadence) => React.ReactNode;
+}) {
+  if (cadence) return children(cadence);
+  if (error)
+    return (
+      <section className="operations-unavailable">
+        <span className="eyebrow">UNIVERSE CADENCE API</span>
+        <h2>Targeter cadence is unavailable</h2>
+        <p>
+          The historical Event Universe explorer remains independent and
+          available from the Universe page.
+        </p>
+      </section>
+    );
+  return <div className="loading">Loading Targeter cadence…</div>;
+}
+
+function CadenceOverview({ cadence }: { cadence: UniverseCadence }) {
+  const [selectedRunId, setSelectedRunId] = useState(
+    cadence.runs[0]?.run_id ?? '',
+  );
   useEffect(() => {
-    if (!s.runs.some((run) => run.runId === selectedRunId))
-      setSelectedRunId(s.runs[0]?.runId ?? '');
-  }, [s.runs, selectedRunId]);
-  const run = s.runs.find((item) => item.runId === selectedRunId) ?? s.runs[0];
+    if (!cadence.runs.some((run) => run.run_id === selectedRunId))
+      setSelectedRunId(cadence.runs[0]?.run_id ?? '');
+  }, [cadence.runs, selectedRunId]);
+  const run =
+    cadence.runs.find((candidate) => candidate.run_id === selectedRunId) ??
+    cadence.runs[0];
+
   return (
     <div className="stack">
       <section>
         <Title
-          title="Committed run timeline"
-          sub="Up to five, ordered by parsed run ID — never S3 LastModified"
+          title="Universe-indexed run timeline"
+          sub="Up to five Targeter runs, newest first"
         />
         <div className="timeline">
-          {s.runs.map((r, i) => (
+          {cadence.runs.map((candidate, index) => (
             <button
-              key={r.runId}
-              className={`${i === 0 ? 'latest' : ''} ${r.runId === run?.runId ? 'selected' : ''}`}
-              aria-pressed={r.runId === run?.runId}
-              onClick={() => setSelectedRunId(r.runId)}
+              key={candidate.run_id}
+              className={`${index === 0 ? 'latest' : ''} ${candidate.run_id === run?.run_id ? 'selected' : ''}`}
+              aria-pressed={candidate.run_id === run?.run_id}
+              onClick={() => setSelectedRunId(candidate.run_id)}
             >
-              <span>{i === 0 ? 'LATEST' : 'RUN'}</span>
-              <b>{r.runId}</b>
-              <small>{date(r.generatedAt)}</small>
-              <em className={r.inputComplete ? 'ok' : 'warn'}>
-                {r.inputComplete ? 'Complete' : 'Incomplete'}
+              <span>{index === 0 ? 'LATEST' : 'RUN'}</span>
+              <b>{candidate.run_id}</b>
+              <small>{date(candidate.generated_at)}</small>
+              <em className={candidate.input_complete ? 'ok' : 'warn'}>
+                {candidate.input_complete
+                  ? 'Complete input'
+                  : 'Incomplete input'}
               </em>
             </button>
           ))}
@@ -160,588 +268,767 @@ function Overview({ s }: { s: Snapshot }) {
       </section>
       {run ? (
         <>
-          <Metrics run={run} latest={run.runId === s.runs[0]?.runId} />
+          <RunMetrics
+            run={run}
+            latest={run.run_id === cadence.runs[0]?.run_id}
+          />
+          <CatalogObservability run={run} />
           <ContinuityObservability run={run} />
-          <Bundles run={run} />
-          <Rejections run={run} />
+          <RunProvenance run={run} />
+          <RunSelections run={run} />
+          <RejectionSummary run={run} />
         </>
       ) : (
-        <section className="empty">No committed manifests found.</section>
+        <section className="empty">
+          No Targeter runs are indexed. Cadence state is unavailable.
+        </section>
       )}
     </div>
   );
 }
-function Metrics({ run, latest }: { run: RunView; latest: boolean }) {
-  const m = run.summary;
-  const retained = isReportV2(run.report)
-    ? run.report.continuity.retained_bundle_ids.length
-    : 0;
+
+function RunMetrics({
+  run,
+  latest,
+}: {
+  run: UniverseCadenceRun;
+  latest: boolean;
+}) {
+  const targets = run.selections.reduce(
+    (count, selection) => count + selection.context.targets.length,
+    0,
+  );
+  const venues = new Set(
+    run.selections.flatMap((selection) =>
+      selection.context.targets.map((target) => target.venue),
+    ),
+  );
   return (
     <section>
       <Title
-        title={latest ? 'Latest run' : 'Selected run'}
-        sub={relativeTime(run.generatedAt)}
+        title={latest ? 'Latest indexed run' : 'Selected indexed run'}
+        sub={relativeTime(run.generated_at)}
       />
       <div className="metrics">
-        <Metric n={m.selected} label="Selected bundles" />
-        <Metric n={retained} label="Retained bundles" />
-        <Metric n={m.targets} label="Capture targets" />
-        <Metric n={m.candidates} label="Candidates" />
+        <Metric n={run.selections.length} label="Selected bundles" />
+        <Metric n={run.counts.candidates} label="Candidates" />
+        <Metric n={run.counts.rejected} label="Rejected" />
         <Metric
-          n={`${m.catalogsComplete}/${m.catalogsTotal}`}
-          label="Catalogues complete"
+          n={
+            run.selections.filter(
+              (selection) => selection.occurrence_kind === 'retained',
+            ).length
+          }
+          label="Retained bundles"
         />
+        <Metric n={targets} label="Selected targets" />
+        <Metric n={venues.size} label="Selected venues" />
+        <Metric n={run.projection_row_count} label="Projected rows" />
       </div>
     </section>
   );
 }
-function ContinuityObservability({ run }: { run: RunView }) {
-  if (!isReportV2(run.report)) {
-    return (
-      <section className="continuity-panel legacy">
-        <Title
-          title="Continuity"
-          sub="Report v1 — continuity evidence is unavailable"
-        />
-        <p className="muted">
-          This archived run predates continuity holds and terminal probes.
-          Subscription truth remains the generation committed by current.json.
-        </p>
-      </section>
-    );
-  }
-  const { continuity } = run.report;
-  const retirement = isLegitimateTerminalRetirement(run.report);
-  const retired = Object.values(continuity.dispositions).filter((value) =>
-    ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(value),
-  ).length;
+
+function CatalogObservability({ run }: { run: UniverseCadenceRun }) {
+  const failures = Object.entries(run.discovery_failures);
   return (
-    <section className="continuity-panel">
+    <section>
       <Title
-        title="Continuity"
-        sub={`Report v2 · ${continuity.bundles.length} prior bundles observed`}
+        title="Discovery inputs"
+        sub={`${run.catalogs.filter((catalog) => catalog.complete).length}/${run.catalogs.length} catalogues complete`}
       />
-      <p className="truth-note">
-        Run decision evidence only. Live subscription truth remains the
-        immutable generation selected by current.json.
-      </p>
-      <div className="continuity-metrics">
-        <Metric
-          n={continuity.retained_bundle_ids.length}
-          label="Exact bundles retained"
-        />
-        <Metric n={retired} label="Terminal/clamp retirements" />
-        <Metric
-          n={run.report.continuity_diagnostics.length}
-          label="Diagnostics"
-        />
+      <div className="catalog-grid">
+        {run.catalogs.map((catalog) => (
+          <article className="catalog" key={catalog.venue}>
+            <div className="row">
+              <b>{catalog.venue}</b>
+              <span className={catalog.complete ? 'ok' : 'warn'}>
+                {catalog.complete ? 'COMPLETE' : 'INCOMPLETE'}
+              </span>
+            </div>
+            <span>
+              {catalog.events} events · {catalog.markets} markets ·{' '}
+              {catalog.requests} requests
+            </span>
+            {!!catalog.classification_diagnostic_count && (
+              <small className="warn">
+                {catalog.classification_diagnostic_count} classification
+                diagnostics
+              </small>
+            )}
+            {Object.entries(catalog.classification_diagnostics_by_code).map(
+              ([code, count]) => (
+                <small className="warn" key={code}>
+                  {label(code)}: {count}
+                </small>
+              ),
+            )}
+            {catalog.diagnostics.map((diagnostic) => (
+              <small key={diagnostic}>{diagnostic}</small>
+            ))}
+          </article>
+        ))}
       </div>
-      {retirement && (
-        <div className="continuity-state ok">
-          Legitimate empty retirement: every prior bundle is evidenced terminal
-          or past its terminal clamp.
-        </div>
-      )}
-      {run.report.continuity_degraded_base_run_id && (
-        <div className="continuity-state warn">
-          DEGRADED BASE RUN{' '}
-          <code>{run.report.continuity_degraded_base_run_id}</code>
-        </div>
-      )}
-      {!!run.report.continuity_diagnostics.length && (
+      {!!failures.length && (
         <ul className="diagnostics">
-          {run.report.continuity_diagnostics.map((diagnostic, index) => (
-            <li key={`${index}-${diagnostic}`}>{diagnostic}</li>
+          {failures.map(([venue, failure]) => (
+            <li key={venue}>
+              {venue}: {failure}
+            </li>
           ))}
         </ul>
       )}
-      {!continuity.bundles.length &&
-        !run.report.continuity_degraded_base_run_id && (
-          <p className="muted">No prior committed generation was observed.</p>
-        )}
+    </section>
+  );
+}
+
+function ContinuityObservability({ run }: { run: UniverseCadenceRun }) {
+  const legitimateRetirement =
+    run.selections.length === 0 &&
+    run.continuity.bundles.length > 0 &&
+    run.continuity.bundles.every((bundle) =>
+      ['all_markets_terminal', 'terminal_clamp_elapsed'].includes(
+        bundle.disposition,
+      ),
+    );
+  const budgetTrimmed =
+    run.selections.length === 0 &&
+    run.continuity.bundles.length > 0 &&
+    run.continuity.bundles.every(
+      (bundle) => bundle.disposition === 'continuity_budget_trimmed',
+    );
+  return (
+    <section className="continuity-panel">
+      <Title
+        title="Continuity decisions"
+        sub={`${run.continuity.bundles.length} prior bundles observed`}
+      />
+      <p className="truth-note">
+        Archived run evidence only. This projection does not verify current.json
+        publication or splice health.
+      </p>
+      <div className="continuity-metrics">
+        <Metric n={run.counts.retained} label="Bundles retained" />
+        <Metric n={run.counts.retired} label="Terminal/clamp retirements" />
+        <Metric n={run.diagnostics.continuity.length} label="Diagnostics" />
+      </div>
+      {legitimateRetirement && (
+        <div className="continuity-state ok">
+          Legitimate empty generation: every prior bundle was retired by
+          all-terminal evidence or the safety clamp.
+        </div>
+      )}
+      {budgetTrimmed && (
+        <div className="continuity-state warn">
+          Empty generation: every prior bundle was continuity-budget trimmed.
+        </div>
+      )}
+      {run.diagnostics.continuity_degraded_base_run_id && (
+        <div className="continuity-state warn">
+          DEGRADED BASE RUN{' '}
+          <code>{run.diagnostics.continuity_degraded_base_run_id}</code>
+        </div>
+      )}
+      {!!run.diagnostics.continuity.length && (
+        <ul className="diagnostics">
+          {run.diagnostics.continuity.map((diagnostic) => (
+            <li key={diagnostic}>{diagnostic}</li>
+          ))}
+        </ul>
+      )}
       <div className="continuity-list">
-        {continuity.bundles.map((bundle) => (
-          <details
-            key={bundle.bundle_id}
-            open={bundle.targets.some(
-              (target) => target.terminal_probe.state === 'unknown',
-            )}
-          >
-            <summary>
-              <span
-                className={`decision ${continuity.dispositions[bundle.bundle_id] === 'retained' ? 'ok' : 'warn'}`}
-              >
-                {relationshipLabel(continuity.dispositions[bundle.bundle_id])}
-              </span>
-              <b>{bundle.bundle_id}</b>
-              <span>
-                Score {scoreLabel(bundle.score)} · base {bundle.base_run_id}
-              </span>
-            </summary>
-            <TerminalProbes targets={bundle.targets} />
-          </details>
-        ))}
+        {[...run.continuity.bundles]
+          .sort(
+            (left, right) =>
+              right.score - left.score ||
+              left.bundle_id.localeCompare(right.bundle_id),
+          )
+          .map((bundle) => (
+            <details
+              key={bundle.bundle_id}
+              open={bundle.targets.some(
+                (target) => target.terminal_probe.state === 'unknown',
+              )}
+            >
+              <summary>
+                <span
+                  className={`decision ${bundle.disposition === 'retained' ? 'ok' : 'warn'}`}
+                >
+                  {label(bundle.disposition)}
+                </span>
+                <b>{bundle.bundle_id}</b>
+                <span>
+                  Score {score(bundle.score)} · base {bundle.base_run_id} ·
+                  origin {bundle.origin_run_id ?? 'not supplied'}
+                </span>
+              </summary>
+              <ul className="probe-list">
+                {bundle.targets.map((target) => (
+                  <li key={target.target_id}>
+                    <span className={`probe ${target.terminal_probe.state}`}>
+                      {target.terminal_probe.state.toUpperCase()}
+                    </span>
+                    <b>{target.venue}</b>
+                    <code>{target.target_id}</code>
+                    <span>{target.terminal_probe.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ))}
       </div>
     </section>
   );
 }
-function TerminalProbes({ targets }: { targets: ContinuityTarget[] }) {
-  return (
-    <ul className="probe-list">
-      {targets.map((target) => (
-        <li key={target.target_id}>
-          <span className={`probe ${target.terminal_probe.state}`}>
-            {target.terminal_probe.state.toUpperCase()}
-          </span>
-          <b>{target.venue}</b>
-          <code>{target.venue_market_id}</code>
-          <span>{target.terminal_probe.reason}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-function StatusFooter({ s }: { s: Snapshot }) {
-  const latest = s.runs[0];
-  const age = latest
-    ? (Date.now() - new Date(latest.generatedAt).valueOf()) / 1000
-    : Infinity;
-  const live = !!latest && age <= s.expectedRunSeconds * 2;
-  return (
-    <footer className="status-footer">
-      <div className={live ? 'good' : 'bad'}>
-        <span className={`dot ${live ? 'good' : 'bad'}`} />
-        <strong>{live ? 'LIVE' : 'NOT LIVE'}</strong>
-        <span>Targeter cadence</span>
-      </div>
-      <span>
-        Latest run {latest ? relativeTime(latest.generatedAt) : 'unavailable'}
-      </span>
-      <span>
-        Archive {s.stale ? 'STALE' : 'CURRENT'} · {s.source.toUpperCase()}
-      </span>
-      <small>
-        Heuristic: latest run within 2× {s.expectedRunSeconds}s cadence
-      </small>
-    </footer>
-  );
-}
-function Metric({ n, label }: { n: any; label: string }) {
-  return (
-    <div className="metric">
-      <strong>{n}</strong>
-      <span>{label}</span>
-    </div>
-  );
-}
-function Bundles({ run }: { run: RunView }) {
-  const bundles = selectedBundleViews(run.report);
-  const terminalRetirement = isLegitimateTerminalRetirement(run.report);
+
+function RunProvenance({ run }: { run: UniverseCadenceRun }) {
   return (
     <section>
       <Title
-        title="Run-selected bundles"
-        sub="Decision evidence; current.json remains subscription truth"
+        title="Run provenance"
+        sub={`Report v${run.report_version} · Strategy v${run.strategy_version}`}
       />
-      <div className="cards">
-        {bundles.map((bundle) => {
-          const candidate = bundle.candidate;
-          const activation =
-            candidate?.activation_at ??
-            bundle.continuity?.activation_at ??
-            bundle.targets[0]?.activation_at;
-          const capture =
-            candidate?.capture_start_at ?? bundle.targets[0]?.capture_start_at;
-          const venues = [
-            ...new Set(bundle.targets.map((target) => target.venue)),
-          ];
-          return (
-            <article
-              className={`bundle ${bundle.retained ? 'retained' : ''}`}
-              key={bundle.bundleId}
-            >
-              <div className="row">
-                <span className="tag">
-                  {bundle.retained ? 'RETAINED' : val(candidate?.sport)}
-                </span>
-                <strong className="score">
-                  {isReportV2(run.report) ? 'Continuity score' : 'Score'}{' '}
-                  {scoreLabel(bundle.score)}
-                </strong>
-              </div>
-              <h3>
-                {list(candidate?.participants).join(' vs ') || bundle.bundleId}
-              </h3>
-              <div className="muted">
-                {venues.join(' · ') || list(candidate?.venues).join(' · ')}
-              </div>
-              <dl>
-                <dt>Activation</dt>
-                <dd>{date(activation)}</dd>
-                <dt>Capture</dt>
-                <dd>{date(capture)}</dd>
-                <dt>Continuity</dt>
-                <dd>
-                  {bundle.disposition
-                    ? relationshipLabel(bundle.disposition)
-                    : 'Report v1'}
-                </dd>
-                <dt>Base run</dt>
-                <dd>
-                  <code>{bundle.continuityBaseRunId}</code>
-                </dd>
-                <dt>{bundle.retained ? 'Admission' : 'Volume gate'}</dt>
-                <dd>
-                  {bundle.retained
-                    ? 'Exact prior committed targets'
-                    : `${compactCurrency(candidate?.admission?.combined_moneyline_volume_usd)} / ${compactCurrency(candidate?.admission?.minimum_moneyline_volume_usd)}`}
-                </dd>
-              </dl>
-              <MarketList bundle={bundle} />
-              {candidate && <RelationshipSummary candidate={candidate} />}
-            </article>
-          );
-        })}
+      <div className="run-proof">
+        <b className={run.input_complete ? 'ok' : 'warn'}>
+          {run.input_complete ? 'COMPLETE INPUT' : 'INCOMPLETE INPUT'}
+        </b>
+        <span>Projection v{run.projection_version}</span>
+        <code>{run.manifest_key}</code>
+        <code>manifest {run.manifest_sha256}</code>
+        <code>report {run.report_sha256}</code>
       </div>
-      {!bundles.length && (
-        <p className={`empty ${terminalRetirement ? 'ok' : ''}`}>
-          {terminalRetirement
-            ? 'No bundles selected: all prior bundles were legitimately retired by terminal evidence or the clamp.'
-            : 'No bundles selected in this run. This report alone does not change live subscriptions.'}
-        </p>
+      <div className="run-proof">
+        <span>
+          Budget used:{' '}
+          {Object.entries(run.budget_used)
+            .map(([venue, used]) => `${venue} ${used}`)
+            .join(' · ') || 'none'}
+        </span>
+        {Object.entries(run.diagnostics.target_records).map(
+          ([venue, diagnostics]) =>
+            diagnostics.map((diagnostic) => (
+              <span className="warn" key={`${venue}-${diagnostic}`}>
+                {venue} target records: {diagnostic}
+              </span>
+            )),
+        )}
+      </div>
+    </section>
+  );
+}
+
+function RunSelections({ run }: { run: UniverseCadenceRun }) {
+  const selections = [...run.selections].sort((left, right) => {
+    const leftScore =
+      selectionDecisionEvidence(run, left).score ?? Number.NEGATIVE_INFINITY;
+    const rightScore =
+      selectionDecisionEvidence(run, right).score ?? Number.NEGATIVE_INFINITY;
+    return (
+      rightScore - leftScore || left.bundle_id.localeCompare(right.bundle_id)
+    );
+  });
+  return (
+    <section>
+      <Title
+        title="Selected bundles"
+        sub="Verified selected lifecycle detail from the cadence projection"
+      />
+      {selections.length ? (
+        <div className="cards">
+          {selections.map((selection) => {
+            const evidence = selectionDecisionEvidence(run, selection);
+            return (
+              <SelectionCard
+                key={`${selection.run_id}-${selection.bundle_id}`}
+                selection={selection}
+                candidate={evidence.candidate}
+                decisionScore={evidence.score}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <p className="empty">{cadenceRunEmptyMessage(run)}</p>
       )}
     </section>
   );
 }
-function MarketList({ bundle }: { bundle: SelectedBundleView }) {
-  const targets = bundle.targets.map((item) => ({
-    venue: item.venue,
-    id: String(item.target_id ?? item.source_ref ?? ''),
-    type: String(item.canonical_class ?? ''),
-    probe: bundle.continuity?.targets.find(
-      (target) => target.target_id === item.target_id,
-    )?.terminal_probe,
-  }));
-  const markets = (
-    targets.length
-      ? targets
-      : list(bundle.candidate?.eligible_market_ids).map((id) => {
-          const [venue, ...rest] = String(id).split(':');
-          return {
-            venue,
-            id: String(id),
-            type: rest.length ? '' : 'market',
-            probe: undefined,
-          };
-        })
-  ).sort(
-    (a, b) =>
-      a.venue.localeCompare(b.venue) ||
-      a.type.localeCompare(b.type) ||
-      a.id.localeCompare(b.id),
+
+function RejectionSummary({ run }: { run: UniverseCadenceRun }) {
+  const reasons = Object.entries({
+    ...run.reason_summaries.candidate_rejections,
+    ...run.reason_summaries.allocation_rejections,
+  }).sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
   );
   return (
-    <details className="markets">
-      <summary>{markets.length} markets</summary>
-      <ul>
-        {markets.map((market) => (
-          <li key={market.id}>
-            <span className="market-venue">{market.venue}</span>
-            <span>
-              {market.type
-                ? relationshipLabel(market.type.split('.').at(-1)!)
-                : 'Market'}
-            </span>
-            <code>{market.id.replace(`${market.venue}:`, '')}</code>
-            {market.probe && (
-              <small className={`probe-reason ${market.probe.state}`}>
-                {market.probe.state}: {market.probe.reason}
-              </small>
-            )}
-          </li>
-        ))}
-      </ul>
+    <section>
+      <Title
+        title="Rejected and unallocated"
+        sub={`${run.counts.rejected} admission rejections · ${run.match_rejections.length} match rejections`}
+      />
+      {reasons.length ? (
+        <div className="reasonbar">
+          {reasons.map(([reason, count]) => (
+            <div key={reason}>
+              <b>{count}</b>
+              <span>{label(reason)}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="muted">No candidate or allocation rejection reasons.</p>
+      )}
+      {!!run.match_rejections.length && (
+        <details className="detail-group">
+          <summary>
+            {run.match_rejections.length} unmatched event groups
+          </summary>
+          <ul className="diagnostics">
+            {run.match_rejections.map((rejection, index) => (
+              <li key={`${rejection.reason}-${index}`}>
+                {rejection.participant_keys?.join(' vs ') ||
+                  'Unidentified group'}{' '}
+                · {label(rejection.reason)}
+                {!!rejection.event_refs?.length && (
+                  <>
+                    {' '}
+                    · <code>{rejection.event_refs.join(', ')}</code>
+                  </>
+                )}
+                {rejection.details &&
+                  Object.keys(rejection.details).length > 0 && (
+                    <pre>{JSON.stringify(rejection.details, null, 2)}</pre>
+                  )}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </section>
+  );
+}
+
+function CandidateDecisionCard({
+  run,
+  candidate,
+  state,
+}: {
+  run: UniverseCadenceRun;
+  candidate: UniverseCadenceCandidate;
+  state: ReturnType<typeof candidateDecisionState>;
+}) {
+  const targetEntries = Object.entries(run.selected_targets).flatMap(
+    ([venue, targets]) =>
+      targets
+        .filter((target) => target.bundle_id === candidate.bundle_id)
+        .map((target) => ({ venue, target })),
+  );
+  return (
+    <details className="decision-card">
+      <summary>
+        <span
+          className={`decision ${state === 'rejected' || state === 'decision-unavailable' ? 'warn' : 'ok'}`}
+        >
+          {state === 'decision-unavailable'
+            ? 'Decision unavailable — incomplete input'
+            : label(state)}
+        </span>
+        <b>{candidate.participants.join(' vs ') || candidate.bundle_id}</b>
+        <span>
+          Score {score(candidate.score)} · {label(candidate.event_status)} ·{' '}
+          {run.run_id}
+        </span>
+      </summary>
+      <div className="detail">
+        <h4>
+          {state === 'decision-unavailable'
+            ? 'Candidate assessment reasons'
+            : 'Decision reasons'}
+        </h4>
+        <pre>
+          {JSON.stringify(
+            [
+              ...(candidate.rejection_reasons ?? []),
+              ...(candidate.allocation_rejection
+                ? [candidate.allocation_rejection]
+                : []),
+            ],
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Admission</h4>
+        <pre>
+          {JSON.stringify(
+            {
+              combined: compactCurrency(
+                candidate.admission.combined_moneyline_volume_usd,
+              ),
+              minimum: compactCurrency(
+                candidate.admission.minimum_moneyline_volume_usd,
+              ),
+              by_venue: candidate.admission.moneyline_volume_usd_by_venue,
+              coverage: candidate.admission.moneyline_volume_usd_coverage,
+            },
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Score components</h4>
+        <pre>{JSON.stringify(candidate.score_components, null, 2)}</pre>
+        <h4>Markets</h4>
+        <pre>{JSON.stringify(candidate.eligible_market_ids, null, 2)}</pre>
+        <h4>Market exclusions</h4>
+        <pre>{JSON.stringify(candidate.market_exclusions, null, 2)}</pre>
+        <h4>Selected targets</h4>
+        <pre>
+          {JSON.stringify(
+            targetEntries.map(({ venue, target }) => ({
+              venue,
+              target_id: target.target_id,
+              subscriptions: target.subscription_ids,
+              continuity_score: target.continuity_score,
+              activation_at: target.activation_at,
+              capture_start_at: target.capture_start_at,
+              source_ref: target.source_ref,
+            })),
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Relationships</h4>
+        <pre>
+          {JSON.stringify(
+            candidate.relationship_analysis.relationships,
+            null,
+            2,
+          )}
+        </pre>
+        <h4>Relationship diagnostics</h4>
+        <pre>
+          {JSON.stringify(
+            {
+              diagnostics:
+                candidate.relationship_analysis.diagnostics ?? 'not supplied',
+              outcome_spaces:
+                candidate.relationship_analysis.outcome_spaces ??
+                'not supplied',
+            },
+            null,
+            2,
+          )}
+        </pre>
+      </div>
     </details>
   );
 }
-function RelationshipSummary({ candidate }: { candidate: any }) {
-  const entries = relationshipSummary(candidate);
-  const total = entries.reduce((sum, [, count]) => sum + count, 0);
+
+function SelectionCard({
+  selection,
+  candidate,
+  decisionScore,
+}: {
+  selection: UniverseSelectionDetail;
+  candidate?: UniverseCadenceCandidate;
+  decisionScore?: number;
+}) {
+  const context = selection.context;
+  const participants = context.participants.join(' vs ') || selection.bundle_id;
+  const venues = [
+    ...new Set(context.targets.map((target) => target.venue)),
+  ].sort();
   return (
-    <div className="relationships">
-      <b>{total ? `${total} relationships` : 'No relationships recorded'}</b>
-      {!!entries.length && (
-        <div className="relationship-types">
-          {entries.map(([type, count]) => (
-            <span key={type}>
-              <strong>{count}</strong> {relationshipLabel(type)}
-            </span>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-function Rejections({ run }: { run: RunView }) {
-  return (
-    <section>
-      <Title
-        title="Rejected candidates"
-        sub={`${run.summary.rejected} rejected in latest run`}
-      />
-      <div className="reasonbar">
-        {Object.entries(run.summary.rejectionReasons)
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, v]) => (
-            <div key={k}>
-              <b>{v}</b>
-              <span>{k}</span>
-            </div>
-          ))}
+    <article
+      className={`bundle ${selection.occurrence_kind === 'retained' ? 'retained' : ''}`}
+    >
+      <div className="row">
+        <span className="tag">{selection.occurrence_kind.toUpperCase()}</span>
+        <strong className="score">Score {score(decisionScore)}</strong>
       </div>
-    </section>
+      <h3>{participants}</h3>
+      <code>{selection.bundle_id}</code>
+      <div className="muted">{venues.join(' · ') || 'No selected venues'}</div>
+      <dl>
+        <dt>Sport / game</dt>
+        <dd>
+          {label(selection.sport)} · {label(selection.game)}
+        </dd>
+        <dt>Topology</dt>
+        <dd>{label(selection.topology)}</dd>
+        <dt>Activation</dt>
+        <dd>{date(selection.activation_at)}</dd>
+        <dt>Capture starts</dt>
+        <dd>{date(selection.capture_start_at)}</dd>
+        <dt>Origin run</dt>
+        <dd>
+          <code>{selection.origin.run_id}</code>
+        </dd>
+        <dt>Retirement</dt>
+        <dd>
+          {selection.retirement
+            ? label(selection.retirement.disposition)
+            : 'Not observed'}
+        </dd>
+        <dt>Volume gate</dt>
+        <dd>
+          {candidate?.admission
+            ? `${compactCurrency(candidate.admission.combined_moneyline_volume_usd)} / ${compactCurrency(candidate.admission.minimum_moneyline_volume_usd)}`
+            : 'Retained from prior committed targets'}
+        </dd>
+      </dl>
+      <p className="muted">
+        Continuity: {label(selection.continuity_disposition)}
+      </p>
+      <p className="note">{occurrenceExplanation(selection)}</p>
+      {selection.retirement && (
+        <p className="retirement-copy">{retirementExplanation(selection)}</p>
+      )}
+      <MarketDetails selection={selection} />
+      <RelationshipDetails selection={selection} />
+      <details className="detail-group">
+        <summary>Immutable source and origin</summary>
+        <div className="identity-proof">
+          <b>Occurrence source · {selection.run_id}</b>
+          <code>{selection.source.manifest_key}</code>
+          <code>manifest {selection.source.manifest_sha256}</code>
+          <code>report {selection.source.report_sha256}</code>
+          <b>Origin · {selection.origin.run_id}</b>
+          <code>{selection.origin.manifest_key}</code>
+          <code>manifest {selection.origin.manifest_sha256}</code>
+          <code>report {selection.origin.report_sha256}</code>
+        </div>
+      </details>
+    </article>
   );
 }
-function Events({ s }: { s: Snapshot }) {
-  const [q, setQ] = useState('');
-  const [state, setState] = useState('all');
-  const [run, setRun] = useState('all');
-  const [reason, setReason] = useState('all');
+
+function MarketDetails({ selection }: { selection: UniverseSelectionDetail }) {
+  return (
+    <details className="markets">
+      <summary>{selection.context.markets.length} markets</summary>
+      <ul>
+        {selection.context.markets.map((market) => (
+          <li key={market.target_id}>
+            <span className="market-venue">{market.venue}</span>
+            <span>{market.selected ? 'Selected' : 'Sibling'}</span>
+            <code>{market.target_id}</code>
+          </li>
+        ))}
+      </ul>
+      <div className="target-list">
+        {selection.context.targets.map((target) => (
+          <div className="target-proof" key={target.target_id}>
+            <b>
+              {target.venue} · {label(target.canonical_class)}
+            </b>
+            <code>{target.target_id}</code>
+            <span>
+              Source <code>{target.source_ref}</code>
+            </span>
+            <span>
+              Subscriptions: {target.subscription_ids.join(', ') || 'None'}
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function RelationshipDetails({
+  selection,
+}: {
+  selection: UniverseSelectionDetail;
+}) {
+  return (
+    <details className="detail-group">
+      <summary>{selection.context.relationships.length} relationships</summary>
+      <div>
+        {selection.context.relationships.map((relationship, index) => (
+          <div
+            className="relationship-proof"
+            key={`${relationship.left}-${relationship.right}-${index}`}
+          >
+            <b>
+              {label(relationship.relationship)} ·{' '}
+              {label(relationship.coverage)}
+            </b>
+            <code>{relationship.left}</code>
+            <span>↔</span>
+            <code>{relationship.right}</code>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function SelectionExplorer({ cadence }: { cadence: UniverseCadence }) {
+  const [query, setQuery] = useState('');
+  const [decision, setDecision] = useState('all');
+  const [runId, setRunId] = useState('all');
+  const [venue, setVenue] = useState('all');
   const rows = useMemo(
     () =>
-      s.runs.flatMap((r) => {
-        const selected = new Set(list(r.report.selection?.bundle_ids));
-        const allocations = r.report.selection?.allocation_rejections ?? {};
-        const selectedViews = selectedBundleViews(r.report);
-        const selectedByBundle = new Map(
-          selectedViews.map((bundle) => [bundle.bundleId, bundle]),
-        );
-        const candidates = list(r.report.candidates).map((c) => {
-          const admissionReasons = list(c.rejection_reasons).map(String);
-          const allocationReason = allocations[c.bundle_id];
-          const bundle = selectedByBundle.get(c.bundle_id);
-          const decision = bundle?.retained
-            ? 'retained'
-            : selected.has(c.bundle_id)
-              ? 'selected'
-              : admissionReasons.length
-                ? 'rejected'
-                : 'not-selected';
-          return {
-            r,
-            c: bundle?.continuity
-              ? {
-                  ...c,
-                  continuity: bundle.continuity,
-                  continuity_base_run_id: bundle.continuityBaseRunId,
-                }
-              : c,
-            decision,
-            reasons: bundle?.disposition
-              ? [bundle.disposition]
-              : selected.has(c.bundle_id)
-                ? ['selected']
-                : admissionReasons.length
-                  ? admissionReasons
-                  : allocationReason
-                    ? [String(allocationReason)]
-                    : ['eligible_not_selected'],
-          };
-        });
-        const retained = selectedViews
-          .filter((bundle) => bundle.retained && !bundle.candidate)
-          .map((bundle) => ({
-            r,
-            c: {
-              bundle_id: bundle.bundleId,
-              score: bundle.score,
-              activation_at: bundle.continuity?.activation_at,
-              venues: [
-                ...new Set(bundle.targets.map((target) => target.venue)),
-              ],
-              event_status: 'RETAINED',
-              continuity: bundle.continuity,
-              continuity_base_run_id: bundle.continuityBaseRunId,
-            },
-            decision: 'retained',
-            reasons: [bundle.disposition ?? 'retained'],
-          }));
-        return [...candidates, ...retained];
-      }),
-    [s],
+      cadence.runs.flatMap((run) =>
+        run.candidates.map((candidate) => ({
+          run,
+          candidate,
+          state: candidateDecisionState(run, candidate),
+        })),
+      ),
+    [cadence],
   );
-  const reasons = [...new Set(rows.flatMap((x) => x.reasons))];
+  const venues = [
+    ...new Set(
+      rows.flatMap(({ run, candidate }) => candidateVenues(run, candidate)),
+    ),
+  ].sort();
   const shown = rows
-    .filter((x) => {
-      const hay = JSON.stringify([
-        x.c.participants,
-        x.c.bundle_id,
-        x.c.venues,
-        x.c.event_status,
-        x.reasons,
-      ]).toLowerCase();
+    .filter(({ run, candidate, state }) => {
+      const haystack = [
+        candidate.bundle_id,
+        candidate.sport,
+        candidate.game,
+        candidate.topology,
+        ...candidate.participants,
+        ...candidate.event_refs,
+        ...candidate.rejection_reasons,
+        ...candidate.eligible_market_ids,
+        ...Object.entries(run.selected_targets)
+          .filter(([, targets]) =>
+            targets.some((target) => target.bundle_id === candidate.bundle_id),
+          )
+          .flatMap(([targetVenue, targets]) => [
+            targetVenue,
+            ...targets
+              .filter((target) => target.bundle_id === candidate.bundle_id)
+              .map((target) => target.target_id),
+          ]),
+      ]
+        .join(' ')
+        .toLowerCase();
       return (
-        hay.includes(q.toLowerCase()) &&
-        (state === 'all' || state === x.decision) &&
-        (run === 'all' || run === x.r.runId) &&
-        (reason === 'all' || x.reasons.includes(reason))
+        haystack.includes(query.toLowerCase()) &&
+        (decision === 'all' || decision === state) &&
+        (runId === 'all' || runId === run.run_id) &&
+        (venue === 'all' || candidateVenues(run, candidate).includes(venue))
       );
     })
     .sort(
-      (a, b) =>
-        numericScore(b.c.score) - numericScore(a.c.score) ||
-        b.r.runId.localeCompare(a.r.runId) ||
-        String(a.c.bundle_id).localeCompare(String(b.c.bundle_id)),
+      (left, right) =>
+        right.candidate.score - left.candidate.score ||
+        right.run.run_id.localeCompare(left.run.run_id) ||
+        left.candidate.bundle_id.localeCompare(right.candidate.bundle_id),
     );
+
   return (
     <section>
       <Title
-        title="Event explorer"
-        sub={`${shown.length} of ${rows.length} candidates across retained runs`}
+        title="Targeter decisions"
+        sub={`${shown.length} of ${rows.length} candidate decisions across indexed cadence runs`}
       />
       <div className="filters">
         <label>
           Search
           <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Team, venue, bundle ID…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Team, venue, bundle, target…"
           />
         </label>
         <label>
           Decision
-          <select value={state} onChange={(e) => setState(e.target.value)}>
+          <select
+            value={decision}
+            onChange={(event) => setDecision(event.target.value)}
+          >
             <option value="all">All</option>
             <option value="selected">Selected</option>
-            <option value="retained">Retained from committed generation</option>
-            <option value="rejected">Admission rejected</option>
             <option value="not-selected">Eligible, not allocated</option>
+            <option value="rejected">Rejected</option>
+            <option value="decision-unavailable">
+              Decision unavailable — incomplete input
+            </option>
           </select>
         </label>
         <label>
           Run
-          <select value={run} onChange={(e) => setRun(e.target.value)}>
+          <select
+            value={runId}
+            onChange={(event) => setRunId(event.target.value)}
+          >
             <option value="all">All five</option>
-            {s.runs.map((r) => (
-              <option key={r.runId}>{r.runId}</option>
+            {cadence.runs.map((run) => (
+              <option key={run.run_id} value={run.run_id}>
+                {run.run_id}
+              </option>
             ))}
           </select>
         </label>
         <label>
-          Reason
-          <select value={reason} onChange={(e) => setReason(e.target.value)}>
-            <option value="all">All reasons</option>
-            {reasons.map((r) => (
-              <option key={r}>{r}</option>
+          Venue
+          <select
+            value={venue}
+            onChange={(event) => setVenue(event.target.value)}
+          >
+            <option value="all">All</option>
+            {venues.map((value) => (
+              <option key={value}>{value}</option>
             ))}
           </select>
         </label>
       </div>
-      <div className="eventlist">
-        {shown.map(({ r, c, decision, reasons }) => (
-          <details key={`${r.runId}-${c.bundle_id}`}>
-            <summary>
-              <span
-                className={`decision ${['selected', 'retained'].includes(decision) ? 'ok' : 'warn'}`}
-              >
-                {decision === 'selected'
-                  ? 'SELECTED'
-                  : decision === 'retained'
-                    ? 'RETAINED'
-                    : decision === 'rejected'
-                      ? 'REJECTED'
-                      : 'NOT ALLOCATED'}
-              </span>
-              <b>{list(c.participants).join(' vs ') || c.bundle_id}</b>
-              <span>
-                Score {scoreLabel(c.score)} · {val(c.event_status)} · {r.runId}
-              </span>
-            </summary>
-            <div className="detail">
-              <h4>Decision reasons</h4>
-              <pre>{JSON.stringify(reasons, null, 2)}</pre>
-              <h4>Admission evidence</h4>
-              <pre>{JSON.stringify(c.admission ?? {}, null, 2)}</pre>
-              <h4>Market exclusions</h4>
-              <pre>{JSON.stringify(c.market_exclusions ?? [], null, 2)}</pre>
-              <h4>Relationships</h4>
-              <pre>
-                {JSON.stringify(c.relationship_analysis ?? [], null, 2)}
-              </pre>
-              <h4>Rule evidence</h4>
-              <pre>{JSON.stringify(c.rule_assessment ?? {}, null, 2)}</pre>
-              <h4>Identifiers & score</h4>
-              <pre>
-                {JSON.stringify(
-                  {
-                    bundle_id: c.bundle_id,
-                    eligible_market_ids: c.eligible_market_ids,
-                    score: c.score,
-                    score_components: c.score_components,
-                  },
-                  null,
-                  2,
-                )}
-              </pre>
-              {c.continuity && (
-                <>
-                  <h4>Continuity evidence</h4>
-                  <pre>{JSON.stringify(c.continuity, null, 2)}</pre>
-                </>
-              )}
-            </div>
-          </details>
-        ))}
-      </div>
+      {shown.length ? (
+        <div className="eventlist">
+          {shown.map(({ run, candidate, state }) => (
+            <CandidateDecisionCard
+              key={`${run.run_id}-${candidate.bundle_id}`}
+              run={run}
+              candidate={candidate}
+              state={state}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="empty">No candidate decisions match these filters.</p>
+      )}
     </section>
   );
 }
-function Config({ s }: { s: Snapshot }) {
+
+function CadenceFooter({ cadence }: { cadence: UniverseCadence }) {
+  const state = cadence.freshness.state;
+  const latest = cadence.runs[0];
   return (
-    <section>
-      <Title title="Current checkout strategy" sub={s.config.label} />
-      <div className="configgrid">
-        <div>
-          <h3>Version comparison</h3>
-          {s.runs.map((r) => (
-            <div className="comparison" key={r.runId}>
-              <code>{r.runId}</code>
-              <span>archived v{val(r.strategyVersion)}</span>
-              <b
-                className={
-                  s.config.versionMatchesRunIds.includes(r.runId)
-                    ? 'ok'
-                    : 'warn'
-                }
-              >
-                {s.config.versionMatchesRunIds.includes(r.runId)
-                  ? 'VERSION MATCH'
-                  : 'DIFFERS / UNKNOWN'}
-              </b>
-            </div>
-          ))}
-          <p className="note">
-            The archive records a strategy version and source path, but not the
-            complete historical config bytes. A version match is useful
-            evidence, not proof that every historical setting equals this
-            checkout.
-          </p>
-        </div>
-        <div>
-          <h3>Readable groups</h3>
-          {Object.entries(s.config.value as object).map(([k, v]) => (
-            <details key={k}>
-              <summary>{k}</summary>
-              <pre>{JSON.stringify(v, null, 2)}</pre>
-            </details>
-          ))}
-        </div>
+    <footer className="status-footer">
+      <div className={state === 'current' ? 'good' : 'bad'}>
+        <span className={`dot ${state === 'current' ? 'good' : 'bad'}`} />
+        <strong>{cadenceStatusLabel(state)}</strong>
       </div>
-      <h3>Raw JSON</h3>
-      <pre className="raw">{JSON.stringify(s.config.value, null, 2)}</pre>
-    </section>
+      <span>
+        Latest run {latest ? relativeTime(latest.generated_at) : 'unavailable'}
+      </span>
+      <span>Indexed {date(cadence.freshness.latest_indexed_at)}</span>
+      <small>
+        Universe observation · expected every{' '}
+        {cadence.freshness.expected_run_seconds}s · does not verify current.json
+        or splice health
+      </small>
+    </footer>
   );
 }
+
+function Metric({ n, label: metricLabel }: { n: number; label: string }) {
+  return (
+    <div className="metric">
+      <strong>{n}</strong>
+      <span>{metricLabel}</span>
+    </div>
+  );
+}
+
 function Title({ title, sub }: { title: string; sub: string }) {
   return (
     <div className="title">
@@ -750,6 +1037,7 @@ function Title({ title, sub }: { title: string; sub: string }) {
     </div>
   );
 }
+
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <BrowserRouter>

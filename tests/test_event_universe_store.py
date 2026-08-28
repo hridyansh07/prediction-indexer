@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sqlite3
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.base import JSON_CONTENT_TYPE
@@ -18,6 +20,7 @@ from targeter.v2.run_archive import archive_run
 from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from universe.api import UniverseApplication
 from universe.backfill import backfill_targeter_history
+from universe.cadence import CadenceProjectionError, project_cadence_run
 from universe.config import UniverseConfigError, load_config
 from universe.projection import (
     ProjectionError,
@@ -67,6 +70,17 @@ def _candidate(bundle_id: str, activation_at: str) -> dict:
         "activation_at": activation_at,
         "capture_start_at": "2026-01-01T02:00:00Z",
         "eligible": True,
+        "event_status": "ELIGIBLE",
+        "score": 10.0,
+        "score_components": {"venue_coverage": 1000.0},
+        "rejection_reasons": [],
+        "market_exclusions": {},
+        "admission": {
+            "combined_moneyline_volume_usd": 30_000,
+            "minimum_moneyline_volume_usd": 25_000,
+            "moneyline_volume_usd_by_venue": {"kalshi": 30_000},
+            "moneyline_volume_usd_coverage": {},
+        },
         "relationship_analysis": {
             "relationships": [
                 {
@@ -562,6 +576,245 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual([run["input_complete"] for run in runs], [False, True])
         selections, _more = self.database.list_selections()
         self.assertEqual(selections, [])
+        cadence = self.database.cadence_snapshot()
+        incomplete = next(run for run in cadence["runs"] if not run["input_complete"])
+        self.assertEqual(incomplete["counts"]["selected"], 0)
+        self.assertEqual(incomplete["selected_targets"], {})
+        self.assertEqual(incomplete["selections"], [])
+
+    def test_cadence_cache_keeps_exactly_the_newest_five_runs(self) -> None:
+        run_ids = []
+        for minute in range(6):
+            run_id = f"20260101T00{minute:02d}00.000000Z"
+            generated_at = f"2026-01-01T00:{minute:02d}:00Z"
+            run_ids.append(run_id)
+            _publish_run(self.objects, _empty_report(run_id, generated_at))
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.ingested, 6, result.as_record())
+
+        cadence = self.database.cadence_snapshot(now_ns=1_767_225_600_000_000_000)
+        self.assertEqual(
+            [run["run_id"] for run in cadence["runs"]], list(reversed(run_ids[1:]))
+        )
+        with sqlite3.connect(self.database.path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM cadence_runs").fetchone()[0],
+                5,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM targeter_runs").fetchone()[0],
+                6,
+            )
+        self.assertTrue(UniverseSync(self.database, self.objects).audit_run(run_ids[0])["ok"])
+        self.assertEqual(
+            [run["run_id"] for run in self.database.cadence_snapshot()["runs"]],
+            list(reversed(run_ids[1:])),
+        )
+        self.assertEqual(self.database.missing_cadence_manifest_keys(), [])
+
+    def test_cadence_projects_operational_decision_evidence(self) -> None:
+        report = _selection_report(R1, G1)
+        report.update(
+            {
+                "catalogs": [
+                    {
+                        "venue": "kalshi",
+                        "complete": False,
+                        "events": 4,
+                        "markets": 8,
+                        "requests": 2,
+                        "diagnostics": ["partial"],
+                        "classification_diagnostics": [
+                            {"code": "unknown_product"},
+                            {"code": "unknown_product"},
+                        ],
+                    }
+                ],
+                "discovery_failures": {"limitless": "timeout"},
+                "continuity_diagnostics": ["pointer unavailable"],
+                "target_record_diagnostics": {"kalshi": ["missing record"]},
+            }
+        )
+        report["candidates"][0].update(
+            {
+                "score": 12.5,
+                "rejection_reasons": [],
+            }
+        )
+        report["candidates"][0]["admission"][
+            "combined_moneyline_volume_usd"
+        ] = 30_000
+        _publish_run(self.objects, report)
+        result = UniverseSync(self.database, self.objects).sync()
+        self.assertEqual(result.failures, [])
+
+        run = self.database.cadence_snapshot()["runs"][0]
+        self.assertEqual(run["counts"]["candidates"], 1)
+        self.assertEqual(run["counts"]["selected"], 1)
+        self.assertEqual(
+            run["catalogs"][0]["classification_diagnostics_by_code"],
+            {"unknown_product": 2},
+        )
+        self.assertEqual(run["discovery_failures"], {"limitless": "timeout"})
+        self.assertEqual(
+            run["candidates"][0]["admission"]["combined_moneyline_volume_usd"],
+            30_000,
+        )
+        self.assertEqual(run["diagnostics"]["continuity"], ["pointer unavailable"])
+        self.assertNotIn("payload_json", run)
+        self.assertNotIn("payload_sha256", run)
+        self.assertEqual(
+            run["selected_targets"]["kalshi"][0]["continuity_score"],
+            10.0,
+        )
+
+    def test_initialize_upgrades_an_existing_v1_database(self) -> None:
+        legacy = self.root / "legacy.sqlite3"
+        with sqlite3.connect(legacy) as connection:
+            connection.executescript(
+                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
+            )
+            connection.execute("PRAGMA user_version = 1")
+        upgraded = UniverseStore(legacy)
+        upgraded.initialize()
+        with sqlite3.connect(legacy) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertIsNotNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cadence_runs'"
+                ).fetchone()
+            )
+
+    def test_initialize_recovers_complete_v1_schema_with_version_zero(self) -> None:
+        legacy = self.root / "interrupted-bootstrap.sqlite3"
+        with sqlite3.connect(legacy) as connection:
+            connection.executescript(
+                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
+            )
+        UniverseStore(legacy).initialize()
+        with sqlite3.connect(legacy) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_initialize_recovers_existing_valid_cadence_table(self) -> None:
+        for interrupted_version in (0, 1):
+            with self.subTest(interrupted_version=interrupted_version):
+                legacy = self.root / f"interrupted-v2-{interrupted_version}.sqlite3"
+                with sqlite3.connect(legacy) as connection:
+                    connection.executescript(
+                        (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
+                    )
+                    connection.execute(f"PRAGMA user_version = {interrupted_version}")
+                    connection.execute(
+                        """CREATE TABLE cadence_runs (
+                               run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
+                               generated_at_ns INTEGER NOT NULL,
+                               projection_version INTEGER NOT NULL CHECK(projection_version = 1),
+                               payload_json TEXT NOT NULL,
+                               payload_sha256 TEXT NOT NULL
+                           ) STRICT"""
+                    )
+                UniverseStore(legacy).initialize()
+                with sqlite3.connect(legacy) as connection:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0], 2
+                    )
+                    self.assertIsNotNone(
+                        connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                            "AND name = 'cadence_runs_generated'"
+                        ).fetchone()
+                    )
+
+    def test_initialize_rejects_incomplete_bootstrap_and_invalid_cadence(self) -> None:
+        for version in (0, 1):
+            incomplete = self.root / f"incomplete-{version}.sqlite3"
+            with sqlite3.connect(incomplete) as connection:
+                connection.execute("CREATE TABLE targeter_runs (run_id TEXT PRIMARY KEY)")
+                connection.execute(f"PRAGMA user_version = {version}")
+            with self.assertRaisesRegex(EvidenceConflict, "invalid Event Universe v1"):
+                UniverseStore(incomplete).initialize()
+
+        invalid = self.root / "invalid-cadence.sqlite3"
+        with sqlite3.connect(invalid) as connection:
+            connection.executescript(
+                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute("CREATE TABLE cadence_runs (run_id TEXT PRIMARY KEY)")
+        with self.assertRaisesRegex(EvidenceConflict, "invalid schema"):
+            UniverseStore(invalid).initialize()
+
+        malformed = self.root / "malformed-cadence.sqlite3"
+        with sqlite3.connect(malformed) as connection:
+            connection.executescript(
+                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute(
+                """CREATE TABLE cadence_runs (
+                       run_id TEXT PRIMARY KEY,
+                       generated_at_ns TEXT,
+                       projection_version TEXT,
+                       payload_json TEXT,
+                       payload_sha256 TEXT
+                   )"""
+            )
+        with self.assertRaisesRegex(EvidenceConflict, "invalid schema"):
+            UniverseStore(malformed).initialize()
+
+    def test_cadence_projection_rejects_semantically_invalid_fields(self) -> None:
+        mutations = (
+            ("eligible string", lambda report: report["candidates"][0].update(eligible="false")),
+            (
+                "catalog count string",
+                lambda report: report.update(
+                    catalogs=[
+                        {
+                            "venue": "kalshi",
+                            "complete": True,
+                            "events": "1",
+                            "markets": 1,
+                            "requests": 1,
+                            "diagnostics": [],
+                        }
+                    ]
+                ),
+            ),
+            (
+                "invalid continuity score",
+                lambda report: report["selection"]["targets"]["kalshi"][0].update(
+                    continuity_score=float("inf")
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                report = _selection_report(R1, G1)
+                mutate(report)
+                with self.assertRaises(CadenceProjectionError):
+                    project_cadence_run(report)
+
+    def test_cadence_snapshot_revalidates_cached_payload(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        with sqlite3.connect(self.database.path) as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM cadence_runs WHERE run_id = ?", (R1,)
+                ).fetchone()[0]
+            )
+            payload["candidates"][0]["eligible"] = "false"
+            payload["input_complete"] = False
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                "UPDATE cadence_runs SET payload_json = ?, payload_sha256 = ? WHERE run_id = ?",
+                (encoded, hashlib.sha256(encoded.encode()).hexdigest(), R1),
+            )
+        with self.assertRaisesRegex(CadenceProjectionError, "fields are invalid"):
+            self.database.cadence_snapshot()
 
     def test_rejects_legacy_report_and_manifest_versions(self) -> None:
         report = _selection_report(R1, G1)
@@ -712,11 +965,6 @@ class EventUniverseTests(unittest.TestCase):
                 {
                     "event_universe_config_version": 1,
                     "database_path": "database.sqlite3",
-                    "archive": {
-                        "bucket": "archive-bucket",
-                        "region": "us-east-1",
-                        "expected_owner": "123456789012",
-                    },
                     "api": {"host": "127.0.0.1", "port": 8080},
                     "backfill": {
                         "temporary_directory": "tmp",
@@ -736,6 +984,9 @@ class EventUniverseTests(unittest.TestCase):
             config.backfill.generated_end.isoformat(),
             "2026-01-01T00:10:00.000002+00:00",
         )
+        with mock.patch("universe.config.build_store", return_value=self.objects) as build:
+            self.assertIs(config.object_store(), self.objects)
+        build.assert_called_once_with((config.database_path.parent,))
 
         document = json.loads(path.read_text())
         document["backfill"]["extra"] = True

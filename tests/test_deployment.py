@@ -143,8 +143,9 @@ class EventUniverseDeploymentTests(unittest.TestCase):
             "  event-universe-sync:", 1
         )[0]
         self.assertNotIn("AWS_ACCESS_KEY_ID", server)
+        self.assertNotIn("ARCHIVE_S3_BUCKET", server)
         runtime = compose.split("x-universe-runtime:", 1)[1].split("\nservices:", 1)[0]
-        self.assertIn("environment: *universe-config-environment", runtime)
+        self.assertNotIn("environment:", runtime)
         self.assertEqual(compose.count("    environment: *universe-job-environment"), 3)
 
     def test_jobs_are_direct_configured_scripts_without_an_argument_parser(
@@ -171,9 +172,13 @@ class EventUniverseDeploymentTests(unittest.TestCase):
 
     def test_schema_is_selected_history_without_raw_universe_tables(self) -> None:
         schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(encoding="utf-8")
+        cadence_schema = (ROOT / "universe" / "schema" / "v2.sql").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("CREATE TABLE selection_occurrences", schema)
         self.assertIn("CREATE TABLE bundle_contexts", schema)
         self.assertIn("CREATE TABLE bundle_retirements", schema)
+        self.assertIn("CREATE TABLE cadence_runs", cadence_schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
             self.assertNotIn(stale, schema)
         self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
