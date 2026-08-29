@@ -95,8 +95,6 @@ class UniverseSync:
         observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         for missing_key in self.database.missing_cadence_manifest_keys():
             self._ingest_direct(missing_key, result)
-        if result.failures:
-            return result
         if checkpoint is None and latest is None:
             try:
                 keys = self._all_manifest_keys()

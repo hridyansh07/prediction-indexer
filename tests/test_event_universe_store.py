@@ -615,6 +615,33 @@ class EventUniverseTests(unittest.TestCase):
         )
         self.assertEqual(self.database.missing_cadence_manifest_keys(), [])
 
+    def test_failed_legacy_cadence_repair_does_not_block_new_runs(self) -> None:
+        _publish_run(self.objects, _empty_report(R1, G1))
+        _publish_run(self.objects, _empty_report(R2, G2))
+        initial = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(initial.ingested, 2, initial.as_record())
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("DELETE FROM cadence_runs")
+        _publish_run(self.objects, _empty_report(R3, G3))
+
+        def project(report):
+            if report["run_id"] == R1:
+                raise CadenceProjectionError("legacy report fails strict cadence validation")
+            return project_cadence_run(report)
+
+        with mock.patch("universe.sync.project_cadence_run", side_effect=project):
+            result = UniverseSync(self.database, self.objects).sync(
+                now=datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc)
+            )
+
+        self.assertTrue(result.failures)
+        self.assertIn("legacy report fails strict cadence validation", result.failures[0])
+        runs, _more = self.database.list_runs()
+        self.assertIn(R3, {run["run_id"] for run in runs})
+
     def test_cadence_projects_operational_decision_evidence(self) -> None:
         report = _selection_report(R1, G1)
         report.update(
