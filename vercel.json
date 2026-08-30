@@ -5,8 +5,8 @@
   "outputDirectory": "targeter-ui/dist",
   "rewrites": [
     {
-      "source": "/api/event-universe/:path*",
-      "destination": "/api/event-universe-proxy?__universe_path=/:path*"
+      "source": "/api/event-universe/:universePath*",
+      "destination": "/api/event-universe-proxy?__universe_path=/:universePath*"
     },
     {
       "source": "/(.*)",

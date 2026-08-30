@@ -778,11 +778,61 @@ test('Vercel builds only the client and routes Universe before the SPA fallback'
     'yarn workspace prediction-indexer-targeter-ui build:client',
   );
   assert.equal(config.outputDirectory, 'targeter-ui/dist');
+  // The group name is `universePath` rather than a generic `path` because Vercel
+  // echoes it into the destination query, where the proxy has to delete it by
+  // name; keeping the two in step is what stops every route 400ing. See the
+  // regression test below.
   assert.deepEqual(config.rewrites, [
     {
-      source: '/api/event-universe/:path*',
-      destination: '/api/event-universe-proxy?__universe_path=/:path*',
+      source: '/api/event-universe/:universePath*',
+      destination: '/api/event-universe-proxy?__universe_path=/:universePath*',
     },
     { source: '/(.*)', destination: '/index.html' },
   ]);
+});
+
+test('Vercel proxy drops the rewrite group the platform echoes into the query', async () => {
+  // The vercel.json rewrite both substitutes `:universePath*` into the
+  // destination and echoes it as its own query parameter, so a real request for
+  // `/api/event-universe/healthz` arrives carrying `universePath=healthz`
+  // alongside `__universe_path=/healthz`. Every other proxy test builds the
+  // idealised URL by hand and so never sees it; forwarding it made every route
+  // fail as `Invalid Event Universe request`, because `requireNoQuery` rejects
+  // any key at all and the per-route allow-lists reject unknown ones.
+  const health = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/healthz&universePath=healthz',
+    ),
+    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
+    (async (input) => {
+      assert.equal(String(input), 'https://universe.internal/healthz');
+      return json({
+        status: 'ok',
+        schema_version: 2,
+        latest_run: null,
+        counts: {
+          targeter_runs: 653,
+          selection_occurrences: 3718,
+          bundle_retirements: 152,
+          bundle_contexts: 153,
+          context_targets: 2125,
+        },
+      });
+    }) as typeof fetch,
+  );
+  assert.equal(health.status, 200);
+
+  // A route with its own allow-listed parameters must keep them and still shed
+  // the echo, rather than the proxy stripping everything indiscriminately.
+  const runs = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/runs&universePath=v1/runs&limit=20',
+    ),
+    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
+    (async (input) => {
+      assert.equal(String(input), 'https://universe.internal/v1/runs?limit=20');
+      return json({ runs: [], next_cursor: null });
+    }) as typeof fetch,
+  );
+  assert.equal(runs.status, 200);
 });

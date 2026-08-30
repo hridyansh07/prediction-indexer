@@ -28,6 +28,15 @@ export async function handleEventUniverseProxy(
   if (paths.length !== 1)
     return json(400, { error: 'Invalid Event Universe request' });
   requestUrl.searchParams.delete('__universe_path');
+  // Vercel echoes the matched source group of the vercel.json rewrite into the
+  // destination query as well as substituting it, so `/api/event-universe/healthz`
+  // arrives as `__universe_path=/healthz&universePath=healthz`. What remains here
+  // is forwarded to dispatchEventUniverseRequest, whose per-route allow-lists
+  // reject any unknown key outright — `requireNoQuery` rejects every key — so the
+  // echo has to be dropped or every request fails as an invalid one. The group is
+  // named `universePath` in vercel.json purely so this deletion is unambiguous;
+  // the two names must change together.
+  requestUrl.searchParams.delete('universePath');
   const pathname = paths[0].startsWith('/') ? paths[0] : `/${paths[0]}`;
 
   try {
