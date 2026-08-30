@@ -40,6 +40,15 @@ class UniverseApplication:
             return HTTPStatus.OK, self.database.cadence_status_snapshot(
                 limit=_integer(query, "limit", default=5)
             )
+        if parsed.path.startswith("/v1/targeter/runs/"):
+            _only(query, set())
+            run_id = _path_value(
+                parsed.path.removeprefix("/v1/targeter/runs/"), "run id"
+            )
+            detail = self.database.cadence_run_detail(run_id)
+            if detail is None:
+                return HTTPStatus.NOT_FOUND, {"error": "run not found"}
+            return HTTPStatus.OK, detail
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
             bundle_id = _path_value(
                 parsed.path.removeprefix("/v1/bundles/").removesuffix("/history"),

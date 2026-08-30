@@ -698,16 +698,70 @@ class EventUniverseTests(unittest.TestCase):
             10.0,
         )
 
-    def test_cadence_status_omits_large_relationship_payloads(self) -> None:
+    def test_cadence_status_is_compact_and_uses_newest_complete_run(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))
-        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        _publish_run(self.objects, _empty_report(R2, G2, input_complete=False))
+        self.assertEqual(
+            UniverseSync(self.database, self.objects)
+            .sync_range(
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 2, tzinfo=timezone.utc),
+            )
+            .failures,
+            [],
+        )
         status, payload = UniverseApplication(self.database).get(
             "/v1/targeter/status?limit=5"
         )
         self.assertEqual(status, 200)
-        run = payload["runs"][0]
-        self.assertEqual(run["candidates"][0]["relationship_analysis"]["relationships"], [])
-        self.assertEqual(run["selections"][0]["context"]["relationships"], [])
+        self.assertEqual(
+            set(payload),
+            {
+                "status_projection_version",
+                "observed_at",
+                "freshness",
+                "latest_run",
+                "current_complete_run",
+                "current_complete_summary",
+            },
+        )
+        self.assertEqual(payload["latest_run"]["run_id"], R2)
+        self.assertFalse(payload["latest_run"]["input_complete"])
+        self.assertEqual(payload["current_complete_run"]["run_id"], R1)
+        self.assertTrue(payload["current_complete_run"]["input_complete"])
+        self.assertEqual(
+            payload["current_complete_summary"],
+            {
+                "selected_bundles": 1,
+                "selected_targets": 2,
+                "venues": ["kalshi", "polymarket"],
+            },
+        )
+        self.assertLess(len(json.dumps(payload, separators=(",", ":"))), 2_000)
+
+    def test_targeter_run_detail_returns_full_cadence_evidence(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(
+            UniverseSync(self.database, self.objects)
+            .sync_range(
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 2, tzinfo=timezone.utc),
+            )
+            .failures,
+            [],
+        )
+        status, detail = UniverseApplication(self.database).get(
+            f"/v1/targeter/runs/{R1}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["run_id"], R1)
+        self.assertIn("candidates", detail)
+        self.assertIn("selected_targets", detail)
+        self.assertIn("continuity", detail)
+        self.assertIn("selections", detail)
+        self.assertEqual(detail["selections"][0]["context"]["bundle_id"], "bundle-1")
+        self.assertNotIn("payload_json", detail)
+        self.assertNotIn("payload_sha256", detail)
 
     def test_public_list_limits_are_bounded(self) -> None:
         application = UniverseApplication(self.database)

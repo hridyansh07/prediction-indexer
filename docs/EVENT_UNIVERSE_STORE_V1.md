@@ -238,6 +238,8 @@ cursors:
 | `GET /v1/selections` | Cross-run selected history |
 | `GET /v1/bundles/<bundle_id>/history` | One bundle's selected occurrence history |
 | `GET /v1/targeter/cadence` | Newest-five operational projection and archive-cadence freshness |
+| `GET /v1/targeter/status?limit=5` | Compact landing-page freshness and current-complete selection summary |
+| `GET /v1/targeter/runs/<run_id>` | Full cadence evidence for one run, bounded by the API response budget |
 
 Selection queries support:
 

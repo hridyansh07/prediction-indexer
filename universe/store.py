@@ -777,20 +777,7 @@ class UniverseStore:
             ).fetchall()
             runs = []
             for row in rows:
-                payload_json = str(row["payload_json"])
-                if (
-                    hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-                    != row["payload_sha256"]
-                ):
-                    raise EvidenceConflict(
-                        f"Targeter run {row['run_id']} cadence projection failed its identity"
-                    )
-                payload = validate_cadence_projection(json.loads(payload_json))
-                selections = self._selection_details(connection, str(row["run_id"]))
-                run = _run_record(row)
-                run.pop("payload_json", None)
-                run.pop("payload_sha256", None)
-                runs.append({**payload, **run, "selections": selections})
+                runs.append(self._cadence_run(connection, row))
         observed_ns = now_ns if now_ns is not None else time.time_ns()
         latest = runs[0] if runs else None
         age_seconds = (
@@ -819,22 +806,106 @@ class UniverseStore:
             "runs": runs,
         }
 
+    def cadence_run_detail(self, run_id: str) -> dict[str, Any] | None:
+        """Return one complete stored cadence run, including its detail evidence."""
+        with closing(self.connect(readonly=True)) as connection:
+            row = connection.execute(
+                """SELECT r.*, c.payload_json, c.payload_sha256
+                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
+                   WHERE r.run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._cadence_run(connection, row)
+
     def cadence_status_snapshot(
         self, *, limit: int = 5, now_ns: int | None = None
     ) -> dict[str, Any]:
-        """Return a transmission-safe cadence view without relationship edges."""
-        snapshot = self.cadence_snapshot(limit=limit, now_ns=now_ns)
-        for run in snapshot["runs"]:
-            for candidate in run["candidates"]:
-                relationship = candidate.get("relationship_analysis")
-                if isinstance(relationship, dict):
-                    relationship["relationships"] = []
-                    relationship["outcome_spaces"] = []
-            for selection in run["selections"]:
-                context = selection.get("context")
-                if isinstance(context, dict):
-                    context["relationships"] = []
-        return snapshot
+        """Return only the bounded landing-page status projection."""
+        _limit(limit)
+        observed_ns = now_ns if now_ns is not None else time.time_ns()
+        with closing(self.connect(readonly=True)) as connection:
+            latest = connection.execute(
+                """SELECT * FROM targeter_runs
+                   ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
+            complete = connection.execute(
+                """SELECT r.*, c.payload_json, c.payload_sha256
+                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
+                   WHERE r.input_complete = 1
+                   ORDER BY c.generated_at_ns DESC, c.run_id DESC LIMIT 1"""
+            ).fetchall()
+
+        latest_record = _run_summary(latest) if latest is not None else None
+        age_seconds = (
+            max(0, (observed_ns - int(latest["generated_at_ns"])) // 1_000_000_000)
+            if latest is not None
+            else None
+        )
+        current = complete[0] if complete else None
+        current_payload = self._cadence_payload(current) if current is not None else None
+        current_record = _run_summary(current) if current is not None else None
+        selected_targets = (
+            current_payload.get("selected_targets", {})
+            if current_payload is not None
+            else {}
+        )
+        return {
+            "status_projection_version": 1,
+            "observed_at": _isoformat_ns(observed_ns),
+            "freshness": {
+                "state": (
+                    "unavailable"
+                    if latest is None
+                    else "late"
+                    if age_seconds is not None
+                    and age_seconds >= TARGETER_CADENCE_SECONDS * 2
+                    else "current"
+                ),
+                "expected_run_seconds": TARGETER_CADENCE_SECONDS,
+                "latest_run_age_seconds": age_seconds,
+                "latest_indexed_at": (
+                    latest_record["indexed_at"] if latest_record is not None else None
+                ),
+            },
+            "latest_run": latest_record,
+            "current_complete_run": current_record,
+            "current_complete_summary": {
+                "selected_bundles": (
+                    int(current_payload["counts"]["selected"])
+                    if current_payload is not None
+                    else 0
+                ),
+                "selected_targets": sum(
+                    len(records) for records in selected_targets.values()
+                ),
+                "venues": sorted(
+                    venue for venue, records in selected_targets.items() if records
+                ),
+            },
+        }
+
+    def _cadence_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload_json = str(row["payload_json"])
+        if hashlib.sha256(payload_json.encode("utf-8")).hexdigest() != row["payload_sha256"]:
+            raise EvidenceConflict(
+                f"Targeter run {row['run_id']} cadence projection failed its identity"
+            )
+        return validate_cadence_projection(json.loads(payload_json))
+
+    def _cadence_run(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        payload = self._cadence_payload(row)
+        run = _run_record(row)
+        run.pop("payload_json", None)
+        run.pop("payload_sha256", None)
+        return {
+            **payload,
+            **run,
+            "selections": self._selection_details(connection, str(row["run_id"])),
+        }
 
     def _selection_details(
         self, connection: sqlite3.Connection, run_id: str
@@ -1450,6 +1521,15 @@ def _run_record(row: sqlite3.Row) -> dict[str, Any]:
     record = _row_record(row)
     record["input_complete"] = bool(record["input_complete"])
     return record
+
+
+def _run_summary(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "run_id": row["run_id"],
+        "generated_at": row["generated_at"],
+        "input_complete": bool(row["input_complete"]),
+        "indexed_at": _isoformat_ns(int(row["indexed_at_ns"])),
+    }
 
 
 def _selection_record(row: sqlite3.Row) -> dict[str, Any]:
