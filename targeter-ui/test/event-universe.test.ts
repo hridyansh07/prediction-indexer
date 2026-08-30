@@ -766,6 +766,9 @@ test('cadence refresh is GET-only and Targeter UI has no direct archive dependen
 });
 
 test('Vercel builds only the client and routes Universe before the SPA fallback', async () => {
+  const apiPackage = JSON.parse(
+    await readFile(new URL('../../api/package.json', import.meta.url), 'utf8'),
+  ) as { type?: string };
   const config = JSON.parse(
     await readFile(new URL('../../vercel.json', import.meta.url), 'utf8'),
   ) as {
@@ -773,6 +776,7 @@ test('Vercel builds only the client and routes Universe before the SPA fallback'
     outputDirectory: string;
     rewrites: Array<{ source: string; destination: string }>;
   };
+  assert.equal(apiPackage.type, 'module');
   assert.equal(
     config.buildCommand,
     'yarn workspace prediction-indexer-targeter-ui build:client',
