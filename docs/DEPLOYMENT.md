@@ -783,7 +783,12 @@ backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
 a private interface or authenticated reverse proxy when exposing the API.
 `GET /v1/targeter/cadence` serves the newest-five cache in descending run order;
 its current/late state describes archive cadence only, not publication or splice
-health.
+health. The UI consumes `GET /v1/targeter/status?limit=5`, a transmission-safe
+view that omits relationship edges and embedded context relationships. Detailed
+selected-bundle context remains available through the run/bundle endpoints.
+Universe and the UI proxy enforce a 1.75 MB serialized response budget; list
+limits are capped at 100. The legacy cadence route remains for compatibility but
+is not used by the UI.
 
 ## Clock and liveness semantics
 

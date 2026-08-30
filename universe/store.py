@@ -22,6 +22,7 @@ from universe.projection import PROJECTION_VERSION
 SCHEMA_VERSION = 2
 STALE_AFTER_SECONDS = 3_600
 TARGETER_CADENCE_SECONDS = 600
+EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
 SCHEMA_V2_PATH = Path(__file__).with_name("schema") / "v2.sql"
@@ -817,6 +818,23 @@ class UniverseStore:
             },
             "runs": runs,
         }
+
+    def cadence_status_snapshot(
+        self, *, limit: int = 5, now_ns: int | None = None
+    ) -> dict[str, Any]:
+        """Return a transmission-safe cadence view without relationship edges."""
+        snapshot = self.cadence_snapshot(limit=limit, now_ns=now_ns)
+        for run in snapshot["runs"]:
+            for candidate in run["candidates"]:
+                relationship = candidate.get("relationship_analysis")
+                if isinstance(relationship, dict):
+                    relationship["relationships"] = []
+                    relationship["outcome_spaces"] = []
+            for selection in run["selections"]:
+                context = selection.get("context")
+                if isinstance(context, dict):
+                    context["relationships"] = []
+        return snapshot
 
     def _selection_details(
         self, connection: sqlite3.Connection, run_id: str

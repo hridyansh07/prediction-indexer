@@ -11,6 +11,8 @@ interface UniverseProxyEnvironment {
   UNIVERSE_API_MAX_RESPONSE_BYTES?: string;
 }
 
+const RESPONSE_BUDGET_BYTES = 1_750_000;
+
 export async function GET(request: Request) {
   return handleEventUniverseProxy(request, process.env, fetch);
 }
@@ -44,9 +46,9 @@ export async function handleEventUniverseProxy(
       baseUrl,
       authorization: environment.UNIVERSE_API_AUTHORIZATION,
       timeoutMs: positive(environment.UNIVERSE_API_TIMEOUT_MS, 5000),
-      maxResponseBytes: positive(
+      maxResponseBytes: bounded(
         environment.UNIVERSE_API_MAX_RESPONSE_BYTES,
-        2 * 1024 * 1024,
+        RESPONSE_BUDGET_BYTES,
       ),
       fetch: fetchImpl,
     });
@@ -69,7 +71,29 @@ function positive(value: string | undefined, fallback: number) {
   return parsed;
 }
 
+function bounded(value: string | undefined, fallback: number) {
+  const parsed = positive(value, fallback);
+  if (parsed > RESPONSE_BUDGET_BYTES)
+    throw new Error(
+      'Event Universe response limit exceeds the application budget',
+    );
+  return parsed;
+}
+
 function json(status: number, body: unknown) {
+  const serialized = JSON.stringify(body);
+  if (new TextEncoder().encode(serialized).byteLength > RESPONSE_BUDGET_BYTES) {
+    return Response.json(
+      { error: 'Event Universe response exceeds size budget' },
+      {
+        status: 502,
+        headers: {
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        },
+      },
+    );
+  }
   return Response.json(body, {
     status,
     headers: {

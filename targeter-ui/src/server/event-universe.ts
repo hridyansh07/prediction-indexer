@@ -40,6 +40,7 @@ const RUN_QUERY = new Set([
   'cursor',
 ]);
 const CADENCE_QUERY = new Set(['limit']);
+const RESPONSE_BUDGET_BYTES = 1_750_000;
 const BUNDLE_QUERY = new Set(['limit', 'cursor']);
 const TIMESTAMP_FIELDS = new Set([
   'activation_start',
@@ -82,7 +83,7 @@ export class EventUniverseClient {
     this.baseUrl.pathname = `${this.baseUrl.pathname.replace(/\/+$/, '')}/`;
     this.timeoutMs = positive(options.timeoutMs ?? 5000, 'timeout');
     this.maxResponseBytes = positive(
-      options.maxResponseBytes ?? 2 * 1024 * 1024,
+      options.maxResponseBytes ?? RESPONSE_BUDGET_BYTES,
       'response limit',
     );
     this.fetchImpl = options.fetch ?? fetch;
@@ -153,6 +154,13 @@ export class EventUniverseClient {
     const limit = validated.get('limit');
     if (limit !== null && Number(limit) > 5) throw new UniverseRequestError();
     return this.get('v1/targeter/cadence', validated, validateCadence);
+  }
+
+  status(query: URLSearchParams) {
+    const validated = validateUniverseQuery(query, CADENCE_QUERY);
+    const limit = validated.get('limit');
+    if (limit !== null && Number(limit) > 5) throw new UniverseRequestError();
+    return this.get('v1/targeter/status', validated, validateCadence);
   }
 
   private async get<T>(
@@ -249,6 +257,7 @@ export async function dispatchEventUniverseRequest(
   if (pathname === '/v1/selections') return client.selections(query);
   if (pathname === '/v1/bundles') return client.bundles(query);
   if (pathname === '/v1/targeter/cadence') return client.cadence(query);
+  if (pathname === '/v1/targeter/status') return client.status(query);
 
   let match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
   if (match) {
@@ -322,7 +331,7 @@ export function validateUniverseQuery(
       throw new UniverseRequestError();
     if (
       key === 'limit' &&
-      (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 1000)
+      (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 100)
     )
       throw new UniverseRequestError();
     result.append(key, value);

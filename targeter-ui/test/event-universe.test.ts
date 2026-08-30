@@ -791,7 +791,7 @@ test('cadence refresh is GET-only and Targeter UI has no direct archive dependen
     readFile(new URL('../package.json', import.meta.url), 'utf8'),
   ]);
   assert.match(client, /const ROOT = '\/api\/event-universe'/);
-  assert.match(client, /\/v1\/targeter\/cadence\?limit=5/);
+  assert.match(client, /\/v1\/targeter\/status\?limit=5/);
   assert.match(client, /method: 'GET'/);
   for (const removed of [
     '/api/refresh',

@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.store import UniverseStore
+from universe.store import EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES, UniverseStore
 
 
 class UniverseApplication:
@@ -33,6 +33,11 @@ class UniverseApplication:
         if parsed.path == "/v1/targeter/cadence":
             _only(query, {"limit"})
             return HTTPStatus.OK, self.database.cadence_snapshot(
+                limit=_integer(query, "limit", default=5)
+            )
+        if parsed.path == "/v1/targeter/status":
+            _only(query, {"limit"})
+            return HTTPStatus.OK, self.database.cadence_status_snapshot(
                 limit=_integer(query, "limit", default=5)
             )
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
@@ -185,6 +190,9 @@ def serve(database: UniverseStore, host: str, port: int) -> None:
                 json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
                 + "\n"
             ).encode("utf-8")
+            if len(payload) > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+                payload = b'{"error":"response exceeds Event Universe size budget"}\n'
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -222,8 +230,8 @@ def _integer(query: dict[str, list[str]], field: str, *, default: int) -> int:
         value = int(raw)
     except ValueError as error:
         raise ValueError(f"query parameter {field} must be an integer") from error
-    if value <= 0 or value > 1000:
-        raise ValueError(f"query parameter {field} must be between 1 and 1000")
+    if value <= 0 or value > 100:
+        raise ValueError(f"query parameter {field} must be between 1 and 100")
     return value
 
 

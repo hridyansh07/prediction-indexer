@@ -698,6 +698,28 @@ class EventUniverseTests(unittest.TestCase):
             10.0,
         )
 
+    def test_cadence_status_omits_large_relationship_payloads(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        status, payload = UniverseApplication(self.database).get(
+            "/v1/targeter/status?limit=5"
+        )
+        self.assertEqual(status, 200)
+        run = payload["runs"][0]
+        self.assertEqual(run["candidates"][0]["relationship_analysis"]["relationships"], [])
+        self.assertEqual(run["selections"][0]["context"]["relationships"], [])
+
+    def test_public_list_limits_are_bounded(self) -> None:
+        application = UniverseApplication(self.database)
+        for path in (
+            "/v1/runs?limit=101",
+            "/v1/selections?limit=101",
+            "/v1/bundles?limit=101",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    application.get(path)
+
     def test_initialize_upgrades_an_existing_v1_database(self) -> None:
         legacy = self.root / "legacy.sqlite3"
         with sqlite3.connect(legacy) as connection:

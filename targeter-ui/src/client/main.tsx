@@ -34,7 +34,7 @@ function App() {
     setRefreshing(true);
     const [nextHealth, nextCadence] = await Promise.allSettled([
       get<UniverseHealth>('/healthz'),
-      get<UniverseCadence>('/v1/targeter/cadence?limit=5'),
+      get<UniverseCadence>('/v1/targeter/status?limit=5'),
     ]);
     if (nextHealth.status === 'fulfilled') {
       setHealth(nextHealth.value);
