@@ -404,7 +404,7 @@ test('current targets use the newest complete cadence run', () => {
   assert.equal(latestCompleteRun(cadence('current', [incomplete])), null);
 });
 
-test('cadence proxy allows only a bounded limit and validates selection detail', async () => {
+test('status proxy allows only a bounded limit and validates selection detail', async () => {
   let requested = '';
   let fetches = 0;
   const client = new EventUniverseClient({
@@ -415,10 +415,10 @@ test('cadence proxy allows only a bounded limit and validates selection detail',
       return json(cadence());
     }) as typeof fetch,
   });
-  const result = await client.cadence(new URLSearchParams({ limit: '5' }));
+  const result = await client.status(new URLSearchParams({ limit: '5' }));
   assert.equal(
     requested,
-    'https://universe.internal/base/v1/targeter/cadence?limit=5',
+    'https://universe.internal/base/v1/targeter/status?limit=5',
   );
   assert.equal(result.runs[0].selections[0].context.participants[0], 'Alpha');
   assert.equal(result.freshness.state, 'current');
@@ -429,12 +429,12 @@ test('cadence proxy allows only a bounded limit and validates selection detail',
     'cursor=forbidden',
     'limit=0',
   ]) {
-    assert.throws(() => client.cadence(new URLSearchParams(query)));
+    assert.throws(() => client.status(new URLSearchParams(query)));
   }
   assert.equal(fetches, 1);
 });
 
-test('Express cadence proxy rejects non-GET refreshes before upstream access', async () => {
+test('Express status proxy rejects non-GET refreshes before upstream access', async () => {
   let fetches = 0;
   const client = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
@@ -453,7 +453,7 @@ test('Express cadence proxy rejects non-GET refreshes before upstream access', a
   try {
     const port = (server.address() as AddressInfo).port;
     const response = await fetch(
-      `http://127.0.0.1:${port}/api/event-universe/v1/targeter/cadence?limit=5`,
+      `http://127.0.0.1:${port}/api/event-universe/v1/targeter/status?limit=5`,
       { method: 'POST' },
     );
     assert.equal(response.status, 405);
@@ -742,21 +742,21 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   assert.equal(upstreamAuthorization, 'Bearer server-only');
   assert.equal(response.headers.get('cache-control'), 'no-store');
 
-  const cadenceResponse = await handleEventUniverseProxy(
+  const statusResponse = await handleEventUniverseProxy(
     new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/targeter/cadence&limit=5',
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/targeter/status&limit=5',
     ),
     { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
     (async (input) => {
       assert.equal(
         String(input),
-        'https://universe.internal/v1/targeter/cadence?limit=5',
+        'https://universe.internal/v1/targeter/status?limit=5',
       );
       return json(cadence());
     }) as typeof fetch,
   );
-  assert.equal(cadenceResponse.status, 200);
-  assert.equal((await cadenceResponse.json()).cadence_projection_version, 1);
+  assert.equal(statusResponse.status, 200);
+  assert.equal((await statusResponse.json()).cadence_projection_version, 1);
 
   const unconfigured = await handleEventUniverseProxy(
     new Request(

@@ -17,7 +17,7 @@ credentials. Event Universe owns report verification and lifecycle projection.
 UNIVERSE_API_BASE_URL=https://universe.example.com
 UNIVERSE_API_AUTHORIZATION=Bearer replace-with-server-side-token  # optional
 UNIVERSE_API_TIMEOUT_MS=5000                                     # optional
-UNIVERSE_API_MAX_RESPONSE_BYTES=2097152                          # optional
+UNIVERSE_API_MAX_RESPONSE_BYTES=1750000                          # optional
 PORT=3000                                                        # Express only
 ```
 
@@ -30,7 +30,7 @@ bodies or credentials.
 Current targets and decisions consume only:
 
 ```text
-GET /api/event-universe/v1/targeter/cadence?limit=5
+GET /api/event-universe/v1/targeter/status?limit=5
 ```
 
 Refreshes are GET-only. Current targets are the complete `selections` set from
