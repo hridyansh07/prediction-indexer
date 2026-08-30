@@ -27,15 +27,22 @@ paths and query fields, validates closed response schemas, applies bounded
 timeouts and response sizes, and returns generic failures without upstream
 bodies or credentials.
 
-Current targets and decisions consume only:
+The landing page consumes only:
 
 ```text
 GET /api/event-universe/v1/targeter/status?limit=5
 ```
 
-Refreshes are GET-only. Current targets are the complete `selections` set from
-the newest complete run in the bounded five-run projection. A newer incomplete
-run cannot replace that set. Cadence is indexed evidence, not proof of
+Refreshes are GET-only. The status response contains only card state and the
+current complete target summary. Current targets and decisions fetch the full
+run on demand from:
+
+```text
+GET /api/event-universe/v1/targeter/runs/<run_id>
+```
+
+They use `current_complete_run.run_id`, so a newer incomplete run cannot
+replace the current target set. Cadence is indexed evidence, not proof of
 `current.json` publication or splice/frame capture health; capture therefore
 remains explicitly unverified. The UI uses the server's semantic counts and
 never reinterprets raw Targeter reports.

@@ -10,6 +10,8 @@ import type {
   UniverseBundlePage,
   UniverseCadence,
   UniverseCadenceRun,
+  UniverseTargeterRunSummary,
+  UniverseTargeterStatus,
   UniverseContext,
   UniverseHealth,
   UniverseOrigin,
@@ -160,7 +162,15 @@ export class EventUniverseClient {
     const validated = validateUniverseQuery(query, CADENCE_QUERY);
     const limit = validated.get('limit');
     if (limit !== null && Number(limit) > 5) throw new UniverseRequestError();
-    return this.get('v1/targeter/status', validated, validateCadence);
+    return this.get('v1/targeter/status', validated, validateTargeterStatus);
+  }
+
+  targeterRun(runId: string) {
+    return this.get(
+      `v1/targeter/runs/${encodeId(runId)}`,
+      new URLSearchParams(),
+      validateTargeterRun,
+    );
   }
 
   private async get<T>(
@@ -258,8 +268,13 @@ export async function dispatchEventUniverseRequest(
   if (pathname === '/v1/bundles') return client.bundles(query);
   if (pathname === '/v1/targeter/cadence') return client.cadence(query);
   if (pathname === '/v1/targeter/status') return client.status(query);
+  let match = /^\/v1\/targeter\/runs\/([^/]+)$/.exec(pathname);
+  if (match) {
+    requireNoQuery(query);
+    return client.targeterRun(pathSegment(match[1]));
+  }
 
-  let match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
+  match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
   if (match) {
     requireNoQuery(query);
     return client.run(pathSegment(match[1]));
@@ -1399,6 +1414,132 @@ export function validateCadence(value: unknown): UniverseCadence {
     runs,
   };
 }
+
+export function validateTargeterRun(value: unknown): UniverseCadenceRun {
+  const run = object(
+    value,
+    [
+      ...RUN_KEYS,
+      'catalogs',
+      'discovery_failures',
+      'counts',
+      'reason_summaries',
+      'match_rejections',
+      'candidates',
+      'selected_targets',
+      'budget_used',
+      'continuity',
+      'diagnostics',
+      'selections',
+    ],
+    'targeter run',
+  );
+  return validateCadence({
+    cadence_projection_version: 1,
+    observed_at: run.generated_at,
+    freshness: {
+      state: 'current',
+      expected_run_seconds: 1,
+      latest_run_age_seconds: 0,
+      latest_indexed_at: run.generated_at,
+    },
+    runs: [run],
+  }).runs[0];
+}
+
+function validateRunSummary(value: unknown): UniverseTargeterRunSummary {
+  const item = object(
+    value,
+    ['run_id', 'generated_at', 'input_complete', 'indexed_at'],
+    'targeter run summary',
+  );
+  return {
+    run_id: text(item.run_id),
+    generated_at: timestamp(item.generated_at),
+    input_complete: boolean(item.input_complete),
+    indexed_at: timestamp(item.indexed_at),
+  };
+}
+
+export function validateTargeterStatus(value: unknown): UniverseTargeterStatus {
+  const item = object(
+    value,
+    [
+      'status_projection_version',
+      'observed_at',
+      'freshness',
+      'latest_run',
+      'current_complete_run',
+      'current_complete_summary',
+    ],
+    'targeter status',
+  );
+  if (item.status_projection_version !== 1) throw new UniverseUpstreamError();
+  const freshness = object(
+    item.freshness,
+    [
+      'state',
+      'expected_run_seconds',
+      'latest_run_age_seconds',
+      'latest_indexed_at',
+    ],
+    'targeter status freshness',
+  );
+  const state = text(freshness.state);
+  if (!['current', 'late', 'unavailable'].includes(state))
+    throw new UniverseUpstreamError();
+  const expectedRunSeconds = integer(freshness.expected_run_seconds);
+  const latestRunAgeSeconds =
+    freshness.latest_run_age_seconds === null
+      ? null
+      : integer(freshness.latest_run_age_seconds);
+  const latestIndexedAt =
+    freshness.latest_indexed_at === null
+      ? null
+      : timestamp(freshness.latest_indexed_at);
+  const summary = object(
+    item.current_complete_summary,
+    ['selected_bundles', 'selected_targets', 'venues'],
+    'current complete summary',
+  );
+  const latestRun =
+    item.latest_run === null ? null : validateRunSummary(item.latest_run);
+  const currentCompleteRun =
+    item.current_complete_run === null
+      ? null
+      : validateRunSummary(item.current_complete_run);
+  if (
+    (state === 'unavailable' &&
+      (latestRun !== null ||
+        latestRunAgeSeconds !== null ||
+        latestIndexedAt !== null)) ||
+    (state !== 'unavailable' &&
+      (latestRun === null ||
+        latestRunAgeSeconds === null ||
+        latestIndexedAt === null)) ||
+    (currentCompleteRun === null &&
+      (summary.selected_bundles !== 0 || summary.selected_targets !== 0))
+  )
+    throw new UniverseUpstreamError();
+  return {
+    status_projection_version: 1,
+    observed_at: timestamp(item.observed_at),
+    freshness: {
+      state: state as UniverseTargeterStatus['freshness']['state'],
+      expected_run_seconds: expectedRunSeconds,
+      latest_run_age_seconds: latestRunAgeSeconds,
+      latest_indexed_at: latestIndexedAt,
+    },
+    latest_run: latestRun,
+    current_complete_run: currentCompleteRun,
+    current_complete_summary: {
+      selected_bundles: integer(summary.selected_bundles),
+      selected_targets: integer(summary.selected_targets),
+      venues: strings(summary.venues),
+    },
+  };
+}
+
 function validateAudit(value: unknown): UniverseAudit {
   const keys = [
     'run_id',

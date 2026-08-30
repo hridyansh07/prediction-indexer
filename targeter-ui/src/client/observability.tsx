@@ -1,14 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
-  UniverseCadence,
   UniverseCadenceCandidate,
   UniverseCadenceRun,
   UniverseHealth,
   UniverseSelection,
   UniverseSelectionDetail,
+  UniverseTargeterStatus,
 } from '../event-universe';
-import { latestCompleteRun } from './cadence-view-model';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
 
 const date = (value: string | null | undefined) =>
@@ -35,16 +34,46 @@ const label = (value: string | null | undefined) =>
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
 
-const runVenues = (run: UniverseCadenceRun | null) =>
-  run
-    ? [
-        ...new Set(
-          run.selections.flatMap((selection) =>
-            selection.context.targets.map((target) => target.venue),
-          ),
-        ),
-      ].sort()
-    : [];
+async function loadTargeterRun(runId: string): Promise<UniverseCadenceRun> {
+  const response = await fetch(
+    `/api/event-universe/v1/targeter/runs/${encodeURIComponent(runId)}`,
+    { headers: { accept: 'application/json' } },
+  );
+  if (!response.ok)
+    throw new Error('Targeter run diagnostics are unavailable.');
+  return response.json() as Promise<UniverseCadenceRun>;
+}
+
+function useTargeterRun(runId: string | null) {
+  const [run, setRun] = useState<UniverseCadenceRun | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(Boolean(runId));
+  useEffect(() => {
+    if (!runId) {
+      setRun(null);
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    setRun(null);
+    setError('');
+    setLoading(true);
+    void loadTargeterRun(runId)
+      .then((nextRun) => {
+        if (active) setRun(nextRun);
+      })
+      .catch(() => {
+        if (active) setError('Targeter run diagnostics are unavailable.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [runId]);
+  return { run, error, loading };
+}
 
 function PageHeading({
   eyebrow,
@@ -70,27 +99,21 @@ function StateDot({ state }: { state: 'live' | 'warn' | 'unknown' }) {
 
 export function StatusPage({
   health,
-  cadence,
+  status,
   healthError,
-  cadenceError,
+  statusError,
   refreshing,
   refresh,
 }: {
   health: UniverseHealth | null;
-  cadence: UniverseCadence | null;
+  status: UniverseTargeterStatus | null;
   healthError: string;
-  cadenceError: string;
+  statusError: string;
   refreshing: boolean;
   refresh: () => Promise<void>;
 }) {
-  const run = latestCompleteRun(cadence);
-  const targetCount =
-    run?.selections.reduce(
-      (total, selection) => total + selection.context.targets.length,
-      0,
-    ) ?? 0;
-  const targeterLive = cadence?.freshness.state === 'current';
-  const checking = !health && !cadence && !healthError && !cadenceError;
+  const targeterLive = status?.freshness.state === 'current';
+  const checking = !health && !status && !healthError && !statusError;
   return (
     <div className="status-page">
       <section className="status-intro">
@@ -137,11 +160,11 @@ export function StatusPage({
           <strong>
             {targeterLive
               ? 'On cadence'
-              : label(cadence?.freshness.state ?? 'Unavailable')}
+              : label(status?.freshness.state ?? 'Unavailable')}
           </strong>
           <p>
-            {cadenceError ||
-              `Expected every ${Math.round((cadence?.freshness.expected_run_seconds ?? 600) / 60)} minutes`}
+            {statusError ||
+              `Expected every ${Math.round((status?.freshness.expected_run_seconds ?? 600) / 60)} minutes`}
           </p>
         </article>
         <article className="status-card unverified">
@@ -160,19 +183,22 @@ export function StatusPage({
         <div>
           <span className="eyebrow">CURRENT COMPLETE TARGET SET</span>
           <h2>
-            {run
-              ? `${run.selections.length} bundles across ${runVenues(run).length} venues`
+            {status?.current_complete_run
+              ? `${status.current_complete_summary.selected_bundles} bundles across ${status.current_complete_summary.venues.length} venues`
               : 'No complete run available'}
           </h2>
           <p>
-            {run
-              ? `${targetCount} selected targets · run ${run.run_id}`
+            {status?.current_complete_run
+              ? `${status.current_complete_summary.selected_targets} selected targets · run ${status.current_complete_run.run_id}`
               : 'Waiting for complete Targeter evidence.'}
           </p>
         </div>
-        <VenueStack venues={runVenues(run)} />
+        <VenueStack venues={status?.current_complete_summary.venues ?? []} />
         <Link className="primary-link" to="/targets">
           View current targets <Chevron />
+        </Link>
+        <Link className="secondary-link" to="/decisions">
+          View run diagnostics <Chevron />
         </Link>
       </section>
       <p className="mobile-truth">
@@ -243,13 +269,15 @@ function EventFilters({
 }
 
 export function TargetsPage({
-  cadence,
+  status,
   error,
 }: {
-  cadence: UniverseCadence | null;
+  status: UniverseTargeterStatus | null;
   error: string;
 }) {
-  const run = latestCompleteRun(cadence);
+  const runId = status?.current_complete_run?.run_id ?? null;
+  const loaded = useTargeterRun(runId);
+  const run = loaded.run;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
@@ -276,10 +304,10 @@ export function TargetsPage({
           (selection.occurrence_kind === 'retained'))
     );
   });
-  if (!run)
+  if (loaded.loading || !run)
     return (
       <EmptyPage
-        error={error}
+        error={error || loaded.error}
         loading="Loading the current complete target set…"
       />
     );
@@ -538,16 +566,23 @@ function MarketList({ detail }: { detail: UniverseSelectionDetail }) {
 }
 
 export function DecisionsPage({
-  cadence,
+  status,
   error,
 }: {
-  cadence: UniverseCadence | null;
+  status: UniverseTargeterStatus | null;
   error: string;
 }) {
-  const run = latestCompleteRun(cadence);
+  const runId = status?.current_complete_run?.run_id ?? null;
+  const loaded = useTargeterRun(runId);
+  const run = loaded.run;
   const [query, setQuery] = useState('');
-  if (!run)
-    return <EmptyPage error={error} loading="Loading Targeter decisions…" />;
+  if (loaded.loading || !run)
+    return (
+      <EmptyPage
+        error={error || loaded.error}
+        loading="Loading Targeter decisions…"
+      />
+    );
   const candidates = run.candidates.filter((candidate) =>
     `${candidate.bundle_id} ${candidate.participants.join(' ')} ${candidate.rejection_reasons.join(' ')}`
       .toLowerCase()

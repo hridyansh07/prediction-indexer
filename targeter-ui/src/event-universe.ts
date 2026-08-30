@@ -316,6 +316,26 @@ export interface UniverseCadence {
   runs: UniverseCadenceRun[];
 }
 
+export interface UniverseTargeterRunSummary {
+  run_id: string;
+  generated_at: string;
+  input_complete: boolean;
+  indexed_at: string;
+}
+
+export interface UniverseTargeterStatus {
+  status_projection_version: 1;
+  observed_at: string;
+  freshness: UniverseCadenceFreshness;
+  latest_run: UniverseTargeterRunSummary | null;
+  current_complete_run: UniverseTargeterRunSummary | null;
+  current_complete_summary: {
+    selected_bundles: number;
+    selected_targets: number;
+    venues: string[];
+  };
+}
+
 export interface UniverseHealth {
   status: 'ok';
   schema_version: number;

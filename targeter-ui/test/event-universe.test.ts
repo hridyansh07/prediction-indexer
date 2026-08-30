@@ -29,6 +29,7 @@ import type {
   UniverseCadenceRun,
   UniverseSelection,
   UniverseSelectionDetail,
+  UniverseTargeterStatus,
 } from '../src/event-universe.js';
 
 const sha = 'a'.repeat(64);
@@ -176,6 +177,36 @@ const cadence = (
     latest_indexed_at: state === 'unavailable' ? null : '2026-08-20T12:01:00Z',
   },
   runs,
+});
+const status = (
+  overrides: Partial<UniverseTargeterStatus> = {},
+): UniverseTargeterStatus => ({
+  status_projection_version: 1,
+  observed_at: '2026-08-20T12:05:18Z',
+  freshness: {
+    state: 'current',
+    expected_run_seconds: 600,
+    latest_run_age_seconds: 318,
+    latest_indexed_at: '2026-08-20T12:01:00Z',
+  },
+  latest_run: {
+    run_id: run().run_id,
+    generated_at: run().generated_at,
+    input_complete: true,
+    indexed_at: '2026-08-20T12:01:00Z',
+  },
+  current_complete_run: {
+    run_id: run().run_id,
+    generated_at: run().generated_at,
+    input_complete: true,
+    indexed_at: '2026-08-20T12:01:00Z',
+  },
+  current_complete_summary: {
+    selected_bundles: 1,
+    selected_targets: 2,
+    venues: ['kalshi', 'polymarket'],
+  },
+  ...overrides,
 });
 const json = (value: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(value), {
@@ -412,7 +443,7 @@ test('status proxy allows only a bounded limit and validates selection detail', 
     fetch: (async (input) => {
       fetches++;
       requested = String(input);
-      return json(cadence());
+      return json(requested.includes('/v1/targeter/runs/') ? run() : status());
     }) as typeof fetch,
   });
   const result = await client.status(new URLSearchParams({ limit: '5' }));
@@ -420,7 +451,9 @@ test('status proxy allows only a bounded limit and validates selection detail', 
     requested,
     'https://universe.internal/base/v1/targeter/status?limit=5',
   );
-  assert.equal(result.runs[0].selections[0].context.participants[0], 'Alpha');
+  assert.equal(result.current_complete_summary.selected_bundles, 1);
+  assert.equal(result.current_complete_summary.selected_targets, 2);
+  assert.equal(result.latest_run?.input_complete, true);
   assert.equal(result.freshness.state, 'current');
 
   for (const query of [
@@ -432,6 +465,13 @@ test('status proxy allows only a bounded limit and validates selection detail', 
     assert.throws(() => client.status(new URLSearchParams(query)));
   }
   assert.equal(fetches, 1);
+
+  const detail = await client.targeterRun(run().run_id);
+  assert.equal(
+    requested,
+    `https://universe.internal/base/v1/targeter/runs/${run().run_id}`,
+  );
+  assert.equal(detail.selections[0].bundle_id, 'bundle alpha');
 });
 
 test('Express status proxy rejects non-GET refreshes before upstream access', async () => {
@@ -440,7 +480,7 @@ test('Express status proxy rejects non-GET refreshes before upstream access', as
     baseUrl: 'https://universe.internal',
     fetch: (async () => {
       fetches++;
-      return json(cadence());
+      return json(status());
     }) as typeof fetch,
   });
   const app = express();
@@ -752,11 +792,11 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
         String(input),
         'https://universe.internal/v1/targeter/status?limit=5',
       );
-      return json(cadence());
+      return json(status());
     }) as typeof fetch,
   );
   assert.equal(statusResponse.status, 200);
-  assert.equal((await statusResponse.json()).cadence_projection_version, 1);
+  assert.equal((await statusResponse.json()).status_projection_version, 1);
 
   const unconfigured = await handleEventUniverseProxy(
     new Request(

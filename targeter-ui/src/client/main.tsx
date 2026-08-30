@@ -7,7 +7,7 @@ import {
   Route,
   Routes,
 } from 'react-router-dom';
-import type { UniverseCadence, UniverseHealth } from '../event-universe';
+import type { UniverseHealth, UniverseTargeterStatus } from '../event-universe';
 import { EventUniversePage } from './event-universe';
 import { DecisionsPage, StatusPage, TargetsPage } from './observability';
 import './style.css';
@@ -25,16 +25,16 @@ async function get<T>(path: string): Promise<T> {
 
 function App() {
   const [health, setHealth] = useState<UniverseHealth | null>(null);
-  const [cadence, setCadence] = useState<UniverseCadence | null>(null);
+  const [status, setStatus] = useState<UniverseTargeterStatus | null>(null);
   const [healthError, setHealthError] = useState('');
-  const [cadenceError, setCadenceError] = useState('');
+  const [statusError, setStatusError] = useState('');
   const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
-    const [nextHealth, nextCadence] = await Promise.allSettled([
+    const [nextHealth, nextStatus] = await Promise.allSettled([
       get<UniverseHealth>('/healthz'),
-      get<UniverseCadence>('/v1/targeter/status?limit=5'),
+      get<UniverseTargeterStatus>('/v1/targeter/status?limit=5'),
     ]);
     if (nextHealth.status === 'fulfilled') {
       setHealth(nextHealth.value);
@@ -42,11 +42,11 @@ function App() {
     } else {
       setHealthError('Server status is unavailable.');
     }
-    if (nextCadence.status === 'fulfilled') {
-      setCadence(nextCadence.value);
-      setCadenceError('');
+    if (nextStatus.status === 'fulfilled') {
+      setStatus(nextStatus.value);
+      setStatusError('');
     } else {
-      setCadenceError('Targeter cadence is unavailable.');
+      setStatusError('Targeter status is unavailable.');
     }
     setRefreshing(false);
   }, []);
@@ -86,9 +86,9 @@ function App() {
             element={
               <StatusPage
                 health={health}
-                cadence={cadence}
+                status={status}
                 healthError={healthError}
-                cadenceError={cadenceError}
+                statusError={statusError}
                 refreshing={refreshing}
                 refresh={refresh}
               />
@@ -96,12 +96,12 @@ function App() {
           />
           <Route
             path="/targets"
-            element={<TargetsPage cadence={cadence} error={cadenceError} />}
+            element={<TargetsPage status={status} error={statusError} />}
           />
           <Route path="/history" element={<EventUniversePage />} />
           <Route
             path="/decisions"
-            element={<DecisionsPage cadence={cadence} error={cadenceError} />}
+            element={<DecisionsPage status={status} error={statusError} />}
           />
           <Route
             path="/operations"
