@@ -18,6 +18,19 @@ RUN groupadd --gid "${APP_GID}" universe \
 WORKDIR /app
 
 COPY encoder/ ./encoder/
+# The first-party import closure of universe/run_server.py is wider than the
+# four packages Universe itself names. archive/common/seal.py needs
+# splices.common.segment, targeter/targets.py needs analysis.storage, and both
+# archive/archiver/manifest.py and targeter/v2/target_records.py need replay.
+# Without these the archive package does not import and the server exits at
+# startup. All three are stdlib-only here, so they cost no new dependency.
+#
+# Only splices/common is copied: the venue splices beside it would drag in
+# websockets and socketio, which this image deliberately does not carry.
+COPY splices/__init__.py ./splices/
+COPY splices/common/ ./splices/common/
+COPY analysis/ ./analysis/
+COPY replay/ ./replay/
 COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
