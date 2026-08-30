@@ -28,6 +28,8 @@ class UniverseApplication:
             return HTTPStatus.OK, self._runs(query)
         if parsed.path == "/v1/selections":
             return HTTPStatus.OK, self._selections(query)
+        if parsed.path == "/v1/bundles":
+            return HTTPStatus.OK, self._bundles(query)
         if parsed.path == "/v1/targeter/cadence":
             _only(query, {"limit"})
             return HTTPStatus.OK, self.database.cadence_snapshot(
@@ -144,6 +146,25 @@ class UniverseApplication:
             "sort": sort,
             "next_cursor": next_cursor,
         }
+
+    def _bundles(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        _only(query, {"limit", "cursor"})
+        after = _bundle_cursor(_optional(query, "cursor"))
+        bundles, has_more = self.database.list_bundles(
+            after=after,
+            limit=_integer(query, "limit", default=100),
+        )
+        next_cursor = None
+        if has_more and bundles:
+            last = bundles[-1]
+            next_cursor = _encode_cursor(
+                [
+                    "bundles",
+                    _timestamp_ns(last["last_selected_at"]),
+                    last["bundle_id"],
+                ]
+            )
+        return {"bundles": bundles, "next_cursor": next_cursor}
 
 
 def serve(database: UniverseStore, host: str, port: int) -> None:
@@ -281,3 +302,17 @@ def _selection_cursor(value: str | None, sort: str) -> tuple[int, str, str] | No
     ):
         raise ValueError("cursor does not belong to this selections query")
     return decoded[1], decoded[2], decoded[3]
+
+
+def _bundle_cursor(value: str | None) -> tuple[int, str] | None:
+    if value is None:
+        return None
+    decoded = _decode_cursor(value)
+    if (
+        len(decoded) != 3
+        or decoded[0] != "bundles"
+        or not isinstance(decoded[1], int)
+        or not isinstance(decoded[2], str)
+    ):
+        raise ValueError("cursor does not belong to the bundles query")
+    return decoded[1], decoded[2]

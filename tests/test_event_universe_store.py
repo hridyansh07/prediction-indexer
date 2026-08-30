@@ -927,6 +927,17 @@ class EventUniverseTests(unittest.TestCase):
             datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
         app = UniverseApplication(self.database)
+        status, bundles = app.get("/v1/bundles?limit=10")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(bundles["bundles"]), 1)
+        self.assertEqual(bundles["bundles"][0]["bundle_id"], "bundle-1")
+        self.assertEqual(bundles["bundles"][0]["latest_run_id"], R2)
+        self.assertEqual(bundles["bundles"][0]["occurrence_count"], 2)
+        self.assertEqual(bundles["bundles"][0]["participants"], ["Alpha", "Beta"])
+        self.assertEqual(bundles["bundles"][0]["venues"], ["kalshi", "polymarket"])
+        self.assertEqual(bundles["bundles"][0]["target_count"], 2)
+        self.assertEqual(bundles["bundles"][0]["lifecycle"], "active")
+        self.assertIsNone(bundles["next_cursor"])
         _status, first = app.get("/v1/bundles/bundle-1/history?limit=1")
         self.assertEqual(len(first["selections"]), 1)
         self.assertIsNotNone(first["next_cursor"])
@@ -958,6 +969,33 @@ class EventUniverseTests(unittest.TestCase):
         self.assertFalse(
             {"segment_receipts", "control_records", "connection_epochs"} & tables
         )
+
+    def test_bundle_summary_pagination_is_newest_first(self) -> None:
+        _publish_run(
+            self.objects,
+            _selection_report(R1, G1, bundle_id="bundle-older"),
+        )
+        _publish_run(
+            self.objects,
+            _selection_report(R2, G2, bundle_id="bundle-newer"),
+        )
+        UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        app = UniverseApplication(self.database)
+
+        status, first = app.get("/v1/bundles?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(first["bundles"][0]["bundle_id"], "bundle-newer")
+        self.assertIsNotNone(first["next_cursor"])
+
+        status, second = app.get(
+            "/v1/bundles?limit=1&cursor=" + first["next_cursor"]
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(second["bundles"][0]["bundle_id"], "bundle-older")
+        self.assertIsNone(second["next_cursor"])
 
     def test_status_staleness_uses_latest_archived_run_time(self) -> None:
         _publish_run(self.objects, _empty_report(R1, G1))

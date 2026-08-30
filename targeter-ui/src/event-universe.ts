@@ -90,6 +90,28 @@ export interface UniverseSelectionPage {
   next_cursor: string | null;
 }
 
+export interface UniverseBundle {
+  bundle_id: string;
+  latest_run_id: string;
+  sport: string;
+  game: string | null;
+  topology: string | null;
+  participants: string[];
+  activation_at: string;
+  capture_start_at: string;
+  first_selected_at: string;
+  last_selected_at: string;
+  occurrence_count: number;
+  venues: string[];
+  target_count: number;
+  lifecycle: 'active' | 'retired';
+}
+
+export interface UniverseBundlePage {
+  bundles: UniverseBundle[];
+  next_cursor: string | null;
+}
+
 export interface UniverseRun {
   run_id: string;
   generated_at: string;

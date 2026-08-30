@@ -1,5 +1,6 @@
 import type {
   CadenceFreshnessState,
+  UniverseCadence,
   UniverseCadenceCandidate,
   UniverseCadenceRun,
   UniverseSelectionDetail,
@@ -13,6 +14,9 @@ export type CandidateDecisionState =
 
 export const cadenceStatusLabel = (state: CadenceFreshnessState) =>
   `CADENCE ${state.toUpperCase()}`;
+
+export const latestCompleteRun = (cadence: UniverseCadence | null) =>
+  cadence?.runs.find((run) => run.input_complete) ?? null;
 
 export const cadenceRunEmptyMessage = (run: UniverseCadenceRun) =>
   run.input_complete

@@ -15,11 +15,11 @@ import {
   retirementExplanation,
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
-import { targeterCadenceNeeded } from '../src/client/app-routing.js';
 import {
   candidateDecisionState,
   cadenceRunEmptyMessage,
   cadenceStatusLabel,
+  latestCompleteRun,
   selectionDecisionEvidence,
 } from '../src/client/cadence-view-model.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
@@ -249,6 +249,45 @@ test('strictly validates selection detail and rejects schema drift', async () =>
   );
 });
 
+test('bundle summaries are closed, grouped records', async () => {
+  const bundle = {
+    bundle_id: 'bundle alpha',
+    latest_run_id: '20260820T120000.000001Z',
+    sport: 'esports',
+    game: 'counter_strike_2',
+    topology: 'series',
+    participants: ['Alpha', 'Beta'],
+    activation_at: '2026-08-20T14:00:00Z',
+    capture_start_at: '2026-08-20T13:00:00Z',
+    first_selected_at: '2026-08-20T12:00:00Z',
+    last_selected_at: '2026-08-20T12:10:00Z',
+    occurrence_count: 2,
+    venues: ['kalshi', 'polymarket'],
+    target_count: 2,
+    lifecycle: 'active',
+  };
+  const client = new EventUniverseClient({
+    baseUrl: 'https://universe.internal',
+    fetch: (async () =>
+      json({ bundles: [bundle], next_cursor: null })) as typeof fetch,
+  });
+  const result = await client.bundles(new URLSearchParams({ limit: '100' }));
+  assert.equal(result.bundles[0].latest_run_id, bundle.latest_run_id);
+  assert.equal(result.bundles[0].occurrence_count, 2);
+
+  const rejecting = new EventUniverseClient({
+    baseUrl: 'https://universe.internal',
+    fetch: (async () =>
+      json({
+        bundles: [{ ...bundle, raw_report: 'must not pass' }],
+        next_cursor: null,
+      })) as typeof fetch,
+  });
+  await assert.rejects(() =>
+    rejecting.bundles(new URLSearchParams({ limit: '100' })),
+  );
+});
+
 test('bounds timeout, response bytes, content type, and upstream status', async () => {
   const timedOut = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
@@ -351,12 +390,18 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
   );
 });
 
-test('Event Universe routing is independent from Targeter cadence availability', () => {
-  assert.equal(targeterCadenceNeeded('/'), false);
-  assert.equal(targeterCadenceNeeded('/event-universe'), false);
-  assert.equal(targeterCadenceNeeded('/operations'), true);
-  assert.equal(targeterCadenceNeeded('/operations/selections'), true);
-  assert.equal(targeterCadenceNeeded('/events'), false);
+test('current targets use the newest complete cadence run', () => {
+  const complete = run({ run_id: 'complete-run' });
+  const incomplete = run({
+    run_id: 'newest-incomplete-run',
+    input_complete: false,
+    selections: [],
+  });
+  assert.equal(
+    latestCompleteRun(cadence('current', [incomplete, complete]))?.run_id,
+    'complete-run',
+  );
+  assert.equal(latestCompleteRun(cadence('current', [incomplete])), null);
 });
 
 test('cadence proxy allows only a bounded limit and validates selection detail', async () => {
@@ -745,7 +790,8 @@ test('cadence refresh is GET-only and Targeter UI has no direct archive dependen
     readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
     readFile(new URL('../package.json', import.meta.url), 'utf8'),
   ]);
-  assert.match(client, /\/api\/event-universe\/v1\/targeter\/cadence\?limit=5/);
+  assert.match(client, /const ROOT = '\/api\/event-universe'/);
+  assert.match(client, /\/v1\/targeter\/cadence\?limit=5/);
   assert.match(client, /method: 'GET'/);
   for (const removed of [
     '/api/refresh',

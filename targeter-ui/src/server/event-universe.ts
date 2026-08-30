@@ -6,6 +6,8 @@ import {
 import type {
   RetirementDisposition,
   UniverseAudit,
+  UniverseBundle,
+  UniverseBundlePage,
   UniverseCadence,
   UniverseCadenceRun,
   UniverseContext,
@@ -38,6 +40,7 @@ const RUN_QUERY = new Set([
   'cursor',
 ]);
 const CADENCE_QUERY = new Set(['limit']);
+const BUNDLE_QUERY = new Set(['limit', 'cursor']);
 const TIMESTAMP_FIELDS = new Set([
   'activation_start',
   'activation_end',
@@ -110,6 +113,14 @@ export class EventUniverseClient {
       'v1/selections',
       validateUniverseQuery(query, SELECTION_QUERY),
       validateSelectionPage,
+    );
+  }
+
+  bundles(query: URLSearchParams) {
+    return this.get(
+      'v1/bundles',
+      validateUniverseQuery(query, BUNDLE_QUERY),
+      validateBundlePage,
     );
   }
 
@@ -236,6 +247,7 @@ export async function dispatchEventUniverseRequest(
   }
   if (pathname === '/v1/runs') return client.runs(query);
   if (pathname === '/v1/selections') return client.selections(query);
+  if (pathname === '/v1/bundles') return client.bundles(query);
   if (pathname === '/v1/targeter/cadence') return client.cadence(query);
 
   let match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
@@ -623,6 +635,56 @@ function validateSelectionPage(value: unknown): UniverseSelectionPage {
   return {
     selections: array(item.selections, validateSelection),
     sort: sort as UniverseSelectionPage['sort'],
+    next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
+  };
+}
+
+function validateBundle(value: unknown): UniverseBundle {
+  const item = object(
+    value,
+    [
+      'bundle_id',
+      'latest_run_id',
+      'sport',
+      'game',
+      'topology',
+      'participants',
+      'activation_at',
+      'capture_start_at',
+      'first_selected_at',
+      'last_selected_at',
+      'occurrence_count',
+      'venues',
+      'target_count',
+      'lifecycle',
+    ],
+    'bundle',
+  );
+  const lifecycle = text(item.lifecycle);
+  if (!['active', 'retired'].includes(lifecycle))
+    throw new UniverseUpstreamError();
+  return {
+    bundle_id: text(item.bundle_id),
+    latest_run_id: text(item.latest_run_id),
+    sport: text(item.sport),
+    game: nullableText(item.game),
+    topology: nullableText(item.topology),
+    participants: strings(item.participants),
+    activation_at: timestamp(item.activation_at),
+    capture_start_at: timestamp(item.capture_start_at),
+    first_selected_at: timestamp(item.first_selected_at),
+    last_selected_at: timestamp(item.last_selected_at),
+    occurrence_count: integer(item.occurrence_count),
+    venues: strings(item.venues),
+    target_count: integer(item.target_count),
+    lifecycle: lifecycle as UniverseBundle['lifecycle'],
+  };
+}
+
+function validateBundlePage(value: unknown): UniverseBundlePage {
+  const item = object(value, ['bundles', 'next_cursor'], 'bundle page');
+  return {
+    bundles: array(item.bundles, validateBundle),
     next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
   };
 }

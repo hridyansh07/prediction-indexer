@@ -931,6 +931,84 @@ class UniverseStore:
         output = [_selection_record(row) for row in rows[:bounded]]
         return output, len(rows) > bounded
 
+    def list_bundles(
+        self,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return one newest-context summary per historical bundle."""
+        bounded = _limit(limit)
+        having = ""
+        parameters: list[Any] = []
+        if after is not None:
+            having = "HAVING (MAX(r.generated_at_ns), o.bundle_id) < (?, ?)"
+            parameters.extend(after)
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                f"""SELECT
+                        o.bundle_id,
+                        MIN(r.generated_at) AS first_selected_at,
+                        MAX(r.generated_at) AS last_selected_at,
+                        MAX(r.generated_at_ns) AS last_selected_at_ns,
+                        COUNT(*) AS occurrence_count,
+                        EXISTS(
+                            SELECT 1 FROM bundle_retirements retired
+                            WHERE retired.bundle_id = o.bundle_id
+                        ) AS retired,
+                        (
+                            SELECT newest.context_sha256
+                            FROM selection_occurrences newest
+                            JOIN targeter_runs newest_run
+                              ON newest_run.run_id = newest.run_id
+                            WHERE newest.bundle_id = o.bundle_id
+                            ORDER BY newest_run.generated_at_ns DESC,
+                                     newest.run_id DESC
+                            LIMIT 1
+                        ) AS context_sha256,
+                        (
+                            SELECT newest.run_id
+                            FROM selection_occurrences newest
+                            JOIN targeter_runs newest_run
+                              ON newest_run.run_id = newest.run_id
+                            WHERE newest.bundle_id = o.bundle_id
+                            ORDER BY newest_run.generated_at_ns DESC,
+                                     newest.run_id DESC
+                            LIMIT 1
+                        ) AS latest_run_id
+                    FROM selection_occurrences o
+                    JOIN targeter_runs r ON r.run_id = o.run_id
+                    GROUP BY o.bundle_id
+                    {having}
+                    ORDER BY last_selected_at_ns DESC, o.bundle_id DESC
+                    LIMIT ?""",
+                (*parameters, bounded + 1),
+            ).fetchall()
+            output = []
+            for row in rows[:bounded]:
+                context = self._context(connection, str(row["context_sha256"]))
+                output.append(
+                    {
+                        "bundle_id": row["bundle_id"],
+                        "latest_run_id": row["latest_run_id"],
+                        "sport": context["sport"],
+                        "game": context["game"],
+                        "topology": context["topology"],
+                        "participants": context["participants"],
+                        "activation_at": context["activation_at"],
+                        "capture_start_at": context["capture_start_at"],
+                        "first_selected_at": row["first_selected_at"],
+                        "last_selected_at": row["last_selected_at"],
+                        "occurrence_count": row["occurrence_count"],
+                        "venues": sorted(
+                            {target["venue"] for target in context["targets"]}
+                        ),
+                        "target_count": len(context["targets"]),
+                        "lifecycle": "retired" if row["retired"] else "active",
+                    }
+                )
+        return output, len(rows) > bounded
+
     def selection_detail(self, run_id: str, bundle_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
             row = connection.execute(

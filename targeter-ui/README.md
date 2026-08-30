@@ -1,10 +1,10 @@
-# Event Universe and Targeter cadence UI
+# Targeter observability UI
 
-Read-only React/Vite UI for historical Event Universe exploration and recent
-Targeter cadence observability. Event Universe is the primary experience at
-`/`; the bounded five-run cadence projection is available at `/operations`.
+Read-only React/Vite UI for current Targeter selections, historical Event
+Universe bundles, and recent Targeter decision evidence. The landing page is a
+compact service/cadence status view; detailed views are desktop-first.
 
-The browser hydrates both views exclusively through the same-origin
+The browser hydrates every view exclusively through the same-origin
 `/api/event-universe/...` proxy. The UI does not list an archive, download
 Targeter reports, decode Zstandard, stage private files, or hold cloud-storage
 credentials. Event Universe owns report verification and lifecycle projection.
@@ -27,28 +27,32 @@ paths and query fields, validates closed response schemas, applies bounded
 timeouts and response sizes, and returns generic failures without upstream
 bodies or credentials.
 
-The cadence dashboard consumes only:
+Current targets and decisions consume only:
 
 ```text
 GET /api/event-universe/v1/targeter/cadence?limit=5
 ```
 
-Refreshes are GET-only. The status is exactly `CADENCE CURRENT`, `CADENCE LATE`,
-or `CADENCE UNAVAILABLE`, as supplied by Universe. It is an indexed cadence
-observation, not proof of `current.json` publication or splice health. The
-API includes selected occurrence detail plus bounded catalogue, candidate,
-rejection, admission, continuity, terminal-probe, and diagnostic projections.
-The UI uses the server's semantic counts and never reinterprets raw Targeter
-reports.
+Refreshes are GET-only. Current targets are the complete `selections` set from
+the newest complete run in the bounded five-run projection. A newer incomplete
+run cannot replace that set. Cadence is indexed evidence, not proof of
+`current.json` publication or splice/frame capture health; capture therefore
+remains explicitly unverified. The UI uses the server's semantic counts and
+never reinterprets raw Targeter reports.
+
+History consumes grouped bundle summaries from `GET /v1/bundles`, then loads
+the latest immutable detail and occurrence timeline only when a bundle opens.
 
 ## Routes
 
-- `/` — historical selected-event explorer
-- `/operations` — five-run Targeter cadence timeline and selected bundles
-- `/operations/selections` — filters across selections in those cadence runs
+- `/` — compact Event Universe server and Targeter cadence status
+- `/targets` — full target set from the newest complete cadence run
+- `/history` — one grouped row per historically selected bundle
+- `/decisions` — latest complete run's candidate decision funnel
 - `/api/event-universe/...` — narrow same-origin Universe proxy
 
-Legacy Event Universe and operations paths redirect to these routes.
+Legacy Event Universe and operations paths redirect to the corresponding new
+routes.
 
 ## Vercel
 
