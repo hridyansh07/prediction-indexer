@@ -10,18 +10,8 @@ import {
 import type { UniverseHealth, UniverseTargeterStatus } from '../event-universe';
 import { EventUniversePage } from './event-universe';
 import { DecisionsPage, StatusPage, TargetsPage } from './observability';
+import { universeGet } from './universe-api';
 import './style.css';
-
-const ROOT = '/api/event-universe';
-
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${ROOT}${path}`, {
-    method: 'GET',
-    headers: { accept: 'application/json' },
-  });
-  if (!response.ok) throw new Error('Event Universe is unavailable.');
-  return response.json() as Promise<T>;
-}
 
 function App() {
   const [health, setHealth] = useState<UniverseHealth | null>(null);
@@ -33,8 +23,8 @@ function App() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     const [nextHealth, nextStatus] = await Promise.allSettled([
-      get<UniverseHealth>('/healthz'),
-      get<UniverseTargeterStatus>('/v1/targeter/status?limit=5'),
+      universeGet<UniverseHealth>('/healthz'),
+      universeGet<UniverseTargeterStatus>('/v1/targeter/status?limit=5'),
     ]);
     if (nextHealth.status === 'fulfilled') {
       setHealth(nextHealth.value);

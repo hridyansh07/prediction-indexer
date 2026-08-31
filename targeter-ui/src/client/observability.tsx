@@ -9,6 +9,7 @@ import type {
   UniverseTargeterStatus,
 } from '../event-universe';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
+import { universeGet } from './universe-api';
 
 const date = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString() : 'Unavailable';
@@ -35,13 +36,9 @@ const label = (value: string | null | undefined) =>
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
 
 async function loadTargeterRun(runId: string): Promise<UniverseCadenceRun> {
-  const response = await fetch(
-    `/api/event-universe/v1/targeter/runs/${encodeURIComponent(runId)}`,
-    { headers: { accept: 'application/json' } },
+  return universeGet<UniverseCadenceRun>(
+    `/v1/targeter/runs/${encodeURIComponent(runId)}`,
   );
-  if (!response.ok)
-    throw new Error('Targeter run diagnostics are unavailable.');
-  return response.json() as Promise<UniverseCadenceRun>;
 }
 
 function useTargeterRun(runId: string | null) {

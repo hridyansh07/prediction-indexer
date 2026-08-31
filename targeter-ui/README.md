@@ -33,6 +33,9 @@ The landing page consumes only:
 GET /api/event-universe/v1/targeter/status?limit=5
 ```
 
+The browser deduplicates in-flight requests and caches status briefly; immutable
+run, bundle, selection, and history responses are cached for five minutes.
+
 Refreshes are GET-only. The status response contains only card state and the
 current complete target summary. Current targets and decisions fetch the full
 run on demand from:

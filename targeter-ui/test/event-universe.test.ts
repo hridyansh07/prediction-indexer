@@ -754,6 +754,14 @@ test('cadence validates operational decision evidence and terminal probes', () =
 test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
   let upstreamUrl = '';
   let upstreamAuthorization = '';
+  let upstreamFetches = 0;
+  const upstreamFetch = (async (input, init) => {
+    upstreamFetches++;
+    upstreamUrl = String(input);
+    upstreamAuthorization =
+      new Headers(init?.headers).get('authorization') ?? '';
+    return json({ selections: [], sort: 'selected', next_cursor: null });
+  }) as typeof fetch;
   const response = await handleEventUniverseProxy(
     new Request(
       'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
@@ -762,12 +770,7 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
       UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
       UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
     },
-    (async (input, init) => {
-      upstreamUrl = String(input);
-      upstreamAuthorization =
-        new Headers(init?.headers).get('authorization') ?? '';
-      return json({ selections: [], sort: 'selected', next_cursor: null });
-    }) as typeof fetch,
+    upstreamFetch,
   );
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
@@ -780,7 +783,20 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
     'https://universe.internal/base/v1/selections?sort=selected&limit=25',
   );
   assert.equal(upstreamAuthorization, 'Bearer server-only');
-  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('cache-control'), 'private, max-age=300');
+
+  const cachedResponse = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
+    ),
+    {
+      UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
+      UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
+    },
+    upstreamFetch,
+  );
+  assert.equal(cachedResponse.status, 200);
+  assert.equal(upstreamFetches, 1);
 
   const statusResponse = await handleEventUniverseProxy(
     new Request(
@@ -824,15 +840,16 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   });
 });
 
-test('cadence refresh is GET-only and Targeter UI has no direct archive dependency', async () => {
-  const [client, server, packageDocument] = await Promise.all([
+test('status refresh is GET-only and Targeter UI has no direct archive dependency', async () => {
+  const [client, apiClient, server, packageDocument] = await Promise.all([
     readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/client/universe-api.ts', import.meta.url), 'utf8'),
     readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
     readFile(new URL('../package.json', import.meta.url), 'utf8'),
   ]);
-  assert.match(client, /const ROOT = '\/api\/event-universe'/);
+  assert.match(client, /universeGet<UniverseTargeterStatus>/);
   assert.match(client, /\/v1\/targeter\/status\?limit=5/);
-  assert.match(client, /method: 'GET'/);
+  assert.match(apiClient, /method: 'GET'/);
   for (const removed of [
     '/api/refresh',
     '/api/snapshot',

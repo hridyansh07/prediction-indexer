@@ -12,6 +12,11 @@ interface UniverseProxyEnvironment {
 }
 
 const RESPONSE_BUDGET_BYTES = 1_750_000;
+const SHORT_CACHE_SECONDS = 15;
+const IMMUTABLE_CACHE_SECONDS = 300;
+const cache = new Map<string, { expiresAt: number; document: unknown }>();
+const fetchIds = new WeakMap<object, number>();
+let nextFetchId = 0;
 
 export async function GET(request: Request) {
   return handleEventUniverseProxy(request, process.env, fetch);
@@ -40,6 +45,17 @@ export async function handleEventUniverseProxy(
   // the two names must change together.
   requestUrl.searchParams.delete('universePath');
   const pathname = paths[0].startsWith('/') ? paths[0] : `/${paths[0]}`;
+  const maxAge = cacheMaxAge(pathname);
+  const fetchId = fetchIds.get(fetchImpl) ?? ++nextFetchId;
+  fetchIds.set(fetchImpl, fetchId);
+  const cacheKey = `${fetchId}:${baseUrl}:${pathname}?${requestUrl.searchParams}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now())
+    return json(
+      200,
+      cached.document,
+      Math.ceil((cached.expiresAt - Date.now()) / 1000),
+    );
 
   try {
     const client = new EventUniverseClient({
@@ -57,7 +73,12 @@ export async function handleEventUniverseProxy(
       pathname,
       requestUrl.searchParams,
     );
-    return json(200, document);
+    if (maxAge > 0)
+      cache.set(cacheKey, {
+        expiresAt: Date.now() + maxAge * 1000,
+        document,
+      });
+    return json(200, document, maxAge);
   } catch (error) {
     const failure = universePublicFailure(error);
     return json(failure.status, failure.body);
@@ -80,7 +101,22 @@ function bounded(value: string | undefined, fallback: number) {
   return parsed;
 }
 
-function json(status: number, body: unknown) {
+function cacheMaxAge(pathname: string) {
+  if (pathname === '/healthz' || pathname === '/v1/targeter/status')
+    return SHORT_CACHE_SECONDS;
+  if (
+    pathname.startsWith('/v1/') &&
+    (pathname.startsWith('/v1/targeter/runs/') ||
+      pathname.startsWith('/v1/bundles') ||
+      pathname.startsWith('/v1/runs/') ||
+      pathname === '/v1/runs' ||
+      pathname === '/v1/selections')
+  )
+    return IMMUTABLE_CACHE_SECONDS;
+  return 0;
+}
+
+function json(status: number, body: unknown, maxAge = 0) {
   const serialized = JSON.stringify(body);
   if (new TextEncoder().encode(serialized).byteLength > RESPONSE_BUDGET_BYTES) {
     return Response.json(
@@ -97,7 +133,7 @@ function json(status: number, body: unknown) {
   return Response.json(body, {
     status,
     headers: {
-      'cache-control': 'no-store',
+      'cache-control': maxAge > 0 ? `private, max-age=${maxAge}` : 'no-store',
       'x-content-type-options': 'nosniff',
     },
   });

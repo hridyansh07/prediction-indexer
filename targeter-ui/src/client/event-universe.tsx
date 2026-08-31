@@ -8,17 +8,7 @@ import type {
 } from '../event-universe';
 import { EventIcon, gameName, SearchIcon, VenueStack, Chevron } from './icons';
 import { BundleDrawer, MobileDetailNotice } from './observability';
-
-const ROOT = '/api/event-universe';
-
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${ROOT}${path}`, {
-    headers: { accept: 'application/json' },
-  });
-  if (!response.ok)
-    throw new Error('Historical Event Universe is unavailable.');
-  return response.json() as Promise<T>;
-}
+import { universeGet } from './universe-api';
 
 async function loadAllBundles() {
   const bundles: UniverseBundle[] = [];
@@ -26,7 +16,7 @@ async function loadAllBundles() {
   do {
     const query = new URLSearchParams({ limit: '100' });
     if (cursor) query.set('cursor', cursor);
-    const page = await get<UniverseBundlePage>(`/v1/bundles?${query}`);
+    const page = await universeGet<UniverseBundlePage>(`/v1/bundles?${query}`);
     bundles.push(...page.bundles);
     cursor = page.next_cursor;
   } while (cursor);
@@ -84,10 +74,10 @@ export function EventUniversePage() {
     try {
       const bundleId = encodeURIComponent(bundle.bundle_id);
       const [nextDetail, historyPage] = await Promise.all([
-        get<UniverseSelectionDetail>(
+        universeGet<UniverseSelectionDetail>(
           `/v1/runs/${encodeURIComponent(bundle.latest_run_id)}/selections/${bundleId}`,
         ),
-        get<UniverseSelectionPage>(
+        universeGet<UniverseSelectionPage>(
           `/v1/bundles/${bundleId}/history?sort=selected&limit=100`,
         ),
       ]);
