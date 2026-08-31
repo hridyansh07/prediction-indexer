@@ -1,317 +1,151 @@
-# Selected-Bundle Event Universe Store V1
+# Event/Market Universe Store V2
 
-**Status:** implemented contract on `feat/event-universe`.
+**Status:** implemented contract. The historical filename is retained so
+existing documentation links remain valid.
 
-## 1. Purpose and boundary
+## 1. Purpose and authority
 
-Event Universe is a durable, append-only SQL index of the **bundle selections
-Targeter made and their proven retirement observations**. Its useful delta over
-Targeter observability is history: a consumer can query which selected event
-bundles existed at an event time or a Targeter selection time without
-downloading and scanning every archived run.
+Event Universe is a rebuildable SQLite view of committed Targeter v3 runs. It
+normalizes events, venue events, canonical markets, venue markets, selection
+decisions, selected-market occurrences, and market relationships so clients do
+not need to download or understand Targeter report payloads.
 
-For each selected occurrence it answers:
+Immutable Targeter run manifests and their objects remain authoritative. The
+database is a query accelerator, not a new commit protocol or evidence archive.
+It may be deleted and reconstructed by sync/backfill. Universe does not copy
+raw reports, raw catalogues, capture deliveries, replay state, or provider
+details into SQLite.
 
-- which run selected the bundle and whether continuity retained it;
-- when the event activates and when its one-hour lookahead starts;
-- when Targeter first observed every selected market terminal, or retired the
-  bundle at its safety clamp;
-- which event, sibling-market, selected-target, subscription, and relationship
-  references belong to the bundle; and
-- which immutable Targeter manifest and report contain the current occurrence
-  and its proven origin.
+The prior selected-bundle history APIs remain available. The former embedded
+cadence projection and `GET /v1/targeter/cadence` are removed because their
+payload size grows with runs, candidates, and relationships.
 
-The durable history remains intentionally narrow. A separate disposable cache
-supports the cadence UI with the newest five run projections. It is not:
+## 2. Verified source contract
 
-- a catalogue of everything Targeter inspected;
-- a historical archive of Targeter observability;
-- a second JSON archive;
-- a row-level index of captured venue deliveries;
-- an authority for choosing usable raw segments, continuity, or replay gates;
-- a replay plan or replay executor; or
-- a place for human-authored market links.
-
-Replay remains responsible for locating and validating raw/canonical evidence
-for an event interval. Event Universe supplies selected-event context and exact
-Targeter object-store provenance, not a claim that any raw segment is replayable.
-
-## 2. Source and version contract
-
-The sole commit marker is an immutable Targeter run manifest in the configured
-provider-neutral ObjectStore at:
+The only admitted commit marker is:
 
 ```text
 targeter-v2/runs/date=YYYY-MM-DD/run=<run_id>/run_manifest.json
 ```
 
-V1 accepts only:
+Universe accepts manifest version 2 with one Targeter v3 shadow selection
+report. Run ID, generated time, completeness, and strategy version must agree.
+It also consumes the manifest-owned normalized event/market NDJSON artifacts
+needed to resolve candidate references.
 
-- `targeter_run_manifest_version: 2`;
-- exactly one manifest-owned `selection_report.json` or
-  `selection_report.json.zst`;
-- `report_version: 3`, `mode: shadow`, and consistent run ID, generated time,
-  input-completeness, and strategy version; and
-- canonical run keys and run timestamps that identify the same UTC instant.
+All object access is provider-neutral:
 
-Every consumed object is checked through the shared ObjectStore against the
-manifest's byte length, SHA-256, content metadata, and provider checksum
-evidence. Zstandard reports are decoded through the shared strict streaming
-`encoder` with the manifest's stored and logical identities and decoded-size
-bound. Universe contains no provider-specific read, hashing, staging, or decode
-implementation.
+- metadata is checked through `verify_metadata_objects` in manifest order;
+- bounded JSON uses `archive.read_verified_json`;
+- normalized NDJSON uses `ArchivedObjectByteStreamer`; and
+- Zstandard decoding and stored/logical identity checks remain in the shared
+  archive/encoder packages.
 
-Existing archived v3 runs already satisfy this source contract. Universe
-derives its projection directly from their report. It does not require, create,
-or upload `selected_bundle_index`, `.universe.json`, `.control.ndjson.zst`, a
-receipt mirror, or any other Universe-specific archive artifact.
+Universe does not implement S3/GCS reads, checksums, private staging, Zstandard
+decoding, or JSON-size enforcement. Selection reports are capped at 128 MiB
+decoded and each normalized NDJSON artifact at 256 MiB decoded.
 
-Targeter report v1/v2 and archive-manifest v1 are rejected. V1 has no
-mixed-version admission or nullable origin. Schema v2 upgrades an existing v1
-database only by adding the rebuildable cadence cache.
+## 3. Canonical identity
 
-An incomplete v3 run is retained as visible run history with zero admitted
-selections. A complete v3 run may also legitimately contain zero selections,
-including continuity retirement that publishes an empty generation.
+An umbrella event ID is a deterministic digest of sport, optional game and
+topology, sorted participant keys, and activation time. It never includes a
+venue ID. Venue-native identities are `(venue, venue_event_id)` and
+`(venue, venue_market_id)`; this contract assumes each pair is globally unique
+and never reused by its venue.
 
-## 3. Deterministic selected projection
+A canonical market ID is a deterministic digest of:
 
-Only IDs in `selection.bundle_ids` become selection occurrences. A prior
-selected bundle may additionally produce a retirement observation under §4.
-Rejected candidates, unselected catalogues, and diagnostics do not enter the
-durable normalized history. Compact semantic summaries enter only the
-newest-five `cadence_runs` cache; report bodies and arbitrary vendor JSON do not.
+- umbrella event ID;
+- canonical class and market type;
+- scope; and
+- normalized semantic parameters.
 
-For each selected current candidate, the projector requires and normalizes:
+`market_template_version` and `outcome_space_version` are explicit key columns.
+They are not hidden in the canonical market ID.
 
-- bundle ID, sport, optional game/topology, participants, and participant keys;
-- event activation and capture-start timestamps;
-- event references and all sibling market IDs;
-- selected targets, canonical classes, source references, and subscription IDs;
-- relationship edges; and
-- optional `held_current_candidate` continuity provenance.
+First- and last-seen run IDs make continuity explicit. Re-ingesting the same
+verified run is idempotent. A venue-native identity that is assigned to a
+different umbrella event fails closed.
 
-The report must name every supported venue in `selection.targets`; a selected
-candidate must be eligible, carry at least one target, and agree with target
-timing. Selected targets must be members of its sibling-market set. Lists and
-rows are sorted explicitly before hashing or insertion.
+## 4. Relationships
 
-A current candidate is a `complete` occurrence whose immutable origin is its
-current run. This includes `held_current_candidate`: Targeter's v3 publication
-contract re-origins a current candidate even when continuity protected its
-budget position.
+Relationships are normalized into `relations`, `relation_members`, and
+`relation_observations`. A relation supports any number of members and optional
+claim keys even though current Targeter reports emit two members.
 
-## 4. Continuity origin and retirement
+The canonical hash contains only the relationship type and normalized members.
+It excludes event, run, bundle, scope, coverage, generation version, market
+template version, and outcome-space version. Symmetric types normalize every
+member to role `member` and sort by venue, venue market ID, claim key, and role.
+Directed types preserve `left`/`right` roles. Generation version is an explicit
+database key column rather than part of the hash input.
 
-Targeter's v3 continuity behavior remains unchanged. In particular, retained
-targets can be absent from current candidates and catalogues, and unknown
-terminal state remains protected rather than inferred terminal.
+`GET /v1/relationship-types` publishes the closed current type catalogue and
+its directed/member-role semantics.
 
-A selected bundle with disposition `retained` is admitted only when its
-continuity evidence supplies non-null:
+## 5. Selection continuity and history
 
-- `origin_run_id`;
-- `origin_report_sha256`;
-- `origin_archive_manifest_key`; and
-- `origin_archive_manifest_sha256`.
+Current candidate selections are linked directly to normalized event and venue
+market rows. A retained selection may be absent from the current catalogue;
+Universe recursively verifies and ingests its exact complete origin, then
+copies the origin's normalized selected-market references into the current run.
+Missing, cyclic, mismatched, or non-complete origins reject the transaction.
 
-Universe follows that exact manifest reference even when the origin lies
-outside the incremental or requested backfill range. It verifies and ingests
-the origin recursively, requires the referenced report to contain one complete
-occurrence for the same bundle, and requires current retained activation,
-capture start, targets, and subscription IDs to equal that origin context.
+The existing content-addressed bundle context, occurrence, and retirement
+tables remain for backward-compatible `/v1/bundles`, `/v1/selections`, and
+selection-detail APIs. Terminal observation remains an upper bound; a clamp is
+not represented as an exact event end.
 
-The SQL occurrence points to the separately stored origin occurrence. Both
-occurrences reference the same content-addressed normalized context. This
-avoids copying the context into every continuity run while keeping every query
-fully resolvable in SQL. Selection-detail responses join the origin run and
-return its immutable manifest/report keys and hashes.
+## 6. SQLite schema and rebuild
 
-Origin cycles, missing objects, wrong identities, a retained origin, a missing
-origin bundle, or timing/target drift reject the current occurrence's entire
-run transaction. Universe never guesses or admits unresolved origin.
-
-Targeter and the venues do not supply an exact event-end timestamp. In
-particular, Targeter's terminal probes classify a held market for one run but
-do not timestamp when its state changed. Universe therefore does not expose a
-misleading `ended_at` value.
-
-For `all_markets_terminal`, Universe verifies that every target in the
-continuity evidence has a `terminal` probe and records the report's
-`generated_at` as `terminal_observed_at`. The actual all-terminal transition
-happened no later than this observation, normally within one Targeter cadence.
-For `terminal_clamp_elapsed`, it records `retired_at` and the disposition but
-leaves `terminal_observed_at` null: the clamp is safe eviction, not proof of
-the event's real end.
-
-Both retirement paths require the same non-null immutable origin identities as
-a retained selection. Universe recursively verifies that complete origin and
-requires exact activation, capture-start, target, and subscription context.
-`continuity_budget_trimmed` is not an event ending and is not projected. An
-empty run and every retirement observation remain visible through run history.
-
-## 5. Incremental sync and bounded backfill
-
-`universe/run_sync.py` and `universe/run_backfill.py` are direct one-shot scripts
-configured by `configs/event_universe.json`. They have no argument parser or
-internal scheduling loop.
-
-Both use the same manifest reader, v3 projector, origin resolver, and append
-transaction:
-
-- A fresh incremental store discovers all committed manifests but indexes only
-  the latest archived run, establishing useful current state cheaply.
-- Later incremental runs list date prefixes from their checkpoint through the
-  current UTC date. They append every not-yet-indexed committed run they find,
-  including earlier runs on the checkpoint date.
-- Bounded backfill lists the half-open Targeter generated-time range
-  `[generated_start, generated_end)` from JSON config.
-- Repeating either operation is idempotent. The same run and identities are a
-  verified no-op; changed immutable evidence or a changed projection conflicts.
-- One malformed manifest is reported while independent later manifests remain
-  eligible. The incremental checkpoint retains the earliest failed date so it
-  is retried.
-
-Origin dependencies are not constrained by the backfill range. Their insertion
-is required to make the requested retained occurrence provable and queryable.
-
-Discovery by object listing is not commitment. Only a valid `run_manifest.json`
-admits a run. Universe does not consume Targeter's atomic `current.json` splice
-publication pointer and publishes no pointer of its own. The greatest indexed
-run timestamp is the derived latest archived run. `/healthz` reports it stale
-after one hour based on its manifest-owned `generated_at`; this is conservative
-when archival or sync was delayed.
-
-## 6. SQL model and durability
-
-The separately reviewable schema is:
+Runtime schema version is 3 and is composed from:
 
 ```text
-universe/schema/README.md
-universe/schema/v1.sql
-universe/schema/v2.sql
+universe/schema/v1.sql  # historical bundle APIs and source identities
+universe/schema/v3.sql  # event/market universe
 ```
 
-It contains:
+Schema v3 intentionally has no in-place migration. Before deploying this
+version, stop Universe jobs and remove the existing rebuildable SQLite database
+(including its WAL/SHM siblings), then run sync/backfill against the immutable
+archive. Starting against schema v1/v2 fails with a clear rebuild instruction.
 
-- `targeter_runs`: exact manifest/report identities and deterministic
-  projection identity/count;
-- `bundle_contexts` and normalized child tables: content-addressed selected
-  event, market, target, asset, and relationship context;
-- `selection_occurrences`: append-only `(run_id, bundle_id)` history and exact
-  complete/retained origin reference;
-- `bundle_retirements`: append-only all-terminal or clamp observations linked
-  to an exact complete origin and normalized context; and
-- `checkpoints`: incremental discovery progress only; and
-- `cadence_runs`: content-identified newest-five operational projections,
-  deleted by rotation without affecting durable selected history.
+Each admitted run and both projections are inserted in one `BEGIN IMMEDIATE`
+transaction with foreign keys, WAL, and `synchronous=FULL`. A projection
+identity detects changed re-ingestion input. SQLite backup uses the native
+online backup API followed by `integrity_check`.
 
-It contains no report/catalogue JSON, active-snapshot table, raw segment,
-control-envelope, connection-epoch, venue-delivery, or replay-plan table.
+## 7. Sync and backfill
 
-Each run is validated before and inserted inside one `BEGIN IMMEDIATE`
-transaction. SQLite uses foreign keys, WAL, `synchronous=FULL`, bounded read
-transactions, and SQLite-native online backup followed by `integrity_check`.
-Contexts are deduplicated by canonical SHA-256. Re-materializing normalized SQL
-rows must reproduce each stored context and run-projection hash.
+`universe/run_sync.py` and `universe/run_backfill.py` are scheduler-owned
+one-shot jobs. Incremental sync continues after an independently bad manifest
+and keeps its checkpoint at the earliest failed date for retry. Backfill uses
+the configured half-open generated-time range. Origin dependencies may be
+ingested outside that range when required to prove continuity.
 
-The immutable ObjectStore remains evidence authority. Selected-history SQL is
-durable operational state and a query accelerator; keep it on an attached
-persistent volume and back it up
-because replaying all historical reports is the expensive recovery path. A
-small burstable instance is appropriate because row growth follows selected
-bundles and runs, not all catalogues or 13.6 million daily deliveries.
+Incomplete and complete-empty runs remain visible but create no selection
+rows. The archive remains sufficient to rebuild all SQLite state.
 
-## 7. Read API
+## 8. Read API
 
-The API is read-only JSON with half-open timestamp filters and opaque stable
-cursors:
+All responses are strict JSON and remain under the 1.75 MB server budget. List
+limits are 1–100 and list cursors are opaque and query-specific.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /healthz` | Schema, latest indexed run, age/staleness, and counts |
-| `GET /v1/runs` | Run history; generated-time and completeness filters |
-| `GET /v1/runs/<run_id>` | Source identities, projection identity, and local SQL audit |
-| `GET /v1/runs/<run_id>/audit` | Re-materialize and verify that run's SQL projection |
-| `GET /v1/runs/<run_id>/selections` | Occurrences selected in one run |
-| `GET /v1/runs/<run_id>/selections/<bundle_id>` | Full context plus current and origin object provenance |
-| `GET /v1/selections` | Cross-run selected history |
-| `GET /v1/bundles/<bundle_id>/history` | One bundle's selected occurrence history |
-| `GET /v1/targeter/cadence` | Newest-five operational projection and archive-cadence freshness |
-| `GET /v1/targeter/status?limit=5` | Compact landing-page freshness and current-complete selection summary |
-| `GET /v1/targeter/runs/<run_id>` | Full cadence evidence for one run, bounded by the API response budget |
+| `GET /healthz` | Schema, latest run, staleness, and normalized counts |
+| `GET /v1/targeter/status?limit=5` | Compact landing status and newest complete selection counts |
+| `GET /v1/targeter/runs/<run_id>` | Bounded decisions and normalized event/market/relation references |
+| `GET /v1/events?limit=&cursor=` | Canonical event summaries |
+| `GET /v1/events/<event_id>` | Event, venue events, canonical markets, relations, observations |
+| `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, relations |
+| `GET /v1/relations/<relation_id>` | Relation, normalized members, observations |
+| `GET /v1/relationship-types` | Closed relationship-type catalogue |
+| `GET /v1/runs`, `/v1/selections`, `/v1/bundles` | Historical compatibility APIs |
 
-Selection queries support:
+`GET /v1/targeter/cadence` returns 404. Run detail intentionally omits raw
+candidate relationship arrays and raw report payloads; clients follow event,
+market, and relation IDs for detail.
 
-- `activation_start` and `activation_end` for event-time filtering;
-- `selected_start` and `selected_end` for Targeter generated-time filtering;
-- `venue`, `sort=activation|selected`, `limit`, and `cursor`.
-
-RFC 3339 bounds are half-open. Activation sorting is the default for general
-selection and per-run queries; selected-time sorting is the default for bundle
-history. API source/origin objects return exact Targeter manifest/report object
-keys and SHA-256 identities. They do not return or infer raw capture-object
-locations.
-
-Selection list and detail responses include `retirement: null` until a terminal
-or clamp observation is indexed. Afterwards the object supplies `retired_at`,
-the disposition, nullable `terminal_observed_at`, and the exact retirement
-report's run ID, manifest/report object keys, and hashes. An all-terminal
-`terminal_observed_at` is an observation upper bound, not a fabricated exact
-match-end timestamp.
-
-The API process requires no object-store credentials or mount. Its audit
-endpoint verifies the stored normalized projection. The sync layer additionally supports an
-authoritative audit that rereads the exact manifest/report bytes before
-requiring the SQL audit to pass.
-
-## 8. Deployment
-
-Event Universe is separate from capture and ingester services:
-
-```text
-small burstable VM
-├── attached persistent volume
-│   ├── event-universe.sqlite3 and WAL
-│   ├── bounded Zstd staging directory
-│   └── local SQLite backups
-├── read-only API server
-├── scheduled one-shot incremental sync
-├── optional bounded one-shot backfill
-└── scheduled one-shot backup/upload
-```
-
-`docker/universe.Dockerfile` starts the API by default. Compose mounts the
-Universe volume and readable config, never the capture spool:
-
-```bash
-docker compose -f compose.universe.yaml up -d event-universe
-```
-
-Scheduler invocations use the `jobs` profile. Backfill refuses to run until
-both bounds are set explicitly in JSON. The archive sidecar has no Universe
-responsibility and creates no derivative objects.
-
-## 9. Acceptance criteria
-
-V1 is complete when tests prove:
-
-1. strict v3 manifest/report identities, including shared bounded Zstd decode;
-2. fresh latest-run bootstrap and append-only incremental history;
-3. bounded, idempotent backfill directly from existing reports;
-4. deterministic selected-lifecycle projection and context deduplication;
-5. exact recursive retained/retirement origin resolution outside requested
-   ranges;
-6. fail-closed origin identity, context, target/timing, and all-terminal probe
-   checks;
-7. visible incomplete and complete-empty run history without false selections;
-8. independent event-time and Targeter-time filtering with stable pagination;
-9. local SQL projection audit and authoritative source re-verification;
-10. honest terminal-observation versus clamp semantics without a fabricated
-    exact event-end timestamp;
-11. absence of Universe archive sidecars and raw/control/replay tables or APIs;
-12. independently readable SQLite backup; and
-13. no legacy report admission, durable Universe pointer, or Targeter
-    continuity weakening; and
-14. provider-neutral retrieval plus exact newest-five cache rotation and API
-    ordering.
+The API process reads SQLite only and needs no object-store credentials. Sync
+owns all verified archive retrieval.

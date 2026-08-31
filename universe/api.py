@@ -30,11 +30,11 @@ class UniverseApplication:
             return HTTPStatus.OK, self._selections(query)
         if parsed.path == "/v1/bundles":
             return HTTPStatus.OK, self._bundles(query)
-        if parsed.path == "/v1/targeter/cadence":
-            _only(query, {"limit"})
-            return HTTPStatus.OK, self.database.cadence_snapshot(
-                limit=_integer(query, "limit", default=5)
-            )
+        if parsed.path == "/v1/events":
+            return HTTPStatus.OK, self._events(query)
+        if parsed.path == "/v1/relationship-types":
+            _only(query, set())
+            return HTTPStatus.OK, _relationship_types()
         if parsed.path == "/v1/targeter/status":
             _only(query, {"limit"})
             return HTTPStatus.OK, self.database.cadence_status_snapshot(
@@ -45,9 +45,48 @@ class UniverseApplication:
             run_id = _path_value(
                 parsed.path.removeprefix("/v1/targeter/runs/"), "run id"
             )
-            detail = self.database.cadence_run_detail(run_id)
+            detail = self.database.targeter_run_detail(run_id)
             if detail is None:
                 return HTTPStatus.NOT_FOUND, {"error": "run not found"}
+            return HTTPStatus.OK, detail
+        if parsed.path.startswith("/v1/events/"):
+            _only(query, set())
+            event_id = _path_value(
+                parsed.path.removeprefix("/v1/events/"), "event id"
+            )
+            detail = self.database.event_detail(event_id)
+            if detail is None:
+                return HTTPStatus.NOT_FOUND, {"error": "event not found"}
+            return HTTPStatus.OK, detail
+        if parsed.path.startswith("/v1/markets/"):
+            _only(query, {"market_template_version", "outcome_space_version"})
+            market_id = _path_value(
+                parsed.path.removeprefix("/v1/markets/"), "market id"
+            )
+            detail = self.database.market_detail(
+                market_id,
+                market_template_version=_optional_positive_integer(
+                    query, "market_template_version"
+                ),
+                outcome_space_version=_optional_positive_integer(
+                    query, "outcome_space_version"
+                ),
+            )
+            if detail is None:
+                return HTTPStatus.NOT_FOUND, {"error": "market not found"}
+            return HTTPStatus.OK, detail
+        if parsed.path.startswith("/v1/relations/"):
+            _only(query, set())
+            raw_id = _path_value(
+                parsed.path.removeprefix("/v1/relations/"), "relation id"
+            )
+            try:
+                relation_id = int(raw_id)
+            except ValueError as error:
+                raise ValueError("relation id must be a positive integer") from error
+            detail = self.database.relation_detail(relation_id)
+            if detail is None:
+                return HTTPStatus.NOT_FOUND, {"error": "relation not found"}
             return HTTPStatus.OK, detail
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
             bundle_id = _path_value(
@@ -180,6 +219,21 @@ class UniverseApplication:
             )
         return {"bundles": bundles, "next_cursor": next_cursor}
 
+    def _events(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        _only(query, {"limit", "cursor"})
+        after = _event_cursor(_optional(query, "cursor"))
+        events, has_more = self.database.list_events(
+            after=after,
+            limit=_integer(query, "limit", default=100),
+        )
+        next_cursor = None
+        if has_more and events:
+            last = events[-1]
+            next_cursor = _encode_cursor(
+                ["events", _timestamp_ns(last["activation_at"]), last["event_id"]]
+            )
+        return {"events": events, "next_cursor": next_cursor}
+
 
 def serve(database: UniverseStore, host: str, port: int) -> None:
     application = UniverseApplication(database)
@@ -241,6 +295,21 @@ def _integer(query: dict[str, list[str]], field: str, *, default: int) -> int:
         raise ValueError(f"query parameter {field} must be an integer") from error
     if value <= 0 or value > 100:
         raise ValueError(f"query parameter {field} must be between 1 and 100")
+    return value
+
+
+def _optional_positive_integer(
+    query: dict[str, list[str]], field: str
+) -> int | None:
+    raw = _optional(query, field)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"query parameter {field} must be an integer") from error
+    if value <= 0:
+        raise ValueError(f"query parameter {field} must be positive")
     return value
 
 
@@ -333,3 +402,50 @@ def _bundle_cursor(value: str | None) -> tuple[int, str] | None:
     ):
         raise ValueError("cursor does not belong to the bundles query")
     return decoded[1], decoded[2]
+
+
+def _event_cursor(value: str | None) -> tuple[int, str] | None:
+    if value is None:
+        return None
+    decoded = _decode_cursor(value)
+    if (
+        len(decoded) != 3
+        or decoded[0] != "events"
+        or not isinstance(decoded[1], int)
+        or not isinstance(decoded[2], str)
+    ):
+        raise ValueError("cursor does not belong to the events query")
+    return decoded[1], decoded[2]
+
+
+def _relationship_types() -> dict[str, Any]:
+    return {
+        "relationship_type_catalog_version": 1,
+        "types": [
+            {
+                "type": "IDENTITY",
+                "directed": False,
+                "member_roles": ["member"],
+            },
+            {
+                "type": "IMPLICATION",
+                "directed": True,
+                "member_roles": ["left", "right"],
+            },
+            {
+                "type": "REVERSE_IMPLICATION",
+                "directed": True,
+                "member_roles": ["left", "right"],
+            },
+            {
+                "type": "MUTUAL_EXCLUSION",
+                "directed": False,
+                "member_roles": ["member"],
+            },
+            {
+                "type": "OVERLAP",
+                "directed": False,
+                "member_roles": ["member"],
+            },
+        ],
+    }

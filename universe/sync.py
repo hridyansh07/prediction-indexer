@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
@@ -9,8 +10,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from archive import read_verified_json
+from archive.retrieval import ArchivedObject, ArchivedObjectByteStreamer
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
+    NDJSON_CONTENT_TYPE,
     ObjectExpectation,
     ObjectStore,
 )
@@ -25,7 +28,7 @@ from targeter.v2.manifest import (
     parse_run_manifest,
 )
 from targeter.v2.models import parse_timestamp
-from universe.cadence import project_cadence_run
+from universe.market_projection import project_market_universe
 from universe.projection import (
     PROJECTION_VERSION,
     project_bundle_retirements,
@@ -35,6 +38,7 @@ from universe.store import EvidenceConflict, UniverseStore
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_SELECTION_REPORT_BYTES = 128 * 1024 * 1024
+MAX_CATALOG_ARTIFACT_BYTES = 256 * 1024 * 1024
 INCREMENTAL_CHECKPOINT = "targeter-v3-incremental-date"
 
 
@@ -68,6 +72,7 @@ class _VerifiedRun:
     manifest_stored: StoredIdentity
     report_item: RunObject
     report: dict[str, Any]
+    market_projection: dict[str, Any]
     projected: tuple[dict[str, Any], ...]
     retirements: tuple[dict[str, Any], ...]
 
@@ -93,8 +98,6 @@ class UniverseSync:
         latest = self.database.latest_run()
         checkpoint = self.database.checkpoint(INCREMENTAL_CHECKPOINT)
         observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        for missing_key in self.database.missing_cadence_manifest_keys():
-            self._ingest_direct(missing_key, result)
         if checkpoint is None and latest is None:
             try:
                 keys = self._all_manifest_keys()
@@ -293,7 +296,7 @@ class UniverseSync:
                     if report_logical is not None
                     else verified.report_item.stored.byte_length
                 ),
-                cadence=project_cadence_run(verified.report),
+                market_projection=verified.market_projection,
                 occurrences=resolved,
                 retirements=resolved_retirements,
             )
@@ -493,8 +496,36 @@ class UniverseSync:
             if manifest.input_complete
             else ()
         )
+        catalog_events: list[Mapping[str, Any]] = []
+        catalog_markets: list[Mapping[str, Any]] = []
+        rule_templates: list[Mapping[str, Any]] = []
+        for item in manifest.objects:
+            if item.file.startswith("catalog_") and "_events.ndjson" in item.file:
+                catalog_events.extend(
+                    self._read_ndjson(item, bound_expectations[item.key])
+                )
+            elif item.file.startswith("catalog_") and "_markets.ndjson" in item.file:
+                catalog_markets.extend(
+                    self._read_ndjson(item, bound_expectations[item.key])
+                )
+            elif item.file.startswith("rule_templates.ndjson"):
+                rule_templates.extend(
+                    self._read_ndjson(item, bound_expectations[item.key])
+                )
+        market_projection = project_market_universe(
+            report,
+            catalog_events=catalog_events,
+            catalog_markets=catalog_markets,
+            rule_templates=rule_templates,
+        )
         return _VerifiedRun(
-            manifest, manifest_stored, report_item, report, projected, retirements
+            manifest,
+            manifest_stored,
+            report_item,
+            report,
+            market_projection,
+            projected,
+            retirements,
         )
 
     def _read_run_manifest(
@@ -550,6 +581,37 @@ class UniverseSync:
         if not isinstance(document, dict):
             raise UniverseSyncError(f"selection report {item.key} is not an object")
         return document
+
+    def _read_ndjson(
+        self, item: RunObject, expected: ObjectExpectation
+    ) -> list[Mapping[str, Any]]:
+        if item.content_type != NDJSON_CONTENT_TYPE or item.logical is None:
+            raise UniverseSyncError(f"normalized artifact {item.key} is not NDJSON")
+        if item.logical.byte_length > MAX_CATALOG_ARTIFACT_BYTES:
+            raise UniverseSyncError(
+                f"normalized artifact {item.key} exceeds "
+                f"{MAX_CATALOG_ARTIFACT_BYTES} decoded bytes"
+            )
+        streamer = ArchivedObjectByteStreamer(
+            self.objects,
+            (ArchivedObject(item.file, expected, item.logical),),
+            temp_root=self.temporary_directory,
+        )
+        pending = b""
+        rows: list[Mapping[str, Any]] = []
+        for chunk in streamer.iter_bytes(item.file):
+            pending += chunk
+            lines = pending.split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                rows.append(_ndjson_row(line, item.key))
+        if pending:
+            raise UniverseSyncError(f"normalized artifact {item.key} lacks final LF")
+        if len(rows) != item.logical.line_count:
+            raise UniverseSyncError(
+                f"normalized artifact {item.key} line count disagrees with manifest"
+            )
+        return rows
 
     def _all_manifest_keys(self) -> list[str]:
         keys = [
@@ -630,6 +692,18 @@ def _required_text(document: Mapping[str, Any], field: str, label: str) -> str:
     value = document.get(field)
     if not isinstance(value, str) or not value:
         raise UniverseSyncError(f"{label} {field} must be non-empty text")
+    return value
+
+
+def _ndjson_row(line: bytes, key: str) -> Mapping[str, Any]:
+    if not line:
+        raise UniverseSyncError(f"normalized artifact {key} contains an empty line")
+    try:
+        value = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise UniverseSyncError(f"normalized artifact {key} contains invalid JSON") from error
+    if not isinstance(value, dict):
+        raise UniverseSyncError(f"normalized artifact {key} row is not an object")
     return value
 
 

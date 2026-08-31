@@ -751,16 +751,19 @@ python universe/run_sync.py
 python universe/run_backup.py
 ```
 
-The durable store is intentionally sparse and append-only: it indexes historical
-Targeter-selected bundle occurrences plus normalized event, sibling-market,
-target-asset, relationship, and exact source/origin provenance. A separate
-disposable `cadence_runs` cache keeps exactly the newest five run projections,
-including incomplete and empty runs. It contains compact catalogue, candidate,
-rejection, admission, continuity, terminal-probe, and diagnostic evidence; it
-does not copy raw catalogues or selection reports. The archive remains
-authoritative and the cache is rebuildable. The durable selected-history schema
-is `universe/schema/v1.sql`; `universe/schema/v2.sql` adds only this disposable
-cache and upgrades existing v1 databases in place.
+The store is a rebuildable event/market view of committed Targeter runs. It
+normalizes cross-venue umbrella events, venue-native events, canonical market
+classes, venue market instances, candidate decisions, selected-market
+occurrences, relationships, and exact source/origin provenance. It does not
+copy raw catalogues or selection reports. `universe/schema/v1.sql` preserves
+the historical bundle APIs and `universe/schema/v3.sql` owns the normalized
+event/market view. There is no cadence cache.
+
+Schema v3 intentionally does not migrate an existing database. Before rolling
+out this version, stop the API and Universe jobs, remove the rebuildable SQLite
+file plus its `-wal`/`-shm` siblings, start the service to create schema v3, and
+run sync/backfill from the immutable archive. A v1/v2 database is rejected with
+a rebuild instruction.
 
 Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
 version-2 run manifests and derives selected occurrences directly from each
@@ -781,16 +784,14 @@ Universe sidecar or receipt-mirror service.
 `EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
 backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
 a private interface or authenticated reverse proxy when exposing the API.
-`GET /v1/targeter/cadence` serves the newest-five cache in descending run order;
-its current/late state describes archive cadence only, not publication or splice
-health. The UI consumes `GET /v1/targeter/status?limit=5`, a compact landing-page
-view containing only freshness, latest/current-complete run summaries, and
-selected-target counts. Full cadence evidence is available on demand from
-`GET /v1/targeter/runs/<run_id>` and detailed selected-bundle context remains
-available through the run/bundle endpoints.
-Universe and the UI proxy enforce a 1.75 MB serialized response budget; list
-limits are capped at 100. The legacy cadence route remains for compatibility but
-is not used by the UI.
+The UI consumes `GET /v1/targeter/status?limit=5`, a compact landing-page view
+containing only freshness, latest/current-complete run summaries, and selected
+counts. `GET /v1/targeter/runs/<run_id>` returns bounded normalized decisions
+and references. Event, market, and relationship detail is available from
+`/v1/events`, `/v1/markets/<market_id>`, and `/v1/relations/<relation_id>`.
+`GET /v1/targeter/cadence` has been removed and returns 404. Universe and the UI
+proxy enforce a 1.75 MB serialized response budget; list limits are capped at
+100.
 
 ## Clock and liveness semantics
 

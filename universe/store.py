@@ -16,16 +16,18 @@ from typing import Any, Iterable, Iterator, Mapping
 from archive.common.durable import fsync_directory
 from archive.storage.base import normalize_key
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.cadence import CADENCE_PROJECTION_VERSION, validate_cadence_projection
+from universe.market_projection import MARKET_PROJECTION_VERSION
 from universe.projection import PROJECTION_VERSION
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STALE_AFTER_SECONDS = 3_600
 TARGETER_CADENCE_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
-SCHEMA_V2_PATH = Path(__file__).with_name("schema") / "v2.sql"
+SCHEMA_V3_PATH = Path(__file__).with_name("schema") / "v3.sql"
+
+
 class EvidenceConflict(ValueError):
     """Immutable source evidence or its SQL projection is inconsistent."""
 
@@ -41,34 +43,20 @@ class UniverseStore:
             if version == 0:
                 objects = self._schema_objects(connection)
                 if not objects:
-                    self._execute_schema_transaction(connection, SCHEMA_PATH)
+                    self._execute_schema_transaction(
+                        connection, SCHEMA_PATH, SCHEMA_V3_PATH
+                    )
                 else:
-                    self._validate_recoverable_schema(connection)
-                version = 1
-            if version == 1:
-                self._validate_recoverable_schema(connection)
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    cadence = connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cadence_runs'"
-                    ).fetchone()
-                    if cadence is None:
-                        self._execute_statements(connection, SCHEMA_V2_PATH)
-                    else:
-                        connection.execute(
-                            "CREATE INDEX IF NOT EXISTS cadence_runs_generated "
-                            "ON cadence_runs(generated_at_ns DESC, run_id DESC)"
-                        )
-                    connection.execute("PRAGMA user_version = 2")
-                    connection.commit()
-                except Exception:
-                    connection.rollback()
-                    raise
+                    raise EvidenceConflict(
+                        "Event Universe schema v3 requires a fresh database; "
+                        "remove the rebuildable SQLite file and run sync"
+                    )
             elif version != SCHEMA_VERSION:
                 raise EvidenceConflict(
                     f"unsupported Event Universe schema version {version}; "
-                    "initialize a fresh v1 database"
+                    "remove the rebuildable SQLite file and run sync"
                 )
+            self._validate_schema(connection)
 
     @staticmethod
     def _schema_objects(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
@@ -90,26 +78,11 @@ class UniverseStore:
             return cls._schema_objects(expected)
 
     @classmethod
-    def _validate_recoverable_schema(cls, connection: sqlite3.Connection) -> None:
+    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
         actual = cls._schema_objects(connection)
-        expected_v1 = cls._expected_schema(SCHEMA_PATH)
-        expected_v2 = cls._expected_schema(SCHEMA_PATH, SCHEMA_V2_PATH)
-        cadence_keys = {
-            ("table", "cadence_runs"),
-            ("index", "cadence_runs_generated"),
-        }
-        if any(actual.get(key) != definition for key, definition in expected_v1.items()):
-            raise EvidenceConflict("database contains an invalid Event Universe v1 schema")
-        extras = set(actual) - set(expected_v1)
-        if not extras <= cadence_keys:
-            raise EvidenceConflict("database contains unexpected Event Universe schema objects")
-        cadence_table = ("table", "cadence_runs")
-        cadence_index = ("index", "cadence_runs_generated")
-        if cadence_index in actual and cadence_table not in actual:
-            raise EvidenceConflict("cadence index exists without its table")
-        for key in extras:
-            if actual[key] != expected_v2[key]:
-                raise EvidenceConflict("existing cadence_runs table has an invalid schema")
+        expected = cls._expected_schema(SCHEMA_PATH, SCHEMA_V3_PATH)
+        if actual != expected:
+            raise EvidenceConflict("database contains an invalid Event Universe v3 schema")
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
@@ -119,12 +92,13 @@ class UniverseStore:
 
     @classmethod
     def _execute_schema_transaction(
-        cls, connection: sqlite3.Connection, path: Path
+        cls, connection: sqlite3.Connection, *paths: Path
     ) -> None:
         try:
             connection.execute("BEGIN IMMEDIATE")
-            cls._execute_statements(connection, path)
-            connection.execute("PRAGMA user_version = 1")
+            for path in paths:
+                cls._execute_statements(connection, path)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -162,37 +136,14 @@ class UniverseStore:
     def known_manifest(self, key: str, sha256: str) -> bool:
         with closing(self.connect(readonly=True)) as connection:
             row = connection.execute(
-                """SELECT r.manifest_sha256,
-                          EXISTS(
-                              SELECT 1 FROM cadence_runs c WHERE c.run_id = r.run_id
-                          ) AS has_cadence,
-                          r.run_id IN (
-                              SELECT run_id FROM targeter_runs
-                              ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
-                          ) AS needs_cadence
-                   FROM targeter_runs r WHERE r.manifest_key = ?""",
+                "SELECT manifest_sha256 FROM targeter_runs WHERE manifest_key = ?",
                 (key,),
             ).fetchone()
         if row is None:
             return False
         if row["manifest_sha256"] != sha256:
             raise EvidenceConflict(f"immutable manifest {key!r} changed identity")
-        return bool(row["has_cadence"]) or not bool(row["needs_cadence"])
-
-    def missing_cadence_manifest_keys(self) -> list[str]:
-        with closing(self.connect(readonly=True)) as connection:
-            rows = connection.execute(
-                """WITH newest AS (
-                       SELECT run_id, manifest_key, generated_at_ns
-                       FROM targeter_runs
-                       ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
-                   )
-                   SELECT r.manifest_key FROM newest r
-                   LEFT JOIN cadence_runs c USING (run_id)
-                   WHERE c.run_id IS NULL
-                   ORDER BY r.generated_at_ns DESC, r.run_id DESC"""
-            ).fetchall()
-        return [str(row["manifest_key"]) for row in rows]
+        return True
 
     def latest_run(self) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
@@ -224,7 +175,7 @@ class UniverseStore:
         report_byte_length: int,
         report_decoded_sha256: str,
         report_decoded_byte_length: int,
-        cadence: Mapping[str, Any],
+        market_projection: Mapping[str, Any],
         occurrences: Iterable[Mapping[str, Any]],
         retirements: Iterable[Mapping[str, Any]],
     ) -> str:
@@ -292,11 +243,10 @@ class UniverseStore:
         ]
         projection_sha256 = _records_sha256(projection_entries)
         generated_at_ns = _timestamp_ns(generated_at)
-        cadence = validate_cadence_projection(cadence)
-        cadence_json = json.dumps(
-            cadence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        market_projection = _market_projection(
+            market_projection, expected_run_id=run_id, expected_generated_at=generated_at
         )
-        cadence_sha256 = hashlib.sha256(cadence_json.encode("utf-8")).hexdigest()
+        market_sha256, market_row_count = _market_projection_identity(market_projection)
         expected = {
             "run_id": run_id,
             "generated_at": generated_at,
@@ -331,28 +281,20 @@ class UniverseStore:
                     raise EvidenceConflict(
                         f"Targeter run {run_id} SQL projection failed audit"
                     )
-                cached = connection.execute(
-                    "SELECT payload_sha256 FROM cadence_runs WHERE run_id = ?", (run_id,)
+                projected = connection.execute(
+                    """SELECT projection_version, projection_sha256,
+                              projection_row_count
+                       FROM universe_run_projections WHERE run_id = ?""",
+                    (run_id,),
                 ).fetchone()
-                if cached is not None and cached["payload_sha256"] != cadence_sha256:
+                if projected is None or (
+                    projected["projection_version"] != MARKET_PROJECTION_VERSION
+                    or projected["projection_sha256"] != market_sha256
+                    or projected["projection_row_count"] != market_row_count
+                ):
                     raise EvidenceConflict(
-                        f"Targeter run {run_id} cadence projection conflicts with prior ingestion"
+                        f"Targeter run {run_id} market projection conflicts with prior ingestion"
                     )
-                if cached is None:
-                    connection.execute(
-                        """INSERT INTO cadence_runs(
-                               run_id, generated_at_ns, projection_version,
-                               payload_json, payload_sha256
-                           ) VALUES (?, ?, ?, ?, ?)""",
-                        (
-                            run_id,
-                            generated_at_ns,
-                            CADENCE_PROJECTION_VERSION,
-                            cadence_json,
-                            cadence_sha256,
-                        ),
-                    )
-                    _trim_cadence(connection)
                 return "skipped"
 
             indexed_at_ns = time.time_ns()
@@ -387,18 +329,13 @@ class UniverseStore:
                     indexed_at_ns,
                 ),
             )
-            connection.execute(
-                """INSERT INTO cadence_runs(
-                       run_id, generated_at_ns, projection_version,
-                       payload_json, payload_sha256
-                   ) VALUES (?, ?, ?, ?, ?)""",
-                (
-                    run_id,
-                    generated_at_ns,
-                    CADENCE_PROJECTION_VERSION,
-                    cadence_json,
-                    cadence_sha256,
-                ),
+            self._insert_market_projection(
+                connection,
+                run_id=run_id,
+                projection=market_projection,
+                projection_sha256=market_sha256,
+                projection_row_count=market_row_count,
+                occurrences=normalized,
             )
             for value in normalized:
                 context = value["context"]
@@ -468,8 +405,392 @@ class UniverseStore:
                         value["disposition"],
                     ),
                 )
-            _trim_cadence(connection)
         return "ingested"
+
+    def _insert_market_projection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        projection: Mapping[str, Any],
+        projection_sha256: str,
+        projection_row_count: int,
+        occurrences: Iterable[Mapping[str, Any]],
+    ) -> None:
+        for event in projection["events"]:
+            existing = connection.execute(
+                "SELECT * FROM umbrella_events WHERE event_id = ?",
+                (event["event_id"],),
+            ).fetchone()
+            semantic = {
+                "sport": event["sport"],
+                "game": event["game"],
+                "topology": event["topology"],
+                "activation_at": event["activation_at"],
+                "participants_json": _canonical_json_value(event["participants"]),
+                "participant_keys_json": _canonical_json_value(
+                    event["participant_keys"]
+                ),
+            }
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO umbrella_events(
+                           event_id, sport, game, topology, activation_at,
+                           activation_at_ns, participants_json,
+                           participant_keys_json, first_seen_run_id,
+                           last_seen_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event["event_id"],
+                        semantic["sport"],
+                        semantic["game"],
+                        semantic["topology"],
+                        semantic["activation_at"],
+                        _timestamp_ns(event["activation_at"]),
+                        semantic["participants_json"],
+                        semantic["participant_keys_json"],
+                        run_id,
+                        run_id,
+                    ),
+                )
+            else:
+                _require_columns(existing, semantic, f"event {event['event_id']}")
+                first_seen, last_seen = _seen_run_ids(connection, existing, run_id)
+                connection.execute(
+                    """UPDATE umbrella_events
+                       SET first_seen_run_id = ?, last_seen_run_id = ?
+                       WHERE event_id = ?""",
+                    (first_seen, last_seen, event["event_id"]),
+                )
+            connection.execute(
+                """INSERT INTO event_observations(run_id, event_id, bundle_id)
+                   VALUES (?, ?, ?)""",
+                (run_id, event["event_id"], event["source_bundle_id"]),
+            )
+
+        for event in projection["venue_events"]:
+            existing = connection.execute(
+                """SELECT event_id, first_seen_run_id, last_seen_run_id
+                   FROM venue_events WHERE venue = ? AND venue_event_id = ?""",
+                (event["venue"], event["venue_event_id"]),
+            ).fetchone()
+            if existing is not None and existing["event_id"] != event["event_id"]:
+                raise EvidenceConflict(
+                    f"venue event {event['venue']}:{event['venue_event_id']} "
+                    "was assigned to a different umbrella event"
+                )
+            first_seen, last_seen = (
+                (run_id, run_id)
+                if existing is None
+                else _seen_run_ids(connection, existing, run_id)
+            )
+            connection.execute(
+                """INSERT INTO venue_events(
+                       venue, venue_event_id, event_id, title, league, status,
+                       source_ref, format, fragment_type, first_seen_run_id,
+                       last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(venue, venue_event_id) DO UPDATE SET
+                       title = excluded.title,
+                       league = excluded.league,
+                       status = excluded.status,
+                       source_ref = excluded.source_ref,
+                       format = excluded.format,
+                       fragment_type = excluded.fragment_type,
+                       first_seen_run_id = excluded.first_seen_run_id,
+                       last_seen_run_id = excluded.last_seen_run_id""",
+                (
+                    event["venue"],
+                    event["venue_event_id"],
+                    event["event_id"],
+                    event["title"],
+                    event["league"],
+                    event["status"],
+                    event["source_ref"],
+                    event["format"],
+                    event["fragment_type"],
+                    first_seen,
+                    last_seen,
+                ),
+            )
+
+        for market in projection["markets"]:
+            key = (
+                market["market_id"],
+                market["market_template_version"],
+                market["outcome_space_version"],
+            )
+            parameters_json = _canonical_json_value(market["parameters"])
+            existing = connection.execute(
+                """SELECT * FROM canonical_markets
+                   WHERE market_id = ? AND market_template_version = ?
+                     AND outcome_space_version = ?""",
+                key,
+            ).fetchone()
+            semantic = {
+                "event_id": market["event_id"],
+                "canonical_class": market["canonical_class"],
+                "market_type": market["market_type"],
+                "scope": market["scope"],
+                "parameters_json": parameters_json,
+            }
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO canonical_markets(
+                           market_id, market_template_version,
+                           outcome_space_version, event_id, canonical_class,
+                           market_type, scope, parameters_json,
+                           first_seen_run_id, last_seen_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (*key, *semantic.values(), run_id, run_id),
+                )
+            else:
+                _require_columns(existing, semantic, f"market {market['market_id']}")
+                first_seen, last_seen = _seen_run_ids(connection, existing, run_id)
+                connection.execute(
+                    """UPDATE canonical_markets
+                       SET first_seen_run_id = ?, last_seen_run_id = ?
+                       WHERE market_id = ? AND market_template_version = ?
+                         AND outcome_space_version = ?""",
+                    (first_seen, last_seen, *key),
+                )
+
+        for market in projection["venue_markets"]:
+            existing = connection.execute(
+                """SELECT event_id, venue_event_id, first_seen_run_id,
+                          last_seen_run_id
+                   FROM venue_markets WHERE venue = ? AND venue_market_id = ?""",
+                (market["venue"], market["venue_market_id"]),
+            ).fetchone()
+            if existing is not None and (
+                existing["event_id"] != market["event_id"]
+                or existing["venue_event_id"] != market["venue_event_id"]
+            ):
+                raise EvidenceConflict(
+                    f"venue market {market['venue']}:{market['venue_market_id']} "
+                    "was assigned to a different event"
+                )
+            first_seen, last_seen = (
+                (run_id, run_id)
+                if existing is None
+                else _seen_run_ids(connection, existing, run_id)
+            )
+            connection.execute(
+                """INSERT INTO venue_markets(
+                       venue, venue_market_id, venue_event_id, event_id,
+                       market_id, market_template_version,
+                       outcome_space_version, canonical_class, market_type,
+                       scope, title, parameters_json, subscription_ids_json,
+                       outcome_labels_json, status, accepting_orders,
+                       rules_hash, rule_template_id, source_ref, created_at,
+                       volume_24h, volume_total, volume_total_usd, liquidity,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(venue, venue_market_id) DO UPDATE SET
+                       market_id = excluded.market_id,
+                       market_template_version = excluded.market_template_version,
+                       outcome_space_version = excluded.outcome_space_version,
+                       canonical_class = excluded.canonical_class,
+                       market_type = excluded.market_type,
+                       scope = excluded.scope,
+                       title = excluded.title,
+                       parameters_json = excluded.parameters_json,
+                       subscription_ids_json = excluded.subscription_ids_json,
+                       outcome_labels_json = excluded.outcome_labels_json,
+                       status = excluded.status,
+                       accepting_orders = excluded.accepting_orders,
+                       rules_hash = excluded.rules_hash,
+                       rule_template_id = excluded.rule_template_id,
+                       source_ref = excluded.source_ref,
+                       created_at = excluded.created_at,
+                       volume_24h = excluded.volume_24h,
+                       volume_total = excluded.volume_total,
+                       volume_total_usd = excluded.volume_total_usd,
+                       liquidity = excluded.liquidity,
+                       first_seen_run_id = excluded.first_seen_run_id,
+                       last_seen_run_id = excluded.last_seen_run_id""",
+                (
+                    market["venue"], market["venue_market_id"],
+                    market["venue_event_id"], market["event_id"],
+                    market["market_id"], market["market_template_version"],
+                    market["outcome_space_version"], market["canonical_class"],
+                    market["market_type"], market["scope"], market["title"],
+                    _canonical_json_value(market["parameters"]),
+                    _canonical_json_value(market["subscription_ids"]),
+                    _canonical_json_value(market["outcome_labels"]),
+                    market["status"], int(market["accepting_orders"]),
+                    market["rules_hash"], market["rule_template_id"],
+                    market["source_ref"], market["created_at"],
+                    market["volume_24h"], market["volume_total"],
+                    market["volume_total_usd"], market["liquidity"],
+                    first_seen, last_seen,
+                ),
+            )
+
+        for decision in projection["decisions"]:
+            connection.execute(
+                """INSERT INTO candidate_decisions(
+                       run_id, event_id, bundle_id, eligible, selected, score,
+                       score_components_json, rejection_reasons_json,
+                       allocation_rejection, admission_json,
+                       market_exclusions_json, eligible_market_ids_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, decision["event_id"], decision["bundle_id"],
+                    int(decision["eligible"]), int(decision["selected"]),
+                    decision["score"],
+                    _canonical_json_value(decision["score_components"]),
+                    _canonical_json_value(decision["rejection_reasons"]),
+                    decision["allocation_rejection"],
+                    _canonical_json_value(decision["admission"]),
+                    _canonical_json_value(decision["market_exclusions"]),
+                    _canonical_json_value(decision["eligible_market_ids"]),
+                ),
+            )
+
+        for selected in projection["selected_markets"]:
+            connection.execute(
+                """INSERT INTO selected_market_occurrences(
+                       run_id, event_id, bundle_id, venue, venue_market_id,
+                       canonical_class, continuity_score, selection_reason,
+                       origin_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, selected["event_id"], selected["bundle_id"],
+                    selected["venue"], selected["venue_market_id"],
+                    selected["canonical_class"], selected["continuity_score"],
+                    selected["selection_reason"], selected["origin_run_id"],
+                ),
+            )
+
+        projected_selected_bundles = {
+            item["bundle_id"] for item in projection["selected_markets"]
+        }
+        for occurrence in occurrences:
+            if occurrence["occurrence_kind"] != "retained":
+                continue
+            bundle_id = occurrence["bundle_id"]
+            if bundle_id in projected_selected_bundles:
+                continue
+            origin_rows = connection.execute(
+                """SELECT event_id, venue, venue_market_id, canonical_class,
+                          continuity_score
+                   FROM selected_market_occurrences
+                   WHERE run_id = ? AND bundle_id = ?
+                   ORDER BY venue, venue_market_id""",
+                (occurrence["origin_run_id"], bundle_id),
+            ).fetchall()
+            if not origin_rows:
+                raise EvidenceConflict(
+                    f"retained bundle {bundle_id} has no market-universe origin"
+                )
+            for origin in origin_rows:
+                connection.execute(
+                    """INSERT INTO selected_market_occurrences(
+                           run_id, event_id, bundle_id, venue, venue_market_id,
+                           canonical_class, continuity_score, selection_reason,
+                           origin_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'retained', ?)""",
+                    (
+                        run_id, origin["event_id"], bundle_id, origin["venue"],
+                        origin["venue_market_id"], origin["canonical_class"],
+                        origin["continuity_score"], occurrence["origin_run_id"],
+                    ),
+                )
+            connection.execute(
+                """INSERT OR IGNORE INTO event_observations(run_id, event_id, bundle_id)
+                   VALUES (?, ?, ?)""",
+                (run_id, origin_rows[0]["event_id"], bundle_id),
+            )
+
+        for relation in projection["relations"]:
+            connection.execute(
+                """INSERT INTO relations(
+                       relation_type, event_id, scope, coverage,
+                       generation_version, canonical_hash
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(relation_type, canonical_hash, generation_version)
+                   DO NOTHING""",
+                (
+                    relation["relation_type"], relation["event_id"],
+                    relation["scope"], relation["coverage"],
+                    relation["generation_version"], relation["canonical_hash"],
+                ),
+            )
+            stored = connection.execute(
+                """SELECT relation_id, event_id, scope, coverage FROM relations
+                   WHERE relation_type = ? AND canonical_hash = ?
+                     AND generation_version = ?""",
+                (
+                    relation["relation_type"], relation["canonical_hash"],
+                    relation["generation_version"],
+                ),
+            ).fetchone()
+            assert stored is not None
+            _require_columns(
+                stored,
+                {
+                    "event_id": relation["event_id"],
+                    "scope": relation["scope"],
+                    "coverage": relation["coverage"],
+                },
+                f"relation {relation['canonical_hash']}",
+            )
+            relation_id = int(stored["relation_id"])
+            existing_members = connection.execute(
+                """SELECT venue, venue_market_id, claim_key, role
+                   FROM relation_members WHERE relation_id = ?
+                   ORDER BY role, venue, venue_market_id, claim_key""",
+                (relation_id,),
+            ).fetchall()
+            members = sorted(
+                relation["members"],
+                key=lambda item: (
+                    item["role"], item["venue"], item["venue_market_id"],
+                    item["claim_key"],
+                ),
+            )
+            if existing_members:
+                if [_row_record(row) for row in existing_members] != members:
+                    raise EvidenceConflict(
+                        f"relation {relation['canonical_hash']} members conflict"
+                    )
+            else:
+                connection.executemany(
+                    """INSERT INTO relation_members(
+                           relation_id, venue, venue_market_id, claim_key, role
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        (
+                            relation_id, member["venue"],
+                            member["venue_market_id"], member["claim_key"],
+                            member["role"],
+                        )
+                        for member in members
+                    ),
+                )
+            bundle = next(
+                decision["bundle_id"]
+                for decision in projection["decisions"]
+                if decision["event_id"] == relation["event_id"]
+            )
+            connection.execute(
+                """INSERT INTO relation_observations(run_id, relation_id, bundle_id)
+                   VALUES (?, ?, ?)""",
+                (run_id, relation_id, bundle),
+            )
+
+        connection.execute(
+            """INSERT INTO universe_run_projections(
+                   run_id, projection_version, projection_sha256,
+                   projection_row_count
+               ) VALUES (?, ?, ?, ?)""",
+            (
+                run_id, MARKET_PROJECTION_VERSION, projection_sha256,
+                projection_row_count,
+            ),
+        )
 
     def _insert_context(
         self,
@@ -734,6 +1055,10 @@ class UniverseStore:
                     "bundle_retirements",
                     "bundle_contexts",
                     "context_targets",
+                    "umbrella_events",
+                    "canonical_markets",
+                    "venue_markets",
+                    "relations",
                 )
             }
             latest = connection.execute(
@@ -763,62 +1088,6 @@ class UniverseStore:
             "counts": counts,
         }
 
-    def cadence_snapshot(
-        self, *, limit: int = 5, now_ns: int | None = None
-    ) -> dict[str, Any]:
-        """Return the bounded Targeter cadence view for the dashboard."""
-        bounded = min(_limit(limit), 5)
-        with closing(self.connect(readonly=True)) as connection:
-            rows = connection.execute(
-                """SELECT r.*, c.payload_json, c.payload_sha256
-                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
-                   ORDER BY c.generated_at_ns DESC, c.run_id DESC LIMIT ?""",
-                (bounded,),
-            ).fetchall()
-            runs = []
-            for row in rows:
-                runs.append(self._cadence_run(connection, row))
-        observed_ns = now_ns if now_ns is not None else time.time_ns()
-        latest = runs[0] if runs else None
-        age_seconds = (
-            max(0, (observed_ns - _timestamp_ns(latest["generated_at"])) // 1_000_000_000)
-            if latest is not None
-            else None
-        )
-        return {
-            "cadence_projection_version": 1,
-            "observed_at": _isoformat_ns(observed_ns),
-            "freshness": {
-                "state": (
-                    "unavailable"
-                    if latest is None
-                    else "late"
-                    if age_seconds is not None
-                    and age_seconds >= TARGETER_CADENCE_SECONDS * 2
-                    else "current"
-                ),
-                "expected_run_seconds": TARGETER_CADENCE_SECONDS,
-                "latest_run_age_seconds": age_seconds,
-                "latest_indexed_at": (
-                    _isoformat_ns(latest["indexed_at_ns"]) if latest is not None else None
-                ),
-            },
-            "runs": runs,
-        }
-
-    def cadence_run_detail(self, run_id: str) -> dict[str, Any] | None:
-        """Return one complete stored cadence run, including its detail evidence."""
-        with closing(self.connect(readonly=True)) as connection:
-            row = connection.execute(
-                """SELECT r.*, c.payload_json, c.payload_sha256
-                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
-                   WHERE r.run_id = ?""",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            return self._cadence_run(connection, row)
-
     def cadence_status_snapshot(
         self, *, limit: int = 5, now_ns: int | None = None
     ) -> dict[str, Any]:
@@ -831,11 +1100,9 @@ class UniverseStore:
                    ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
             ).fetchone()
             complete = connection.execute(
-                """SELECT r.*, c.payload_json, c.payload_sha256
-                   FROM cadence_runs c JOIN targeter_runs r USING (run_id)
-                   WHERE r.input_complete = 1
-                   ORDER BY c.generated_at_ns DESC, c.run_id DESC LIMIT 1"""
-            ).fetchall()
+                """SELECT * FROM targeter_runs WHERE input_complete = 1
+                   ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
 
         latest_record = _run_summary(latest) if latest is not None else None
         age_seconds = (
@@ -843,14 +1110,27 @@ class UniverseStore:
             if latest is not None
             else None
         )
-        current = complete[0] if complete else None
-        current_payload = self._cadence_payload(current) if current is not None else None
-        current_record = _run_summary(current) if current is not None else None
-        selected_targets = (
-            current_payload.get("selected_targets", {})
-            if current_payload is not None
-            else {}
-        )
+        current_record = _run_summary(complete) if complete is not None else None
+        with closing(self.connect(readonly=True)) as connection:
+            summary = (
+                connection.execute(
+                    """SELECT COUNT(DISTINCT bundle_id) AS selected_bundles,
+                              COUNT(*) AS selected_targets
+                       FROM selected_market_occurrences WHERE run_id = ?""",
+                    (complete["run_id"],),
+                ).fetchone()
+                if complete is not None
+                else None
+            )
+            venues = (
+                connection.execute(
+                    """SELECT DISTINCT venue FROM selected_market_occurrences
+                       WHERE run_id = ? ORDER BY venue""",
+                    (complete["run_id"],),
+                ).fetchall()
+                if complete is not None
+                else []
+            )
         return {
             "status_projection_version": 1,
             "observed_at": _isoformat_ns(observed_ns),
@@ -872,54 +1152,277 @@ class UniverseStore:
             "latest_run": latest_record,
             "current_complete_run": current_record,
             "current_complete_summary": {
-                "selected_bundles": (
-                    int(current_payload["counts"]["selected"])
-                    if current_payload is not None
-                    else 0
-                ),
-                "selected_targets": sum(
-                    len(records) for records in selected_targets.values()
-                ),
-                "venues": sorted(
-                    venue for venue, records in selected_targets.items() if records
-                ),
+                "selected_bundles": int(summary["selected_bundles"] or 0) if summary else 0,
+                "selected_targets": int(summary["selected_targets"] or 0) if summary else 0,
+                "venues": [row["venue"] for row in venues],
             },
         }
 
-    def _cadence_payload(self, row: sqlite3.Row) -> dict[str, Any]:
-        payload_json = str(row["payload_json"])
-        if hashlib.sha256(payload_json.encode("utf-8")).hexdigest() != row["payload_sha256"]:
-            raise EvidenceConflict(
-                f"Targeter run {row['run_id']} cadence projection failed its identity"
-            )
-        return validate_cadence_projection(json.loads(payload_json))
-
-    def _cadence_run(
-        self, connection: sqlite3.Connection, row: sqlite3.Row
-    ) -> dict[str, Any]:
-        payload = self._cadence_payload(row)
-        run = _run_record(row)
-        run.pop("payload_json", None)
-        run.pop("payload_sha256", None)
+    def targeter_run_detail(self, run_id: str) -> dict[str, Any] | None:
+        """Return bounded run decisions with references to normalized detail."""
+        with closing(self.connect(readonly=True)) as connection:
+            run = connection.execute(
+                "SELECT * FROM targeter_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                return None
+            decisions = connection.execute(
+                """SELECT event_id, bundle_id, eligible, selected, score,
+                          score_components_json, rejection_reasons_json,
+                          allocation_rejection, admission_json,
+                          market_exclusions_json, eligible_market_ids_json
+                   FROM candidate_decisions WHERE run_id = ? ORDER BY bundle_id""",
+                (run_id,),
+            ).fetchall()
+            selected = connection.execute(
+                """SELECT s.event_id, s.bundle_id, s.venue, s.venue_market_id,
+                          v.market_id, v.market_template_version,
+                          v.outcome_space_version, s.canonical_class,
+                          s.continuity_score, s.selection_reason, s.origin_run_id
+                   FROM selected_market_occurrences s
+                   JOIN venue_markets v USING (venue, venue_market_id)
+                   WHERE s.run_id = ?
+                   ORDER BY s.bundle_id, s.venue, s.venue_market_id""",
+                (run_id,),
+            ).fetchall()
+            relations = connection.execute(
+                """SELECT relation.relation_id, relation.relation_type,
+                          relation.event_id, relation.scope, relation.coverage,
+                          relation.generation_version, relation.canonical_hash
+                   FROM relation_observations observed
+                   JOIN relations relation USING (relation_id)
+                   WHERE observed.run_id = ? ORDER BY relation.relation_id""",
+                (run_id,),
+            ).fetchall()
         return {
-            **payload,
-            **run,
-            "selections": self._selection_details(connection, str(row["run_id"])),
+            "run": _run_summary(run),
+            "source": {
+                "manifest_key": run["manifest_key"],
+                "manifest_sha256": run["manifest_sha256"],
+                "report_key": run["report_key"],
+                "report_sha256": run["report_sha256"],
+            },
+            "counts": {
+                "candidates": len(decisions),
+                "eligible": sum(bool(row["eligible"]) for row in decisions),
+                "selected_events": len({row["event_id"] for row in selected}),
+                "selected_markets": len(selected),
+                "relations": len(relations),
+            },
+            "decisions": [
+                {
+                    "event_id": row["event_id"],
+                    "bundle_id": row["bundle_id"],
+                    "eligible": bool(row["eligible"]),
+                    "selected": bool(row["selected"]),
+                    "score": row["score"],
+                    "score_components": json.loads(row["score_components_json"]),
+                    "rejection_reasons": json.loads(row["rejection_reasons_json"]),
+                    "allocation_rejection": row["allocation_rejection"],
+                    "admission": json.loads(row["admission_json"]),
+                    "market_exclusions": json.loads(row["market_exclusions_json"]),
+                    "eligible_market_ids": json.loads(row["eligible_market_ids_json"]),
+                }
+                for row in decisions
+            ],
+            "selected_markets": [_row_record(row) for row in selected],
+            "relations": [_row_record(row) for row in relations],
         }
 
-    def _selection_details(
-        self, connection: sqlite3.Connection, run_id: str
-    ) -> list[dict[str, Any]]:
-        rows = connection.execute(
-            f"{_SELECTION_QUERY} WHERE o.run_id = ? ORDER BY o.bundle_id", (run_id,)
-        ).fetchall()
-        return [
-            {
-                **_selection_record(row),
-                "context": self._context(connection, row["context_sha256"]),
-            }
-            for row in rows
-        ]
+    def list_events(
+        self,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        bounded = _limit(limit)
+        where = ""
+        parameters: list[Any] = []
+        if after is not None:
+            where = "WHERE (activation_at_ns, event_id) < (?, ?)"
+            parameters.extend(after)
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                f"""SELECT event.*,
+                            COUNT(DISTINCT venue.venue) AS venue_count,
+                            COUNT(DISTINCT market.market_id) AS market_count,
+                            COUNT(DISTINCT selected.run_id) AS selected_run_count
+                     FROM umbrella_events event
+                     LEFT JOIN venue_events venue USING (event_id)
+                     LEFT JOIN canonical_markets market USING (event_id)
+                     LEFT JOIN selected_market_occurrences selected USING (event_id)
+                     {where}
+                     GROUP BY event.event_id
+                     ORDER BY event.activation_at_ns DESC, event.event_id DESC
+                     LIMIT ?""",
+                (*parameters, bounded + 1),
+            ).fetchall()
+        return [_event_record(row) for row in rows[:bounded]], len(rows) > bounded
+
+    def event_detail(self, event_id: str) -> dict[str, Any] | None:
+        with closing(self.connect(readonly=True)) as connection:
+            event = connection.execute(
+                "SELECT * FROM umbrella_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if event is None:
+                return None
+            venue_events = connection.execute(
+                """SELECT venue, venue_event_id, title, league, status,
+                          source_ref, format, fragment_type, first_seen_run_id,
+                          last_seen_run_id
+                   FROM venue_events WHERE event_id = ?
+                   ORDER BY venue, venue_event_id""",
+                (event_id,),
+            ).fetchall()
+            markets = connection.execute(
+                """SELECT canonical.*,
+                          COUNT(venue.venue_market_id) AS venue_market_count,
+                          GROUP_CONCAT(DISTINCT venue.venue) AS venues
+                   FROM canonical_markets canonical
+                   LEFT JOIN venue_markets venue
+                     ON venue.market_id = canonical.market_id
+                    AND venue.market_template_version = canonical.market_template_version
+                    AND venue.outcome_space_version = canonical.outcome_space_version
+                   WHERE canonical.event_id = ?
+                   GROUP BY canonical.market_id, canonical.market_template_version,
+                            canonical.outcome_space_version
+                   ORDER BY canonical.canonical_class, canonical.market_id""",
+                (event_id,),
+            ).fetchall()
+            relations = connection.execute(
+                """SELECT relation_id, relation_type, scope, coverage,
+                          generation_version, canonical_hash
+                   FROM relations WHERE event_id = ?
+                   ORDER BY relation_type, relation_id""",
+                (event_id,),
+            ).fetchall()
+            observations = connection.execute(
+                """SELECT observed.run_id, run.generated_at, observed.bundle_id
+                   FROM event_observations observed
+                   JOIN targeter_runs run USING (run_id)
+                   WHERE observed.event_id = ?
+                   ORDER BY run.generated_at_ns, observed.run_id""",
+                (event_id,),
+            ).fetchall()
+        return {
+            "event": _event_record(event),
+            "venue_events": [_row_record(row) for row in venue_events],
+            "markets": [_canonical_market_record(row) for row in markets],
+            "relations": [_row_record(row) for row in relations],
+            "observations": [_row_record(row) for row in observations],
+        }
+
+    def market_detail(
+        self,
+        market_id: str,
+        *,
+        market_template_version: int | None = None,
+        outcome_space_version: int | None = None,
+    ) -> dict[str, Any] | None:
+        predicates = ["market_id = ?"]
+        parameters: list[Any] = [market_id]
+        for field, value in (
+            ("market_template_version", market_template_version),
+            ("outcome_space_version", outcome_space_version),
+        ):
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{field} must be a positive integer")
+                predicates.append(f"{field} = ?")
+                parameters.append(value)
+        with closing(self.connect(readonly=True)) as connection:
+            market = connection.execute(
+                f"""SELECT * FROM canonical_markets
+                    WHERE {' AND '.join(predicates)}
+                    ORDER BY market_template_version DESC,
+                             outcome_space_version DESC LIMIT 1""",
+                parameters,
+            ).fetchone()
+            if market is None:
+                return None
+            key = (
+                market["market_id"], market["market_template_version"],
+                market["outcome_space_version"],
+            )
+            venue_markets = connection.execute(
+                """SELECT * FROM venue_markets
+                   WHERE market_id = ? AND market_template_version = ?
+                     AND outcome_space_version = ?
+                   ORDER BY venue, venue_market_id""",
+                key,
+            ).fetchall()
+            selections = connection.execute(
+                """SELECT selected.run_id, run.generated_at, selected.bundle_id,
+                          selected.venue, selected.venue_market_id,
+                          selected.continuity_score, selected.selection_reason,
+                          selected.origin_run_id
+                   FROM selected_market_occurrences selected
+                   JOIN targeter_runs run USING (run_id)
+                   JOIN venue_markets venue USING (venue, venue_market_id)
+                   WHERE venue.market_id = ?
+                     AND venue.market_template_version = ?
+                     AND venue.outcome_space_version = ?
+                   ORDER BY run.generated_at_ns, selected.run_id,
+                            selected.venue, selected.venue_market_id""",
+                key,
+            ).fetchall()
+            relations = connection.execute(
+                """SELECT DISTINCT relation.relation_id,
+                          relation.relation_type, relation.scope,
+                          relation.coverage, relation.generation_version,
+                          relation.canonical_hash
+                   FROM relation_members member
+                   JOIN relations relation USING (relation_id)
+                   JOIN venue_markets venue
+                     ON venue.venue = member.venue
+                    AND venue.venue_market_id = member.venue_market_id
+                   WHERE venue.market_id = ?
+                     AND venue.market_template_version = ?
+                     AND venue.outcome_space_version = ?
+                   ORDER BY relation.relation_type, relation.relation_id""",
+                key,
+            ).fetchall()
+        return {
+            "market": _canonical_market_record(market),
+            "venue_markets": [_venue_market_record(row) for row in venue_markets],
+            "selections": [_row_record(row) for row in selections],
+            "relations": [_row_record(row) for row in relations],
+        }
+
+    def relation_detail(self, relation_id: int) -> dict[str, Any] | None:
+        if isinstance(relation_id, bool) or not isinstance(relation_id, int) or relation_id <= 0:
+            raise ValueError("relation id must be a positive integer")
+        with closing(self.connect(readonly=True)) as connection:
+            relation = connection.execute(
+                "SELECT * FROM relations WHERE relation_id = ?", (relation_id,)
+            ).fetchone()
+            if relation is None:
+                return None
+            members = connection.execute(
+                """SELECT member.venue, member.venue_market_id,
+                          venue.market_id, venue.market_template_version,
+                          venue.outcome_space_version, member.claim_key,
+                          member.role
+                   FROM relation_members member
+                   JOIN venue_markets venue USING (venue, venue_market_id)
+                   WHERE member.relation_id = ?
+                   ORDER BY member.role, member.venue,
+                            member.venue_market_id, member.claim_key""",
+                (relation_id,),
+            ).fetchall()
+            observations = connection.execute(
+                """SELECT observed.run_id, run.generated_at, observed.bundle_id
+                   FROM relation_observations observed
+                   JOIN targeter_runs run USING (run_id)
+                   WHERE observed.relation_id = ?
+                   ORDER BY run.generated_at_ns, observed.run_id""",
+                (relation_id,),
+            ).fetchall()
+        return {
+            "relation": _row_record(relation),
+            "members": [_row_record(row) for row in members],
+            "observations": [_row_record(row) for row in observations],
+        }
 
     def list_runs(
         self,
@@ -1585,6 +2088,145 @@ def _row_record(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _market_projection(
+    value: Mapping[str, Any], *, expected_run_id: str, expected_generated_at: str
+) -> dict[str, Any]:
+    fields = {
+        "projection_version",
+        "run_id",
+        "generated_at",
+        "events",
+        "venue_events",
+        "markets",
+        "venue_markets",
+        "decisions",
+        "selected_markets",
+        "relations",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise EvidenceConflict("market projection fields are invalid")
+    if (
+        value.get("projection_version") != MARKET_PROJECTION_VERSION
+        or value.get("run_id") != expected_run_id
+        or value.get("generated_at") != expected_generated_at
+    ):
+        raise EvidenceConflict("market projection disagrees with its Targeter run")
+    record = dict(value)
+    for field in fields - {"projection_version", "run_id", "generated_at"}:
+        if not isinstance(record[field], list) or any(
+            not isinstance(item, Mapping) for item in record[field]
+        ):
+            raise EvidenceConflict(f"market projection {field} must be object rows")
+    try:
+        json.dumps(record, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise EvidenceConflict("market projection must be finite JSON") from error
+    return record
+
+
+def _market_projection_identity(value: Mapping[str, Any]) -> tuple[str, int]:
+    encoded = _canonical_json_value(value)
+    rows = sum(
+        len(value[field])
+        for field in (
+            "events",
+            "venue_events",
+            "markets",
+            "venue_markets",
+            "decisions",
+            "selected_markets",
+            "relations",
+        )
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), rows
+
+
+def _canonical_json_value(value: Any) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _require_columns(
+    row: sqlite3.Row, expected: Mapping[str, Any], label: str
+) -> None:
+    if any(row[field] != value for field, value in expected.items()):
+        raise EvidenceConflict(f"{label} conflicts with its prior projection")
+
+
+def _seen_run_ids(
+    connection: sqlite3.Connection, existing: sqlite3.Row, run_id: str
+) -> tuple[str, str]:
+    run_ids = {
+        str(existing["first_seen_run_id"]),
+        str(existing["last_seen_run_id"]),
+        run_id,
+    }
+    rows = connection.execute(
+        f"""SELECT run_id, generated_at_ns FROM targeter_runs
+            WHERE run_id IN ({','.join('?' for _ in run_ids)})""",
+        tuple(sorted(run_ids)),
+    ).fetchall()
+    if len(rows) != len(run_ids):
+        raise EvidenceConflict("first/last-seen run provenance is incomplete")
+    ordered = sorted(rows, key=lambda row: (row["generated_at_ns"], row["run_id"]))
+    return str(ordered[0]["run_id"]), str(ordered[-1]["run_id"])
+
+
+def _event_record(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    record = {
+        "event_id": row["event_id"],
+        "sport": row["sport"],
+        "game": row["game"],
+        "topology": row["topology"],
+        "activation_at": row["activation_at"],
+        "participants": json.loads(row["participants_json"]),
+        "participant_keys": json.loads(row["participant_keys_json"]),
+        "first_seen_run_id": row["first_seen_run_id"],
+        "last_seen_run_id": row["last_seen_run_id"],
+    }
+    for field in ("venue_count", "market_count", "selected_run_count"):
+        if field in keys:
+            record[field] = int(row[field])
+    return record
+
+
+def _canonical_market_record(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    record = {
+        "market_id": row["market_id"],
+        "market_template_version": row["market_template_version"],
+        "outcome_space_version": row["outcome_space_version"],
+        "event_id": row["event_id"],
+        "canonical_class": row["canonical_class"],
+        "market_type": row["market_type"],
+        "scope": row["scope"],
+        "parameters": json.loads(row["parameters_json"]),
+        "first_seen_run_id": row["first_seen_run_id"],
+        "last_seen_run_id": row["last_seen_run_id"],
+    }
+    if "venue_market_count" in keys:
+        record["venue_market_count"] = int(row["venue_market_count"])
+        record["venues"] = sorted(
+            item for item in str(row["venues"] or "").split(",") if item
+        )
+    return record
+
+
+def _venue_market_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = _row_record(row)
+    record["parameters"] = json.loads(record.pop("parameters_json"))
+    record["subscription_ids"] = json.loads(record.pop("subscription_ids_json"))
+    record["outcome_labels"] = json.loads(record.pop("outcome_labels_json"))
+    record["accepting_orders"] = bool(record["accepting_orders"])
+    return record
+
+
 def _range(start: int | None, end: int | None, label: str) -> None:
     for value in (start, end):
         if value is not None and (
@@ -1631,15 +2273,6 @@ def _canonical_timestamp(value: Any, label: str) -> str:
     if value != canonical:
         raise EvidenceConflict(f"{label} must use canonical UTC form")
     return canonical
-
-
-def _trim_cadence(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """DELETE FROM cadence_runs WHERE run_id NOT IN (
-               SELECT run_id FROM cadence_runs
-               ORDER BY generated_at_ns DESC, run_id DESC LIMIT 5
-           )"""
-    )
 
 
 def _timestamp_ns(value: str) -> int:

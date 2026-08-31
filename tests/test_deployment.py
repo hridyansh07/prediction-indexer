@@ -170,18 +170,22 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
         self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
 
-    def test_schema_is_selected_history_without_raw_universe_tables(self) -> None:
-        schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(encoding="utf-8")
-        cadence_schema = (ROOT / "universe" / "schema" / "v2.sql").read_text(
+    def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
+        history_schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(
             encoding="utf-8"
         )
-        self.assertIn("CREATE TABLE selection_occurrences", schema)
-        self.assertIn("CREATE TABLE bundle_contexts", schema)
-        self.assertIn("CREATE TABLE bundle_retirements", schema)
-        self.assertIn("CREATE TABLE cadence_runs", cadence_schema)
+        market_schema = (ROOT / "universe" / "schema" / "v3.sql").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("CREATE TABLE selection_occurrences", history_schema)
+        self.assertIn("CREATE TABLE bundle_contexts", history_schema)
+        self.assertIn("CREATE TABLE bundle_retirements", history_schema)
+        self.assertIn("CREATE TABLE umbrella_events", market_schema)
+        self.assertIn("CREATE TABLE canonical_markets", market_schema)
+        self.assertIn("CREATE TABLE relation_members", market_schema)
+        self.assertNotIn("CREATE TABLE cadence_runs", market_schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
-            self.assertNotIn(stale, schema)
-        self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
+            self.assertNotIn(stale, history_schema + market_schema)
 
     def test_orb_setup_creates_and_installs_the_project_virtual_environment(
         self,
