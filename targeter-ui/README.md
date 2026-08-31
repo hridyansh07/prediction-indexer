@@ -44,8 +44,9 @@ run on demand from:
 GET /api/event-universe/v1/targeter/runs/<run_id>
 ```
 
-They use `current_complete_run.run_id`, so a newer incomplete run cannot
-replace the current target set. Cadence is indexed evidence, not proof of
+They use `current_complete_run.run_id`, then hydrate normalized event detail
+from `GET /v1/events/<event_id>`; a newer incomplete run cannot replace the
+current target set. Indexed status is not proof of
 `current.json` publication or splice/frame capture health; capture therefore
 remains explicitly unverified. The UI uses the server's semantic counts and
 never reinterprets raw Targeter reports.
@@ -56,7 +57,7 @@ the latest immutable detail and occurrence timeline only when a bundle opens.
 ## Routes
 
 - `/` — compact Event Universe server and Targeter cadence status
-- `/targets` — full target set from the newest complete cadence run
+- `/targets` — normalized events and selected markets from the newest complete run
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
 - `/api/event-universe/...` — narrow same-origin Universe proxy

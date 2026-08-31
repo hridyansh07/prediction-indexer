@@ -336,6 +336,120 @@ export interface UniverseTargeterStatus {
   };
 }
 
+export interface UniverseEvent {
+  event_id: string;
+  sport: string;
+  game: string | null;
+  topology: string | null;
+  activation_at: string;
+  participants: string[];
+  participant_keys: string[];
+  first_seen_run_id: string;
+  last_seen_run_id: string;
+  venue_count?: number;
+  market_count?: number;
+  selected_run_count?: number;
+}
+
+export interface UniverseCanonicalMarket {
+  market_id: string;
+  market_template_version: number;
+  outcome_space_version: number;
+  event_id: string;
+  canonical_class: string;
+  market_type: string;
+  scope: string;
+  parameters: Record<string, unknown>;
+  first_seen_run_id: string;
+  last_seen_run_id: string;
+  venue_market_count: number;
+  venues: string[];
+}
+
+export interface UniverseRelationSummary {
+  relation_id: number;
+  relation_type: string;
+  event_id?: string;
+  scope: string;
+  coverage: string;
+  generation_version: number;
+  canonical_hash: string;
+}
+
+export interface UniverseEventDetail {
+  event: UniverseEvent;
+  venue_events: Array<{
+    venue: string;
+    venue_event_id: string;
+    title: string;
+    league: string | null;
+    status: string;
+    source_ref: string;
+    format: string | null;
+    fragment_type: string | null;
+    first_seen_run_id: string;
+    last_seen_run_id: string;
+  }>;
+  markets: UniverseCanonicalMarket[];
+  relations: UniverseRelationSummary[];
+  observations: Array<{
+    run_id: string;
+    generated_at: string;
+    bundle_id: string;
+  }>;
+}
+
+export interface UniverseTargeterDecision {
+  event_id: string;
+  bundle_id: string;
+  eligible: boolean;
+  selected: boolean;
+  score: number;
+  score_components: Record<string, number>;
+  rejection_reasons: string[];
+  allocation_rejection: string | null;
+  admission: {
+    combined_moneyline_volume_usd: number;
+    minimum_moneyline_volume_usd: number;
+    moneyline_volume_usd_by_venue: Record<string, number>;
+    moneyline_volume_usd_coverage: Record<
+      string,
+      { known_markets: number; unknown_markets: number }
+    >;
+  };
+  market_exclusions: Record<string, string[]>;
+  eligible_market_ids: string[];
+}
+
+export interface UniverseSelectedMarket {
+  event_id: string;
+  bundle_id: string;
+  venue: string;
+  venue_market_id: string;
+  market_id: string;
+  market_template_version: number;
+  outcome_space_version: number;
+  canonical_class: string;
+  continuity_score: number;
+  selection_reason: 'selected' | 'held_current_candidate' | 'retained';
+  origin_run_id: string;
+}
+
+export interface UniverseTargeterRunDetail {
+  run: UniverseTargeterRunSummary;
+  source: UniverseSource;
+  counts: {
+    candidates: number;
+    eligible: number;
+    selected_events: number;
+    selected_markets: number;
+    relations: number;
+  };
+  decisions: UniverseTargeterDecision[];
+  selected_markets: UniverseSelectedMarket[];
+  relations: UniverseRelationSummary[];
+}
+
 export interface UniverseHealth {
   status: 'ok';
   schema_version: number;

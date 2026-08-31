@@ -29,6 +29,7 @@ import type {
   UniverseCadenceRun,
   UniverseSelection,
   UniverseSelectionDetail,
+  UniverseTargeterRunDetail,
   UniverseTargeterStatus,
 } from '../src/event-universe.js';
 
@@ -208,6 +209,128 @@ const status = (
   },
   ...overrides,
 });
+const normalizedRun = (): UniverseTargeterRunDetail => ({
+  run: {
+    run_id: run().run_id,
+    generated_at: run().generated_at,
+    input_complete: true,
+    indexed_at: '2026-08-20T12:01:00Z',
+  },
+  source,
+  counts: {
+    candidates: 1,
+    eligible: 1,
+    selected_events: 1,
+    selected_markets: 1,
+    relations: 1,
+  },
+  decisions: [
+    {
+      event_id: 'event-alpha',
+      bundle_id: 'bundle alpha',
+      eligible: true,
+      selected: true,
+      score: 10,
+      score_components: { venue_coverage: 1 },
+      rejection_reasons: [],
+      allocation_rejection: null,
+      admission: {
+        combined_moneyline_volume_usd: 30_000,
+        minimum_moneyline_volume_usd: 25_000,
+        moneyline_volume_usd_by_venue: { kalshi: 30_000 },
+        moneyline_volume_usd_coverage: {},
+      },
+      market_exclusions: {},
+      eligible_market_ids: ['market-alpha'],
+    },
+  ],
+  selected_markets: [
+    {
+      event_id: 'event-alpha',
+      bundle_id: 'bundle alpha',
+      venue: 'kalshi',
+      venue_market_id: 'K-ALPHA',
+      market_id: 'market-alpha',
+      market_template_version: 1,
+      outcome_space_version: 1,
+      canonical_class: 'esports.series_moneyline',
+      continuity_score: 10,
+      selection_reason: 'selected',
+      origin_run_id: run().run_id,
+    },
+  ],
+  relations: [
+    {
+      relation_id: 1,
+      relation_type: 'IDENTITY',
+      event_id: 'event-alpha',
+      scope: 'series',
+      coverage: 'EXHAUSTIVE',
+      generation_version: 1,
+      canonical_hash: sha,
+    },
+  ],
+});
+const normalizedEvent = () => ({
+  event: {
+    event_id: 'event-alpha',
+    sport: 'esports',
+    game: 'counter_strike_2',
+    topology: 'series',
+    activation_at: '2026-08-20T14:00:00Z',
+    participants: ['Alpha', 'Beta'],
+    participant_keys: ['alpha', 'beta'],
+    first_seen_run_id: run().run_id,
+    last_seen_run_id: run().run_id,
+  },
+  venue_events: [
+    {
+      venue: 'kalshi',
+      venue_event_id: 'event-a',
+      title: 'Alpha vs Beta',
+      league: null,
+      status: 'open',
+      source_ref: 'kalshi:event-a',
+      format: null,
+      fragment_type: null,
+      first_seen_run_id: run().run_id,
+      last_seen_run_id: run().run_id,
+    },
+  ],
+  markets: [
+    {
+      market_id: 'market-alpha',
+      market_template_version: 1,
+      outcome_space_version: 1,
+      event_id: 'event-alpha',
+      canonical_class: 'esports.series_moneyline',
+      market_type: 'moneyline',
+      scope: 'series',
+      parameters: {},
+      first_seen_run_id: run().run_id,
+      last_seen_run_id: run().run_id,
+      venue_market_count: 1,
+      venues: ['kalshi'],
+    },
+  ],
+  relations: [
+    {
+      relation_id: 1,
+      relation_type: 'IDENTITY',
+      scope: 'series',
+      coverage: 'EXHAUSTIVE',
+      generation_version: 1,
+      canonical_hash: sha,
+    },
+  ],
+  observations: [
+    {
+      run_id: run().run_id,
+      generated_at: run().generated_at,
+      bundle_id: 'bundle alpha',
+    },
+  ],
+});
 const json = (value: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(value), {
     status: 200,
@@ -331,7 +454,7 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
       })) as typeof fetch,
   });
   const timeout = await timedOut
-    .cadence(new URLSearchParams())
+    .status(new URLSearchParams())
     .catch((error) => error);
   assert.deepEqual(universePublicFailure(timeout), {
     status: 504,
@@ -345,7 +468,7 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
       json({ secret: 'upstream-body-must-not-leak' })) as typeof fetch,
   });
   const tooLarge = await oversize
-    .cadence(new URLSearchParams())
+    .status(new URLSearchParams())
     .catch((error) => error);
   assert.deepEqual(universePublicFailure(tooLarge), {
     status: 502,
@@ -364,7 +487,7 @@ test('bounds timeout, response bytes, content type, and upstream status', async 
       fetch: (async () => response) as typeof fetch,
     });
     const error = await failed
-      .cadence(new URLSearchParams())
+      .status(new URLSearchParams())
       .catch((reason) => reason);
     assert.deepEqual(universePublicFailure(error).body, {
       error: 'Event Universe unavailable',
@@ -443,7 +566,13 @@ test('status proxy allows only a bounded limit and validates selection detail', 
     fetch: (async (input) => {
       fetches++;
       requested = String(input);
-      return json(requested.includes('/v1/targeter/runs/') ? run() : status());
+      return json(
+        requested.includes('/v1/targeter/runs/')
+          ? normalizedRun()
+          : requested.includes('/v1/events/')
+            ? normalizedEvent()
+            : status(),
+      );
     }) as typeof fetch,
   });
   const result = await client.status(new URLSearchParams({ limit: '5' }));
@@ -471,7 +600,12 @@ test('status proxy allows only a bounded limit and validates selection detail', 
     requested,
     `https://universe.internal/base/v1/targeter/runs/${run().run_id}`,
   );
-  assert.equal(detail.selections[0].bundle_id, 'bundle alpha');
+  assert.equal(detail.decisions[0].bundle_id, 'bundle alpha');
+  assert.equal(detail.selected_markets[0].event_id, 'event-alpha');
+
+  const event = await client.event('event-alpha');
+  assert.equal(event.event.participants.join(' vs '), 'Alpha vs Beta');
+  assert.equal(event.markets[0].market_id, 'market-alpha');
 });
 
 test('Express status proxy rejects non-GET refreshes before upstream access', async () => {

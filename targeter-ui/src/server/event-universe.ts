@@ -10,6 +10,11 @@ import type {
   UniverseBundlePage,
   UniverseCadence,
   UniverseCadenceRun,
+  UniverseEventDetail,
+  UniverseRelationSummary,
+  UniverseSelectedMarket,
+  UniverseTargeterDecision,
+  UniverseTargeterRunDetail,
   UniverseTargeterRunSummary,
   UniverseTargeterStatus,
   UniverseContext,
@@ -151,13 +156,6 @@ export class EventUniverseClient {
     );
   }
 
-  cadence(query: URLSearchParams) {
-    const validated = validateUniverseQuery(query, CADENCE_QUERY);
-    const limit = validated.get('limit');
-    if (limit !== null && Number(limit) > 5) throw new UniverseRequestError();
-    return this.get('v1/targeter/cadence', validated, validateCadence);
-  }
-
   status(query: URLSearchParams) {
     const validated = validateUniverseQuery(query, CADENCE_QUERY);
     const limit = validated.get('limit');
@@ -170,6 +168,14 @@ export class EventUniverseClient {
       `v1/targeter/runs/${encodeId(runId)}`,
       new URLSearchParams(),
       validateTargeterRun,
+    );
+  }
+
+  event(eventId: string) {
+    return this.get(
+      `v1/events/${encodeId(eventId)}`,
+      new URLSearchParams(),
+      validateEventDetail,
     );
   }
 
@@ -266,12 +272,16 @@ export async function dispatchEventUniverseRequest(
   if (pathname === '/v1/runs') return client.runs(query);
   if (pathname === '/v1/selections') return client.selections(query);
   if (pathname === '/v1/bundles') return client.bundles(query);
-  if (pathname === '/v1/targeter/cadence') return client.cadence(query);
   if (pathname === '/v1/targeter/status') return client.status(query);
   let match = /^\/v1\/targeter\/runs\/([^/]+)$/.exec(pathname);
   if (match) {
     requireNoQuery(query);
     return client.targeterRun(pathSegment(match[1]));
+  }
+  match = /^\/v1\/events\/([^/]+)$/.exec(pathname);
+  if (match) {
+    requireNoQuery(query);
+    return client.event(pathSegment(match[1]));
   }
 
   match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
@@ -1415,36 +1425,327 @@ export function validateCadence(value: unknown): UniverseCadence {
   };
 }
 
-export function validateTargeterRun(value: unknown): UniverseCadenceRun {
-  const run = object(
+export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
+  const item = object(
+    value,
+    ['run', 'source', 'counts', 'decisions', 'selected_markets', 'relations'],
+    'targeter run detail',
+  );
+  const source = object(
+    item.source,
+    ['manifest_key', 'manifest_sha256', 'report_key', 'report_sha256'],
+    'targeter run source',
+  );
+  const counts = object(
+    item.counts,
+    [
+      'candidates',
+      'eligible',
+      'selected_events',
+      'selected_markets',
+      'relations',
+    ],
+    'targeter run counts',
+  );
+  const decisions = array(item.decisions, validateTargeterDecision);
+  const selectedMarkets = array(item.selected_markets, validateSelectedMarket);
+  const relations = array(item.relations, (relation) =>
+    validateRelationSummary(relation, true),
+  );
+  const validatedCounts = {
+    candidates: integer(counts.candidates),
+    eligible: integer(counts.eligible),
+    selected_events: integer(counts.selected_events),
+    selected_markets: integer(counts.selected_markets),
+    relations: integer(counts.relations),
+  };
+  if (
+    validatedCounts.candidates !== decisions.length ||
+    validatedCounts.eligible !==
+      decisions.filter((decision) => decision.eligible).length ||
+    validatedCounts.selected_markets !== selectedMarkets.length ||
+    validatedCounts.selected_events !==
+      new Set(selectedMarkets.map((market) => market.event_id)).size ||
+    validatedCounts.relations !== relations.length
+  )
+    throw new UniverseUpstreamError();
+  return {
+    run: validateRunSummary(item.run),
+    source: {
+      manifest_key: text(source.manifest_key),
+      manifest_sha256: sha(source.manifest_sha256),
+      report_key: text(source.report_key),
+      report_sha256: sha(source.report_sha256),
+    },
+    counts: validatedCounts,
+    decisions,
+    selected_markets: selectedMarkets,
+    relations,
+  };
+}
+
+function validateTargeterDecision(value: unknown): UniverseTargeterDecision {
+  const item = object(
     value,
     [
-      ...RUN_KEYS,
-      'catalogs',
-      'discovery_failures',
-      'counts',
-      'reason_summaries',
-      'match_rejections',
-      'candidates',
-      'selected_targets',
-      'budget_used',
-      'continuity',
-      'diagnostics',
-      'selections',
+      'event_id',
+      'bundle_id',
+      'eligible',
+      'selected',
+      'score',
+      'score_components',
+      'rejection_reasons',
+      'allocation_rejection',
+      'admission',
+      'market_exclusions',
+      'eligible_market_ids',
     ],
-    'targeter run',
+    'targeter decision',
   );
-  return validateCadence({
-    cadence_projection_version: 1,
-    observed_at: run.generated_at,
-    freshness: {
-      state: 'current',
-      expected_run_seconds: 1,
-      latest_run_age_seconds: 0,
-      latest_indexed_at: run.generated_at,
+  const admission = object(
+    item.admission,
+    [
+      'combined_moneyline_volume_usd',
+      'minimum_moneyline_volume_usd',
+      'moneyline_volume_usd_by_venue',
+      'moneyline_volume_usd_coverage',
+    ],
+    'targeter admission',
+  );
+  const coverage = Object.fromEntries(
+    Object.entries(jsonObject(admission.moneyline_volume_usd_coverage)).map(
+      ([venue, value]) => {
+        const record = object(
+          value,
+          ['known_markets', 'unknown_markets'],
+          'moneyline volume coverage',
+        );
+        return [
+          venue,
+          {
+            known_markets: integer(record.known_markets),
+            unknown_markets: integer(record.unknown_markets),
+          },
+        ];
+      },
+    ),
+  );
+  return {
+    event_id: text(item.event_id),
+    bundle_id: text(item.bundle_id),
+    eligible: boolean(item.eligible),
+    selected: boolean(item.selected),
+    score: number(item.score),
+    score_components: numberRecord(item.score_components),
+    rejection_reasons: strings(item.rejection_reasons),
+    allocation_rejection:
+      item.allocation_rejection === null
+        ? null
+        : text(item.allocation_rejection),
+    admission: {
+      combined_moneyline_volume_usd: number(
+        admission.combined_moneyline_volume_usd,
+      ),
+      minimum_moneyline_volume_usd: number(
+        admission.minimum_moneyline_volume_usd,
+      ),
+      moneyline_volume_usd_by_venue: numberRecord(
+        admission.moneyline_volume_usd_by_venue,
+      ),
+      moneyline_volume_usd_coverage: coverage,
     },
-    runs: [run],
-  }).runs[0];
+    market_exclusions: stringListRecord(item.market_exclusions),
+    eligible_market_ids: strings(item.eligible_market_ids),
+  };
+}
+
+function validateSelectedMarket(value: unknown): UniverseSelectedMarket {
+  const item = object(
+    value,
+    [
+      'event_id',
+      'bundle_id',
+      'venue',
+      'venue_market_id',
+      'market_id',
+      'market_template_version',
+      'outcome_space_version',
+      'canonical_class',
+      'continuity_score',
+      'selection_reason',
+      'origin_run_id',
+    ],
+    'selected market',
+  );
+  const selectionReason = text(item.selection_reason);
+  if (
+    !['selected', 'held_current_candidate', 'retained'].includes(
+      selectionReason,
+    )
+  )
+    throw new UniverseUpstreamError();
+  return {
+    event_id: text(item.event_id),
+    bundle_id: text(item.bundle_id),
+    venue: text(item.venue),
+    venue_market_id: text(item.venue_market_id),
+    market_id: text(item.market_id),
+    market_template_version: integer(item.market_template_version),
+    outcome_space_version: integer(item.outcome_space_version),
+    canonical_class: text(item.canonical_class),
+    continuity_score: number(item.continuity_score),
+    selection_reason:
+      selectionReason as UniverseSelectedMarket['selection_reason'],
+    origin_run_id: text(item.origin_run_id),
+  };
+}
+
+function validateRelationSummary(
+  value: unknown,
+  includeEvent: boolean,
+): UniverseRelationSummary {
+  const keys = [
+    'relation_id',
+    'relation_type',
+    ...(includeEvent ? ['event_id'] : []),
+    'scope',
+    'coverage',
+    'generation_version',
+    'canonical_hash',
+  ];
+  const item = object(value, keys, 'relation summary');
+  return {
+    relation_id: integer(item.relation_id),
+    relation_type: text(item.relation_type),
+    ...(includeEvent ? { event_id: text(item.event_id) } : {}),
+    scope: text(item.scope),
+    coverage: text(item.coverage),
+    generation_version: integer(item.generation_version),
+    canonical_hash: sha(item.canonical_hash),
+  };
+}
+
+export function validateEventDetail(value: unknown): UniverseEventDetail {
+  const item = object(
+    value,
+    ['event', 'venue_events', 'markets', 'relations', 'observations'],
+    'event detail',
+  );
+  const event = validateEvent(item.event);
+  const venueEvents = array(item.venue_events, (value) => {
+    const record = object(
+      value,
+      [
+        'venue',
+        'venue_event_id',
+        'title',
+        'league',
+        'status',
+        'source_ref',
+        'format',
+        'fragment_type',
+        'first_seen_run_id',
+        'last_seen_run_id',
+      ],
+      'venue event',
+    );
+    return {
+      venue: text(record.venue),
+      venue_event_id: text(record.venue_event_id),
+      title: text(record.title),
+      league: record.league === null ? null : text(record.league),
+      status: text(record.status),
+      source_ref: text(record.source_ref),
+      format: record.format === null ? null : text(record.format),
+      fragment_type:
+        record.fragment_type === null ? null : text(record.fragment_type),
+      first_seen_run_id: text(record.first_seen_run_id),
+      last_seen_run_id: text(record.last_seen_run_id),
+    };
+  });
+  const markets = array(item.markets, (value) => {
+    const record = object(
+      value,
+      [
+        'market_id',
+        'market_template_version',
+        'outcome_space_version',
+        'event_id',
+        'canonical_class',
+        'market_type',
+        'scope',
+        'parameters',
+        'first_seen_run_id',
+        'last_seen_run_id',
+        'venue_market_count',
+        'venues',
+      ],
+      'canonical market',
+    );
+    return {
+      market_id: text(record.market_id),
+      market_template_version: integer(record.market_template_version),
+      outcome_space_version: integer(record.outcome_space_version),
+      event_id: text(record.event_id),
+      canonical_class: text(record.canonical_class),
+      market_type: text(record.market_type),
+      scope: text(record.scope),
+      parameters: jsonObject(record.parameters),
+      first_seen_run_id: text(record.first_seen_run_id),
+      last_seen_run_id: text(record.last_seen_run_id),
+      venue_market_count: integer(record.venue_market_count),
+      venues: strings(record.venues),
+    };
+  });
+  return {
+    event,
+    venue_events: venueEvents,
+    markets,
+    relations: array(item.relations, (relation) =>
+      validateRelationSummary(relation, false),
+    ),
+    observations: array(item.observations, (value) => {
+      const record = object(
+        value,
+        ['run_id', 'generated_at', 'bundle_id'],
+        'event observation',
+      );
+      return {
+        run_id: text(record.run_id),
+        generated_at: timestamp(record.generated_at),
+        bundle_id: text(record.bundle_id),
+      };
+    }),
+  };
+}
+
+function validateEvent(value: unknown) {
+  const item = object(
+    value,
+    [
+      'event_id',
+      'sport',
+      'game',
+      'topology',
+      'activation_at',
+      'participants',
+      'participant_keys',
+      'first_seen_run_id',
+      'last_seen_run_id',
+    ],
+    'event',
+  );
+  return {
+    event_id: text(item.event_id),
+    sport: text(item.sport),
+    game: item.game === null ? null : text(item.game),
+    topology: item.topology === null ? null : text(item.topology),
+    activation_at: timestamp(item.activation_at),
+    participants: strings(item.participants),
+    participant_keys: strings(item.participant_keys),
+    first_seen_run_id: text(item.first_seen_run_id),
+    last_seen_run_id: text(item.last_seen_run_id),
+  };
 }
 
 function validateRunSummary(value: unknown): UniverseTargeterRunSummary {

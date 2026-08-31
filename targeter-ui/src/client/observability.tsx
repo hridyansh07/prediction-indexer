@@ -1,11 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
-  UniverseCadenceCandidate,
-  UniverseCadenceRun,
+  UniverseEventDetail,
   UniverseHealth,
+  UniverseSelectedMarket,
   UniverseSelection,
   UniverseSelectionDetail,
+  UniverseTargeterDecision,
+  UniverseTargeterRunDetail,
   UniverseTargeterStatus,
 } from '../event-universe';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
@@ -35,14 +37,16 @@ const label = (value: string | null | undefined) =>
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
 
-async function loadTargeterRun(runId: string): Promise<UniverseCadenceRun> {
-  return universeGet<UniverseCadenceRun>(
+async function loadTargeterRun(
+  runId: string,
+): Promise<UniverseTargeterRunDetail> {
+  return universeGet<UniverseTargeterRunDetail>(
     `/v1/targeter/runs/${encodeURIComponent(runId)}`,
   );
 }
 
 function useTargeterRun(runId: string | null) {
-  const [run, setRun] = useState<UniverseCadenceRun | null>(null);
+  const [run, setRun] = useState<UniverseTargeterRunDetail | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(Boolean(runId));
   useEffect(() => {
@@ -70,6 +74,43 @@ function useTargeterRun(runId: string | null) {
     };
   }, [runId]);
   return { run, error, loading };
+}
+
+function useEventDetails(eventIds: string[]) {
+  const key = [...new Set(eventIds)].sort().join('\n');
+  const [events, setEvents] = useState<Record<string, UniverseEventDetail>>({});
+  const [error, setError] = useState('');
+  useEffect(() => {
+    const ids = key ? key.split('\n') : [];
+    if (!ids.length) {
+      setEvents({});
+      return;
+    }
+    let active = true;
+    setError('');
+    void Promise.all(
+      ids.map((eventId) =>
+        universeGet<UniverseEventDetail>(
+          `/v1/events/${encodeURIComponent(eventId)}`,
+        ),
+      ),
+    )
+      .then((details) => {
+        if (active)
+          setEvents(
+            Object.fromEntries(
+              details.map((detail) => [detail.event.event_id, detail]),
+            ),
+          );
+      })
+      .catch(() => {
+        if (active) setError('Normalized event detail is unavailable.');
+      });
+    return () => {
+      active = false;
+    };
+  }, [key]);
+  return { events, error };
 }
 
 function PageHeading({
@@ -186,7 +227,7 @@ export function StatusPage({
           </h2>
           <p>
             {status?.current_complete_run
-              ? `${status.current_complete_summary.selected_targets} selected targets · run ${status.current_complete_run.run_id}`
+              ? `${status.current_complete_summary.selected_targets} selected markets · run ${status.current_complete_run.run_id}`
               : 'Waiting for complete Targeter evidence.'}
           </p>
         </div>
@@ -275,30 +316,49 @@ export function TargetsPage({
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
   const run = loaded.run;
+  const normalized = useEventDetails(
+    run?.selected_markets.map((market) => market.event_id) ?? [],
+  );
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
   );
   const [event, setEvent] = useState('');
-  const [detail, setDetail] = useState<UniverseSelectionDetail | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const grouped = useMemo(() => {
+    const groups = new Map<string, UniverseSelectedMarket[]>();
+    for (const market of run?.selected_markets ?? [])
+      groups.set(market.event_id, [
+        ...(groups.get(market.event_id) ?? []),
+        market,
+      ]);
+    return [...groups].map(([eventId, markets]) => ({
+      detail: normalized.events[eventId],
+      markets,
+    }));
+  }, [run, normalized.events]);
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
-    for (const selection of run?.selections ?? [])
-      values.set(selection.game ?? selection.sport, {
-        game: selection.game,
-        sport: selection.sport,
-      });
+    for (const { detail } of grouped)
+      if (detail)
+        values.set(detail.event.game ?? detail.event.sport, {
+          game: detail.event.game,
+          sport: detail.event.sport,
+        });
     return [...values.values()];
-  }, [run]);
-  const shown = (run?.selections ?? []).filter((selection) => {
+  }, [grouped]);
+  const shown = grouped.filter(({ detail, markets }) => {
+    if (!detail) return false;
+    const record = detail.event;
+    const retained = markets.every(
+      (market) => market.selection_reason === 'retained',
+    );
     const text =
-      `${selection.bundle_id} ${selection.context.participants.join(' ')}`.toLowerCase();
+      `${record.event_id} ${record.participants.join(' ')}`.toLowerCase();
     return (
       text.includes(query.toLowerCase()) &&
-      (!event || event === (selection.game ?? selection.sport)) &&
-      (lifecycle === 'all' ||
-        (lifecycle === 'retained') ===
-          (selection.occurrence_kind === 'retained'))
+      (!event || event === (record.game ?? record.sport)) &&
+      (lifecycle === 'all' || (lifecycle === 'retained') === retained)
     );
   });
   if (loaded.loading || !run)
@@ -308,13 +368,20 @@ export function TargetsPage({
         loading="Loading the current complete target set…"
       />
     );
+  if (normalized.error)
+    return (
+      <EmptyPage
+        error={normalized.error}
+        loading="Loading normalized events…"
+      />
+    );
   return (
     <div className="desktop-page">
       <MobileDetailNotice />
       <PageHeading
         eyebrow="CURRENT TARGETS"
         title="Everything being indexed."
-        copy={`The full selection set from the newest complete run · ${date(run.generated_at)}`}
+        copy={`Normalized selected markets from the newest complete run · ${date(run.run.generated_at)}`}
       />
       <div className="compact-toolbar">
         <label className="search-field">
@@ -323,7 +390,7 @@ export function TargetsPage({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search bundles or participants"
+            placeholder="Search events or participants"
           />
         </label>
         <div className="segmented" role="group" aria-label="Lifecycle filter">
@@ -344,69 +411,163 @@ export function TargetsPage({
           <span>Event</span>
           <span>Venues</span>
           <span>Activation</span>
-          <span>Targets</span>
+          <span>Markets</span>
           <span />
         </div>
-        {shown.map((selection) => (
-          <BundleRow
-            key={selection.bundle_id}
-            selection={selection}
-            open={() => setDetail(selection)}
+        {shown.map(({ detail, markets }) => (
+          <NormalizedTargetRow
+            key={detail.event.event_id}
+            detail={detail}
+            markets={markets}
+            open={() => setDetailId(detail.event.event_id)}
           />
         ))}
       </div>
       {!shown.length && (
         <div className="empty-state">
-          No current targets match these controls.
+          {grouped.some(({ detail }) => !detail)
+            ? 'Loading normalized event details…'
+            : 'No current targets match these controls.'}
         </div>
       )}
-      <BundleDrawer detail={detail} run={run} close={() => setDetail(null)} />
+      <NormalizedTargetDrawer
+        detail={detailId ? normalized.events[detailId] : null}
+        markets={
+          detailId
+            ? (grouped.find(({ detail }) => detail?.event.event_id === detailId)
+                ?.markets ?? [])
+            : []
+        }
+        close={() => setDetailId(null)}
+      />
     </div>
   );
 }
 
-function BundleRow({
-  selection,
+function NormalizedTargetRow({
+  detail,
+  markets,
   open,
 }: {
-  selection: UniverseSelectionDetail;
+  detail: UniverseEventDetail;
+  markets: UniverseSelectedMarket[];
   open: () => void;
 }) {
-  const venues = selection.context.targets.map((target) => target.venue);
+  const event = detail.event;
+  const retained = markets.every(
+    (market) => market.selection_reason === 'retained',
+  );
   return (
     <button className="bundle-row" onClick={open}>
       <span className="event-cell">
-        <EventIcon game={selection.game} sport={selection.sport} />
+        <EventIcon game={event.game} sport={event.sport} />
         <span>
-          <b>
-            {selection.context.participants.join(' vs ') || selection.bundle_id}
-          </b>
+          <b>{event.participants.join(' vs ') || event.event_id}</b>
           <small>
-            {label(selection.topology)} ·{' '}
-            {selection.occurrence_kind === 'retained'
-              ? 'Retained'
-              : 'Current candidate'}
+            {label(event.topology)} ·{' '}
+            {retained ? 'Retained' : 'Current candidate'}
           </small>
         </span>
       </span>
-      <VenueStack venues={venues} />
-      <span className="date-cell">{date(selection.activation_at)}</span>
-      <strong className="target-count">
-        {selection.context.targets.length}
-      </strong>
+      <VenueStack venues={markets.map((market) => market.venue)} />
+      <span className="date-cell">{date(event.activation_at)}</span>
+      <strong className="target-count">{markets.length}</strong>
       <Chevron />
     </button>
   );
 }
 
+function NormalizedTargetDrawer({
+  detail,
+  markets,
+  close,
+}: {
+  detail: UniverseEventDetail | null;
+  markets: UniverseSelectedMarket[];
+  close: () => void;
+}) {
+  useEffect(() => {
+    if (!detail) return;
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('keydown', keydown);
+    return () => window.removeEventListener('keydown', keydown);
+  }, [detail, close]);
+  if (!detail) return null;
+  return (
+    <div className="drawer-layer">
+      <button
+        className="drawer-backdrop"
+        onClick={close}
+        aria-label="Close event detail"
+      />
+      <div
+        className="bundle-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Normalized event detail"
+      >
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow">NORMALIZED EVENT</span>
+            <h2>{detail.event.participants.join(' vs ')}</h2>
+            <code>{detail.event.event_id}</code>
+          </div>
+          <button
+            className="close-button"
+            onClick={close}
+            aria-label="Close"
+            autoFocus
+          >
+            ×
+          </button>
+        </div>
+        <div className="drawer-facts">
+          <span>
+            <b>{markets.length}</b> selected markets
+          </span>
+          <span>
+            <b>{new Set(markets.map((market) => market.venue)).size}</b> venues
+          </span>
+          <span>
+            <b>{detail.relations.length}</b> relations
+          </span>
+        </div>
+        <div className="drawer-body market-list">
+          {markets.map((market) => (
+            <div
+              className="market-row"
+              key={`${market.venue}:${market.venue_market_id}`}
+            >
+              <VenueStack venues={[market.venue]} />
+              <span>
+                <b>{label(market.canonical_class)}</b>
+                <code>{market.market_id}</code>
+              </span>
+              <em>{label(market.selection_reason)}</em>
+            </div>
+          ))}
+          {detail.relations.map((relation) => (
+            <div className="proof-card" key={relation.relation_id}>
+              <b>
+                {label(relation.relation_type)} · {label(relation.coverage)}
+              </b>
+              <code>Relation {relation.relation_id}</code>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function BundleDrawer({
   detail,
-  run,
   history = [],
   close,
 }: {
   detail: UniverseSelectionDetail | null;
-  run?: UniverseCadenceRun;
   history?: UniverseSelection[];
   close: () => void;
 }) {
@@ -423,9 +584,6 @@ export function BundleDrawer({
     return () => window.removeEventListener('keydown', keydown);
   }, [detail, close]);
   if (!detail) return null;
-  const candidate = run?.candidates.find(
-    (item) => item.bundle_id === detail.bundle_id,
-  );
   return (
     <div className="drawer-layer">
       <button
@@ -511,12 +669,6 @@ export function BundleDrawer({
             <div className="evidence-list">
               <span>Occurrence: {label(detail.occurrence_kind)}</span>
               <span>Continuity: {label(detail.continuity_disposition)}</span>
-              {candidate && (
-                <span>
-                  Admission volume: $
-                  {candidate.admission.combined_moneyline_volume_usd.toLocaleString()}
-                </span>
-              )}
               <code>{detail.source.manifest_key}</code>
               <code>Manifest {detail.source.manifest_sha256}</code>
               <code>Report {detail.source.report_sha256}</code>
@@ -572,6 +724,9 @@ export function DecisionsPage({
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
   const run = loaded.run;
+  const normalized = useEventDetails(
+    run?.decisions.map((decision) => decision.event_id) ?? [],
+  );
   const [query, setQuery] = useState('');
   if (loaded.loading || !run)
     return (
@@ -580,11 +735,13 @@ export function DecisionsPage({
         loading="Loading Targeter decisions…"
       />
     );
-  const candidates = run.candidates.filter((candidate) =>
-    `${candidate.bundle_id} ${candidate.participants.join(' ')} ${candidate.rejection_reasons.join(' ')}`
+  const candidates = run.decisions.filter((candidate) => {
+    const participants =
+      normalized.events[candidate.event_id]?.event.participants.join(' ') ?? '';
+    return `${candidate.bundle_id} ${participants} ${candidate.rejection_reasons.join(' ')}`
       .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+      .includes(query.toLowerCase());
+  });
   return (
     <div className="desktop-page decisions-page">
       <MobileDetailNotice />
@@ -598,7 +755,11 @@ export function DecisionsPage({
         <Chevron />
         <FunnelStep count={run.counts.eligible} label="Eligible" />
         <Chevron />
-        <FunnelStep count={run.counts.selected} label="Selected" accent />
+        <FunnelStep
+          count={run.counts.selected_events}
+          label="Selected events"
+          accent
+        />
       </section>
       <label className="search-field decisions-search">
         <SearchIcon />
@@ -611,7 +772,11 @@ export function DecisionsPage({
       </label>
       <section className="decision-list">
         {candidates.map((candidate) => (
-          <CandidateRow key={candidate.bundle_id} candidate={candidate} />
+          <CandidateRow
+            key={candidate.bundle_id}
+            candidate={candidate}
+            detail={normalized.events[candidate.event_id]}
+          />
         ))}
       </section>
       {!candidates.length && (
@@ -640,7 +805,13 @@ function FunnelStep({
   );
 }
 
-function CandidateRow({ candidate }: { candidate: UniverseCadenceCandidate }) {
+function CandidateRow({
+  candidate,
+  detail,
+}: {
+  candidate: UniverseTargeterDecision;
+  detail?: UniverseEventDetail;
+}) {
   const state = candidate.selected
     ? 'Selected'
     : candidate.eligible
@@ -649,9 +820,14 @@ function CandidateRow({ candidate }: { candidate: UniverseCadenceCandidate }) {
   return (
     <details className="candidate-row">
       <summary>
-        <EventIcon game={candidate.game} sport={candidate.sport} />
+        <EventIcon
+          game={detail?.event.game ?? null}
+          sport={detail?.event.sport ?? 'event'}
+        />
         <span>
-          <b>{candidate.participants.join(' vs ') || candidate.bundle_id}</b>
+          <b>
+            {detail?.event.participants.join(' vs ') || candidate.bundle_id}
+          </b>
           <small>
             {candidate.rejection_reasons.map(label).join(' · ') ||
               label(candidate.allocation_rejection) ||
