@@ -44,15 +44,20 @@ run on demand from:
 GET /api/event-universe/v1/targeter/runs/<run_id>
 ```
 
-They use `current_complete_run.run_id`, then hydrate normalized event detail
-from `GET /v1/events/<event_id>`; a newer incomplete run cannot replace the
-current target set. Indexed status is not proof of
+They use `current_complete_run.run_id` and render the run's compact embedded
+event summaries. Full `GET /v1/events/<event_id>` detail is requested only when
+the corresponding target drawer opens; a newer incomplete run cannot replace
+the current target set. Indexed status is not proof of
 `current.json` publication or splice/frame capture health; capture therefore
 remains explicitly unverified. The UI uses the server's semantic counts and
 never reinterprets raw Targeter reports.
 
-History consumes grouped bundle summaries from `GET /v1/bundles`, then loads
-the latest immutable detail and occurrence timeline only when a bundle opens.
+History pages through grouped bundle summaries from `GET /v1/bundles`, retaining
+only one 100-row page, then loads the latest immutable detail and occurrence
+timeline only when a bundle opens. Targets and decisions render at most 100 rows
+per client-side page. Browser and function caches retain at most eight bounded
+responses; the browser does not cache full event details after their drawer
+closes.
 
 ## Routes
 

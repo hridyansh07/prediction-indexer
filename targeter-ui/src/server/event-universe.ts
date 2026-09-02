@@ -11,7 +11,11 @@ import type {
   UniverseCadence,
   UniverseCadenceRun,
   UniverseEventDetail,
+  UniverseEventPage,
+  UniverseMarketDetail,
+  UniverseRelationDetail,
   UniverseRelationSummary,
+  UniverseRelationshipTypeCatalog,
   UniverseSelectedMarket,
   UniverseTargeterDecision,
   UniverseTargeterRunDetail,
@@ -48,7 +52,17 @@ const RUN_QUERY = new Set([
 ]);
 const CADENCE_QUERY = new Set(['limit']);
 const RESPONSE_BUDGET_BYTES = 1_750_000;
+const DETAIL_ROW_LIMIT = 1000;
 const BUNDLE_QUERY = new Set(['limit', 'cursor']);
+const EVENT_QUERY = new Set(['limit', 'cursor']);
+const MARKET_QUERY = new Set([
+  'market_template_version',
+  'outcome_space_version',
+]);
+const POSITIVE_INTEGER_FIELDS = new Set([
+  'market_template_version',
+  'outcome_space_version',
+]);
 const TIMESTAMP_FIELDS = new Set([
   'activation_start',
   'activation_end',
@@ -93,6 +107,8 @@ export class EventUniverseClient {
       options.maxResponseBytes ?? RESPONSE_BUDGET_BYTES,
       'response limit',
     );
+    if (this.maxResponseBytes > RESPONSE_BUDGET_BYTES)
+      throw new Error('response limit exceeds the application budget');
     this.fetchImpl = options.fetch ?? fetch;
   }
 
@@ -179,6 +195,39 @@ export class EventUniverseClient {
     );
   }
 
+  events(query: URLSearchParams) {
+    return this.get(
+      'v1/events',
+      validateUniverseQuery(query, EVENT_QUERY),
+      validateEventPage,
+    );
+  }
+
+  market(marketId: string, query: URLSearchParams) {
+    return this.get(
+      `v1/markets/${encodeId(marketId)}`,
+      validateUniverseQuery(query, MARKET_QUERY),
+      validateMarketDetail,
+    );
+  }
+
+  relation(relationId: string) {
+    if (!/^[1-9]\d*$/.test(relationId)) throw new UniverseRequestError();
+    return this.get(
+      `v1/relations/${relationId}`,
+      new URLSearchParams(),
+      validateRelationDetail,
+    );
+  }
+
+  relationshipTypes() {
+    return this.get(
+      'v1/relationship-types',
+      new URLSearchParams(),
+      validateRelationshipTypes,
+    );
+  }
+
   private async get<T>(
     path: string,
     query: URLSearchParams,
@@ -241,6 +290,8 @@ export class EventUniverseClient {
 export function createEventUniverseRouter(client: EventUniverseClient | null) {
   const router = Router();
   router.use(async (request: Request, response: ExpressResponse) => {
+    if (/^\/v1\/events\/[^/]+$/.test(request.path))
+      response.setHeader('cache-control', 'no-store');
     if (!client) return response.status(503).json(SAFE_ERROR);
     if (request.method !== 'GET')
       return response.status(405).json({ error: 'Method not allowed' });
@@ -272,6 +323,11 @@ export async function dispatchEventUniverseRequest(
   if (pathname === '/v1/runs') return client.runs(query);
   if (pathname === '/v1/selections') return client.selections(query);
   if (pathname === '/v1/bundles') return client.bundles(query);
+  if (pathname === '/v1/events') return client.events(query);
+  if (pathname === '/v1/relationship-types') {
+    requireNoQuery(query);
+    return client.relationshipTypes();
+  }
   if (pathname === '/v1/targeter/status') return client.status(query);
   let match = /^\/v1\/targeter\/runs\/([^/]+)$/.exec(pathname);
   if (match) {
@@ -282,6 +338,13 @@ export async function dispatchEventUniverseRequest(
   if (match) {
     requireNoQuery(query);
     return client.event(pathSegment(match[1]));
+  }
+  match = /^\/v1\/markets\/([^/]+)$/.exec(pathname);
+  if (match) return client.market(pathSegment(match[1]), query);
+  match = /^\/v1\/relations\/([^/]+)$/.exec(pathname);
+  if (match) {
+    requireNoQuery(query);
+    return client.relation(pathSegment(match[1]));
   }
 
   match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
@@ -359,6 +422,8 @@ export function validateUniverseQuery(
       (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 100)
     )
       throw new UniverseRequestError();
+    if (POSITIVE_INTEGER_FIELDS.has(key) && !/^[1-9]\d*$/.test(value))
+      throw new UniverseRequestError();
     result.append(key, value);
   }
   return result;
@@ -415,6 +480,10 @@ const text = (value: unknown) => {
   if (typeof value !== 'string' || !value) throw new UniverseUpstreamError();
   return value;
 };
+const possiblyEmptyText = (value: unknown) => {
+  if (typeof value !== 'string') throw new UniverseUpstreamError();
+  return value;
+};
 const nullableText = (value: unknown) => (value === null ? null : text(value));
 const number = (value: unknown) => {
   if (typeof value !== 'number' || !Number.isFinite(value))
@@ -427,6 +496,13 @@ const integer = (value: unknown) => {
     throw new UniverseUpstreamError();
   return result;
 };
+const positiveInteger = (value: unknown) => {
+  const result = integer(value);
+  if (result === 0) throw new UniverseUpstreamError();
+  return result;
+};
+const nullableNumber = (value: unknown) =>
+  value === null ? null : number(value);
 const boolean = (value: unknown) => {
   if (typeof value !== 'boolean') throw new UniverseUpstreamError();
   return value;
@@ -448,6 +524,16 @@ const strings = (value: unknown) => {
 };
 const array = <T>(value: unknown, validate: Validator<T>) => {
   if (!Array.isArray(value)) throw new UniverseUpstreamError();
+  return value.map(validate);
+};
+const pageArray = <T>(value: unknown, validate: Validator<T>) => {
+  if (!Array.isArray(value) || value.length > 100)
+    throw new UniverseUpstreamError();
+  return value.map(validate);
+};
+const detailArray = <T>(value: unknown, validate: Validator<T>) => {
+  if (!Array.isArray(value) || value.length > DETAIL_ROW_LIMIT)
+    throw new UniverseUpstreamError();
   return value.map(validate);
 };
 const jsonValue = (value: unknown, depth = 0): unknown => {
@@ -667,7 +753,7 @@ function validateSelectionPage(value: unknown): UniverseSelectionPage {
   if (!['activation', 'selected'].includes(sort))
     throw new UniverseUpstreamError();
   return {
-    selections: array(item.selections, validateSelection),
+    selections: pageArray(item.selections, validateSelection),
     sort: sort as UniverseSelectionPage['sort'],
     next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
   };
@@ -718,7 +804,7 @@ function validateBundle(value: unknown): UniverseBundle {
 function validateBundlePage(value: unknown): UniverseBundlePage {
   const item = object(value, ['bundles', 'next_cursor'], 'bundle page');
   return {
-    bundles: array(item.bundles, validateBundle),
+    bundles: pageArray(item.bundles, validateBundle),
     next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
   };
 }
@@ -883,7 +969,7 @@ function validateRun(value: unknown): UniverseRun {
 function validateRunPage(value: unknown): UniverseRunPage {
   const item = object(value, ['runs', 'next_cursor'], 'run page');
   return {
-    runs: array(item.runs, validateRun),
+    runs: pageArray(item.runs, validateRun),
     next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
   };
 }
@@ -1428,7 +1514,15 @@ export function validateCadence(value: unknown): UniverseCadence {
 export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
   const item = object(
     value,
-    ['run', 'source', 'counts', 'decisions', 'selected_markets', 'relations'],
+    [
+      'run',
+      'source',
+      'counts',
+      'decisions',
+      'events',
+      'selected_markets',
+      'relations',
+    ],
     'targeter run detail',
   );
   const source = object(
@@ -1447,11 +1541,16 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     ],
     'targeter run counts',
   );
-  const decisions = array(item.decisions, validateTargeterDecision);
-  const selectedMarkets = array(item.selected_markets, validateSelectedMarket);
-  const relations = array(item.relations, (relation) =>
+  const decisions = detailArray(item.decisions, validateTargeterDecision);
+  const events = detailArray(item.events, validateEvent);
+  const selectedMarkets = detailArray(
+    item.selected_markets,
+    validateSelectedMarket,
+  );
+  const relations = detailArray(item.relations, (relation) =>
     validateRelationSummary(relation, true),
   );
+  const eventIds = new Set(events.map((event) => event.event_id));
   const validatedCounts = {
     candidates: integer(counts.candidates),
     eligible: integer(counts.eligible),
@@ -1466,7 +1565,12 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     validatedCounts.selected_markets !== selectedMarkets.length ||
     validatedCounts.selected_events !==
       new Set(selectedMarkets.map((market) => market.event_id)).size ||
-    validatedCounts.relations !== relations.length
+    validatedCounts.relations !== relations.length ||
+    eventIds.size !== events.length ||
+    [...decisions, ...selectedMarkets, ...relations].some(
+      (record) =>
+        record.event_id === undefined || !eventIds.has(record.event_id),
+    )
   )
     throw new UniverseUpstreamError();
   return {
@@ -1479,6 +1583,7 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     },
     counts: validatedCounts,
     decisions,
+    events,
     selected_markets: selectedMarkets,
     relations,
   };
@@ -1590,8 +1695,8 @@ function validateSelectedMarket(value: unknown): UniverseSelectedMarket {
     venue: text(item.venue),
     venue_market_id: text(item.venue_market_id),
     market_id: text(item.market_id),
-    market_template_version: integer(item.market_template_version),
-    outcome_space_version: integer(item.outcome_space_version),
+    market_template_version: positiveInteger(item.market_template_version),
+    outcome_space_version: positiveInteger(item.outcome_space_version),
     canonical_class: text(item.canonical_class),
     continuity_score: number(item.continuity_score),
     selection_reason:
@@ -1615,14 +1720,323 @@ function validateRelationSummary(
   ];
   const item = object(value, keys, 'relation summary');
   return {
-    relation_id: integer(item.relation_id),
+    relation_id: positiveInteger(item.relation_id),
     relation_type: text(item.relation_type),
     ...(includeEvent ? { event_id: text(item.event_id) } : {}),
     scope: text(item.scope),
     coverage: text(item.coverage),
-    generation_version: integer(item.generation_version),
+    generation_version: positiveInteger(item.generation_version),
     canonical_hash: sha(item.canonical_hash),
   };
+}
+
+function validateEventPage(value: unknown): UniverseEventPage {
+  const item = object(value, ['events', 'next_cursor'], 'event page');
+  const events = pageArray(item.events, (value) => {
+    const record = object(
+      value,
+      [
+        'event_id',
+        'sport',
+        'game',
+        'topology',
+        'activation_at',
+        'participants',
+        'participant_keys',
+        'first_seen_run_id',
+        'last_seen_run_id',
+        'venue_count',
+        'market_count',
+        'selected_run_count',
+      ],
+      'event summary',
+    );
+    const event = validateEvent(
+      Object.fromEntries(
+        Object.entries(record).filter(
+          ([key]) =>
+            !['venue_count', 'market_count', 'selected_run_count'].includes(
+              key,
+            ),
+        ),
+      ),
+    );
+    return {
+      ...event,
+      venue_count: integer(record.venue_count),
+      market_count: integer(record.market_count),
+      selected_run_count: integer(record.selected_run_count),
+    };
+  });
+  if (new Set(events.map((event) => event.event_id)).size !== events.length)
+    throw new UniverseUpstreamError();
+  return {
+    events,
+    next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
+  };
+}
+
+function validateCanonicalMarket(value: unknown) {
+  const record = object(
+    value,
+    [
+      'market_id',
+      'market_template_version',
+      'outcome_space_version',
+      'event_id',
+      'canonical_class',
+      'market_type',
+      'scope',
+      'parameters',
+      'first_seen_run_id',
+      'last_seen_run_id',
+      'venue_market_count',
+      'venues',
+    ],
+    'canonical market',
+  );
+  return {
+    market_id: text(record.market_id),
+    market_template_version: positiveInteger(record.market_template_version),
+    outcome_space_version: positiveInteger(record.outcome_space_version),
+    event_id: text(record.event_id),
+    canonical_class: text(record.canonical_class),
+    market_type: text(record.market_type),
+    scope: text(record.scope),
+    parameters: jsonObject(record.parameters),
+    first_seen_run_id: text(record.first_seen_run_id),
+    last_seen_run_id: text(record.last_seen_run_id),
+    venue_market_count: integer(record.venue_market_count),
+    venues: strings(record.venues),
+  };
+}
+
+function validateMarketDetail(value: unknown): UniverseMarketDetail {
+  const item = object(
+    value,
+    ['market', 'venue_markets', 'selections', 'relations'],
+    'market detail',
+  );
+  const market = validateCanonicalMarket(item.market);
+  const venueMarkets = detailArray(item.venue_markets, (value) => {
+    const record = object(
+      value,
+      [
+        'venue',
+        'venue_market_id',
+        'venue_event_id',
+        'event_id',
+        'market_id',
+        'market_template_version',
+        'outcome_space_version',
+        'canonical_class',
+        'market_type',
+        'scope',
+        'title',
+        'parameters',
+        'subscription_ids',
+        'outcome_labels',
+        'status',
+        'accepting_orders',
+        'rules_hash',
+        'rule_template_id',
+        'source_ref',
+        'created_at',
+        'volume_24h',
+        'volume_total',
+        'volume_total_usd',
+        'liquidity',
+        'first_seen_run_id',
+        'last_seen_run_id',
+      ],
+      'venue market',
+    );
+    return {
+      venue: text(record.venue),
+      venue_market_id: text(record.venue_market_id),
+      venue_event_id: text(record.venue_event_id),
+      event_id: text(record.event_id),
+      market_id: text(record.market_id),
+      market_template_version: positiveInteger(record.market_template_version),
+      outcome_space_version: positiveInteger(record.outcome_space_version),
+      canonical_class: text(record.canonical_class),
+      market_type: text(record.market_type),
+      scope: text(record.scope),
+      title: text(record.title),
+      parameters: jsonObject(record.parameters),
+      subscription_ids: strings(record.subscription_ids),
+      outcome_labels: strings(record.outcome_labels),
+      status: text(record.status),
+      accepting_orders: boolean(record.accepting_orders),
+      rules_hash: nullableText(record.rules_hash),
+      rule_template_id: nullableText(record.rule_template_id),
+      source_ref: text(record.source_ref),
+      created_at:
+        record.created_at === null ? null : timestamp(record.created_at),
+      volume_24h: nullableNumber(record.volume_24h),
+      volume_total: nullableNumber(record.volume_total),
+      volume_total_usd: nullableNumber(record.volume_total_usd),
+      liquidity: nullableNumber(record.liquidity),
+      first_seen_run_id: text(record.first_seen_run_id),
+      last_seen_run_id: text(record.last_seen_run_id),
+    };
+  });
+  const selections = detailArray(item.selections, (value) => {
+    const record = object(
+      value,
+      [
+        'run_id',
+        'generated_at',
+        'bundle_id',
+        'venue',
+        'venue_market_id',
+        'continuity_score',
+        'selection_reason',
+        'origin_run_id',
+      ],
+      'market selection',
+    );
+    const selectionReason = text(record.selection_reason);
+    if (
+      !['selected', 'held_current_candidate', 'retained'].includes(
+        selectionReason,
+      )
+    )
+      throw new UniverseUpstreamError();
+    return {
+      run_id: text(record.run_id),
+      generated_at: timestamp(record.generated_at),
+      bundle_id: text(record.bundle_id),
+      venue: text(record.venue),
+      venue_market_id: text(record.venue_market_id),
+      continuity_score: number(record.continuity_score),
+      selection_reason:
+        selectionReason as UniverseSelectedMarket['selection_reason'],
+      origin_run_id: text(record.origin_run_id),
+    };
+  });
+  return {
+    market,
+    venue_markets: venueMarkets,
+    selections,
+    relations: detailArray(item.relations, (relation) =>
+      validateRelationSummary(relation, false),
+    ),
+  };
+}
+
+function validateRelationDetail(value: unknown): UniverseRelationDetail {
+  const item = object(
+    value,
+    ['relation', 'members', 'observations'],
+    'relation detail',
+  );
+  const relation = object(
+    item.relation,
+    ['relation_id', 'relation_type', 'generation_version', 'canonical_hash'],
+    'relation',
+  );
+  return {
+    relation: {
+      relation_id: positiveInteger(relation.relation_id),
+      relation_type: text(relation.relation_type),
+      generation_version: positiveInteger(relation.generation_version),
+      canonical_hash: sha(relation.canonical_hash),
+    },
+    members: detailArray(item.members, (value) => {
+      const record = object(
+        value,
+        [
+          'venue',
+          'venue_market_id',
+          'market_id',
+          'market_template_version',
+          'outcome_space_version',
+          'claim_key',
+          'role',
+        ],
+        'relation member',
+      );
+      return {
+        venue: text(record.venue),
+        venue_market_id: text(record.venue_market_id),
+        market_id: text(record.market_id),
+        market_template_version: positiveInteger(
+          record.market_template_version,
+        ),
+        outcome_space_version: positiveInteger(record.outcome_space_version),
+        claim_key: possiblyEmptyText(record.claim_key),
+        role: text(record.role),
+      };
+    }),
+    observations: detailArray(item.observations, (value) => {
+      const record = object(
+        value,
+        [
+          'run_id',
+          'generated_at',
+          'bundle_id',
+          'event_id',
+          'scope',
+          'coverage',
+        ],
+        'relation observation',
+      );
+      return {
+        run_id: text(record.run_id),
+        generated_at: timestamp(record.generated_at),
+        bundle_id: text(record.bundle_id),
+        event_id: text(record.event_id),
+        scope: text(record.scope),
+        coverage: text(record.coverage),
+      };
+    }),
+  };
+}
+
+function validateRelationshipTypes(
+  value: unknown,
+): UniverseRelationshipTypeCatalog {
+  const item = object(
+    value,
+    ['relationship_type_catalog_version', 'types'],
+    'relationship type catalog',
+  );
+  if (item.relationship_type_catalog_version !== 1)
+    throw new UniverseUpstreamError();
+  const expected = new Map<string, { directed: boolean; roles: string[] }>([
+    ['IDENTITY', { directed: false, roles: ['member'] }],
+    ['IMPLICATION', { directed: true, roles: ['left', 'right'] }],
+    ['REVERSE_IMPLICATION', { directed: true, roles: ['left', 'right'] }],
+    ['MUTUAL_EXCLUSION', { directed: false, roles: ['member'] }],
+    ['OVERLAP', { directed: false, roles: ['member'] }],
+  ]);
+  const types = array(item.types, (value) => {
+    const record = object(
+      value,
+      ['type', 'directed', 'member_roles'],
+      'relationship type',
+    );
+    return {
+      type: text(record.type),
+      directed: boolean(record.directed),
+      member_roles: strings(record.member_roles),
+    };
+  });
+  if (
+    types.length !== expected.size ||
+    new Set(types.map((type) => type.type)).size !== types.length ||
+    types.some((type) => {
+      const contract = expected.get(type.type);
+      return (
+        !contract ||
+        type.directed !== contract.directed ||
+        type.member_roles.join('\0') !== contract.roles.join('\0')
+      );
+    })
+  )
+    throw new UniverseUpstreamError();
+  return { relationship_type_catalog_version: 1, types };
 }
 
 export function validateEventDetail(value: unknown): UniverseEventDetail {
@@ -1632,7 +2046,7 @@ export function validateEventDetail(value: unknown): UniverseEventDetail {
     'event detail',
   );
   const event = validateEvent(item.event);
-  const venueEvents = array(item.venue_events, (value) => {
+  const venueEvents = detailArray(item.venue_events, (value) => {
     const record = object(
       value,
       [
@@ -1663,48 +2077,15 @@ export function validateEventDetail(value: unknown): UniverseEventDetail {
       last_seen_run_id: text(record.last_seen_run_id),
     };
   });
-  const markets = array(item.markets, (value) => {
-    const record = object(
-      value,
-      [
-        'market_id',
-        'market_template_version',
-        'outcome_space_version',
-        'event_id',
-        'canonical_class',
-        'market_type',
-        'scope',
-        'parameters',
-        'first_seen_run_id',
-        'last_seen_run_id',
-        'venue_market_count',
-        'venues',
-      ],
-      'canonical market',
-    );
-    return {
-      market_id: text(record.market_id),
-      market_template_version: integer(record.market_template_version),
-      outcome_space_version: integer(record.outcome_space_version),
-      event_id: text(record.event_id),
-      canonical_class: text(record.canonical_class),
-      market_type: text(record.market_type),
-      scope: text(record.scope),
-      parameters: jsonObject(record.parameters),
-      first_seen_run_id: text(record.first_seen_run_id),
-      last_seen_run_id: text(record.last_seen_run_id),
-      venue_market_count: integer(record.venue_market_count),
-      venues: strings(record.venues),
-    };
-  });
+  const markets = detailArray(item.markets, validateCanonicalMarket);
   return {
     event,
     venue_events: venueEvents,
     markets,
-    relations: array(item.relations, (relation) =>
+    relations: detailArray(item.relations, (relation) =>
       validateRelationSummary(relation, false),
     ),
-    observations: array(item.observations, (value) => {
+    observations: detailArray(item.observations, (value) => {
       const record = object(
         value,
         ['run_id', 'generated_at', 'bundle_id'],
@@ -1819,7 +2200,8 @@ export function validateTargeterStatus(value: unknown): UniverseTargeterStatus {
         latestRunAgeSeconds === null ||
         latestIndexedAt === null)) ||
     (currentCompleteRun === null &&
-      (summary.selected_bundles !== 0 || summary.selected_targets !== 0))
+      (summary.selected_bundles !== 0 || summary.selected_targets !== 0)) ||
+    (currentCompleteRun !== null && !currentCompleteRun.input_complete)
   )
     throw new UniverseUpstreamError();
   return {
@@ -1879,7 +2261,8 @@ function validateHealth(value: unknown): UniverseHealth {
     ['status', 'schema_version', 'latest_run', 'counts'],
     'health',
   );
-  if (item.status !== 'ok') throw new UniverseUpstreamError();
+  if (item.status !== 'ok' || item.schema_version !== 3)
+    throw new UniverseUpstreamError();
   const counts = object(
     item.counts,
     [
@@ -1888,6 +2271,10 @@ function validateHealth(value: unknown): UniverseHealth {
       'bundle_retirements',
       'bundle_contexts',
       'context_targets',
+      'umbrella_events',
+      'canonical_markets',
+      'venue_markets',
+      'relations',
     ],
     'counts',
   );
@@ -1918,7 +2305,7 @@ function validateHealth(value: unknown): UniverseHealth {
   }
   return {
     status: 'ok',
-    schema_version: integer(item.schema_version),
+    schema_version: 3,
     latest_run: latest,
     counts: {
       targeter_runs: integer(counts.targeter_runs),
@@ -1926,6 +2313,10 @@ function validateHealth(value: unknown): UniverseHealth {
       bundle_retirements: integer(counts.bundle_retirements),
       bundle_contexts: integer(counts.bundle_contexts),
       context_targets: integer(counts.context_targets),
+      umbrella_events: integer(counts.umbrella_events),
+      canonical_markets: integer(counts.canonical_markets),
+      venue_markets: integer(counts.venue_markets),
+      relations: integer(counts.relations),
     },
   };
 }

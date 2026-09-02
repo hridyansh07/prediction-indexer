@@ -351,6 +351,17 @@ export interface UniverseEvent {
   selected_run_count?: number;
 }
 
+export interface UniverseEventPage {
+  events: Array<
+    UniverseEvent & {
+      venue_count: number;
+      market_count: number;
+      selected_run_count: number;
+    }
+  >;
+  next_cursor: string | null;
+}
+
 export interface UniverseCanonicalMarket {
   market_id: string;
   market_template_version: number;
@@ -396,6 +407,86 @@ export interface UniverseEventDetail {
     run_id: string;
     generated_at: string;
     bundle_id: string;
+  }>;
+}
+
+export interface UniverseVenueMarket {
+  venue: string;
+  venue_market_id: string;
+  venue_event_id: string;
+  event_id: string;
+  market_id: string;
+  market_template_version: number;
+  outcome_space_version: number;
+  canonical_class: string;
+  market_type: string;
+  scope: string;
+  title: string;
+  parameters: Record<string, unknown>;
+  subscription_ids: string[];
+  outcome_labels: string[];
+  status: string;
+  accepting_orders: boolean;
+  rules_hash: string | null;
+  rule_template_id: string | null;
+  source_ref: string;
+  created_at: string | null;
+  volume_24h: number | null;
+  volume_total: number | null;
+  volume_total_usd: number | null;
+  liquidity: number | null;
+  first_seen_run_id: string;
+  last_seen_run_id: string;
+}
+
+export interface UniverseMarketDetail {
+  market: UniverseCanonicalMarket;
+  venue_markets: UniverseVenueMarket[];
+  selections: Array<{
+    run_id: string;
+    generated_at: string;
+    bundle_id: string;
+    venue: string;
+    venue_market_id: string;
+    continuity_score: number;
+    selection_reason: UniverseSelectedMarket['selection_reason'];
+    origin_run_id: string;
+  }>;
+  relations: UniverseRelationSummary[];
+}
+
+export interface UniverseRelationDetail {
+  relation: {
+    relation_id: number;
+    relation_type: string;
+    generation_version: number;
+    canonical_hash: string;
+  };
+  members: Array<{
+    venue: string;
+    venue_market_id: string;
+    market_id: string;
+    market_template_version: number;
+    outcome_space_version: number;
+    claim_key: string;
+    role: string;
+  }>;
+  observations: Array<{
+    run_id: string;
+    generated_at: string;
+    bundle_id: string;
+    event_id: string;
+    scope: string;
+    coverage: string;
+  }>;
+}
+
+export interface UniverseRelationshipTypeCatalog {
+  relationship_type_catalog_version: 1;
+  types: Array<{
+    type: string;
+    directed: boolean;
+    member_roles: string[];
   }>;
 }
 
@@ -446,13 +537,14 @@ export interface UniverseTargeterRunDetail {
     relations: number;
   };
   decisions: UniverseTargeterDecision[];
+  events: UniverseEvent[];
   selected_markets: UniverseSelectedMarket[];
   relations: UniverseRelationSummary[];
 }
 
 export interface UniverseHealth {
   status: 'ok';
-  schema_version: number;
+  schema_version: 3;
   latest_run: {
     run_id: string;
     generated_at: string;
@@ -468,6 +560,10 @@ export interface UniverseHealth {
     bundle_retirements: number;
     bundle_contexts: number;
     context_targets: number;
+    umbrella_events: number;
+    canonical_markets: number;
+    venue_markets: number;
+    relations: number;
   };
 }
 

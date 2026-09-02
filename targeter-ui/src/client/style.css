@@ -789,6 +789,14 @@ main {
   background: var(--surface);
   overflow: hidden;
 }
+
+.result-pagination {
+  align-items: center;
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  margin-top: 1.25rem;
+}
 .candidate-row {
   border-bottom: 1px solid var(--line);
 }

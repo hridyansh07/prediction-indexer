@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
+  UniverseEvent,
   UniverseEventDetail,
   UniverseHealth,
   UniverseSelectedMarket,
@@ -11,6 +12,7 @@ import type {
   UniverseTargeterStatus,
 } from '../event-universe';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
+import { boundedRenderPage } from './event-universe-view-model';
 import { universeGet } from './universe-api';
 
 const date = (value: string | null | undefined) =>
@@ -76,41 +78,93 @@ function useTargeterRun(runId: string | null) {
   return { run, error, loading };
 }
 
-function useEventDetails(eventIds: string[]) {
-  const key = [...new Set(eventIds)].sort().join('\n');
-  const [events, setEvents] = useState<Record<string, UniverseEventDetail>>({});
+function useEventDetail(eventId: string | null) {
+  const [detail, setDetail] = useState<UniverseEventDetail | null>(null);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   useEffect(() => {
-    const ids = key ? key.split('\n') : [];
-    if (!ids.length) {
-      setEvents({});
+    if (!eventId) {
+      setDetail(null);
+      setError('');
+      setLoading(false);
       return;
     }
     let active = true;
+    const controller = new AbortController();
+    setDetail(null);
     setError('');
-    void Promise.all(
-      ids.map((eventId) =>
-        universeGet<UniverseEventDetail>(
-          `/v1/events/${encodeURIComponent(eventId)}`,
-        ),
-      ),
+    setLoading(true);
+    void universeGet<UniverseEventDetail>(
+      `/v1/events/${encodeURIComponent(eventId)}`,
+      { signal: controller.signal, cache: false },
     )
-      .then((details) => {
-        if (active)
-          setEvents(
-            Object.fromEntries(
-              details.map((detail) => [detail.event.event_id, detail]),
-            ),
-          );
+      .then((nextDetail) => {
+        if (active) setDetail(nextDetail);
       })
       .catch(() => {
         if (active) setError('Normalized event detail is unavailable.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
     return () => {
       active = false;
+      controller.abort();
     };
-  }, [key]);
-  return { events, error };
+  }, [eventId]);
+  return { detail, error, loading };
+}
+
+function useDrawerFocus(
+  open: boolean,
+  close: () => void,
+  opener: React.MutableRefObject<HTMLElement | null>,
+) {
+  const dialog = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  useEffect(() => {
+    if (!open) return;
+    const element = dialog.current;
+    if (!element) return;
+    element.focus();
+    const focusables = () =>
+      [
+        ...element.querySelectorAll<HTMLElement>(
+          'button, [href], input, [tabindex]:not([tabindex="-1"])',
+        ),
+      ].filter((item) => !item.hasAttribute('disabled'));
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusables();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (document.activeElement === element) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    element.addEventListener('keydown', keydown);
+    return () => {
+      element.removeEventListener('keydown', keydown);
+      opener.current?.focus();
+      opener.current = null;
+    };
+  }, [open, opener]);
+  return dialog;
 }
 
 function PageHeading({
@@ -306,6 +360,44 @@ function EventFilters({
   );
 }
 
+function ResultPagination({
+  currentPage,
+  pageCount,
+  setPage,
+}: {
+  currentPage: number;
+  pageCount: number;
+  setPage: (page: number) => void;
+}) {
+  if (pageCount <= 1) return null;
+  return (
+    <nav className="result-pagination" aria-label="Result pages">
+      <button
+        className="quiet-button"
+        disabled={currentPage === 0}
+        onClick={() => setPage(currentPage - 1)}
+      >
+        Previous
+      </button>
+      <span aria-live="polite">
+        Page {currentPage + 1} of {pageCount}
+      </span>
+      <button
+        className="quiet-button"
+        disabled={currentPage + 1 === pageCount}
+        onClick={() => setPage(currentPage + 1)}
+      >
+        Next
+      </button>
+    </nav>
+  );
+}
+
+interface TargetEventGroup {
+  event: UniverseEvent;
+  markets: UniverseSelectedMarket[];
+}
+
 export function TargetsPage({
   status,
   error,
@@ -316,40 +408,44 @@ export function TargetsPage({
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
   const run = loaded.run;
-  const normalized = useEventDetails(
-    run?.selected_markets.map((market) => market.event_id) ?? [],
-  );
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
   );
   const [event, setEvent] = useState('');
+  const [page, setPage] = useState(0);
   const [detailId, setDetailId] = useState<string | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const selectedDetail = useEventDetail(detailId);
   const grouped = useMemo(() => {
     const groups = new Map<string, UniverseSelectedMarket[]>();
+    const events = new Map(
+      (run?.events ?? []).map((event) => [event.event_id, event]),
+    );
     for (const market of run?.selected_markets ?? [])
       groups.set(market.event_id, [
         ...(groups.get(market.event_id) ?? []),
         market,
       ]);
-    return [...groups].map(([eventId, markets]) => ({
-      detail: normalized.events[eventId],
-      markets,
-    }));
-  }, [run, normalized.events]);
+    return [...groups]
+      .map(([eventId, markets]) => ({
+        event: events.get(eventId),
+        markets,
+      }))
+      .filter((group): group is TargetEventGroup => group.event !== undefined);
+  }, [run]);
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
-    for (const { detail } of grouped)
-      if (detail)
-        values.set(detail.event.game ?? detail.event.sport, {
-          game: detail.event.game,
-          sport: detail.event.sport,
+    for (const { event } of grouped)
+      if (event)
+        values.set(event.game ?? event.sport, {
+          game: event.game,
+          sport: event.sport,
         });
     return [...values.values()];
   }, [grouped]);
-  const shown = grouped.filter(({ detail, markets }) => {
-    if (!detail) return false;
-    const record = detail.event;
+  const shown = grouped.filter(({ event: record, markets }) => {
+    if (!record) return false;
     const retained = markets.every(
       (market) => market.selection_reason === 'retained',
     );
@@ -361,18 +457,13 @@ export function TargetsPage({
       (lifecycle === 'all' || (lifecycle === 'retained') === retained)
     );
   });
+  const rendered = boundedRenderPage(shown, page);
+  useEffect(() => setPage(0), [query, lifecycle, event, runId]);
   if (loaded.loading || !run)
     return (
       <EmptyPage
         error={error || loaded.error}
         loading="Loading the current complete target set…"
-      />
-    );
-  if (normalized.error)
-    return (
-      <EmptyPage
-        error={normalized.error}
-        loading="Loading normalized events…"
       />
     );
   return (
@@ -414,46 +505,62 @@ export function TargetsPage({
           <span>Markets</span>
           <span />
         </div>
-        {shown.map(({ detail, markets }) => (
+        {rendered.items.map(({ event, markets }) => (
           <NormalizedTargetRow
-            key={detail.event.event_id}
-            detail={detail}
+            key={event.event_id}
+            event={event}
             markets={markets}
-            open={() => setDetailId(detail.event.event_id)}
+            open={() => {
+              opener.current = document.activeElement as HTMLElement | null;
+              setDetailId(event.event_id);
+            }}
           />
         ))}
       </div>
+      <ResultPagination
+        currentPage={rendered.currentPage}
+        pageCount={rendered.pageCount}
+        setPage={setPage}
+      />
       {!shown.length && (
         <div className="empty-state">
-          {grouped.some(({ detail }) => !detail)
-            ? 'Loading normalized event details…'
-            : 'No current targets match these controls.'}
+          No current targets match these controls.
+        </div>
+      )}
+      {selectedDetail.error && (
+        <div className="error-state" role="alert">
+          {selectedDetail.error}
+        </div>
+      )}
+      {detailId && selectedDetail.loading && (
+        <div className="empty-state" role="status">
+          Loading event detail…
         </div>
       )}
       <NormalizedTargetDrawer
-        detail={detailId ? normalized.events[detailId] : null}
+        detail={selectedDetail.detail}
         markets={
           detailId
-            ? (grouped.find(({ detail }) => detail?.event.event_id === detailId)
+            ? (grouped.find(({ event }) => event?.event_id === detailId)
                 ?.markets ?? [])
             : []
         }
         close={() => setDetailId(null)}
+        opener={opener}
       />
     </div>
   );
 }
 
 function NormalizedTargetRow({
-  detail,
+  event,
   markets,
   open,
 }: {
-  detail: UniverseEventDetail;
+  event: UniverseEvent;
   markets: UniverseSelectedMarket[];
   open: () => void;
 }) {
-  const event = detail.event;
   const retained = markets.every(
     (market) => market.selection_reason === 'retained',
   );
@@ -481,19 +588,14 @@ function NormalizedTargetDrawer({
   detail,
   markets,
   close,
+  opener,
 }: {
   detail: UniverseEventDetail | null;
   markets: UniverseSelectedMarket[];
   close: () => void;
+  opener: React.MutableRefObject<HTMLElement | null>;
 }) {
-  useEffect(() => {
-    if (!detail) return;
-    const keydown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('keydown', keydown);
-    return () => window.removeEventListener('keydown', keydown);
-  }, [detail, close]);
+  const dialog = useDrawerFocus(Boolean(detail), close, opener);
   if (!detail) return null;
   return (
     <div className="drawer-layer">
@@ -507,6 +609,8 @@ function NormalizedTargetDrawer({
         role="dialog"
         aria-modal="true"
         aria-label="Normalized event detail"
+        tabIndex={-1}
+        ref={dialog}
       >
         <div className="drawer-header">
           <div>
@@ -566,14 +670,17 @@ export function BundleDrawer({
   detail,
   history = [],
   close,
+  opener,
 }: {
   detail: UniverseSelectionDetail | null;
   history?: UniverseSelection[];
   close: () => void;
+  opener: React.MutableRefObject<HTMLElement | null>;
 }) {
   const [tab, setTab] = useState<'markets' | 'relationships' | 'evidence'>(
     'markets',
   );
+  const dialog = useDrawerFocus(Boolean(detail), close, opener);
   useEffect(() => {
     if (!detail) return;
     setTab('markets');
@@ -596,6 +703,8 @@ export function BundleDrawer({
         role="dialog"
         aria-modal="true"
         aria-label="Bundle detail"
+        tabIndex={-1}
+        ref={dialog}
       >
         <div className="drawer-header">
           <div>
@@ -724,10 +833,9 @@ export function DecisionsPage({
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
   const run = loaded.run;
-  const normalized = useEventDetails(
-    run?.decisions.map((decision) => decision.event_id) ?? [],
-  );
   const [query, setQuery] = useState('');
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [query, runId]);
   if (loaded.loading || !run)
     return (
       <EmptyPage
@@ -735,13 +843,15 @@ export function DecisionsPage({
         loading="Loading Targeter decisions…"
       />
     );
+  const events = new Map(run.events.map((event) => [event.event_id, event]));
   const candidates = run.decisions.filter((candidate) => {
     const participants =
-      normalized.events[candidate.event_id]?.event.participants.join(' ') ?? '';
+      events.get(candidate.event_id)?.participants.join(' ') ?? '';
     return `${candidate.bundle_id} ${participants} ${candidate.rejection_reasons.join(' ')}`
       .toLowerCase()
       .includes(query.toLowerCase());
   });
+  const rendered = boundedRenderPage(candidates, page);
   return (
     <div className="desktop-page decisions-page">
       <MobileDetailNotice />
@@ -771,14 +881,19 @@ export function DecisionsPage({
         />
       </label>
       <section className="decision-list">
-        {candidates.map((candidate) => (
+        {rendered.items.map((candidate) => (
           <CandidateRow
             key={candidate.bundle_id}
             candidate={candidate}
-            detail={normalized.events[candidate.event_id]}
+            event={events.get(candidate.event_id)}
           />
         ))}
       </section>
+      <ResultPagination
+        currentPage={rendered.currentPage}
+        pageCount={rendered.pageCount}
+        setPage={setPage}
+      />
       {!candidates.length && (
         <div className="empty-state">
           No candidate decisions match this search.
@@ -807,10 +922,10 @@ function FunnelStep({
 
 function CandidateRow({
   candidate,
-  detail,
+  event,
 }: {
   candidate: UniverseTargeterDecision;
-  detail?: UniverseEventDetail;
+  event?: UniverseEvent;
 }) {
   const state = candidate.selected
     ? 'Selected'
@@ -820,14 +935,9 @@ function CandidateRow({
   return (
     <details className="candidate-row">
       <summary>
-        <EventIcon
-          game={detail?.event.game ?? null}
-          sport={detail?.event.sport ?? 'event'}
-        />
+        <EventIcon game={event?.game ?? null} sport={event?.sport ?? 'event'} />
         <span>
-          <b>
-            {detail?.event.participants.join(' vs ') || candidate.bundle_id}
-          </b>
+          <b>{event?.participants.join(' vs ') || candidate.bundle_id}</b>
           <small>
             {candidate.rejection_reasons.map(label).join(' · ') ||
               label(candidate.allocation_rejection) ||

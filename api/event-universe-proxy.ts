@@ -14,6 +14,7 @@ interface UniverseProxyEnvironment {
 const RESPONSE_BUDGET_BYTES = 1_750_000;
 const SHORT_CACHE_SECONDS = 15;
 const IMMUTABLE_CACHE_SECONDS = 300;
+const MAX_CACHE_ENTRIES = 8;
 const cache = new Map<string, { expiresAt: number; document: unknown }>();
 const fetchIds = new WeakMap<object, number>();
 let nextFetchId = 0;
@@ -73,11 +74,15 @@ export async function handleEventUniverseProxy(
       pathname,
       requestUrl.searchParams,
     );
-    if (maxAge > 0)
+    if (maxAge > 0) {
+      cache.delete(cacheKey);
       cache.set(cacheKey, {
         expiresAt: Date.now() + maxAge * 1000,
         document,
       });
+      while (cache.size > MAX_CACHE_ENTRIES)
+        cache.delete(cache.keys().next().value!);
+    }
     return json(200, document, maxAge);
   } catch (error) {
     const failure = universePublicFailure(error);
@@ -104,6 +109,7 @@ function bounded(value: string | undefined, fallback: number) {
 function cacheMaxAge(pathname: string) {
   if (pathname === '/healthz' || pathname === '/v1/targeter/status')
     return SHORT_CACHE_SECONDS;
+  if (/^\/v1\/events\/[^/]+$/.test(pathname)) return 0;
   if (
     pathname.startsWith('/v1/') &&
     (pathname.startsWith('/v1/targeter/runs/') ||

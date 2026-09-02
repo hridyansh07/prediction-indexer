@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   UniverseBundle,
   UniverseBundlePage,
@@ -10,17 +10,12 @@ import { EventIcon, gameName, SearchIcon, VenueStack, Chevron } from './icons';
 import { BundleDrawer, MobileDetailNotice } from './observability';
 import { universeGet } from './universe-api';
 
-async function loadAllBundles() {
-  const bundles: UniverseBundle[] = [];
-  let cursor: string | null = null;
-  do {
-    const query = new URLSearchParams({ limit: '100' });
-    if (cursor) query.set('cursor', cursor);
-    const page = await universeGet<UniverseBundlePage>(`/v1/bundles?${query}`);
-    bundles.push(...page.bundles);
-    cursor = page.next_cursor;
-  } while (cursor);
-  return bundles;
+const CURSOR_HISTORY_LIMIT = 8;
+
+async function loadBundles(cursor: string | null) {
+  const query = new URLSearchParams({ limit: '100' });
+  if (cursor) query.set('cursor', cursor);
+  return universeGet<UniverseBundlePage>(`/v1/bundles?${query}`);
 }
 
 const displayDate = (value: string) =>
@@ -39,15 +34,44 @@ export function EventUniversePage() {
   const [event, setEvent] = useState('');
   const [detail, setDetail] = useState<UniverseSelectionDetail | null>(null);
   const [history, setHistory] = useState<UniverseSelection[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [previousCursors, setPreviousCursors] = useState<Array<string | null>>(
+    [],
+  );
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [pageNumber, setPageNumber] = useState(1);
+  const detailRequest = useRef<AbortController | null>(null);
+  const detailRequestId = useRef(0);
+  const opener = useRef<HTMLElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    void loadAllBundles()
-      .then(setBundles)
+    let active = true;
+    setLoading(true);
+    setError('');
+    void loadBundles(cursor)
+      .then((page) => {
+        if (!active) return;
+        setBundles(page.bundles);
+        setNextCursor(page.next_cursor);
+      })
       .catch(() => setError('Historical bundle summaries are unavailable.'))
-      .finally(() => setLoading(false));
-  }, []);
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [cursor]);
+
+  useEffect(
+    () => () => {
+      detailRequest.current?.abort();
+      detailRequest.current = null;
+    },
+    [],
+  );
 
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
@@ -68,6 +92,10 @@ export function EventUniversePage() {
   );
 
   const open = async (bundle: UniverseBundle) => {
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
+    const requestId = ++detailRequestId.current;
     setError('');
     setDetail(null);
     setHistory([]);
@@ -76,16 +104,27 @@ export function EventUniversePage() {
       const [nextDetail, historyPage] = await Promise.all([
         universeGet<UniverseSelectionDetail>(
           `/v1/runs/${encodeURIComponent(bundle.latest_run_id)}/selections/${bundleId}`,
+          { signal: controller.signal, cache: false },
         ),
         universeGet<UniverseSelectionPage>(
           `/v1/bundles/${bundleId}/history?sort=selected&limit=100`,
+          { signal: controller.signal, cache: false },
         ),
       ]);
+      if (requestId !== detailRequestId.current) return;
       setDetail(nextDetail);
       setHistory(historyPage.selections);
     } catch {
-      setError('Bundle detail is unavailable.');
+      if (!controller.signal.aborted && requestId === detailRequestId.current)
+        setError('Bundle detail is unavailable.');
     }
+  };
+
+  const closeDetail = () => {
+    detailRequest.current?.abort();
+    detailRequest.current = null;
+    ++detailRequestId.current;
+    setDetail(null);
   };
 
   return (
@@ -106,7 +145,7 @@ export function EventUniversePage() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search event or bundle"
+            placeholder="Search this page"
           />
         </label>
         <div className="segmented" role="group" aria-label="Lifecycle filter">
@@ -163,7 +202,10 @@ export function EventUniversePage() {
             <button
               className="bundle-row"
               key={bundle.bundle_id}
-              onClick={() => void open(bundle)}
+              onClick={(event) => {
+                opener.current = event.currentTarget;
+                void open(bundle);
+              }}
             >
               <span className="event-cell">
                 <EventIcon game={bundle.game} sport={bundle.sport} />
@@ -192,10 +234,42 @@ export function EventUniversePage() {
           No historical bundles match these controls.
         </div>
       )}
+      {!loading && (previousCursors.length > 0 || nextCursor) && (
+        <nav className="result-pagination" aria-label="Bundle pages">
+          <button
+            className="quiet-button"
+            disabled={!previousCursors.length}
+            onClick={() => {
+              const previous = previousCursors.at(-1) ?? null;
+              setPreviousCursors((values) => values.slice(0, -1));
+              setCursor(previous);
+              setPageNumber((value) => Math.max(1, value - 1));
+            }}
+          >
+            Previous
+          </button>
+          <span aria-live="polite">Page {pageNumber}</span>
+          <button
+            className="quiet-button"
+            disabled={!nextCursor}
+            onClick={() => {
+              if (!nextCursor) return;
+              setPreviousCursors((values) =>
+                [...values, cursor].slice(-CURSOR_HISTORY_LIMIT),
+              );
+              setCursor(nextCursor);
+              setPageNumber((value) => value + 1);
+            }}
+          >
+            Next
+          </button>
+        </nav>
+      )}
       <BundleDrawer
         detail={detail}
         history={history}
-        close={() => setDetail(null)}
+        close={closeDetail}
+        opener={opener}
       />
     </div>
   );

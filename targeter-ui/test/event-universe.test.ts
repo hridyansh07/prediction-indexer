@@ -8,9 +8,11 @@ import {
   EventUniverseClient,
   universePublicFailure,
   validateCadence,
+  validateTargeterRun,
   validateUniverseQuery,
 } from '../src/server/event-universe.js';
 import {
+  boundedRenderPage,
   occurrenceExplanation,
   retirementExplanation,
   universeFilterQuery,
@@ -22,6 +24,7 @@ import {
   latestCompleteRun,
   selectionDecisionEvidence,
 } from '../src/client/cadence-view-model.js';
+import { universeGet } from '../src/client/universe-api.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
   CadenceFreshnessState,
@@ -209,6 +212,17 @@ const status = (
   },
   ...overrides,
 });
+const normalizedEventSummary = () => ({
+  event_id: 'event-alpha',
+  sport: 'esports',
+  game: 'counter_strike_2',
+  topology: 'series',
+  activation_at: '2026-08-20T14:00:00Z',
+  participants: ['Alpha', 'Beta'],
+  participant_keys: ['alpha', 'beta'],
+  first_seen_run_id: run().run_id,
+  last_seen_run_id: run().run_id,
+});
 const normalizedRun = (): UniverseTargeterRunDetail => ({
   run: {
     run_id: run().run_id,
@@ -244,6 +258,7 @@ const normalizedRun = (): UniverseTargeterRunDetail => ({
       eligible_market_ids: ['market-alpha'],
     },
   ],
+  events: [normalizedEventSummary()],
   selected_markets: [
     {
       event_id: 'event-alpha',
@@ -272,17 +287,7 @@ const normalizedRun = (): UniverseTargeterRunDetail => ({
   ],
 });
 const normalizedEvent = () => ({
-  event: {
-    event_id: 'event-alpha',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    activation_at: '2026-08-20T14:00:00Z',
-    participants: ['Alpha', 'Beta'],
-    participant_keys: ['alpha', 'beta'],
-    first_seen_run_id: run().run_id,
-    last_seen_run_id: run().run_id,
-  },
+  event: normalizedEventSummary(),
   venue_events: [
     {
       venue: 'kalshi',
@@ -328,6 +333,95 @@ const normalizedEvent = () => ({
       run_id: run().run_id,
       generated_at: run().generated_at,
       bundle_id: 'bundle alpha',
+    },
+  ],
+});
+const relationshipTypes = () => ({
+  relationship_type_catalog_version: 1,
+  types: [
+    { type: 'IDENTITY', directed: false, member_roles: ['member'] },
+    { type: 'IMPLICATION', directed: true, member_roles: ['left', 'right'] },
+    {
+      type: 'REVERSE_IMPLICATION',
+      directed: true,
+      member_roles: ['left', 'right'],
+    },
+    { type: 'MUTUAL_EXCLUSION', directed: false, member_roles: ['member'] },
+    { type: 'OVERLAP', directed: false, member_roles: ['member'] },
+  ],
+});
+const normalizedMarket = () => ({
+  market: normalizedEvent().markets[0],
+  venue_markets: [
+    {
+      venue: 'kalshi',
+      venue_market_id: 'K-ALPHA',
+      venue_event_id: 'event-a',
+      event_id: 'event-alpha',
+      market_id: 'market-alpha',
+      market_template_version: 1,
+      outcome_space_version: 1,
+      canonical_class: 'esports.series_moneyline',
+      market_type: 'moneyline',
+      scope: 'series',
+      title: 'Alpha vs Beta',
+      parameters: {},
+      subscription_ids: ['K-ALPHA'],
+      outcome_labels: ['Alpha', 'Beta'],
+      status: 'open',
+      accepting_orders: true,
+      rules_hash: null,
+      rule_template_id: null,
+      source_ref: 'kalshi:event-a',
+      created_at: null,
+      volume_24h: null,
+      volume_total: 30_000,
+      volume_total_usd: 30_000,
+      liquidity: null,
+      first_seen_run_id: run().run_id,
+      last_seen_run_id: run().run_id,
+    },
+  ],
+  selections: [
+    {
+      run_id: run().run_id,
+      generated_at: run().generated_at,
+      bundle_id: 'bundle alpha',
+      venue: 'kalshi',
+      venue_market_id: 'K-ALPHA',
+      continuity_score: 10,
+      selection_reason: 'selected',
+      origin_run_id: run().run_id,
+    },
+  ],
+  relations: normalizedEvent().relations,
+});
+const normalizedRelation = (claimKey: unknown = '') => ({
+  relation: {
+    relation_id: 1,
+    relation_type: 'IDENTITY',
+    generation_version: 1,
+    canonical_hash: sha,
+  },
+  members: [
+    {
+      venue: 'kalshi',
+      venue_market_id: 'K-ALPHA',
+      market_id: 'market-alpha',
+      market_template_version: 1,
+      outcome_space_version: 1,
+      claim_key: claimKey,
+      role: 'member',
+    },
+  ],
+  observations: [
+    {
+      run_id: run().run_id,
+      generated_at: run().generated_at,
+      bundle_id: 'bundle alpha',
+      event_id: 'event-alpha',
+      scope: 'series',
+      coverage: 'EXHAUSTIVE',
     },
   ],
 });
@@ -608,6 +702,244 @@ test('status proxy allows only a bounded limit and validates selection detail', 
   assert.equal(event.markets[0].market_id, 'market-alpha');
 });
 
+test('same-origin proxy dispatches every normalized collection and detail route', async () => {
+  const requested: string[] = [];
+  const upstreamFetch = (async (input) => {
+    const url = new URL(String(input));
+    requested.push(`${url.pathname}${url.search}`);
+    if (url.pathname.endsWith('/v1/events'))
+      return json({
+        events: [
+          {
+            ...normalizedEventSummary(),
+            venue_count: 1,
+            market_count: 1,
+            selected_run_count: 1,
+          },
+        ],
+        next_cursor: 'opaque-events-cursor',
+      });
+    if (url.pathname.endsWith('/v1/events/event-alpha'))
+      return json(normalizedEvent());
+    if (url.pathname.endsWith('/v1/relationship-types'))
+      return json(relationshipTypes());
+    if (url.pathname.endsWith('/v1/markets/market-alpha'))
+      return json(normalizedMarket());
+    if (url.pathname.endsWith('/v1/relations/1'))
+      return json(normalizedRelation());
+    throw new Error(`unexpected route ${url.pathname}`);
+  }) as typeof fetch;
+  const environment = {
+    UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
+    UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
+  };
+
+  for (const route of [
+    '/v1/events?limit=25&cursor=opaque-events-cursor',
+    '/v1/relationship-types',
+    '/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
+    '/v1/relations/1',
+  ]) {
+    const [path, query = ''] = route.split('?');
+    const response = await handleEventUniverseProxy(
+      new Request(
+        `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(path)}${query ? `&${query}` : ''}`,
+      ),
+      environment,
+      upstreamFetch,
+    );
+    assert.equal(response.status, 200, route);
+    if (route === '/v1/relations/1')
+      assert.equal(
+        response.headers.get('cache-control'),
+        'private, max-age=300',
+      );
+  }
+  assert.deepEqual(requested, [
+    '/base/v1/events?limit=25&cursor=opaque-events-cursor',
+    '/base/v1/relationship-types',
+    '/base/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
+    '/base/v1/relations/1',
+  ]);
+
+  for (const route of [
+    '/v1/events?limit=101',
+    '/v1/relationship-types?cursor=nope',
+    '/v1/markets/market-alpha?market_template_version=0',
+    '/v1/relations/0',
+  ]) {
+    const [path, query = ''] = route.split('?');
+    const response = await handleEventUniverseProxy(
+      new Request(
+        `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(path)}${query ? `&${query}` : ''}`,
+      ),
+      environment,
+      upstreamFetch,
+    );
+    assert.equal(response.status, 400, route);
+  }
+  assert.equal(requested.length, 4);
+
+  const eventDetail = await handleEventUniverseProxy(
+    new Request(
+      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/events/event-alpha',
+    ),
+    environment,
+    upstreamFetch,
+  );
+  assert.equal(eventDetail.status, 200);
+  assert.equal(eventDetail.headers.get('cache-control'), 'no-store');
+});
+
+test('relation detail accepts an empty claim key but rejects schema drift', async () => {
+  const valid = new EventUniverseClient({
+    baseUrl: 'https://universe.internal',
+    fetch: (async () => json(normalizedRelation())) as typeof fetch,
+  });
+  assert.equal((await valid.relation('1')).members[0].claim_key, '');
+
+  const invalid = new EventUniverseClient({
+    baseUrl: 'https://universe.internal',
+    fetch: (async () => json(normalizedRelation(null))) as typeof fetch,
+  });
+  await assert.rejects(() => invalid.relation('1'));
+});
+
+test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
+  const [source, historySource] = await Promise.all([
+    readFile(
+      new URL('../src/client/observability.tsx', import.meta.url),
+      'utf8',
+    ),
+    readFile(
+      new URL('../src/client/event-universe.tsx', import.meta.url),
+      'utf8',
+    ),
+  ]);
+  assert.doesNotMatch(
+    source,
+    /useEventDetails|Promise\.all\([^)]*\/v1\/events/s,
+  );
+  assert.match(source, /run\?\.events/);
+  assert.match(source, /useEventDetail\(detailId\)/);
+  assert.match(
+    source,
+    /document\.activeElement === element[\s\S]*event\.shiftKey \? last : first/,
+  );
+  assert.match(source, /opener\.current\?\.focus\(\)/);
+  assert.doesNotMatch(historySource, /do \{|loadAllBundles/);
+  assert.match(historySource, /limit: '100'/);
+
+  const records = Array.from({ length: 1000 }, (_, index) => index);
+  const first = boundedRenderPage(records, 0);
+  const last = boundedRenderPage(records, 9);
+  assert.equal(first.items.length, 100);
+  assert.deepEqual(first.items.slice(0, 2), [0, 1]);
+  assert.equal(last.items.length, 100);
+  assert.deepEqual(last.items.slice(-2), [998, 999]);
+  assert.equal(last.pageCount, 10);
+  assert.throws(() =>
+    validateTargeterRun({
+      ...normalizedRun(),
+      events: Array.from({ length: 1001 }, (_, index) => ({
+        ...normalizedEventSummary(),
+        event_id: `event-${index}`,
+      })),
+    }),
+  );
+  for (const field of ['bundles', 'selections', 'runs']) {
+    const payload =
+      field === 'bundles'
+        ? {
+            bundles: Array(101).fill((normalizedRun() as any).run),
+            next_cursor: null,
+          }
+        : field === 'selections'
+          ? {
+              selections: Array(101).fill(detail()),
+              sort: 'selected',
+              next_cursor: null,
+            }
+          : {
+              runs: Array(101).fill((normalizedRun() as any).run),
+              next_cursor: null,
+            };
+    await assert.rejects(
+      field === 'bundles'
+        ? new EventUniverseClient({
+            baseUrl: 'https://x',
+            fetch: (async () => json(payload)) as typeof fetch,
+          }).bundles(new URLSearchParams())
+        : field === 'selections'
+          ? new EventUniverseClient({
+              baseUrl: 'https://x',
+              fetch: (async () => json(payload)) as typeof fetch,
+            }).selections(new URLSearchParams())
+          : new EventUniverseClient({
+              baseUrl: 'https://x',
+              fetch: (async () => json(payload)) as typeof fetch,
+            }).runs(new URLSearchParams()),
+    );
+  }
+});
+
+test('browser caching is bounded and does not retain event details', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input) => {
+    requests.push(String(input));
+    return json({ ok: true });
+  }) as typeof fetch;
+  try {
+    for (let index = 0; index < 9; index++)
+      await universeGet(`/bounded-cache-${index}`);
+    await universeGet('/bounded-cache-0');
+    assert.equal(requests.length, 10, 'the oldest of nine entries was evicted');
+
+    await universeGet('/v1/events/detail-not-cached');
+    await universeGet('/v1/events/detail-not-cached');
+    assert.equal(
+      requests.filter((path) => path.endsWith('/v1/events/detail-not-cached'))
+        .length,
+      2,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('signal-bound browser requests are never reused after abort', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = ((input, init) => {
+    calls++;
+    if (calls === 1)
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('aborted', 'AbortError')),
+        );
+      });
+    return Promise.resolve(json({ second: true }));
+  }) as typeof fetch;
+  try {
+    const firstController = new AbortController();
+    const first = universeGet('/retry-after-abort', {
+      signal: firstController.signal,
+      cache: false,
+    });
+    firstController.abort();
+    await assert.rejects(first);
+    const second = await universeGet<{ second: boolean }>(
+      '/retry-after-abort',
+      { cache: false },
+    );
+    assert.equal(second.second, true);
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('Express status proxy rejects non-GET refreshes before upstream access', async () => {
   let fetches = 0;
   const client = new EventUniverseClient({
@@ -633,6 +965,33 @@ test('Express status proxy rejects non-GET refreshes before upstream access', as
     assert.equal(response.status, 405);
     assert.deepEqual(await response.json(), { error: 'Method not allowed' });
     assert.equal(fetches, 0);
+
+    const detailClient = new EventUniverseClient({
+      baseUrl: 'https://universe.internal',
+      fetch: (async () => json(normalizedEvent())) as typeof fetch,
+    });
+    const detailApp = express();
+    detailApp.use(
+      '/api/event-universe',
+      createEventUniverseRouter(detailClient),
+    );
+    const detailServer = detailApp.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve, reject) => {
+      detailServer.once('listening', resolve);
+      detailServer.once('error', reject);
+    });
+    try {
+      const detailPort = (detailServer.address() as AddressInfo).port;
+      const detailResponse = await fetch(
+        `http://127.0.0.1:${detailPort}/api/event-universe/v1/events/event-alpha`,
+      );
+      assert.equal(detailResponse.status, 200);
+      assert.equal(detailResponse.headers.get('cache-control'), 'no-store');
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        detailServer.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
@@ -1049,7 +1408,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
       assert.equal(String(input), 'https://universe.internal/healthz');
       return json({
         status: 'ok',
-        schema_version: 2,
+        schema_version: 3,
         latest_run: null,
         counts: {
           targeter_runs: 653,
@@ -1057,11 +1416,16 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
           bundle_retirements: 152,
           bundle_contexts: 153,
           context_targets: 2125,
+          umbrella_events: 804,
+          canonical_markets: 1912,
+          venue_markets: 3618,
+          relations: 733,
         },
       });
     }) as typeof fetch,
   );
   assert.equal(health.status, 200);
+  assert.equal((await health.clone().json()).schema_version, 3);
 
   // A route with its own allow-listed parameters must keep them and still shed
   // the echo, rather than the proxy stripping everything indiscriminately.
