@@ -39,11 +39,23 @@ from universe.store import EvidenceConflict, UniverseStore
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_SELECTION_REPORT_BYTES = 128 * 1024 * 1024
 MAX_CATALOG_ARTIFACT_BYTES = 256 * 1024 * 1024
+MAX_CATALOG_BYTES_PER_RUN = 128 * 1024 * 1024
 INCREMENTAL_CHECKPOINT = "targeter-v3-incremental-date"
 
 
 class UniverseSyncError(ValueError):
     """A discovered archive object violates the v3 consumer contract."""
+
+
+def _logical_size(item: RunObject) -> int:
+    if item.logical is None:
+        raise UniverseSyncError(f"normalized artifact {item.key} has no logical identity")
+    if item.logical.byte_length > MAX_CATALOG_ARTIFACT_BYTES:
+        raise UniverseSyncError(
+            f"normalized artifact {item.key} exceeds "
+            f"{MAX_CATALOG_ARTIFACT_BYTES} decoded bytes"
+        )
+    return item.logical.byte_length
 
 
 @dataclass
@@ -109,11 +121,25 @@ class UniverseSync:
             result.discovered = len(keys)
             if not keys:
                 return result
-            key = max(keys, key=manifest_run_id)
-            self._ingest_direct(key, result)
-            if not result.failures:
+            complete_found = False
+            failed_dates: list[date] = []
+            for key in reversed(keys):
+                before = len(result.failures)
+                self._ingest_direct(key, result)
+                if len(result.failures) != before:
+                    failed_dates.append(manifest_run_instant(key).date())
+                    continue
+                detail = self.database.run_detail(manifest_run_id(key))
+                if detail is not None and detail["input_complete"]:
+                    complete_found = True
+                    break
+            if complete_found or failed_dates:
+                next_floor = min(failed_dates) if failed_dates else manifest_run_instant(
+                    keys[-1]
+                ).date()
                 self.database.set_checkpoint(
-                    INCREMENTAL_CHECKPOINT, manifest_run_instant(key).date().isoformat()
+                    INCREMENTAL_CHECKPOINT,
+                    next_floor.isoformat(),
                 )
             return result
 
@@ -499,6 +525,21 @@ class UniverseSync:
         catalog_events: list[Mapping[str, Any]] = []
         catalog_markets: list[Mapping[str, Any]] = []
         rule_templates: list[Mapping[str, Any]] = []
+        catalog_items = [
+            item
+            for item in manifest.objects
+            if (
+                item.file.startswith("catalog_")
+                and ("_events.ndjson" in item.file or "_markets.ndjson" in item.file)
+            )
+            or item.file.startswith("rule_templates.ndjson")
+        ]
+        catalog_bytes = sum(_logical_size(item) for item in catalog_items)
+        if catalog_bytes > MAX_CATALOG_BYTES_PER_RUN:
+            raise UniverseSyncError(
+                f"normalized artifacts for run {manifest.run_id} exceed "
+                f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
+            )
         for item in manifest.objects:
             if item.file.startswith("catalog_") and "_events.ndjson" in item.file:
                 catalog_events.extend(
@@ -612,7 +653,6 @@ class UniverseSync:
                 f"normalized artifact {item.key} line count disagrees with manifest"
             )
         return rows
-
     def _all_manifest_keys(self) -> list[str]:
         keys = [
             key

@@ -25,7 +25,7 @@ from universe.projection import (
     project_bundle_retirements,
     project_selected_bundles,
 )
-from universe.store import EvidenceConflict, UniverseStore, file_sha256
+from universe.store import DetailTooLarge, EvidenceConflict, UniverseStore, file_sha256
 from universe.sync import UniverseSync
 
 R1 = "20260101T000000.000001Z"
@@ -531,6 +531,41 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(event["markets"][0]["first_seen_run_id"], R1)
         self.assertEqual(event["markets"][0]["last_seen_run_id"], R3)
 
+    def test_bootstrap_keeps_latest_incomplete_and_newest_complete_run(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        _publish_run(self.objects, _empty_report(R2, G2, input_complete=False))
+
+        result = UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(result.ingested, 2, result.as_record())
+        runs, _more = self.database.list_runs()
+        self.assertEqual([run["run_id"] for run in runs], [R1, R2])
+        status = self.database.cadence_status_snapshot()
+        self.assertEqual(status["latest_run"]["run_id"], R2)
+        self.assertEqual(status["current_complete_run"]["run_id"], R1)
+
+    def test_bootstrap_checkpoints_failed_older_date_without_complete_run(self) -> None:
+        invalid = _empty_report(R1, G1, input_complete=False)
+        invalid["report_version"] = 2
+        _publish_run(self.objects, invalid)
+        newer_run = "20260102T000000.000001Z"
+        _publish_run(
+            self.objects,
+            _empty_report(newer_run, "2026-01-02T00:00:00.000001Z", input_complete=False),
+        )
+
+        result = UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 2, 0, 1, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(
+            self.database.checkpoint("targeter-v3-incremental-date"), "2026-01-01"
+        )
+
     def test_bounded_backfill_uses_report_without_selected_index(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1), compressed=True)
         _publish_run(self.objects, _selection_report(R2, G2), compressed=True)
@@ -624,6 +659,12 @@ class EventUniverseTests(unittest.TestCase):
             "kalshi:event-a",
             "polymarket:event-b",
         ])
+        run_detail = self.database.targeter_run_detail(R2)
+        assert run_detail is not None
+        self.assertEqual(
+            [event["event_id"] for event in run_detail["events"]],
+            [run_detail["selected_markets"][0]["event_id"]],
+        )
         self.assertEqual(self.database.status()["counts"]["bundle_contexts"], 1)
 
     def test_retained_selection_fails_closed_on_origin_drift(self) -> None:
@@ -636,10 +677,10 @@ class EventUniverseTests(unittest.TestCase):
             now=datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc)
         )
 
-        self.assertEqual(result.ingested, 0)
+        self.assertEqual(result.ingested, 1)
         self.assertEqual(len(result.failures), 1)
         self.assertIn("report identity disagrees", result.failures[0])
-        self.assertEqual(self.database.status()["counts"]["targeter_runs"], 0)
+        self.assertEqual(self.database.status()["counts"]["targeter_runs"], 1)
 
     def test_all_terminal_continuity_records_proven_observed_end(self) -> None:
         origin = _publish_run(self.objects, _selection_report(R1, G1))
@@ -835,6 +876,146 @@ class EventUniverseTests(unittest.TestCase):
         self.assertNotIn("relationship_analysis", json.dumps(detail))
         self.assertLess(len(json.dumps(detail, separators=(",", ":"))), 20_000)
 
+    def test_targeter_run_detail_prechecks_every_variable_field_before_decode(
+        self,
+    ) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        multibyte_json = json.dumps(
+            {"combined_moneyline_volume_usd": 30_000, "padding": "界" * 600_000},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        oversized_values = {
+            "event_id": "界" * 600_000,
+            "bundle_id": "界" * 600_000,
+            "score_components_json": multibyte_json,
+            "rejection_reasons_json": multibyte_json,
+            "allocation_rejection": "x" * 1_750_001,
+            "admission_json": multibyte_json,
+            "market_exclusions_json": multibyte_json,
+            "eligible_market_ids_json": multibyte_json,
+        }
+        with sqlite3.connect(self.database.path) as connection:
+            original = connection.execute(
+                "SELECT * FROM candidate_decisions WHERE run_id = ?", (R1,)
+            ).fetchone()
+            assert original is not None
+            fields = [column[0] for column in connection.execute(
+                "SELECT name FROM pragma_table_info('candidate_decisions')"
+            )]
+            original_values = dict(zip(fields, original, strict=True))
+
+            for field, oversized in oversized_values.items():
+                with self.subTest(field=field):
+                    connection.execute(
+                        f"UPDATE candidate_decisions SET {field} = ? WHERE run_id = ?",
+                        (oversized, R1),
+                    )
+                    connection.commit()
+                    with mock.patch("universe.store.json.loads") as decode:
+                        with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
+                            self.database.targeter_run_detail(R1)
+                        decode.assert_not_called()
+                    connection.execute(
+                        f"UPDATE candidate_decisions SET {field} = ? WHERE run_id = ?",
+                        (original_values[field], R1),
+                    )
+                    connection.commit()
+
+    def test_list_events_pages_before_indexed_counts_and_counts_market_versions(
+        self,
+    ) -> None:
+        _publish_run(
+            self.objects,
+            _selection_report(
+                R1,
+                G1,
+                bundle_id="older-event",
+                activation_at="2026-01-01T03:00:00Z",
+            ),
+        )
+        _publish_run(
+            self.objects,
+            _selection_report(
+                R2,
+                G2,
+                bundle_id="newer-event",
+                activation_at="2026-01-01T05:00:00Z",
+            ),
+        )
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.failures, [])
+
+        with sqlite3.connect(self.database.path) as connection:
+            newer_id, activation_ns = connection.execute(
+                """SELECT event_id, activation_at_ns FROM umbrella_events
+                   ORDER BY activation_at_ns DESC LIMIT 1"""
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO canonical_markets(
+                       market_id, market_template_version, outcome_space_version,
+                       event_id, canonical_class, market_type, scope,
+                       parameters_json, first_seen_run_id, last_seen_run_id
+                   )
+                   SELECT market_id, 2, outcome_space_version, event_id,
+                          canonical_class, market_type, scope, parameters_json,
+                          first_seen_run_id, last_seen_run_id
+                   FROM canonical_markets
+                   WHERE event_id = ?
+                   ORDER BY market_id LIMIT 1""",
+                (newer_id,),
+            )
+
+        first, has_more = self.database.list_events(limit=1)
+        self.assertTrue(has_more)
+        self.assertEqual(first[0]["event_id"], newer_id)
+        self.assertEqual(first[0]["market_count"], 3)
+
+        class CapturingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                self.statement = ""
+                self.parameters = ()
+
+            def execute(self, statement, parameters=()):
+                self.statement = statement
+                self.parameters = parameters
+                return self.connection.execute(statement, parameters)
+
+            def close(self):
+                pass
+
+        connection = self.database.connect(readonly=True)
+        captured = CapturingConnection(connection)
+        try:
+            with mock.patch.object(self.database, "connect", return_value=captured):
+                second, second_has_more = self.database.list_events(
+                    after=(activation_ns, newer_id), limit=1
+                )
+            plan = [
+                row[3]
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN " + captured.statement,
+                    captured.parameters,
+                )
+            ]
+        finally:
+            connection.close()
+
+        self.assertFalse(second_has_more)
+        self.assertEqual(len(second), 1)
+        self.assertIn("USING INDEX umbrella_events_activation", "\n".join(plan))
+        for index in (
+            "venue_events_event",
+            "canonical_markets_event",
+            "selected_market_occurrences_event",
+        ):
+            self.assertIn(f"USING COVERING INDEX {index}", "\n".join(plan))
+
     def test_public_list_limits_are_bounded(self) -> None:
         application = UniverseApplication(self.database)
         for path in (
@@ -902,6 +1083,23 @@ class EventUniverseTests(unittest.TestCase):
         result = UniverseSync(self.database, self.objects).sync()
         self.assertEqual(result.ingested, 0)
         self.assertIn("continuity_score is invalid", result.failures[0])
+
+    def test_relation_member_must_belong_to_candidate_markets(self) -> None:
+        report = _selection_report(R1, G1)
+        relationship = report["candidates"][0]["relationship_analysis"][
+            "relationships"
+        ][0]
+        relationship["left"] = "kalshi:unrelated-market#claim=0"
+        _publish_run(self.objects, report)
+
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result.ingested, 0)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("is not a candidate market", result.failures[0])
 
     def test_market_projection_identity_is_checked_on_reingestion(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))
@@ -1039,7 +1237,7 @@ class EventUniverseTests(unittest.TestCase):
         relation_id = event["relations"][0]["relation_id"]
         status, relation = app.get(f"/v1/relations/{relation_id}")
         self.assertEqual(status, 200)
-        self.assertEqual(relation["relation"]["event_id"], event_id)
+        self.assertEqual(relation["observations"][0]["event_id"], event_id)
         self.assertEqual(len(relation["members"]), 2)
         status, relation_types = app.get("/v1/relationship-types")
         self.assertEqual(status, 200)

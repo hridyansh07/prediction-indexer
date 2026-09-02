@@ -135,16 +135,20 @@ def project_market_universe(
             _put_unique(event_rows, event["event_id"], event, "event")
             event_for_bundle[bundle_id] = event["event_id"]
 
-    selected_markets = _selected_market_rows(
-        selection,
-        run_id,
-        selected,
-        event_for_bundle,
-        dispositions,
-        continuity_by_bundle,
-        venue_market_rows,
+    selected_markets = (
+        _selected_market_rows(
+            selection,
+            run_id,
+            selected,
+            event_for_bundle,
+            dispositions,
+            continuity_by_bundle,
+            venue_market_rows,
+        )
+        if root["input_complete"]
+        else []
     )
-    relations = _relation_rows(candidates, event_for_bundle)
+    relations = _relation_rows(candidates, event_for_bundle) if root["input_complete"] else []
     return {
         "projection_version": MARKET_PROJECTION_VERSION,
         "run_id": run_id,
@@ -451,6 +455,13 @@ def _selected_market_rows(
                     "bundle_id": bundle_id,
                     "venue": venue,
                     "venue_market_id": native_id,
+                    "market_id": projected_market["market_id"],
+                    "market_template_version": projected_market[
+                        "market_template_version"
+                    ],
+                    "outcome_space_version": projected_market[
+                        "outcome_space_version"
+                    ],
                     "canonical_class": canonical_class,
                     "continuity_score": _number(
                         target.get("continuity_score"),
@@ -474,6 +485,9 @@ def _relation_rows(
     rows: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
         bundle_id = _text(candidate, "bundle_id", "candidate")
+        market_ids = set(
+            _texts(candidate.get("market_ids"), f"candidate {bundle_id} market_ids")
+        )
         analysis = _mapping(
             candidate.get("relationship_analysis"),
             f"candidate {bundle_id} relationship_analysis",
@@ -490,6 +504,13 @@ def _relation_rows(
                 _relation_member(relation, "left"),
                 _relation_member(relation, "right"),
             ]
+            for member in members:
+                target_id = f"{member['venue']}:{member['venue_market_id']}"
+                if target_id not in market_ids:
+                    raise MarketProjectionError(
+                        f"candidate {bundle_id} relationship member {target_id} "
+                        "is not a candidate market"
+                    )
             if kind in _SYMMETRIC:
                 members = sorted(
                     ({**member, "role": "member"} for member in members),

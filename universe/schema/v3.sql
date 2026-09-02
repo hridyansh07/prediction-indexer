@@ -126,6 +126,9 @@ CREATE TABLE selected_market_occurrences (
     bundle_id TEXT NOT NULL,
     venue TEXT NOT NULL,
     venue_market_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    market_template_version INTEGER NOT NULL CHECK(market_template_version > 0),
+    outcome_space_version INTEGER NOT NULL CHECK(outcome_space_version > 0),
     canonical_class TEXT NOT NULL,
     continuity_score REAL NOT NULL,
     selection_reason TEXT NOT NULL CHECK(
@@ -134,25 +137,28 @@ CREATE TABLE selected_market_occurrences (
     origin_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
     PRIMARY KEY(run_id, venue, venue_market_id),
     FOREIGN KEY(venue, venue_market_id)
-        REFERENCES venue_markets(venue, venue_market_id)
+        REFERENCES venue_markets(venue, venue_market_id),
+    FOREIGN KEY(market_id, market_template_version, outcome_space_version)
+        REFERENCES canonical_markets(
+            market_id, market_template_version, outcome_space_version
+        )
 ) STRICT;
 CREATE INDEX selected_market_occurrences_event
     ON selected_market_occurrences(event_id, run_id, venue, venue_market_id);
 CREATE INDEX selected_market_occurrences_market
     ON selected_market_occurrences(venue, venue_market_id, run_id);
+CREATE INDEX selected_market_occurrences_canonical
+    ON selected_market_occurrences(
+        market_id, market_template_version, outcome_space_version, run_id
+    );
 
 CREATE TABLE relations (
     relation_id INTEGER PRIMARY KEY,
     relation_type TEXT NOT NULL,
-    event_id TEXT NOT NULL REFERENCES umbrella_events(event_id),
-    scope TEXT NOT NULL,
-    coverage TEXT NOT NULL,
     generation_version INTEGER NOT NULL CHECK(generation_version > 0),
     canonical_hash TEXT NOT NULL,
     UNIQUE(relation_type, canonical_hash, generation_version)
 ) STRICT;
-CREATE INDEX relations_event ON relations(event_id, relation_type, relation_id);
-
 CREATE TABLE relation_members (
     relation_id INTEGER NOT NULL REFERENCES relations(relation_id) ON DELETE CASCADE,
     venue TEXT NOT NULL,
@@ -170,5 +176,12 @@ CREATE TABLE relation_observations (
     run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
     relation_id INTEGER NOT NULL REFERENCES relations(relation_id),
     bundle_id TEXT NOT NULL,
+    event_id TEXT NOT NULL REFERENCES umbrella_events(event_id),
+    scope TEXT NOT NULL,
+    coverage TEXT NOT NULL,
     PRIMARY KEY(run_id, relation_id, bundle_id)
 ) STRICT;
+CREATE INDEX relation_observations_relation
+    ON relation_observations(relation_id, event_id, run_id);
+CREATE INDEX relation_observations_event
+    ON relation_observations(event_id, relation_id, run_id);

@@ -11,7 +11,11 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.store import EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES, UniverseStore
+from universe.store import (
+    EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
+    DetailTooLarge,
+    UniverseStore,
+)
 
 
 class UniverseApplication:
@@ -242,6 +246,10 @@ def serve(database: UniverseStore, host: str, port: int) -> None:
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             try:
                 status, document = application.get(self.path)
+            except DetailTooLarge as error:
+                status, document = HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                    "error": str(error)
+                }
             except (ValueError, TypeError) as error:
                 status, document = HTTPStatus.BAD_REQUEST, {"error": str(error)}
             except Exception as error:  # noqa: BLE001 - do not expose internals
@@ -254,7 +262,7 @@ def serve(database: UniverseStore, host: str, port: int) -> None:
                 + "\n"
             ).encode("utf-8")
             if len(payload) > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:
-                status = HTTPStatus.INTERNAL_SERVER_ERROR
+                status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
                 payload = b'{"error":"response exceeds Event Universe size budget"}\n'
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")

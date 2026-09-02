@@ -23,6 +23,11 @@ SCHEMA_VERSION = 3
 STALE_AFTER_SECONDS = 3_600
 TARGETER_CADENCE_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
+DETAIL_ROW_LIMIT = 1000
+
+
+class DetailTooLarge(ValueError):
+    """A detail document would require more child rows than the API permits."""
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
 SCHEMA_V3_PATH = Path(__file__).with_name("schema") / "v3.sql"
@@ -484,6 +489,19 @@ class UniverseStore:
                 if existing is None
                 else _seen_run_ids(connection, existing, run_id)
             )
+            if existing is not None and _run_is_newer(
+                connection, run_id, existing["last_seen_run_id"]
+            ):
+                connection.execute(
+                    """UPDATE venue_events SET title = ?, league = ?, status = ?,
+                              source_ref = ?, format = ?, fragment_type = ?
+                       WHERE venue = ? AND venue_event_id = ?""",
+                    (
+                        event["title"], event["league"], event["status"],
+                        event["source_ref"], event["format"], event["fragment_type"],
+                        event["venue"], event["venue_event_id"],
+                    ),
+                )
             connection.execute(
                 """INSERT INTO venue_events(
                        venue, venue_event_id, event_id, title, league, status,
@@ -491,12 +509,6 @@ class UniverseStore:
                        last_seen_run_id
                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(venue, venue_event_id) DO UPDATE SET
-                       title = excluded.title,
-                       league = excluded.league,
-                       status = excluded.status,
-                       source_ref = excluded.source_ref,
-                       format = excluded.format,
-                       fragment_type = excluded.fragment_type,
                        first_seen_run_id = excluded.first_seen_run_id,
                        last_seen_run_id = excluded.last_seen_run_id""",
                 (
@@ -557,24 +569,52 @@ class UniverseStore:
 
         for market in projection["venue_markets"]:
             existing = connection.execute(
-                """SELECT event_id, venue_event_id, first_seen_run_id,
-                          last_seen_run_id
+                """SELECT event_id, venue_event_id, market_id,
+                          market_template_version, outcome_space_version,
+                          first_seen_run_id, last_seen_run_id
                    FROM venue_markets WHERE venue = ? AND venue_market_id = ?""",
                 (market["venue"], market["venue_market_id"]),
             ).fetchone()
             if existing is not None and (
                 existing["event_id"] != market["event_id"]
                 or existing["venue_event_id"] != market["venue_event_id"]
+                or existing["market_id"] != market["market_id"]
+                or existing["market_template_version"]
+                != market["market_template_version"]
+                or existing["outcome_space_version"]
+                != market["outcome_space_version"]
             ):
                 raise EvidenceConflict(
                     f"venue market {market['venue']}:{market['venue_market_id']} "
-                    "was assigned to a different event"
+                    "was assigned to a different event or canonical market"
                 )
             first_seen, last_seen = (
                 (run_id, run_id)
                 if existing is None
                 else _seen_run_ids(connection, existing, run_id)
             )
+            if existing is not None and _run_is_newer(
+                connection, run_id, existing["last_seen_run_id"]
+            ):
+                connection.execute(
+                    """UPDATE venue_markets SET canonical_class = ?, market_type = ?,
+                              scope = ?, title = ?, parameters_json = ?, subscription_ids_json = ?,
+                              outcome_labels_json = ?, status = ?, accepting_orders = ?,
+                              rules_hash = ?, rule_template_id = ?, source_ref = ?, created_at = ?,
+                              volume_24h = ?, volume_total = ?, volume_total_usd = ?, liquidity = ?
+                       WHERE venue = ? AND venue_market_id = ?""",
+                    (
+                        market["canonical_class"],
+                        market["market_type"], market["scope"], market["title"],
+                        _canonical_json_value(market["parameters"]),
+                        _canonical_json_value(market["subscription_ids"]),
+                        _canonical_json_value(market["outcome_labels"]), market["status"],
+                        int(market["accepting_orders"]), market["rules_hash"],
+                        market["rule_template_id"], market["source_ref"], market["created_at"],
+                        market["volume_24h"], market["volume_total"], market["volume_total_usd"],
+                        market["liquidity"], market["venue"], market["venue_market_id"],
+                    ),
+                )
             connection.execute(
                 """INSERT INTO venue_markets(
                        venue, venue_market_id, venue_event_id, event_id,
@@ -588,26 +628,6 @@ class UniverseStore:
                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(venue, venue_market_id) DO UPDATE SET
-                       market_id = excluded.market_id,
-                       market_template_version = excluded.market_template_version,
-                       outcome_space_version = excluded.outcome_space_version,
-                       canonical_class = excluded.canonical_class,
-                       market_type = excluded.market_type,
-                       scope = excluded.scope,
-                       title = excluded.title,
-                       parameters_json = excluded.parameters_json,
-                       subscription_ids_json = excluded.subscription_ids_json,
-                       outcome_labels_json = excluded.outcome_labels_json,
-                       status = excluded.status,
-                       accepting_orders = excluded.accepting_orders,
-                       rules_hash = excluded.rules_hash,
-                       rule_template_id = excluded.rule_template_id,
-                       source_ref = excluded.source_ref,
-                       created_at = excluded.created_at,
-                       volume_24h = excluded.volume_24h,
-                       volume_total = excluded.volume_total,
-                       volume_total_usd = excluded.volume_total_usd,
-                       liquidity = excluded.liquidity,
                        first_seen_run_id = excluded.first_seen_run_id,
                        last_seen_run_id = excluded.last_seen_run_id""",
                 (
@@ -653,12 +673,15 @@ class UniverseStore:
             connection.execute(
                 """INSERT INTO selected_market_occurrences(
                        run_id, event_id, bundle_id, venue, venue_market_id,
+                       market_id, market_template_version, outcome_space_version,
                        canonical_class, continuity_score, selection_reason,
                        origin_run_id
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id, selected["event_id"], selected["bundle_id"],
                     selected["venue"], selected["venue_market_id"],
+                    selected["market_id"], selected["market_template_version"],
+                    selected["outcome_space_version"],
                     selected["canonical_class"], selected["continuity_score"],
                     selected["selection_reason"], selected["origin_run_id"],
                 ),
@@ -674,7 +697,9 @@ class UniverseStore:
             if bundle_id in projected_selected_bundles:
                 continue
             origin_rows = connection.execute(
-                """SELECT event_id, venue, venue_market_id, canonical_class,
+                """SELECT event_id, venue, venue_market_id, market_id,
+                          market_template_version, outcome_space_version,
+                          canonical_class,
                           continuity_score
                    FROM selected_market_occurrences
                    WHERE run_id = ? AND bundle_id = ?
@@ -689,12 +714,15 @@ class UniverseStore:
                 connection.execute(
                     """INSERT INTO selected_market_occurrences(
                            run_id, event_id, bundle_id, venue, venue_market_id,
+                           market_id, market_template_version, outcome_space_version,
                            canonical_class, continuity_score, selection_reason,
                            origin_run_id
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'retained', ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'retained', ?)""",
                     (
                         run_id, origin["event_id"], bundle_id, origin["venue"],
-                        origin["venue_market_id"], origin["canonical_class"],
+                        origin["venue_market_id"], origin["market_id"],
+                        origin["market_template_version"], origin["outcome_space_version"],
+                        origin["canonical_class"],
                         origin["continuity_score"], occurrence["origin_run_id"],
                     ),
                 )
@@ -707,19 +735,17 @@ class UniverseStore:
         for relation in projection["relations"]:
             connection.execute(
                 """INSERT INTO relations(
-                       relation_type, event_id, scope, coverage,
-                       generation_version, canonical_hash
-                   ) VALUES (?, ?, ?, ?, ?, ?)
+                       relation_type, generation_version, canonical_hash
+                   ) VALUES (?, ?, ?)
                    ON CONFLICT(relation_type, canonical_hash, generation_version)
                    DO NOTHING""",
                 (
-                    relation["relation_type"], relation["event_id"],
-                    relation["scope"], relation["coverage"],
-                    relation["generation_version"], relation["canonical_hash"],
+                    relation["relation_type"], relation["generation_version"],
+                    relation["canonical_hash"],
                 ),
             )
             stored = connection.execute(
-                """SELECT relation_id, event_id, scope, coverage FROM relations
+                """SELECT relation_id FROM relations
                    WHERE relation_type = ? AND canonical_hash = ?
                      AND generation_version = ?""",
                 (
@@ -728,15 +754,6 @@ class UniverseStore:
                 ),
             ).fetchone()
             assert stored is not None
-            _require_columns(
-                stored,
-                {
-                    "event_id": relation["event_id"],
-                    "scope": relation["scope"],
-                    "coverage": relation["coverage"],
-                },
-                f"relation {relation['canonical_hash']}",
-            )
             relation_id = int(stored["relation_id"])
             existing_members = connection.execute(
                 """SELECT venue, venue_market_id, claim_key, role
@@ -776,9 +793,13 @@ class UniverseStore:
                 if decision["event_id"] == relation["event_id"]
             )
             connection.execute(
-                """INSERT INTO relation_observations(run_id, relation_id, bundle_id)
-                   VALUES (?, ?, ?)""",
-                (run_id, relation_id, bundle),
+                """INSERT INTO relation_observations(
+                       run_id, relation_id, bundle_id, event_id, scope, coverage
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, relation_id, bundle, relation["event_id"],
+                    relation["scope"], relation["coverage"],
+                ),
             )
 
         connection.execute(
@@ -1166,34 +1187,65 @@ class UniverseStore:
             ).fetchone()
             if run is None:
                 return None
+            decision_bytes = connection.execute(
+                """SELECT COALESCE(SUM(
+                          length(CAST(event_id AS BLOB)) +
+                          length(CAST(bundle_id AS BLOB)) +
+                          length(CAST(score_components_json AS BLOB)) +
+                          length(CAST(rejection_reasons_json AS BLOB)) +
+                          length(CAST(COALESCE(allocation_rejection, '') AS BLOB)) +
+                          length(CAST(admission_json AS BLOB)) +
+                          length(CAST(market_exclusions_json AS BLOB)) +
+                          length(CAST(eligible_market_ids_json AS BLOB))
+                       ), 0)
+                   FROM candidate_decisions WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()[0]
+            if int(decision_bytes) > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:
+                raise DetailTooLarge("targeter run detail exceeds the byte limit")
             decisions = connection.execute(
                 """SELECT event_id, bundle_id, eligible, selected, score,
                           score_components_json, rejection_reasons_json,
                           allocation_rejection, admission_json,
                           market_exclusions_json, eligible_market_ids_json
-                   FROM candidate_decisions WHERE run_id = ? ORDER BY bundle_id""",
-                (run_id,),
+                   FROM candidate_decisions WHERE run_id = ? ORDER BY bundle_id
+                   LIMIT ?""",
+                (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             selected = connection.execute(
                 """SELECT s.event_id, s.bundle_id, s.venue, s.venue_market_id,
-                          v.market_id, v.market_template_version,
-                          v.outcome_space_version, s.canonical_class,
+                          s.market_id, s.market_template_version,
+                          s.outcome_space_version, s.canonical_class,
                           s.continuity_score, s.selection_reason, s.origin_run_id
                    FROM selected_market_occurrences s
                    JOIN venue_markets v USING (venue, venue_market_id)
                    WHERE s.run_id = ?
-                   ORDER BY s.bundle_id, s.venue, s.venue_market_id""",
-                (run_id,),
+                   ORDER BY s.bundle_id, s.venue, s.venue_market_id
+                   LIMIT ?""",
+                (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             relations = connection.execute(
                 """SELECT relation.relation_id, relation.relation_type,
-                          relation.event_id, relation.scope, relation.coverage,
+                          observed.event_id, observed.scope, observed.coverage,
                           relation.generation_version, relation.canonical_hash
                    FROM relation_observations observed
                    JOIN relations relation USING (relation_id)
-                   WHERE observed.run_id = ? ORDER BY relation.relation_id""",
-                (run_id,),
+                   WHERE observed.run_id = ? ORDER BY relation.relation_id
+                   LIMIT ?""",
+                (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+            events = connection.execute(
+                """SELECT DISTINCT event.*
+                   FROM umbrella_events event
+                   JOIN event_observations observed USING (event_id)
+                   WHERE observed.run_id = ?
+                   ORDER BY event.activation_at_ns, event.event_id
+                   LIMIT ?""",
+                (run_id, DETAIL_ROW_LIMIT + 1),
+            ).fetchall()
+        _ensure_detail_rows(
+            (decisions, selected, relations, events), "targeter run detail"
+        )
         return {
             "run": _run_summary(run),
             "source": {
@@ -1225,6 +1277,7 @@ class UniverseStore:
                 }
                 for row in decisions
             ],
+            "events": [_event_record(row) for row in events],
             "selected_markets": [_row_record(row) for row in selected],
             "relations": [_row_record(row) for row in relations],
         }
@@ -1243,18 +1296,24 @@ class UniverseStore:
             parameters.extend(after)
         with closing(self.connect(readonly=True)) as connection:
             rows = connection.execute(
-                f"""SELECT event.*,
-                            COUNT(DISTINCT venue.venue) AS venue_count,
-                            COUNT(DISTINCT market.market_id) AS market_count,
-                            COUNT(DISTINCT selected.run_id) AS selected_run_count
-                     FROM umbrella_events event
-                     LEFT JOIN venue_events venue USING (event_id)
-                     LEFT JOIN canonical_markets market USING (event_id)
-                     LEFT JOIN selected_market_occurrences selected USING (event_id)
-                     {where}
-                     GROUP BY event.event_id
-                     ORDER BY event.activation_at_ns DESC, event.event_id DESC
-                     LIMIT ?""",
+                f"""WITH page AS (
+                         SELECT * FROM umbrella_events
+                         {where}
+                         ORDER BY activation_at_ns DESC, event_id DESC
+                         LIMIT ?
+                     )
+                     SELECT page.*,
+                            (SELECT COUNT(DISTINCT venue.venue)
+                             FROM venue_events venue
+                             WHERE venue.event_id = page.event_id) AS venue_count,
+                            (SELECT COUNT(*)
+                             FROM canonical_markets market
+                             WHERE market.event_id = page.event_id) AS market_count,
+                            (SELECT COUNT(DISTINCT selected.run_id)
+                             FROM selected_market_occurrences selected
+                             WHERE selected.event_id = page.event_id) AS selected_run_count
+                     FROM page
+                     ORDER BY page.activation_at_ns DESC, page.event_id DESC""",
                 (*parameters, bounded + 1),
             ).fetchall()
         return [_event_record(row) for row in rows[:bounded]], len(rows) > bounded
@@ -1271,8 +1330,9 @@ class UniverseStore:
                           source_ref, format, fragment_type, first_seen_run_id,
                           last_seen_run_id
                    FROM venue_events WHERE event_id = ?
-                   ORDER BY venue, venue_event_id""",
-                (event_id,),
+                   ORDER BY venue, venue_event_id
+                   LIMIT ?""",
+                (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             markets = connection.execute(
                 """SELECT canonical.*,
@@ -1286,24 +1346,45 @@ class UniverseStore:
                    WHERE canonical.event_id = ?
                    GROUP BY canonical.market_id, canonical.market_template_version,
                             canonical.outcome_space_version
-                   ORDER BY canonical.canonical_class, canonical.market_id""",
-                (event_id,),
+                   ORDER BY canonical.canonical_class, canonical.market_id
+                   LIMIT ?""",
+                (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             relations = connection.execute(
-                """SELECT relation_id, relation_type, scope, coverage,
-                          generation_version, canonical_hash
-                   FROM relations WHERE event_id = ?
-                   ORDER BY relation_type, relation_id""",
-                (event_id,),
+                """SELECT relation.relation_id, relation.relation_type,
+                          observed.scope, observed.coverage,
+                          relation.generation_version, relation.canonical_hash
+                   FROM relations relation
+                   JOIN relation_observations observed USING (relation_id)
+                   JOIN targeter_runs observed_run USING (run_id)
+                   WHERE observed.event_id = ?
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM relation_observations newer
+                         JOIN targeter_runs newer_run USING (run_id)
+                         WHERE newer.relation_id = observed.relation_id
+                           AND newer.event_id = observed.event_id
+                           AND (newer_run.generated_at_ns,
+                                newer.run_id, newer.bundle_id) >
+                               (observed_run.generated_at_ns,
+                                observed_run.run_id, observed.bundle_id)
+                     )
+                   ORDER BY relation.relation_type, relation.relation_id
+                   LIMIT ?""",
+                (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             observations = connection.execute(
                 """SELECT observed.run_id, run.generated_at, observed.bundle_id
                    FROM event_observations observed
                    JOIN targeter_runs run USING (run_id)
                    WHERE observed.event_id = ?
-                   ORDER BY run.generated_at_ns, observed.run_id""",
-                (event_id,),
+                   ORDER BY run.generated_at_ns, observed.run_id, observed.bundle_id
+                   LIMIT ?""",
+                (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+        _ensure_detail_rows(
+            (venue_events, markets, relations, observations), "event detail"
+        )
         return {
             "event": _event_record(event),
             "venue_events": [_row_record(row) for row in venue_events],
@@ -1319,7 +1400,7 @@ class UniverseStore:
         market_template_version: int | None = None,
         outcome_space_version: int | None = None,
     ) -> dict[str, Any] | None:
-        predicates = ["market_id = ?"]
+        predicates = ["canonical.market_id = ?"]
         parameters: list[Any] = [market_id]
         for field, value in (
             ("market_template_version", market_template_version),
@@ -1328,14 +1409,23 @@ class UniverseStore:
             if value is not None:
                 if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                     raise ValueError(f"{field} must be a positive integer")
-                predicates.append(f"{field} = ?")
+                predicates.append(f"canonical.{field} = ?")
                 parameters.append(value)
         with closing(self.connect(readonly=True)) as connection:
             market = connection.execute(
-                f"""SELECT * FROM canonical_markets
+                f"""SELECT canonical.*,
+                          COUNT(venue.venue_market_id) AS venue_market_count,
+                          GROUP_CONCAT(DISTINCT venue.venue) AS venues
+                    FROM canonical_markets canonical
+                    LEFT JOIN venue_markets venue
+                      ON venue.market_id = canonical.market_id
+                     AND venue.market_template_version = canonical.market_template_version
+                     AND venue.outcome_space_version = canonical.outcome_space_version
                     WHERE {' AND '.join(predicates)}
-                    ORDER BY market_template_version DESC,
-                             outcome_space_version DESC LIMIT 1""",
+                    GROUP BY canonical.market_id, canonical.market_template_version,
+                             canonical.outcome_space_version
+                    ORDER BY canonical.market_template_version DESC,
+                             canonical.outcome_space_version DESC LIMIT 1""",
                 parameters,
             ).fetchone()
             if market is None:
@@ -1348,8 +1438,9 @@ class UniverseStore:
                 """SELECT * FROM venue_markets
                    WHERE market_id = ? AND market_template_version = ?
                      AND outcome_space_version = ?
-                   ORDER BY venue, venue_market_id""",
-                key,
+                   ORDER BY venue, venue_market_id
+                   LIMIT ?""",
+                (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             selections = connection.execute(
                 """SELECT selected.run_id, run.generated_at, selected.bundle_id,
@@ -1358,30 +1449,44 @@ class UniverseStore:
                           selected.origin_run_id
                    FROM selected_market_occurrences selected
                    JOIN targeter_runs run USING (run_id)
-                   JOIN venue_markets venue USING (venue, venue_market_id)
-                   WHERE venue.market_id = ?
-                     AND venue.market_template_version = ?
-                     AND venue.outcome_space_version = ?
+                   WHERE selected.market_id = ?
+                     AND selected.market_template_version = ?
+                     AND selected.outcome_space_version = ?
                    ORDER BY run.generated_at_ns, selected.run_id,
-                            selected.venue, selected.venue_market_id""",
-                key,
+                            selected.venue, selected.venue_market_id
+                   LIMIT ?""",
+                (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             relations = connection.execute(
                 """SELECT DISTINCT relation.relation_id,
-                          relation.relation_type, relation.scope,
-                          relation.coverage, relation.generation_version,
+                          relation.relation_type, observed.scope,
+                          observed.coverage, relation.generation_version,
                           relation.canonical_hash
                    FROM relation_members member
                    JOIN relations relation USING (relation_id)
+                   JOIN relation_observations observed USING (relation_id)
+                   JOIN targeter_runs observed_run USING (run_id)
                    JOIN venue_markets venue
                      ON venue.venue = member.venue
                     AND venue.venue_market_id = member.venue_market_id
                    WHERE venue.market_id = ?
                      AND venue.market_template_version = ?
                      AND venue.outcome_space_version = ?
-                   ORDER BY relation.relation_type, relation.relation_id""",
-                key,
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM relation_observations newer
+                         JOIN targeter_runs newer_run USING (run_id)
+                         WHERE newer.relation_id = observed.relation_id
+                           AND (newer_run.generated_at_ns,
+                                newer_run.run_id, newer.bundle_id) >
+                               (observed_run.generated_at_ns,
+                                observed_run.run_id, observed.bundle_id)
+                     )
+                   ORDER BY relation.relation_type, relation.relation_id
+                   LIMIT ?""",
+                (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+        _ensure_detail_rows((venue_markets, selections, relations), "market detail")
         return {
             "market": _canonical_market_record(market),
             "venue_markets": [_venue_market_record(row) for row in venue_markets],
@@ -1407,17 +1512,21 @@ class UniverseStore:
                    JOIN venue_markets venue USING (venue, venue_market_id)
                    WHERE member.relation_id = ?
                    ORDER BY member.role, member.venue,
-                            member.venue_market_id, member.claim_key""",
-                (relation_id,),
+                            member.venue_market_id, member.claim_key
+                   LIMIT ?""",
+                (relation_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             observations = connection.execute(
-                """SELECT observed.run_id, run.generated_at, observed.bundle_id
+                """SELECT observed.run_id, run.generated_at, observed.bundle_id,
+                          observed.event_id, observed.scope, observed.coverage
                    FROM relation_observations observed
                    JOIN targeter_runs run USING (run_id)
                    WHERE observed.relation_id = ?
-                   ORDER BY run.generated_at_ns, observed.run_id""",
-                (relation_id,),
+                   ORDER BY run.generated_at_ns, observed.run_id, observed.bundle_id
+                   LIMIT ?""",
+                (relation_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+        _ensure_detail_rows((members, observations), "relation detail")
         return {
             "relation": _row_record(relation),
             "members": [_row_record(row) for row in members],
@@ -2177,6 +2286,20 @@ def _seen_run_ids(
     return str(ordered[0]["run_id"]), str(ordered[-1]["run_id"])
 
 
+def _run_is_newer(
+    connection: sqlite3.Connection, run_id: str, other_run_id: str
+) -> bool:
+    rows = connection.execute(
+        """SELECT run_id, generated_at_ns FROM targeter_runs
+           WHERE run_id IN (?, ?)""",
+        (run_id, other_run_id),
+    ).fetchall()
+    if len(rows) != 2:
+        raise EvidenceConflict("venue projection observation is incomplete")
+    timestamps = {str(row["run_id"]): int(row["generated_at_ns"]) for row in rows}
+    return (timestamps[run_id], run_id) > (timestamps[other_run_id], other_run_id)
+
+
 def _event_record(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
     record = {
@@ -2241,6 +2364,11 @@ def _limit(value: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError("limit must be a positive integer")
     return min(value, 1000)
+
+
+def _ensure_detail_rows(groups: tuple[list[Any], ...], label: str) -> None:
+    if any(len(rows) > DETAIL_ROW_LIMIT for rows in groups):
+        raise DetailTooLarge(f"{label} exceeds the child-row limit")
 
 
 def _nonempty(value: Any, label: str) -> str:
