@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import heapq
 import json
 import tempfile
+import time
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from archive import read_verified_json
-from archive.retrieval import ArchivedObject, ArchivedObjectByteStreamer
+from archive.retrieval import (
+    ArchivedObject,
+    ArchivedObjectByteStreamer,
+    cleanup_stale_retrieval_directories,
+)
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
     NDJSON_CONTENT_TYPE,
@@ -38,8 +45,15 @@ from universe.store import EvidenceConflict, UniverseStore
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_SELECTION_REPORT_BYTES = 128 * 1024 * 1024
-MAX_CATALOG_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_CATALOG_BYTES_PER_RUN = 128 * 1024 * 1024
+CATALOG_HEADROOM_WARNING_BYTES = 96 * 1024 * 1024
+MAX_CATALOG_ROW_BYTES = 4 * 1024 * 1024
+MAX_CATALOG_REFERENCES_PER_RUN = 100_000
+BOOTSTRAP_RUN_BUDGET = 144
+FAILURE_RETRY_BUDGET = 32
+MAX_RESULT_DIAGNOSTICS = 100
+STALE_RETRIEVAL_SECONDS = 24 * 60 * 60
+BACKFILL_BATCH_SIZE = 100
 INCREMENTAL_CHECKPOINT = "targeter-v3-incremental-date"
 
 
@@ -50,10 +64,10 @@ class UniverseSyncError(ValueError):
 def _logical_size(item: RunObject) -> int:
     if item.logical is None:
         raise UniverseSyncError(f"normalized artifact {item.key} has no logical identity")
-    if item.logical.byte_length > MAX_CATALOG_ARTIFACT_BYTES:
+    if item.logical.byte_length > MAX_CATALOG_BYTES_PER_RUN:
         raise UniverseSyncError(
             f"normalized artifact {item.key} exceeds "
-            f"{MAX_CATALOG_ARTIFACT_BYTES} decoded bytes"
+            f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
         )
     return item.logical.byte_length
 
@@ -65,7 +79,23 @@ class SyncResult:
     skipped: int = 0
     incomplete: int = 0
     origin_dependencies_ingested: int = 0
+    failure_count: int = 0
     failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    bootstrap_exhausted: bool = False
+    completed: bool = False
+    catalog_decoded_bytes: int = 0
+    catalog_rows_retained: int = 0
+    pending_failures: int = 0
+
+    def add_failure(self, value: str) -> None:
+        self.failure_count += 1
+        if len(self.failures) < MAX_RESULT_DIAGNOSTICS:
+            self.failures.append(value[:4096])
+
+    def add_warning(self, value: str) -> None:
+        if len(self.warnings) < MAX_RESULT_DIAGNOSTICS:
+            self.warnings.append(value[:4096])
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -74,7 +104,14 @@ class SyncResult:
             "skipped": self.skipped,
             "incomplete": self.incomplete,
             "origin_dependencies_ingested": self.origin_dependencies_ingested,
+            "failure_count": self.failure_count,
             "failures": list(self.failures),
+            "warnings": list(self.warnings),
+            "bootstrap_exhausted": self.bootstrap_exhausted,
+            "completed": self.completed,
+            "catalog_decoded_bytes": self.catalog_decoded_bytes,
+            "catalog_rows_retained": self.catalog_rows_retained,
+            "pending_failures": self.pending_failures,
         }
 
 
@@ -87,6 +124,8 @@ class _VerifiedRun:
     market_projection: dict[str, Any]
     projected: tuple[dict[str, Any], ...]
     retirements: tuple[dict[str, Any], ...]
+    catalog_decoded_bytes: int
+    catalog_rows_retained: int
 
 
 class UniverseSync:
@@ -103,6 +142,10 @@ class UniverseSync:
             temporary_directory or tempfile.gettempdir()
         )
         self.temporary_directory.mkdir(parents=True, exist_ok=True)
+        cleanup_stale_retrieval_directories(
+            self.temporary_directory,
+            older_than_seconds=STALE_RETRIEVAL_SECONDS,
+        )
 
     def sync(self, *, now: datetime | None = None) -> SyncResult:
         """Catch up from the incremental floor; bootstrap with the latest run."""
@@ -110,38 +153,54 @@ class UniverseSync:
         latest = self.database.latest_run()
         checkpoint = self.database.checkpoint(INCREMENTAL_CHECKPOINT)
         observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        observed_ns = _timestamp_ns(observed)
+        retried = set(
+            self.database.due_sync_failures(
+                now_ns=observed_ns, limit=FAILURE_RETRY_BUDGET
+            )
+        )
+        for key in sorted(retried):
+            self._ingest_direct(key, result, now_ns=observed_ns)
         if checkpoint is None and latest is None:
             try:
-                keys = self._all_manifest_keys()
+                keys = self._bootstrap_manifest_keys(
+                    result, now_ns=observed_ns, retried=retried
+                )
             except Exception as error:  # noqa: BLE001 - discovery belongs in result
-                result.failures.append(
+                result.add_failure(
                     f"targeter-v2/runs/: {type(error).__name__}: {error}"
                 )
-                return result
-            result.discovered = len(keys)
+                return self._finish(result)
             if not keys:
-                return result
+                self.database.set_checkpoint(
+                    INCREMENTAL_CHECKPOINT, observed.date().isoformat()
+                )
+                result.completed = True
+                return self._finish(result)
             complete_found = False
-            failed_dates: list[date] = []
+            walked = 0
             for key in reversed(keys):
-                before = len(result.failures)
-                self._ingest_direct(key, result)
-                if len(result.failures) != before:
-                    failed_dates.append(manifest_run_instant(key).date())
-                    continue
-                detail = self.database.run_detail(manifest_run_id(key))
-                if detail is not None and detail["input_complete"]:
+                input_complete = self._ingest_direct(
+                    key, result, now_ns=observed_ns
+                )
+                walked += 1
+                if input_complete is True:
                     complete_found = True
                     break
-            if complete_found or failed_dates:
-                next_floor = min(failed_dates) if failed_dates else manifest_run_instant(
-                    keys[-1]
-                ).date()
-                self.database.set_checkpoint(
-                    INCREMENTAL_CHECKPOINT,
-                    next_floor.isoformat(),
+                if walked >= BOOTSTRAP_RUN_BUDGET:
+                    break
+            result.bootstrap_exhausted = not complete_found and walked >= BOOTSTRAP_RUN_BUDGET
+            if result.bootstrap_exhausted:
+                result.add_failure(
+                    f"bootstrap found no complete run within the {BOOTSTRAP_RUN_BUDGET}-run budget; "
+                    "run the configured backfill to index older history"
                 )
-            return result
+            self.database.set_checkpoint(
+                INCREMENTAL_CHECKPOINT,
+                manifest_run_instant(keys[-1]).date().isoformat(),
+            )
+            result.completed = not result.bootstrap_exhausted
+            return self._finish(result)
 
         floor = _date(
             checkpoint
@@ -149,23 +208,31 @@ class UniverseSync:
             "incremental checkpoint",
         )
         ceiling = max(floor, observed.date())
-        try:
-            keys = self._manifest_keys_for_dates(floor, ceiling)
-        except Exception as error:  # noqa: BLE001
-            result.failures.append(
-                f"targeter-v2/runs/: {type(error).__name__}: {error}"
+        cursor = floor
+        while cursor <= ceiling:
+            try:
+                discovered = self._manifest_keys_for_dates(cursor, cursor)
+            except Exception as error:  # noqa: BLE001
+                result.add_failure(
+                    f"targeter-v2/runs/date={cursor.isoformat()}/: "
+                    f"{type(error).__name__}: {error}"
+                )
+                return self._finish(result)
+            result.discovered += len(discovered)
+            deferred = self.database.known_sync_failure_keys(discovered) - retried
+            keys = self._valid_manifest_keys(
+                discovered,
+                result,
+                now_ns=observed_ns,
+                deferred=deferred | retried,
             )
-            return result
-        result.discovered = len(keys)
-        failed_dates: list[date] = []
-        for key in keys:
-            before = len(result.failures)
-            self._ingest_direct(key, result)
-            if len(result.failures) != before:
-                failed_dates.append(manifest_run_instant(key).date())
-        next_floor = min(failed_dates) if failed_dates else ceiling
-        self.database.set_checkpoint(INCREMENTAL_CHECKPOINT, next_floor.isoformat())
-        return result
+            for key in keys:
+                self._ingest_direct(key, result, now_ns=observed_ns)
+            next_floor = min(cursor + timedelta(days=1), ceiling)
+            self.database.set_checkpoint(INCREMENTAL_CHECKPOINT, next_floor.isoformat())
+            cursor += timedelta(days=1)
+        result.completed = True
+        return self._finish(result)
 
     def sync_range(self, start: datetime, end: datetime) -> SyncResult:
         """Ingest every manifest whose canonical run timestamp is in [start, end)."""
@@ -174,30 +241,146 @@ class UniverseSync:
         if start >= end:
             raise ValueError("backfill start must be before end")
         result = SyncResult()
+        now_ns = time.time_ns()
         try:
             last_date = (end - timedelta(microseconds=1)).date()
+            discovered = self._manifest_keys_for_dates(start.date(), last_date)
             keys = [
                 key
-                for key in self._manifest_keys_for_dates(start.date(), last_date)
+                for key in self._valid_manifest_keys(
+                    discovered, result, now_ns=now_ns
+                )
                 if start <= manifest_run_instant(key) < end
             ]
         except Exception as error:  # noqa: BLE001
-            result.failures.append(
+            result.add_failure(
                 f"targeter-v2/runs/: {type(error).__name__}: {error}"
             )
-            return result
-        result.discovered = len(keys)
+            return self._finish(result)
+        result.discovered = len(discovered)
         for key in keys:
-            self._ingest_direct(key, result)
+            self._ingest_direct(key, result, now_ns=now_ns)
+        result.completed = True
+        return self._finish(result)
+
+    def backfill_range(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        batch_size: int = BACKFILL_BATCH_SIZE,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> SyncResult:
+        """Checkpoint and batch a full half-open rebuild range."""
+        start = _utc(start, "backfill start")
+        end = _utc(end, "backfill end")
+        if start >= end:
+            raise ValueError("backfill start must be before end")
+        if batch_size <= 0:
+            raise ValueError("backfill batch_size must be positive")
+        identity = hashlib.sha256(
+            f"{start.isoformat()}\n{end.isoformat()}".encode()
+        ).hexdigest()[:16]
+        checkpoint_name = f"targeter-v3-backfill-{identity}"
+        cursor = self.database.checkpoint(checkpoint_name)
+        result = SyncResult()
+        now_ns = time.time_ns()
+        first_partition, after_last_partition = _manifest_partition_bounds(start, end)
+        if cursor == "scan-complete":
+            for key in self.database.due_sync_failures(
+                now_ns=now_ns,
+                limit=FAILURE_RETRY_BUDGET,
+                key_start=first_partition,
+                key_end=after_last_partition,
+            ):
+                try:
+                    instant = manifest_run_instant(key)
+                except Exception:  # malformed listed keys remain visible and retriable
+                    self._ingest_direct(key, result, now_ns=now_ns)
+                    continue
+                if start <= instant < end:
+                    self._ingest_direct(key, result, now_ns=now_ns)
+            result.completed = (
+                self.database.sync_failure_count(
+                    key_start=first_partition,
+                    key_end=after_last_partition,
+                )
+                == 0
+            )
+            return self._finish(result)
+        last_date = (end - timedelta(microseconds=1)).date()
+        pending: list[str] = []
+        cursor_run_id = manifest_run_id(cursor) if cursor is not None else None
+        day = (
+            max(start.date(), manifest_run_instant(cursor).date())
+            if cursor is not None
+            else start.date()
+        )
+        while day <= last_date:
+            keys = self._manifest_keys_for_dates(day, day)
+            result.discovered += len(keys)
+            for key in self._valid_manifest_keys(keys, result, now_ns=now_ns):
+                instant = manifest_run_instant(key)
+                if start <= instant < end and (
+                    cursor_run_id is None or manifest_run_id(key) > cursor_run_id
+                ):
+                    pending.append(key)
+                if len(pending) == batch_size:
+                    self._backfill_batch(
+                        pending, result, checkpoint_name, progress, now_ns
+                    )
+                    cursor = pending[-1]
+                    pending = []
+            day += timedelta(days=1)
+        if pending:
+            self._backfill_batch(pending, result, checkpoint_name, progress, now_ns)
+        self.database.set_checkpoint(checkpoint_name, "scan-complete")
+        result.completed = (
+            self.database.sync_failure_count(
+                key_start=first_partition,
+                key_end=after_last_partition,
+            )
+            == 0
+        )
+        return self._finish(result)
+
+    def _backfill_batch(
+        self,
+        keys: list[str],
+        result: SyncResult,
+        checkpoint_name: str,
+        progress: Callable[[dict[str, Any]], None] | None,
+        now_ns: int,
+    ) -> None:
+        before_ingested = result.ingested
+        before_skipped = result.skipped
+        before_failures = result.failure_count
+        for key in keys:
+            self._ingest_direct(key, result, now_ns=now_ns)
+        self.database.set_checkpoint(checkpoint_name, keys[-1])
+        if progress is not None:
+            progress(
+                {
+                    "type": "backfill_batch",
+                    "processed": len(keys),
+                    "through_manifest_key": keys[-1],
+                    "ingested": result.ingested - before_ingested,
+                    "skipped": result.skipped - before_skipped,
+                    "failures": result.failure_count - before_failures,
+                }
+            )
+
+    def _finish(self, result: SyncResult) -> SyncResult:
+        result.pending_failures = self.database.sync_failure_count()
         return result
 
     def audit_run(self, run_id: str) -> dict[str, Any]:
         """Reverify one run and every retained origin against immutable store bytes."""
-        detail = self.database.run_detail(run_id)
-        if detail is None:
+        source = self.database.run_source(run_id)
+        if source is None:
             raise UniverseSyncError(f"Targeter run {run_id} is not indexed")
         status = self._ingest_manifest(
-            detail["manifest_key"],
+            source["manifest_key"],
             stack=set(),
             force=True,
             dependency=False,
@@ -205,11 +388,15 @@ class UniverseSync:
         )
         audit = self.database.audit_run(run_id)
         assert audit is not None
-        return {"source_status": status, **audit}
+        if not audit["ok"]:
+            raise EvidenceConflict(f"Targeter run {run_id} SQL projection failed audit")
+        return {"source_status": status[0], **audit}
 
-    def _ingest_direct(self, key: str, result: SyncResult) -> None:
+    def _ingest_direct(
+        self, key: str, result: SyncResult, *, now_ns: int
+    ) -> bool | None:
         try:
-            status = self._ingest_manifest(
+            status, input_complete = self._ingest_manifest(
                 key,
                 stack=set(),
                 force=False,
@@ -218,13 +405,17 @@ class UniverseSync:
             )
             if status == "ingested":
                 result.ingested += 1
-                detail = self.database.run_detail(manifest_run_id(key))
-                if detail is not None and detail["input_complete"] is False:
+                if input_complete is False:
                     result.incomplete += 1
             else:
                 result.skipped += 1
+            self.database.clear_sync_failure(key)
+            return input_complete
         except Exception as error:  # noqa: BLE001 - preserve every failed source
-            result.failures.append(f"{key}: {type(error).__name__}: {error}")
+            message = f"{key}: {type(error).__name__}: {error}"
+            result.add_failure(message)
+            self.database.record_sync_failure(key, message, now_ns=now_ns)
+            return None
 
     def _ingest_manifest(
         self,
@@ -236,7 +427,7 @@ class UniverseSync:
         result: SyncResult | None,
         expected_manifest_sha256: str | None = None,
         expected_report_sha256: str | None = None,
-    ) -> str:
+    ) -> tuple[str, bool | None]:
         metadata = self.objects.head(key)
         if metadata is None:
             raise UniverseSyncError(f"run manifest is absent: {key}")
@@ -247,7 +438,7 @@ class UniverseSync:
                 f"run manifest {key} identity disagrees with continuity origin"
             )
         if not force and self.database.known_manifest(key, metadata.sha256):
-            return "skipped"
+            return "skipped", None
         if key in stack:
             raise UniverseSyncError(f"continuity origin cycle reaches {key}")
         stack.add(key)
@@ -328,7 +519,16 @@ class UniverseSync:
             )
             if dependency and status == "ingested" and result is not None:
                 result.origin_dependencies_ingested += 1
-            return status
+            if result is not None:
+                result.catalog_decoded_bytes += verified.catalog_decoded_bytes
+                result.catalog_rows_retained += verified.catalog_rows_retained
+                if verified.catalog_decoded_bytes >= CATALOG_HEADROOM_WARNING_BYTES:
+                    result.add_warning(
+                        f"run {verified.manifest.run_id} normalized catalogue bytes "
+                        f"{verified.catalog_decoded_bytes} are above the "
+                        f"{CATALOG_HEADROOM_WARNING_BYTES}-byte headroom threshold"
+                    )
+            return status, verified.manifest.input_complete
         finally:
             stack.remove(key)
 
@@ -522,17 +722,31 @@ class UniverseSync:
             if manifest.input_complete
             else ()
         )
+        required_event_refs, required_market_refs = (
+            _catalog_references(report) if manifest.input_complete else (set(), set())
+        )
+        if len(required_event_refs) + len(required_market_refs) > MAX_CATALOG_REFERENCES_PER_RUN:
+            raise UniverseSyncError(
+                f"run {manifest.run_id} exceeds the "
+                f"{MAX_CATALOG_REFERENCES_PER_RUN}-reference projection limit"
+            )
+        event_venues = {value.split(":", 1)[0] for value in required_event_refs}
+        market_venues = {value.split(":", 1)[0] for value in required_market_refs}
         catalog_events: list[Mapping[str, Any]] = []
         catalog_markets: list[Mapping[str, Any]] = []
         rule_templates: list[Mapping[str, Any]] = []
         catalog_items = [
             item
             for item in manifest.objects
-            if (
-                item.file.startswith("catalog_")
-                and ("_events.ndjson" in item.file or "_markets.ndjson" in item.file)
+            if any(
+                item.file.startswith(f"catalog_{venue}_events.ndjson")
+                for venue in event_venues
             )
-            or item.file.startswith("rule_templates.ndjson")
+            or any(
+                item.file.startswith(f"catalog_{venue}_markets.ndjson")
+                for venue in market_venues
+            )
+            or (required_market_refs and item.file.startswith("rule_templates.ndjson"))
         ]
         catalog_bytes = sum(_logical_size(item) for item in catalog_items)
         if catalog_bytes > MAX_CATALOG_BYTES_PER_RUN:
@@ -540,18 +754,36 @@ class UniverseSync:
                 f"normalized artifacts for run {manifest.run_id} exceed "
                 f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
             )
-        for item in manifest.objects:
-            if item.file.startswith("catalog_") and "_events.ndjson" in item.file:
+        for item in catalog_items:
+            if any(
+                item.file.startswith(f"catalog_{venue}_events.ndjson")
+                for venue in event_venues
+            ):
                 catalog_events.extend(
-                    self._read_ndjson(item, bound_expectations[item.key])
+                    self._read_ndjson(
+                        item,
+                        bound_expectations[item.key],
+                        keep=lambda row: _raw_event_ref(row) in required_event_refs,
+                    )
                 )
-            elif item.file.startswith("catalog_") and "_markets.ndjson" in item.file:
+            elif any(
+                item.file.startswith(f"catalog_{venue}_markets.ndjson")
+                for venue in market_venues
+            ):
                 catalog_markets.extend(
-                    self._read_ndjson(item, bound_expectations[item.key])
+                    self._read_ndjson(
+                        item,
+                        bound_expectations[item.key],
+                        keep=lambda row: row.get("target_id") in required_market_refs,
+                    )
                 )
             elif item.file.startswith("rule_templates.ndjson"):
                 rule_templates.extend(
-                    self._read_ndjson(item, bound_expectations[item.key])
+                    self._read_ndjson(
+                        item,
+                        bound_expectations[item.key],
+                        keep=lambda row: row.get("market_id") in required_market_refs,
+                    )
                 )
         market_projection = project_market_universe(
             report,
@@ -567,6 +799,8 @@ class UniverseSync:
             market_projection,
             projected,
             retirements,
+            catalog_bytes,
+            len(catalog_events) + len(catalog_markets) + len(rule_templates),
         )
 
     def _read_run_manifest(
@@ -624,14 +858,18 @@ class UniverseSync:
         return document
 
     def _read_ndjson(
-        self, item: RunObject, expected: ObjectExpectation
+        self,
+        item: RunObject,
+        expected: ObjectExpectation,
+        *,
+        keep: Callable[[Mapping[str, Any]], bool],
     ) -> list[Mapping[str, Any]]:
         if item.content_type != NDJSON_CONTENT_TYPE or item.logical is None:
             raise UniverseSyncError(f"normalized artifact {item.key} is not NDJSON")
-        if item.logical.byte_length > MAX_CATALOG_ARTIFACT_BYTES:
+        if item.logical.byte_length > MAX_CATALOG_BYTES_PER_RUN:
             raise UniverseSyncError(
                 f"normalized artifact {item.key} exceeds "
-                f"{MAX_CATALOG_ARTIFACT_BYTES} decoded bytes"
+                f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
             )
         streamer = ArchivedObjectByteStreamer(
             self.objects,
@@ -640,28 +878,75 @@ class UniverseSync:
         )
         pending = b""
         rows: list[Mapping[str, Any]] = []
+        line_count = 0
         for chunk in streamer.iter_bytes(item.file):
             pending += chunk
             lines = pending.split(b"\n")
             pending = lines.pop()
             for line in lines:
-                rows.append(_ndjson_row(line, item.key))
+                line_count += 1
+                if len(line) > MAX_CATALOG_ROW_BYTES:
+                    raise UniverseSyncError(
+                        f"normalized artifact {item.key} contains a row above the "
+                        f"{MAX_CATALOG_ROW_BYTES}-byte limit"
+                    )
+                row = _ndjson_row(line, item.key)
+                if keep(row):
+                    rows.append(row)
+            if len(pending) > MAX_CATALOG_ROW_BYTES:
+                raise UniverseSyncError(
+                    f"normalized artifact {item.key} contains a row above the "
+                    f"{MAX_CATALOG_ROW_BYTES}-byte limit"
+                )
         if pending:
             raise UniverseSyncError(f"normalized artifact {item.key} lacks final LF")
-        if len(rows) != item.logical.line_count:
+        if line_count != item.logical.line_count:
             raise UniverseSyncError(
                 f"normalized artifact {item.key} line count disagrees with manifest"
             )
         return rows
-    def _all_manifest_keys(self) -> list[str]:
-        keys = [
-            key
-            for key in self.objects.list_keys("targeter-v2/runs/")
-            if key.endswith("/run_manifest.json")
-        ]
-        for key in keys:
-            manifest_run_id(key)
-        return sorted(set(keys), key=manifest_run_id)
+    def _bootstrap_manifest_keys(
+        self,
+        result: SyncResult,
+        *,
+        now_ns: int,
+        retried: set[str],
+    ) -> list[str]:
+        newest: list[tuple[str, str]] = []
+        candidates: list[tuple[str, str]] = []
+
+        def retain_newest() -> None:
+            known = self.database.known_sync_failure_keys(
+                [key for _run_id, key in candidates]
+            )
+            for item in candidates:
+                if item[1] in known or item[1] in retried:
+                    continue
+                if len(newest) < BOOTSTRAP_RUN_BUDGET:
+                    heapq.heappush(newest, item)
+                elif item > newest[0]:
+                    heapq.heapreplace(newest, item)
+            candidates.clear()
+
+        for key in self.objects.list_keys("targeter-v2/runs/"):
+            if not key.endswith("/run_manifest.json"):
+                continue
+            result.discovered += 1
+            try:
+                run_id = manifest_run_id(key)
+                manifest_run_instant(key)
+            except Exception as error:  # noqa: BLE001 - isolate malformed listings
+                if key in retried or self.database.has_sync_failure(key):
+                    continue
+                message = f"{key}: {type(error).__name__}: {error}"
+                result.add_failure(message)
+                self.database.record_sync_failure(key, message, now_ns=now_ns)
+                continue
+            candidates.append((run_id, key))
+            if len(candidates) == 500:
+                retain_newest()
+        retain_newest()
+        return [key for _run_id, key in sorted(newest)]
 
     def _manifest_keys_for_dates(self, start: date, end: date) -> list[str]:
         keys: list[str] = []
@@ -670,10 +955,32 @@ class UniverseSync:
             prefix = f"targeter-v2/runs/date={cursor.isoformat()}/"
             for key in self.objects.list_keys(prefix):
                 if key.endswith("/run_manifest.json"):
-                    manifest_run_id(key)
                     keys.append(key)
             cursor += timedelta(days=1)
-        return sorted(set(keys), key=manifest_run_id)
+        return sorted(set(keys))
+
+    def _valid_manifest_keys(
+        self,
+        keys: list[str],
+        result: SyncResult,
+        *,
+        now_ns: int,
+        deferred: set[str] | None = None,
+    ) -> list[str]:
+        valid: list[str] = []
+        for key in keys:
+            if deferred is not None and key in deferred:
+                continue
+            try:
+                manifest_run_id(key)
+                manifest_run_instant(key)
+            except Exception as error:  # noqa: BLE001 - isolate malformed listings
+                message = f"{key}: {type(error).__name__}: {error}"
+                result.add_failure(message)
+                self.database.record_sync_failure(key, message, now_ns=now_ns)
+                continue
+            valid.append(key)
+        return sorted(set(valid), key=manifest_run_id)
 
 
 def _complete_context(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -747,6 +1054,47 @@ def _ndjson_row(line: bytes, key: str) -> Mapping[str, Any]:
     return value
 
 
+def _catalog_references(report: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    candidates = report.get("candidates")
+    if not isinstance(candidates, list):
+        raise UniverseSyncError("report.candidates must be an array")
+    event_refs: set[str] = set()
+    market_refs: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise UniverseSyncError("report candidate must be an object")
+        bundle_id = _required_text(candidate, "bundle_id", "candidate")
+        for field, destination in (
+            ("event_refs", event_refs),
+            ("market_ids", market_refs),
+        ):
+            values = candidate.get(field)
+            if not isinstance(values, list) or not all(
+                _is_venue_reference(value)
+                for value in values
+            ):
+                raise UniverseSyncError(
+                    f"candidate {bundle_id} {field} must contain venue-prefixed text"
+                )
+            destination.update(values)
+    return event_refs, market_refs
+
+
+def _is_venue_reference(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    venue, separator, identifier = value.partition(":")
+    return bool(venue and separator and identifier)
+
+
+def _raw_event_ref(row: Mapping[str, Any]) -> str | None:
+    venue = row.get("venue")
+    identifier = row.get("venue_event_id")
+    if not isinstance(venue, str) or not isinstance(identifier, str):
+        return None
+    return f"{venue}:{identifier}"
+
+
 def _date(value: str, label: str) -> date:
     try:
         parsed = date.fromisoformat(value)
@@ -761,3 +1109,21 @@ def _utc(value: datetime, label: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError(f"{label} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def _timestamp_ns(value: datetime) -> int:
+    delta = value.astimezone(timezone.utc) - datetime(
+        1970, 1, 1, tzinfo=timezone.utc
+    )
+    return (
+        (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+def _manifest_partition_bounds(start: datetime, end: datetime) -> tuple[str, str]:
+    after_last = (end - timedelta(microseconds=1)).date() + timedelta(days=1)
+    return (
+        f"targeter-v2/runs/date={start.date().isoformat()}/",
+        f"targeter-v2/runs/date={after_last.isoformat()}/",
+    )

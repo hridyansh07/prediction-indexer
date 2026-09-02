@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest import mock
 
 from archive.storage import INDEPENDENT, LocalObjectStore
 from archive.storage.base import JSON_CONTENT_TYPE
+from archive.retrieval import cleanup_stale_retrieval_directories
 from encoder import DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version, stored_identity_of
 from targeter.v2.domain import CatalogSnapshot
 from targeter.v2.registry import load_strategy
@@ -20,13 +23,14 @@ from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from universe.api import UniverseApplication
 from universe.backfill import backfill_targeter_history
 from universe.config import UniverseConfigError, load_config
+from universe.market_projection import project_market_universe
 from universe.projection import (
     ProjectionError,
     project_bundle_retirements,
     project_selected_bundles,
 )
 from universe.store import DetailTooLarge, EvidenceConflict, UniverseStore, file_sha256
-from universe.sync import UniverseSync
+from universe.sync import BOOTSTRAP_RUN_BUDGET, UniverseSync
 
 R1 = "20260101T000000.000001Z"
 R2 = "20260101T001000.000002Z"
@@ -283,6 +287,73 @@ def _compression() -> dict:
     }
 
 
+def _catalog_rows(report: dict) -> tuple[list[dict], list[dict]]:
+    events: list[dict] = []
+    markets: list[dict] = []
+    selected_classes = {
+        target["target_id"]: target["canonical_class"]
+        for targets in report["selection"]["targets"].values()
+        for target in targets
+    }
+    for candidate in report["candidates"]:
+        event_by_venue = {
+            reference.split(":", 1)[0]: reference.split(":", 1)[1]
+            for reference in candidate["event_refs"]
+        }
+        for venue, event_id in event_by_venue.items():
+            events.append(
+                {
+                    "venue": venue,
+                    "venue_event_id": event_id,
+                    "sport": candidate["sport"],
+                    "league": "test league",
+                    "title": "Alpha vs Beta",
+                    "participants": candidate["participants"],
+                    "participant_keys": candidate["participant_keys"],
+                    "activation_at": candidate["activation_at"],
+                    "status": "open",
+                    "source_ref": f"/{venue}/{event_id}",
+                    "format": "3",
+                    "fragment_type": None,
+                    "game": candidate["game"],
+                    "topology": candidate["topology"],
+                }
+            )
+        for target_id in candidate["market_ids"]:
+            venue, market_id = target_id.split(":", 1)
+            canonical_class = selected_classes.get(
+                target_id,
+                "esports.map_winner"
+                if "map" in market_id
+                else "esports.series_moneyline",
+            )
+            markets.append(
+                {
+                    "target_id": target_id,
+                    "venue": venue,
+                    "venue_market_id": market_id,
+                    "venue_event_id": event_by_venue[venue],
+                    "canonical_class": canonical_class,
+                    "market_type": canonical_class.split(".", 1)[1],
+                    "scope": "series",
+                    "title": market_id,
+                    "parameters": {"side": "home"},
+                    "subscription_ids": [f"{market_id}-subscription"],
+                    "outcome_labels": ["Yes", "No"],
+                    "status": "open",
+                    "accepting_orders": True,
+                    "rules_hash": None,
+                    "created_at": "2025-12-31T00:00:00Z",
+                    "volume_24h": 100,
+                    "volume_total": 500,
+                    "volume_total_usd": 30_000,
+                    "liquidity": 200,
+                    "source_ref": f"/{venue}/{market_id}",
+                }
+            )
+    return events, markets
+
+
 def _publish_run(
     store: LocalObjectStore,
     report: dict,
@@ -489,6 +560,48 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertFalse(project_bundle_retirements(clamped)[0]["terminal_observed"])
 
+    def test_event_identity_uses_exact_native_reference_set_not_activation(self) -> None:
+        first = _selection_report(R1, G1, activation_at="2026-01-01T03:00:00Z")
+        shifted = _selection_report(R2, G2, activation_at="2026-01-01T03:05:00Z")
+        first_projection = project_market_universe(
+            first,
+            catalog_events=_catalog_rows(first)[0],
+            catalog_markets=_catalog_rows(first)[1],
+        )
+        shifted_projection = project_market_universe(
+            shifted,
+            catalog_events=_catalog_rows(shifted)[0],
+            catalog_markets=_catalog_rows(shifted)[1],
+        )
+        self.assertEqual(
+            first_projection["events"][0]["event_id"],
+            shifted_projection["events"][0]["event_id"],
+        )
+
+        changed = _selection_report(R2, G2)
+        changed["candidates"][0]["event_refs"].append("limitless:event-c")
+        changed_events, changed_markets = _catalog_rows(changed)
+        changed_projection = project_market_universe(
+            changed,
+            catalog_events=changed_events,
+            catalog_markets=changed_markets,
+        )
+        self.assertNotEqual(
+            first_projection["events"][0]["event_id"],
+            changed_projection["events"][0]["event_id"],
+        )
+
+    def test_unreferenced_duplicate_catalogue_rows_do_not_reject_projection(self) -> None:
+        report = _selection_report(R1, G1)
+        events, markets = _catalog_rows(report)
+        unrelated = {**events[0], "venue_event_id": "unrelated"}
+        projection = project_market_universe(
+            report,
+            catalog_events=[*events, unrelated, unrelated],
+            catalog_markets=markets,
+        )
+        self.assertEqual(len(projection["venue_events"]), 2)
+
 
 class EventUniverseTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -542,11 +655,11 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(result.ingested, 2, result.as_record())
         runs, _more = self.database.list_runs()
         self.assertEqual([run["run_id"] for run in runs], [R1, R2])
-        status = self.database.cadence_status_snapshot()
+        status = self.database.targeter_status_snapshot()
         self.assertEqual(status["latest_run"]["run_id"], R2)
         self.assertEqual(status["current_complete_run"]["run_id"], R1)
 
-    def test_bootstrap_checkpoints_failed_older_date_without_complete_run(self) -> None:
+    def test_bootstrap_advances_high_water_past_failed_older_date(self) -> None:
         invalid = _empty_report(R1, G1, input_complete=False)
         invalid["report_version"] = 2
         _publish_run(self.objects, invalid)
@@ -563,8 +676,91 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(result.ingested, 1, result.as_record())
         self.assertEqual(len(result.failures), 1)
         self.assertEqual(
-            self.database.checkpoint("targeter-v3-incremental-date"), "2026-01-01"
+            self.database.checkpoint("targeter-v3-incremental-date"), "2026-01-02"
         )
+        self.assertEqual(self.database.sync_failure_count(), 1)
+
+    def test_malformed_manifest_key_isolated_from_valid_discovery(self) -> None:
+        _publish_run(self.objects, _empty_report(R1, G1))
+        _put(
+            self.objects,
+            "targeter-v2/runs/date=2026-01-01/run=malformed/run_manifest.json",
+            b"{}\n",
+        )
+
+        result = UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(result.failure_count, 1)
+        self.assertEqual(self.database.status()["sync"]["pending_failures"], 1)
+
+    def test_later_runs_progress_while_failed_manifest_retries_are_bounded(self) -> None:
+        _publish_run(self.objects, _empty_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        bad_id = "20260101T010000.000000Z"
+        bad = _empty_report(bad_id, "2026-01-01T01:00:00Z")
+        bad["report_version"] = 2
+        _publish_run(self.objects, bad)
+        later_id = "20260102T010000.000000Z"
+        _publish_run(
+            self.objects,
+            _empty_report(later_id, "2026-01-02T01:00:00Z"),
+        )
+
+        result = UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 2, 2, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(self.database.checkpoint("targeter-v3-incremental-date"), "2026-01-02")
+        self.assertEqual(self.database.sync_failure_count(), 1)
+        runs, _more = self.database.list_runs()
+        self.assertIn(later_id, {run["run_id"] for run in runs})
+
+    def test_failed_manifest_uses_durable_exponential_backoff(self) -> None:
+        bad = _empty_report(R1, G1)
+        bad["report_version"] = 2
+        _publish_run(self.objects, bad)
+        sync = UniverseSync(self.database, self.objects)
+        first_at = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+        first = sync.sync(now=first_at)
+        deferred = sync.sync(
+            now=datetime(2026, 1, 1, 1, 0, 30, tzinfo=timezone.utc)
+        )
+        retry = sync.sync(
+            now=datetime(2026, 1, 1, 1, 1, 1, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(first.failure_count, 1)
+        self.assertEqual(deferred.failure_count, 0)
+        self.assertEqual(deferred.pending_failures, 1)
+        self.assertEqual(retry.failure_count, 1)
+        with sqlite3.connect(self.database.path) as connection:
+            attempts, delay_ns = connection.execute(
+                """SELECT attempts, next_retry_at_ns - last_failed_at_ns
+                   FROM universe_sync_failures"""
+            ).fetchone()
+        self.assertEqual(attempts, 2)
+        self.assertEqual(delay_ns, 120 * 1_000_000_000)
+
+    def test_bootstrap_walkback_has_explicit_budget(self) -> None:
+        for minute in range(BOOTSTRAP_RUN_BUDGET + 1):
+            run_id = f"20260101T{minute // 60:02d}{minute % 60:02d}00.000000Z"
+            generated = f"2026-01-01T{minute // 60:02d}:{minute % 60:02d}:00Z"
+            _publish_run(
+                self.objects,
+                _empty_report(run_id, generated, input_complete=False),
+            )
+
+        result = UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 2, tzinfo=timezone.utc)
+        )
+
+        self.assertTrue(result.bootstrap_exhausted)
+        self.assertEqual(result.ingested, BOOTSTRAP_RUN_BUDGET)
 
     def test_bounded_backfill_uses_report_without_selected_index(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1), compressed=True)
@@ -638,6 +834,58 @@ class EventUniverseTests(unittest.TestCase):
         )
         self.assertEqual(retry.ingested, 0)
         self.assertEqual(retry.skipped, 2)
+
+    def test_backfill_batches_checkpoints_and_resumes_after_progress_failure(self) -> None:
+        for run_id, generated_at in ((R1, G1), (R2, G2), (R3, G3)):
+            _publish_run(self.objects, _empty_report(run_id, generated_at))
+        progress: list[dict] = []
+
+        def interrupt(record: dict) -> None:
+            progress.append(record)
+            raise RuntimeError("simulated scheduler interruption")
+
+        with self.assertRaisesRegex(RuntimeError, "scheduler interruption"):
+            backfill_targeter_history(
+                objects=self.objects,
+                database=self.database,
+                generated_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                generated_end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                batch_size=1,
+                progress=interrupt,
+            )
+        self.assertEqual(progress[0]["processed"], 1)
+
+        resumed: list[dict] = []
+        result = backfill_targeter_history(
+            objects=self.objects,
+            database=self.database,
+            generated_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            generated_end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            batch_size=1,
+            progress=resumed.append,
+        )
+        self.assertEqual(result.ingested, 2, result.as_record())
+        self.assertTrue(result.completed)
+        self.assertEqual([row["processed"] for row in resumed], [1, 1])
+        self.assertEqual(self.database.status()["counts"]["targeter_runs"], 3)
+
+    def test_backfill_completion_is_scoped_to_its_requested_date_partitions(self) -> None:
+        _publish_run(self.objects, _empty_report(R1, G1))
+        self.database.record_sync_failure(
+            "targeter-v2/runs/date=2025-12-01/run=malformed/run_manifest.json",
+            "outside configured rebuild range",
+            now_ns=0,
+        )
+
+        result = backfill_targeter_history(
+            objects=self.objects,
+            database=self.database,
+            generated_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            generated_end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.pending_failures, 1)
 
     def test_retained_selection_resolves_origin_outside_requested_range(self) -> None:
         origin = _publish_run(self.objects, _selection_report(R1, G1))
@@ -739,6 +987,89 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(incomplete["counts"]["selected_events"], 0)
         self.assertEqual(incomplete["selected_markets"], [])
 
+    def test_incomplete_candidates_do_not_create_universe_bindings(self) -> None:
+        _publish_run(
+            self.objects,
+            _selection_report(R1, G1, input_complete=False),
+        )
+        result = UniverseSync(self.database, self.objects).sync()
+        self.assertEqual(result.failures, [], result.as_record())
+        counts = self.database.status()["counts"]
+        for table in (
+            "umbrella_events",
+            "canonical_markets",
+            "venue_markets",
+            "relations",
+        ):
+            self.assertEqual(counts[table], 0, table)
+        detail = self.database.targeter_run_detail(R1)
+        assert detail is not None
+        self.assertEqual(detail["decisions"], [])
+
+    def test_activation_drift_is_recorded_without_changing_event_identity(self) -> None:
+        _publish_run(
+            self.objects,
+            _selection_report(R1, G1, activation_at="2026-01-01T03:00:00Z"),
+        )
+        _publish_run(
+            self.objects,
+            _selection_report(R2, G2, activation_at="2026-01-01T03:05:00Z"),
+        )
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.failures, [], result.as_record())
+        events, _more = self.database.list_events()
+        self.assertEqual(len(events), 1)
+        detail = self.database.event_detail(events[0]["event_id"])
+        assert detail is not None
+        self.assertEqual(detail["event"]["activation_at"], "2026-01-01T03:00:00Z")
+        self.assertEqual(
+            [row["observed_activation_at"] for row in detail["observations"]],
+            ["2026-01-01T03:00:00Z", "2026-01-01T03:05:00Z"],
+        )
+
+    def test_incomplete_run_cannot_poison_later_activation_observation(self) -> None:
+        _publish_run(
+            self.objects,
+            _selection_report(
+                R1,
+                G1,
+                input_complete=False,
+                activation_at="2026-01-01T03:00:00Z",
+            ),
+        )
+        _publish_run(
+            self.objects,
+            _selection_report(R2, G2, activation_at="2026-01-01T03:05:00Z"),
+        )
+
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result.failures, [], result.as_record())
+        events, _more = self.database.list_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["activation_at"], "2026-01-01T03:05:00Z")
+
+    def test_changed_exact_reference_set_preserves_native_binding_conflict(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        changed = _selection_report(R2, G2)
+        changed["candidates"][0]["event_refs"].append("limitless:event-c")
+        _publish_run(self.objects, changed)
+
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(result.failure_count, 1)
+        self.assertIn("assigned to a different umbrella event", result.failures[0])
+
     def test_run_history_is_not_truncated_and_cadence_route_is_removed(self) -> None:
         run_ids = []
         for minute in range(6):
@@ -812,7 +1143,7 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(len(detail["venue_events"]), 2)
         self.assertEqual(len(detail["relations"]), 1)
 
-    def test_cadence_status_is_compact_and_uses_newest_complete_run(self) -> None:
+    def test_targeter_status_is_compact_and_uses_newest_complete_run(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))
         _publish_run(self.objects, _empty_report(R2, G2, input_complete=False))
         self.assertEqual(
@@ -923,6 +1254,37 @@ class EventUniverseTests(unittest.TestCase):
                     )
                     connection.commit()
 
+    def test_event_detail_enforces_serialized_byte_budget(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute(
+                "UPDATE venue_events SET title = ?",
+                ("x" * 1_750_001,),
+            )
+        event_id = self.database.list_events()[0][0]["event_id"]
+        with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
+            self.database.event_detail(event_id)
+
+    def test_selection_context_enforces_every_child_row_bound(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        with sqlite3.connect(self.database.path) as connection:
+            context = connection.execute(
+                "SELECT context_sha256 FROM bundle_contexts"
+            ).fetchone()[0]
+            connection.executemany(
+                """INSERT INTO context_relationships(
+                       context_sha256, relationship_index, left_market,
+                       right_market, relationship, scope, left_venue,
+                       right_venue, coverage
+                   ) VALUES (?, ?, 'left', 'right', 'IDENTITY', 'series',
+                             'kalshi', 'polymarket', 'EXHAUSTIVE')""",
+                ((context, index) for index in range(1, 1001)),
+            )
+        with self.assertRaisesRegex(DetailTooLarge, "child-row limit"):
+            self.database.selection_detail(R1, "bundle-1")
+
     def test_list_events_pages_before_indexed_counts_and_counts_market_versions(
         self,
     ) -> None:
@@ -1028,9 +1390,9 @@ class EventUniverseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     application.get(path)
 
-    def test_fresh_database_uses_market_universe_schema_v3(self) -> None:
+    def test_fresh_database_uses_canonical_schema_v4(self) -> None:
         with sqlite3.connect(self.database.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -1055,26 +1417,30 @@ class EventUniverseTests(unittest.TestCase):
     def test_initialize_requires_wiping_pre_market_universe_database(self) -> None:
         legacy = self.root / "legacy.sqlite3"
         with sqlite3.connect(legacy) as connection:
-            connection.executescript(
-                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
-            )
+            connection.execute("CREATE TABLE legacy_state (value TEXT)")
             connection.execute("PRAGMA user_version = 1")
-        with self.assertRaisesRegex(EvidenceConflict, "remove the rebuildable SQLite"):
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
             UniverseStore(legacy).initialize()
 
-    def test_initialize_rejects_modified_v3_schema(self) -> None:
-        malformed = self.root / "malformed-v3.sqlite3"
-        with sqlite3.connect(malformed) as connection:
-            connection.executescript(
-                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
-            )
-            connection.executescript(
-                (Path(__file__).parents[1] / "universe/schema/v3.sql").read_text()
-            )
-            connection.execute("DROP INDEX relation_members_market")
+    def test_initialize_rejects_v3_schema_with_rebuild_instruction(self) -> None:
+        previous = self.root / "schema-v3.sqlite3"
+        with sqlite3.connect(previous) as connection:
+            connection.execute("CREATE TABLE previous_state (value TEXT)")
             connection.execute("PRAGMA user_version = 3")
-        with self.assertRaisesRegex(EvidenceConflict, "invalid Event Universe v3"):
-            UniverseStore(malformed).initialize()
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
+            UniverseStore(previous).initialize()
+
+    def test_initialize_rejects_modified_v4_with_rebuild_instruction(self) -> None:
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("CREATE TABLE unexpected_state (value TEXT)")
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
+            self.database.initialize()
 
     def test_market_projection_rejects_non_finite_selection_evidence(self) -> None:
         report = _selection_report(R1, G1)
@@ -1309,6 +1675,23 @@ class EventUniverseTests(unittest.TestCase):
         digest, length = file_sha256(backup)
         self.assertEqual(len(digest), 64)
         self.assertGreater(length, 0)
+
+    def test_stale_retrieval_cleanup_keeps_live_process_directories(self) -> None:
+        stale = self.root / "archive-retrieval-999999-dead"
+        live = self.root / f"archive-json-{os.getpid()}-live"
+        stale.mkdir()
+        live.mkdir()
+        old = time.time() - 25 * 60 * 60
+        os.utime(stale, (old, old))
+        os.utime(live, (old, old))
+
+        removed = cleanup_stale_retrieval_directories(
+            self.root, older_than_seconds=24 * 60 * 60
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(stale.exists())
+        self.assertTrue(live.exists())
 
     def test_config_has_explicit_optional_backfill_range(self) -> None:
         path = self.root / "event-universe.json"

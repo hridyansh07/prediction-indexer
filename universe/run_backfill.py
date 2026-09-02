@@ -29,9 +29,18 @@ def main() -> int:
         generated_start=config.backfill.generated_start,
         generated_end=config.backfill.generated_end,
         temporary_directory=config.temporary_directory,
+        progress=lambda record: print(
+            json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True
+        ),
     )
-    print(json.dumps(result.as_record(), ensure_ascii=False, sort_keys=True))
-    return 1 if result.failures else 0
+    print(
+        json.dumps(
+            {"type": "backfill_summary", **result.as_record()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if result.completed and result.failure_count == 0 else 1
 
 
 if __name__ == "__main__":

@@ -42,16 +42,28 @@ All object access is provider-neutral:
   archive/encoder packages.
 
 Universe does not implement S3/GCS reads, checksums, private staging, Zstandard
-decoding, or JSON-size enforcement. Selection reports are capped at 128 MiB
-decoded and each normalized NDJSON artifact at 256 MiB decoded.
+decoding, or JSON-size enforcement. Selection reports and the combined selected
+normalized catalogue artifacts are each capped at 128 MiB decoded per run.
 
 ## 3. Canonical identity
 
 An umbrella event ID is a deterministic digest of sport, optional game and
-topology, sorted participant keys, and activation time. It never includes a
-venue ID. Venue-native identities are `(venue, venue_event_id)` and
-`(venue, venue_market_id)`; this contract assumes each pair is globally unique
-and never reused by its venue.
+topology, sorted participant keys, and the complete sorted set of native event
+references `(venue, venue_event_id)`. Activation time is deliberately excluded:
+catalogues can revise it without changing the event. Each run records its
+observed activation in `event_observations`; the umbrella row exposes the
+chronologically first observation as its canonical display/sort value.
+
+The exact reference set is identity, not an incrementally merged alias set.
+Adding or removing a venue reference therefore produces a distinct umbrella
+ID. If either set reuses a native reference already bound to the other ID,
+ingestion fails closed. Venue-native event and market identities are assumed to
+be globally unique and never reused by their venue.
+
+The earlier selected-bundle V1 contract treated activation as versioned bundle
+context, not as a cross-run umbrella identity. Activation entered the new
+normalized identity when schema v3 was introduced; this contract corrects that
+drift while retaining every observed value for audit.
 
 A canonical market ID is a deterministic digest of:
 
@@ -98,17 +110,16 @@ not represented as an exact event end.
 
 ## 6. SQLite schema and rebuild
 
-Runtime schema version is 3 and is composed from:
+Runtime schema version is 4 and is initialized from one canonical resource:
 
 ```text
-universe/schema/v1.sql  # historical bundle APIs and source identities
-universe/schema/v3.sql  # event/market universe
+universe/schema/schema.sql
 ```
 
-Schema v3 intentionally has no in-place migration. Before deploying this
+Schema v4 intentionally has no in-place migration. Before deploying this
 version, stop Universe jobs and remove the existing rebuildable SQLite database
-(including its WAL/SHM siblings), then run sync/backfill against the immutable
-archive. Starting against schema v1/v2 fails with a clear rebuild instruction.
+(including its WAL/SHM siblings), then run backfill against the immutable
+archive. Starting against schema v1/v2/v3 fails with a clear rebuild instruction.
 
 Each admitted run and both projections are inserted in one `BEGIN IMMEDIATE`
 transaction with foreign keys, WAL, and `synchronous=FULL`. A projection
@@ -118,13 +129,46 @@ online backup API followed by `integrity_check`.
 ## 7. Sync and backfill
 
 `universe/run_sync.py` and `universe/run_backfill.py` are scheduler-owned
-one-shot jobs. Incremental sync continues after an independently bad manifest
-and keeps its checkpoint at the earliest failed date for retry. Backfill uses
-the configured half-open generated-time range. Origin dependencies may be
-ingested outside that range when required to prove continuity.
+one-shot jobs. Incremental sync advances a high-water date independently of bad
+manifests. Failures live in a durable retry ledger with capped exponential
+backoff (at most one day) and a 32-item retry budget per invocation, so one
+systematic corruption remains visible without forcing unbounded date rescans or
+blocking later runs. Malformed listed keys are isolated into the same ledger.
 
-Incomplete and complete-empty runs remain visible but create no selection
-rows. The archive remains sufficient to rebuild all SQLite state.
+Fresh-database bootstrap walks backward at most 144 valid manifests looking for
+the newest complete run. Exhausting that budget is an explicit failed/degraded
+result; full history comes from backfill, never from an unbounded bootstrap.
+
+Backfill uses the configured half-open generated-time range, processes 100-run
+batches, emits one progress record per batch, and checkpoints each committed
+batch in SQLite. Restarting the same range resumes after its durable cursor.
+Origin dependencies may be ingested outside that range when required to prove
+continuity. Backfill has an independent range checkpoint, so running an initial
+incremental sync cannot make older configured history unreachable.
+
+Incomplete and complete-empty runs remain visible. Incomplete runs create no
+event, venue-event, market, venue-market, candidate-decision, relationship, or
+lifecycle rows; their partial catalogue cannot claim an immutable native
+binding. A complete-empty run naturally creates none of those rows either.
+
+Only catalogue artifacts for venues referenced by complete-run candidates are
+retrieved. Their complete stored/logical identities and line counts are still
+verified, but only referenced rows are retained in memory and validated as
+trusted projection input. Unreferenced object rows do not enlarge the SQL
+projection or its validation blast radius. Invalid NDJSON framing/JSON still
+rejects the containing referenced artifact because no row identity can safely
+be established.
+
+The selected normalized artifacts for one run are capped at 128 MiB decoded,
+with a warning at 96 MiB; an NDJSON row is capped at 4 MiB and a report at
+100,000 catalogue references. The selection report remains capped at 128 MiB.
+This supersedes the ineffective former combination of a 256 MiB per-artifact
+limit and a 128 MiB per-run limit.
+
+The immutable ObjectStore remains sufficient to rebuild all SQLite state and is
+the retention authority. Universe does not automatically prune runs or apply a
+rolling horizon. A built database preserves all history it has indexed; future
+historical truncation would be a separate product/API contract.
 
 ## 8. Read API
 

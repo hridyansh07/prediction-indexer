@@ -24,7 +24,7 @@ def main() -> int:
         temporary_directory=config.temporary_directory,
     ).sync()
     print(json.dumps(result.as_record(), ensure_ascii=False, sort_keys=True))
-    return 1 if result.failures else 0
+    return 1 if result.failure_count or result.pending_failures else 0
 
 
 if __name__ == "__main__":

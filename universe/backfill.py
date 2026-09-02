@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 from archive.storage.base import ObjectStore
 from universe.store import UniverseStore
@@ -17,10 +18,17 @@ def backfill_targeter_history(
     generated_start: datetime,
     generated_end: datetime,
     temporary_directory: Path | None = None,
+    batch_size: int = 100,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> SyncResult:
-    """Index committed runs in the half-open generated-time range."""
+    """Checkpoint and batch committed runs in the half-open generated-time range."""
     return UniverseSync(
         database,
         objects,
         temporary_directory=temporary_directory,
-    ).sync_range(generated_start, generated_end)
+    ).backfill_range(
+        generated_start,
+        generated_end,
+        batch_size=batch_size,
+        progress=progress,
+    )
