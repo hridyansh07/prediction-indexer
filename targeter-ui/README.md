@@ -33,8 +33,11 @@ The targets and decisions views resolve the newest complete run through:
 GET /api/event-universe/v1/targeter/status?limit=5
 ```
 
-The browser deduplicates in-flight requests and caches status briefly; immutable
-run, bundle, selection, and history responses are cached for five minutes.
+TanStack React Query deduplicates in-flight browser requests. Status is fresh for
+15 seconds and polls every minute; immutable run, bundle, selection, and history
+responses are fresh for five minutes. Inactive list/run queries are garbage
+collected after five minutes, while drawer-only details are discarded as soon as
+the drawer closes. Nothing is persisted to browser storage.
 
 Refreshes are GET-only. The status response contains only card state and the
 current complete target summary. Current targets and decisions fetch the full
@@ -53,11 +56,10 @@ remains explicitly unverified. The UI uses the server's semantic counts and
 never reinterprets raw Targeter reports.
 
 History pages through grouped bundle summaries from `GET /v1/bundles`, retaining
-only one 100-row page, then loads the latest immutable detail and occurrence
+at most eight 100-row pages, then loads the latest immutable detail and occurrence
 timeline only when a bundle opens. Targets and decisions render at most 100 rows
-per client-side page. Browser and function caches retain at most eight bounded
-responses; the browser does not cache full event details after their drawer
-closes.
+per client-side page. Full event and bundle drawer details are not retained after
+their drawer closes.
 
 ## Routes
 

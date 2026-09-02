@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import {
   BrowserRouter,
@@ -7,35 +8,14 @@ import {
   Route,
   Routes,
 } from 'react-router-dom';
-import type { UniverseTargeterStatus } from '../event-universe';
 import { EventUniversePage } from './event-universe';
 import { DecisionsPage, TargetsPage } from './observability';
-import { universeGet } from './universe-api';
+import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
+const queryClient = createUniverseQueryClient();
+
 function App() {
-  const [status, setStatus] = useState<UniverseTargeterStatus | null>(null);
-  const [statusError, setStatusError] = useState('');
-
-  const refresh = useCallback(async () => {
-    try {
-      setStatus(
-        await universeGet<UniverseTargeterStatus>(
-          '/v1/targeter/status?limit=5',
-        ),
-      );
-      setStatusError('');
-    } catch {
-      setStatusError('Targeter status is unavailable.');
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    const interval = window.setInterval(() => void refresh(), 60_000);
-    return () => window.clearInterval(interval);
-  }, [refresh]);
-
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -59,16 +39,10 @@ function App() {
       </header>
       <main>
         <Routes>
-          <Route
-            path="/"
-            element={<TargetsPage status={status} error={statusError} />}
-          />
+          <Route path="/" element={<TargetsPage />} />
           <Route path="/targets" element={<Navigate to="/" replace />} />
           <Route path="/history" element={<EventUniversePage />} />
-          <Route
-            path="/decisions"
-            element={<DecisionsPage status={status} error={statusError} />}
-          />
+          <Route path="/decisions" element={<DecisionsPage />} />
           <Route path="/operations" element={<Navigate to="/" replace />} />
           <Route
             path="/operations/selections"
@@ -92,8 +66,10 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <BrowserRouter>
-      <App />
-    </BrowserRouter>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    </QueryClientProvider>
   </React.StrictMode>,
 );

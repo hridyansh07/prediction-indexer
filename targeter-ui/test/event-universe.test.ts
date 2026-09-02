@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { InfiniteQueryObserver, QueryObserver } from '@tanstack/react-query';
 import express from 'express';
 import {
   createEventUniverseRouter,
@@ -16,7 +17,15 @@ import {
   retirementExplanation,
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
-import { universeGet } from '../src/client/universe-api.js';
+import {
+  bundlesQuery,
+  createUniverseQueryClient,
+  eventDetailQuery,
+  MAX_BUNDLE_PAGES,
+  QUERY_GC_MS,
+  targeterRunQuery,
+  universeKeys,
+} from '../src/client/universe-queries.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
   UniverseRun,
@@ -740,13 +749,17 @@ test('relation detail accepts an empty claim key but rejects schema drift', asyn
 });
 
 test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
-  const [source, historySource] = await Promise.all([
+  const [source, historySource, querySource] = await Promise.all([
     readFile(
       new URL('../src/client/observability.tsx', import.meta.url),
       'utf8',
     ),
     readFile(
       new URL('../src/client/event-universe.tsx', import.meta.url),
+      'utf8',
+    ),
+    readFile(
+      new URL('../src/client/universe-queries.ts', import.meta.url),
       'utf8',
     ),
   ]);
@@ -762,7 +775,8 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   );
   assert.match(source, /opener\.current\?\.focus\(\)/);
   assert.doesNotMatch(historySource, /do \{|loadAllBundles/);
-  assert.match(historySource, /limit: '100'/);
+  assert.match(querySource, /BUNDLE_PAGE_SIZE = 100/);
+  assert.match(querySource, /enabled: Boolean\(eventId\)/);
 
   const records = Array.from({ length: 1000 }, (_, index) => index);
   const first = boundedRenderPage(records, 0);
@@ -817,59 +831,194 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   }
 });
 
-test('browser caching is bounded and does not retain event details', async () => {
-  const originalFetch = globalThis.fetch;
-  const requests: string[] = [];
-  globalThis.fetch = (async (input) => {
-    requests.push(String(input));
-    return json({ ok: true });
-  }) as typeof fetch;
-  try {
-    for (let index = 0; index < 9; index++)
-      await universeGet(`/bounded-cache-${index}`);
-    await universeGet('/bounded-cache-0');
-    assert.equal(requests.length, 10, 'the oldest of nine entries was evicted');
+test('query keys are stable, typed by endpoint, and independent', () => {
+  assert.deepEqual(universeKeys.status(5), universeKeys.status(5));
+  assert.deepEqual(universeKeys.bundles(100), [
+    'event-universe',
+    'bundles',
+    { limit: 100 },
+  ]);
+  assert.notDeepEqual(universeKeys.status(5), universeKeys.status(4));
+  assert.notDeepEqual(
+    universeKeys.targeterRun('run-a'),
+    universeKeys.targeterRun('run-b'),
+  );
+  assert.notDeepEqual(
+    universeKeys.event('event-a'),
+    universeKeys.selection('run-a', 'event-a'),
+  );
+  const client = createUniverseQueryClient();
+  assert.equal(client.getDefaultOptions().queries?.gcTime, QUERY_GC_MS);
+  assert.equal(eventDetailQuery('event-a').gcTime, 0);
+  assert.equal(bundlesQuery().maxPages, MAX_BUNDLE_PAGES);
+  client.clear();
+});
 
-    await universeGet('/v1/events/detail-not-cached');
-    await universeGet('/v1/events/detail-not-cached');
+test('React Query deduplicates requests and retries one failed attempt', async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  let release: (() => void) | undefined;
+  globalThis.fetch = (async () => {
+    requests++;
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return json(normalizedRun());
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  try {
+    const first = client.fetchQuery(targeterRunQuery('run-a'));
+    const second = client.fetchQuery(targeterRunQuery('run-a'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(requests, 1);
+    release?.();
+    assert.deepEqual(await first, await second);
+  } finally {
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+
+  let attempts = 0;
+  globalThis.fetch = (async () => {
+    attempts++;
+    return attempts === 1
+      ? json({ error: 'temporary' }, { status: 503 })
+      : json(normalizedRun());
+  }) as typeof fetch;
+  const retryingClient = createUniverseQueryClient();
+  retryingClient.setDefaultOptions({
+    queries: { gcTime: 300_000, retry: 1, retryDelay: 0 },
+  });
+  try {
     assert.equal(
-      requests.filter((path) => path.endsWith('/v1/events/detail-not-cached'))
-        .length,
-      2,
+      (await retryingClient.fetchQuery(targeterRunQuery('run-retry'))).run
+        .run_id,
+      run().run_id,
+    );
+    assert.equal(attempts, 2);
+
+    attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts++;
+      return json({ error: 'still unavailable' }, { status: 503 });
+    }) as typeof fetch;
+    await assert.rejects(() =>
+      retryingClient.fetchQuery(targeterRunQuery('run-error')),
+    );
+    assert.equal(attempts, 2);
+    assert.equal(
+      retryingClient.getQueryState(universeKeys.targeterRun('run-error'))
+        ?.status,
+      'error',
     );
   } finally {
+    retryingClient.clear();
     globalThis.fetch = originalFetch;
   }
 });
 
-test('signal-bound browser requests are never reused after abort', async () => {
+test('query cancellation aborts the supplied request signal', async () => {
   const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = ((input, init) => {
-    calls++;
-    if (calls === 1)
-      return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () =>
-          reject(new DOMException('aborted', 'AbortError')),
-        );
+  let aborted = false;
+  globalThis.fetch = ((_input, init) => {
+    return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        aborted = true;
+        reject(new DOMException('aborted', 'AbortError'));
       });
-    return Promise.resolve(json({ second: true }));
-  }) as typeof fetch;
-  try {
-    const firstController = new AbortController();
-    const first = universeGet('/retry-after-abort', {
-      signal: firstController.signal,
-      cache: false,
     });
-    firstController.abort();
-    await assert.rejects(first);
-    const second = await universeGet<{ second: boolean }>(
-      '/retry-after-abort',
-      { cache: false },
-    );
-    assert.equal(second.second, true);
-    assert.equal(calls, 2);
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  try {
+    const request = client.fetchQuery(eventDetailQuery('event-a'));
+    await client.cancelQueries({ queryKey: universeKeys.event('event-a') });
+    await assert.rejects(request);
+    assert.equal(aborted, true);
   } finally {
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('switching detail observers aborts stale data and exposes only the new key', async () => {
+  const originalFetch = globalThis.fetch;
+  let firstAborted = false;
+  globalThis.fetch = ((input, init) => {
+    const eventId = String(input).split('/').at(-1);
+    if (eventId === 'event-a')
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          firstAborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    return Promise.resolve(
+      json({
+        ...normalizedEvent(),
+        event: { ...normalizedEvent().event, event_id: eventId },
+      }),
+    );
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  const observer = new QueryObserver(client, eventDetailQuery('event-a'));
+  const observed: string[] = [];
+  const unsubscribe = observer.subscribe((result) => {
+    if (result.data) observed.push(result.data.event.event_id);
+  });
+  try {
+    observer.setOptions(eventDetailQuery('event-b'));
+    const result = await observer.refetch();
+    assert.equal(result.data?.event.event_id, 'event-b');
+    assert.equal(firstAborted, true);
+    assert.deepEqual(observed, ['event-b']);
+  } finally {
+    unsubscribe();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(client.getQueryData(universeKeys.event('event-b')), undefined);
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('bundle infinite query preserves opaque cursors and bounds retained pages', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = (async (input) => {
+    const url = new URL(String(input), 'https://ui.example');
+    requested.push(url.searchParams.get('cursor') ?? 'first');
+    const page = requested.length;
+    return json({
+      bundles: [],
+      next_cursor: page <= MAX_BUNDLE_PAGES ? `opaque-${page}` : null,
+    });
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  const observer = new InfiniteQueryObserver(client, bundlesQuery());
+  try {
+    await observer.refetch();
+    for (let page = 1; page <= MAX_BUNDLE_PAGES; page++)
+      await observer.fetchNextPage();
+    const result = observer.getCurrentResult();
+    assert.equal(result.data?.pages.length, MAX_BUNDLE_PAGES);
+    assert.deepEqual(requested, [
+      'first',
+      ...Array.from(
+        { length: MAX_BUNDLE_PAGES },
+        (_, index) => `opaque-${index + 1}`,
+      ),
+    ]);
+    assert.deepEqual(result.data?.pageParams, [
+      'opaque-1',
+      'opaque-2',
+      'opaque-3',
+      'opaque-4',
+      'opaque-5',
+      'opaque-6',
+      'opaque-7',
+      'opaque-8',
+    ]);
+  } finally {
+    client.clear();
     globalThis.fetch = originalFetch;
   }
 });
@@ -1023,11 +1172,15 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
 });
 
 test('live routes use the Universe proxy without cadence or archive dependencies', async () => {
-  const [client, apiClient, server, proxy, packageDocument] = await Promise.all(
-    [
+  const [client, apiClient, queryClient, server, proxy, packageDocument] =
+    await Promise.all([
       readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
       readFile(
         new URL('../src/client/universe-api.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(
+        new URL('../src/client/universe-queries.ts', import.meta.url),
         'utf8',
       ),
       readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
@@ -1036,10 +1189,10 @@ test('live routes use the Universe proxy without cadence or archive dependencies
         'utf8',
       ),
       readFile(new URL('../package.json', import.meta.url), 'utf8'),
-    ],
-  );
-  assert.match(client, /universeGet<UniverseTargeterStatus>/);
-  assert.match(client, /\/v1\/targeter\/status\?limit=5/);
+    ]);
+  assert.match(client, /QueryClientProvider client={queryClient}/);
+  assert.match(queryClient, /universeGet<UniverseTargeterStatus>/);
+  assert.match(queryClient, /\/v1\/targeter\/status\?limit=\$\{limit\}/);
   assert.match(client, /path="\/"[\s\S]*<TargetsPage/);
   assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
   assert.doesNotMatch(client, /StatusPage|>Status</);
