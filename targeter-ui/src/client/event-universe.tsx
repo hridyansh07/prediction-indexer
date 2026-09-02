@@ -1,22 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type {
-  UniverseBundle,
-  UniverseBundlePage,
-  UniverseSelection,
-  UniverseSelectionDetail,
-  UniverseSelectionPage,
-} from '../event-universe';
+import React, { useMemo, useRef, useState } from 'react';
+import type { UniverseBundle } from '../event-universe';
 import { EventIcon, gameName, SearchIcon, VenueStack, Chevron } from './icons';
 import { BundleDrawer, MobileDetailNotice } from './observability';
-import { universeGet } from './universe-api';
+import {
+  useBundleHistory,
+  useBundles,
+  useSelectionDetail,
+} from './universe-queries';
 
-const CURSOR_HISTORY_LIMIT = 8;
-
-async function loadBundles(cursor: string | null) {
-  const query = new URLSearchParams({ limit: '100' });
-  if (cursor) query.set('cursor', cursor);
-  return universeGet<UniverseBundlePage>(`/v1/bundles?${query}`);
-}
+const EMPTY_BUNDLES: UniverseBundle[] = [];
 
 const displayDate = (value: string) =>
   new Date(value).toLocaleDateString(undefined, {
@@ -26,52 +18,31 @@ const displayDate = (value: string) =>
   });
 
 export function EventUniversePage() {
-  const [bundles, setBundles] = useState<UniverseBundle[]>([]);
+  const bundlePages = useBundles();
+  const [pageIndex, setPageIndex] = useState(0);
+  const pages = bundlePages.data?.pages ?? [];
+  const bundles = pages[pageIndex]?.bundles ?? EMPTY_BUNDLES;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'active' | 'retired'>(
     'all',
   );
   const [event, setEvent] = useState('');
-  const [detail, setDetail] = useState<UniverseSelectionDetail | null>(null);
-  const [history, setHistory] = useState<UniverseSelection[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [previousCursors, setPreviousCursors] = useState<Array<string | null>>(
-    [],
+  const [selectedBundle, setSelectedBundle] = useState<UniverseBundle | null>(
+    null,
   );
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
-  const detailRequest = useRef<AbortController | null>(null);
-  const detailRequestId = useRef(0);
   const opener = useRef<HTMLElement | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    setError('');
-    void loadBundles(cursor)
-      .then((page) => {
-        if (!active) return;
-        setBundles(page.bundles);
-        setNextCursor(page.next_cursor);
-      })
-      .catch(() => setError('Historical bundle summaries are unavailable.'))
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [cursor]);
-
-  useEffect(
-    () => () => {
-      detailRequest.current?.abort();
-      detailRequest.current = null;
-    },
-    [],
+  const detail = useSelectionDetail(
+    selectedBundle?.latest_run_id ?? null,
+    selectedBundle?.bundle_id ?? null,
   );
+  const history = useBundleHistory(selectedBundle?.bundle_id ?? null);
+  const loading = bundlePages.isPending;
+  const listError =
+    bundlePages.isError || bundlePages.isFetchNextPageError
+      ? 'Historical bundle summaries are unavailable.'
+      : '';
+  const detailError = detail.isError || history.isError;
 
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
@@ -91,41 +62,7 @@ export function EventUniversePage() {
       (!event || event === (bundle.game ?? bundle.sport)),
   );
 
-  const open = async (bundle: UniverseBundle) => {
-    detailRequest.current?.abort();
-    const controller = new AbortController();
-    detailRequest.current = controller;
-    const requestId = ++detailRequestId.current;
-    setError('');
-    setDetail(null);
-    setHistory([]);
-    try {
-      const bundleId = encodeURIComponent(bundle.bundle_id);
-      const [nextDetail, historyPage] = await Promise.all([
-        universeGet<UniverseSelectionDetail>(
-          `/v1/runs/${encodeURIComponent(bundle.latest_run_id)}/selections/${bundleId}`,
-          { signal: controller.signal, cache: false },
-        ),
-        universeGet<UniverseSelectionPage>(
-          `/v1/bundles/${bundleId}/history?sort=selected&limit=100`,
-          { signal: controller.signal, cache: false },
-        ),
-      ]);
-      if (requestId !== detailRequestId.current) return;
-      setDetail(nextDetail);
-      setHistory(historyPage.selections);
-    } catch {
-      if (!controller.signal.aborted && requestId === detailRequestId.current)
-        setError('Bundle detail is unavailable.');
-    }
-  };
-
-  const closeDetail = () => {
-    detailRequest.current?.abort();
-    detailRequest.current = null;
-    ++detailRequestId.current;
-    setDetail(null);
-  };
+  const closeDetail = () => setSelectedBundle(null);
 
   return (
     <div className="desktop-page history-page">
@@ -182,9 +119,9 @@ export function EventUniversePage() {
           ))}
         </div>
       </div>
-      {error && (
+      {listError && (
         <div className="error-state" role="alert">
-          {error}
+          {listError}
         </div>
       )}
       {loading ? (
@@ -204,7 +141,7 @@ export function EventUniversePage() {
               key={bundle.bundle_id}
               onClick={(event) => {
                 opener.current = event.currentTarget;
-                void open(bundle);
+                setSelectedBundle(bundle);
               }}
             >
               <span className="event-cell">
@@ -234,40 +171,59 @@ export function EventUniversePage() {
           No historical bundles match these controls.
         </div>
       )}
-      {!loading && (previousCursors.length > 0 || nextCursor) && (
-        <nav className="result-pagination" aria-label="Bundle pages">
-          <button
-            className="quiet-button"
-            disabled={!previousCursors.length}
-            onClick={() => {
-              const previous = previousCursors.at(-1) ?? null;
-              setPreviousCursors((values) => values.slice(0, -1));
-              setCursor(previous);
-              setPageNumber((value) => Math.max(1, value - 1));
-            }}
-          >
-            Previous
-          </button>
-          <span aria-live="polite">Page {pageNumber}</span>
-          <button
-            className="quiet-button"
-            disabled={!nextCursor}
-            onClick={() => {
-              if (!nextCursor) return;
-              setPreviousCursors((values) =>
-                [...values, cursor].slice(-CURSOR_HISTORY_LIMIT),
-              );
-              setCursor(nextCursor);
-              setPageNumber((value) => value + 1);
-            }}
-          >
-            Next
-          </button>
-        </nav>
+      {!loading &&
+        (pageIndex > 0 ||
+          pageIndex + 1 < pages.length ||
+          Boolean(pages.at(-1)?.next_cursor)) && (
+          <nav className="result-pagination" aria-label="Bundle pages">
+            <button
+              className="quiet-button"
+              disabled={pageIndex === 0}
+              onClick={() => {
+                setPageIndex((value) => Math.max(0, value - 1));
+                setPageNumber((value) => Math.max(1, value - 1));
+              }}
+            >
+              Previous
+            </button>
+            <span aria-live="polite">Page {pageNumber}</span>
+            <button
+              className="quiet-button"
+              disabled={
+                bundlePages.isFetchingNextPage ||
+                (pageIndex + 1 === pages.length && !bundlePages.hasNextPage)
+              }
+              onClick={async () => {
+                if (pageIndex + 1 < pages.length) {
+                  setPageIndex((value) => value + 1);
+                  setPageNumber((value) => value + 1);
+                  return;
+                }
+                const result = await bundlePages.fetchNextPage();
+                if (!result.data || result.isError) return;
+                setPageIndex((value) =>
+                  Math.min(value + 1, result.data.pages.length - 1),
+                );
+                setPageNumber((value) => value + 1);
+              }}
+            >
+              {bundlePages.isFetchingNextPage ? 'Loading…' : 'Next'}
+            </button>
+          </nav>
+        )}
+      {detailError && (
+        <div className="error-state" role="alert">
+          Bundle detail is unavailable.
+        </div>
+      )}
+      {selectedBundle && (detail.isPending || history.isPending) && (
+        <div className="empty-state" role="status">
+          Loading bundle detail…
+        </div>
       )}
       <BundleDrawer
-        detail={detail}
-        history={history}
+        detail={detail.data && history.data ? detail.data : null}
+        history={history.data?.selections ?? []}
         close={closeDetail}
         opener={opener}
       />

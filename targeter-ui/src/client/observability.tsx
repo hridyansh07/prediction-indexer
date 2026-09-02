@@ -6,12 +6,14 @@ import type {
   UniverseSelection,
   UniverseSelectionDetail,
   UniverseTargeterDecision,
-  UniverseTargeterRunDetail,
-  UniverseTargeterStatus,
 } from '../event-universe';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
 import { boundedRenderPage } from './event-universe-view-model';
-import { universeGet } from './universe-api';
+import {
+  useEventDetail,
+  useTargeterRun,
+  useTargeterStatus,
+} from './universe-queries';
 
 const date = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString() : 'Unavailable';
@@ -20,82 +22,6 @@ const label = (value: string | null | undefined) =>
   value
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
-
-async function loadTargeterRun(
-  runId: string,
-): Promise<UniverseTargeterRunDetail> {
-  return universeGet<UniverseTargeterRunDetail>(
-    `/v1/targeter/runs/${encodeURIComponent(runId)}`,
-  );
-}
-
-function useTargeterRun(runId: string | null) {
-  const [run, setRun] = useState<UniverseTargeterRunDetail | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(Boolean(runId));
-  useEffect(() => {
-    if (!runId) {
-      setRun(null);
-      setLoading(false);
-      return;
-    }
-    let active = true;
-    setRun(null);
-    setError('');
-    setLoading(true);
-    void loadTargeterRun(runId)
-      .then((nextRun) => {
-        if (active) setRun(nextRun);
-      })
-      .catch(() => {
-        if (active) setError('Targeter run diagnostics are unavailable.');
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [runId]);
-  return { run, error, loading };
-}
-
-function useEventDetail(eventId: string | null) {
-  const [detail, setDetail] = useState<UniverseEventDetail | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
-    if (!eventId) {
-      setDetail(null);
-      setError('');
-      setLoading(false);
-      return;
-    }
-    let active = true;
-    const controller = new AbortController();
-    setDetail(null);
-    setError('');
-    setLoading(true);
-    void universeGet<UniverseEventDetail>(
-      `/v1/events/${encodeURIComponent(eventId)}`,
-      { signal: controller.signal, cache: false },
-    )
-      .then((nextDetail) => {
-        if (active) setDetail(nextDetail);
-      })
-      .catch(() => {
-        if (active) setError('Normalized event detail is unavailable.');
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [eventId]);
-  return { detail, error, loading };
-}
 
 function useDrawerFocus(
   open: boolean,
@@ -261,16 +187,12 @@ interface TargetEventGroup {
   markets: UniverseSelectedMarket[];
 }
 
-export function TargetsPage({
-  status,
-  error,
-}: {
-  status: UniverseTargeterStatus | null;
-  error: string;
-}) {
+export function TargetsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
-  const run = loaded.run;
+  const run = loaded.data;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
@@ -322,10 +244,16 @@ export function TargetsPage({
   });
   const rendered = boundedRenderPage(shown, page);
   useEffect(() => setPage(0), [query, lifecycle, event, runId]);
-  if (loaded.loading || !run)
+  if (statusQuery.isPending || loaded.isPending || !run)
     return (
       <EmptyPage
-        error={error || loaded.error}
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
         loading="Loading the current complete target set…"
       />
     );
@@ -390,18 +318,18 @@ export function TargetsPage({
           No current targets match these controls.
         </div>
       )}
-      {selectedDetail.error && (
+      {selectedDetail.isError && (
         <div className="error-state" role="alert">
-          {selectedDetail.error}
+          Normalized event detail is unavailable.
         </div>
       )}
-      {detailId && selectedDetail.loading && (
+      {detailId && selectedDetail.isPending && (
         <div className="empty-state" role="status">
           Loading event detail…
         </div>
       )}
       <NormalizedTargetDrawer
-        detail={selectedDetail.detail}
+        detail={selectedDetail.data ?? null}
         markets={
           detailId
             ? (grouped.find(({ event }) => event?.event_id === detailId)
@@ -686,23 +614,25 @@ function MarketList({ detail }: { detail: UniverseSelectionDetail }) {
   );
 }
 
-export function DecisionsPage({
-  status,
-  error,
-}: {
-  status: UniverseTargeterStatus | null;
-  error: string;
-}) {
+export function DecisionsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
-  const run = loaded.run;
+  const run = loaded.data;
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
   useEffect(() => setPage(0), [query, runId]);
-  if (loaded.loading || !run)
+  if (statusQuery.isPending || loaded.isPending || !run)
     return (
       <EmptyPage
-        error={error || loaded.error}
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
         loading="Loading Targeter decisions…"
       />
     );
