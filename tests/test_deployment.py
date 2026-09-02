@@ -174,18 +174,33 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         history_schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(
             encoding="utf-8"
         )
-        market_schema = (ROOT / "universe" / "schema" / "v3.sql").read_text(
+        market_schema = (ROOT / "universe" / "schema" / "v4.sql").read_text(
             encoding="utf-8"
         )
         self.assertIn("CREATE TABLE selection_occurrences", history_schema)
         self.assertIn("CREATE TABLE bundle_contexts", history_schema)
         self.assertIn("CREATE TABLE bundle_retirements", history_schema)
         self.assertIn("CREATE TABLE umbrella_events", market_schema)
+        self.assertIn("observed_activation_at", market_schema)
+        self.assertIn("CREATE TABLE universe_sync_failures", market_schema)
         self.assertIn("CREATE TABLE canonical_markets", market_schema)
         self.assertIn("CREATE TABLE relation_members", market_schema)
         self.assertNotIn("CREATE TABLE cadence_runs", market_schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
             self.assertNotIn(stale, history_schema + market_schema)
+
+    def test_universe_runbook_has_safe_bounded_rebuild_order(self) -> None:
+        deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        section = deployment.split("### Safe full rebuild ordering", 1)[1]
+        self.assertLess(section.index("event-universe-backfill"), section.index("event-universe-sync"))
+        for contract in (
+            "backfill_batch",
+            "range-specific SQLite checkpoint",
+            "144 runs",
+            "128 MiB/run",
+            "There is no automatic pruning",
+        ):
+            self.assertIn(contract, section)
 
     def test_orb_setup_creates_and_installs_the_project_virtual_environment(
         self,

@@ -1,6 +1,6 @@
 CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    projection_version INTEGER NOT NULL CHECK(projection_version = 1),
+    projection_version INTEGER NOT NULL CHECK(projection_version = 2),
     projection_sha256 TEXT NOT NULL,
     projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0)
 ) STRICT;
@@ -14,6 +14,7 @@ CREATE TABLE umbrella_events (
     activation_at_ns INTEGER NOT NULL,
     participants_json TEXT NOT NULL CHECK(json_valid(participants_json)),
     participant_keys_json TEXT NOT NULL CHECK(json_valid(participant_keys_json)),
+    event_refs_json TEXT NOT NULL CHECK(json_valid(event_refs_json)),
     first_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
     last_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id)
 ) STRICT;
@@ -24,8 +25,23 @@ CREATE TABLE event_observations (
     run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
     event_id TEXT NOT NULL REFERENCES umbrella_events(event_id),
     bundle_id TEXT NOT NULL,
+    observed_activation_at TEXT NOT NULL,
+    observed_activation_at_ns INTEGER NOT NULL,
     PRIMARY KEY(run_id, event_id, bundle_id)
 ) STRICT;
+CREATE INDEX event_observations_event_time
+    ON event_observations(event_id, observed_activation_at_ns, run_id, bundle_id);
+
+CREATE TABLE universe_sync_failures (
+    manifest_key TEXT PRIMARY KEY,
+    first_failed_at_ns INTEGER NOT NULL,
+    last_failed_at_ns INTEGER NOT NULL,
+    next_retry_at_ns INTEGER NOT NULL,
+    attempts INTEGER NOT NULL CHECK(attempts > 0),
+    error TEXT NOT NULL
+) STRICT;
+CREATE INDEX universe_sync_failures_retry
+    ON universe_sync_failures(next_retry_at_ns, manifest_key);
 
 -- Venue contracts are assumed to make (venue, venue_event_id) globally unique
 -- and non-reusable. The umbrella event association is therefore not part of

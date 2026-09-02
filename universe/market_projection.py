@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 
 from targeter.v2.models import isoformat, parse_timestamp
 
-MARKET_PROJECTION_VERSION = 1
+MARKET_PROJECTION_VERSION = 2
 MARKET_TEMPLATE_VERSION = 1
 OUTCOME_SPACE_VERSION = 1
 RELATION_GENERATION_VERSION = 1
@@ -40,10 +40,8 @@ def project_market_universe(
     version = root.get("strategy_version")
     if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
         raise MarketProjectionError("report.strategy_version must be a positive integer")
-
-    events_by_ref = _index_records(catalog_events, _event_ref, "catalogue event")
-    markets_by_id = _index_records(catalog_markets, _market_ref, "catalogue market")
-    templates = _index_records(rule_templates, _template_market_ref, "rule template")
+    if root["input_complete"] is False:
+        return _empty_projection(run_id, generated_at)
 
     selection = _mapping(root.get("selection"), "report.selection")
     selected_ids = _texts(selection.get("bundle_ids"), "selection.bundle_ids")
@@ -61,6 +59,42 @@ def project_market_universe(
         if bundle_id in by_bundle:
             raise MarketProjectionError(f"duplicate candidate bundle {bundle_id}")
         by_bundle[bundle_id] = candidate
+
+    required_event_refs = {
+        ref
+        for bundle_id, candidate in by_bundle.items()
+        for ref in _texts(
+            candidate.get("event_refs"), f"candidate {bundle_id} event_refs"
+        )
+    }
+    required_market_refs = {
+        ref
+        for bundle_id, candidate in by_bundle.items()
+        for ref in _texts(
+            candidate.get("market_ids"), f"candidate {bundle_id} market_ids"
+        )
+    }
+    events_by_ref = _index_records(
+        catalog_events,
+        _event_ref,
+        _raw_event_ref,
+        required_event_refs,
+        "catalogue event",
+    )
+    markets_by_id = _index_records(
+        catalog_markets,
+        _market_ref,
+        _raw_market_ref,
+        required_market_refs,
+        "catalogue market",
+    )
+    templates = _index_records(
+        rule_templates,
+        _template_market_ref,
+        _raw_template_ref,
+        required_market_refs,
+        "rule template",
+    )
 
     continuity = _mapping(root.get("continuity"), "report.continuity")
     retained_ids = _texts(
@@ -189,12 +223,17 @@ def _project_candidate(
     if len(participants) != 2 or len(participant_keys) != 2 or len(set(participant_keys)) != 2:
         raise MarketProjectionError(f"candidate {bundle_id} participants are invalid")
     activation_at = _time(candidate.get("activation_at"), f"candidate {bundle_id} activation_at")
+    event_refs = _texts(
+        candidate.get("event_refs"), f"candidate {bundle_id} event_refs"
+    )
+    _unique(event_refs, f"candidate {bundle_id} event_refs")
+    event_refs = sorted(event_refs)
     identity = {
         "sport": sport,
         "game": game,
         "topology": topology,
         "participant_keys": sorted(participant_keys),
-        "activation_at": activation_at,
+        "event_refs": event_refs,
     }
     event_id = "event:" + _digest(identity)[:32]
     _put_unique(
@@ -208,14 +247,11 @@ def _project_candidate(
             "activation_at": activation_at,
             "participants": participants,
             "participant_keys": sorted(participant_keys),
+            "event_refs": event_refs,
             "source_bundle_id": bundle_id,
         },
         "event",
     )
-    event_refs = _texts(
-        candidate.get("event_refs"), f"candidate {bundle_id} event_refs"
-    )
-    _unique(event_refs, f"candidate {bundle_id} event_refs")
     for ref in event_refs:
         source = events_by_ref.get(ref)
         if source is None:
@@ -355,7 +391,13 @@ def _project_candidate(
 
 def _retained_event(evidence: Mapping[str, Any], bundle_id: str) -> dict[str, Any] | None:
     """Use copied origin semantics when present; otherwise leave retention unresolved."""
-    required = ("sport", "participants", "participant_keys", "activation_at")
+    required = (
+        "sport",
+        "participants",
+        "participant_keys",
+        "activation_at",
+        "event_refs",
+    )
     if not all(field in evidence for field in required):
         return None
     sport = _text(evidence, "sport", f"continuity bundle {bundle_id}")
@@ -380,16 +422,21 @@ def _retained_event(evidence: Mapping[str, Any], bundle_id: str) -> dict[str, An
     activation_at = _time(
         evidence.get("activation_at"), f"continuity bundle {bundle_id} activation_at"
     )
+    event_refs = sorted(
+        _texts(evidence.get("event_refs"), f"continuity bundle {bundle_id} event_refs")
+    )
+    _unique(event_refs, f"continuity bundle {bundle_id} event_refs")
     identity = {
         "sport": sport,
         "game": game,
         "topology": topology,
         "participant_keys": sorted(participant_keys),
-        "activation_at": activation_at,
+        "event_refs": event_refs,
     }
     return {
         "event_id": "event:" + _digest(identity)[:32],
         **identity,
+        "activation_at": activation_at,
         "participants": participants,
         "source_bundle_id": bundle_id,
     }
@@ -560,17 +607,55 @@ def _member_key(value: Mapping[str, str]) -> tuple[str, str, str, str]:
 
 
 def _index_records(
-    values: Iterable[Mapping[str, Any]], key_fn: Any, label: str
+    values: Iterable[Mapping[str, Any]],
+    key_fn: Any,
+    raw_key_fn: Any,
+    required: set[str],
+    label: str,
 ) -> dict[str, Mapping[str, Any]]:
     output: dict[str, Mapping[str, Any]] = {}
     for value in values:
         row = _mapping(value, label)
+        if raw_key_fn(row) not in required:
+            continue
         key = key_fn(row)
         if key in output:
             raise MarketProjectionError(f"duplicate {label} {key}")
-        _finite(row, label)
         output[key] = row
     return output
+
+
+def _raw_event_ref(row: Mapping[str, Any]) -> str | None:
+    venue = row.get("venue")
+    identifier = row.get("venue_event_id")
+    if not isinstance(venue, str) or not isinstance(identifier, str):
+        return None
+    return f"{venue}:{identifier}"
+
+
+def _raw_market_ref(row: Mapping[str, Any]) -> str | None:
+    value = row.get("target_id")
+    return value if isinstance(value, str) else None
+
+
+def _raw_template_ref(row: Mapping[str, Any]) -> str | None:
+    value = row.get("market_id")
+    return value if isinstance(value, str) else None
+
+
+def _empty_projection(run_id: str, generated_at: str) -> dict[str, Any]:
+    return {
+        "projection_version": MARKET_PROJECTION_VERSION,
+        "run_id": run_id,
+        "generated_at": generated_at,
+        "events": [],
+        "venue_events": [],
+        "markets": [],
+        "venue_markets": [],
+        "decisions": [],
+        "selected_markets": [],
+        "relations": [],
+    }
 
 
 def _event_ref(row: Mapping[str, Any]) -> str:

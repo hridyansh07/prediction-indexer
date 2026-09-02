@@ -19,7 +19,7 @@ from targeter.v2.models import isoformat, parse_timestamp
 from universe.market_projection import MARKET_PROJECTION_VERSION
 from universe.projection import PROJECTION_VERSION
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STALE_AFTER_SECONDS = 3_600
 TARGETER_CADENCE_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
@@ -30,7 +30,7 @@ class DetailTooLarge(ValueError):
     """A detail document would require more child rows than the API permits."""
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
-SCHEMA_V3_PATH = Path(__file__).with_name("schema") / "v3.sql"
+SCHEMA_V4_PATH = Path(__file__).with_name("schema") / "v4.sql"
 
 
 class EvidenceConflict(ValueError):
@@ -49,11 +49,11 @@ class UniverseStore:
                 objects = self._schema_objects(connection)
                 if not objects:
                     self._execute_schema_transaction(
-                        connection, SCHEMA_PATH, SCHEMA_V3_PATH
+                        connection, SCHEMA_PATH, SCHEMA_V4_PATH
                     )
                 else:
                     raise EvidenceConflict(
-                        "Event Universe schema v3 requires a fresh database; "
+                        "Event Universe schema v4 requires a fresh database; "
                         "remove the rebuildable SQLite file and run sync"
                     )
             elif version != SCHEMA_VERSION:
@@ -85,9 +85,9 @@ class UniverseStore:
     @classmethod
     def _validate_schema(cls, connection: sqlite3.Connection) -> None:
         actual = cls._schema_objects(connection)
-        expected = cls._expected_schema(SCHEMA_PATH, SCHEMA_V3_PATH)
+        expected = cls._expected_schema(SCHEMA_PATH, SCHEMA_V4_PATH)
         if actual != expected:
-            raise EvidenceConflict("database contains an invalid Event Universe v3 schema")
+            raise EvidenceConflict("database contains an invalid Event Universe v4 schema")
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
@@ -157,6 +157,21 @@ class UniverseStore:
                           manifest_key, manifest_sha256
                    FROM targeter_runs
                    ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        record = _row_record(row)
+        record["input_complete"] = bool(record["input_complete"])
+        return record
+
+    def run_source(self, run_id: str) -> dict[str, Any] | None:
+        """Return source identity without constructing or auditing run detail."""
+        with closing(self.connect(readonly=True)) as connection:
+            row = connection.execute(
+                """SELECT run_id, input_complete, manifest_key, manifest_sha256,
+                          report_key, report_sha256
+                   FROM targeter_runs WHERE run_id = ?""",
+                (run_id,),
             ).fetchone()
         if row is None:
             return None
@@ -280,11 +295,6 @@ class UniverseStore:
                 if any(existing[field] != value for field, value in expected.items()):
                     raise EvidenceConflict(
                         f"Targeter run {run_id} conflicts with prior ingestion"
-                    )
-                audit = self._audit_run(connection, run_id)
-                if not audit["ok"]:
-                    raise EvidenceConflict(
-                        f"Targeter run {run_id} SQL projection failed audit"
                     )
                 projected = connection.execute(
                     """SELECT projection_version, projection_sha256,
@@ -431,29 +441,30 @@ class UniverseStore:
                 "sport": event["sport"],
                 "game": event["game"],
                 "topology": event["topology"],
-                "activation_at": event["activation_at"],
                 "participants_json": _canonical_json_value(event["participants"]),
                 "participant_keys_json": _canonical_json_value(
                     event["participant_keys"]
                 ),
+                "event_refs_json": _canonical_json_value(event["event_refs"]),
             }
             if existing is None:
                 connection.execute(
                     """INSERT INTO umbrella_events(
                            event_id, sport, game, topology, activation_at,
                            activation_at_ns, participants_json,
-                           participant_keys_json, first_seen_run_id,
-                           last_seen_run_id
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           participant_keys_json, event_refs_json,
+                           first_seen_run_id, last_seen_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         event["event_id"],
                         semantic["sport"],
                         semantic["game"],
                         semantic["topology"],
-                        semantic["activation_at"],
+                        event["activation_at"],
                         _timestamp_ns(event["activation_at"]),
                         semantic["participants_json"],
                         semantic["participant_keys_json"],
+                        semantic["event_refs_json"],
                         run_id,
                         run_id,
                     ),
@@ -463,14 +474,25 @@ class UniverseStore:
                 first_seen, last_seen = _seen_run_ids(connection, existing, run_id)
                 connection.execute(
                     """UPDATE umbrella_events
-                       SET first_seen_run_id = ?, last_seen_run_id = ?
+                       SET activation_at = CASE WHEN ? = ? THEN ? ELSE activation_at END,
+                           activation_at_ns = CASE WHEN ? = ? THEN ? ELSE activation_at_ns END,
+                           first_seen_run_id = ?, last_seen_run_id = ?
                        WHERE event_id = ?""",
-                    (first_seen, last_seen, event["event_id"]),
+                    (
+                        first_seen, run_id, event["activation_at"],
+                        first_seen, run_id, _timestamp_ns(event["activation_at"]),
+                        first_seen, last_seen, event["event_id"],
+                    ),
                 )
             connection.execute(
-                """INSERT INTO event_observations(run_id, event_id, bundle_id)
-                   VALUES (?, ?, ?)""",
-                (run_id, event["event_id"], event["source_bundle_id"]),
+                """INSERT INTO event_observations(
+                       run_id, event_id, bundle_id,
+                       observed_activation_at, observed_activation_at_ns
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    run_id, event["event_id"], event["source_bundle_id"],
+                    event["activation_at"], _timestamp_ns(event["activation_at"]),
+                ),
             )
 
         for event in projection["venue_events"]:
@@ -726,10 +748,16 @@ class UniverseStore:
                         origin["continuity_score"], occurrence["origin_run_id"],
                     ),
                 )
+            activation_at = occurrence["context"]["activation_at"]
             connection.execute(
-                """INSERT OR IGNORE INTO event_observations(run_id, event_id, bundle_id)
-                   VALUES (?, ?, ?)""",
-                (run_id, origin_rows[0]["event_id"], bundle_id),
+                """INSERT OR IGNORE INTO event_observations(
+                       run_id, event_id, bundle_id,
+                       observed_activation_at, observed_activation_at_ns
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    run_id, origin_rows[0]["event_id"], bundle_id,
+                    activation_at, _timestamp_ns(activation_at),
+                ),
             )
 
         for relation in projection["relations"]:
@@ -979,6 +1007,100 @@ class UniverseStore:
             ).fetchone()
         return None if row is None else str(row["cursor"])
 
+    def record_sync_failure(
+        self, manifest_key: str, error: str, *, now_ns: int
+    ) -> None:
+        message = str(error)[:4096]
+        with self.write_transaction() as connection:
+            existing = connection.execute(
+                "SELECT attempts, first_failed_at_ns FROM universe_sync_failures "
+                "WHERE manifest_key = ?",
+                (manifest_key,),
+            ).fetchone()
+            attempts = 1 if existing is None else int(existing["attempts"]) + 1
+            first = now_ns if existing is None else int(existing["first_failed_at_ns"])
+            retry_seconds = min(60 * (2 ** min(attempts - 1, 10)), 86_400)
+            connection.execute(
+                """INSERT INTO universe_sync_failures(
+                       manifest_key, first_failed_at_ns, last_failed_at_ns,
+                       next_retry_at_ns, attempts, error
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(manifest_key) DO UPDATE SET
+                       last_failed_at_ns = excluded.last_failed_at_ns,
+                       next_retry_at_ns = excluded.next_retry_at_ns,
+                       attempts = excluded.attempts,
+                       error = excluded.error""",
+                (
+                    manifest_key,
+                    first,
+                    now_ns,
+                    now_ns + retry_seconds * 1_000_000_000,
+                    attempts,
+                    message,
+                ),
+            )
+
+    def clear_sync_failure(self, manifest_key: str) -> None:
+        with self.write_transaction() as connection:
+            connection.execute(
+                "DELETE FROM universe_sync_failures WHERE manifest_key = ?",
+                (manifest_key,),
+            )
+
+    def due_sync_failures(
+        self,
+        *,
+        now_ns: int,
+        limit: int,
+        key_start: str | None = None,
+        key_end: str | None = None,
+    ) -> list[str]:
+        if limit <= 0:
+            raise ValueError("sync failure retry limit must be positive")
+        where, parameters = _sync_failure_range(key_start, key_end)
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                f"""SELECT manifest_key FROM universe_sync_failures
+                    WHERE next_retry_at_ns <= ? {where}
+                    ORDER BY next_retry_at_ns, manifest_key LIMIT ?""",
+                (now_ns, *parameters, limit),
+            ).fetchall()
+        return [str(row["manifest_key"]) for row in rows]
+
+    def sync_failure_count(
+        self, *, key_start: str | None = None, key_end: str | None = None
+    ) -> int:
+        where, parameters = _sync_failure_range(key_start, key_end, conjunction=False)
+        with closing(self.connect(readonly=True)) as connection:
+            return int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM universe_sync_failures {where}", parameters
+                ).fetchone()[0]
+            )
+
+    def has_sync_failure(self, manifest_key: str) -> bool:
+        with closing(self.connect(readonly=True)) as connection:
+            return connection.execute(
+                "SELECT 1 FROM universe_sync_failures WHERE manifest_key = ?",
+                (manifest_key,),
+            ).fetchone() is not None
+
+    def known_sync_failure_keys(self, manifest_keys: list[str]) -> set[str]:
+        known: set[str] = set()
+        with closing(self.connect(readonly=True)) as connection:
+            for offset in range(0, len(manifest_keys), 500):
+                chunk = manifest_keys[offset : offset + 500]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _key in chunk)
+                rows = connection.execute(
+                    "SELECT manifest_key FROM universe_sync_failures "
+                    f"WHERE manifest_key IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                known.update(str(row["manifest_key"]) for row in rows)
+        return known
+
     def audit_run(self, run_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
             exists = connection.execute(
@@ -1088,6 +1210,11 @@ class UniverseStore:
                    FROM targeter_runs
                    ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
             ).fetchone()
+            pending_failures = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM universe_sync_failures"
+                ).fetchone()[0]
+            )
         latest_record = None
         if latest is not None:
             age_seconds = max(
@@ -1103,10 +1230,11 @@ class UniverseStore:
                 "stale": age_seconds >= STALE_AFTER_SECONDS,
             }
         return {
-            "status": "ok",
+            "status": "degraded" if pending_failures else "ok",
             "schema_version": version,
             "latest_run": latest_record,
             "counts": counts,
+            "sync": {"pending_failures": pending_failures},
         }
 
     def cadence_status_snapshot(
@@ -1246,41 +1374,46 @@ class UniverseStore:
         _ensure_detail_rows(
             (decisions, selected, relations, events), "targeter run detail"
         )
-        return {
-            "run": _run_summary(run),
-            "source": {
-                "manifest_key": run["manifest_key"],
-                "manifest_sha256": run["manifest_sha256"],
-                "report_key": run["report_key"],
-                "report_sha256": run["report_sha256"],
+        return _bounded_detail(
+            {
+                "run": _run_summary(run),
+                "source": {
+                    "manifest_key": run["manifest_key"],
+                    "manifest_sha256": run["manifest_sha256"],
+                    "report_key": run["report_key"],
+                    "report_sha256": run["report_sha256"],
+                },
+                "counts": {
+                    "candidates": len(decisions),
+                    "eligible": sum(bool(row["eligible"]) for row in decisions),
+                    "selected_events": len({row["event_id"] for row in selected}),
+                    "selected_markets": len(selected),
+                    "relations": len(relations),
+                },
+                "decisions": [
+                    {
+                        "event_id": row["event_id"],
+                        "bundle_id": row["bundle_id"],
+                        "eligible": bool(row["eligible"]),
+                        "selected": bool(row["selected"]),
+                        "score": row["score"],
+                        "score_components": json.loads(row["score_components_json"]),
+                        "rejection_reasons": json.loads(row["rejection_reasons_json"]),
+                        "allocation_rejection": row["allocation_rejection"],
+                        "admission": json.loads(row["admission_json"]),
+                        "market_exclusions": json.loads(row["market_exclusions_json"]),
+                        "eligible_market_ids": json.loads(
+                            row["eligible_market_ids_json"]
+                        ),
+                    }
+                    for row in decisions
+                ],
+                "events": [_event_record(row) for row in events],
+                "selected_markets": [_row_record(row) for row in selected],
+                "relations": [_row_record(row) for row in relations],
             },
-            "counts": {
-                "candidates": len(decisions),
-                "eligible": sum(bool(row["eligible"]) for row in decisions),
-                "selected_events": len({row["event_id"] for row in selected}),
-                "selected_markets": len(selected),
-                "relations": len(relations),
-            },
-            "decisions": [
-                {
-                    "event_id": row["event_id"],
-                    "bundle_id": row["bundle_id"],
-                    "eligible": bool(row["eligible"]),
-                    "selected": bool(row["selected"]),
-                    "score": row["score"],
-                    "score_components": json.loads(row["score_components_json"]),
-                    "rejection_reasons": json.loads(row["rejection_reasons_json"]),
-                    "allocation_rejection": row["allocation_rejection"],
-                    "admission": json.loads(row["admission_json"]),
-                    "market_exclusions": json.loads(row["market_exclusions_json"]),
-                    "eligible_market_ids": json.loads(row["eligible_market_ids_json"]),
-                }
-                for row in decisions
-            ],
-            "events": [_event_record(row) for row in events],
-            "selected_markets": [_row_record(row) for row in selected],
-            "relations": [_row_record(row) for row in relations],
-        }
+            "targeter run detail",
+        )
 
     def list_events(
         self,
@@ -1374,7 +1507,8 @@ class UniverseStore:
                 (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             observations = connection.execute(
-                """SELECT observed.run_id, run.generated_at, observed.bundle_id
+                """SELECT observed.run_id, run.generated_at, observed.bundle_id,
+                          observed.observed_activation_at
                    FROM event_observations observed
                    JOIN targeter_runs run USING (run_id)
                    WHERE observed.event_id = ?
@@ -1385,13 +1519,16 @@ class UniverseStore:
         _ensure_detail_rows(
             (venue_events, markets, relations, observations), "event detail"
         )
-        return {
-            "event": _event_record(event),
-            "venue_events": [_row_record(row) for row in venue_events],
-            "markets": [_canonical_market_record(row) for row in markets],
-            "relations": [_row_record(row) for row in relations],
-            "observations": [_row_record(row) for row in observations],
-        }
+        return _bounded_detail(
+            {
+                "event": _event_record(event),
+                "venue_events": [_row_record(row) for row in venue_events],
+                "markets": [_canonical_market_record(row) for row in markets],
+                "relations": [_row_record(row) for row in relations],
+                "observations": [_row_record(row) for row in observations],
+            },
+            "event detail",
+        )
 
     def market_detail(
         self,
@@ -1487,12 +1624,15 @@ class UniverseStore:
                 (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
         _ensure_detail_rows((venue_markets, selections, relations), "market detail")
-        return {
-            "market": _canonical_market_record(market),
-            "venue_markets": [_venue_market_record(row) for row in venue_markets],
-            "selections": [_row_record(row) for row in selections],
-            "relations": [_row_record(row) for row in relations],
-        }
+        return _bounded_detail(
+            {
+                "market": _canonical_market_record(market),
+                "venue_markets": [_venue_market_record(row) for row in venue_markets],
+                "selections": [_row_record(row) for row in selections],
+                "relations": [_row_record(row) for row in relations],
+            },
+            "market detail",
+        )
 
     def relation_detail(self, relation_id: int) -> dict[str, Any] | None:
         if isinstance(relation_id, bool) or not isinstance(relation_id, int) or relation_id <= 0:
@@ -1527,11 +1667,14 @@ class UniverseStore:
                 (relation_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
         _ensure_detail_rows((members, observations), "relation detail")
-        return {
-            "relation": _row_record(relation),
-            "members": [_row_record(row) for row in members],
-            "observations": [_row_record(row) for row in observations],
-        }
+        return _bounded_detail(
+            {
+                "relation": _row_record(relation),
+                "members": [_row_record(row) for row in members],
+                "observations": [_row_record(row) for row in observations],
+            },
+            "relation detail",
+        )
 
     def list_runs(
         self,
@@ -1719,7 +1862,9 @@ class UniverseStore:
             if row is None:
                 return None
             context = self._context(connection, row["context_sha256"])
-        return {**_selection_record(row), "context": context}
+        return _bounded_detail(
+            {**_selection_record(row), "context": context}, "selection detail"
+        )
 
     def run_detail(self, run_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
@@ -1743,46 +1888,57 @@ class UniverseStore:
             raise EvidenceConflict(f"bundle context {context_sha256} is absent")
         participants = connection.execute(
             """SELECT position, name, participant_key FROM context_participants
-               WHERE context_sha256 = ? ORDER BY position""",
-            (context_sha256,),
+               WHERE context_sha256 = ? ORDER BY position LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
         ).fetchall()
         events = connection.execute(
             """SELECT event_ref FROM context_events
-               WHERE context_sha256 = ? ORDER BY event_ref""",
-            (context_sha256,),
+               WHERE context_sha256 = ? ORDER BY event_ref LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
         ).fetchall()
         markets = connection.execute(
             """SELECT target_id, venue, selected FROM context_markets
-               WHERE context_sha256 = ? ORDER BY target_id""",
-            (context_sha256,),
+               WHERE context_sha256 = ? ORDER BY target_id LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
         ).fetchall()
         targets = connection.execute(
             """SELECT target_id, venue, canonical_class, source_ref
                FROM context_targets WHERE context_sha256 = ?
-               ORDER BY venue, target_id""",
-            (context_sha256,),
+               ORDER BY venue, target_id LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
         ).fetchall()
+        assets = connection.execute(
+            """SELECT target_id, asset_id FROM context_target_assets
+               WHERE context_sha256 = ? ORDER BY target_id, asset_id LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
+        ).fetchall()
+        assets_by_target: dict[str, list[str]] = {}
+        for asset in assets:
+            assets_by_target.setdefault(str(asset["target_id"]), []).append(
+                str(asset["asset_id"])
+            )
         target_records: list[dict[str, Any]] = []
         for target in targets:
-            assets = connection.execute(
-                """SELECT asset_id FROM context_target_assets
-                   WHERE context_sha256 = ? AND target_id = ? ORDER BY asset_id""",
-                (context_sha256, target["target_id"]),
-            ).fetchall()
             target_records.append(
                 {
                     **_row_record(target),
-                    "subscription_ids": [asset["asset_id"] for asset in assets],
+                    "subscription_ids": assets_by_target.get(
+                        str(target["target_id"]), []
+                    ),
                 }
             )
         relationships = connection.execute(
             """SELECT left_market AS left, right_market AS right,
                       relationship, scope, left_venue, right_venue, coverage
                FROM context_relationships WHERE context_sha256 = ?
-               ORDER BY relationship_index""",
-            (context_sha256,),
+               ORDER BY relationship_index LIMIT ?""",
+            (context_sha256, DETAIL_ROW_LIMIT + 1),
         ).fetchall()
-        return {
+        _ensure_detail_rows(
+            (participants, events, markets, targets, assets, relationships),
+            "bundle context",
+        )
+        record = {
             "bundle_id": context["bundle_id"],
             "sport": context["sport"],
             "game": context["game"],
@@ -1803,6 +1959,12 @@ class UniverseStore:
             "targets": target_records,
             "relationships": [_row_record(value) for value in relationships],
         }
+        if (
+            len(_canonical_json_value(record).encode("utf-8"))
+            > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES
+        ):
+            raise DetailTooLarge("bundle context exceeds the byte limit")
+        return record
 
     def backup(self, destination: Path) -> Path:
         destination = Path(destination)
@@ -2310,6 +2472,7 @@ def _event_record(row: sqlite3.Row) -> dict[str, Any]:
         "activation_at": row["activation_at"],
         "participants": json.loads(row["participants_json"]),
         "participant_keys": json.loads(row["participant_keys_json"]),
+        "event_refs": json.loads(row["event_refs_json"]),
         "first_seen_run_id": row["first_seen_run_id"],
         "last_seen_run_id": row["last_seen_run_id"],
     }
@@ -2369,6 +2532,29 @@ def _limit(value: int) -> int:
 def _ensure_detail_rows(groups: tuple[list[Any], ...], label: str) -> None:
     if any(len(rows) > DETAIL_ROW_LIMIT for rows in groups):
         raise DetailTooLarge(f"{label} exceeds the child-row limit")
+
+
+def _bounded_detail(record: dict[str, Any], label: str) -> dict[str, Any]:
+    if (
+        len(_canonical_json_value(record).encode("utf-8"))
+        > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES
+    ):
+        raise DetailTooLarge(f"{label} exceeds the byte limit")
+    return record
+
+
+def _sync_failure_range(
+    key_start: str | None,
+    key_end: str | None,
+    *,
+    conjunction: bool = True,
+) -> tuple[str, tuple[str, str] | tuple[()]]:
+    if (key_start is None) != (key_end is None):
+        raise ValueError("sync failure key bounds must both be set")
+    if key_start is None:
+        return "", ()
+    operator = "AND" if conjunction else "WHERE"
+    return f"{operator} manifest_key >= ? AND manifest_key < ?", (key_start, key_end)
 
 
 def _nonempty(value: Any, label: str) -> str:
