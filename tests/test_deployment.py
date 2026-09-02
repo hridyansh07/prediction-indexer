@@ -171,23 +171,23 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
 
     def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
-        history_schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(
+        schema_directory = ROOT / "universe" / "schema"
+        sql_files = list(schema_directory.glob("*.sql"))
+        self.assertEqual([path.name for path in sql_files], ["schema.sql"])
+        schema = sql_files[0].read_text(
             encoding="utf-8"
         )
-        market_schema = (ROOT / "universe" / "schema" / "v4.sql").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("CREATE TABLE selection_occurrences", history_schema)
-        self.assertIn("CREATE TABLE bundle_contexts", history_schema)
-        self.assertIn("CREATE TABLE bundle_retirements", history_schema)
-        self.assertIn("CREATE TABLE umbrella_events", market_schema)
-        self.assertIn("observed_activation_at", market_schema)
-        self.assertIn("CREATE TABLE universe_sync_failures", market_schema)
-        self.assertIn("CREATE TABLE canonical_markets", market_schema)
-        self.assertIn("CREATE TABLE relation_members", market_schema)
-        self.assertNotIn("CREATE TABLE cadence_runs", market_schema)
+        self.assertIn("CREATE TABLE selection_occurrences", schema)
+        self.assertIn("CREATE TABLE bundle_contexts", schema)
+        self.assertIn("CREATE TABLE bundle_retirements", schema)
+        self.assertIn("CREATE TABLE umbrella_events", schema)
+        self.assertIn("observed_activation_at", schema)
+        self.assertIn("CREATE TABLE universe_sync_failures", schema)
+        self.assertIn("CREATE TABLE canonical_markets", schema)
+        self.assertIn("CREATE TABLE relation_members", schema)
+        self.assertNotIn("CREATE TABLE cadence_runs", schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
-            self.assertNotIn(stale, history_schema + market_schema)
+            self.assertNotIn(stale, schema)
 
     def test_universe_runbook_has_safe_bounded_rebuild_order(self) -> None:
         deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")

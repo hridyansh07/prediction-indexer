@@ -1,119 +1,27 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
 import type {
   UniverseEvent,
   UniverseEventDetail,
-  UniverseHealth,
   UniverseSelectedMarket,
   UniverseSelection,
   UniverseSelectionDetail,
   UniverseTargeterDecision,
-  UniverseTargeterRunDetail,
-  UniverseTargeterStatus,
 } from '../event-universe';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
 import { boundedRenderPage } from './event-universe-view-model';
-import { universeGet } from './universe-api';
+import {
+  useEventDetail,
+  useTargeterRun,
+  useTargeterStatus,
+} from './universe-queries';
 
 const date = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString() : 'Unavailable';
-
-const relative = (value: string | null | undefined) => {
-  if (!value) return 'Unavailable';
-  const seconds = Math.round((new Date(value).valueOf() - Date.now()) / 1000);
-  const absolute = Math.abs(seconds);
-  const [divisor, unit] =
-    absolute < 60
-      ? [1, 'second']
-      : absolute < 3600
-        ? [60, 'minute']
-        : [3600, 'hour'];
-  return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(
-    Math.round(seconds / divisor),
-    unit as Intl.RelativeTimeFormatUnit,
-  );
-};
 
 const label = (value: string | null | undefined) =>
   value
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
-
-async function loadTargeterRun(
-  runId: string,
-): Promise<UniverseTargeterRunDetail> {
-  return universeGet<UniverseTargeterRunDetail>(
-    `/v1/targeter/runs/${encodeURIComponent(runId)}`,
-  );
-}
-
-function useTargeterRun(runId: string | null) {
-  const [run, setRun] = useState<UniverseTargeterRunDetail | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(Boolean(runId));
-  useEffect(() => {
-    if (!runId) {
-      setRun(null);
-      setLoading(false);
-      return;
-    }
-    let active = true;
-    setRun(null);
-    setError('');
-    setLoading(true);
-    void loadTargeterRun(runId)
-      .then((nextRun) => {
-        if (active) setRun(nextRun);
-      })
-      .catch(() => {
-        if (active) setError('Targeter run diagnostics are unavailable.');
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [runId]);
-  return { run, error, loading };
-}
-
-function useEventDetail(eventId: string | null) {
-  const [detail, setDetail] = useState<UniverseEventDetail | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
-    if (!eventId) {
-      setDetail(null);
-      setError('');
-      setLoading(false);
-      return;
-    }
-    let active = true;
-    const controller = new AbortController();
-    setDetail(null);
-    setError('');
-    setLoading(true);
-    void universeGet<UniverseEventDetail>(
-      `/v1/events/${encodeURIComponent(eventId)}`,
-      { signal: controller.signal, cache: false },
-    )
-      .then((nextDetail) => {
-        if (active) setDetail(nextDetail);
-      })
-      .catch(() => {
-        if (active) setError('Normalized event detail is unavailable.');
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [eventId]);
-  return { detail, error, loading };
-}
 
 function useDrawerFocus(
   open: boolean,
@@ -185,122 +93,6 @@ function PageHeading({
   );
 }
 
-function StateDot({ state }: { state: 'live' | 'warn' | 'unknown' }) {
-  return <span className={`state-dot ${state}`} aria-hidden="true" />;
-}
-
-export function StatusPage({
-  health,
-  status,
-  healthError,
-  statusError,
-  refreshing,
-  refresh,
-}: {
-  health: UniverseHealth | null;
-  status: UniverseTargeterStatus | null;
-  healthError: string;
-  statusError: string;
-  refreshing: boolean;
-  refresh: () => Promise<void>;
-}) {
-  const targeterLive = status?.freshness.state === 'current';
-  const checking = !health && !status && !healthError && !statusError;
-  return (
-    <div className="status-page">
-      <section className="status-intro">
-        <div>
-          <span className="eyebrow">SYSTEM STATUS</span>
-          <h1>
-            {checking
-              ? 'Checking indexer health.'
-              : health && targeterLive
-                ? 'Server and cadence are on track.'
-                : 'Indexing needs attention.'}
-          </h1>
-          <p>
-            A concise view of the Event Universe server and Targeter cadence.
-          </p>
-        </div>
-        <button
-          className="quiet-button"
-          onClick={() => void refresh()}
-          disabled={refreshing}
-        >
-          {refreshing ? 'Refreshing…' : '↻ Refresh'}
-        </button>
-      </section>
-      <section className="status-grid" aria-label="Service health">
-        <article className="status-card">
-          <div className="status-card-title">
-            <StateDot state={health ? 'live' : 'warn'} />
-            <span>EVENT UNIVERSE</span>
-          </div>
-          <strong>{health ? 'Server live' : 'Unavailable'}</strong>
-          <p>
-            {healthError ||
-              (health?.latest_run
-                ? `Latest evidence ${relative(health.latest_run.generated_at)}`
-                : 'No indexed runs yet')}
-          </p>
-        </article>
-        <article className="status-card featured">
-          <div className="status-card-title">
-            <StateDot state={targeterLive ? 'live' : 'warn'} />
-            <span>TARGETER CADENCE</span>
-          </div>
-          <strong>
-            {targeterLive
-              ? 'On cadence'
-              : label(status?.freshness.state ?? 'Unavailable')}
-          </strong>
-          <p>
-            {statusError ||
-              `Expected every ${Math.round((status?.freshness.expected_run_seconds ?? 600) / 60)} minutes`}
-          </p>
-        </article>
-        <article className="status-card unverified">
-          <div className="status-card-title">
-            <StateDot state="unknown" />
-            <span>CAPTURE</span>
-          </div>
-          <strong>Unverified</strong>
-          <p>
-            Cadence evidence does not verify live splice or frame capture
-            health.
-          </p>
-        </article>
-      </section>
-      <section className="current-summary">
-        <div>
-          <span className="eyebrow">CURRENT COMPLETE TARGET SET</span>
-          <h2>
-            {status?.current_complete_run
-              ? `${status.current_complete_summary.selected_bundles} bundles across ${status.current_complete_summary.venues.length} venues`
-              : 'No complete run available'}
-          </h2>
-          <p>
-            {status?.current_complete_run
-              ? `${status.current_complete_summary.selected_targets} selected markets · run ${status.current_complete_run.run_id}`
-              : 'Waiting for complete Targeter evidence.'}
-          </p>
-        </div>
-        <VenueStack venues={status?.current_complete_summary.venues ?? []} />
-        <Link className="primary-link" to="/targets">
-          View current targets <Chevron />
-        </Link>
-        <Link className="secondary-link" to="/decisions">
-          View run diagnostics <Chevron />
-        </Link>
-      </section>
-      <p className="mobile-truth">
-        Capture status remains unverified until a splice-health projection
-        exists.
-      </p>
-    </div>
-  );
-}
-
 function EmptyPage({ error, loading }: { error: string; loading: string }) {
   return (
     <div className={error ? 'error-state' : 'empty-state'}>
@@ -313,10 +105,7 @@ export function MobileDetailNotice() {
   return (
     <div className="mobile-only">
       <h1>Desktop detail view</h1>
-      <p>This compact mobile UI focuses on server and cadence health.</p>
-      <Link className="primary-link" to="/">
-        View status
-      </Link>
+      <p>The Event Universe explorer is currently desktop-first.</p>
     </div>
   );
 }
@@ -398,16 +187,12 @@ interface TargetEventGroup {
   markets: UniverseSelectedMarket[];
 }
 
-export function TargetsPage({
-  status,
-  error,
-}: {
-  status: UniverseTargeterStatus | null;
-  error: string;
-}) {
+export function TargetsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
-  const run = loaded.run;
+  const run = loaded.data;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
@@ -459,10 +244,16 @@ export function TargetsPage({
   });
   const rendered = boundedRenderPage(shown, page);
   useEffect(() => setPage(0), [query, lifecycle, event, runId]);
-  if (loaded.loading || !run)
+  if (statusQuery.isPending || loaded.isPending || !run)
     return (
       <EmptyPage
-        error={error || loaded.error}
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
         loading="Loading the current complete target set…"
       />
     );
@@ -527,18 +318,18 @@ export function TargetsPage({
           No current targets match these controls.
         </div>
       )}
-      {selectedDetail.error && (
+      {selectedDetail.isError && (
         <div className="error-state" role="alert">
-          {selectedDetail.error}
+          Normalized event detail is unavailable.
         </div>
       )}
-      {detailId && selectedDetail.loading && (
+      {detailId && selectedDetail.isPending && (
         <div className="empty-state" role="status">
           Loading event detail…
         </div>
       )}
       <NormalizedTargetDrawer
-        detail={selectedDetail.detail}
+        detail={selectedDetail.data ?? null}
         markets={
           detailId
             ? (grouped.find(({ event }) => event?.event_id === detailId)
@@ -823,23 +614,25 @@ function MarketList({ detail }: { detail: UniverseSelectionDetail }) {
   );
 }
 
-export function DecisionsPage({
-  status,
-  error,
-}: {
-  status: UniverseTargeterStatus | null;
-  error: string;
-}) {
+export function DecisionsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
   const runId = status?.current_complete_run?.run_id ?? null;
   const loaded = useTargeterRun(runId);
-  const run = loaded.run;
+  const run = loaded.data;
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
   useEffect(() => setPage(0), [query, runId]);
-  if (loaded.loading || !run)
+  if (statusQuery.isPending || loaded.isPending || !run)
     return (
       <EmptyPage
-        error={error || loaded.error}
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
         loading="Loading Targeter decisions…"
       />
     );

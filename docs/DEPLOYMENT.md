@@ -755,8 +755,8 @@ The store is a rebuildable event/market view of committed Targeter runs. It
 normalizes cross-venue umbrella events, venue-native events, canonical market
 classes, venue market instances, candidate decisions, selected-market
 occurrences, relationships, and exact source/origin provenance. It does not
-copy raw catalogues or selection reports. `universe/schema/v1.sql` preserves
-the historical bundle APIs and `universe/schema/v4.sql` owns the normalized
+copy raw catalogues or selection reports. `universe/schema/schema.sql` is the
+single canonical schema for both historical bundle APIs and the normalized
 event/market view. There is no cadence cache.
 
 Schema v4 intentionally does not migrate an existing database. Before rolling
@@ -836,9 +836,10 @@ has no Universe sidecar or receipt-mirror service.
 `EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
 backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
 a private interface or authenticated reverse proxy when exposing the API.
-The UI consumes `GET /v1/targeter/status?limit=5`, a compact landing-page view
-containing only freshness, latest/current-complete run summaries, and selected
-counts. `GET /v1/targeter/runs/<run_id>` returns bounded normalized decisions
+The UI consumes `GET /v1/targeter/status?limit=5` to resolve the newest complete
+run for its targets and decisions views. The response contains only freshness,
+latest/current-complete run summaries, and selected counts.
+`GET /v1/targeter/runs/<run_id>` returns bounded normalized decisions
 and references. Event, market, and relationship detail is available from
 `/v1/events`, `/v1/markets/<market_id>`, and `/v1/relations/<relation_id>`.
 `GET /v1/targeter/cadence` has been removed and returns 404. Universe and the UI

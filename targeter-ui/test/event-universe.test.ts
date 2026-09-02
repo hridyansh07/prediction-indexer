@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { InfiniteQueryObserver, QueryObserver } from '@tanstack/react-query';
 import express from 'express';
 import {
   createEventUniverseRouter,
   EventUniverseClient,
   universePublicFailure,
-  validateCadence,
   validateTargeterRun,
   validateUniverseQuery,
 } from '../src/server/event-universe.js';
@@ -18,18 +18,17 @@ import {
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
 import {
-  candidateDecisionState,
-  cadenceRunEmptyMessage,
-  cadenceStatusLabel,
-  latestCompleteRun,
-  selectionDecisionEvidence,
-} from '../src/client/cadence-view-model.js';
-import { universeGet } from '../src/client/universe-api.js';
+  bundlesQuery,
+  createUniverseQueryClient,
+  eventDetailQuery,
+  MAX_BUNDLE_PAGES,
+  QUERY_GC_MS,
+  targeterRunQuery,
+  universeKeys,
+} from '../src/client/universe-queries.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
-  CadenceFreshnessState,
-  UniverseCadence,
-  UniverseCadenceRun,
+  UniverseRun,
   UniverseSelection,
   UniverseSelectionDetail,
   UniverseTargeterRunDetail,
@@ -119,9 +118,7 @@ const detail = (
   },
   ...overrides,
 });
-const run = (
-  overrides: Partial<UniverseCadenceRun> = {},
-): UniverseCadenceRun => ({
+const run = (overrides: Partial<UniverseRun> = {}): UniverseRun => ({
   run_id: '20260820T120000.000001Z',
   generated_at: '2026-08-20T12:00:00Z',
   generated_at_ns: 1,
@@ -140,47 +137,7 @@ const run = (
   projection_sha256: sha,
   projection_row_count: 1,
   indexed_at_ns: 2,
-  catalogs: [],
-  discovery_failures: {},
-  counts: {
-    candidates: 0,
-    eligible: 0,
-    selected: 1,
-    rejected: 0,
-    retained: 0,
-    retired: 0,
-  },
-  reason_summaries: {
-    candidate_rejections: {},
-    allocation_rejections: {},
-    continuity_dispositions: {},
-  },
-  match_rejections: [],
-  candidates: [],
-  selected_targets: {},
-  budget_used: {},
-  continuity: { bundles: [], retained_bundle_ids: [], dispositions: {} },
-  diagnostics: {
-    continuity: [],
-    continuity_degraded_base_run_id: null,
-    target_records: {},
-  },
-  selections: [detail()],
   ...overrides,
-});
-const cadence = (
-  state: CadenceFreshnessState = 'current',
-  runs: UniverseCadenceRun[] = [run()],
-): UniverseCadence => ({
-  cadence_projection_version: 1,
-  observed_at: '2026-08-20T12:05:18Z',
-  freshness: {
-    state,
-    expected_run_seconds: 600,
-    latest_run_age_seconds: state === 'unavailable' ? null : 318,
-    latest_indexed_at: state === 'unavailable' ? null : '2026-08-20T12:01:00Z',
-  },
-  runs,
 });
 const status = (
   overrides: Partial<UniverseTargeterStatus> = {},
@@ -638,20 +595,6 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
   );
 });
 
-test('current targets use the newest complete cadence run', () => {
-  const complete = run({ run_id: 'complete-run' });
-  const incomplete = run({
-    run_id: 'newest-incomplete-run',
-    input_complete: false,
-    selections: [],
-  });
-  assert.equal(
-    latestCompleteRun(cadence('current', [incomplete, complete]))?.run_id,
-    'complete-run',
-  );
-  assert.equal(latestCompleteRun(cadence('current', [incomplete])), null);
-});
-
 test('status proxy allows only a bounded limit and validates selection detail', async () => {
   let requested = '';
   let fetches = 0;
@@ -806,13 +749,17 @@ test('relation detail accepts an empty claim key but rejects schema drift', asyn
 });
 
 test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
-  const [source, historySource] = await Promise.all([
+  const [source, historySource, querySource] = await Promise.all([
     readFile(
       new URL('../src/client/observability.tsx', import.meta.url),
       'utf8',
     ),
     readFile(
       new URL('../src/client/event-universe.tsx', import.meta.url),
+      'utf8',
+    ),
+    readFile(
+      new URL('../src/client/universe-queries.ts', import.meta.url),
       'utf8',
     ),
   ]);
@@ -828,7 +775,8 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   );
   assert.match(source, /opener\.current\?\.focus\(\)/);
   assert.doesNotMatch(historySource, /do \{|loadAllBundles/);
-  assert.match(historySource, /limit: '100'/);
+  assert.match(querySource, /BUNDLE_PAGE_SIZE = 100/);
+  assert.match(querySource, /enabled: Boolean\(eventId\)/);
 
   const records = Array.from({ length: 1000 }, (_, index) => index);
   const first = boundedRenderPage(records, 0);
@@ -883,59 +831,194 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   }
 });
 
-test('browser caching is bounded and does not retain event details', async () => {
-  const originalFetch = globalThis.fetch;
-  const requests: string[] = [];
-  globalThis.fetch = (async (input) => {
-    requests.push(String(input));
-    return json({ ok: true });
-  }) as typeof fetch;
-  try {
-    for (let index = 0; index < 9; index++)
-      await universeGet(`/bounded-cache-${index}`);
-    await universeGet('/bounded-cache-0');
-    assert.equal(requests.length, 10, 'the oldest of nine entries was evicted');
+test('query keys are stable, typed by endpoint, and independent', () => {
+  assert.deepEqual(universeKeys.status(5), universeKeys.status(5));
+  assert.deepEqual(universeKeys.bundles(100), [
+    'event-universe',
+    'bundles',
+    { limit: 100 },
+  ]);
+  assert.notDeepEqual(universeKeys.status(5), universeKeys.status(4));
+  assert.notDeepEqual(
+    universeKeys.targeterRun('run-a'),
+    universeKeys.targeterRun('run-b'),
+  );
+  assert.notDeepEqual(
+    universeKeys.event('event-a'),
+    universeKeys.selection('run-a', 'event-a'),
+  );
+  const client = createUniverseQueryClient();
+  assert.equal(client.getDefaultOptions().queries?.gcTime, QUERY_GC_MS);
+  assert.equal(eventDetailQuery('event-a').gcTime, 0);
+  assert.equal(bundlesQuery().maxPages, MAX_BUNDLE_PAGES);
+  client.clear();
+});
 
-    await universeGet('/v1/events/detail-not-cached');
-    await universeGet('/v1/events/detail-not-cached');
+test('React Query deduplicates requests and retries one failed attempt', async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  let release: (() => void) | undefined;
+  globalThis.fetch = (async () => {
+    requests++;
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return json(normalizedRun());
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  try {
+    const first = client.fetchQuery(targeterRunQuery('run-a'));
+    const second = client.fetchQuery(targeterRunQuery('run-a'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(requests, 1);
+    release?.();
+    assert.deepEqual(await first, await second);
+  } finally {
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+
+  let attempts = 0;
+  globalThis.fetch = (async () => {
+    attempts++;
+    return attempts === 1
+      ? json({ error: 'temporary' }, { status: 503 })
+      : json(normalizedRun());
+  }) as typeof fetch;
+  const retryingClient = createUniverseQueryClient();
+  retryingClient.setDefaultOptions({
+    queries: { gcTime: 300_000, retry: 1, retryDelay: 0 },
+  });
+  try {
     assert.equal(
-      requests.filter((path) => path.endsWith('/v1/events/detail-not-cached'))
-        .length,
-      2,
+      (await retryingClient.fetchQuery(targeterRunQuery('run-retry'))).run
+        .run_id,
+      run().run_id,
+    );
+    assert.equal(attempts, 2);
+
+    attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts++;
+      return json({ error: 'still unavailable' }, { status: 503 });
+    }) as typeof fetch;
+    await assert.rejects(() =>
+      retryingClient.fetchQuery(targeterRunQuery('run-error')),
+    );
+    assert.equal(attempts, 2);
+    assert.equal(
+      retryingClient.getQueryState(universeKeys.targeterRun('run-error'))
+        ?.status,
+      'error',
     );
   } finally {
+    retryingClient.clear();
     globalThis.fetch = originalFetch;
   }
 });
 
-test('signal-bound browser requests are never reused after abort', async () => {
+test('query cancellation aborts the supplied request signal', async () => {
   const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = ((input, init) => {
-    calls++;
-    if (calls === 1)
-      return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () =>
-          reject(new DOMException('aborted', 'AbortError')),
-        );
+  let aborted = false;
+  globalThis.fetch = ((_input, init) => {
+    return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        aborted = true;
+        reject(new DOMException('aborted', 'AbortError'));
       });
-    return Promise.resolve(json({ second: true }));
-  }) as typeof fetch;
-  try {
-    const firstController = new AbortController();
-    const first = universeGet('/retry-after-abort', {
-      signal: firstController.signal,
-      cache: false,
     });
-    firstController.abort();
-    await assert.rejects(first);
-    const second = await universeGet<{ second: boolean }>(
-      '/retry-after-abort',
-      { cache: false },
-    );
-    assert.equal(second.second, true);
-    assert.equal(calls, 2);
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  try {
+    const request = client.fetchQuery(eventDetailQuery('event-a'));
+    await client.cancelQueries({ queryKey: universeKeys.event('event-a') });
+    await assert.rejects(request);
+    assert.equal(aborted, true);
   } finally {
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('switching detail observers aborts stale data and exposes only the new key', async () => {
+  const originalFetch = globalThis.fetch;
+  let firstAborted = false;
+  globalThis.fetch = ((input, init) => {
+    const eventId = String(input).split('/').at(-1);
+    if (eventId === 'event-a')
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          firstAborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    return Promise.resolve(
+      json({
+        ...normalizedEvent(),
+        event: { ...normalizedEvent().event, event_id: eventId },
+      }),
+    );
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  const observer = new QueryObserver(client, eventDetailQuery('event-a'));
+  const observed: string[] = [];
+  const unsubscribe = observer.subscribe((result) => {
+    if (result.data) observed.push(result.data.event.event_id);
+  });
+  try {
+    observer.setOptions(eventDetailQuery('event-b'));
+    const result = await observer.refetch();
+    assert.equal(result.data?.event.event_id, 'event-b');
+    assert.equal(firstAborted, true);
+    assert.deepEqual(observed, ['event-b']);
+  } finally {
+    unsubscribe();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(client.getQueryData(universeKeys.event('event-b')), undefined);
+    client.clear();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('bundle infinite query preserves opaque cursors and bounds retained pages', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = (async (input) => {
+    const url = new URL(String(input), 'https://ui.example');
+    requested.push(url.searchParams.get('cursor') ?? 'first');
+    const page = requested.length;
+    return json({
+      bundles: [],
+      next_cursor: page <= MAX_BUNDLE_PAGES ? `opaque-${page}` : null,
+    });
+  }) as typeof fetch;
+  const client = createUniverseQueryClient();
+  const observer = new InfiniteQueryObserver(client, bundlesQuery());
+  try {
+    await observer.refetch();
+    for (let page = 1; page <= MAX_BUNDLE_PAGES; page++)
+      await observer.fetchNextPage();
+    const result = observer.getCurrentResult();
+    assert.equal(result.data?.pages.length, MAX_BUNDLE_PAGES);
+    assert.deepEqual(requested, [
+      'first',
+      ...Array.from(
+        { length: MAX_BUNDLE_PAGES },
+        (_, index) => `opaque-${index + 1}`,
+      ),
+    ]);
+    assert.deepEqual(result.data?.pageParams, [
+      'opaque-1',
+      'opaque-2',
+      'opaque-3',
+      'opaque-4',
+      'opaque-5',
+      'opaque-6',
+      'opaque-7',
+      'opaque-8',
+    ]);
+  } finally {
+    client.clear();
     globalThis.fetch = originalFetch;
   }
 });
@@ -997,251 +1080,6 @@ test('Express status proxy rejects non-GET refreshes before upstream access', as
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
-});
-
-test('cadence schema and view model cover every freshness state and empty runs', () => {
-  for (const state of ['current', 'late'] as const) {
-    assert.equal(validateCadence(cadence(state)).freshness.state, state);
-    assert.equal(cadenceStatusLabel(state), `CADENCE ${state.toUpperCase()}`);
-  }
-  const unavailable = cadence('unavailable', []);
-  assert.deepEqual(validateCadence(unavailable).runs, []);
-  assert.equal(cadenceStatusLabel('unavailable'), 'CADENCE UNAVAILABLE');
-
-  const completeEmpty = run({ selections: [], projection_row_count: 0 });
-  assert.match(cadenceRunEmptyMessage(completeEmpty), /complete indexed run/);
-  assert.match(
-    cadenceRunEmptyMessage(
-      run({ input_complete: false, selections: [], projection_row_count: 0 }),
-    ),
-    /incomplete input/,
-  );
-
-  assert.throws(() =>
-    validateCadence({
-      ...cadence(),
-      unexpected_decision_summary: {},
-    }),
-  );
-  assert.throws(() =>
-    validateCadence({
-      ...cadence('unavailable', []),
-      freshness: {
-        ...cadence('unavailable', []).freshness,
-        state: 'live',
-      },
-    }),
-  );
-  assert.throws(() =>
-    validateCadence({
-      ...cadence(),
-      runs: [run({ selections: [detail({ run_id: 'wrong-run' })] })],
-    }),
-  );
-});
-
-test('cadence view models distinguish incomplete decisions and retained evidence', () => {
-  const candidate = {
-    bundle_id: 'bundle alpha',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    participants: ['Alpha', 'Beta'],
-    participant_keys: ['alpha', 'beta'],
-    event_refs: ['kalshi:event-a'],
-    activation_at: '2026-08-20T14:00:00Z',
-    capture_start_at: '2026-08-20T13:00:00Z',
-    score: 3,
-    score_components: {},
-    eligible: false,
-    event_status: 'REJECTED' as const,
-    rejection_reasons: ['volume_gate'],
-    admission: {
-      combined_moneyline_volume_usd: 100,
-      minimum_moneyline_volume_usd: 25000,
-      moneyline_volume_usd_by_venue: {},
-      moneyline_volume_usd_coverage: {},
-    },
-    market_exclusions: {},
-    eligible_market_ids: [],
-    selected: false,
-    allocation_rejection: null,
-    relationship_analysis: { relationships: [] },
-  };
-  const incomplete = run({ input_complete: false, candidates: [candidate] });
-  assert.equal(
-    candidateDecisionState(incomplete, candidate),
-    'decision-unavailable',
-  );
-
-  const retainedSelection = detail({
-    occurrence_kind: 'retained',
-    continuity_disposition: 'retained',
-  });
-  const retainedRun = run({
-    candidates: [candidate],
-    continuity: {
-      bundles: [
-        {
-          base_run_id: '20260820T110000.000001Z',
-          bundle_id: candidate.bundle_id,
-          activation_at: candidate.activation_at,
-          score: 91,
-          disposition: 'retained',
-          targets: [],
-        },
-      ],
-      retained_bundle_ids: [candidate.bundle_id],
-      dispositions: { [candidate.bundle_id]: 'retained' },
-    },
-    selections: [retainedSelection],
-  });
-  assert.deepEqual(selectionDecisionEvidence(retainedRun, retainedSelection), {
-    score: 91,
-    candidate: undefined,
-  });
-});
-
-test('cadence validates operational decision evidence and terminal probes', () => {
-  const candidate = {
-    bundle_id: 'bundle alpha',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    participants: ['Alpha', 'Beta'],
-    participant_keys: ['alpha', 'beta'],
-    event_refs: ['kalshi:event-a'],
-    activation_at: '2026-08-20T14:00:00Z',
-    capture_start_at: '2026-08-20T13:00:00Z',
-    score: 12.5,
-    score_components: { venue_coverage: 1000 },
-    eligible: true,
-    event_status: 'ELIGIBLE',
-    rejection_reasons: [],
-    admission: {
-      combined_moneyline_volume_usd: 30000,
-      minimum_moneyline_volume_usd: 25000,
-      moneyline_volume_usd_by_venue: { kalshi: 30000 },
-      moneyline_volume_usd_coverage: {
-        kalshi: { known_markets: 1, unknown_markets: 0 },
-      },
-    },
-    market_exclusions: {},
-    eligible_market_ids: ['kalshi:market-a'],
-    selected: true,
-    allocation_rejection: null,
-    relationship_analysis: { relationships: [], diagnostics: [] },
-  };
-  const continuityBundle = {
-    base_run_id: '20260820T110000.000001Z',
-    bundle_id: 'bundle alpha',
-    activation_at: '2026-08-20T14:00:00Z',
-    score: 12.5,
-    origin_run_id: '20260820T110000.000001Z',
-    disposition: 'retained',
-    targets: [
-      {
-        target_id: 'kalshi:market-a',
-        venue: 'kalshi',
-        canonical_class: 'esports.series_moneyline',
-        subscription_ids: ['asset-a'],
-        activation_at: '2026-08-20T14:00:00Z',
-        capture_start_at: '2026-08-20T13:00:00Z',
-        source_ref: 'kalshi:event-a',
-        terminal_probe: { state: 'unknown', reason: 'probe_failed' },
-      },
-    ],
-  };
-  const valid = run({
-    candidates: [candidate],
-    selected_targets: {
-      kalshi: [
-        {
-          target_id: 'kalshi:market-a',
-          bundle_id: 'bundle alpha',
-          canonical_class: 'esports.series_moneyline',
-          subscription_ids: ['asset-a'],
-          activation_at: '2026-08-20T14:00:00Z',
-          capture_start_at: '2026-08-20T13:00:00Z',
-          source_ref: 'kalshi:event-a',
-          continuity_score: 12.5,
-        },
-      ],
-    },
-    counts: {
-      candidates: 1,
-      eligible: 1,
-      selected: 1,
-      rejected: 0,
-      retained: 0,
-      retired: 0,
-    },
-    continuity: {
-      bundles: [],
-      retained_bundle_ids: [],
-      dispositions: {},
-    },
-  });
-  assert.equal(
-    validateCadence(cadence('current', [valid])).runs[0].candidates[0].score,
-    12.5,
-  );
-  assert.equal(
-    validateCadence(cadence('current', [valid])).runs[0].selected_targets
-      .kalshi[0].continuity_score,
-    12.5,
-  );
-
-  assert.throws(() =>
-    validateCadence(
-      cadence('current', [
-        run({
-          candidates: [candidate],
-          continuity: {
-            bundles: [
-              { ...continuityBundle, disposition: 'unknown_disposition' },
-            ],
-            retained_bundle_ids: ['bundle alpha'],
-            dispositions: { 'bundle alpha': 'unknown_disposition' },
-          },
-        }),
-      ]),
-    ),
-  );
-  assert.equal(
-    validateCadence(
-      cadence('current', [
-        run({
-          candidates: [candidate],
-          continuity: {
-            bundles: [continuityBundle],
-            retained_bundle_ids: ['bundle alpha'],
-            dispositions: { 'bundle alpha': 'retained' },
-          },
-          selections: [
-            detail({
-              occurrence_kind: 'retained',
-              continuity_disposition: 'retained',
-              origin: {
-                ...source,
-                run_id: '20260820T110000.000001Z',
-                generated_at: '2026-08-20T11:00:00Z',
-              },
-            }),
-          ],
-          counts: {
-            candidates: 1,
-            eligible: 1,
-            selected: 1,
-            rejected: 0,
-            retained: 1,
-            retired: 0,
-          },
-        }),
-      ]),
-    ).runs[0].continuity.bundles[0].targets[0].terminal_probe.state,
-    'unknown',
-  );
 });
 
 test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
@@ -1333,15 +1171,32 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   });
 });
 
-test('status refresh is GET-only and Targeter UI has no direct archive dependency', async () => {
-  const [client, apiClient, server, packageDocument] = await Promise.all([
-    readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
-    readFile(new URL('../src/client/universe-api.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../package.json', import.meta.url), 'utf8'),
-  ]);
-  assert.match(client, /universeGet<UniverseTargeterStatus>/);
-  assert.match(client, /\/v1\/targeter\/status\?limit=5/);
+test('live routes use the Universe proxy without cadence or archive dependencies', async () => {
+  const [client, apiClient, queryClient, server, proxy, packageDocument] =
+    await Promise.all([
+      readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
+      readFile(
+        new URL('../src/client/universe-api.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(
+        new URL('../src/client/universe-queries.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
+      readFile(
+        new URL('../src/server/event-universe.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ]);
+  assert.match(client, /QueryClientProvider client={queryClient}/);
+  assert.match(queryClient, /universeGet<UniverseTargeterStatus>/);
+  assert.match(queryClient, /\/v1\/targeter\/status\?limit=\$\{limit\}/);
+  assert.match(client, /path="\/"[\s\S]*<TargetsPage/);
+  assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
+  assert.doesNotMatch(client, /StatusPage|>Status</);
+  assert.doesNotMatch(proxy, /validateCadence|UniverseCadence|CADENCE_QUERY/);
   assert.match(apiClient, /method: 'GET'/);
   for (const removed of [
     '/api/refresh',
@@ -1408,7 +1263,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
       assert.equal(String(input), 'https://universe.internal/healthz');
       return json({
         status: 'ok',
-        schema_version: 3,
+        schema_version: 4,
         latest_run: null,
         counts: {
           targeter_runs: 653,
@@ -1425,7 +1280,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
     }) as typeof fetch,
   );
   assert.equal(health.status, 200);
-  assert.equal((await health.clone().json()).schema_version, 3);
+  assert.equal((await health.clone().json()).schema_version, 4);
 
   // A route with its own allow-listed parameters must keep them and still shed
   // the echo, rather than the proxy stripping everything indiscriminately.

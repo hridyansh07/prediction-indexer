@@ -655,7 +655,7 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(result.ingested, 2, result.as_record())
         runs, _more = self.database.list_runs()
         self.assertEqual([run["run_id"] for run in runs], [R1, R2])
-        status = self.database.cadence_status_snapshot()
+        status = self.database.targeter_status_snapshot()
         self.assertEqual(status["latest_run"]["run_id"], R2)
         self.assertEqual(status["current_complete_run"]["run_id"], R1)
 
@@ -1143,7 +1143,7 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(len(detail["venue_events"]), 2)
         self.assertEqual(len(detail["relations"]), 1)
 
-    def test_cadence_status_is_compact_and_uses_newest_complete_run(self) -> None:
+    def test_targeter_status_is_compact_and_uses_newest_complete_run(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))
         _publish_run(self.objects, _empty_report(R2, G2, input_complete=False))
         self.assertEqual(
@@ -1390,7 +1390,7 @@ class EventUniverseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     application.get(path)
 
-    def test_fresh_database_uses_market_universe_schema_v4(self) -> None:
+    def test_fresh_database_uses_canonical_schema_v4(self) -> None:
         with sqlite3.connect(self.database.path) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
             tables = {
@@ -1417,22 +1417,30 @@ class EventUniverseTests(unittest.TestCase):
     def test_initialize_requires_wiping_pre_market_universe_database(self) -> None:
         legacy = self.root / "legacy.sqlite3"
         with sqlite3.connect(legacy) as connection:
-            connection.executescript(
-                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
-            )
+            connection.execute("CREATE TABLE legacy_state (value TEXT)")
             connection.execute("PRAGMA user_version = 1")
-        with self.assertRaisesRegex(EvidenceConflict, "remove the rebuildable SQLite"):
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
             UniverseStore(legacy).initialize()
 
     def test_initialize_rejects_v3_schema_with_rebuild_instruction(self) -> None:
         previous = self.root / "schema-v3.sqlite3"
         with sqlite3.connect(previous) as connection:
-            connection.executescript(
-                (Path(__file__).parents[1] / "universe/schema/v1.sql").read_text()
-            )
+            connection.execute("CREATE TABLE previous_state (value TEXT)")
             connection.execute("PRAGMA user_version = 3")
-        with self.assertRaisesRegex(EvidenceConflict, "remove the rebuildable SQLite"):
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
             UniverseStore(previous).initialize()
+
+    def test_initialize_rejects_modified_v4_with_rebuild_instruction(self) -> None:
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("CREATE TABLE unexpected_state (value TEXT)")
+        with self.assertRaisesRegex(
+            EvidenceConflict, "run backfill from the immutable archive"
+        ):
+            self.database.initialize()
 
     def test_market_projection_rejects_non_finite_selection_evidence(self) -> None:
         report = _selection_report(R1, G1)

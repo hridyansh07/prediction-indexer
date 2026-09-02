@@ -21,7 +21,7 @@ from universe.projection import PROJECTION_VERSION
 
 SCHEMA_VERSION = 4
 STALE_AFTER_SECONDS = 3_600
-TARGETER_CADENCE_SECONDS = 600
+TARGETER_RUN_INTERVAL_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
 DETAIL_ROW_LIMIT = 1000
 
@@ -29,8 +29,10 @@ DETAIL_ROW_LIMIT = 1000
 class DetailTooLarge(ValueError):
     """A detail document would require more child rows than the API permits."""
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
-SCHEMA_PATH = Path(__file__).with_name("schema") / "v1.sql"
-SCHEMA_V4_PATH = Path(__file__).with_name("schema") / "v4.sql"
+SCHEMA_PATH = Path(__file__).with_name("schema") / "schema.sql"
+REBUILD_INSTRUCTION = (
+    "remove the rebuildable SQLite file and run backfill from the immutable archive"
+)
 
 
 class EvidenceConflict(ValueError):
@@ -48,18 +50,16 @@ class UniverseStore:
             if version == 0:
                 objects = self._schema_objects(connection)
                 if not objects:
-                    self._execute_schema_transaction(
-                        connection, SCHEMA_PATH, SCHEMA_V4_PATH
-                    )
+                    self._execute_schema_transaction(connection, SCHEMA_PATH)
                 else:
                     raise EvidenceConflict(
                         "Event Universe schema v4 requires a fresh database; "
-                        "remove the rebuildable SQLite file and run sync"
+                        f"{REBUILD_INSTRUCTION}"
                     )
             elif version != SCHEMA_VERSION:
                 raise EvidenceConflict(
                     f"unsupported Event Universe schema version {version}; "
-                    "remove the rebuildable SQLite file and run sync"
+                    f"{REBUILD_INSTRUCTION}"
                 )
             self._validate_schema(connection)
 
@@ -75,19 +75,21 @@ class UniverseStore:
         }
 
     @classmethod
-    def _expected_schema(cls, *paths: Path) -> dict[tuple[str, str], str]:
+    def _expected_schema(cls) -> dict[tuple[str, str], str]:
         with closing(sqlite3.connect(":memory:")) as expected:
             expected.execute("PRAGMA foreign_keys = ON")
-            for path in paths:
-                expected.executescript(path.read_text(encoding="utf-8"))
+            expected.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             return cls._schema_objects(expected)
 
     @classmethod
     def _validate_schema(cls, connection: sqlite3.Connection) -> None:
         actual = cls._schema_objects(connection)
-        expected = cls._expected_schema(SCHEMA_PATH, SCHEMA_V4_PATH)
+        expected = cls._expected_schema()
         if actual != expected:
-            raise EvidenceConflict("database contains an invalid Event Universe v4 schema")
+            raise EvidenceConflict(
+                "database contains an invalid Event Universe schema v4; "
+                f"{REBUILD_INSTRUCTION}"
+            )
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
@@ -1237,10 +1239,10 @@ class UniverseStore:
             "sync": {"pending_failures": pending_failures},
         }
 
-    def cadence_status_snapshot(
+    def targeter_status_snapshot(
         self, *, limit: int = 5, now_ns: int | None = None
     ) -> dict[str, Any]:
-        """Return only the bounded landing-page status projection."""
+        """Return the bounded newest-run projection used by live UI views."""
         _limit(limit)
         observed_ns = now_ns if now_ns is not None else time.time_ns()
         with closing(self.connect(readonly=True)) as connection:
@@ -1289,10 +1291,10 @@ class UniverseStore:
                     if latest is None
                     else "late"
                     if age_seconds is not None
-                    and age_seconds >= TARGETER_CADENCE_SECONDS * 2
+                    and age_seconds >= TARGETER_RUN_INTERVAL_SECONDS * 2
                     else "current"
                 ),
-                "expected_run_seconds": TARGETER_CADENCE_SECONDS,
+                "expected_run_seconds": TARGETER_RUN_INTERVAL_SECONDS,
                 "latest_run_age_seconds": age_seconds,
                 "latest_indexed_at": (
                     latest_record["indexed_at"] if latest_record is not None else None
