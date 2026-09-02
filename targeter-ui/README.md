@@ -1,8 +1,8 @@
 # Targeter observability UI
 
 Read-only React/Vite UI for current Targeter selections, historical Event
-Universe bundles, and recent Targeter decision evidence. The landing page is a
-compact service/cadence status view; detailed views are desktop-first.
+Universe bundles, and recent Targeter decision evidence. The current targets
+explorer is the landing page; detailed views are desktop-first.
 
 The browser hydrates every view exclusively through the same-origin
 `/api/event-universe/...` proxy. The UI does not list an archive, download
@@ -27,7 +27,7 @@ paths and query fields, validates closed response schemas, applies bounded
 timeouts and response sizes, and returns generic failures without upstream
 bodies or credentials.
 
-The landing page consumes only:
+The targets and decisions views resolve the newest complete run through:
 
 ```text
 GET /api/event-universe/v1/targeter/status?limit=5
@@ -61,8 +61,8 @@ closes.
 
 ## Routes
 
-- `/` — compact Event Universe server and Targeter cadence status
-- `/targets` — normalized events and selected markets from the newest complete run
+- `/` — normalized events and selected markets from the newest complete run
+- `/targets` — compatibility redirect to `/`
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
 - `/api/event-universe/...` — narrow same-origin Universe proxy

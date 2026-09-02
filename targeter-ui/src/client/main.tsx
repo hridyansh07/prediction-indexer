@@ -7,38 +7,27 @@ import {
   Route,
   Routes,
 } from 'react-router-dom';
-import type { UniverseHealth, UniverseTargeterStatus } from '../event-universe';
+import type { UniverseTargeterStatus } from '../event-universe';
 import { EventUniversePage } from './event-universe';
-import { DecisionsPage, StatusPage, TargetsPage } from './observability';
+import { DecisionsPage, TargetsPage } from './observability';
 import { universeGet } from './universe-api';
 import './style.css';
 
 function App() {
-  const [health, setHealth] = useState<UniverseHealth | null>(null);
   const [status, setStatus] = useState<UniverseTargeterStatus | null>(null);
-  const [healthError, setHealthError] = useState('');
   const [statusError, setStatusError] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
-    setRefreshing(true);
-    const [nextHealth, nextStatus] = await Promise.allSettled([
-      universeGet<UniverseHealth>('/healthz'),
-      universeGet<UniverseTargeterStatus>('/v1/targeter/status?limit=5'),
-    ]);
-    if (nextHealth.status === 'fulfilled') {
-      setHealth(nextHealth.value);
-      setHealthError('');
-    } else {
-      setHealthError('Server status is unavailable.');
-    }
-    if (nextStatus.status === 'fulfilled') {
-      setStatus(nextStatus.value);
+    try {
+      setStatus(
+        await universeGet<UniverseTargeterStatus>(
+          '/v1/targeter/status?limit=5',
+        ),
+      );
       setStatusError('');
-    } else {
+    } catch {
       setStatusError('Targeter status is unavailable.');
     }
-    setRefreshing(false);
   }, []);
 
   useEffect(() => {
@@ -53,7 +42,7 @@ function App() {
         <NavLink
           className="brand"
           to="/"
-          aria-label="Prediction Indexer status"
+          aria-label="Prediction Indexer targets"
         >
           <span className="brand-mark" aria-hidden="true">
             ◇
@@ -62,9 +51,8 @@ function App() {
         </NavLink>
         <nav aria-label="Main navigation">
           <NavLink to="/" end>
-            Status
+            Targets
           </NavLink>
-          <NavLink to="/targets">Targets</NavLink>
           <NavLink to="/history">History</NavLink>
           <NavLink to="/decisions">Decisions</NavLink>
         </nav>
@@ -73,30 +61,15 @@ function App() {
         <Routes>
           <Route
             path="/"
-            element={
-              <StatusPage
-                health={health}
-                status={status}
-                healthError={healthError}
-                statusError={statusError}
-                refreshing={refreshing}
-                refresh={refresh}
-              />
-            }
-          />
-          <Route
-            path="/targets"
             element={<TargetsPage status={status} error={statusError} />}
           />
+          <Route path="/targets" element={<Navigate to="/" replace />} />
           <Route path="/history" element={<EventUniversePage />} />
           <Route
             path="/decisions"
             element={<DecisionsPage status={status} error={statusError} />}
           />
-          <Route
-            path="/operations"
-            element={<Navigate to="/targets" replace />}
-          />
+          <Route path="/operations" element={<Navigate to="/" replace />} />
           <Route
             path="/operations/selections"
             element={<Navigate to="/decisions" replace />}

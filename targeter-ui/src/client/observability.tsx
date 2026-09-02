@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
 import type {
   UniverseEvent,
   UniverseEventDetail,
-  UniverseHealth,
   UniverseSelectedMarket,
   UniverseSelection,
   UniverseSelectionDetail,
@@ -17,22 +15,6 @@ import { universeGet } from './universe-api';
 
 const date = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString() : 'Unavailable';
-
-const relative = (value: string | null | undefined) => {
-  if (!value) return 'Unavailable';
-  const seconds = Math.round((new Date(value).valueOf() - Date.now()) / 1000);
-  const absolute = Math.abs(seconds);
-  const [divisor, unit] =
-    absolute < 60
-      ? [1, 'second']
-      : absolute < 3600
-        ? [60, 'minute']
-        : [3600, 'hour'];
-  return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(
-    Math.round(seconds / divisor),
-    unit as Intl.RelativeTimeFormatUnit,
-  );
-};
 
 const label = (value: string | null | undefined) =>
   value
@@ -185,122 +167,6 @@ function PageHeading({
   );
 }
 
-function StateDot({ state }: { state: 'live' | 'warn' | 'unknown' }) {
-  return <span className={`state-dot ${state}`} aria-hidden="true" />;
-}
-
-export function StatusPage({
-  health,
-  status,
-  healthError,
-  statusError,
-  refreshing,
-  refresh,
-}: {
-  health: UniverseHealth | null;
-  status: UniverseTargeterStatus | null;
-  healthError: string;
-  statusError: string;
-  refreshing: boolean;
-  refresh: () => Promise<void>;
-}) {
-  const targeterLive = status?.freshness.state === 'current';
-  const checking = !health && !status && !healthError && !statusError;
-  return (
-    <div className="status-page">
-      <section className="status-intro">
-        <div>
-          <span className="eyebrow">SYSTEM STATUS</span>
-          <h1>
-            {checking
-              ? 'Checking indexer health.'
-              : health && targeterLive
-                ? 'Server and cadence are on track.'
-                : 'Indexing needs attention.'}
-          </h1>
-          <p>
-            A concise view of the Event Universe server and Targeter cadence.
-          </p>
-        </div>
-        <button
-          className="quiet-button"
-          onClick={() => void refresh()}
-          disabled={refreshing}
-        >
-          {refreshing ? 'Refreshing…' : '↻ Refresh'}
-        </button>
-      </section>
-      <section className="status-grid" aria-label="Service health">
-        <article className="status-card">
-          <div className="status-card-title">
-            <StateDot state={health ? 'live' : 'warn'} />
-            <span>EVENT UNIVERSE</span>
-          </div>
-          <strong>{health ? 'Server live' : 'Unavailable'}</strong>
-          <p>
-            {healthError ||
-              (health?.latest_run
-                ? `Latest evidence ${relative(health.latest_run.generated_at)}`
-                : 'No indexed runs yet')}
-          </p>
-        </article>
-        <article className="status-card featured">
-          <div className="status-card-title">
-            <StateDot state={targeterLive ? 'live' : 'warn'} />
-            <span>TARGETER CADENCE</span>
-          </div>
-          <strong>
-            {targeterLive
-              ? 'On cadence'
-              : label(status?.freshness.state ?? 'Unavailable')}
-          </strong>
-          <p>
-            {statusError ||
-              `Expected every ${Math.round((status?.freshness.expected_run_seconds ?? 600) / 60)} minutes`}
-          </p>
-        </article>
-        <article className="status-card unverified">
-          <div className="status-card-title">
-            <StateDot state="unknown" />
-            <span>CAPTURE</span>
-          </div>
-          <strong>Unverified</strong>
-          <p>
-            Cadence evidence does not verify live splice or frame capture
-            health.
-          </p>
-        </article>
-      </section>
-      <section className="current-summary">
-        <div>
-          <span className="eyebrow">CURRENT COMPLETE TARGET SET</span>
-          <h2>
-            {status?.current_complete_run
-              ? `${status.current_complete_summary.selected_bundles} bundles across ${status.current_complete_summary.venues.length} venues`
-              : 'No complete run available'}
-          </h2>
-          <p>
-            {status?.current_complete_run
-              ? `${status.current_complete_summary.selected_targets} selected markets · run ${status.current_complete_run.run_id}`
-              : 'Waiting for complete Targeter evidence.'}
-          </p>
-        </div>
-        <VenueStack venues={status?.current_complete_summary.venues ?? []} />
-        <Link className="primary-link" to="/targets">
-          View current targets <Chevron />
-        </Link>
-        <Link className="secondary-link" to="/decisions">
-          View run diagnostics <Chevron />
-        </Link>
-      </section>
-      <p className="mobile-truth">
-        Capture status remains unverified until a splice-health projection
-        exists.
-      </p>
-    </div>
-  );
-}
-
 function EmptyPage({ error, loading }: { error: string; loading: string }) {
   return (
     <div className={error ? 'error-state' : 'empty-state'}>
@@ -313,10 +179,7 @@ export function MobileDetailNotice() {
   return (
     <div className="mobile-only">
       <h1>Desktop detail view</h1>
-      <p>This compact mobile UI focuses on server and cadence health.</p>
-      <Link className="primary-link" to="/">
-        View status
-      </Link>
+      <p>The Event Universe explorer is currently desktop-first.</p>
     </div>
   );
 }

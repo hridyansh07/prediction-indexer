@@ -110,16 +110,15 @@ not represented as an exact event end.
 
 ## 6. SQLite schema and rebuild
 
-Runtime schema version is 4 and is composed from:
+Runtime schema version is 4 and is initialized from one canonical resource:
 
 ```text
-universe/schema/v1.sql  # historical bundle APIs and source identities
-universe/schema/v4.sql  # stable event/market universe identity and sync ledger
+universe/schema/schema.sql
 ```
 
 Schema v4 intentionally has no in-place migration. Before deploying this
 version, stop Universe jobs and remove the existing rebuildable SQLite database
-(including its WAL/SHM siblings), then run sync/backfill against the immutable
+(including its WAL/SHM siblings), then run backfill against the immutable
 archive. Starting against schema v1/v2/v3 fails with a clear rebuild instruction.
 
 Each admitted run and both projections are inserted in one `BEGIN IMMEDIATE`

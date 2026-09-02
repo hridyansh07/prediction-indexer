@@ -41,7 +41,7 @@ class UniverseApplication:
             return HTTPStatus.OK, _relationship_types()
         if parsed.path == "/v1/targeter/status":
             _only(query, {"limit"})
-            return HTTPStatus.OK, self.database.cadence_status_snapshot(
+            return HTTPStatus.OK, self.database.targeter_status_snapshot(
                 limit=_integer(query, "limit", default=5)
             )
         if parsed.path.startswith("/v1/targeter/runs/"):

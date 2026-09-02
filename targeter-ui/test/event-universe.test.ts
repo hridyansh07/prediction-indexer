@@ -7,7 +7,6 @@ import {
   createEventUniverseRouter,
   EventUniverseClient,
   universePublicFailure,
-  validateCadence,
   validateTargeterRun,
   validateUniverseQuery,
 } from '../src/server/event-universe.js';
@@ -17,19 +16,10 @@ import {
   retirementExplanation,
   universeFilterQuery,
 } from '../src/client/event-universe-view-model.js';
-import {
-  candidateDecisionState,
-  cadenceRunEmptyMessage,
-  cadenceStatusLabel,
-  latestCompleteRun,
-  selectionDecisionEvidence,
-} from '../src/client/cadence-view-model.js';
 import { universeGet } from '../src/client/universe-api.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
 import type {
-  CadenceFreshnessState,
-  UniverseCadence,
-  UniverseCadenceRun,
+  UniverseRun,
   UniverseSelection,
   UniverseSelectionDetail,
   UniverseTargeterRunDetail,
@@ -119,9 +109,7 @@ const detail = (
   },
   ...overrides,
 });
-const run = (
-  overrides: Partial<UniverseCadenceRun> = {},
-): UniverseCadenceRun => ({
+const run = (overrides: Partial<UniverseRun> = {}): UniverseRun => ({
   run_id: '20260820T120000.000001Z',
   generated_at: '2026-08-20T12:00:00Z',
   generated_at_ns: 1,
@@ -140,47 +128,7 @@ const run = (
   projection_sha256: sha,
   projection_row_count: 1,
   indexed_at_ns: 2,
-  catalogs: [],
-  discovery_failures: {},
-  counts: {
-    candidates: 0,
-    eligible: 0,
-    selected: 1,
-    rejected: 0,
-    retained: 0,
-    retired: 0,
-  },
-  reason_summaries: {
-    candidate_rejections: {},
-    allocation_rejections: {},
-    continuity_dispositions: {},
-  },
-  match_rejections: [],
-  candidates: [],
-  selected_targets: {},
-  budget_used: {},
-  continuity: { bundles: [], retained_bundle_ids: [], dispositions: {} },
-  diagnostics: {
-    continuity: [],
-    continuity_degraded_base_run_id: null,
-    target_records: {},
-  },
-  selections: [detail()],
   ...overrides,
-});
-const cadence = (
-  state: CadenceFreshnessState = 'current',
-  runs: UniverseCadenceRun[] = [run()],
-): UniverseCadence => ({
-  cadence_projection_version: 1,
-  observed_at: '2026-08-20T12:05:18Z',
-  freshness: {
-    state,
-    expected_run_seconds: 600,
-    latest_run_age_seconds: state === 'unavailable' ? null : 318,
-    latest_indexed_at: state === 'unavailable' ? null : '2026-08-20T12:01:00Z',
-  },
-  runs,
 });
 const status = (
   overrides: Partial<UniverseTargeterStatus> = {},
@@ -638,20 +586,6 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
   );
 });
 
-test('current targets use the newest complete cadence run', () => {
-  const complete = run({ run_id: 'complete-run' });
-  const incomplete = run({
-    run_id: 'newest-incomplete-run',
-    input_complete: false,
-    selections: [],
-  });
-  assert.equal(
-    latestCompleteRun(cadence('current', [incomplete, complete]))?.run_id,
-    'complete-run',
-  );
-  assert.equal(latestCompleteRun(cadence('current', [incomplete])), null);
-});
-
 test('status proxy allows only a bounded limit and validates selection detail', async () => {
   let requested = '';
   let fetches = 0;
@@ -999,251 +933,6 @@ test('Express status proxy rejects non-GET refreshes before upstream access', as
   }
 });
 
-test('cadence schema and view model cover every freshness state and empty runs', () => {
-  for (const state of ['current', 'late'] as const) {
-    assert.equal(validateCadence(cadence(state)).freshness.state, state);
-    assert.equal(cadenceStatusLabel(state), `CADENCE ${state.toUpperCase()}`);
-  }
-  const unavailable = cadence('unavailable', []);
-  assert.deepEqual(validateCadence(unavailable).runs, []);
-  assert.equal(cadenceStatusLabel('unavailable'), 'CADENCE UNAVAILABLE');
-
-  const completeEmpty = run({ selections: [], projection_row_count: 0 });
-  assert.match(cadenceRunEmptyMessage(completeEmpty), /complete indexed run/);
-  assert.match(
-    cadenceRunEmptyMessage(
-      run({ input_complete: false, selections: [], projection_row_count: 0 }),
-    ),
-    /incomplete input/,
-  );
-
-  assert.throws(() =>
-    validateCadence({
-      ...cadence(),
-      unexpected_decision_summary: {},
-    }),
-  );
-  assert.throws(() =>
-    validateCadence({
-      ...cadence('unavailable', []),
-      freshness: {
-        ...cadence('unavailable', []).freshness,
-        state: 'live',
-      },
-    }),
-  );
-  assert.throws(() =>
-    validateCadence({
-      ...cadence(),
-      runs: [run({ selections: [detail({ run_id: 'wrong-run' })] })],
-    }),
-  );
-});
-
-test('cadence view models distinguish incomplete decisions and retained evidence', () => {
-  const candidate = {
-    bundle_id: 'bundle alpha',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    participants: ['Alpha', 'Beta'],
-    participant_keys: ['alpha', 'beta'],
-    event_refs: ['kalshi:event-a'],
-    activation_at: '2026-08-20T14:00:00Z',
-    capture_start_at: '2026-08-20T13:00:00Z',
-    score: 3,
-    score_components: {},
-    eligible: false,
-    event_status: 'REJECTED' as const,
-    rejection_reasons: ['volume_gate'],
-    admission: {
-      combined_moneyline_volume_usd: 100,
-      minimum_moneyline_volume_usd: 25000,
-      moneyline_volume_usd_by_venue: {},
-      moneyline_volume_usd_coverage: {},
-    },
-    market_exclusions: {},
-    eligible_market_ids: [],
-    selected: false,
-    allocation_rejection: null,
-    relationship_analysis: { relationships: [] },
-  };
-  const incomplete = run({ input_complete: false, candidates: [candidate] });
-  assert.equal(
-    candidateDecisionState(incomplete, candidate),
-    'decision-unavailable',
-  );
-
-  const retainedSelection = detail({
-    occurrence_kind: 'retained',
-    continuity_disposition: 'retained',
-  });
-  const retainedRun = run({
-    candidates: [candidate],
-    continuity: {
-      bundles: [
-        {
-          base_run_id: '20260820T110000.000001Z',
-          bundle_id: candidate.bundle_id,
-          activation_at: candidate.activation_at,
-          score: 91,
-          disposition: 'retained',
-          targets: [],
-        },
-      ],
-      retained_bundle_ids: [candidate.bundle_id],
-      dispositions: { [candidate.bundle_id]: 'retained' },
-    },
-    selections: [retainedSelection],
-  });
-  assert.deepEqual(selectionDecisionEvidence(retainedRun, retainedSelection), {
-    score: 91,
-    candidate: undefined,
-  });
-});
-
-test('cadence validates operational decision evidence and terminal probes', () => {
-  const candidate = {
-    bundle_id: 'bundle alpha',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    participants: ['Alpha', 'Beta'],
-    participant_keys: ['alpha', 'beta'],
-    event_refs: ['kalshi:event-a'],
-    activation_at: '2026-08-20T14:00:00Z',
-    capture_start_at: '2026-08-20T13:00:00Z',
-    score: 12.5,
-    score_components: { venue_coverage: 1000 },
-    eligible: true,
-    event_status: 'ELIGIBLE',
-    rejection_reasons: [],
-    admission: {
-      combined_moneyline_volume_usd: 30000,
-      minimum_moneyline_volume_usd: 25000,
-      moneyline_volume_usd_by_venue: { kalshi: 30000 },
-      moneyline_volume_usd_coverage: {
-        kalshi: { known_markets: 1, unknown_markets: 0 },
-      },
-    },
-    market_exclusions: {},
-    eligible_market_ids: ['kalshi:market-a'],
-    selected: true,
-    allocation_rejection: null,
-    relationship_analysis: { relationships: [], diagnostics: [] },
-  };
-  const continuityBundle = {
-    base_run_id: '20260820T110000.000001Z',
-    bundle_id: 'bundle alpha',
-    activation_at: '2026-08-20T14:00:00Z',
-    score: 12.5,
-    origin_run_id: '20260820T110000.000001Z',
-    disposition: 'retained',
-    targets: [
-      {
-        target_id: 'kalshi:market-a',
-        venue: 'kalshi',
-        canonical_class: 'esports.series_moneyline',
-        subscription_ids: ['asset-a'],
-        activation_at: '2026-08-20T14:00:00Z',
-        capture_start_at: '2026-08-20T13:00:00Z',
-        source_ref: 'kalshi:event-a',
-        terminal_probe: { state: 'unknown', reason: 'probe_failed' },
-      },
-    ],
-  };
-  const valid = run({
-    candidates: [candidate],
-    selected_targets: {
-      kalshi: [
-        {
-          target_id: 'kalshi:market-a',
-          bundle_id: 'bundle alpha',
-          canonical_class: 'esports.series_moneyline',
-          subscription_ids: ['asset-a'],
-          activation_at: '2026-08-20T14:00:00Z',
-          capture_start_at: '2026-08-20T13:00:00Z',
-          source_ref: 'kalshi:event-a',
-          continuity_score: 12.5,
-        },
-      ],
-    },
-    counts: {
-      candidates: 1,
-      eligible: 1,
-      selected: 1,
-      rejected: 0,
-      retained: 0,
-      retired: 0,
-    },
-    continuity: {
-      bundles: [],
-      retained_bundle_ids: [],
-      dispositions: {},
-    },
-  });
-  assert.equal(
-    validateCadence(cadence('current', [valid])).runs[0].candidates[0].score,
-    12.5,
-  );
-  assert.equal(
-    validateCadence(cadence('current', [valid])).runs[0].selected_targets
-      .kalshi[0].continuity_score,
-    12.5,
-  );
-
-  assert.throws(() =>
-    validateCadence(
-      cadence('current', [
-        run({
-          candidates: [candidate],
-          continuity: {
-            bundles: [
-              { ...continuityBundle, disposition: 'unknown_disposition' },
-            ],
-            retained_bundle_ids: ['bundle alpha'],
-            dispositions: { 'bundle alpha': 'unknown_disposition' },
-          },
-        }),
-      ]),
-    ),
-  );
-  assert.equal(
-    validateCadence(
-      cadence('current', [
-        run({
-          candidates: [candidate],
-          continuity: {
-            bundles: [continuityBundle],
-            retained_bundle_ids: ['bundle alpha'],
-            dispositions: { 'bundle alpha': 'retained' },
-          },
-          selections: [
-            detail({
-              occurrence_kind: 'retained',
-              continuity_disposition: 'retained',
-              origin: {
-                ...source,
-                run_id: '20260820T110000.000001Z',
-                generated_at: '2026-08-20T11:00:00Z',
-              },
-            }),
-          ],
-          counts: {
-            candidates: 1,
-            eligible: 1,
-            selected: 1,
-            rejected: 0,
-            retained: 1,
-            retired: 0,
-          },
-        }),
-      ]),
-    ).runs[0].continuity.bundles[0].targets[0].terminal_probe.state,
-    'unknown',
-  );
-});
-
 test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
   let upstreamUrl = '';
   let upstreamAuthorization = '';
@@ -1333,15 +1022,28 @@ test('Vercel proxy hydrates Universe only through server-side configuration', as
   });
 });
 
-test('status refresh is GET-only and Targeter UI has no direct archive dependency', async () => {
-  const [client, apiClient, server, packageDocument] = await Promise.all([
-    readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
-    readFile(new URL('../src/client/universe-api.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../package.json', import.meta.url), 'utf8'),
-  ]);
+test('live routes use the Universe proxy without cadence or archive dependencies', async () => {
+  const [client, apiClient, server, proxy, packageDocument] = await Promise.all(
+    [
+      readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
+      readFile(
+        new URL('../src/client/universe-api.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
+      readFile(
+        new URL('../src/server/event-universe.ts', import.meta.url),
+        'utf8',
+      ),
+      readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ],
+  );
   assert.match(client, /universeGet<UniverseTargeterStatus>/);
   assert.match(client, /\/v1\/targeter\/status\?limit=5/);
+  assert.match(client, /path="\/"[\s\S]*<TargetsPage/);
+  assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
+  assert.doesNotMatch(client, /StatusPage|>Status</);
+  assert.doesNotMatch(proxy, /validateCadence|UniverseCadence|CADENCE_QUERY/);
   assert.match(apiClient, /method: 'GET'/);
   for (const removed of [
     '/api/refresh',
@@ -1408,7 +1110,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
       assert.equal(String(input), 'https://universe.internal/healthz');
       return json({
         status: 'ok',
-        schema_version: 3,
+        schema_version: 4,
         latest_run: null,
         counts: {
           targeter_runs: 653,
@@ -1425,7 +1127,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
     }) as typeof fetch,
   );
   assert.equal(health.status, 200);
-  assert.equal((await health.clone().json()).schema_version, 3);
+  assert.equal((await health.clone().json()).schema_version, 4);
 
   // A route with its own allow-listed parameters must keep them and still shed
   // the echo, rather than the proxy stripping everything indiscriminately.
