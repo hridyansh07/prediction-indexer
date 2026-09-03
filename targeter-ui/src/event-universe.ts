@@ -184,6 +184,9 @@ export interface UniverseTargeterStatus {
 
 export interface UniverseEvent {
   event_id: string;
+  identity_version: 1;
+  identity_activation_date: string;
+  identity_ordinal: number;
   sport: string;
   game: string | null;
   topology: string | null;
@@ -392,7 +395,7 @@ export interface UniverseTargeterRunDetail {
 
 export interface UniverseHealth {
   status: 'ok' | 'degraded';
-  schema_version: 4;
+  schema_version: 5;
   latest_run: {
     run_id: string;
     generated_at: string;

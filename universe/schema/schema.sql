@@ -159,15 +159,26 @@ CREATE TABLE checkpoints (
     updated_at_ns INTEGER NOT NULL
 ) STRICT;
 
+CREATE TABLE event_identity_lineage (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    generated_start TEXT NOT NULL,
+    generated_end TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('running', 'complete'))
+) STRICT;
+
 CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    projection_version INTEGER NOT NULL CHECK(projection_version = 2),
+    projection_version INTEGER NOT NULL CHECK(projection_version = 3),
     projection_sha256 TEXT NOT NULL,
     projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0)
 ) STRICT;
 
 CREATE TABLE umbrella_events (
     event_id TEXT PRIMARY KEY,
+    identity_version INTEGER NOT NULL CHECK(identity_version = 1),
+    identity_activation_date TEXT NOT NULL
+        CHECK(length(identity_activation_date) = 10),
+    identity_ordinal INTEGER NOT NULL CHECK(identity_ordinal >= 0),
     sport TEXT NOT NULL,
     game TEXT,
     topology TEXT,
@@ -175,10 +186,19 @@ CREATE TABLE umbrella_events (
     activation_at_ns INTEGER NOT NULL,
     participants_json TEXT NOT NULL CHECK(json_valid(participants_json)),
     participant_keys_json TEXT NOT NULL CHECK(json_valid(participant_keys_json)),
-    event_refs_json TEXT NOT NULL CHECK(json_valid(event_refs_json)),
     first_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
     last_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id)
 ) STRICT;
+CREATE UNIQUE INDEX umbrella_events_identity
+    ON umbrella_events(
+        identity_version,
+        sport,
+        COALESCE(game, ''),
+        COALESCE(topology, ''),
+        participant_keys_json,
+        identity_activation_date,
+        identity_ordinal
+    );
 CREATE INDEX umbrella_events_activation
     ON umbrella_events(activation_at_ns, event_id);
 

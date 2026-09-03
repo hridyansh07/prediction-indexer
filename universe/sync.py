@@ -34,7 +34,7 @@ from targeter.v2.manifest import (
     manifest_run_instant,
     parse_run_manifest,
 )
-from targeter.v2.models import parse_timestamp
+from targeter.v2.models import isoformat, parse_timestamp
 from universe.market_projection import project_market_universe
 from universe.projection import (
     PROJECTION_VERSION,
@@ -150,6 +150,12 @@ class UniverseSync:
     def sync(self, *, now: datetime | None = None) -> SyncResult:
         """Catch up from the incremental floor; bootstrap with the latest run."""
         result = SyncResult()
+        if self.database.event_identity_backfill_running():
+            result.add_failure(
+                "canonical event-identity backfill is running; "
+                "incremental sync is blocked until it completes"
+            )
+            return self._finish(result)
         latest = self.database.latest_run()
         checkpoint = self.database.checkpoint(INCREMENTAL_CHECKPOINT)
         observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -278,6 +284,10 @@ class UniverseSync:
             raise ValueError("backfill start must be before end")
         if batch_size <= 0:
             raise ValueError("backfill batch_size must be positive")
+        generated_start = isoformat(start)
+        generated_end = isoformat(end)
+        assert generated_start is not None and generated_end is not None
+        self.database.begin_event_identity_backfill(generated_start, generated_end)
         identity = hashlib.sha256(
             f"{start.isoformat()}\n{end.isoformat()}".encode()
         ).hexdigest()[:16]
@@ -296,10 +306,14 @@ class UniverseSync:
                 try:
                     instant = manifest_run_instant(key)
                 except Exception:  # malformed listed keys remain visible and retriable
-                    self._ingest_direct(key, result, now_ns=now_ns)
+                    self._ingest_direct(
+                        key, result, now_ns=now_ns, identity_backfill=True
+                    )
                     continue
                 if start <= instant < end:
-                    self._ingest_direct(key, result, now_ns=now_ns)
+                    self._ingest_direct(
+                        key, result, now_ns=now_ns, identity_backfill=True
+                    )
             result.completed = (
                 self.database.sync_failure_count(
                     key_start=first_partition,
@@ -307,6 +321,10 @@ class UniverseSync:
                 )
                 == 0
             )
+            if result.completed:
+                self.database.complete_event_identity_backfill(
+                    generated_start, generated_end
+                )
             return self._finish(result)
         last_date = (end - timedelta(microseconds=1)).date()
         pending: list[str] = []
@@ -326,14 +344,18 @@ class UniverseSync:
                 ):
                     pending.append(key)
                 if len(pending) == batch_size:
-                    self._backfill_batch(
+                    if not self._backfill_batch(
                         pending, result, checkpoint_name, progress, now_ns
-                    )
+                    ):
+                        return self._finish(result)
                     cursor = pending[-1]
                     pending = []
             day += timedelta(days=1)
         if pending:
-            self._backfill_batch(pending, result, checkpoint_name, progress, now_ns)
+            if not self._backfill_batch(
+                pending, result, checkpoint_name, progress, now_ns
+            ):
+                return self._finish(result)
         self.database.set_checkpoint(checkpoint_name, "scan-complete")
         result.completed = (
             self.database.sync_failure_count(
@@ -342,6 +364,10 @@ class UniverseSync:
             )
             == 0
         )
+        if result.completed:
+            self.database.complete_event_identity_backfill(
+                generated_start, generated_end
+            )
         return self._finish(result)
 
     def _backfill_batch(
@@ -351,24 +377,35 @@ class UniverseSync:
         checkpoint_name: str,
         progress: Callable[[dict[str, Any]], None] | None,
         now_ns: int,
-    ) -> None:
+    ) -> bool:
         before_ingested = result.ingested
         before_skipped = result.skipped
         before_failures = result.failure_count
+        processed = 0
+        last_success: str | None = None
         for key in keys:
-            self._ingest_direct(key, result, now_ns=now_ns)
-        self.database.set_checkpoint(checkpoint_name, keys[-1])
+            failures = result.failure_count
+            self._ingest_direct(
+                key, result, now_ns=now_ns, identity_backfill=True
+            )
+            processed += 1
+            if result.failure_count != failures:
+                break
+            last_success = key
+        if last_success is not None:
+            self.database.set_checkpoint(checkpoint_name, last_success)
         if progress is not None:
             progress(
                 {
                     "type": "backfill_batch",
-                    "processed": len(keys),
-                    "through_manifest_key": keys[-1],
+                    "processed": processed,
+                    "through_manifest_key": keys[processed - 1],
                     "ingested": result.ingested - before_ingested,
                     "skipped": result.skipped - before_skipped,
                     "failures": result.failure_count - before_failures,
                 }
             )
+        return result.failure_count == before_failures
 
     def _finish(self, result: SyncResult) -> SyncResult:
         result.pending_failures = self.database.sync_failure_count()
@@ -393,7 +430,12 @@ class UniverseSync:
         return {"source_status": status[0], **audit}
 
     def _ingest_direct(
-        self, key: str, result: SyncResult, *, now_ns: int
+        self,
+        key: str,
+        result: SyncResult,
+        *,
+        now_ns: int,
+        identity_backfill: bool = False,
     ) -> bool | None:
         try:
             status, input_complete = self._ingest_manifest(
@@ -402,6 +444,7 @@ class UniverseSync:
                 force=False,
                 dependency=False,
                 result=result,
+                identity_backfill=identity_backfill,
             )
             if status == "ingested":
                 result.ingested += 1
@@ -425,6 +468,7 @@ class UniverseSync:
         force: bool,
         dependency: bool,
         result: SyncResult | None,
+        identity_backfill: bool = False,
         expected_manifest_sha256: str | None = None,
         expected_report_sha256: str | None = None,
     ) -> tuple[str, bool | None]:
@@ -459,6 +503,7 @@ class UniverseSync:
                         stack=stack,
                         force=force,
                         result=result,
+                        identity_backfill=identity_backfill,
                     )
                 resolved.append(
                     {
@@ -479,6 +524,7 @@ class UniverseSync:
                     stack=stack,
                     force=force,
                     result=result,
+                    identity_backfill=identity_backfill,
                 )
                 resolved_retirements.append(
                     {
@@ -516,6 +562,7 @@ class UniverseSync:
                 market_projection=verified.market_projection,
                 occurrences=resolved,
                 retirements=resolved_retirements,
+                identity_backfill=identity_backfill,
             )
             if dependency and status == "ingested" and result is not None:
                 result.origin_dependencies_ingested += 1
@@ -540,6 +587,7 @@ class UniverseSync:
         stack: set[str],
         force: bool,
         result: SyncResult | None,
+        identity_backfill: bool,
     ) -> dict[str, Any]:
         context = self._resolve_origin_context(
             current,
@@ -548,6 +596,7 @@ class UniverseSync:
             stack=stack,
             force=force,
             result=result,
+            identity_backfill=identity_backfill,
         )
         bundle_id = _required_text(row, "bundle_id", "retained occurrence")
         if (
@@ -568,6 +617,7 @@ class UniverseSync:
         stack: set[str],
         force: bool,
         result: SyncResult | None,
+        identity_backfill: bool,
     ) -> dict[str, Any]:
         context = self._resolve_origin_context(
             current,
@@ -576,6 +626,7 @@ class UniverseSync:
             stack=stack,
             force=force,
             result=result,
+            identity_backfill=identity_backfill,
         )
         bundle_id = _required_text(row, "bundle_id", "retirement")
         if (
@@ -597,6 +648,7 @@ class UniverseSync:
         stack: set[str],
         force: bool,
         result: SyncResult | None,
+        identity_backfill: bool,
     ) -> dict[str, Any]:
         evidence_label = f"{label} evidence"
         bundle_id = _required_text(row, "bundle_id", evidence_label)
@@ -632,6 +684,7 @@ class UniverseSync:
                 force=force,
                 dependency=True,
                 result=result,
+                identity_backfill=identity_backfill,
                 expected_manifest_sha256=origin_manifest_sha256,
                 expected_report_sha256=origin_report_sha256,
             )

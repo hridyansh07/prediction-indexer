@@ -759,11 +759,11 @@ copy raw catalogues or selection reports. `universe/schema/schema.sql` is the
 single canonical schema for both historical bundle APIs and the normalized
 event/market view. There is no cadence cache.
 
-Schema v4 intentionally does not migrate an existing database. Before rolling
+Schema v5 intentionally does not migrate an existing database. Before rolling
 out this version, stop the API and Universe jobs, remove the rebuildable SQLite
-file plus its `-wal`/`-shm` siblings, run backfill to create schema v4, and
-then start sync/API from the immutable archive. A v1/v2/v3 database is rejected
-with a rebuild instruction.
+file plus its `-wal`/`-shm` siblings, run the oldest-first backfill to create
+schema v5, and then start sync/API from the immutable archive. A v1/v2/v3/v4
+database is rejected with a rebuild instruction.
 
 Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
 version-2 run manifests and derives selected occurrences directly from each
@@ -787,19 +787,25 @@ docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-s
 docker compose -f compose.universe.yaml up -d event-universe
 ```
 
+This oldest-first order is part of deterministic umbrella identity: disjoint
+same-day rematches receive immutable ordinals in archive order. Use the same
+retained history range for rebuilds when stable event links are required.
+
 Backfill emits newline-delimited `backfill_batch` progress records for each 100
 runs and one `backfill_summary`. Exit 0 means the range scan completed with no
 pending source failures; exit 1 means retry or operator investigation is still
 required. Every committed batch advances a range-specific SQLite checkpoint,
 so rerunning the exact same half-open range resumes rather than restarts. Do not
-change either bound while resuming; a different range intentionally has a
-different checkpoint.
+change either bound while resuming; the identity-lineage guard rejects a
+different range even though it would otherwise have a different checkpoint.
 
-Running sync first is no longer a data trap: the configured backfill has an
-independent checkpoint and can still ingest older runs. Backfill-first remains
-the clearest rollout order because the API is not exposed with a misleadingly
-short history. Retained selection origins may be fetched and indexed outside
-the configured range to preserve continuity proof.
+Do not run incremental sync first when rebuild-stable event links are required.
+Canonical backfill requires an identity-empty database, records its exact range,
+stops at the first valid manifest failure, and blocks incremental sync until it
+completes. A newest-run bootstrap remains useful for a non-canonical serving
+baseline, but converting that database to canonical history requires deleting
+and rebuilding SQLite. Retained selection origins may be fetched and indexed
+outside the configured range to preserve continuity proof.
 
 Incremental sync uses a forward high-water date plus a durable per-manifest
 failure ledger. A bad manifest does not pin the date or block later runs.

@@ -1,6 +1,6 @@
 # Event Universe schema
 
-Runtime schema version 4 applies the single canonical [`schema.sql`](schema.sql)
+Runtime schema version 5 applies the single canonical [`schema.sql`](schema.sql)
 package resource. It contains both the historical run/bundle API tables and the
 event/market view: umbrella and venue events, canonical and venue markets,
 candidate decisions, selected-market occurrences, and n-ary relationships.
@@ -9,9 +9,13 @@ The database is a rebuildable query index, not another evidence archive:
 
 - `targeter_runs` binds every run to exact manifest/report identities;
 - `universe_run_projections` binds its deterministic market projection;
-- `umbrella_events` group the exact sorted native-event reference set with
-  stable sport/game/topology/participant semantics; activation observations are
-  versioned separately in `event_observations`;
+- `umbrella_events` hold versioned domain identity coordinates and an immutable
+  same-day ordinal; `venue_events` are the durable native-alias edges used to
+  resolve later observations to that identity;
+- `event_observations` retain every observed activation while the identity's
+  activation date remains frozen at first allocation;
+- `event_identity_lineage` binds the one canonical oldest-first backfill range
+  and blocks incremental allocation while that rebuild is incomplete;
 - `canonical_markets` group venue markets under explicit market-template and
   outcome-space versions;
 - `relations` plus `relation_members` normalize symmetric or directed n-ary
@@ -23,7 +27,8 @@ There is no cadence cache, active snapshot, raw report/catalogue, raw segment,
 control, connection-epoch, venue-delivery, or replay-plan table. Exact evidence
 remains in the immutable configured ObjectStore.
 
-Schema v4 deliberately has no in-place migration. Stop Universe, remove an
-existing v1/v2/v3 SQLite file and its WAL/SHM siblings, then run backfill from
-the immutable archive. Runtime retains `PRAGMA user_version = 4` and rejects any
-older or modified schema with that rebuild instruction.
+Schema v5 deliberately has no in-place migration. Stop Universe, remove an
+existing v1/v2/v3/v4 SQLite file and its WAL/SHM siblings, then run an
+oldest-first backfill from the immutable archive. Runtime retains
+`PRAGMA user_version = 5` and rejects any older or modified schema with that
+rebuild instruction.

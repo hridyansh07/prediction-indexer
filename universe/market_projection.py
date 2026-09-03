@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 
 from targeter.v2.models import isoformat, parse_timestamp
 
-MARKET_PROJECTION_VERSION = 2
+MARKET_PROJECTION_VERSION = 3
 MARKET_TEMPLATE_VERSION = 1
 OUTCOME_SPACE_VERSION = 1
 RELATION_GENERATION_VERSION = 1
@@ -228,14 +228,7 @@ def _project_candidate(
     )
     _unique(event_refs, f"candidate {bundle_id} event_refs")
     event_refs = sorted(event_refs)
-    identity = {
-        "sport": sport,
-        "game": game,
-        "topology": topology,
-        "participant_keys": sorted(participant_keys),
-        "event_refs": event_refs,
-    }
-    event_id = "event:" + _digest(identity)[:32]
+    event_id = "event-proposal:" + _digest({"bundle_id": bundle_id})
     _put_unique(
         event_rows,
         event_id,
@@ -321,7 +314,11 @@ def _project_candidate(
             "scope": _text(source, "scope", f"market {target_id}"),
             "parameters": parameters,
         }
-        market_id = "market:" + _digest(coordinates)[:32]
+        market_id = canonical_market_id(
+            **coordinates,
+            market_template_version=MARKET_TEMPLATE_VERSION,
+            outcome_space_version=OUTCOME_SPACE_VERSION,
+        )
         market_row = {
             "market_id": market_id,
             **coordinates,
@@ -426,16 +423,13 @@ def _retained_event(evidence: Mapping[str, Any], bundle_id: str) -> dict[str, An
         _texts(evidence.get("event_refs"), f"continuity bundle {bundle_id} event_refs")
     )
     _unique(event_refs, f"continuity bundle {bundle_id} event_refs")
-    identity = {
+    return {
+        "event_id": "event-proposal:" + _digest({"bundle_id": bundle_id}),
         "sport": sport,
         "game": game,
         "topology": topology,
         "participant_keys": sorted(participant_keys),
         "event_refs": event_refs,
-    }
-    return {
-        "event_id": "event:" + _digest(identity)[:32],
-        **identity,
         "activation_at": activation_at,
         "participants": participants,
         "source_bundle_id": bundle_id,
@@ -568,6 +562,7 @@ def _relation_rows(
                 "canonical_hash": canonical_hash,
                 "relation_type": kind,
                 "event_id": event_for_bundle[bundle_id],
+                "bundle_id": bundle_id,
                 "scope": _text(relation, "scope", "relationship"),
                 "coverage": _text(relation, "coverage", "relationship"),
                 "generation_version": RELATION_GENERATION_VERSION,
@@ -578,6 +573,32 @@ def _relation_rows(
                 raise MarketProjectionError(f"relationship hash conflict {canonical_hash}")
             rows[canonical_hash] = row
     return sorted(rows.values(), key=lambda row: row["canonical_hash"])
+
+
+def canonical_market_id(
+    *,
+    event_id: str,
+    canonical_class: str,
+    market_type: str,
+    scope: str,
+    parameters: Mapping[str, Any],
+    market_template_version: int,
+    outcome_space_version: int,
+) -> str:
+    """Return the canonical ID for a market under a resolved umbrella event."""
+
+    if market_template_version != MARKET_TEMPLATE_VERSION:
+        raise MarketProjectionError("unsupported market template version")
+    if outcome_space_version != OUTCOME_SPACE_VERSION:
+        raise MarketProjectionError("unsupported outcome-space version")
+    coordinates = {
+        "event_id": event_id,
+        "canonical_class": canonical_class,
+        "market_type": market_type,
+        "scope": scope,
+        "parameters": parameters,
+    }
+    return "market:" + _digest(coordinates)[:32]
 
 
 def _relation_member(value: Mapping[str, Any], side: str) -> dict[str, str]:

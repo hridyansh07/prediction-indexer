@@ -173,6 +173,9 @@ const status = (
 });
 const normalizedEventSummary = () => ({
   event_id: 'event-alpha',
+  identity_version: 1 as const,
+  identity_activation_date: '2026-08-20',
+  identity_ordinal: 0,
   sport: 'esports',
   game: 'counter_strike_2',
   topology: 'series',
@@ -1341,7 +1344,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
       assert.equal(String(input), 'https://universe.internal/healthz');
       return json({
         status: 'ok',
-        schema_version: 4,
+        schema_version: 5,
         latest_run: null,
         counts: {
           targeter_runs: 653,
@@ -1359,7 +1362,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
     }) as typeof fetch,
   );
   assert.equal(health.status, 200);
-  assert.equal((await health.clone().json()).schema_version, 4);
+  assert.equal((await health.clone().json()).schema_version, 5);
 
   // A route with its own allow-listed parameters must keep them and still shed
   // the echo, rather than the proxy stripping everything indiscriminately.

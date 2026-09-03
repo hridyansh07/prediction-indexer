@@ -16,10 +16,11 @@ from typing import Any, Iterable, Iterator, Mapping
 from archive.common.durable import fsync_directory
 from archive.storage.base import normalize_key
 from targeter.v2.models import isoformat, parse_timestamp
+from universe.event_identity import EventIdentityError, resolve_market_projection
 from universe.market_projection import MARKET_PROJECTION_VERSION
 from universe.projection import PROJECTION_VERSION
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STALE_AFTER_SECONDS = 3_600
 TARGETER_RUN_INTERVAL_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
@@ -53,7 +54,7 @@ class UniverseStore:
                     self._execute_schema_transaction(connection, SCHEMA_PATH)
                 else:
                     raise EvidenceConflict(
-                        "Event Universe schema v4 requires a fresh database; "
+                        "Event Universe schema v5 requires a fresh database; "
                         f"{REBUILD_INSTRUCTION}"
                     )
             elif version != SCHEMA_VERSION:
@@ -87,7 +88,7 @@ class UniverseStore:
         expected = cls._expected_schema()
         if actual != expected:
             raise EvidenceConflict(
-                "database contains an invalid Event Universe schema v4; "
+                "database contains an invalid Event Universe schema v5; "
                 f"{REBUILD_INSTRUCTION}"
             )
 
@@ -200,6 +201,7 @@ class UniverseStore:
         market_projection: Mapping[str, Any],
         occurrences: Iterable[Mapping[str, Any]],
         retirements: Iterable[Mapping[str, Any]],
+        identity_backfill: bool = False,
     ) -> str:
         """Atomically append one verified run and its lifecycle projection."""
         run_id = _nonempty(run_id, "run_id")
@@ -268,7 +270,6 @@ class UniverseStore:
         market_projection = _market_projection(
             market_projection, expected_run_id=run_id, expected_generated_at=generated_at
         )
-        market_sha256, market_row_count = _market_projection_identity(market_projection)
         expected = {
             "run_id": run_id,
             "generated_at": generated_at,
@@ -290,6 +291,27 @@ class UniverseStore:
         }
 
         with self.write_transaction() as connection:
+            lineage = connection.execute(
+                "SELECT state FROM event_identity_lineage WHERE singleton = 1"
+            ).fetchone()
+            if (
+                lineage is not None
+                and lineage["state"] == "running"
+                and not identity_backfill
+            ):
+                raise EvidenceConflict(
+                    "canonical event-identity backfill is running; "
+                    "incremental ingestion is blocked"
+                )
+            try:
+                resolved_market_projection = resolve_market_projection(
+                    connection, market_projection
+                )
+            except EventIdentityError as error:
+                raise EvidenceConflict(str(error)) from error
+            market_sha256, market_row_count = _market_projection_identity(
+                resolved_market_projection
+            )
             existing = connection.execute(
                 "SELECT * FROM targeter_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -349,7 +371,7 @@ class UniverseStore:
             self._insert_market_projection(
                 connection,
                 run_id=run_id,
-                projection=market_projection,
+                projection=resolved_market_projection,
                 projection_sha256=market_sha256,
                 projection_row_count=market_row_count,
                 occurrences=normalized,
@@ -440,33 +462,38 @@ class UniverseStore:
                 (event["event_id"],),
             ).fetchone()
             semantic = {
+                "identity_version": event["identity_version"],
+                "identity_activation_date": event["identity_activation_date"],
+                "identity_ordinal": event["identity_ordinal"],
                 "sport": event["sport"],
                 "game": event["game"],
                 "topology": event["topology"],
-                "participants_json": _canonical_json_value(event["participants"]),
                 "participant_keys_json": _canonical_json_value(
                     event["participant_keys"]
                 ),
-                "event_refs_json": _canonical_json_value(event["event_refs"]),
             }
             if existing is None:
                 connection.execute(
                     """INSERT INTO umbrella_events(
-                           event_id, sport, game, topology, activation_at,
+                           event_id, identity_version,
+                           identity_activation_date, identity_ordinal,
+                           sport, game, topology, activation_at,
                            activation_at_ns, participants_json,
-                           participant_keys_json, event_refs_json,
+                           participant_keys_json,
                            first_seen_run_id, last_seen_run_id
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         event["event_id"],
+                        semantic["identity_version"],
+                        semantic["identity_activation_date"],
+                        semantic["identity_ordinal"],
                         semantic["sport"],
                         semantic["game"],
                         semantic["topology"],
                         event["activation_at"],
                         _timestamp_ns(event["activation_at"]),
-                        semantic["participants_json"],
+                        _canonical_json_value(event["participants"]),
                         semantic["participant_keys_json"],
-                        semantic["event_refs_json"],
                         run_id,
                         run_id,
                     ),
@@ -478,11 +505,13 @@ class UniverseStore:
                     """UPDATE umbrella_events
                        SET activation_at = CASE WHEN ? = ? THEN ? ELSE activation_at END,
                            activation_at_ns = CASE WHEN ? = ? THEN ? ELSE activation_at_ns END,
+                           participants_json = CASE WHEN ? = ? THEN ? ELSE participants_json END,
                            first_seen_run_id = ?, last_seen_run_id = ?
                        WHERE event_id = ?""",
                     (
                         first_seen, run_id, event["activation_at"],
                         first_seen, run_id, _timestamp_ns(event["activation_at"]),
+                        first_seen, run_id, _canonical_json_value(event["participants"]),
                         first_seen, last_seen, event["event_id"],
                     ),
                 )
@@ -817,17 +846,12 @@ class UniverseStore:
                         for member in members
                     ),
                 )
-            bundle = next(
-                decision["bundle_id"]
-                for decision in projection["decisions"]
-                if decision["event_id"] == relation["event_id"]
-            )
             connection.execute(
                 """INSERT INTO relation_observations(
                        run_id, relation_id, bundle_id, event_id, scope, coverage
                    ) VALUES (?, ?, ?, ?, ?, ?)""",
                 (
-                    run_id, relation_id, bundle, relation["event_id"],
+                    run_id, relation_id, relation["bundle_id"], relation["event_id"],
                     relation["scope"], relation["coverage"],
                 ),
             )
@@ -1008,6 +1032,64 @@ class UniverseStore:
                 "SELECT cursor FROM checkpoints WHERE name = ?", (name,)
             ).fetchone()
         return None if row is None else str(row["cursor"])
+
+    def begin_event_identity_backfill(
+        self, generated_start: str, generated_end: str
+    ) -> None:
+        """Claim the one canonical oldest-first identity-allocation lineage."""
+
+        generated_start = _canonical_timestamp(generated_start, "generated_start")
+        generated_end = _canonical_timestamp(generated_end, "generated_end")
+        with self.write_transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM event_identity_lineage WHERE singleton = 1"
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["generated_start"] != generated_start
+                    or existing["generated_end"] != generated_end
+                ):
+                    raise EvidenceConflict(
+                        "canonical event-identity backfill must resume with its "
+                        "original generated-time range"
+                    )
+                return
+            event_count = int(
+                connection.execute("SELECT COUNT(*) FROM umbrella_events").fetchone()[0]
+            )
+            if event_count:
+                raise EvidenceConflict(
+                    "canonical event-identity backfill requires an identity-empty database; "
+                    f"{REBUILD_INSTRUCTION}"
+                )
+            connection.execute(
+                """INSERT INTO event_identity_lineage(
+                       singleton, generated_start, generated_end, state
+                   ) VALUES (1, ?, ?, 'running')""",
+                (generated_start, generated_end),
+            )
+
+    def complete_event_identity_backfill(
+        self, generated_start: str, generated_end: str
+    ) -> None:
+        generated_start = _canonical_timestamp(generated_start, "generated_start")
+        generated_end = _canonical_timestamp(generated_end, "generated_end")
+        with self.write_transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE event_identity_lineage SET state = 'complete'
+                   WHERE singleton = 1 AND generated_start = ?
+                     AND generated_end = ?""",
+                (generated_start, generated_end),
+            )
+            if cursor.rowcount != 1:
+                raise EvidenceConflict("canonical event-identity backfill lineage is missing")
+
+    def event_identity_backfill_running(self) -> bool:
+        with closing(self.connect(readonly=True)) as connection:
+            row = connection.execute(
+                "SELECT state FROM event_identity_lineage WHERE singleton = 1"
+            ).fetchone()
+        return row is not None and row["state"] == "running"
 
     def record_sync_failure(
         self, manifest_key: str, error: str, *, now_ns: int
@@ -1365,7 +1447,8 @@ class UniverseStore:
                 (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             events = connection.execute(
-                """SELECT DISTINCT event.*
+                f"""SELECT DISTINCT event.*,
+                          {_event_refs_sql('event')} AS event_refs_json
                    FROM umbrella_events event
                    JOIN event_observations observed USING (event_id)
                    WHERE observed.run_id = ?
@@ -1438,6 +1521,7 @@ class UniverseStore:
                          LIMIT ?
                      )
                      SELECT page.*,
+                            {_event_refs_sql('page')} AS event_refs_json,
                             (SELECT COUNT(DISTINCT venue.venue)
                              FROM venue_events venue
                              WHERE venue.event_id = page.event_id) AS venue_count,
@@ -1456,7 +1540,10 @@ class UniverseStore:
     def event_detail(self, event_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:
             event = connection.execute(
-                "SELECT * FROM umbrella_events WHERE event_id = ?", (event_id,)
+                f"""SELECT event.*,
+                          {_event_refs_sql('event')} AS event_refs_json
+                   FROM umbrella_events event WHERE event_id = ?""",
+                (event_id,),
             ).fetchone()
             if event is None:
                 return None
@@ -2468,6 +2555,9 @@ def _event_record(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
     record = {
         "event_id": row["event_id"],
+        "identity_version": row["identity_version"],
+        "identity_activation_date": row["identity_activation_date"],
+        "identity_ordinal": row["identity_ordinal"],
         "sport": row["sport"],
         "game": row["game"],
         "topology": row["topology"],
@@ -2482,6 +2572,18 @@ def _event_record(row: sqlite3.Row) -> dict[str, Any]:
         if field in keys:
             record[field] = int(row[field])
     return record
+
+
+def _event_refs_sql(event_alias: str) -> str:
+    return f"""COALESCE((
+        SELECT json_group_array(alias.event_ref)
+        FROM (
+            SELECT venue || ':' || venue_event_id AS event_ref
+            FROM venue_events
+            WHERE event_id = {event_alias}.event_id
+            ORDER BY venue, venue_event_id
+        ) alias
+    ), '[]')"""
 
 
 def _canonical_market_record(row: sqlite3.Row) -> dict[str, Any]:

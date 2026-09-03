@@ -1,4 +1,4 @@
-# Event/Market Universe Store V2
+# Event/Market Universe Store V3
 
 **Status:** implemented contract. The historical filename is retained so
 existing documentation links remain valid.
@@ -47,23 +47,45 @@ normalized catalogue artifacts are each capped at 128 MiB decoded per run.
 
 ## 3. Canonical identity
 
-An umbrella event ID is a deterministic digest of sport, optional game and
-topology, sorted participant keys, and the complete sorted set of native event
-references `(venue, venue_event_id)`. Activation time is deliberately excluded:
-catalogues can revise it without changing the event. Each run records its
-observed activation in `event_observations`; the umbrella row exposes the
-chronologically first observation as its canonical display/sort value.
+Umbrella identity is allocated by Universe, not by Targeter and not by SQLite
+row order. Targeter remains the source of matched cross-venue candidate
+evidence. Its per-bundle projection ID is only a transaction-local proposal.
+During ingestion, Universe resolves every native event reference
+`(venue, venue_event_id)` through the durable `venue_events` alias edges:
 
-The exact reference set is identity, not an incrementally merged alias set.
-Adding or removing a venue reference therefore produces a distinct umbrella
-ID. If either set reuses a native reference already bound to the other ID,
-ingestion fails closed. Venue-native event and market identities are assumed to
-be globally unique and never reused by their venue.
+1. if all known aliases name one umbrella event, reuse it and attach any new
+   native aliases;
+2. if no alias is known, allocate a new domain identity; and
+3. if aliases name more than one umbrella event, fail the transaction closed.
 
-The earlier selected-bundle V1 contract treated activation as versioned bundle
-context, not as a cross-run umbrella identity. Activation entered the new
-normalized identity when schema v3 was introduced; this contract corrects that
-drift while retaining every observed value for audit.
+The version-1 identity preimage is canonical JSON containing:
+
+- `identity_version = 1`;
+- sport, optional game, and optional topology;
+- sorted participant keys;
+- the UTC calendar date of activation observed when the identity is allocated;
+  and
+- an immutable zero-based ordinal for otherwise equal events on that date.
+
+The public ID is `event:d1:<sha256>`, where the full lowercase SHA-256 digest is
+over that preimage. Native references, exact activation time, bundle ID, event
+title, participant display names, and venue membership are not in the preimage.
+The first allocation uses ordinal 0; a disjoint same-day occurrence with equal
+domain coordinates receives the next available ordinal in the same write
+transaction. Ordinals are never renumbered.
+
+`identity_activation_date` is frozen once allocated. Each run separately
+records its exact observed activation in `event_observations`, and the umbrella
+row exposes the chronologically first observation as its display/sort time.
+Postponement across midnight therefore does not churn an identity when at least
+one native alias survives. The native alias is authoritative for continuity;
+if every venue replaces every native ID simultaneously, current evidence cannot
+prove continuity and Universe allocates a separate event rather than guessing.
+
+Venue-native event and market identities are assumed to be globally unique and
+never reused by their venue. Reusing a known alias with different sport, game,
+topology, or participant keys fails closed. Participant order and display-name
+changes do not matter when the normalized participant-key set is unchanged.
 
 A canonical market ID is a deterministic digest of:
 
@@ -76,8 +98,8 @@ A canonical market ID is a deterministic digest of:
 They are not hidden in the canonical market ID.
 
 First- and last-seen run IDs make continuity explicit. Re-ingesting the same
-verified run is idempotent. A venue-native identity that is assigned to a
-different umbrella event fails closed.
+verified run is idempotent. API `event_refs` are derived in stable order from
+the alias edges rather than stored as immutable umbrella content.
 
 ## 4. Relationships
 
@@ -110,21 +132,23 @@ not represented as an exact event end.
 
 ## 6. SQLite schema and rebuild
 
-Runtime schema version is 4 and is initialized from one canonical resource:
+Runtime schema version is 5 and is initialized from one canonical resource:
 
 ```text
 universe/schema/schema.sql
 ```
 
-Schema v4 intentionally has no in-place migration. Before deploying this
+Schema v5 intentionally has no in-place migration. Before deploying this
 version, stop Universe jobs and remove the existing rebuildable SQLite database
 (including its WAL/SHM siblings), then run backfill against the immutable
-archive. Starting against schema v1/v2/v3 fails with a clear rebuild instruction.
+archive. Starting against schema v1/v2/v3/v4 fails with a clear rebuild
+instruction.
 
 Each admitted run and both projections are inserted in one `BEGIN IMMEDIATE`
 transaction with foreign keys, WAL, and `synchronous=FULL`. A projection
-identity detects changed re-ingestion input. SQLite backup uses the native
-online backup API followed by `integrity_check`.
+identity over the resolved public event/market rows detects changed
+re-ingestion output. SQLite backup uses the native online backup API followed
+by `integrity_check`.
 
 ## 7. Sync and backfill
 
@@ -144,7 +168,27 @@ batches, emits one progress record per batch, and checkpoints each committed
 batch in SQLite. Restarting the same range resumes after its durable cursor.
 Origin dependencies may be ingested outside that range when required to prove
 continuity. Backfill has an independent range checkpoint, so running an initial
-incremental sync cannot make older configured history unreachable.
+incremental sync cannot make older source evidence undiscoverable. However, a
+canonical identity rebuild must start from an identity-empty database as
+described below.
+
+Because ordinals disambiguate evidence that has no surviving alias edge, a
+canonical rebuild must ingest the retained archive oldest-first over the same
+configured history range. This makes ordinal allocation, IDs, and API links
+repeatable across rebuilds. Periodic sync then appends ordinals but never
+renumbers them. The newest-run bootstrap is an operational recovery path, not a
+substitute for the documented oldest-first full rebuild when historical link
+determinism is required.
+
+`event_identity_lineage` claims that generated-time range before the first
+allocation. A new claim requires an identity-empty database; a resume must use
+the exact same bounds. Backfill stops at the first valid manifest that fails,
+does not advance its cursor past that manifest, and blocks incremental sync
+until the range completes. This prevents a later rematch from taking an older
+event's ordinal while the older evidence is temporarily unavailable. The
+determinism guarantee assumes the same immutable manifest set and configured
+range; changing the retained history set requires a fresh rebuild and may
+change ordinals for otherwise indistinguishable same-day occurrences.
 
 Incomplete and complete-empty runs remain visible. Incomplete runs create no
 event, venue-event, market, venue-market, candidate-decision, relationship, or
@@ -180,7 +224,7 @@ limits are 1–100 and list cursors are opaque and query-specific.
 | `GET /healthz` | Schema, latest run, staleness, and normalized counts |
 | `GET /v1/targeter/status?limit=5` | Compact landing status and newest complete selection counts |
 | `GET /v1/targeter/runs/<run_id>` | Bounded decisions and normalized event/market/relation references |
-| `GET /v1/events?limit=&cursor=` | Canonical event summaries |
+| `GET /v1/events?limit=&cursor=` | Canonical event summaries with identity coordinates and native aliases |
 | `GET /v1/events/<event_id>` | Event, venue events, canonical markets, relations, observations |
 | `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, relations |
 | `GET /v1/relations/<relation_id>` | Relation, normalized members, observations |
