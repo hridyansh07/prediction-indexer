@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { InfiniteQueryObserver, QueryObserver } from '@tanstack/react-query';
 import express from 'express';
 import {
@@ -177,6 +179,7 @@ const normalizedEventSummary = () => ({
   activation_at: '2026-08-20T14:00:00Z',
   participants: ['Alpha', 'Beta'],
   participant_keys: ['alpha', 'beta'],
+  event_refs: ['kalshi:event-a', 'polymarket:event-b'],
   first_seen_run_id: run().run_id,
   last_seen_run_id: run().run_id,
 });
@@ -290,6 +293,7 @@ const normalizedEvent = () => ({
       run_id: run().run_id,
       generated_at: run().generated_at,
       bundle_id: 'bundle alpha',
+      observed_activation_at: '2026-08-20T14:00:00Z',
     },
   ],
 });
@@ -388,6 +392,78 @@ const json = (value: unknown, init: ResponseInit = {}) =>
     headers: { 'content-type': 'application/json', ...init.headers },
     ...init,
   });
+
+type ContractCase = { name: string; path: string; body: any };
+
+function realUniverseContract(): ContractCase[] {
+  const repository = new URL('../..', import.meta.url);
+  const document = JSON.parse(
+    execFileSync(
+      fileURLToPath(new URL('.venv/bin/python', repository)),
+      ['-m', 'tests.generate_event_universe_contract'],
+      { cwd: fileURLToPath(repository), encoding: 'utf8' },
+    ),
+  );
+  assert.equal(document.fixture_version, 1);
+  assert.equal(document.schema_version, 4);
+  return document.cases;
+}
+
+async function proxyContractCase(contract: ContractCase) {
+  const [pathname, query = ''] = contract.path.split('?');
+  return handleEventUniverseProxy(
+    new Request(
+      `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(pathname)}${query ? `&${query}` : ''}`,
+    ),
+    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
+    (async () => json(contract.body)) as typeof fetch,
+  );
+}
+
+test('real UniverseApplication responses satisfy all eight proxy contracts', async () => {
+  const contracts = realUniverseContract();
+  assert.deepEqual(
+    contracts.map(({ name }) => name),
+    [
+      'health_ok',
+      'targeter_status',
+      'runs',
+      'selections',
+      'bundles',
+      'events',
+      'event_detail',
+      'targeter_run',
+      'health_degraded',
+    ],
+  );
+  for (const contract of contracts) {
+    const response = await proxyContractCase(contract);
+    assert.equal(response.status, 200, contract.name);
+    assert.deepEqual(await response.json(), contract.body, contract.name);
+  }
+  const degraded = contracts.find(({ name }) => name === 'health_degraded')!;
+  assert.equal(degraded.body.status, 'degraded');
+  assert.equal(degraded.body.sync.pending_failures, 1);
+});
+
+test('real Universe contracts remain closed to key-set drift', async () => {
+  const contracts = new Map(
+    realUniverseContract().map((contract) => [contract.name, contract]),
+  );
+  const mutations: Array<[string, (body: any) => void]> = [
+    ['health_ok', (body) => (body.unexpected = true)],
+    ['health_degraded', (body) => (body.sync.pending_failures = 0)],
+    ['events', (body) => delete body.events[0].event_refs],
+    ['event_detail', (body) => (body.observations[0].unexpected = true)],
+    ['targeter_run', (body) => delete body.events[0].event_refs],
+  ];
+  for (const [name, mutate] of mutations) {
+    const contract = structuredClone(contracts.get(name)!);
+    mutate(contract.body);
+    const response = await proxyContractCase(contract);
+    assert.equal(response.status, 502, name);
+  }
+});
 
 test('proxy allowlists one encoded value per supported query field', async () => {
   let requested = '';
@@ -769,6 +845,8 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   );
   assert.match(source, /run\?\.events/);
   assert.match(source, /useEventDetail\(detailId\)/);
+  assert.match(source, /detail\.event\.event_refs\.map/);
+  assert.match(source, /observation\.observed_activation_at/);
   assert.match(
     source,
     /document\.activeElement === element[\s\S]*event\.shiftKey \? last : first/,
@@ -1276,6 +1354,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
           venue_markets: 3618,
           relations: 733,
         },
+        sync: { pending_failures: 0 },
       });
     }) as typeof fetch,
   );

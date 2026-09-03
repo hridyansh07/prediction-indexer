@@ -430,6 +430,12 @@ function NormalizedTargetDrawer({
           </span>
         </div>
         <div className="drawer-body market-list">
+          {detail.event.event_refs.map((reference) => (
+            <div className="proof-card" key={reference}>
+              <b>Venue event reference</b>
+              <code>{reference}</code>
+            </div>
+          ))}
           {markets.map((market) => (
             <div
               className="market-row"
@@ -449,6 +455,18 @@ function NormalizedTargetDrawer({
                 {label(relation.relation_type)} · {label(relation.coverage)}
               </b>
               <code>Relation {relation.relation_id}</code>
+            </div>
+          ))}
+          {detail.observations.map((observation) => (
+            <div
+              className="proof-card"
+              key={`${observation.run_id}:${observation.bundle_id}`}
+            >
+              <b>
+                Activation observed {date(observation.observed_activation_at)}
+              </b>
+              <span>Indexed from {date(observation.generated_at)}</span>
+              <code>{observation.run_id}</code>
             </div>
           ))}
         </div>

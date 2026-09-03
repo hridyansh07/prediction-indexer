@@ -190,6 +190,7 @@ export interface UniverseEvent {
   activation_at: string;
   participants: string[];
   participant_keys: string[];
+  event_refs: string[];
   first_seen_run_id: string;
   last_seen_run_id: string;
   venue_count?: number;
@@ -253,6 +254,7 @@ export interface UniverseEventDetail {
     run_id: string;
     generated_at: string;
     bundle_id: string;
+    observed_activation_at: string;
   }>;
 }
 
@@ -389,7 +391,7 @@ export interface UniverseTargeterRunDetail {
 }
 
 export interface UniverseHealth {
-  status: 'ok';
+  status: 'ok' | 'degraded';
   schema_version: 4;
   latest_run: {
     run_id: string;
@@ -410,6 +412,9 @@ export interface UniverseHealth {
     canonical_markets: number;
     venue_markets: number;
     relations: number;
+  };
+  sync: {
+    pending_failures: number;
   };
 }
 

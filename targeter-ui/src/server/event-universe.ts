@@ -1179,6 +1179,7 @@ function validateEventPage(value: unknown): UniverseEventPage {
         'activation_at',
         'participants',
         'participant_keys',
+        'event_refs',
         'first_seen_run_id',
         'last_seen_run_id',
         'venue_count',
@@ -1524,13 +1525,14 @@ export function validateEventDetail(value: unknown): UniverseEventDetail {
     observations: detailArray(item.observations, (value) => {
       const record = object(
         value,
-        ['run_id', 'generated_at', 'bundle_id'],
+        ['run_id', 'generated_at', 'bundle_id', 'observed_activation_at'],
         'event observation',
       );
       return {
         run_id: text(record.run_id),
         generated_at: timestamp(record.generated_at),
         bundle_id: text(record.bundle_id),
+        observed_activation_at: timestamp(record.observed_activation_at),
       };
     }),
   };
@@ -1547,6 +1549,7 @@ function validateEvent(value: unknown) {
       'activation_at',
       'participants',
       'participant_keys',
+      'event_refs',
       'first_seen_run_id',
       'last_seen_run_id',
     ],
@@ -1560,6 +1563,7 @@ function validateEvent(value: unknown) {
     activation_at: timestamp(item.activation_at),
     participants: strings(item.participants),
     participant_keys: strings(item.participant_keys),
+    event_refs: strings(item.event_refs),
     first_seen_run_id: text(item.first_seen_run_id),
     last_seen_run_id: text(item.last_seen_run_id),
   };
@@ -1694,10 +1698,13 @@ function validateRunDetail(value: unknown): UniverseRunDetail {
 function validateHealth(value: unknown): UniverseHealth {
   const item = object(
     value,
-    ['status', 'schema_version', 'latest_run', 'counts'],
+    ['status', 'schema_version', 'latest_run', 'counts', 'sync'],
     'health',
   );
-  if (item.status !== 'ok' || item.schema_version !== 4)
+  if (
+    !['ok', 'degraded'].includes(text(item.status)) ||
+    item.schema_version !== 4
+  )
     throw new UniverseUpstreamError();
   const counts = object(
     item.counts,
@@ -1714,6 +1721,13 @@ function validateHealth(value: unknown): UniverseHealth {
     ],
     'counts',
   );
+  const sync = object(item.sync, ['pending_failures'], 'sync');
+  const pendingFailures = integer(sync.pending_failures);
+  if (
+    (item.status === 'ok' && pendingFailures !== 0) ||
+    (item.status === 'degraded' && pendingFailures === 0)
+  )
+    throw new UniverseUpstreamError();
   let latest = null;
   if (item.latest_run !== null) {
     const run = object(
@@ -1740,7 +1754,7 @@ function validateHealth(value: unknown): UniverseHealth {
     };
   }
   return {
-    status: 'ok',
+    status: item.status as UniverseHealth['status'],
     schema_version: 4,
     latest_run: latest,
     counts: {
@@ -1754,6 +1768,7 @@ function validateHealth(value: unknown): UniverseHealth {
       venue_markets: integer(counts.venue_markets),
       relations: integer(counts.relations),
     },
+    sync: { pending_failures: pendingFailures },
   };
 }
 
