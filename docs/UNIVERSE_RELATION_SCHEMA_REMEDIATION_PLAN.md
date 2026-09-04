@@ -183,7 +183,27 @@ data we already have, before any schema is touched.
 
 ### Phase 1 — falsification spike (gate; offline; no schema change)
 
-Nothing is built until this passes.
+**Implemented.** `analysis/claims.py` carries the model; `derive_bundle_claims`
+(`targeter/v2/relationships.py`) compiles claims through `_scope_masks`, the same
+path `derive_bundle_relationships` uses, so the two cannot drift.
+`tests/test_claims.py` locks the properties and runs the reconstruction diff
+against real bundle fixtures; `scripts/verify_claim_model.py` runs the same gate
+against a built database.
+
+Offline result: on two-venue esports bundles the reconstruction reproduces the
+cross-venue non-OVERLAP relation set **exactly** (12/12 on BO3-with-maps, 8/8 on
+BO5-with-maps), while a BO3 bundle's 66 pairwise edges collapse to 8 claims and 8
+claim relations — and those 8 relations are reusable by every other BO3 event.
+
+**Still required before Phase 3:** the same gate against the real archive. The
+fixtures prove the model is sound; only `/srv/event-universe/build/universe-v5.sqlite3`
+proves it matches what the venues actually publish.
+
+```sh
+python scripts/verify_claim_model.py --database /srv/event-universe/build/universe-v5.sqlite3
+```
+
+Nothing in the schema moves until that reports `defect_count: 0`.
 
 1. Recompute claims for archived runs via Path A. Enumerate distinct
    `(space_shape, outcome_keys)` over the full history and the resulting relation

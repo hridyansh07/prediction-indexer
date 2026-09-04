@@ -2017,5 +2017,49 @@ class EventUniverseTests(unittest.TestCase):
             load_config(path)
 
 
+class ClaimModelVerificationTests(unittest.TestCase):
+    """The real-data gate reads a built database without recompiling masks."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.database = UniverseStore(self.root / "universe.sqlite3")
+        self.database.initialize()
+        self.objects = LocalObjectStore(
+            self.root / "objects", store_id="archive", durability=INDEPENDENT
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _report(self) -> dict:
+        for run, generated in ((R1, G1), (R2, G2), (R3, G3)):
+            _publish_run(self.objects, _selection_report(run, generated))
+        UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 1, 0, 31, tzinfo=timezone.utc)
+        )
+        import scripts.verify_claim_model as gate
+
+        with gate._connect(self.database.path) as connection:
+            return {
+                "dead_weight": gate._dead_weight(connection),
+                "pressure": gate._observation_pressure(connection),
+                "partition": gate._claims_per_run(connection, None),
+            }
+
+    def test_gate_partitions_a_built_database_without_defects(self) -> None:
+        report = self._report()
+        self.assertEqual(report["partition"]["defect_count"], 0)
+        self.assertGreater(report["partition"]["runs_checked"], 0)
+        self.assertGreater(report["partition"]["claims"], 0)
+
+    def test_gate_reports_dead_weight_and_row_pressure(self) -> None:
+        report = self._report()
+        self.assertGreater(report["dead_weight"]["distinct_relations"], 0)
+        self.assertIsNotNone(report["dead_weight"]["dead_weight_fraction"])
+        self.assertFalse(report["pressure"]["run_detail_already_unservable"])
+        self.assertEqual(report["pressure"]["detail_row_limit"], DETAIL_ROW_LIMIT)
+
+
 if __name__ == "__main__":
     unittest.main()
