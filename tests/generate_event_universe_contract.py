@@ -1,4 +1,4 @@
-"""Emit deterministic responses from the real schema-v4 Universe application."""
+"""Emit deterministic responses from the current Event Universe application."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from unittest import mock
 from archive.storage import INDEPENDENT, LocalObjectStore
 from tests.test_event_universe_store import R1, G1, _publish_run, _selection_report
 from universe.api import UniverseApplication
-from universe.store import UniverseStore
+from universe.store import SCHEMA_VERSION, UniverseStore
 from universe.sync import UniverseSync
 
 FIXED_NOW_NS = 1_767_226_200_000_000_000
@@ -82,7 +82,11 @@ def generate_contract() -> dict:
                     _response(application, "/healthz"),
                 )
             )
-    return {"fixture_version": 1, "schema_version": 4, "cases": cases}
+    return {
+        "fixture_version": 1,
+        "schema_version": SCHEMA_VERSION,
+        "cases": cases,
+    }
 
 
 def _response(application: UniverseApplication, path: str) -> dict:

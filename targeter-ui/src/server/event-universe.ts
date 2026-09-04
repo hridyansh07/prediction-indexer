@@ -3,6 +3,7 @@ import {
   type Request,
   type Response as ExpressResponse,
 } from 'express';
+import { EVENT_UNIVERSE_SCHEMA_VERSION } from '../event-universe.js';
 import type {
   RetirementDisposition,
   UniverseAudit,
@@ -1173,6 +1174,9 @@ function validateEventPage(value: unknown): UniverseEventPage {
       value,
       [
         'event_id',
+        'identity_version',
+        'identity_activation_date',
+        'identity_ordinal',
         'sport',
         'game',
         'topology',
@@ -1543,6 +1547,9 @@ function validateEvent(value: unknown) {
     value,
     [
       'event_id',
+      'identity_version',
+      'identity_activation_date',
+      'identity_ordinal',
       'sport',
       'game',
       'topology',
@@ -1555,8 +1562,13 @@ function validateEvent(value: unknown) {
     ],
     'event',
   );
+  const identityVersion = integer(item.identity_version);
+  if (identityVersion !== 1) throw new UniverseUpstreamError();
   return {
     event_id: text(item.event_id),
+    identity_version: 1 as const,
+    identity_activation_date: text(item.identity_activation_date),
+    identity_ordinal: integer(item.identity_ordinal),
     sport: text(item.sport),
     game: item.game === null ? null : text(item.game),
     topology: item.topology === null ? null : text(item.topology),
@@ -1703,7 +1715,7 @@ function validateHealth(value: unknown): UniverseHealth {
   );
   if (
     !['ok', 'degraded'].includes(text(item.status)) ||
-    item.schema_version !== 4
+    item.schema_version !== EVENT_UNIVERSE_SCHEMA_VERSION
   )
     throw new UniverseUpstreamError();
   const counts = object(
@@ -1755,7 +1767,7 @@ function validateHealth(value: unknown): UniverseHealth {
   }
   return {
     status: item.status as UniverseHealth['status'],
-    schema_version: 4,
+    schema_version: EVENT_UNIVERSE_SCHEMA_VERSION,
     latest_run: latest,
     counts: {
       targeter_runs: integer(counts.targeter_runs),
