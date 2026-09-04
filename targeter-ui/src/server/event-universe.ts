@@ -3,6 +3,7 @@ import {
   type Request,
   type Response as ExpressResponse,
 } from 'express';
+import { EVENT_UNIVERSE_SCHEMA_VERSION } from '../event-universe.js';
 import type {
   RetirementDisposition,
   UniverseAudit,
@@ -1714,7 +1715,7 @@ function validateHealth(value: unknown): UniverseHealth {
   );
   if (
     !['ok', 'degraded'].includes(text(item.status)) ||
-    item.schema_version !== 5
+    item.schema_version !== EVENT_UNIVERSE_SCHEMA_VERSION
   )
     throw new UniverseUpstreamError();
   const counts = object(
@@ -1766,7 +1767,7 @@ function validateHealth(value: unknown): UniverseHealth {
   }
   return {
     status: item.status as UniverseHealth['status'],
-    schema_version: 5,
+    schema_version: EVENT_UNIVERSE_SCHEMA_VERSION,
     latest_run: latest,
     counts: {
       targeter_runs: integer(counts.targeter_runs),

@@ -29,6 +29,7 @@ import {
   universeKeys,
 } from '../src/client/universe-queries.js';
 import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
+import { EVENT_UNIVERSE_SCHEMA_VERSION } from '../src/event-universe.js';
 import type {
   UniverseRun,
   UniverseSelection,
@@ -408,7 +409,7 @@ function realUniverseContract(): ContractCase[] {
     ),
   );
   assert.equal(document.fixture_version, 1);
-  assert.equal(document.schema_version, 4);
+  assert.equal(document.schema_version, EVENT_UNIVERSE_SCHEMA_VERSION);
   return document.cases;
 }
 
@@ -1344,7 +1345,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
       assert.equal(String(input), 'https://universe.internal/healthz');
       return json({
         status: 'ok',
-        schema_version: 5,
+        schema_version: EVENT_UNIVERSE_SCHEMA_VERSION,
         latest_run: null,
         counts: {
           targeter_runs: 653,
@@ -1362,7 +1363,10 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
     }) as typeof fetch,
   );
   assert.equal(health.status, 200);
-  assert.equal((await health.clone().json()).schema_version, 5);
+  assert.equal(
+    (await health.clone().json()).schema_version,
+    EVENT_UNIVERSE_SCHEMA_VERSION,
+  );
 
   // A route with its own allow-listed parameters must keep them and still shed
   // the echo, rather than the proxy stripping everything indiscriminately.

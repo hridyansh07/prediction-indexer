@@ -1,3 +1,5 @@
+export const EVENT_UNIVERSE_SCHEMA_VERSION = 5 as const;
+
 export type UniverseSort = 'activation' | 'selected';
 export type OccurrenceKind = 'complete' | 'retained';
 export type SelectionDisposition = 'held_current_candidate' | 'retained' | null;
@@ -395,7 +397,7 @@ export interface UniverseTargeterRunDetail {
 
 export interface UniverseHealth {
   status: 'ok' | 'degraded';
-  schema_version: 5;
+  schema_version: typeof EVENT_UNIVERSE_SCHEMA_VERSION;
   latest_run: {
     run_id: string;
     generated_at: string;

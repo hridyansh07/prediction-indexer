@@ -54,7 +54,7 @@ class UniverseStore:
                     self._execute_schema_transaction(connection, SCHEMA_PATH)
                 else:
                     raise EvidenceConflict(
-                        "Event Universe schema v5 requires a fresh database; "
+                        f"Event Universe schema v{SCHEMA_VERSION} requires a fresh database; "
                         f"{REBUILD_INSTRUCTION}"
                     )
             elif version != SCHEMA_VERSION:
@@ -88,7 +88,7 @@ class UniverseStore:
         expected = cls._expected_schema()
         if actual != expected:
             raise EvidenceConflict(
-                "database contains an invalid Event Universe schema v5; "
+                f"database contains an invalid Event Universe schema v{SCHEMA_VERSION}; "
                 f"{REBUILD_INSTRUCTION}"
             )
 
