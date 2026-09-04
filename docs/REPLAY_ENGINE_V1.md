@@ -1575,9 +1575,9 @@ transition arrived, every delivery is complete, or H2→H3 suffix completeness.
 Polymarket publishes no dense source sequence. Our delivery index proves recorder
 accepted-order continuity only.
 
-**Recommended pending §14 approval: two-pass is the normative V1 oracle and
-default.** Pass one indexes every independent snapshot occurrence without
-collapsing equal `(asset, hash)` pairs.
+**Approved for V1: two-pass is the normative oracle and default.** Pass one
+indexes every independent snapshot occurrence without collapsing equal
+`(asset, hash)` pairs.
 Pass two reconstructs WebSocket state, closes the approved candidate run,
 compares the historical frontier, resets scratch state to the full anchor when
 appropriate, and replays the exact captured suffix to the later frontier. It
@@ -1668,27 +1668,198 @@ publisher writes immutable segment objects, and neither can delete archive data.
 
 ## 14. Approval checklist and completion gates
 
-The evidence constrains safe behavior but does not choose product policy. Every
-item below remains **pending explicit user approval**. Implementations may expose
-the alternatives behind types/tests, but may not silently select one in a
-committed segment or headline result.
+The evidence constrains safe behavior but does not choose product policy. This
+ledger records the user's numbered response on 2026-09-04. “Approved” means the
+exact contract is settled. “Partial” or “conditional” does not authorize the
+recommended default. Implementations may expose unresolved alternatives behind
+types and tests but may not select one in a committed segment or headline result.
 
-| Decision | Recommended default | Alternatives and consequence |
-|---|---|---|
-| Offline Polymarket trust algorithm | Two-pass oracle for V1; one-pass experimental only until the §12.9 differential gate passes. | Shipping one-pass earlier reduces I/O but knowingly permits unmeasured journal/fallback divergence. |
-| Candidate completion | Preserve every address; test the end of a maximal contiguous same-asset same-hash run. Treat this as a versioned observed rule. | Per-delivery is disproven. Any broader equal-hash pooling destroys address evidence and is prohibited. |
-| Economic evaluation across a candidate run | Evaluate each canonical delivery normally; use the completed run only for verification and retrospective demotion. | Waiting until run end avoids transient partial-state episodes but invents economic atomicity not established by the protocol. Whichever is chosen changes episode boundaries and must enter the policy identity. |
-| Non-contiguous recurrence and epoch/fault crossing | `AmbiguousAnchor` for recurrence; `MissingSuffix` across epoch, parse reject, missing address, or continuity fault. | Nearest-time or arbitrary candidate selection can certify the wrong historical frontier and is prohibited. |
-| One-pass journal bound | Do not choose a production number from the ten-minute sample; run a predeclared 72-hour study (24-hour minimum), then approve event, byte, and time caps together. | A time-only cap below 155.659 s is already falsified. Larger/unbounded retention increases memory/storage and defeats bounded operation. |
-| `AnchorPending` horizon | Keep pending until the run closes, a later event disambiguates it, or the approved journal/window bound is reached; then fail closed. | Immediate mismatch misclassifies the six observed post-receipt candidates; indefinite pending is unbounded. |
-| One-pass failure handling | Keep the asset unusable for that result. Permit two-pass only as an explicit separately identified retry/fallback. | Silent in-run fallback makes output semantics and resource bounds unknowable. Waiting only for a later full anchor is safer but can lose more measurable time. |
-| Canonical lower-bound policy | `LowerBoundPolicy::Clip`: audit the whole first window, emit only `[T0 − prologue, T1)`. | `RequireWindowBoundary` forces resolver alignment; `ExpandToWindowStart` adds evidence and changes effective scope. The chosen policy enters segment identity. |
-| Canonical certification policy | `RequireCertified` for committed/headline Replay. Allow uncertified windows only in a separately typed diagnostic run. | `AllowUncertified` increases coverage but admits known quarantined evidence; a flag inside a headline run is too easy to drop. |
-| Initial Polymarket full-book trust | Start unsequenced WebSocket-derived state as `Provisional`; headline eligibility begins only at the approved independent-anchor condition. | Immediate `Usable` preserves current behavior but allows pre-verification episodes and relies entirely on later demotion. |
-| Deployment lane attribution | Require a versioned lane-role map; runtime subscription evidence may refine but not contradict it. Unknown attribution makes the affected scope unobservable. | Treating a missing unattributed lane as quiet converts capture blindness into false absence. |
-| Money/fee inputs | Pin fixed-point scales, orientation, rounding, offline fee schedule keys, and SDK versions before Phase 2 headlines. | Current SDK/service lookup is nondeterministic for historical runs; floating point or implicit conversion makes exact replay impossible. |
+| # | Decision | Status | Recorded disposition |
+|---:|---|---|---|
+| 1 | Offline Polymarket trust algorithm | **Approved** | Two-pass is the V1 production/offline oracle and default. One-pass remains experimental until the §12.9 differential gate passes. The old `BookReplay` also used two passes; the retired gate ladder made several complete tape walks, but that fact alone did not provide this address-preserving anchor/suffix contract. |
+| 2 | Candidate completion | **Pending explanation/decision** | No run rule approved yet. Every canonical address must be retained regardless of the eventual rule. See §14.1.1. |
+| 3 | Strategy evaluation cadence | **Conditional** | The user generally approved per-delivery evaluation but correctly conditioned observability on strategy semantics. No single global cadence is approved. See §14.1.2. |
+| 4 | Unknown controls and unusable books | **Partial** | It is approved that fail-closed handling may make order books unavailable. It is not yet explicit whether every unknown control on a relevant attributed lane must stale its books, including a control later shown to be operational-only. See §14.1.3. |
+| 5 | One-pass journal bound | **Approved as a measurement process, not a number** | Run a predeclared 72-hour study (24-hour minimum), then approve time, event, and byte caps together. No production bound is approved; below 155.659 seconds is already falsified. |
+| 6 | `AnchorPending` horizon | **Pending clarification** | The user asked whether anchors are snapshots; they are the independently polled REST `/books` full-book responses. No timeout/finalization rule was approved. See §14.1.4. |
+| 7 | One-pass failure handling | **Pending explanation/decision** | Whether an automatic but explicitly identified two-pass retry is allowed remains open. Silent fallback remains prohibited by the evidence contract. See §14.1.5. |
+| 8 | Canonical lower-bound policy | **Not approved; premise corrected** | `Clip` removes canonical records before the requested bound after auditing the whole first window. It neither carries forward previous prices nor applies a tick tolerance. See §14.1.6. |
+| 9 | Canonical certification policy | **Pending explanation/decision** | No headline/diagnostic policy was approved. See §14.1.7. |
+| 10 | Initial Polymarket trust | **Partial** | Starting provisional was approved. “Until first snapshot” is ambiguous between an in-stream WebSocket `book` bootstrap and an independent REST `/books` anchor, so the promotion condition is not approved. See §14.1.4. |
+| 11 | Deployment lane attribution | **Pending explanation/decision** | `indexer-finalize` detects missing/invalid lanes and preserves provenance, but cannot infer which Replay instruments a wholly absent or pre-prologue lane carried. See §14.1.8. |
+| 12 | Money and fee inputs | **Conditional** | Fixed-point/economic semantics are approved only in conjunction with the economics implementation. The minimum boundary primitives versus deferred fee policy still need confirmation. See §14.1.9. |
 
-### 14.1 Phase acceptance
+### 14.1 Clarifications and exact decision requests
+
+#### 14.1.1 Same-hash candidate completion (#2)
+
+A *maximal contiguous same-asset/same-hash candidate run* is the longest sequence
+of adjacent canonical WebSocket deliveries for one asset carrying hash H, ending
+before that asset next carries a different hash. Example:
+
+```text
+address 40  asset A  hash H  apply size 2  → levels do not match REST H
+address 41  asset A  hash H  apply size 3  → levels match REST H
+address 42  asset A  hash J                → H run is closed at address 41
+```
+
+The ten observed split candidates had this shape. Address 40 cannot be erased:
+it proves per-delivery certification is false, can delimit retrospective distrust,
+and may have been visible to a causal strategy. Address 41 is the evidenced H
+frontier. Pooling all H occurrences would also confuse a later non-contiguous H
+at address 90 with this run. What remains uncertain is whether maximal-contiguous
+completion is a stable venue rule; the sample saw no reconnect or non-contiguous
+WebSocket recurrence.
+
+**Decision request:** approve the maximal contiguous same-asset/same-hash rule as
+a versioned V1 *anchor-candidate* rule, with every constituent address retained
+and any non-contiguous recurrence reported as `AmbiguousAnchor`?
+
+#### 14.1.2 Mutation, evaluation, and observability (#3)
+
+Book mutation order is not strategy-specific: normalized changes apply in
+canonical order, after completing only proven atomic boundaries (one vendor
+delivery and one `visible_tie_group`). Evaluation cadence is strategy-specific.
+A price/depth strategy must observe every completed relevant mutation group or it
+can miss a 20 ms crossing. A strategy based only on terminal resolution, a game
+score, or a minute bucket need not evaluate on an unrelated quote change.
+
+Least restrictive deterministic contract: each versioned consumer declares its
+input event classes and evaluation trigger; dispatch invokes it after every
+completed atomic group that changes one of those declared inputs. No consumer may
+observe a partial vendor delivery or partial visible tie group. Same-hash runs do
+not globally delay mutation or evaluation. The trigger declaration is hashed into
+the strategy specification.
+
+**Decision request:** approve this per-consumer trigger contract, with
+price/depth consumers triggered after every relevant completed mutation group?
+
+#### 14.1.3 Unknown controls (#4)
+
+The control's exact canonical envelope may contain anything and is always
+preserved. Replay must not invent semantics for an unknown shape. A known
+state-neutral control such as a recognized heartbeat may be retained without
+changing a book. A malformed or unknown control on a relevant lane is written to
+the reject sidecar; if its effect cannot be proven state-neutral, every instrument
+attributable to that lane becomes `Unusable` at that address. Strategies then see
+“book unavailable,” never a guessed mutation. If lane attribution itself is
+unknown, #11 decides whether the whole scope becomes unobservable.
+
+**Decision request:** approve “recognized state-neutral controls do not stale;
+unknown or malformed controls stale every attributable book, while preserving the
+exact record and reject”?
+
+#### 14.1.4 Anchors, pending, and first snapshot (#6 and #10)
+
+The independent anchors in this design are full-book responses from the separate
+Polymarket snapshot lane polling REST `POST /books`. A WebSocket `book` event is
+also a full book and can bootstrap/reset state at its own stream frontier, but it
+is not an independent audit of that same WebSocket delivery chain. Therefore
+“provisional until first snapshot” settles the initial state only if “snapshot”
+means a successfully placed independent REST anchor, not merely the subscribe-time
+WebSocket book.
+
+`AnchorPending` means the REST anchor exists but its matching WebSocket candidate
+or candidate-run end is not yet in the observed canonical stream; six such
+post-receipt arrivals occurred. Recommended deterministic horizon: in one-pass,
+keep it pending until the candidate run closes or the approved journal bound
+evicts its possible frontier (`AnchorTooOld`); at selected-input end, retain a
+right-censored `AnchorPending`. Offline two-pass examines the entire selected
+interval but may not read beyond `T1` merely to manufacture resolution.
+
+**Decision request:** confirm that promotion requires the first successfully
+placed independent REST anchor plus required suffix handling, and approve the
+pending horizon above?
+
+#### 14.1.5 Explicit retry versus silent fallback (#7)
+
+Silent fallback means one committed run starts with bounded one-pass semantics,
+encounters an old/ambiguous anchor, secretly rereads arbitrary history with
+two-pass, and still publishes the same mode/attempt identity. Operators cannot
+predict resources, and two identical requests can take different paths while
+appearing equivalent.
+
+An explicit retry records `attempt 1 = one_pass, AnchorTooOld`, then schedules
+`attempt 2 = two_pass` with its own mode, input identities, resource class, logs,
+and receipt. The final verdict points to attempt 2 and retains attempt 1's failure.
+This is reproducible and operationally schedulable, but costs another tape walk.
+
+**Decision request:** allow that explicit two-pass retry, or require the asset to
+remain unavailable until a later full anchor with no automatic retry?
+
+#### 14.1.6 Lower-bound clipping is not price imputation (#8)
+
+Canonical windows are 30-minute storage units. If the requested Replay input
+starts at 10:07, `Clip` audits the whole 10:00 window but yields only records at
+or after 10:07. It does **not** use a price from 10:06:59, estimate a price, or
+accept movement within a percentage/tick tolerance. The separately requested
+prologue normally starts before analytical T0 so a real full book can bootstrap
+state; if no admitted full book exists, the book remains unavailable.
+
+Carrying forward a previous price would be a separate imputation policy and is
+not recommended for V1. A percentage/tick bound belongs to a strategy's staleness
+or sensitivity policy after a real book exists; tick size bounds legal price
+increments, not how far an unseen book may have moved.
+
+**Decision request:** approve `Clip` for exact interval selection, with no
+previous-price imputation and `NotBootstrapped` until real full-book evidence in
+the admitted prologue/interval?
+
+#### 14.1.7 Certified canonical windows (#9)
+
+The finalizer may commit an immutable window even when expected evidence was
+missing or unsafe, so healthy lanes are not blocked forever. Its receipt sets
+`certified = complete && clock_faults.is_empty()`. An uncertified window may name
+a missing lane, an invalid/excluded lane, or a cross-window clock fault. The bytes
+and provenance can still verify perfectly; what failed is the claim that this is
+a complete, normally ordered deployment window.
+
+`RequireCertified` rejects a headline Replay if any selected window is
+uncertified. `AllowUncertified` admits it only with the false certification and
+fault details preserved; Replay can then produce diagnostic/unobservable
+intervals but must not silently call absence “no opportunity.”
+
+**Decision request:** require certified windows for headline results and permit
+uncertified windows only in a separately typed diagnostic run?
+
+#### 14.1.8 What the finalizer cannot attribute (#11)
+
+`indexer-finalize` proves which deployment lanes were expected, present, missing,
+or invalid; verifies every admitted envelope/provenance pair; and preserves each
+record's lane and continuity verdict. It deliberately does not parse venue
+payloads or know Replay scopes. Combining canonical receipts can therefore detect
+“lane `polymarket` was missing,” but not “that lane carried asset A in this Replay
+scope.” A wholly missing lane has no `connection_opened`; a selected prologue may
+also begin after the subscription record that named its assets.
+
+A versioned deployment lane-role map supplies the stable lane→venue/stream role.
+Runtime subscription evidence can narrow that to instruments when present. It
+does not duplicate canonicalization; it maps a known capture fault to affected
+Replay scopes.
+
+**Decision request:** approve the versioned lane-role map and fail the affected
+scope closed when neither it nor runtime evidence can prove a missing lane
+irrelevant?
+
+#### 14.1.9 Boundary primitives versus economics policy (#12)
+
+Phase 0 must freeze only what the typed normalizer/book needs to be deterministic:
+integer-backed price and quantity types; explicit scale/unit metadata; exact
+decimal parsing; checked overflow; explicit absolute-versus-relative size; side
+and contract orientation; and no implicit cross-venue arithmetic. These choices
+determine whether two segment builds encode the same event and cannot wait for fee
+implementation.
+
+Economics can defer the venue fee formulas, effective schedules, conservative
+trigger envelope, payout-currency conversion, SDK choice/version, and fee-rounding
+vectors until Phase 3—but all must be pinned, offline, and fixture-verified before
+headline output. No current venue service may price historical evidence.
+
+**Decision request:** approve that split: freeze representation primitives in
+Phase 0, and freeze fee/conversion policy with the Phase 3 economics module before
+headline use?
+
+### 14.2 Phase acceptance
 
 1. **Phase 0 boundary integrated.** Universe responses pin all context identities;
    the lane-role map and approved selector policies are versioned; the Phase-0
