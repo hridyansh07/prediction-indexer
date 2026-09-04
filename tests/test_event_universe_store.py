@@ -897,10 +897,10 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual([row["processed"] for row in resumed], [1, 1])
         self.assertEqual(self.database.status()["counts"]["targeter_runs"], 3)
 
-    def test_canonical_backfill_stops_at_first_valid_manifest_failure(self) -> None:
+    def test_canonical_backfill_logs_invalid_manifest_and_continues(self) -> None:
         invalid = _selection_report(R1, G1)
         invalid["report_version"] = 2
-        _publish_run(self.objects, invalid)
+        invalid_source = _publish_run(self.objects, invalid)
         _publish_run(
             self.objects,
             _selection_report(R2, G2, bundle_id="later-rematch"),
@@ -913,13 +913,30 @@ class EventUniverseTests(unittest.TestCase):
             generated_end=datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
 
-        self.assertFalse(result.completed)
-        self.assertEqual(result.ingested, 0, result.as_record())
+        self.assertTrue(result.completed)
+        self.assertEqual(result.ingested, 1, result.as_record())
         self.assertEqual(result.failure_count, 1)
-        self.assertEqual(self.database.status()["counts"]["umbrella_events"], 0)
+        self.assertEqual(result.pending_failures, 1)
+        self.assertEqual(self.database.status()["counts"]["umbrella_events"], 1)
+        with sqlite3.connect(self.database.path) as connection:
+            lineage = connection.execute(
+                "SELECT state FROM event_identity_lineage"
+            ).fetchone()
+            failure = connection.execute(
+                """SELECT manifest_key, attempts, error
+                   FROM universe_sync_failures"""
+            ).fetchone()
+        self.assertEqual(lineage, ("complete",))
+        assert failure is not None
+        self.assertEqual(failure[0], invalid_source["manifest_key"])
+        self.assertEqual(failure[1], 1)
+        self.assertIn("not a consistent Targeter v3 report", failure[2])
         incremental = UniverseSync(self.database, self.objects).sync()
-        self.assertIn("backfill is running", incremental.failures[0])
-        self.assertEqual(self.database.status()["counts"]["targeter_runs"], 0)
+        self.assertFalse(
+            any("backfill is running" in failure for failure in incremental.failures),
+            incremental.as_record(),
+        )
+        self.assertEqual(self.database.status()["counts"]["targeter_runs"], 1)
 
     def test_canonical_backfill_rejects_bootstrapped_identity_database(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))

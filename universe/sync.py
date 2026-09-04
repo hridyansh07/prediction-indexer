@@ -314,17 +314,10 @@ class UniverseSync:
                     self._ingest_direct(
                         key, result, now_ns=now_ns, identity_backfill=True
                     )
-            result.completed = (
-                self.database.sync_failure_count(
-                    key_start=first_partition,
-                    key_end=after_last_partition,
-                )
-                == 0
+            result.completed = True
+            self.database.complete_event_identity_backfill(
+                generated_start, generated_end
             )
-            if result.completed:
-                self.database.complete_event_identity_backfill(
-                    generated_start, generated_end
-                )
             return self._finish(result)
         last_date = (end - timedelta(microseconds=1)).date()
         pending: list[str] = []
@@ -344,30 +337,20 @@ class UniverseSync:
                 ):
                     pending.append(key)
                 if len(pending) == batch_size:
-                    if not self._backfill_batch(
+                    self._backfill_batch(
                         pending, result, checkpoint_name, progress, now_ns
-                    ):
-                        return self._finish(result)
-                    cursor = pending[-1]
+                    )
                     pending = []
             day += timedelta(days=1)
         if pending:
-            if not self._backfill_batch(
+            self._backfill_batch(
                 pending, result, checkpoint_name, progress, now_ns
-            ):
-                return self._finish(result)
+            )
         self.database.set_checkpoint(checkpoint_name, "scan-complete")
-        result.completed = (
-            self.database.sync_failure_count(
-                key_start=first_partition,
-                key_end=after_last_partition,
-            )
-            == 0
+        result.completed = True
+        self.database.complete_event_identity_backfill(
+            generated_start, generated_end
         )
-        if result.completed:
-            self.database.complete_event_identity_backfill(
-                generated_start, generated_end
-            )
         return self._finish(result)
 
     def _backfill_batch(
@@ -377,35 +360,26 @@ class UniverseSync:
         checkpoint_name: str,
         progress: Callable[[dict[str, Any]], None] | None,
         now_ns: int,
-    ) -> bool:
+    ) -> None:
         before_ingested = result.ingested
         before_skipped = result.skipped
         before_failures = result.failure_count
-        processed = 0
-        last_success: str | None = None
         for key in keys:
-            failures = result.failure_count
             self._ingest_direct(
                 key, result, now_ns=now_ns, identity_backfill=True
             )
-            processed += 1
-            if result.failure_count != failures:
-                break
-            last_success = key
-        if last_success is not None:
-            self.database.set_checkpoint(checkpoint_name, last_success)
+        self.database.set_checkpoint(checkpoint_name, keys[-1])
         if progress is not None:
             progress(
                 {
                     "type": "backfill_batch",
-                    "processed": processed,
-                    "through_manifest_key": keys[processed - 1],
+                    "processed": len(keys),
+                    "through_manifest_key": keys[-1],
                     "ingested": result.ingested - before_ingested,
                     "skipped": result.skipped - before_skipped,
                     "failures": result.failure_count - before_failures,
                 }
             )
-        return result.failure_count == before_failures
 
     def _finish(self, result: SyncResult) -> SyncResult:
         result.pending_failures = self.database.sync_failure_count()

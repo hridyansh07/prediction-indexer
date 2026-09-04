@@ -787,25 +787,33 @@ docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-s
 docker compose -f compose.universe.yaml up -d event-universe
 ```
 
-This oldest-first order is part of deterministic umbrella identity: disjoint
-same-day rematches receive immutable ordinals in archive order. Use the same
-retained history range for rebuilds when stable event links are required.
+Backfill visits the archive oldest-first, so disjoint same-day rematches receive
+immutable ordinals in successful ingestion order. The first occurrence seen for
+an identity tuple receives ordinal zero. Repeating that order repeats event
+links, but a previously failed manifest that ingests later may receive a later
+ordinal; ordinal allocation is encounter-ordered rather than independent of
+ingestion order.
 
 Backfill emits newline-delimited `backfill_batch` progress records for each 100
 runs and one `backfill_summary`. Exit 0 means the range scan completed with no
 pending source failures; exit 1 means retry or operator investigation is still
-required. Every committed batch advances a range-specific SQLite checkpoint,
-so rerunning the exact same half-open range resumes rather than restarts. Do not
-change either bound while resuming; the identity-lineage guard rejects a
-different range even though it would otherwise have a different checkpoint.
+required. A failed manifest is omitted from the projection and written to the
+durable `universe_sync_failures` ledger, but does not stop later manifests or
+leave the identity lineage running. Every processed batch advances a
+range-specific SQLite checkpoint, so rerunning the exact same half-open range
+resumes rather than restarts. Do not change either bound while resuming; the
+identity-lineage guard rejects a different range even though it would otherwise
+have a different checkpoint.
 
-Do not run incremental sync first when rebuild-stable event links are required.
-Canonical backfill requires an identity-empty database, records its exact range,
-stops at the first valid manifest failure, and blocks incremental sync until it
-completes. A newest-run bootstrap remains useful for a non-canonical serving
-baseline, but converting that database to canonical history requires deleting
-and rebuilding SQLite. Retained selection origins may be fetched and indexed
-outside the configured range to preserve continuity proof.
+Do not run incremental sync first when the historical scan must allocate the
+initial event links. Canonical backfill requires an identity-empty database and
+records its exact range. Incremental sync is blocked only while that range scan
+is in progress; failed manifests remain visible and retryable after the scan,
+without blocking later ingestion. A newest-run bootstrap remains useful for a
+non-canonical serving baseline, but converting that database to canonical
+history requires deleting and rebuilding SQLite. Retained selection origins may
+be fetched and indexed outside the configured range to preserve continuity
+proof.
 
 Incremental sync uses a forward high-water date plus a durable per-manifest
 failure ledger. A bad manifest does not pin the date or block later runs.

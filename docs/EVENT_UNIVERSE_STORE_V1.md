@@ -172,23 +172,27 @@ incremental sync cannot make older source evidence undiscoverable. However, a
 canonical identity rebuild must start from an identity-empty database as
 described below.
 
-Because ordinals disambiguate evidence that has no surviving alias edge, a
-canonical rebuild must ingest the retained archive oldest-first over the same
-configured history range. This makes ordinal allocation, IDs, and API links
-repeatable across rebuilds. Periodic sync then appends ordinals but never
-renumbers them. The newest-run bootstrap is an operational recovery path, not a
-substitute for the documented oldest-first full rebuild when historical link
-determinism is required.
+Because ordinals disambiguate evidence that has no surviving alias edge, the
+canonical rebuild visits the retained archive oldest-first. Ordinal allocation
+is deliberately encounter-ordered: the first successfully ingested occurrence
+for one identity tuple receives ordinal zero, and periodic sync appends but
+never renumbers later ordinals. Repeating the same successful ingestion order
+repeats IDs and API links; temporarily unavailable evidence that is admitted
+later may receive a later ordinal. The newest-run bootstrap remains an
+operational recovery path rather than a substitute for a full historical scan.
 
 `event_identity_lineage` claims that generated-time range before the first
 allocation. A new claim requires an identity-empty database; a resume must use
-the exact same bounds. Backfill stops at the first valid manifest that fails,
-does not advance its cursor past that manifest, and blocks incremental sync
-until the range completes. This prevents a later rematch from taking an older
-event's ordinal while the older evidence is temporarily unavailable. The
-determinism guarantee assumes the same immutable manifest set and configured
-range; changing the retained history set requires a fresh rebuild and may
-change ordinals for otherwise indistinguishable same-day occurrences.
+the exact same bounds. Backfill records every failed manifest in
+`universe_sync_failures`, continues through later manifests, and advances its
+checkpoint through the processed batch. Completing the range scan completes
+the lineage and unblocks incremental sync even when failed manifests remain in
+the retry ledger. Their manifest keys, errors, attempt counts, and retry times
+stay durable and `/healthz` stays degraded until they ingest successfully.
+This prevents one malformed immutable run from pinning the whole rebuild while
+keeping the missing evidence explicit. Changing the evidence admitted or its
+encounter order may change ordinals for otherwise indistinguishable same-day
+occurrences.
 
 Incomplete and complete-empty runs remain visible. Incomplete runs create no
 event, venue-event, market, venue-market, candidate-decision, relationship, or

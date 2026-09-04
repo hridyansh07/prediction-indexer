@@ -15,7 +15,10 @@ The database is a rebuildable query index, not another evidence archive:
 - `event_observations` retain every observed activation while the identity's
   activation date remains frozen at first allocation;
 - `event_identity_lineage` binds the one canonical oldest-first backfill range
-  and blocks incremental allocation while that rebuild is incomplete;
+  and blocks incremental allocation only while that range scan is incomplete;
+- `universe_sync_failures` durably records manifests omitted from ingestion so
+  one invalid run cannot pin the scan and missing evidence remains visible and
+  retryable;
 - `canonical_markets` group venue markets under explicit market-template and
   outcome-space versions;
 - `relations` plus `relation_members` normalize symmetric or directed n-ary
