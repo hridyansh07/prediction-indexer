@@ -5,6 +5,10 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from universe import run_backfill
+from universe.sync import SyncResult
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -170,18 +174,54 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
         self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
 
-    def test_schema_is_selected_history_without_raw_universe_tables(self) -> None:
-        schema = (ROOT / "universe" / "schema" / "v1.sql").read_text(encoding="utf-8")
-        cadence_schema = (ROOT / "universe" / "schema" / "v2.sql").read_text(
+    def test_backfill_job_fails_while_retry_ledger_is_pending(self) -> None:
+        config = mock.Mock()
+        config.backfill.generated_start = object()
+        config.backfill.generated_end = object()
+        result = SyncResult(completed=True, pending_failures=1)
+
+        with (
+            mock.patch.object(run_backfill, "load_config", return_value=config),
+            mock.patch.object(run_backfill, "UniverseStore") as store,
+            mock.patch.object(
+                run_backfill, "backfill_targeter_history", return_value=result
+            ),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(run_backfill.main(), 1)
+        store.return_value.initialize.assert_called_once_with()
+
+    def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
+        schema_directory = ROOT / "universe" / "schema"
+        sql_files = list(schema_directory.glob("*.sql"))
+        self.assertEqual([path.name for path in sql_files], ["schema.sql"])
+        schema = sql_files[0].read_text(
             encoding="utf-8"
         )
         self.assertIn("CREATE TABLE selection_occurrences", schema)
         self.assertIn("CREATE TABLE bundle_contexts", schema)
         self.assertIn("CREATE TABLE bundle_retirements", schema)
-        self.assertIn("CREATE TABLE cadence_runs", cadence_schema)
+        self.assertIn("CREATE TABLE umbrella_events", schema)
+        self.assertIn("observed_activation_at", schema)
+        self.assertIn("CREATE TABLE universe_sync_failures", schema)
+        self.assertIn("CREATE TABLE canonical_markets", schema)
+        self.assertIn("CREATE TABLE relation_members", schema)
+        self.assertNotIn("CREATE TABLE cadence_runs", schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
             self.assertNotIn(stale, schema)
-        self.assertFalse((ROOT / "universe" / "schema" / "v3.sql").exists())
+
+    def test_universe_runbook_has_safe_bounded_rebuild_order(self) -> None:
+        deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        section = deployment.split("### Safe full rebuild ordering", 1)[1]
+        self.assertLess(section.index("event-universe-backfill"), section.index("event-universe-sync"))
+        for contract in (
+            "backfill_batch",
+            "range-specific SQLite checkpoint",
+            "144 runs",
+            "128 MiB/run",
+            "There is no automatic pruning",
+        ):
+            self.assertIn(contract, section)
 
     def test_orb_setup_creates_and_installs_the_project_virtual_environment(
         self,

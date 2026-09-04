@@ -751,16 +751,19 @@ python universe/run_sync.py
 python universe/run_backup.py
 ```
 
-The durable store is intentionally sparse and append-only: it indexes historical
-Targeter-selected bundle occurrences plus normalized event, sibling-market,
-target-asset, relationship, and exact source/origin provenance. A separate
-disposable `cadence_runs` cache keeps exactly the newest five run projections,
-including incomplete and empty runs. It contains compact catalogue, candidate,
-rejection, admission, continuity, terminal-probe, and diagnostic evidence; it
-does not copy raw catalogues or selection reports. The archive remains
-authoritative and the cache is rebuildable. The durable selected-history schema
-is `universe/schema/v1.sql`; `universe/schema/v2.sql` adds only this disposable
-cache and upgrades existing v1 databases in place.
+The store is a rebuildable event/market view of committed Targeter runs. It
+normalizes cross-venue umbrella events, venue-native events, canonical market
+classes, venue market instances, candidate decisions, selected-market
+occurrences, relationships, and exact source/origin provenance. It does not
+copy raw catalogues or selection reports. `universe/schema/schema.sql` is the
+single canonical schema for both historical bundle APIs and the normalized
+event/market view. There is no cadence cache.
+
+Schema v5 intentionally does not migrate an existing database. Before rolling
+out this version, stop the API and Universe jobs, remove the rebuildable SQLite
+file plus its `-wal`/`-shm` siblings, run the oldest-first backfill to create
+schema v5, and then start sync/API from the immutable archive. A v1/v2/v3/v4
+database is rejected with a rebuild instruction.
 
 Event Universe is strict Targeter v3-only. Incremental sync discovers immutable
 version-2 run manifests and derives selected occurrences directly from each
@@ -771,19 +774,91 @@ requested range. There is no Universe publication pointer; `/healthz` derives
 the latest indexed archived run and marks it stale from that run's
 `generated_at`.
 
-Historical **selected-run** rollout uses `python universe/run_backfill.py` after
-`backfill.generated_start` and `backfill.generated_end` are explicitly set in
-the JSON config. The bounds are half-open Targeter generated times. Backfill and
-incremental sync share one idempotent projector and ingestion transaction. Raw
-segment selection and trust remain replay responsibilities; the archiver has no
-Universe sidecar or receipt-mirror service.
+### Safe full rebuild ordering
+
+For a full historical rebuild, stop the Universe scheduler and API, remove the
+disposable SQLite file plus WAL/SHM siblings, set `backfill.generated_start` to
+the earliest retained Targeter run and `backfill.generated_end` past the newest
+run to include, then run backfill **before** enabling periodic sync:
+
+```bash
+docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-backfill
+docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-sync
+docker compose -f compose.universe.yaml up -d event-universe
+```
+
+Backfill visits the archive oldest-first, so disjoint same-day rematches receive
+immutable ordinals in successful ingestion order. The first occurrence seen for
+an identity tuple receives ordinal zero. Repeating that order repeats event
+links, but a previously failed manifest that ingests later may receive a later
+ordinal; ordinal allocation is encounter-ordered rather than independent of
+ingestion order.
+
+Backfill emits newline-delimited `backfill_batch` progress records for each 100
+runs and one `backfill_summary`. Exit 0 means the range scan completed with no
+pending source failures; exit 1 means retry or operator investigation is still
+required. A failed manifest is omitted from the projection and written to the
+durable `universe_sync_failures` ledger, but does not stop later manifests or
+leave the identity lineage running. Every processed batch advances a
+range-specific SQLite checkpoint, so rerunning the exact same half-open range
+resumes rather than restarts. Do not change either bound while resuming; the
+identity-lineage guard rejects a different range even though it would otherwise
+have a different checkpoint.
+
+Do not run incremental sync first when the historical scan must allocate the
+initial event links. Canonical backfill requires an identity-empty database and
+records its exact range. Incremental sync is blocked only while that range scan
+is in progress; failed manifests remain visible and retryable after the scan,
+without blocking later ingestion. A newest-run bootstrap remains useful for a
+non-canonical serving baseline, but converting that database to canonical
+history requires deleting and rebuilding SQLite. Retained selection origins may
+be fetched and indexed outside the configured range to preserve continuity
+proof.
+
+Incremental sync uses a forward high-water date plus a durable per-manifest
+failure ledger. A bad manifest does not pin the date or block later runs.
+Failures retry with exponential backoff capped at one day, at most 32 per job,
+and keep `/healthz` degraded and the job exit nonzero until resolved. One
+malformed listed key is recorded without aborting other keys. Initial sync on a
+fresh database walks back at most 144 runs for a complete serving baseline; an
+exhausted walk fails visibly and instructs the operator to run backfill.
+
+Universe verifies metadata for every manifest-owned object. For complete runs
+it downloads only normalized catalogue artifacts for venues referenced by
+candidates, verifies each complete object, and retains only referenced rows in
+memory. The decoded selected-catalogue budget is 128 MiB/run (warning at 96
+MiB), each NDJSON row is at most 4 MiB, candidate references are capped at
+100,000, and the selection report remains capped at 128 MiB. Decoded retrieval
+stages one artifact at a time under `backfill.temporary_directory`; plan at
+least 512 MiB free there and 1 GiB container memory. Compose does not impose a
+`mem_limit`, consistent with the other services, but these application bounds
+prevent catalogue-sized unbounded growth.
+
+Retrieval directories include the owning PID. At job startup Universe removes
+only directories older than 24 hours whose PID is no longer live; active or
+unrecognized staging is retained. This safely cleans hard-kill leftovers
+without racing an active download.
+
+The immutable S3/GCS archive is the evidence and retention authority. Universe
+SQLite is disposable and rebuildable, but a built database retains every run it
+has indexed. There is no automatic pruning or rolling horizon in this release;
+future historical truncation requires a separate API/product policy.
+
+Raw segment selection and trust remain replay responsibilities; the archiver
+has no Universe sidecar or receipt-mirror service.
 
 `EVENT_UNIVERSE_DATA_ROOT` must be an attached persistent volume and should be
 backed up independently. `EVENT_UNIVERSE_BIND_ADDRESS` defaults to loopback; use
 a private interface or authenticated reverse proxy when exposing the API.
-`GET /v1/targeter/cadence` serves the newest-five cache in descending run order;
-its current/late state describes archive cadence only, not publication or splice
-health.
+The UI consumes `GET /v1/targeter/status?limit=5` to resolve the newest complete
+run for its targets and decisions views. The response contains only freshness,
+latest/current-complete run summaries, and selected counts.
+`GET /v1/targeter/runs/<run_id>` returns bounded normalized decisions
+and references. Event, market, and relationship detail is available from
+`/v1/events`, `/v1/markets/<market_id>`, and `/v1/relations/<relation_id>`.
+`GET /v1/targeter/cadence` has been removed and returns 404. Universe and the UI
+proxy enforce a 1.75 MB serialized response budget; list limits are capped at
+100.
 
 ## Clock and liveness semantics
 

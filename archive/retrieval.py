@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterable, Iterator
@@ -20,6 +23,7 @@ from encoder import DEFAULT_BUFFER_BYTES, LogicalIdentity, decode_stream
 __all__ = [
     "ArchivedObject",
     "ArchivedObjectByteStreamer",
+    "cleanup_stale_retrieval_directories",
     "read_verified_json",
     "verify_object",
 ]
@@ -65,7 +69,7 @@ class ArchivedObjectByteStreamer:
             raise VerificationFailure(f"unknown archived object key: {key}") from error
 
         with tempfile.TemporaryDirectory(
-            prefix="archive-retrieval-", dir=self.temp_root
+            prefix=f"archive-retrieval-{os.getpid()}-", dir=self.temp_root
         ) as directory:
             staged = Path(directory) / Path(key).name
             try:
@@ -134,7 +138,9 @@ def read_verified_json(
             f"{expected.content_encoding!r}"
         )
 
-    with tempfile.TemporaryDirectory(prefix="archive-json-", dir=temp_root) as directory:
+    with tempfile.TemporaryDirectory(
+        prefix=f"archive-json-{os.getpid()}-", dir=temp_root
+    ) as directory:
         staged = Path(directory) / Path(expected.key).name
         archived = ArchivedObject(staged.name, expected, logical)
         with store.open_verified(expected) as source, _private_file(staged) as sink:
@@ -159,6 +165,39 @@ def read_verified_json(
                 return json.load(source)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise VerificationFailure(f"{expected.key}: invalid JSON: {error}") from error
+
+
+_RETRIEVAL_TEMPORARY = re.compile(r"^archive-(?:retrieval|json)-([1-9][0-9]*)-")
+
+
+def cleanup_stale_retrieval_directories(
+    temp_root: Path, *, older_than_seconds: int, now: float | None = None
+) -> int:
+    """Remove old retrieval staging owned by processes that no longer exist.
+
+    New staging names carry their creator PID. Unknown legacy names and any PID
+    that is still present are retained, so cleanup cannot delete active reads.
+    """
+    if older_than_seconds < 0:
+        raise ValueError("older_than_seconds must not be negative")
+    root = Path(temp_root)
+    if not root.exists():
+        return 0
+    cutoff = (time.time() if now is None else now) - older_than_seconds
+    removed = 0
+    for path in root.iterdir():
+        try:
+            match = _RETRIEVAL_TEMPORARY.match(path.name)
+            if not path.is_dir() or match is None or path.stat().st_mtime > cutoff:
+                continue
+            pid = int(match.group(1))
+            if Path(f"/proc/{pid}").exists():
+                continue
+            shutil.rmtree(path)
+            removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
 
 
 def _copy_plain(

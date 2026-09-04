@@ -21,7 +21,7 @@ const universe = universeUrl
       ),
       maxResponseBytes: positive(
         process.env.UNIVERSE_API_MAX_RESPONSE_BYTES,
-        2 * 1024 * 1024,
+        1_750_000,
         'UNIVERSE_API_MAX_RESPONSE_BYTES',
       ),
     })

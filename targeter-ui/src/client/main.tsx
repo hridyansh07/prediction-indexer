@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import {
   BrowserRouter,
@@ -7,63 +8,21 @@ import {
   Route,
   Routes,
 } from 'react-router-dom';
-import type { UniverseCadence, UniverseHealth } from '../event-universe';
 import { EventUniversePage } from './event-universe';
-import { DecisionsPage, StatusPage, TargetsPage } from './observability';
+import { DecisionsPage, TargetsPage } from './observability';
+import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
-const ROOT = '/api/event-universe';
-
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${ROOT}${path}`, {
-    method: 'GET',
-    headers: { accept: 'application/json' },
-  });
-  if (!response.ok) throw new Error('Event Universe is unavailable.');
-  return response.json() as Promise<T>;
-}
+const queryClient = createUniverseQueryClient();
 
 function App() {
-  const [health, setHealth] = useState<UniverseHealth | null>(null);
-  const [cadence, setCadence] = useState<UniverseCadence | null>(null);
-  const [healthError, setHealthError] = useState('');
-  const [cadenceError, setCadenceError] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
-    const [nextHealth, nextCadence] = await Promise.allSettled([
-      get<UniverseHealth>('/healthz'),
-      get<UniverseCadence>('/v1/targeter/cadence?limit=5'),
-    ]);
-    if (nextHealth.status === 'fulfilled') {
-      setHealth(nextHealth.value);
-      setHealthError('');
-    } else {
-      setHealthError('Server status is unavailable.');
-    }
-    if (nextCadence.status === 'fulfilled') {
-      setCadence(nextCadence.value);
-      setCadenceError('');
-    } else {
-      setCadenceError('Targeter cadence is unavailable.');
-    }
-    setRefreshing(false);
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    const interval = window.setInterval(() => void refresh(), 60_000);
-    return () => window.clearInterval(interval);
-  }, [refresh]);
-
   return (
     <div className="app-shell">
       <header className="app-header">
         <NavLink
           className="brand"
           to="/"
-          aria-label="Prediction Indexer status"
+          aria-label="Prediction Indexer targets"
         >
           <span className="brand-mark" aria-hidden="true">
             ◇
@@ -72,41 +31,19 @@ function App() {
         </NavLink>
         <nav aria-label="Main navigation">
           <NavLink to="/" end>
-            Status
+            Targets
           </NavLink>
-          <NavLink to="/targets">Targets</NavLink>
           <NavLink to="/history">History</NavLink>
           <NavLink to="/decisions">Decisions</NavLink>
         </nav>
       </header>
       <main>
         <Routes>
-          <Route
-            path="/"
-            element={
-              <StatusPage
-                health={health}
-                cadence={cadence}
-                healthError={healthError}
-                cadenceError={cadenceError}
-                refreshing={refreshing}
-                refresh={refresh}
-              />
-            }
-          />
-          <Route
-            path="/targets"
-            element={<TargetsPage cadence={cadence} error={cadenceError} />}
-          />
+          <Route path="/" element={<TargetsPage />} />
+          <Route path="/targets" element={<Navigate to="/" replace />} />
           <Route path="/history" element={<EventUniversePage />} />
-          <Route
-            path="/decisions"
-            element={<DecisionsPage cadence={cadence} error={cadenceError} />}
-          />
-          <Route
-            path="/operations"
-            element={<Navigate to="/targets" replace />}
-          />
+          <Route path="/decisions" element={<DecisionsPage />} />
+          <Route path="/operations" element={<Navigate to="/" replace />} />
           <Route
             path="/operations/selections"
             element={<Navigate to="/decisions" replace />}
@@ -129,8 +66,10 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <BrowserRouter>
-      <App />
-    </BrowserRouter>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    </QueryClientProvider>
   </React.StrictMode>,
 );

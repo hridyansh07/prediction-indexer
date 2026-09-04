@@ -1,37 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import type {
-  UniverseBundle,
-  UniverseBundlePage,
-  UniverseSelection,
-  UniverseSelectionDetail,
-  UniverseSelectionPage,
-} from '../event-universe';
+import React, { useMemo, useRef, useState } from 'react';
+import type { UniverseBundle } from '../event-universe';
 import { EventIcon, gameName, SearchIcon, VenueStack, Chevron } from './icons';
 import { BundleDrawer, MobileDetailNotice } from './observability';
+import {
+  useBundleHistory,
+  useBundles,
+  useSelectionDetail,
+} from './universe-queries';
 
-const ROOT = '/api/event-universe';
-
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${ROOT}${path}`, {
-    headers: { accept: 'application/json' },
-  });
-  if (!response.ok)
-    throw new Error('Historical Event Universe is unavailable.');
-  return response.json() as Promise<T>;
-}
-
-async function loadAllBundles() {
-  const bundles: UniverseBundle[] = [];
-  let cursor: string | null = null;
-  do {
-    const query = new URLSearchParams({ limit: '100' });
-    if (cursor) query.set('cursor', cursor);
-    const page = await get<UniverseBundlePage>(`/v1/bundles?${query}`);
-    bundles.push(...page.bundles);
-    cursor = page.next_cursor;
-  } while (cursor);
-  return bundles;
-}
+const EMPTY_BUNDLES: UniverseBundle[] = [];
 
 const displayDate = (value: string) =>
   new Date(value).toLocaleDateString(undefined, {
@@ -41,23 +18,31 @@ const displayDate = (value: string) =>
   });
 
 export function EventUniversePage() {
-  const [bundles, setBundles] = useState<UniverseBundle[]>([]);
+  const bundlePages = useBundles();
+  const [pageIndex, setPageIndex] = useState(0);
+  const pages = bundlePages.data?.pages ?? [];
+  const bundles = pages[pageIndex]?.bundles ?? EMPTY_BUNDLES;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'active' | 'retired'>(
     'all',
   );
   const [event, setEvent] = useState('');
-  const [detail, setDetail] = useState<UniverseSelectionDetail | null>(null);
-  const [history, setHistory] = useState<UniverseSelection[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    void loadAllBundles()
-      .then(setBundles)
-      .catch(() => setError('Historical bundle summaries are unavailable.'))
-      .finally(() => setLoading(false));
-  }, []);
+  const [selectedBundle, setSelectedBundle] = useState<UniverseBundle | null>(
+    null,
+  );
+  const [pageNumber, setPageNumber] = useState(1);
+  const opener = useRef<HTMLElement | null>(null);
+  const detail = useSelectionDetail(
+    selectedBundle?.latest_run_id ?? null,
+    selectedBundle?.bundle_id ?? null,
+  );
+  const history = useBundleHistory(selectedBundle?.bundle_id ?? null);
+  const loading = bundlePages.isPending;
+  const listError =
+    bundlePages.isError || bundlePages.isFetchNextPageError
+      ? 'Historical bundle summaries are unavailable.'
+      : '';
+  const detailError = detail.isError || history.isError;
 
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
@@ -77,26 +62,7 @@ export function EventUniversePage() {
       (!event || event === (bundle.game ?? bundle.sport)),
   );
 
-  const open = async (bundle: UniverseBundle) => {
-    setError('');
-    setDetail(null);
-    setHistory([]);
-    try {
-      const bundleId = encodeURIComponent(bundle.bundle_id);
-      const [nextDetail, historyPage] = await Promise.all([
-        get<UniverseSelectionDetail>(
-          `/v1/runs/${encodeURIComponent(bundle.latest_run_id)}/selections/${bundleId}`,
-        ),
-        get<UniverseSelectionPage>(
-          `/v1/bundles/${bundleId}/history?sort=selected&limit=100`,
-        ),
-      ]);
-      setDetail(nextDetail);
-      setHistory(historyPage.selections);
-    } catch {
-      setError('Bundle detail is unavailable.');
-    }
-  };
+  const closeDetail = () => setSelectedBundle(null);
 
   return (
     <div className="desktop-page history-page">
@@ -116,7 +82,7 @@ export function EventUniversePage() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search event or bundle"
+            placeholder="Search this page"
           />
         </label>
         <div className="segmented" role="group" aria-label="Lifecycle filter">
@@ -153,9 +119,9 @@ export function EventUniversePage() {
           ))}
         </div>
       </div>
-      {error && (
+      {listError && (
         <div className="error-state" role="alert">
-          {error}
+          {listError}
         </div>
       )}
       {loading ? (
@@ -173,7 +139,10 @@ export function EventUniversePage() {
             <button
               className="bundle-row"
               key={bundle.bundle_id}
-              onClick={() => void open(bundle)}
+              onClick={(event) => {
+                opener.current = event.currentTarget;
+                setSelectedBundle(bundle);
+              }}
             >
               <span className="event-cell">
                 <EventIcon game={bundle.game} sport={bundle.sport} />
@@ -202,10 +171,61 @@ export function EventUniversePage() {
           No historical bundles match these controls.
         </div>
       )}
+      {!loading &&
+        (pageIndex > 0 ||
+          pageIndex + 1 < pages.length ||
+          Boolean(pages.at(-1)?.next_cursor)) && (
+          <nav className="result-pagination" aria-label="Bundle pages">
+            <button
+              className="quiet-button"
+              disabled={pageIndex === 0}
+              onClick={() => {
+                setPageIndex((value) => Math.max(0, value - 1));
+                setPageNumber((value) => Math.max(1, value - 1));
+              }}
+            >
+              Previous
+            </button>
+            <span aria-live="polite">Page {pageNumber}</span>
+            <button
+              className="quiet-button"
+              disabled={
+                bundlePages.isFetchingNextPage ||
+                (pageIndex + 1 === pages.length && !bundlePages.hasNextPage)
+              }
+              onClick={async () => {
+                if (pageIndex + 1 < pages.length) {
+                  setPageIndex((value) => value + 1);
+                  setPageNumber((value) => value + 1);
+                  return;
+                }
+                const result = await bundlePages.fetchNextPage();
+                if (!result.data || result.isError) return;
+                setPageIndex((value) =>
+                  Math.min(value + 1, result.data.pages.length - 1),
+                );
+                setPageNumber((value) => value + 1);
+              }}
+            >
+              {bundlePages.isFetchingNextPage ? 'Loading…' : 'Next'}
+            </button>
+          </nav>
+        )}
+      {detailError && (
+        <div className="error-state" role="alert">
+          Bundle detail is unavailable.
+        </div>
+      )}
+      {selectedBundle && (detail.isPending || history.isPending) && (
+        <div className="empty-state" role="status">
+          Loading bundle detail…
+        </div>
+      )}
       <BundleDrawer
-        detail={detail}
-        history={history}
-        close={() => setDetail(null)}
+        detail={detail.data && history.data ? detail.data : null}
+        history={history.data?.selections ?? []}
+        close={closeDetail}
+        opener={opener}
       />
     </div>
   );

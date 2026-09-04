@@ -1,50 +1,79 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  UniverseCadence,
-  UniverseCadenceCandidate,
-  UniverseCadenceRun,
-  UniverseHealth,
+  UniverseEvent,
+  UniverseEventDetail,
+  UniverseSelectedMarket,
   UniverseSelection,
   UniverseSelectionDetail,
+  UniverseTargeterDecision,
 } from '../event-universe';
-import { latestCompleteRun } from './cadence-view-model';
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
+import { boundedRenderPage } from './event-universe-view-model';
+import {
+  useEventDetail,
+  useTargeterRun,
+  useTargeterStatus,
+} from './universe-queries';
 
 const date = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString() : 'Unavailable';
-
-const relative = (value: string | null | undefined) => {
-  if (!value) return 'Unavailable';
-  const seconds = Math.round((new Date(value).valueOf() - Date.now()) / 1000);
-  const absolute = Math.abs(seconds);
-  const [divisor, unit] =
-    absolute < 60
-      ? [1, 'second']
-      : absolute < 3600
-        ? [60, 'minute']
-        : [3600, 'hour'];
-  return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(
-    Math.round(seconds / divisor),
-    unit as Intl.RelativeTimeFormatUnit,
-  );
-};
 
 const label = (value: string | null | undefined) =>
   value
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
 
-const runVenues = (run: UniverseCadenceRun | null) =>
-  run
-    ? [
-        ...new Set(
-          run.selections.flatMap((selection) =>
-            selection.context.targets.map((target) => target.venue),
-          ),
+function useDrawerFocus(
+  open: boolean,
+  close: () => void,
+  opener: React.MutableRefObject<HTMLElement | null>,
+) {
+  const dialog = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  useEffect(() => {
+    if (!open) return;
+    const element = dialog.current;
+    if (!element) return;
+    element.focus();
+    const focusables = () =>
+      [
+        ...element.querySelectorAll<HTMLElement>(
+          'button, [href], input, [tabindex]:not([tabindex="-1"])',
         ),
-      ].sort()
-    : [];
+      ].filter((item) => !item.hasAttribute('disabled'));
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusables();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (document.activeElement === element) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    element.addEventListener('keydown', keydown);
+    return () => {
+      element.removeEventListener('keydown', keydown);
+      opener.current?.focus();
+      opener.current = null;
+    };
+  }, [open, opener]);
+  return dialog;
+}
 
 function PageHeading({
   eyebrow,
@@ -64,125 +93,6 @@ function PageHeading({
   );
 }
 
-function StateDot({ state }: { state: 'live' | 'warn' | 'unknown' }) {
-  return <span className={`state-dot ${state}`} aria-hidden="true" />;
-}
-
-export function StatusPage({
-  health,
-  cadence,
-  healthError,
-  cadenceError,
-  refreshing,
-  refresh,
-}: {
-  health: UniverseHealth | null;
-  cadence: UniverseCadence | null;
-  healthError: string;
-  cadenceError: string;
-  refreshing: boolean;
-  refresh: () => Promise<void>;
-}) {
-  const run = latestCompleteRun(cadence);
-  const targetCount =
-    run?.selections.reduce(
-      (total, selection) => total + selection.context.targets.length,
-      0,
-    ) ?? 0;
-  const targeterLive = cadence?.freshness.state === 'current';
-  const checking = !health && !cadence && !healthError && !cadenceError;
-  return (
-    <div className="status-page">
-      <section className="status-intro">
-        <div>
-          <span className="eyebrow">SYSTEM STATUS</span>
-          <h1>
-            {checking
-              ? 'Checking indexer health.'
-              : health && targeterLive
-                ? 'Server and cadence are on track.'
-                : 'Indexing needs attention.'}
-          </h1>
-          <p>
-            A concise view of the Event Universe server and Targeter cadence.
-          </p>
-        </div>
-        <button
-          className="quiet-button"
-          onClick={() => void refresh()}
-          disabled={refreshing}
-        >
-          {refreshing ? 'Refreshing…' : '↻ Refresh'}
-        </button>
-      </section>
-      <section className="status-grid" aria-label="Service health">
-        <article className="status-card">
-          <div className="status-card-title">
-            <StateDot state={health ? 'live' : 'warn'} />
-            <span>EVENT UNIVERSE</span>
-          </div>
-          <strong>{health ? 'Server live' : 'Unavailable'}</strong>
-          <p>
-            {healthError ||
-              (health?.latest_run
-                ? `Latest evidence ${relative(health.latest_run.generated_at)}`
-                : 'No indexed runs yet')}
-          </p>
-        </article>
-        <article className="status-card featured">
-          <div className="status-card-title">
-            <StateDot state={targeterLive ? 'live' : 'warn'} />
-            <span>TARGETER CADENCE</span>
-          </div>
-          <strong>
-            {targeterLive
-              ? 'On cadence'
-              : label(cadence?.freshness.state ?? 'Unavailable')}
-          </strong>
-          <p>
-            {cadenceError ||
-              `Expected every ${Math.round((cadence?.freshness.expected_run_seconds ?? 600) / 60)} minutes`}
-          </p>
-        </article>
-        <article className="status-card unverified">
-          <div className="status-card-title">
-            <StateDot state="unknown" />
-            <span>CAPTURE</span>
-          </div>
-          <strong>Unverified</strong>
-          <p>
-            Cadence evidence does not verify live splice or frame capture
-            health.
-          </p>
-        </article>
-      </section>
-      <section className="current-summary">
-        <div>
-          <span className="eyebrow">CURRENT COMPLETE TARGET SET</span>
-          <h2>
-            {run
-              ? `${run.selections.length} bundles across ${runVenues(run).length} venues`
-              : 'No complete run available'}
-          </h2>
-          <p>
-            {run
-              ? `${targetCount} selected targets · run ${run.run_id}`
-              : 'Waiting for complete Targeter evidence.'}
-          </p>
-        </div>
-        <VenueStack venues={runVenues(run)} />
-        <Link className="primary-link" to="/targets">
-          View current targets <Chevron />
-        </Link>
-      </section>
-      <p className="mobile-truth">
-        Capture status remains unverified until a splice-health projection
-        exists.
-      </p>
-    </div>
-  );
-}
-
 function EmptyPage({ error, loading }: { error: string; loading: string }) {
   return (
     <div className={error ? 'error-state' : 'empty-state'}>
@@ -195,10 +105,7 @@ export function MobileDetailNotice() {
   return (
     <div className="mobile-only">
       <h1>Desktop detail view</h1>
-      <p>This compact mobile UI focuses on server and cadence health.</p>
-      <Link className="primary-link" to="/">
-        View status
-      </Link>
+      <p>The Event Universe explorer is currently desktop-first.</p>
     </div>
   );
 }
@@ -242,44 +149,111 @@ function EventFilters({
   );
 }
 
-export function TargetsPage({
-  cadence,
-  error,
+function ResultPagination({
+  currentPage,
+  pageCount,
+  setPage,
 }: {
-  cadence: UniverseCadence | null;
-  error: string;
+  currentPage: number;
+  pageCount: number;
+  setPage: (page: number) => void;
 }) {
-  const run = latestCompleteRun(cadence);
+  if (pageCount <= 1) return null;
+  return (
+    <nav className="result-pagination" aria-label="Result pages">
+      <button
+        className="quiet-button"
+        disabled={currentPage === 0}
+        onClick={() => setPage(currentPage - 1)}
+      >
+        Previous
+      </button>
+      <span aria-live="polite">
+        Page {currentPage + 1} of {pageCount}
+      </span>
+      <button
+        className="quiet-button"
+        disabled={currentPage + 1 === pageCount}
+        onClick={() => setPage(currentPage + 1)}
+      >
+        Next
+      </button>
+    </nav>
+  );
+}
+
+interface TargetEventGroup {
+  event: UniverseEvent;
+  markets: UniverseSelectedMarket[];
+}
+
+export function TargetsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
+  const runId = status?.current_complete_run?.run_id ?? null;
+  const loaded = useTargeterRun(runId);
+  const run = loaded.data;
   const [query, setQuery] = useState('');
   const [lifecycle, setLifecycle] = useState<'all' | 'current' | 'retained'>(
     'all',
   );
   const [event, setEvent] = useState('');
-  const [detail, setDetail] = useState<UniverseSelectionDetail | null>(null);
+  const [page, setPage] = useState(0);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const selectedDetail = useEventDetail(detailId);
+  const grouped = useMemo(() => {
+    const groups = new Map<string, UniverseSelectedMarket[]>();
+    const events = new Map(
+      (run?.events ?? []).map((event) => [event.event_id, event]),
+    );
+    for (const market of run?.selected_markets ?? [])
+      groups.set(market.event_id, [
+        ...(groups.get(market.event_id) ?? []),
+        market,
+      ]);
+    return [...groups]
+      .map(([eventId, markets]) => ({
+        event: events.get(eventId),
+        markets,
+      }))
+      .filter((group): group is TargetEventGroup => group.event !== undefined);
+  }, [run]);
   const games = useMemo(() => {
     const values = new Map<string, { game: string | null; sport: string }>();
-    for (const selection of run?.selections ?? [])
-      values.set(selection.game ?? selection.sport, {
-        game: selection.game,
-        sport: selection.sport,
-      });
+    for (const { event } of grouped)
+      if (event)
+        values.set(event.game ?? event.sport, {
+          game: event.game,
+          sport: event.sport,
+        });
     return [...values.values()];
-  }, [run]);
-  const shown = (run?.selections ?? []).filter((selection) => {
+  }, [grouped]);
+  const shown = grouped.filter(({ event: record, markets }) => {
+    if (!record) return false;
+    const retained = markets.every(
+      (market) => market.selection_reason === 'retained',
+    );
     const text =
-      `${selection.bundle_id} ${selection.context.participants.join(' ')}`.toLowerCase();
+      `${record.event_id} ${record.participants.join(' ')}`.toLowerCase();
     return (
       text.includes(query.toLowerCase()) &&
-      (!event || event === (selection.game ?? selection.sport)) &&
-      (lifecycle === 'all' ||
-        (lifecycle === 'retained') ===
-          (selection.occurrence_kind === 'retained'))
+      (!event || event === (record.game ?? record.sport)) &&
+      (lifecycle === 'all' || (lifecycle === 'retained') === retained)
     );
   });
-  if (!run)
+  const rendered = boundedRenderPage(shown, page);
+  useEffect(() => setPage(0), [query, lifecycle, event, runId]);
+  if (statusQuery.isPending || loaded.isPending || !run)
     return (
       <EmptyPage
-        error={error}
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
         loading="Loading the current complete target set…"
       />
     );
@@ -289,7 +263,7 @@ export function TargetsPage({
       <PageHeading
         eyebrow="CURRENT TARGETS"
         title="Everything being indexed."
-        copy={`The full selection set from the newest complete run · ${date(run.generated_at)}`}
+        copy={`Normalized selected markets from the newest complete run · ${date(run.run.generated_at)}`}
       />
       <div className="compact-toolbar">
         <label className="search-field">
@@ -298,7 +272,7 @@ export function TargetsPage({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search bundles or participants"
+            placeholder="Search events or participants"
           />
         </label>
         <div className="segmented" role="group" aria-label="Lifecycle filter">
@@ -319,75 +293,203 @@ export function TargetsPage({
           <span>Event</span>
           <span>Venues</span>
           <span>Activation</span>
-          <span>Targets</span>
+          <span>Markets</span>
           <span />
         </div>
-        {shown.map((selection) => (
-          <BundleRow
-            key={selection.bundle_id}
-            selection={selection}
-            open={() => setDetail(selection)}
+        {rendered.items.map(({ event, markets }) => (
+          <NormalizedTargetRow
+            key={event.event_id}
+            event={event}
+            markets={markets}
+            open={() => {
+              opener.current = document.activeElement as HTMLElement | null;
+              setDetailId(event.event_id);
+            }}
           />
         ))}
       </div>
+      <ResultPagination
+        currentPage={rendered.currentPage}
+        pageCount={rendered.pageCount}
+        setPage={setPage}
+      />
       {!shown.length && (
         <div className="empty-state">
           No current targets match these controls.
         </div>
       )}
-      <BundleDrawer detail={detail} run={run} close={() => setDetail(null)} />
+      {selectedDetail.isError && (
+        <div className="error-state" role="alert">
+          Normalized event detail is unavailable.
+        </div>
+      )}
+      {detailId && selectedDetail.isPending && (
+        <div className="empty-state" role="status">
+          Loading event detail…
+        </div>
+      )}
+      <NormalizedTargetDrawer
+        detail={selectedDetail.data ?? null}
+        markets={
+          detailId
+            ? (grouped.find(({ event }) => event?.event_id === detailId)
+                ?.markets ?? [])
+            : []
+        }
+        close={() => setDetailId(null)}
+        opener={opener}
+      />
     </div>
   );
 }
 
-function BundleRow({
-  selection,
+function NormalizedTargetRow({
+  event,
+  markets,
   open,
 }: {
-  selection: UniverseSelectionDetail;
+  event: UniverseEvent;
+  markets: UniverseSelectedMarket[];
   open: () => void;
 }) {
-  const venues = selection.context.targets.map((target) => target.venue);
+  const retained = markets.every(
+    (market) => market.selection_reason === 'retained',
+  );
   return (
     <button className="bundle-row" onClick={open}>
       <span className="event-cell">
-        <EventIcon game={selection.game} sport={selection.sport} />
+        <EventIcon game={event.game} sport={event.sport} />
         <span>
-          <b>
-            {selection.context.participants.join(' vs ') || selection.bundle_id}
-          </b>
+          <b>{event.participants.join(' vs ') || event.event_id}</b>
           <small>
-            {label(selection.topology)} ·{' '}
-            {selection.occurrence_kind === 'retained'
-              ? 'Retained'
-              : 'Current candidate'}
+            {label(event.topology)} ·{' '}
+            {retained ? 'Retained' : 'Current candidate'}
           </small>
         </span>
       </span>
-      <VenueStack venues={venues} />
-      <span className="date-cell">{date(selection.activation_at)}</span>
-      <strong className="target-count">
-        {selection.context.targets.length}
-      </strong>
+      <VenueStack venues={markets.map((market) => market.venue)} />
+      <span className="date-cell">{date(event.activation_at)}</span>
+      <strong className="target-count">{markets.length}</strong>
       <Chevron />
     </button>
   );
 }
 
+function NormalizedTargetDrawer({
+  detail,
+  markets,
+  close,
+  opener,
+}: {
+  detail: UniverseEventDetail | null;
+  markets: UniverseSelectedMarket[];
+  close: () => void;
+  opener: React.MutableRefObject<HTMLElement | null>;
+}) {
+  const dialog = useDrawerFocus(Boolean(detail), close, opener);
+  if (!detail) return null;
+  return (
+    <div className="drawer-layer">
+      <button
+        className="drawer-backdrop"
+        onClick={close}
+        aria-label="Close event detail"
+      />
+      <div
+        className="bundle-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Normalized event detail"
+        tabIndex={-1}
+        ref={dialog}
+      >
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow">NORMALIZED EVENT</span>
+            <h2>{detail.event.participants.join(' vs ')}</h2>
+            <code>{detail.event.event_id}</code>
+          </div>
+          <button
+            className="close-button"
+            onClick={close}
+            aria-label="Close"
+            autoFocus
+          >
+            ×
+          </button>
+        </div>
+        <div className="drawer-facts">
+          <span>
+            <b>{markets.length}</b> selected markets
+          </span>
+          <span>
+            <b>{new Set(markets.map((market) => market.venue)).size}</b> venues
+          </span>
+          <span>
+            <b>{detail.relations.length}</b> relations
+          </span>
+        </div>
+        <div className="drawer-body market-list">
+          {detail.event.event_refs.map((reference) => (
+            <div className="proof-card" key={reference}>
+              <b>Venue event reference</b>
+              <code>{reference}</code>
+            </div>
+          ))}
+          {markets.map((market) => (
+            <div
+              className="market-row"
+              key={`${market.venue}:${market.venue_market_id}`}
+            >
+              <VenueStack venues={[market.venue]} />
+              <span>
+                <b>{label(market.canonical_class)}</b>
+                <code>{market.market_id}</code>
+              </span>
+              <em>{label(market.selection_reason)}</em>
+            </div>
+          ))}
+          {detail.relations.map((relation) => (
+            <div className="proof-card" key={relation.relation_id}>
+              <b>
+                {label(relation.relation_type)} · {label(relation.coverage)}
+              </b>
+              <code>Relation {relation.relation_id}</code>
+            </div>
+          ))}
+          {detail.observations.map((observation) => (
+            <div
+              className="proof-card"
+              key={`${observation.run_id}:${observation.bundle_id}`}
+            >
+              <b>
+                Activation observed {date(observation.observed_activation_at)}
+              </b>
+              <span>Indexed from {date(observation.generated_at)}</span>
+              <code>{observation.run_id}</code>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function BundleDrawer({
   detail,
-  run,
   history = [],
   close,
+  opener,
 }: {
   detail: UniverseSelectionDetail | null;
-  run?: UniverseCadenceRun;
   history?: UniverseSelection[];
   close: () => void;
+  opener: React.MutableRefObject<HTMLElement | null>;
 }) {
   const [tab, setTab] = useState<'markets' | 'relationships' | 'evidence'>(
     'markets',
   );
+  const dialog = useDrawerFocus(Boolean(detail), close, opener);
   useEffect(() => {
     if (!detail) return;
     setTab('markets');
@@ -398,9 +500,6 @@ export function BundleDrawer({
     return () => window.removeEventListener('keydown', keydown);
   }, [detail, close]);
   if (!detail) return null;
-  const candidate = run?.candidates.find(
-    (item) => item.bundle_id === detail.bundle_id,
-  );
   return (
     <div className="drawer-layer">
       <button
@@ -413,6 +512,8 @@ export function BundleDrawer({
         role="dialog"
         aria-modal="true"
         aria-label="Bundle detail"
+        tabIndex={-1}
+        ref={dialog}
       >
         <div className="drawer-header">
           <div>
@@ -486,12 +587,6 @@ export function BundleDrawer({
             <div className="evidence-list">
               <span>Occurrence: {label(detail.occurrence_kind)}</span>
               <span>Continuity: {label(detail.continuity_disposition)}</span>
-              {candidate && (
-                <span>
-                  Admission volume: $
-                  {candidate.admission.combined_moneyline_volume_usd.toLocaleString()}
-                </span>
-              )}
               <code>{detail.source.manifest_key}</code>
               <code>Manifest {detail.source.manifest_sha256}</code>
               <code>Report {detail.source.report_sha256}</code>
@@ -537,22 +632,37 @@ function MarketList({ detail }: { detail: UniverseSelectionDetail }) {
   );
 }
 
-export function DecisionsPage({
-  cadence,
-  error,
-}: {
-  cadence: UniverseCadence | null;
-  error: string;
-}) {
-  const run = latestCompleteRun(cadence);
+export function DecisionsPage() {
+  const statusQuery = useTargeterStatus();
+  const status = statusQuery.data;
+  const runId = status?.current_complete_run?.run_id ?? null;
+  const loaded = useTargeterRun(runId);
+  const run = loaded.data;
   const [query, setQuery] = useState('');
-  if (!run)
-    return <EmptyPage error={error} loading="Loading Targeter decisions…" />;
-  const candidates = run.candidates.filter((candidate) =>
-    `${candidate.bundle_id} ${candidate.participants.join(' ')} ${candidate.rejection_reasons.join(' ')}`
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [query, runId]);
+  if (statusQuery.isPending || loaded.isPending || !run)
+    return (
+      <EmptyPage
+        error={
+          statusQuery.isError
+            ? 'Targeter status is unavailable.'
+            : loaded.isError
+              ? 'Targeter run diagnostics are unavailable.'
+              : ''
+        }
+        loading="Loading Targeter decisions…"
+      />
+    );
+  const events = new Map(run.events.map((event) => [event.event_id, event]));
+  const candidates = run.decisions.filter((candidate) => {
+    const participants =
+      events.get(candidate.event_id)?.participants.join(' ') ?? '';
+    return `${candidate.bundle_id} ${participants} ${candidate.rejection_reasons.join(' ')}`
       .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+      .includes(query.toLowerCase());
+  });
+  const rendered = boundedRenderPage(candidates, page);
   return (
     <div className="desktop-page decisions-page">
       <MobileDetailNotice />
@@ -566,7 +676,11 @@ export function DecisionsPage({
         <Chevron />
         <FunnelStep count={run.counts.eligible} label="Eligible" />
         <Chevron />
-        <FunnelStep count={run.counts.selected} label="Selected" accent />
+        <FunnelStep
+          count={run.counts.selected_events}
+          label="Selected events"
+          accent
+        />
       </section>
       <label className="search-field decisions-search">
         <SearchIcon />
@@ -578,10 +692,19 @@ export function DecisionsPage({
         />
       </label>
       <section className="decision-list">
-        {candidates.map((candidate) => (
-          <CandidateRow key={candidate.bundle_id} candidate={candidate} />
+        {rendered.items.map((candidate) => (
+          <CandidateRow
+            key={candidate.bundle_id}
+            candidate={candidate}
+            event={events.get(candidate.event_id)}
+          />
         ))}
       </section>
+      <ResultPagination
+        currentPage={rendered.currentPage}
+        pageCount={rendered.pageCount}
+        setPage={setPage}
+      />
       {!candidates.length && (
         <div className="empty-state">
           No candidate decisions match this search.
@@ -608,7 +731,13 @@ function FunnelStep({
   );
 }
 
-function CandidateRow({ candidate }: { candidate: UniverseCadenceCandidate }) {
+function CandidateRow({
+  candidate,
+  event,
+}: {
+  candidate: UniverseTargeterDecision;
+  event?: UniverseEvent;
+}) {
   const state = candidate.selected
     ? 'Selected'
     : candidate.eligible
@@ -617,9 +746,9 @@ function CandidateRow({ candidate }: { candidate: UniverseCadenceCandidate }) {
   return (
     <details className="candidate-row">
       <summary>
-        <EventIcon game={candidate.game} sport={candidate.sport} />
+        <EventIcon game={event?.game ?? null} sport={event?.sport ?? 'event'} />
         <span>
-          <b>{candidate.participants.join(' vs ') || candidate.bundle_id}</b>
+          <b>{event?.participants.join(' vs ') || candidate.bundle_id}</b>
           <small>
             {candidate.rejection_reasons.map(label).join(' · ') ||
               label(candidate.allocation_rejection) ||

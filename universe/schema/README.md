@@ -1,30 +1,37 @@
 # Event Universe schema
 
-[`v1.sql`](v1.sql) is the durable selected-history schema. [`v2.sql`](v2.sql)
-adds the disposable newest-five cadence cache. Runtime code applies both as
-package resources and upgrades existing v1 databases transactionally; SQL does
-not live inside `universe/store.py`.
+Runtime schema version 5 applies the single canonical [`schema.sql`](schema.sql)
+package resource. It contains both the historical run/bundle API tables and the
+event/market view: umbrella and venue events, canonical and venue markets,
+candidate decisions, selected-market occurrences, and n-ary relationships.
 
-The database is an append-only selected-history index, not another evidence
-archive:
+The database is a rebuildable query index, not another evidence archive:
 
-- `targeter_runs` binds each indexed Targeter v3 run to exact manifest/report
-  identities and a deterministic SQL projection identity;
-- content-addressed `bundle_contexts` and normalized child tables deduplicate
-  selected event, sibling-market, target, asset, and relationship context;
-- `selection_occurrences` records every selected `(run_id, bundle_id)` and
-  references a non-null complete origin occurrence;
-- `bundle_retirements` records proven all-terminal or safety-clamp observations
-  and references their exact complete origin context; and
-- `checkpoints` records incremental object-store discovery progress; and
-- `cadence_runs` caches compact operational projections for exactly the newest
-  five runs, including incomplete and empty runs.
+- `targeter_runs` binds every run to exact manifest/report identities;
+- `universe_run_projections` binds its deterministic market projection;
+- `umbrella_events` hold versioned domain identity coordinates and an immutable
+  same-day ordinal; `venue_events` are the durable native-alias edges used to
+  resolve later observations to that identity;
+- `event_observations` retain every observed activation while the identity's
+  activation date remains frozen at first allocation;
+- `event_identity_lineage` binds the one canonical oldest-first backfill range
+  and blocks incremental allocation only while that range scan is incomplete;
+- `universe_sync_failures` durably records manifests omitted from ingestion so
+  one invalid run cannot pin the scan and missing evidence remains visible and
+  retryable;
+- `canonical_markets` group venue markets under explicit market-template and
+  outcome-space versions;
+- `relations` plus `relation_members` normalize symmetric or directed n-ary
+  market relations; and
+- the v1 occurrence/context tables preserve historical bundle APIs and exact
+  continuity/retirement provenance.
 
-The schema has no active-snapshot, raw catalogue, raw segment, control,
-connection-epoch, venue-delivery, report JSON, or replay-plan table. Exact
-evidence remains in the immutable configured ObjectStore. Source keys and
-SHA-256 identities are the route back to those bytes.
+There is no cadence cache, active snapshot, raw report/catalogue, raw segment,
+control, connection-epoch, venue-delivery, or replay-plan table. Exact evidence
+remains in the immutable configured ObjectStore.
 
-V1 selected-history rows remain unchanged. The v2 migration creates only the
-rebuildable cache; sync repopulates missing newest-run projections from verified
-Targeter reports.
+Schema v5 deliberately has no in-place migration. Stop Universe, remove an
+existing v1/v2/v3/v4 SQLite file and its WAL/SHM siblings, then run an
+oldest-first backfill from the immutable archive. Runtime retains
+`PRAGMA user_version = 5` and rejects any older or modified schema with that
+rebuild instruction.

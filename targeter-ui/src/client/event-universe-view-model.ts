@@ -7,6 +7,22 @@ export const universeLabel = (value: string | null | undefined) =>
         .replace(/\b\w/g, (character) => character.toUpperCase())
     : '—';
 
+export const UNIVERSE_RENDER_PAGE_SIZE = 100;
+
+export function boundedRenderPage<T>(items: T[], page: number) {
+  const pageCount = Math.max(
+    1,
+    Math.ceil(items.length / UNIVERSE_RENDER_PAGE_SIZE),
+  );
+  const currentPage = Math.min(Math.max(0, page), pageCount - 1);
+  const start = currentPage * UNIVERSE_RENDER_PAGE_SIZE;
+  return {
+    items: items.slice(start, start + UNIVERSE_RENDER_PAGE_SIZE),
+    currentPage,
+    pageCount,
+  };
+}
+
 export function occurrenceExplanation(selection: UniverseSelection) {
   if (selection.occurrence_kind === 'retained')
     return 'Retained reference — exact context and targets resolve to the immutable origin run.';

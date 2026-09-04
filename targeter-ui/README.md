@@ -1,8 +1,8 @@
 # Targeter observability UI
 
 Read-only React/Vite UI for current Targeter selections, historical Event
-Universe bundles, and recent Targeter decision evidence. The landing page is a
-compact service/cadence status view; detailed views are desktop-first.
+Universe bundles, and recent Targeter decision evidence. The current targets
+explorer is the landing page; detailed views are desktop-first.
 
 The browser hydrates every view exclusively through the same-origin
 `/api/event-universe/...` proxy. The UI does not list an archive, download
@@ -17,7 +17,7 @@ credentials. Event Universe owns report verification and lifecycle projection.
 UNIVERSE_API_BASE_URL=https://universe.example.com
 UNIVERSE_API_AUTHORIZATION=Bearer replace-with-server-side-token  # optional
 UNIVERSE_API_TIMEOUT_MS=5000                                     # optional
-UNIVERSE_API_MAX_RESPONSE_BYTES=2097152                          # optional
+UNIVERSE_API_MAX_RESPONSE_BYTES=1750000                          # optional
 PORT=3000                                                        # Express only
 ```
 
@@ -27,26 +27,44 @@ paths and query fields, validates closed response schemas, applies bounded
 timeouts and response sizes, and returns generic failures without upstream
 bodies or credentials.
 
-Current targets and decisions consume only:
+The targets and decisions views resolve the newest complete run through:
 
 ```text
-GET /api/event-universe/v1/targeter/cadence?limit=5
+GET /api/event-universe/v1/targeter/status?limit=5
 ```
 
-Refreshes are GET-only. Current targets are the complete `selections` set from
-the newest complete run in the bounded five-run projection. A newer incomplete
-run cannot replace that set. Cadence is indexed evidence, not proof of
+TanStack React Query deduplicates in-flight browser requests. Status is fresh for
+15 seconds and polls every minute; immutable run, bundle, selection, and history
+responses are fresh for five minutes. Inactive list/run queries are garbage
+collected after five minutes, while drawer-only details are discarded as soon as
+the drawer closes. Nothing is persisted to browser storage.
+
+Refreshes are GET-only. The status response contains only card state and the
+current complete target summary. Current targets and decisions fetch the full
+run on demand from:
+
+```text
+GET /api/event-universe/v1/targeter/runs/<run_id>
+```
+
+They use `current_complete_run.run_id` and render the run's compact embedded
+event summaries. Full `GET /v1/events/<event_id>` detail is requested only when
+the corresponding target drawer opens; a newer incomplete run cannot replace
+the current target set. Indexed status is not proof of
 `current.json` publication or splice/frame capture health; capture therefore
 remains explicitly unverified. The UI uses the server's semantic counts and
 never reinterprets raw Targeter reports.
 
-History consumes grouped bundle summaries from `GET /v1/bundles`, then loads
-the latest immutable detail and occurrence timeline only when a bundle opens.
+History pages through grouped bundle summaries from `GET /v1/bundles`, retaining
+at most eight 100-row pages, then loads the latest immutable detail and occurrence
+timeline only when a bundle opens. Targets and decisions render at most 100 rows
+per client-side page. Full event and bundle drawer details are not retained after
+their drawer closes.
 
 ## Routes
 
-- `/` — compact Event Universe server and Targeter cadence status
-- `/targets` — full target set from the newest complete cadence run
+- `/` — normalized events and selected markets from the newest complete run
+- `/targets` — compatibility redirect to `/`
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
 - `/api/event-universe/...` — narrow same-origin Universe proxy
