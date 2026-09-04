@@ -12,11 +12,27 @@ rather than preceding it.
 of them did not hold and are corrected here rather than left in place:
 
 - the review's claim that `price_changes[].hash` is an *order* hash is
-  unsupported by the venue's documentation and contradicted by our own
-  measurement. Snapshot positioning by hash equality is restored as the primary
-  mechanism and delayed-anchor suffix replay becomes its fallback (§12.9);
+  unsupported by the venue's documentation and contradicted by measurement.
+  Hash equality is evidence for candidate historical placement; the later
+  evidence amendment below supersedes this amendment's former claim that it
+  uniquely positions a snapshot or makes suffix replay optional (§12.9);
 - the Universe umbrella-event API is implemented, not pending. Phase 0 shrinks
   accordingly (§3.1, §4).
+
+**Polymarket evidence amendment (2026-09-04).** The completed live experiment in
+[`POLYMARKET_HASH_REPLAY_EVIDENCE_2026-09-04.md`](POLYMARKET_HASH_REPLAY_EVIDENCE_2026-09-04.md)
+supersedes the preliminary 24-snapshot reasoning in the second amendment. It
+confirms a shared asset-scoped REST/WS full-state hash space, but directly
+falsifies per-delivery certification. Sections 4, 6, 7, 9, 12, and 14 state the
+resulting recommended two-pass default, address-preserving one-pass requirements,
+and choices that remain subject to explicit approval.
+
+**Phase-0 integration note.** The audited canonical selector/reader described in
+§5.2 has been implemented in `indexer-finalize` in the Phase-0 work. Its API and
+capability lifecycle are the Replay boundary; the older proposal to move receipt
+types into `indexer-types` is withdrawn. That implementation is not assumed to be
+present on this branch until its source-thread commit
+`343db932ac216cfa0ba1c467254a0f6bac6ba589` is integrated.
 
 ---
 
@@ -296,7 +312,8 @@ Each phase is usable without enabling the next one. Scaling, unattended
 operation, simulation, and deletion do not ride along with correctness work.
 
 **Phase 0 — Freeze what the reconciler will depend on.** Smaller than the first
-review assumed, because two of its prerequisites already exist:
+review assumed, because Universe exists and the canonical boundary is implemented
+in the Phase-0 `indexer-finalize` work:
 
 - **Universe is implemented** (§3.1). This is a contract test plus two field
   additions, not an API build.
@@ -306,15 +323,19 @@ review assumed, because two of its prerequisites already exist:
   the conversion/rounding rules at the boundary; it does not re-derive the
   primitives. *(Pending: point this at the source repository once shared.)*
 
-What genuinely has to be settled first: the versioned lane-role map, the fee
-inputs, the half-open scope interval, and extracting the public Rust
-committed-window reader and gap-free selector out of `finalize` (§5.2).
+What genuinely has to be settled first: integrating and pinning that public
+boundary, the versioned lane-role map, fee inputs, half-open scope interval, and
+the explicit selector policies in §14. Integration must preserve the implemented
+API and capability lifecycle rather than re-implementing its audit in Replay.
 
 Acceptance: one fixture resolves to the same canonical scope bytes repeatedly;
-window selection proves gap-free coverage of `[T0 − prologue, T1)`; every
-selected receipt passes the independent audit path; retirement is recorded as an
-observation/clamp rather than asserted to be the exact event end; and the §12.9
-hash-space query has been run, because it decides the shape of §6.4.
+`select_canonical_windows` proves unique minimal adjacent coverage of
+`[T0 − prologue, T1)`; the stream is consumed through `Ok(None)` and only
+`finish()` mints `AuditedCanonicalSelection`; retirement is recorded as an
+observation/clamp rather than asserted to be the exact event end; selector policy
+choices are recorded in the segment manifest; and the completed §12.9 evidence
+is pinned. An object, record prefix, or successful decode without the finished
+audit capability cannot commit a segment.
 
 Normaliser conformance (§5.10) runs against fixtures and depends on none of the
 above, so it starts in parallel rather than queueing behind this phase.
@@ -332,9 +353,11 @@ no rejected payload can produce a usable book.
 partition-sum family, measurement episodes and repricing revisions only.
 Acceptance: malformed/overflowing deltas, unknown controls, missing full books,
 sink failure, reconnects, and continuity faults fail as specified; snapshot
-fixtures prove historical Polymarket verification and suffix recovery (§6.4,
-§12.9); and final episodes overlapping retrospectively untrusted intervals are
-demoted.
+fixtures prove historical Polymarket placement and two-pass suffix recovery
+(§6.4, §12.9); every candidate keeps its canonical address; all five named anchor
+outcomes are covered; and final episodes overlapping retrospectively provisional
+or unusable intervals are demoted. Production one-pass remains out of scope until
+the independent replacement gate in §12.9 passes.
 
 **Phase 3 — Deterministic economics.** Add the pinned, offline fee module and
 verdict pipeline only after representation is settled. Acceptance: each emitted
@@ -379,8 +402,8 @@ that instead of redoing it.
 ```
  0  stage       archived windows → local canonical root           new bounded Python stager
                 (only when the local root has been reaped)         (§3.1 resolve --stage)
- 1  select      gap-free receipts covering [T0 − prologue, T1)    new public selection API
- 2  verify      stored + decoded identity; provenance binding     new public audited reader
+ 1  select      gap-free receipts covering [T0 − prologue, T1)    indexer-finalize public API
+ 2  verify      stored + decoded identity; provenance binding     AuditedCanonicalReader
                 to receipt inputs; canonical_seq continuity
  3  decode      Zstandard through the strict decoder              prediction-encoder::StreamingDecoder
  4  parse       envelope lines, closed and versioned              indexer-types::EnvelopeView
@@ -391,17 +414,33 @@ that instead of redoing it.
  8  emit        stream, or segment + rejects + manifest + receipt new
 ```
 
-**Stages 1–4 reuse existing mechanics but not an existing public API.**
-`finalize::committed_windows` enumerates receipts; it does not select or prove a
-gap-free covering interval. `finalize::audit::audit_window` performs the strict
-identity/provenance checks for one window but is private. Phase 0 extracts one
-public audited reader and adds a selector that requires exact half-open coverage
-of `[T0 − prologue, T1)`, rejects overlaps and gaps, and records the selected
-receipt identities. The reader opens evidence and provenance together through
-the strict decoder, checks `canonical_seq` continuity, and binds every
-provenance line to a receipt input by lane and source digest. Stage 5 consumes
-that joined stream. Receipt and identity types move to `indexer-types` so the
-engine depends on shared types and the encoder, never on the finalizer binary.
+**Stages 1–4 consume the implemented `indexer-finalize` boundary.**
+`select_canonical_windows(root, start, end, SelectionPolicy)` returns the unique
+minimal adjacent committed-window run covering the half-open interval and rejects
+gaps, overlaps, duplicate starts, missing/corrupt receipts, missing objects, and
+non-adjacent canonical sequence. Empty windows do not reset sequence continuity.
+`CanonicalSelection::open()` returns `AuditedCanonicalReader`, whose
+`next_record()` yields exact envelope bytes joined to closed provenance in
+finalizer order. It rechecks stored and decoded identities, strict Zstandard EOF,
+receipt identity, evidence/provenance lockstep, source binding, record/content
+identity, window bounds, delivery index, and line-level sequence. An error poisons
+the reader permanently.
+
+The caller must consume through `Ok(None)` and call `finish()`. Only `finish()`
+returns the opaque `AuditedCanonicalSelection` that pins receipt SHA-256 and byte
+length; records yielded earlier are untrusted. Segment output may be staged while
+streaming but its commit receipt cannot be published without this capability.
+The final upper bound is always clipped. Lower-bound and certification behavior
+remain explicit `SelectionPolicy` choices (§14), and both the selected policy and
+effective interval enter the segment manifest and address.
+
+These APIs and their receipt/provenance types remain owned by
+`indexer-finalize`; Replay must not fork them into `indexer-types` or duplicate
+the audit. `indexer-types` continues to own shared envelope and identity
+primitives only. Stage 5 consumes `JoinedCanonicalRecord`, including exact
+envelope bytes, `canonical_seq`, `order_ns = visible_ns`, tie group,
+lane/delivery address, record/source/content provenance, and the closed
+continuity verdict.
 
 **Stage 0 is Python and optional.** The canonical reaper removes local windows
 about eighteen hours after they are archived, so the local root is a rolling
@@ -516,22 +555,23 @@ Fatal for the segment:
 1. any object failed verification against its receipt;
 2. the window is not closed — no segment is built over an interval still being
    captured.
+3. the audited reader did not reach EOF and mint `AuditedCanonicalSelection`.
 
 Fatal **per instrument**, which refuses that instrument's legs rather than the
 segment:
 
-3. no full book anywhere in prologue + window, so the book can never leave
+4. no full book anywhere in prologue + window, so the book can never leave
    `NotBootstrapped`.
 
 Recorded in the manifest, not fatal:
 
-4. `bootstrap_offset_ns` per instrument — how far into the segment its first
+5. `bootstrap_offset_ns` per instrument — how far into the segment its first
    usable book appears. Normally near zero thanks to the prologue; when it is
    not, the loss is visible instead of silent.
-5. delivery-index discontinuities per lane, read from the provenance index's
+6. delivery-index discontinuities per lane, read from the provenance index's
    continuity verdicts and passed to the engine as an `UnusableCause` at that
    position.
-6. an `incomplete` receipt — a lane missing or invalid for the whole window. The
+7. an `incomplete` receipt — a lane missing or invalid for the whole window. The
    window is admitted; every instrument on the faulted lane is passed to the
    engine as `SegmentDiscontinuity` spanning the window. This is what stops one
    wedged splice from hiding the other venues' evidence, and what stops it from
@@ -547,15 +587,18 @@ Recorded in the manifest, not fatal:
 sha256(
     "prediction-indexer/replay-segment/v1" ||
     u64be(len(scope_descriptor_canonical_bytes)) || scope_descriptor_canonical_bytes ||
+    u64be(len(selection_policy_canonical_bytes)) || selection_policy_canonical_bytes ||
     u64be(len(input_object_manifest)) || input_object_manifest ||
     u64be(len(reconciler_version)) || reconciler_version
 )
 ```
 
 `input_object_manifest` itself has canonical bytes and explicitly sorted receipt
-entries. The same framing rule applies to any future composite run, cache, or
-episode identity. It does not alter existing canonical content hashes, archive
-identities, or vendor hashes; those follow their owning contracts exactly.
+entries. `selection_policy_canonical_bytes` records certified and lower-bound
+policy plus the requested/effective interval returned by the audited capability.
+The same framing rule applies to any future composite run, cache, or episode
+identity. It does not alter existing canonical content hashes, archive identities,
+or vendor hashes; those follow their owning contracts exactly.
 
 Computed and recorded on every run even when the segment is discarded, so results
 join to segments retroactively once caching is on. Every episode carries it.
@@ -682,7 +725,8 @@ engine/crates/
   cli        replay-engine  (build · run)
 
 shared from the ingester workspace, never the reverse:
-  indexer-types        EnvelopeView, identities, receipt and identity types
+  indexer-finalize     canonical selection, audited reader, provenance types
+  indexer-types        EnvelopeView and shared identity primitives
   prediction-encoder   strict Zstandard
 ```
 
@@ -711,14 +755,17 @@ default:
 The boundary is attributed to the last canonical address in the group and also
 records the tie-group identifier.
 
-Polymarket's repeated `hash` across the entries of one delivery is treated as
-case 1 — one logical update, applied before evaluation, boundary attributed to
-the last entry of the run. This is what `replay/books.py` already does and what
-`replay/tests/test_books.py::test_repeated_hash_across_frames_is_checked_after_complete_hash_run`
-pins. It is a grouping rule over *equal adjacent hashes* and needs no theory of
-what the hash denotes, so it holds under either reading in §12.9. What the
-engine does **not** do is verify a book against a per-delta hash; that remains
-unproven and is gated behind §12.9.
+Polymarket same-hash candidate runs are **not automatically a third economic
+atomic group**. The live sample found ten candidate occurrences where exact
+levels appeared only after the next same-asset, same-hash delivery. This makes a
+maximal contiguous run useful for anchor verification, but does not prove that
+the venue intended all intervening deliveries to become one strategy-observation
+instant. Every delivery and normalized child therefore retains its
+`EventAddress`; the verifier may derive a candidate-run range without replacing,
+pooling, or repositioning those records. Whether strategy evaluation waits for a
+candidate-run end is an explicit protocol/product choice in §14. Recommended
+pending approval: evaluate canonical deliveries normally and use the run only
+for retrospective verification and demotion.
 
 There is **no heartbeat and no synthetic record**. Staleness and timeout closures
 are applied **backdated** at the next evaluation: the tracker knows each leg's
@@ -733,22 +780,37 @@ Per-event evaluation yields a second lifetime measure for free. An episode carri
 both `duration_ns` and `events_survived`. One that survived 40 events is a
 different animal from one that survived 1 at the same wall duration.
 
-### 6.4 The book state machine
+### 6.4 The book and anchor state machines
 
 ```
-  NotBootstrapped ──full book──► Usable ──divergence──► Unusable
-                                    ▲                       │
-                                    └──────full book────────┘
+  NotBootstrapped ──current full book──► Provisional ──verified frontier──► Usable
+          ▲                                  │                                 │
+          │                                  └──── fault/divergence ──────────┤
+          │                                                                    ▼
+          └──────────── unusable until later usable full anchor ◄───────── Unusable
+
+  anchor: Pending ──candidate run closes──► Placed ──suffix replay──► Recovered
+              │                               │             │
+              └── bound/end ─► AnchorPending  │             └──► MissingSuffix
+                                              ├──► Divergence
+                                              ├──► AmbiguousAnchor
+                                              └──► AnchorTooOld
 ```
 
-- Deltas apply **only** in `Usable`. In `Unusable` they are dropped: they act on a
-  book we do not trust and we will hard-reset anyway.
+- Deltas apply in `Provisional` and `Usable`. In `Unusable` they are journaled as
+  evidence when required for later suffix analysis but do not mutate the primary
+  book: they act on state we do not trust and recovery uses scratch replay.
 - Canonical provenance is applied first. `duplicate` records do not mutate;
   conflict and continuity-fault records make the affected book unusable before
   venue semantics run.
+- A current full book bootstraps observed levels. Whether that starts as `Usable`
+  or `Provisional` is venue/trust-policy specific; Polymarket's unsequenced delta
+  path remains provisional until the approved independent-anchor condition is
+  met. `Usable` means usable under the declared captured-tape trust contract,
+  never venue-proven completeness.
 - Recovery requires a **full book at the recovery frontier**, or a historical
-  full book followed by a complete deterministic replay of the captured suffix.
-  A hash match alone cannot move a frozen book forward.
+  full book followed by complete deterministic replay of the retained captured
+  suffix. A hash match alone cannot move a frozen book forward.
 - Missed deltas are never recovered. We only ever bound when trust was lost and
   regained.
 - Bootstrap and recovery are the same transition, so segment start is not a
@@ -764,10 +826,13 @@ it verifies the reconstructed historical state at that frontier and never resets
 the current book. Comparing it with the current book creates false mismatches;
 resetting the current book to it rewinds state.
 
-Placing that frontier is a hash lookup first (§12.9): the delivery whose
-`book_hash` equals the snapshot's *is* the frontier, exactly, with no reliance on
-timestamps or round-trip duration. §12.10's bounded time-window match is the
-fallback for a snapshot whose hash matches nothing.
+Placing that frontier begins by enumerating **all** same-asset/hash canonical
+addresses (§12.9). Hash equality identifies candidates, not necessarily one
+frontier: consecutive repeats can describe a split update, and non-contiguous
+recurrence remains uncharacterised. Replay compares full levels at every
+delivery-end candidate and applies only the approved candidate-run rule. Request
+and receipt clocks never select among candidates. There is no permissive
+time-window placement fallback (§12.10).
 
 While `Unusable`, a historical snapshot is a recovery anchor only after replaying
 the complete captured suffix from its observation frontier to the current replay
@@ -776,13 +841,21 @@ its own instant and the book remains unusable until a later full book. The engin
 retains bounded checkpoints or performs a second serial pass; it never applies a
 stale anchor at receipt time.
 
-On mismatch, the confirmed state preceding the first known fault remains valid;
-the interval from that fault (or, when no tighter bound exists, the previous
-successful verification) to the snapshot frontier is retrospectively unusable.
-The snapshot frontier is a new confirmed state. Its following interval remains
-provisional until suffix continuity and a later anchor establish it. A later
-endpoint match restores the endpoint but does not prove an intermediate path
-that contains a known gap.
+Anchor processing has five closed outcomes: `AnchorPending` while a candidate
+run may still arrive or close; `AnchorTooOld` when every candidate is outside a
+declared journal; `AmbiguousAnchor` when candidate recurrence/runs cannot be
+resolved; `MissingSuffix` when exact transport from historical H2 to current H3
+is unavailable; and `Divergence` when the completed candidate state disagrees.
+The first four never promote trust; divergence makes the affected interval and
+current book unusable unless exact suffix recovery succeeds from the anchor.
+None permits a best-effort reset.
+
+On mismatch, the confirmed state preceding the first known fault remains valid.
+The interval from that fault—or, when no tighter bound exists, the previous
+successful verification—to the snapshot frontier is retrospectively unusable.
+The snapshot frontier is a confirmed instant, not automatically confirmed
+current state. A later endpoint match restores that endpoint but does not prove
+an intermediate path containing a known gap.
 
 **Causal usability is weaker than the retrospective audit, by design.** A future
 live driver cannot retract its past, so the first engine pass may emit provisional
@@ -791,13 +864,13 @@ window are retained as evidence but **demoted before headline verdicts** once th
 second trust pass has placed snapshots and suffixes (§9.1). The engine stays
 causal; committed replay results preserve the audit.
 
-### 6.5 Recovery latency is per-venue and asymmetric
+### 6.5 Detection and recovery latency are different
 
 | Venue | In-band gap detection | Recovery source | Typical blind window |
 |---|---|---|---|
 | Limitless | n/a — every message is a full book | every message | ~one message |
 | Kalshi | `update_range` — immediate | 30s sweep + subscribe | ≤ 30s |
-| Polymarket | **none** | hash-positioned poll anchor + suffix, or later full book | detection ~60s; recovery evidence-dependent |
+| Polymarket | **none** | candidate-positioned poll anchor + exact suffix, or later full book | detection poll-dependent; recovery evidence-dependent |
 
 Polymarket is uniquely exposed: no sequence numbers, so divergence is detected
 only when a full-book poll is received. A delayed poll can anchor its historical
@@ -806,14 +879,21 @@ complete; otherwise a later full book is required. A book can therefore be
 silently wrong for up to a poll interval before detection, and first-pass
 episodes in that interval are provisional.
 
+In the ten-minute sample, chosen anchor→REST receipt lag reached **155.659 s**
+and six anchors became visible on WebSocket only after REST receipt. This is a
+lower bound on journal demand, not a production recovery bound. Detection
+latency is poll schedule + request/anchor delay. Recovery latency additionally
+includes candidate-run closure and availability of an exact suffix; it can run
+until a later usable full anchor. Both distributions are reported separately.
+
 The response is annotation in the engine and demotion in Python (§9.1), never
 retraction of the tape: every episode carries `verification_age_ns` per leg, so a
 consumer can require recent confirmation without the engine buffering or
 rewriting anything, and the Python side re-types what hindsight later condemns.
 
-§12.9 records why hash *equality* positions a snapshot exactly and is the primary
-mechanism here, and what reproducing the venue's digest would add on top. Neither
-turns the hash into per-delta verification, and neither proves a gapped suffix.
+§12.9 records why hash equality enumerates historical candidates and what
+reproducing the venue digest proves. Neither uniquely positions every snapshot,
+turns a hash into per-delivery verification, or proves suffix completeness.
 
 ### 6.6 Consumers
 
@@ -970,15 +1050,7 @@ pub struct CanonicalProvenance {
     pub source_segment_sha256: Arc<str>,
     pub source_line_number: u64,
     pub content_hash: Arc<str>,
-    pub continuity: ContinuityVerdict,
-}
-
-pub enum ContinuityVerdict {
-    Continuous,
-    Duplicate,
-    GapProven,
-    Conflict,
-    Fault { code: Arc<str> },
+    pub continuity: indexer_finalize::ContinuityVerdict,
 }
 
 pub enum SegmentEvent {
@@ -1030,16 +1102,19 @@ pub enum ControlEvent {
 }
 ```
 
-The parser maps the finalizer's versioned continuity vocabulary exhaustively;
-an unknown label is a fatal segment-schema error, not `Continuous`.
+The parser preserves the finalizer's exact closed vocabulary (`lifecycle`,
+`bootstrap`, `unsequenced_venue`, `sparse_monotonic`, `continuous`,
+`gap_proven`, `cursor_went_backwards`, `local_counter_broken`, `duplicate`, and
+`conflict`). An unknown label is fatal, not `Continuous`, and Replay does not
+collapse distinct upstream evidence into a generic fault.
 
 `Absolute` application is idempotent; `Relative` is not, which is one more reason
 a book fed by relative deltas can never re-converge after a gap without a full
-book (§6.4). `book_hash` is carried verbatim and is used for equality — grouping
-one logical update (§6.2) and positioning a snapshot (§12.9). It is never
-*recomputed* and compared against reconstructed state until §12.9's reproduction
-work lands. Kalshi's delta semantics are taken from its published spec and
-are unverified against live servers (§12.7); the variant exists so that verifying
+book (§6.4). `book_hash` is carried verbatim and used with the asset and preserved
+addresses to enumerate anchor candidates (§12.9). The official full-book SHA-1
+is reproducible, but it certifies neither an individual delta/delivery nor suffix
+completeness. Kalshi's delta semantics are taken from its published spec and are
+unverified against live servers (§12.7); the variant exists so that verifying
 them is a reconciler change, not a schema change.
 
 ### 7.3 The book and its receipt
@@ -1047,13 +1122,23 @@ them is a reconciler change, not a schema change.
 ```rust
 pub enum BookState {
     NotBootstrapped,
+    Provisional { since_ns: i64, reason: ProvisionalReason },
     Usable   { since_ns: i64, last_verified_ns: Option<i64> },
     Unusable { since_ns: i64, cause: UnusableCause },
+}
+
+pub enum ProvisionalReason {
+    AwaitingIndependentAnchor,
+    AnchorPending,
+    SuffixNotYetVerified,
 }
 
 pub enum UnusableCause {
     AnchorMismatch,          // poll disagreed with our reconstruction
     AnchorConflict,          // two polls, same hash, different contents
+    AnchorTooOld,
+    AmbiguousAnchor,
+    MissingSuffix,
     EpochReset,              // reconnect; prior book cannot carry over
     LaneInterrupted,         // connection_failed covering this instrument
     SegmentDiscontinuity,    // manifest-declared delivery gap
@@ -1222,19 +1307,33 @@ pub struct UnusableInterval {
 Emitted so that "no episodes here" is never ambiguous between *no edge existed*
 and *we were blind*. Those have opposite implications for whether to keep going.
 
-Every anchor comparison against a `Usable` book is emitted too. Positive results
-matter as much as negative ones: §9.1 needs the last instant a book was proven
-right, and `verification_age_ns` on an episode only looks backwards.
+Every anchor comparison against a `Provisional` or `Usable` book is emitted too.
+Positive results matter as much as negative ones: §9.1 needs the last instant a
+book was proven right, and `verification_age_ns` on an episode only looks
+backwards.
 
 ```rust
 pub struct VerificationRecord {
     pub instrument: InstrumentId,
     pub source_observed_ns: i64,
     pub received_ns: i64,
-    pub stream_frontier: Option<EventAddress>,
+    pub candidate_addresses: Vec<EventAddress>,
+    pub chosen_run: Option<(EventAddress, EventAddress)>,
+    pub recovered_frontier: Option<EventAddress>,
     pub snapshot_hash: Arc<str>,
-    pub matched: bool,
-    pub reason: Arc<str>,
+    pub outcome: AnchorOutcome,
+    pub detection_latency_ns: Option<i64>,
+    pub recovery_latency_ns: Option<i64>,
+}
+
+pub enum AnchorOutcome {
+    Verified,
+    Recovered,
+    AnchorTooOld,
+    AmbiguousAnchor,
+    MissingSuffix,
+    Divergence,
+    AnchorPending,
 }
 ```
 
@@ -1325,10 +1424,13 @@ so it is free to be slow, exploratory, and rewritten weekly.
 ### 9.1 Retrospective demotion
 
 The engine is causal (§6.4). Replay finalization is not, and holds the whole run.
-It places each independent snapshot at `source_observed_ns`, associates it with a
-historical stream frontier, and derives maximal verified, provisional, and
-unusable intervals per instrument. Known continuity faults tighten the left
-boundary; a matching endpoint never validates a path containing a known gap.
+V1 performs the two-pass oracle in §12.9: it preserves every snapshot and
+candidate address, places an anchor by the approved completed-run rule, replays
+the exact captured suffix in scratch state, and derives maximal verified,
+provisional, and unusable intervals per instrument. `source_observed_ns` is
+evidence attached to the anchor, not sufficient placement by itself. Known
+continuity faults tighten the left boundary; a matching endpoint never validates
+a path containing a known gap.
 
 Every episode leg is intersected with those final intervals. Any overlap with a
 provisional or unusable interval re-types the episode
@@ -1341,6 +1443,11 @@ This restores the walk-back `trust.py` performed, in the layer that scales with
 episode count, without putting hindsight into an engine that must one day run
 live. The demoted count and gross magnitude are reported beside the headline: they
 measure the practical cost of delayed verification and continuity faults.
+
+A future one-pass engine may emit the same final intervals only after passing the
+byte-identical differential gate in §12.9. Before then its output is explicitly
+experimental/provisional and cannot feed headline verdicts merely because its
+book levels happen to match at run end.
 
 ### 9.2 Stages
 
@@ -1445,70 +1552,75 @@ receipt has, which is what keeps it possible.
 
 **12.9 Polymarket's book hash: what it is, and what we may conclude from it.**
 
-The first review asserted that `price_changes[].hash` is "the hash of the order
-causing the change, not a post-update book-state hash," and rebuilt snapshot
-recovery around that. The assertion does not survive checking, and because a
-great deal was built on it, the evidence is recorded here rather than in a commit
-message.
+The completed evidence is retained in
+[`POLYMARKET_HASH_REPLAY_EVIDENCE_2026-09-04.md`](POLYMARKET_HASH_REPLAY_EVIDENCE_2026-09-04.md).
+Over 24 assets, 216/216 post-bootstrap REST snapshots had exact WebSocket
+candidates and the official full-book SHA-1 reproduced 240/240 REST hashes. REST
+and `price_changes[].hash` therefore share an observed asset-scoped full-state
+hash space.
 
-*Against the order-hash reading:*
+That does **not** make a hash a per-delta or per-delivery certificate. Ten cases
+had two consecutive same-hash WebSocket delivery candidates: the first state
+differed from REST at one level and the second matched. Replay must preserve all
+canonical addresses and compare delivery-end states. It may use “end of the
+maximal contiguous same-asset same-hash run” as an approved, predeclared candidate
+rule, but the short sample gives only moderate confidence and no protocol
+guarantee. Non-contiguous recurrence is `AmbiguousAnchor`, not an invitation to
+pick the nearest occurrence.
 
-1. **The venue documents neither hash.** The
-   [market-channel reference](https://docs.polymarket.com/developers/CLOB/websocket/market-channel)
-   declares `hash?: string | null` on both `MarketBookEvent` and
-   `MarketPriceChangeEvent` and describes neither. So "documented as an order
-   hash" is not the case; there is no published statement either way.
-2. **The only hash the official clients define is a book-state hash.** Both the
-   [Python v2 client](https://github.com/Polymarket/py-clob-client-v2/blob/main/py_clob_client_v2/utilities.py)
-   and the
-   [TypeScript v2 client](https://github.com/Polymarket/clob-client-v2/blob/main/src/utilities.ts)
-   implement one hash function, over the order-book summary: blank the `hash`
-   field, compact-serialize `market`, `asset_id`, `timestamp`, `bids`, `asks`,
-   `min_order_size`, `tick_size`, `neg_risk`, `last_trade_price`, and SHA-1 the
-   UTF-8 bytes. Neither file mentions an order hash.
-3. **Our own measurement contradicts it directly.** `splices/polymarket/snapshots.py`
-   records that **24 of 24** polled REST full-book hashes were found exactly in
-   the matching asset's websocket `price_change` hash stream. A hash over one
-   order cannot equal a hash over a whole book 24 times out of 24.
+The SHA-1 preimage includes market, asset, timestamp, both sides, minimum order
+size, tick size, negative-risk status, and last trade. Reproduction is an
+independent full-snapshot integrity check. It does not prove every metadata
+transition arrived, every delivery is complete, or H2→H3 suffix completeness.
+Polymarket publishes no dense source sequence. Our delivery index proves recorder
+accepted-order continuity only.
 
-The reading consistent with all three: the venue keeps one order-book summary
-per asset, recomputes its hash when the book changes, and serves that same
-stored object over both REST and websocket. That also explains why the
-`timestamp` inside the preimage does not break the match — REST returns the
-stored summary, not a freshly stamped one.
+**Recommended pending §14 approval: two-pass is the normative V1 oracle and
+default.** Pass one indexes every independent snapshot occurrence without
+collapsing equal `(asset, hash)` pairs.
+Pass two reconstructs WebSocket state, closes the approved candidate run,
+compares the historical frontier, resets scratch state to the full anchor when
+appropriate, and replays the exact captured suffix to the later frontier. It
+then emits final trust intervals and demotions. This is exact relative to the
+captured tape, not proof the venue emitted a complete tape.
 
-*What survives of the review's caution.* Its conclusion — do not build on
-per-delta hash verification — is still right, for a different and better reason.
-The preimage includes `tick_size`, `neg_risk`, and `last_trade_price`, which a
-`price_change` message does not carry. Reproducing the hash after applying a
-delta therefore requires reconstructing book metadata from other streams
-(`tick_size_change`, `last_trade_price`), which may be possible but is unproven.
-Per-delta verification stays gated.
+**A production one-pass path is experimental until its replacement gate
+passes.** It must predeclare a bound and retain, per asset:
 
-*What this changes.* Hash **equality** requires no reproduction at all, so it is
-restored as the primary way a polled snapshot is positioned in the delta stream:
-find the delivery whose hash equals the snapshot's, and that is where the book
-state sits. This is exactly the argument `splices/polymarket/snapshots.py`
-already makes, and it is why the ~955 ms round trip does not matter. §12.10's
-bounded time-window match is the **fallback** for when no hash matches, not the
-default path. Reproducing the summary hash (the work described above) remains
-worth doing because it upgrades content comparison from "levels agree" to "the
-venue's own digest agrees," but it is not on the critical path.
+- current reconstructed levels and hash-relevant metadata;
+- every `EventAddress` in the open contiguous same-hash candidate run;
+- a bounded lossless journal/reference containing byte cost, epoch,
+  source/receipt/canonical times, parse status, and before/after frontier;
+- provisional trust and output boundaries that can be retrospectively demoted.
 
-*The decisive test, before any of this is relied on.* Take the hashes already on
-tape, and for each polled snapshot check whether its hash appears in that asset's
-`price_change` hash stream. A high match rate confirms the shared-hash-space
-reading and this section stands. A low one refutes it, and §6.4 reverts to
-delayed anchors with suffix replay as the primary path. Run this in Phase 0; it
-is one query over data we already hold and it decides between two designs.
+At anchor arrival it enumerates every in-bound candidate, preserves mismatches,
+applies only the approved run rule, and replays the exact H2→current suffix in
+scratch state before replacing current state. It must not cross an epoch, parse
+reject, missing address, or known continuity fault. Journal overflow fails closed
+with `AnchorTooOld` or `MissingSuffix`; it never truncates evidence and continues
+as trusted. `AnchorPending` waits for the candidate/run closure only within the
+approved horizon. `AmbiguousAnchor`, `Divergence`, and all unresolved pending
+anchors remain explicit outcomes. Automatic two-pass fallback, if approved, uses
+a separately identified output attempt and cannot silently change semantics
+inside one committed result.
 
-**12.10 Snapshot frontier alignment when hash positioning fails.** A snapshot
-whose hash matches no delivery — a dropped frame, an unseen intermediate state —
-still needs placing. Then, and only then: match within a bounded source-time
-interval and require exactly one normalized-book candidate; zero candidates is a
-mismatch and multiple candidates are ambiguous. Both outcomes remain explicit
-verification records. Arrival-time comparison and healthy-book reset are
-forbidden regardless of observed frequency.
+The observed anchor→receipt maximum of **155.659 seconds** falsifies any shorter
+time bound but does not establish a production bound. Before one-pass can replace
+two-pass, run a predeclared 24-hour minimum, preferably 72-hour, stratified sample.
+It must have zero too-old, ambiguous, missing-suffix, unhandled-shape, and silent
+fallback outcomes; retain every candidate/suffix within measured byte/event/time
+bounds; and produce byte-identical books and trust intervals, reasons, demotion
+starts, and recovery ends versus two-pass. Adversarial fixtures cover startup,
+reconnect, split same-hash runs, unchanged and non-contiguous recurrence, late
+candidate arrival, stale H2/current H3, parse/continuity faults, and every bound
+overflow.
+
+**12.10 No heuristic frontier fallback.** A snapshot with no unique valid hash
+candidate yields `AnchorPending`, `AnchorTooOld`, `AmbiguousAnchor`, or
+`Divergence` according to retained evidence. Source/request/receipt timestamps may
+be reported diagnostically but cannot place it. Arrival-time comparison,
+nearest-time matching, arbitrary equal-hash selection, and healthy-current-book
+reset are prohibited regardless of observed frequency.
 
 **12.11 Rust object retrieval.** Closed for V1 by stage 0 (§5.2): the Python
 resolve step stages stored archived windows into a local canonical root through
@@ -1545,8 +1657,66 @@ publisher writes immutable segment objects, and neither can delete archive data.
 - **Polymarket first-pass episodes can be emitted on a book that was already
   wrong**, for up to one poll interval before divergence is detectable (§6.5).
   They remain provisional and are demoted after the trust pass (§9.1). Hash
-  positioning locates a snapshot exactly (§12.9) but does not eliminate
-  uncertainty across a known gap.
-- **The shared-hash-space reading in §12.9 is measured on 24 snapshots, not
-  proven.** The Phase 0 query over the hashes already on tape either confirms it
-  at scale or reverts §6.4 to time-window anchoring.
+  candidates can locate a historical state (§12.9) but do not eliminate
+  uncertainty across a known gap or prove the current state.
+- **The shared hash space is strongly evidenced, not a protocol guarantee.** It
+  held for 216/216 post-bootstrap snapshots and official SHA-1 reproduction held
+  for 240/240. The sample had no reconnect or tick-size change and does not prove
+  non-recurrence, a production journal bound, or venue-complete delivery.
+
+---
+
+## 14. Approval checklist and completion gates
+
+The evidence constrains safe behavior but does not choose product policy. Every
+item below remains **pending explicit user approval**. Implementations may expose
+the alternatives behind types/tests, but may not silently select one in a
+committed segment or headline result.
+
+| Decision | Recommended default | Alternatives and consequence |
+|---|---|---|
+| Offline Polymarket trust algorithm | Two-pass oracle for V1; one-pass experimental only until the §12.9 differential gate passes. | Shipping one-pass earlier reduces I/O but knowingly permits unmeasured journal/fallback divergence. |
+| Candidate completion | Preserve every address; test the end of a maximal contiguous same-asset same-hash run. Treat this as a versioned observed rule. | Per-delivery is disproven. Any broader equal-hash pooling destroys address evidence and is prohibited. |
+| Economic evaluation across a candidate run | Evaluate each canonical delivery normally; use the completed run only for verification and retrospective demotion. | Waiting until run end avoids transient partial-state episodes but invents economic atomicity not established by the protocol. Whichever is chosen changes episode boundaries and must enter the policy identity. |
+| Non-contiguous recurrence and epoch/fault crossing | `AmbiguousAnchor` for recurrence; `MissingSuffix` across epoch, parse reject, missing address, or continuity fault. | Nearest-time or arbitrary candidate selection can certify the wrong historical frontier and is prohibited. |
+| One-pass journal bound | Do not choose a production number from the ten-minute sample; run a predeclared 72-hour study (24-hour minimum), then approve event, byte, and time caps together. | A time-only cap below 155.659 s is already falsified. Larger/unbounded retention increases memory/storage and defeats bounded operation. |
+| `AnchorPending` horizon | Keep pending until the run closes, a later event disambiguates it, or the approved journal/window bound is reached; then fail closed. | Immediate mismatch misclassifies the six observed post-receipt candidates; indefinite pending is unbounded. |
+| One-pass failure handling | Keep the asset unusable for that result. Permit two-pass only as an explicit separately identified retry/fallback. | Silent in-run fallback makes output semantics and resource bounds unknowable. Waiting only for a later full anchor is safer but can lose more measurable time. |
+| Canonical lower-bound policy | `LowerBoundPolicy::Clip`: audit the whole first window, emit only `[T0 − prologue, T1)`. | `RequireWindowBoundary` forces resolver alignment; `ExpandToWindowStart` adds evidence and changes effective scope. The chosen policy enters segment identity. |
+| Canonical certification policy | `RequireCertified` for committed/headline Replay. Allow uncertified windows only in a separately typed diagnostic run. | `AllowUncertified` increases coverage but admits known quarantined evidence; a flag inside a headline run is too easy to drop. |
+| Initial Polymarket full-book trust | Start unsequenced WebSocket-derived state as `Provisional`; headline eligibility begins only at the approved independent-anchor condition. | Immediate `Usable` preserves current behavior but allows pre-verification episodes and relies entirely on later demotion. |
+| Deployment lane attribution | Require a versioned lane-role map; runtime subscription evidence may refine but not contradict it. Unknown attribution makes the affected scope unobservable. | Treating a missing unattributed lane as quiet converts capture blindness into false absence. |
+| Money/fee inputs | Pin fixed-point scales, orientation, rounding, offline fee schedule keys, and SDK versions before Phase 2 headlines. | Current SDK/service lookup is nondeterministic for historical runs; floating point or implicit conversion makes exact replay impossible. |
+
+### 14.1 Phase acceptance
+
+1. **Phase 0 boundary integrated.** Universe responses pin all context identities;
+   the lane-role map and approved selector policies are versioned; the Phase-0
+   selector rejects gaps/overlaps and always clips `T1`; the audited stream is
+   consumed to EOF and `finish()` is required before segment commit. Repeated
+   runs resolve identical bytes and receipt identities.
+2. **Serial reconciler conformant.** Every normalized child preserves canonical
+   sequence, lane/delivery/event address, tie group, source provenance, and exact
+   continuity verdict. Duplicate never mutates; conflict/fault/reject stales the
+   affected book or fails the scope closed when attribution is unknowable. Every
+   reject is committed and counted. Independent readers verify local output.
+3. **Two-pass engine correct.** Address-preserving anchor fixtures cover split
+   runs, recurrence, late arrival, H2/H3 recovery, startup, reconnect, all five
+   anchor outcomes, malformed/overflowing relative deltas, unknown controls,
+   no-full-book, sink failure, and retrospective episode demotion. Repeated runs
+   are byte-identical and no provisional interval enters headline results.
+4. **Economics exact.** Every repricing input is in the revision stream; offline
+   fee vectors agree with hand calculations; substitution closes/reopens; net
+   outputs are deterministic and independently readable.
+5. **Operations bounded.** Publication is a separate Python `ObjectStore` client;
+   leases and retries are idempotent; staging, workers, open files, journals, and
+   temporary slices have measured limits; receipt verification precedes local
+   eviction; V1 has no archive deletion authority.
+6. **One-pass replacement, if pursued.** Complete the predeclared 24–72-hour gate
+   in §12.9 with zero unsafe outcomes and byte-identical book/trust results versus
+   two-pass before making it production or allowing its output into headlines.
+
+Replay Engine V1 is complete only after approved items 1–5 pass on real canonical
+windows and adversarial fixtures. Item 6 is not required for V1; until it passes,
+two-pass remains the recommended production/offline trust path and one-pass is
+explicitly experimental.
