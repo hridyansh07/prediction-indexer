@@ -5,9 +5,18 @@ document retires rather than revises.
 
 **Architecture-review amendment:** the V1 implementation gates in §4 are
 normative. In particular, canonical provenance survives normalization, replay
-outputs are receipt-committed, Polymarket verification uses delayed full-book
-anchors rather than order hashes, and scaling/publishing follows serial
-conformance rather than preceding it.
+outputs are receipt-committed, and scaling/publishing follows serial conformance
+rather than preceding it.
+
+**Second amendment, after checking the review's premises against source.** Two
+of them did not hold and are corrected here rather than left in place:
+
+- the review's claim that `price_changes[].hash` is an *order* hash is
+  unsupported by the venue's documentation and contradicted by our own
+  measurement. Snapshot positioning by hash equality is restored as the primary
+  mechanism and delayed-anchor suffix replay becomes its fallback (§12.9);
+- the Universe umbrella-event API is implemented, not pending. Phase 0 shrinks
+  accordingly (§3.1, §4).
 
 ---
 
@@ -169,11 +178,19 @@ does not read run manifests.
 **What the resolver needs from Universe.** Four lookups. Table names below are
 the local schema's; the contract is the lookups — an umbrella event id linked to
 every venue event id, venue market id, and captured asset id beneath it, over
-every Targeter run combined. These resolver endpoints and response fields are a
-Phase 0 dependency, not an existing API: the current Universe routes have no
-umbrella-event endpoint, selection serialization omits `context_sha256`, and
-the SQL schema does not directly expose both proposed market identifiers. Freeze
-and test the response contract before the reconciler depends on it.
+every Targeter run combined. **The Universe server implements this.** The
+umbrella-event model is live: `umbrella_events` joined to `venue_events`,
+`canonical_markets`, and `venue_markets` — whose `subscription_ids_json` holds
+the captured asset ids — served through `/v1/events/{event_id}` and
+`/v1/markets/{market_id}`, with relationships in `relations` and
+`relation_observations`.
+
+Two shape mismatches remain, and they are field additions rather than new
+subsystems: event detail returns canonical markets with a venue count, so
+reaching subscription ids needs a second call per market; and the selection
+record does not carry `context_sha256`, which the descriptor needs for
+reproducibility (§3.1). Pin the response contract with a test so it cannot drift
+under the reconciler, and add those fields. Do not rebuild what exists.
 
 | lookup | today |
 |---|---|
@@ -278,13 +295,29 @@ does not terminate in a complete occurrence.
 Each phase is usable without enabling the next one. Scaling, unattended
 operation, simulation, and deletion do not ride along with correctness work.
 
-**Phase 0 — Freeze prerequisites.** Specify and contract-test the Universe
-resolver response, versioned lane-role map, money/tick/lot conversions, fee
-inputs, half-open scope interval, and the public Rust committed-window reader.
+**Phase 0 — Freeze what the reconciler will depend on.** Smaller than the first
+review assumed, because two of its prerequisites already exist:
+
+- **Universe is implemented** (§3.1). This is a contract test plus two field
+  additions, not an API build.
+- **Money representation is adopted, not designed.** Integer tick/lot handling
+  with no floating point exists in our other Rust implementation of this work and
+  is vendored in rather than rewritten. Phase 0 fixes the per-venue scales and
+  the conversion/rounding rules at the boundary; it does not re-derive the
+  primitives. *(Pending: point this at the source repository once shared.)*
+
+What genuinely has to be settled first: the versioned lane-role map, the fee
+inputs, the half-open scope interval, and extracting the public Rust
+committed-window reader and gap-free selector out of `finalize` (§5.2).
+
 Acceptance: one fixture resolves to the same canonical scope bytes repeatedly;
 window selection proves gap-free coverage of `[T0 − prologue, T1)`; every
-selected receipt passes the independent audit path; and retirement is recorded
-as an observation/clamp rather than asserted to be the exact event end.
+selected receipt passes the independent audit path; retirement is recorded as an
+observation/clamp rather than asserted to be the exact event end; and the §12.9
+hash-space query has been run, because it decides the shape of §6.4.
+
+Normaliser conformance (§5.10) runs against fixtures and depends on none of the
+above, so it starts in parallel rather than queueing behind this phase.
 
 **Phase 1 — Serial reconciler and `build`.** One process and one decode worker,
 with no archive publication: verify, decode, join provenance, clip, normalise,
@@ -676,11 +709,16 @@ default:
    lane rank is not evidence that one simultaneous market moved first.
 
 The boundary is attributed to the last canonical address in the group and also
-records the tie-group identifier. In particular, Polymarket's
-`price_changes[].hash` is documented as the hash of the order causing the
-change, **not** a post-update book-state hash. It neither defines a "hash run"
-nor supports per-delta book verification. Full-book `book.hash` is the only
-state-hash anchor (§12.9).
+records the tie-group identifier.
+
+Polymarket's repeated `hash` across the entries of one delivery is treated as
+case 1 — one logical update, applied before evaluation, boundary attributed to
+the last entry of the run. This is what `replay/books.py` already does and what
+`replay/tests/test_books.py::test_repeated_hash_across_frames_is_checked_after_complete_hash_run`
+pins. It is a grouping rule over *equal adjacent hashes* and needs no theory of
+what the hash denotes, so it holds under either reading in §12.9. What the
+engine does **not** do is verify a book against a per-delta hash; that remains
+unproven and is gated behind §12.9.
 
 There is **no heartbeat and no synthetic record**. Staleness and timeout closures
 are applied **backdated** at the next evaluation: the tracker knows each leg's
@@ -726,6 +764,11 @@ it verifies the reconstructed historical state at that frontier and never resets
 the current book. Comparing it with the current book creates false mismatches;
 resetting the current book to it rewinds state.
 
+Placing that frontier is a hash lookup first (§12.9): the delivery whose
+`book_hash` equals the snapshot's *is* the frontier, exactly, with no reliance on
+timestamps or round-trip duration. §12.10's bounded time-window match is the
+fallback for a snapshot whose hash matches nothing.
+
 While `Unusable`, a historical snapshot is a recovery anchor only after replaying
 the complete captured suffix from its observation frontier to the current replay
 frontier. If continuity of that suffix is not provable, the anchor verifies only
@@ -754,7 +797,7 @@ causal; committed replay results preserve the audit.
 |---|---|---|---|
 | Limitless | n/a — every message is a full book | every message | ~one message |
 | Kalshi | `update_range` — immediate | 30s sweep + subscribe | ≤ 30s |
-| Polymarket | **none** | historical poll anchor + suffix, or later full book | detection ~60s; recovery evidence-dependent |
+| Polymarket | **none** | hash-positioned poll anchor + suffix, or later full book | detection ~60s; recovery evidence-dependent |
 
 Polymarket is uniquely exposed: no sequence numbers, so divergence is detected
 only when a full-book poll is received. A delayed poll can anchor its historical
@@ -768,9 +811,9 @@ retraction of the tape: every episode carries `verification_age_ns` per leg, so 
 consumer can require recent confirmation without the engine buffering or
 rewriting anything, and the Python side re-types what hindsight later condemns.
 
-§12.9 specifies the hash conformance work that makes full-book comparisons
-deterministic. It improves anchor matching; it does not turn order hashes into
-per-delta verification or prove a gapped suffix.
+§12.9 records why hash *equality* positions a snapshot exactly and is the primary
+mechanism here, and what reproducing the venue's digest would add on top. Neither
+turns the hash into per-delta verification, and neither proves a gapped suffix.
 
 ### 6.6 Consumers
 
@@ -963,7 +1006,7 @@ pub enum BookEvent {
         side: Side,
         price: Px,
         size: LevelSize,
-        vendor_order_hash: Option<Arc<str>>,
+        book_hash: Option<Arc<str>>,   // venue digest; see §12.9
     },
 }
 
@@ -992,8 +1035,10 @@ an unknown label is a fatal segment-schema error, not `Continuous`.
 
 `Absolute` application is idempotent; `Relative` is not, which is one more reason
 a book fed by relative deltas can never re-converge after a gap without a full
-book (§6.4). `vendor_order_hash` is opaque event evidence and is never compared
-with book state. Kalshi's delta semantics are taken from its published spec and
+book (§6.4). `book_hash` is carried verbatim and is used for equality — grouping
+one logical update (§6.2) and positioning a snapshot (§12.9). It is never
+*recomputed* and compared against reconstructed state until §12.9's reproduction
+work lands. Kalshi's delta semantics are taken from its published spec and
 are unverified against live servers (§12.7); the variant exists so that verifying
 them is a reconciler change, not a schema change.
 
@@ -1356,10 +1401,9 @@ until profiled otherwise.
 
 ## 12. Intentional gaps
 
-**12.1 Resolver and job dispatch.** The resolver ownership and output are settled
-(§3.1), but the required umbrella/context API is still under implementation and
-must pass Phase 0 contract tests. Also not built is the path from a UI action to
-a run — a job carrying umbrella event ids, an optional window end, and a policy
+**12.1 Job dispatch.** Resolver ownership, output, and its Universe source are
+settled and implemented (§3.1); only the contract test and two response fields
+remain. What is not built is the path from a UI action to a run — a job carrying umbrella event ids, an optional window end, and a policy
 version, queued by the Universe server, executed by
 `resolve → build → run`, and landing in the results ledger the UI reads.
 `EVENT_UNIVERSE_STORE_V1.md` disclaims being a replay planner, so the queue is a
@@ -1383,9 +1427,11 @@ implemented day 0.
 day 0 and the engine refuses substitution or locked baskets on non-`IDENTITY`
 legs. The tier is not yet *derived* automatically, so cross-venue families wait.
 
-**12.6 Money representation.** Per-venue tick and lot scale, integer or scaled
-decimal; checked conversion, overflow, rounding, contract orientation, and fee
-schedule identity. This is a Phase 0 decision, not deferred engine work.
+**12.6 Money representation.** Integer tick/lot primitives with no floating
+point are taken from our existing Rust implementation (§4, Phase 0). What
+remains is per-venue scale, checked conversion, overflow, rounding, contract
+orientation, and fee-schedule identity — a Phase 0 decision, not deferred engine
+work.
 
 **12.7 Kalshi.** Its splice remains unverified against live servers
 (`ARCHITECTURE.md` §8). Kalshi legs stay out of headline results until a live
@@ -1397,29 +1443,72 @@ Not built, but the consumer API is forbidden from depending on anything only a
 replay has, and the normaliser is forbidden from depending on anything only a
 receipt has, which is what keeps it possible.
 
-**12.9 Reproducing Polymarket's snapshot hash.** The current official
-[Python v2 client](https://github.com/Polymarket/py-clob-client-v2/blob/main/py_clob_client_v2/utilities.py)
-and
-[TypeScript v2 client](https://github.com/Polymarket/clob-client-v2/blob/main/src/utilities.ts)
-publish a server-compatible algorithm for full-book snapshots: construct the
-complete ordered summary, blank its `hash` field,
-compact-serialize exact JSON strings and array order, and SHA-1 the UTF-8 bytes.
-The preimage includes metadata such as timestamp, tick/minimum size, negative-risk
-status, and last-trade price, not only levels. The Rust normaliser must match the
-official vectors and captured historical shapes before relying on it.
+**12.9 Polymarket's book hash: what it is, and what we may conclude from it.**
 
-This validates and identifies a full snapshot. It does **not** provide per-delta
-verification: `price_changes[].hash` is an order hash and has no published
-book-state preimage. Hash reproduction can shorten anchor comparison work, but
-recovery still requires historical placement and complete suffix replay (§6.4).
-Any API-version-specific algorithm is recorded in the segment manifest.
+The first review asserted that `price_changes[].hash` is "the hash of the order
+causing the change, not a post-update book-state hash," and rebuilt snapshot
+recovery around that. The assertion does not survive checking, and because a
+great deal was built on it, the evidence is recorded here rather than in a commit
+message.
 
-**12.10 Snapshot frontier alignment.** A delayed snapshot carries source and
-receipt times but may not identify one unique canonical frontier. Match only
-within a bounded source-time interval and require exactly one normalized-book
-candidate; zero candidates is a mismatch and multiple candidates are ambiguous.
-Both outcomes remain explicit verification records. Arrival-time comparison and
-healthy-book reset are forbidden regardless of observed frequency.
+*Against the order-hash reading:*
+
+1. **The venue documents neither hash.** The
+   [market-channel reference](https://docs.polymarket.com/developers/CLOB/websocket/market-channel)
+   declares `hash?: string | null` on both `MarketBookEvent` and
+   `MarketPriceChangeEvent` and describes neither. So "documented as an order
+   hash" is not the case; there is no published statement either way.
+2. **The only hash the official clients define is a book-state hash.** Both the
+   [Python v2 client](https://github.com/Polymarket/py-clob-client-v2/blob/main/py_clob_client_v2/utilities.py)
+   and the
+   [TypeScript v2 client](https://github.com/Polymarket/clob-client-v2/blob/main/src/utilities.ts)
+   implement one hash function, over the order-book summary: blank the `hash`
+   field, compact-serialize `market`, `asset_id`, `timestamp`, `bids`, `asks`,
+   `min_order_size`, `tick_size`, `neg_risk`, `last_trade_price`, and SHA-1 the
+   UTF-8 bytes. Neither file mentions an order hash.
+3. **Our own measurement contradicts it directly.** `splices/polymarket/snapshots.py`
+   records that **24 of 24** polled REST full-book hashes were found exactly in
+   the matching asset's websocket `price_change` hash stream. A hash over one
+   order cannot equal a hash over a whole book 24 times out of 24.
+
+The reading consistent with all three: the venue keeps one order-book summary
+per asset, recomputes its hash when the book changes, and serves that same
+stored object over both REST and websocket. That also explains why the
+`timestamp` inside the preimage does not break the match — REST returns the
+stored summary, not a freshly stamped one.
+
+*What survives of the review's caution.* Its conclusion — do not build on
+per-delta hash verification — is still right, for a different and better reason.
+The preimage includes `tick_size`, `neg_risk`, and `last_trade_price`, which a
+`price_change` message does not carry. Reproducing the hash after applying a
+delta therefore requires reconstructing book metadata from other streams
+(`tick_size_change`, `last_trade_price`), which may be possible but is unproven.
+Per-delta verification stays gated.
+
+*What this changes.* Hash **equality** requires no reproduction at all, so it is
+restored as the primary way a polled snapshot is positioned in the delta stream:
+find the delivery whose hash equals the snapshot's, and that is where the book
+state sits. This is exactly the argument `splices/polymarket/snapshots.py`
+already makes, and it is why the ~955 ms round trip does not matter. §12.10's
+bounded time-window match is the **fallback** for when no hash matches, not the
+default path. Reproducing the summary hash (the work described above) remains
+worth doing because it upgrades content comparison from "levels agree" to "the
+venue's own digest agrees," but it is not on the critical path.
+
+*The decisive test, before any of this is relied on.* Take the hashes already on
+tape, and for each polled snapshot check whether its hash appears in that asset's
+`price_change` hash stream. A high match rate confirms the shared-hash-space
+reading and this section stands. A low one refutes it, and §6.4 reverts to
+delayed anchors with suffix replay as the primary path. Run this in Phase 0; it
+is one query over data we already hold and it decides between two designs.
+
+**12.10 Snapshot frontier alignment when hash positioning fails.** A snapshot
+whose hash matches no delivery — a dropped frame, an unseen intermediate state —
+still needs placing. Then, and only then: match within a bounded source-time
+interval and require exactly one normalized-book candidate; zero candidates is a
+mismatch and multiple candidates are ambiguous. Both outcomes remain explicit
+verification records. Arrival-time comparison and healthy-book reset are
+forbidden regardless of observed frequency.
 
 **12.11 Rust object retrieval.** Closed for V1 by stage 0 (§5.2): the Python
 resolve step stages stored archived windows into a local canonical root through
@@ -1455,5 +1544,9 @@ publisher writes immutable segment objects, and neither can delete archive data.
   recorded so the loss is quantifiable.
 - **Polymarket first-pass episodes can be emitted on a book that was already
   wrong**, for up to one poll interval before divergence is detectable (§6.5).
-  They remain provisional and are demoted after the trust pass (§9.1); snapshot
-  hashing does not eliminate uncertainty across a known gap.
+  They remain provisional and are demoted after the trust pass (§9.1). Hash
+  positioning locates a snapshot exactly (§12.9) but does not eliminate
+  uncertainty across a known gap.
+- **The shared-hash-space reading in §12.9 is measured on 24 snapshots, not
+  proven.** The Phase 0 query over the hashes already on tape either confirms it
+  at scale or reverts §6.4 to time-window anchoring.
