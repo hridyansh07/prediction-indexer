@@ -5,6 +5,10 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from universe import run_backfill
+from universe.sync import SyncResult
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -169,6 +173,23 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn('"generated_end": null', config)
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
         self.assertFalse((ROOT / "configs" / "archive_receipt_mirror.json").exists())
+
+    def test_backfill_job_fails_while_retry_ledger_is_pending(self) -> None:
+        config = mock.Mock()
+        config.backfill.generated_start = object()
+        config.backfill.generated_end = object()
+        result = SyncResult(completed=True, pending_failures=1)
+
+        with (
+            mock.patch.object(run_backfill, "load_config", return_value=config),
+            mock.patch.object(run_backfill, "UniverseStore") as store,
+            mock.patch.object(
+                run_backfill, "backfill_targeter_history", return_value=result
+            ),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(run_backfill.main(), 1)
+        store.return_value.initialize.assert_called_once_with()
 
     def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
         schema_directory = ROOT / "universe" / "schema"

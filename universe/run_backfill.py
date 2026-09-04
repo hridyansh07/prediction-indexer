@@ -40,7 +40,7 @@ def main() -> int:
             sort_keys=True,
         )
     )
-    return 0 if result.completed and result.failure_count == 0 else 1
+    return 1 if result.failure_count or result.pending_failures else 0
 
 
 if __name__ == "__main__":
