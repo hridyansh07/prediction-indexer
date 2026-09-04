@@ -878,7 +878,8 @@ class UniverseStore:
             (context_sha256,),
         ).fetchone()
         if existing is not None:
-            if _context_sha256(self._context(connection, context_sha256)) != context_sha256:
+            stored = self._context(connection, context_sha256, bounded=False)
+            if _context_sha256(stored) != context_sha256:
                 raise EvidenceConflict(
                     f"bundle context {context_sha256} failed its content identity"
                 )
@@ -1012,7 +1013,7 @@ class UniverseStore:
                 raise EvidenceConflict(
                     f"bundle {bundle_id} origin {run_id} conflicts with indexed evidence"
                 )
-            return self._context(connection, row["context_sha256"])
+            return self._context(connection, row["context_sha256"], bounded=False)
 
     def set_checkpoint(self, name: str, cursor: str) -> None:
         now_ns = time.time_ns()
@@ -1967,8 +1968,21 @@ class UniverseStore:
             return record
 
     def _context(
-        self, connection: sqlite3.Connection, context_sha256: str
+        self,
+        connection: sqlite3.Connection,
+        context_sha256: str,
+        *,
+        bounded: bool = True,
     ) -> dict[str, Any]:
+        """Rebuild one bundle context, optionally under the API response limits.
+
+        The row and byte limits exist so a single HTTP response stays inside the
+        response budget; they are presentation limits. Ingestion must never fail
+        because a record would be awkward to serve, so the write path reads the
+        whole context with ``bounded=False`` and only the API keeps the bound.
+        """
+        # SQLite treats a negative LIMIT as unbounded.
+        row_limit = DETAIL_ROW_LIMIT + 1 if bounded else -1
         context = connection.execute(
             "SELECT * FROM bundle_contexts WHERE context_sha256 = ?",
             (context_sha256,),
@@ -1978,28 +1992,28 @@ class UniverseStore:
         participants = connection.execute(
             """SELECT position, name, participant_key FROM context_participants
                WHERE context_sha256 = ? ORDER BY position LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
         events = connection.execute(
             """SELECT event_ref FROM context_events
                WHERE context_sha256 = ? ORDER BY event_ref LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
         markets = connection.execute(
             """SELECT target_id, venue, selected FROM context_markets
                WHERE context_sha256 = ? ORDER BY target_id LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
         targets = connection.execute(
             """SELECT target_id, venue, canonical_class, source_ref
                FROM context_targets WHERE context_sha256 = ?
                ORDER BY venue, target_id LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
         assets = connection.execute(
             """SELECT target_id, asset_id FROM context_target_assets
                WHERE context_sha256 = ? ORDER BY target_id, asset_id LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
         assets_by_target: dict[str, list[str]] = {}
         for asset in assets:
@@ -2021,12 +2035,13 @@ class UniverseStore:
                       relationship, scope, left_venue, right_venue, coverage
                FROM context_relationships WHERE context_sha256 = ?
                ORDER BY relationship_index LIMIT ?""",
-            (context_sha256, DETAIL_ROW_LIMIT + 1),
+            (context_sha256, row_limit),
         ).fetchall()
-        _ensure_detail_rows(
-            (participants, events, markets, targets, assets, relationships),
-            "bundle context",
-        )
+        if bounded:
+            _ensure_detail_rows(
+                (participants, events, markets, targets, assets, relationships),
+                "bundle context",
+            )
         record = {
             "bundle_id": context["bundle_id"],
             "sport": context["sport"],
@@ -2048,7 +2063,7 @@ class UniverseStore:
             "targets": target_records,
             "relationships": [_row_record(value) for value in relationships],
         }
-        if (
+        if bounded and (
             len(_canonical_json_value(record).encode("utf-8"))
             > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES
         ):

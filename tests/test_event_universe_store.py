@@ -30,7 +30,13 @@ from universe.projection import (
     project_bundle_retirements,
     project_selected_bundles,
 )
-from universe.store import DetailTooLarge, EvidenceConflict, UniverseStore, file_sha256
+from universe.store import (
+    DETAIL_ROW_LIMIT,
+    DetailTooLarge,
+    EvidenceConflict,
+    UniverseStore,
+    file_sha256,
+)
 from universe.sync import BOOTSTRAP_RUN_BUDGET, UniverseSync
 
 R1 = "20260101T000000.000001Z"
@@ -1038,6 +1044,49 @@ class EventUniverseTests(unittest.TestCase):
             [run_detail["selected_markets"][0]["event_id"]],
         )
         self.assertEqual(self.database.status()["counts"]["bundle_contexts"], 1)
+
+    def test_retained_origin_ingests_a_context_the_api_cannot_serve(self) -> None:
+        report = _selection_report(R1, G1)
+        relationships = report["candidates"][0]["relationship_analysis"]["relationships"]
+        template = relationships[0]
+        # Two rows past DETAIL_ROW_LIMIT, so the bounded read window of
+        # DETAIL_ROW_LIMIT + 1 rows would drop one and fail content identity.
+        relationships.extend(
+            {
+                **template,
+                "left": f"kalshi:series#claim={index}",
+                "right": f"polymarket:series#claim={index}",
+            }
+            for index in range(1, DETAIL_ROW_LIMIT + 2)
+        )
+        origin = _publish_run(self.objects, report)
+        _publish_run(self.objects, _retained_report(R2, G2, origin))
+
+        result = UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, 0, 9, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.ingested, 1, result.as_record())
+        self.assertEqual(result.origin_dependencies_ingested, 1)
+        counts = self.database.status()["counts"]
+        self.assertEqual(counts["selection_occurrences"], 2)
+        self.assertEqual(counts["bundle_contexts"], 1)
+        with sqlite3.connect(self.database.path) as connection:
+            occurrence = connection.execute(
+                """SELECT occurrence_kind, origin_run_id FROM selection_occurrences
+                   WHERE run_id = ?""",
+                (R2,),
+            ).fetchone()
+            stored_relationships = connection.execute(
+                "SELECT COUNT(*) FROM context_relationships"
+            ).fetchone()[0]
+        self.assertEqual(occurrence, ("retained", R1))
+        self.assertEqual(stored_relationships, len(relationships))
+        # The API keeps refusing to serve in one response what ingestion accepted.
+        with self.assertRaises(DetailTooLarge):
+            self.database.selection_detail(R2, "bundle-1")
 
     def test_retained_selection_fails_closed_on_origin_drift(self) -> None:
         origin = _publish_run(self.objects, _selection_report(R1, G1))
