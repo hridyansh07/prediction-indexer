@@ -49,6 +49,7 @@ pub const WATERMARK_FILE: &str = "watermark.json";
 
 /// A window whose clock disagreed with the one before it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ClockFault {
     pub window_start_ns: u64,
     pub lane: String,
@@ -62,6 +63,7 @@ pub struct ClockFault {
 /// last receive time so the boundary can be checked. Both are recorded in the
 /// receipt, which is why a deleted watermark rebuilds exactly.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Carried {
     pub ordering: OrderingState,
     pub lane_visible_ns: BTreeMap<String, u64>,

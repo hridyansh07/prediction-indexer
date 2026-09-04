@@ -30,7 +30,12 @@ pub mod reader;
 pub mod watermark;
 pub mod window;
 
-pub use audit::{AuditReport, audit_canonical_root};
+pub use audit::{
+    AuditReport, AuditedCanonicalReader, AuditedCanonicalSelection, CanonicalProvenance,
+    CanonicalSelection, CertifiedPolicy, ContinuityVerdict, EventAddress, JoinedCanonicalRecord,
+    LowerBoundPolicy, ReceiptIdentity, SelectionPolicy, audit_canonical_root,
+    select_canonical_windows,
+};
 pub use canonical::{
     CanonicalOutput, CanonicalOutputsState, CompressionContract, DecodedIdentity, FinalizedWindow,
     InputSegment, LaneFault, Receipt, RootLease, StoredIdentity, WindowOutcome,

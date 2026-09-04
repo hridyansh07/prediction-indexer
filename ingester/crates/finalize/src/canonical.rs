@@ -99,6 +99,7 @@ struct CanonicalArchiveObject {
 
 /// Identity of the decoded NDJSON carried by a compressed canonical object.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DecodedIdentity {
     pub byte_length: u64,
     pub line_count: u64,
@@ -107,6 +108,7 @@ pub struct DecodedIdentity {
 
 /// Identity of the compressed bytes as stored.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StoredIdentity {
     pub byte_length: u64,
     pub sha256: String,
@@ -114,6 +116,7 @@ pub struct StoredIdentity {
 
 /// The fixed V1 compression contract. The encoder string is diagnostic only.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CompressionContract {
     pub algorithm: String,
     pub level: i32,
@@ -125,6 +128,7 @@ pub struct CompressionContract {
 
 /// What one compressed output asserts about both representations.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalOutput {
     pub file: String,
     pub content_encoding: String,
@@ -135,6 +139,7 @@ pub struct CanonicalOutput {
 
 /// One source segment a window consumed.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InputSegment {
     pub lane: String,
     pub data_file: String,
@@ -147,6 +152,7 @@ pub struct InputSegment {
 
 /// Why a lane is not contributing to this window.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaneFault {
     pub lane: String,
     /// `lane_missing` or `lane_invalid` — §5's two verdicts.
@@ -156,6 +162,7 @@ pub struct LaneFault {
 
 /// The completion receipt (§5).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub receipt_version: u64,
     pub window_start_ns: u64,
@@ -988,6 +995,29 @@ pub fn read_receipt(
             "window_start_ns does not precede window_end_ns".to_owned(),
         ));
     }
+    if receipt.finalizer_version != FINALIZER_VERSION {
+        return Err(invalid(format!(
+            "unsupported finalizer_version {}",
+            receipt.finalizer_version
+        )));
+    }
+    if !matches!(receipt.completeness.as_str(), "complete" | "incomplete") {
+        return Err(invalid(format!(
+            "unknown completeness label {}",
+            receipt.completeness
+        )));
+    }
+    if receipt
+        .missing_lanes
+        .iter()
+        .any(|fault| fault.reason != "lane_missing")
+        || receipt
+            .invalid_lanes
+            .iter()
+            .any(|fault| fault.reason != "lane_invalid")
+    {
+        return Err(invalid("unknown lane fault reason".to_owned()));
+    }
     match (receipt.first_canonical_seq, receipt.last_canonical_seq) {
         (None, None) if receipt.evidence.decoded.line_count == 0 => {}
         (Some(first), Some(last)) if first >= 1 && last >= first => {
@@ -1360,7 +1390,11 @@ pub fn committed_windows(canonical_root: &Path) -> Result<BTreeMap<u64, Receipt>
                 continue;
             };
             if let Some(receipt) = read_receipt(canonical_root, start)? {
-                found.insert(start, receipt);
+                if found.insert(start, receipt).is_some() {
+                    return Err(format!(
+                        "canonical root contains more than one committed window starting at {start}"
+                    ));
+                }
             }
         }
     }
