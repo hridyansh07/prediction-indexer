@@ -29,9 +29,12 @@ and choices that remain subject to explicit approval.
 
 **Phase-0 integration note.** The audited canonical selector/reader described in
 §5.2 has been implemented in `indexer-finalize` in the Phase-0 work. Its API and
-capability lifecycle are the Replay boundary; the older proposal to move receipt
-types into `indexer-types` is withdrawn. That implementation is not assumed to be
-present on this branch until its source-thread commit
+capability lifecycle are the rebuild boundary; the older proposal to move
+receipt types into `indexer-types` is withdrawn. The same-pass path additionally
+requires a generic ordered-record derivative-sink surface around the finalizer
+merge, without changing the reader or importing venue code. The existing
+implementation is not assumed to be present on this branch until its
+source-thread commit
 `343db932ac216cfa0ba1c467254a0f6bac6ba589` is integrated.
 
 **Simplification amendment (2026-09-05).** The A–I product response supersedes
@@ -52,6 +55,19 @@ cannot reset a later current state or prove a complete suffix. Canonical evidenc
 and prior strategy output are never rewritten. Sections 3–14 have been revised
 to keep those boundaries explicit.
 
+**Bundle materialization amendment (2026-09-05).** Normalized Replay artifacts
+are intentionally umbrella-event/bundle scoped. Replaying unrelated markets has
+no current consumer and would add storage and filtering work without improving
+the declared correlated-outcome analyses. The normal path therefore normalizes
+each finalized canonical record once during the finalizer's k-way merge and
+fans the typed result out to every applicable retained scope. This does not put
+venue semantics into canonical evidence: the exact canonical files and their
+receipt remain the authority, while each bundle segment is an independently
+committed derivative. The audited reader remains the byte-identical rebuild path
+for canonical windows that were finalized before a scope or normalizer version
+existed. Sections 3–5, 7, 11, and 14 define the two paths and their equivalence
+gate.
+
 ---
 
 ## 1. Purpose and boundary
@@ -62,10 +78,12 @@ The replay engine answers one question repeatedly and cheaply:
 > strategy see an opportunity, for how long did it survive, and was every book it
 > priced available from captured evidence at that instant?
 
-It assumes canonical records exist. It does not produce, repair, or reinterpret
-them. It does verify every selected committed object and consumes the
-finalizer's continuity provenance before venue payloads cross the typed replay
-boundary.
+It consumes the finalizer's ordered records either while their exact canonical
+window is being committed or later through the audited canonical reader. Replay
+does not produce, repair, replace, or reinterpret canonical evidence. It
+preserves the finalizer's continuity provenance before venue payloads cross the
+typed replay boundary, and a normalized segment can never commit before every
+canonical receipt it names.
 
 **It is not:**
 
@@ -85,7 +103,7 @@ one gate's output could not feed several strategy runs, and the terminal verdict
 
 | Retired | Survives as |
 |---|---|
-| Gate 1 capture checks | reconciler admissibility (§5.6) |
+| Gate 1 capture checks | materializer admissibility (§5.6) |
 | Gate 2 mandatory trust evidence | captured-state book availability plus optional audit controls (§6.4, §7.8) |
 | Gate 3 economics | Python netting over episodes (§9) |
 | Gate 4 depth survival | episode lifetime, intrinsic to detection (§6.8) |
@@ -97,16 +115,17 @@ one gate's output could not feed several strategy runs, and the terminal verdict
 
 Deleted: `gate1..gate5`, `pipeline.py`, `output.py`, `economics.py`, `trust.py`,
 `execution.py`, `books.py`. Retired once nothing else imports them, because the
-Rust reconciler (§5) replaces what they did: `stream.py`, `order.py`, `lanes.py`,
-`envelope.py`. Kept: `catalog.py`, which feeds the Python spec generator (§9),
-and `events.py`, which stays as the **conformance oracle** for the Rust
-normaliser (§5.10) and as the typer for game-state and reference-tick events that
-other consumers read and the segment schema does not carry.
+Rust finalizer plus materializer (§5) replace what they did: `stream.py`,
+`order.py`, `lanes.py`, `envelope.py`. Kept: `catalog.py`, which feeds the Python
+spec generator (§9), and `events.py`, which stays as the **conformance oracle**
+for the Rust normaliser (§5.10) and as the typer for game-state and
+reference-tick events that other consumers read and the segment schema does not
+carry.
 
 Two pieces of retired code remain useful as conformance evidence rather than
 runtime dependencies: the canonical-form logic in `books.py` seeds the optional
 two-pass auditor (§12.9), and the venue interpretation in `events.py` is ported
-into the reconciler with its tests as fixtures. The retired gate orchestration
+into the materializer with its tests as fixtures. The retired gate orchestration
 does not survive.
 
 ---
@@ -169,13 +188,17 @@ crate, and the same normaliser that builds a segment is the one a live driver
         │                                                        specs.json (§9)
         │            today: CLI  ·  later: Universe job dispatch (§12.1)
         ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │  TAPE RECONCILER                                Rust      │
-  │  receipts → verify → decode → normalise → filter → concat │
-  └───────────────────────────┬───────────────────────────────┘
+  sealed lanes ──► INDEXER FINALIZER ──► exact canonical window + receipt
+                         │
+                         │ ordered record + provenance (one merge pass)
+                         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  BUNDLE MATERIALIZER                              Rust      │
+  │  normalise once → scope fan-out → verify temp → commit      │
+  └────────────────────────────┬────────────────────────────────┘
                               │  typed event stream, in-process
-                              │  optionally materialised as
-                              │  segment + rejects + manifest + receipt (§5.9)
+                              │  bundle segment + rejects + manifest + receipt
+                              │  (§5.9)
         ┌─────────────────────▼─────────────────────┐
         │  ENGINE                          Rust     │
         │                                           │
@@ -196,11 +219,16 @@ crate, and the same normaliser that builds a segment is the one a live driver
   segment + REST anchors ──► TWO-PASS AUDITOR ──► immutable audit overlay
                                                    (verification/invalidation
                                                     controls, manifest, receipt)
+
+  deterministic rebuild path:
+
+  committed canonical receipts ──► AuditedCanonicalReader ──► same bundle
+                                                                materializer
 ```
 
 ### 3.1 Scope resolution
 
-The reconciler never discovers anything. It is handed a **scope descriptor**
+The materializer never discovers anything. It is handed a **scope descriptor**
 that names instruments and a window, and it filters the tape to them. The open
 question was who writes that descriptor, and from what. There were two
 candidates:
@@ -210,7 +238,7 @@ candidates:
 - a resolver queries the Universe server, which already is that derivation,
   persisted and queryable.
 
-The first re-implements Universe's projection inside the reconciler, inherits
+The first re-implements Universe's projection inside the materializer, inherits
 every retained-bundle and origin-resolution problem a second time, and produces
 a scope that cannot be reproduced later because it was computed from whatever
 runs were on disk that day. It is rejected. **Universe is the only resolver
@@ -232,7 +260,7 @@ subsystems: event detail returns canonical markets with a venue count, so
 reaching subscription ids needs a second call per market; and the selection
 record does not carry `context_sha256`, which the descriptor needs for
 reproducibility (§3.1). Pin the response contract with a test so it cannot drift
-under the reconciler, and add those fields. Do not rebuild what exists.
+under the materializer, and add those fields. Do not rebuild what exists.
 
 | lookup | today |
 |---|---|
@@ -287,7 +315,10 @@ the workspace and the contract above does not change.
 
 - `instruments` is the filter (§5.3). `id` is the venue-qualified instrument the
   engine keys on (§7.1); the other fields are provenance so an episode can be
-  read back to a market without another Universe query.
+  read back to a market without another Universe query. The persisted segment
+  contains this correlated bundle only. An event shared by several retained
+  umbrella scopes is written to each of them during fan-out; unrelated markets
+  are excluded because V1 has no strategy or analytic that consumes them.
 - **Lanes are not in the descriptor.** Canonical windows carry every admitted
   lane. Pending §14.1(2), the proposed minimum is for normalizer adapters to bind
   recognized lane ids to minimal venue/stream roles. Runtime
@@ -304,7 +335,7 @@ the workspace and the contract above does not change.
   for esports the in-play evidence is the point. `end_ns` comes from the bundle's
   retirement, from an explicit `--to`, or from the latest closed canonical window
   when the bundle is still live — and `end_source` records which. `start_ns` is
-  the earliest `capture_start_at_ns` over the contexts; the reconciler adds the
+  the earliest `capture_start_at_ns` over the contexts; the materializer adds the
   prologue (§5.5) itself. Universe retirement is an observation upper bound or
   safety clamp, not proof of the exact event end. The scope preserves retirement
   disposition and observation time, and consumers do not relabel it as an exact
@@ -331,7 +362,7 @@ does not terminate in a complete occurrence.
 Each phase is usable without enabling the next one. Scaling, unattended
 operation, simulation, and deletion do not ride along with correctness work.
 
-**Phase 0 — Freeze what the reconciler will depend on.** Smaller than the first
+**Phase 0 — Freeze what the materializer will depend on.** Smaller than the first
 review assumed, because Universe exists and the canonical boundary is implemented
 in the Phase-0 `indexer-finalize` work:
 
@@ -348,10 +379,12 @@ in the Phase-0 `indexer-finalize` work:
   explicit permission/license clarification.
 
 What genuinely has to be settled first: integrating and pinning that public
-boundary, the minimal adapter-owned lane role, fixed-point representation, and
-the half-open scope interval decision in §14. Integration must preserve the
-implemented API and capability lifecycle rather than re-implementing its audit
-in Replay. Fee formulae and strategy economics do not block this boundary.
+boundary, exposing the same ordered-record view as an optional derivative sink
+from the finalizer merge, the minimal adapter-owned lane role, fixed-point
+representation, and the half-open scope interval decision in §14. The existing
+audited-reader API and capability lifecycle do not change. The finalizer core
+remains venue-agnostic: Replay owns and supplies the optional sink. Fee formulae
+and strategy economics do not block this boundary.
 
 Acceptance: one fixture resolves to the same canonical scope bytes repeatedly;
 `select_canonical_windows` proves unique minimal adjacent coverage of
@@ -361,20 +394,29 @@ Acceptance: one fixture resolves to the same canonical scope bytes repeatedly;
 recorded as an observation/clamp rather than asserted to be the exact event end;
 selector policy choices are recorded in the segment manifest; and the completed
 §12.9 evidence
-is pinned. An object, record prefix, or successful decode without the finished
-audit capability cannot commit a segment.
+is pinned. On the co-materialization path, the equivalent gate is the successfully
+committed canonical receipt returned by the finalizer. An object, record prefix,
+temporary normalized file, or successful decode without one of those completed
+canonical capabilities cannot commit a segment.
 
 Normaliser conformance (§5.10) runs against fixtures and depends on none of the
 above, so it starts in parallel rather than queueing behind this phase.
 
-**Phase 1 — Serial reconciler and `build`.** One process and one decode worker,
-with no archive publication: verify, decode, join provenance, clip, normalise,
-filter, and write a receipt-committed local segment plus reject sidecar.
+**Phase 1 — Serial materializer and `build`.** One process and one merge/decode
+worker, with no archive publication. The normal path observes each ordered
+record during canonical finalization, normalizes it once, and fans it into the
+applicable umbrella-event scopes. The rebuild path reads already committed
+windows through `AuditedCanonicalReader` and invokes the identical normalizer and
+fan-out code. Both write a receipt-committed local segment plus reject sidecar.
 Acceptance: Rust reproduces `replay/events.py` on fixtures and real canonical
-windows (§5.10); duplicate/conflict/gap fixtures exercise the provenance policy;
-equal-time tie groups remain atomic; Kalshi fixtures cover relative deltas; and
-an independent reader verifies every output identity. No reject is silent and
-no rejected payload can produce an available book.
+windows (§5.10); same-pass and audited-reader builds over the same canonical
+inputs are byte-identical; one input parse fans out to every overlapping scope;
+unrelated instruments enter none; duplicate/conflict/gap fixtures exercise the
+provenance policy; equal-time tie groups remain atomic; Kalshi fixtures cover
+relative deltas; canonical output commits even when an optional derivative sink
+fails; no failed canonical attempt can commit a segment; and an independent
+reader verifies every output identity. No reject is silent and no rejected
+payload can produce an available book.
 
 **Phase 2 — Captured-state projector and pull API.** Serial book mutation plus
 `ReplayCursor::next`; no producer-owned dispatch, strategy family, REST promotion,
@@ -416,41 +458,62 @@ work.
 
 ---
 
-## 5. The tape reconciler
+## 5. The bundle materializer
 
 ### 5.1 Job
 
-One scope's evidence, verified, normalised, filtered, totally ordered,
-self-contained, as a typed event stream the engine consumes in-process. When
-materialised (§5.9) it is NDJSON: it streams and appends without an index, it is
-inspectable with a pager, and Python can read it for ad hoc work without a
-binding. The format is a persistence format, not a language boundary — there is
-no language boundary here any more (§2.7).
+One umbrella-event scope's evidence, normalized, filtered, totally ordered, and
+self-contained as a typed event stream the engine can replay repeatedly. The
+normal path builds it as a derivative of the same ordered records that the
+finalizer writes to exact canonical evidence. A retained canonical window can
+rebuild the identical segment through the audited reader. The materialized
+NDJSON streams without an index, is inspectable with a pager, and is readable by
+Python for ad hoc work without a binding. It is a persistence format, not a
+language boundary — there is no language boundary here any more (§2.7).
 
 ### 5.2 Stages
 
-The input is **canonical windows**, never raw lane segments. A canonical window
-is already receipted, already verified at finalization, already merged across
-lanes on `(visible_ns, lane_rank, delivery_index)`, and already
-continuity-classified in its provenance index. The reconciler inherits all of
-that instead of redoing it.
+There are two input paths into one materializer. The normal path observes the
+finalizer's joined ordered records while it merges sealed lanes. The rebuild
+path reads already committed canonical windows through
+`AuditedCanonicalReader`. Both paths deliver the same exact envelope bytes,
+canonical address, tie group, source/content provenance, and closed continuity
+verdict to the same normalizer and scope router. Replay never implements another
+k-way merge.
 
 ```
- 0  stage       archived windows → local canonical root           new bounded Python stager
-                (only when the local root has been reaped)         (§3.1 resolve --stage)
- 1  select      gap-free receipts covering [T0 − prologue, T1)    indexer-finalize public API
- 2  verify      stored + decoded identity; provenance binding     AuditedCanonicalReader
-                to receipt inputs; canonical_seq continuity
- 3  decode      Zstandard through the strict decoder              prediction-encoder::StreamingDecoder
- 4  parse       envelope lines, closed and versioned              indexer-types::EnvelopeView
- 5  normalise   raw_payload → SegmentEvent (§7.2)                 new: tape::normalise
- 6  filter      in-scope instruments + control for their lanes    new
- 7  clip/concat discard records at or after T1; windows in order  new + finalizer order
-                order; within a delivery, venue array order
- 8  emit        stream, or segment + rejects + manifest + receipt new
+ 0  resolve     umbrella ids → retained scope/context descriptors Universe + Targeter evidence
+ 1a merge       sealed lanes → exact canonical ordered records     indexer-finalize normal path
+ 1b rebuild     committed windows → audited ordered records        AuditedCanonicalReader fallback
+ 2  normalise   raw_payload → SegmentEvent (§7.2), once per record new: tape::normalise
+ 3  route       typed event/control → every applicable scope       new: bounded fan-out
+ 4  clip/concat enforce each scope's [T0 − prologue, T1)           new + finalizer order
+ 5  stage       segment + rejects in private temporary files       new
+ 6  verify      strict read-back, logical/stored hashes and counts new + prediction-encoder
+ 7  commit      manifest + receipt after canonical capability      new
 ```
 
-**Stages 1–4 consume the implemented `indexer-finalize` boundary.**
+**The normal path is one source pass.** The finalizer remains responsible for
+seal verification, the k-way merge on
+`(visible_ns, lane_rank, delivery_index)`, identity/continuity classification,
+and exact canonical files. It exposes each complete joined record to an optional
+generic derivative sink after its order and provenance are fixed. Replay owns
+the sink implementation, S2 types, venue normalizers, scope index, temporary
+files, and fan-out. The finalizer crate imports none of them. One venue payload
+is parsed once and its zero or more typed children are appended to every scope
+that declares the instrument; a control is appended to every affected scope.
+
+Exact canonical writing is unconditional. An expected malformed venue payload
+becomes a deterministic reject rather than a sink error. If the optional Replay
+sink or its storage fails, the finalizer disables that derivative attempt and
+continues the exact canonical commit; no segment receipt is published. A process
+crash may leave both outputs uncommitted, but the sealed lanes remain retryable.
+After canonical commit, the materializer binds each staged slice to the exact
+canonical receipt. It may then read the completed normalized temporary file once
+through the strict decoder before publishing the segment receipt. That is output
+verification, not a second normalization or source pass.
+
+**The rebuild path consumes the implemented `indexer-finalize` boundary.**
 `select_canonical_windows(root, start, end, SelectionPolicy)` returns the unique
 minimal adjacent committed-window run covering the half-open interval and rejects
 gaps, overlaps, duplicate starts, missing/corrupt receipts, missing objects, and
@@ -475,28 +538,29 @@ interval enter the segment manifest and address.
 These APIs and their receipt/provenance types remain owned by
 `indexer-finalize`; Replay must not fork them into `indexer-types` or duplicate
 the audit. `indexer-types` continues to own shared envelope and identity
-primitives only. Stage 5 consumes `JoinedCanonicalRecord`, including exact
-envelope bytes, `canonical_seq`, `order_ns = visible_ns`, tie group,
-lane/delivery address, record/source/content provenance, and the closed
-continuity verdict.
+primitives only. Both paths feed the normalizer the equivalent of
+`JoinedCanonicalRecord`, including exact envelope bytes, `canonical_seq`,
+`order_ns = visible_ns`, tie group, lane/delivery address,
+record/source/content provenance, and the closed continuity verdict.
 
-**Stage 0 is Python and optional.** The canonical reaper removes local windows
-about eighteen hours after they are archived, so the local root is a rolling
-window. `ArchivedCanonicalByteStreamer` currently verifies archived objects but
-exposes decoded logical bytes; it does not materialize the original stored Zstd
-frames and local receipt layout expected by the Rust audited reader. Phase 0
-therefore adds a bounded stager over the existing `ObjectStore` verification
-path that preserves each archived object's stored bytes and identity, writes the
-retained canonical receipt, fsyncs, and publishes the local window atomically.
-Rust then independently re-verifies it on read. Staging sits before the byte
-boundary with the resolver (§3.1); it has explicit byte quota and cleanup.
+**Archived staging is Python and rebuild-only.** The canonical reaper removes
+local windows about eighteen hours after they are archived, so the local root is
+a rolling window. `ArchivedCanonicalByteStreamer` currently verifies archived
+objects but exposes decoded logical bytes; it does not materialize the original
+stored Zstd frames and local receipt layout expected by the Rust audited reader.
+Phase 0 therefore adds a bounded stager over the existing `ObjectStore`
+verification path that preserves each archived object's stored bytes and
+identity, writes the retained canonical receipt, fsyncs, and publishes the local
+window atomically. Rust then independently re-verifies it on read. Staging sits
+before the byte boundary with the resolver (§3.1); it has explicit byte quota
+and cleanup.
 
-**There is no k-way merge and no new dedupe stage.** Both existed because the
-retired Python replay read raw lane segments. Canonical windows are time-disjoint
-and internally ordered, so stage 7 is concatenation. Overlapping window ranges are
-rejected at stage 1 rather than deduplicated later. A `late_after_finalization`
-correction dataset (`SEALED_CAPTURE_PIPELINE_V1.md` §5) is a different canonical
-lineage with its own receipts and is selected as such, never merged in.
+**Replay owns no k-way merge and no new dedupe stage.** The normal path observes
+the existing finalizer merge; the rebuild path concatenates time-disjoint,
+internally ordered canonical windows. Overlapping window ranges are rejected by
+selection rather than deduplicated later. A `late_after_finalization` correction
+dataset (`SEALED_CAPTURE_PIPELINE_V1.md` §5) is a different canonical lineage
+with its own receipts and is selected as such, never merged in.
 
 This does not mean duplicate records are impossible. Canonicalization preserves
 the exact envelope and classifies each line. A `duplicate` provenance verdict is
@@ -504,7 +568,7 @@ retained but never mutates a book; `conflict`, `gap_proven`, and other continuit
 faults transition affected books to `Unavailable` before their payload could mutate
 state. That policy is especially important for relative Kalshi deltas.
 
-**Stage 5 is a port, not a design.** `replay/events.py` already interprets
+**Normalization is a port, not a design.** `replay/events.py` already interprets
 Polymarket and Limitless payloads and its tests are the fixtures. It is ported
 line for line and must pass conformance (§5.10) before anything reads its
 output. Kalshi normalisation — `orderbook_snapshot`, `orderbook_delta`, `trade`,
@@ -512,22 +576,26 @@ and the `update_range` control — exists on neither side and is written once,
 here. Kalshi carries a material share of moneyline volume on the esports bundles
 this engine exists to measure, so it is not optional.
 
-**Why normalisation is a reconciler stage and not part of the engine walk.** It is
-paid **once per segment** rather than once per run, and it lets the filter be
-exact rather than approximate because the builder knows the instrument. The
-engine then consumes a closed typed schema and never sees venue JSON.
+**Why normalisation is a materialization stage and not part of the engine
+walk.** It is paid once per input record and fanned out to every applicable
+segment rather than paid once per strategy run. It also makes filtering exact
+because the router knows the typed instrument. The engine consumes a closed
+schema and never sees venue JSON.
 
-**Why it is not in the finalizer.** The finalizer is payload-agnostic by
-invariant (`AGENTS.md` §2): a canonical object's identity is the hash of exact
-envelope bytes, and normalising at capture makes a schema misreading permanent.
-`CAPTURE_SPEC.md` §11.3 records the case that settled this. The normaliser lives
-under `engine/crates`, reads only committed canonical objects, and its output is
-never written into a canonical file. The engine may depend on ingester crates;
-the ingester never depends on the engine.
+**Why observing finalization does not make canonical evidence normalized.** The
+finalizer core remains payload-agnostic by invariant (`AGENTS.md` §2): canonical
+identity is still the hash of exact envelope bytes, and neither a schema
+misreading nor a Replay sink failure can alter that file or receipt. The
+normalizer lives under `engine/crates` and implements a generic derivative-sink
+boundary exposed by `indexer-finalize`; the dependency still runs from Replay to
+the ingester crates, never the reverse. Its separately addressed output is a
+cacheable interpretation that may be regenerated under a new version, not a
+canonical replacement. `CAPTURE_SPEC.md` §11.3 records the empirical reason the
+exact bytes remain authoritative.
 
 **Twin lanes.** `record_id` is per-splice, so if a redundant-lane experiment ever
 runs, both records reach the engine. Cross-lane arbitration is client-owned
-policy (§6.6), not a reconciler stage.
+policy (§6.6), not a materializer stage.
 
 ### 5.3 What the filter keeps
 
@@ -562,7 +630,7 @@ absolutely is not.
 
 Inherited from the finalizer: within a window, `(visible_ns, lane_rank,
 delivery_index)`; across windows, window order; within a delivery, the venue's
-array order. The reconciler re-derives none of it.
+array order. The materializer re-derives none of it.
 
 > Segment order is a **serialization** order. `visible_ns` carries real timing;
 > no lead-lag conclusion may rest on segment position, and none may rest on
@@ -583,7 +651,7 @@ but cannot emit episodes before `T0`.
 ### 5.5 The prologue
 
 Bootstrap and recovery are the same operation (§6.4), so segment start needs no
-special mechanism. The reconciler simply **reads early enough that a full book
+special mechanism. The materializer simply **reads early enough that a full book
 lands before `T0`** for every in-scope instrument:
 
 ```
@@ -634,13 +702,23 @@ sha256(
     u64be(len(scope_descriptor_canonical_bytes)) || scope_descriptor_canonical_bytes ||
     u64be(len(selection_policy_canonical_bytes)) || selection_policy_canonical_bytes ||
     u64be(len(input_object_manifest)) || input_object_manifest ||
-    u64be(len(reconciler_version)) || reconciler_version
+    u64be(len(normalized_schema_version)) || normalized_schema_version ||
+    u64be(len(normalizer_bundle_identity)) || normalizer_bundle_identity ||
+    u64be(len(materializer_version)) || materializer_version
 )
 ```
 
 `input_object_manifest` itself has canonical bytes and explicitly sorted receipt
 entries. `selection_policy_canonical_bytes` records certified and lower-bound
-policy plus the requested/effective interval returned by the audited capability.
+policy plus the requested/effective interval returned by the audited capability
+on rebuild or derived by the identical rule from committed canonical receipts on
+co-materialization.
+The scope descriptor binds its umbrella-event id, retained Targeter/Universe
+context identities, instrument membership, and interval; changing event
+membership therefore changes the segment address. The normalizer bundle identity
+binds every venue adapter and semantic configuration, including any SDK version
+whose behavior affects output. Correcting a parser produces a new immutable
+address; it never silently reinterprets an old result.
 The same framing rule applies to any future composite run, cache, or episode
 identity. It does not alter existing canonical content hashes, archive identities,
 or vendor hashes; those follow their owning contracts exactly.
@@ -650,49 +728,55 @@ join to segments retroactively once caching is on. Every episode carries it.
 Strategy specs are not in the address (§3.1): one segment serves every hypothesis
 set over its scope.
 
-### 5.8 Build order: bounded window passes, fanned out to every scope
+### 5.8 Build order: one ordered pass, fanned out to bundle scopes
 
-The filter runs *after* decode, so building one scope costs the full decode of
-every canonical window in its time range, all lanes, whether the scope touches
-two instruments or two hundred. At 100–150 bundles a day, most of them
-overlapping in time, building scopes one at a time decodes the same windows over
-and over. The unit of work is therefore the **window**, not the scope:
+Replay artifacts are deliberately scope-specific: the declared correlated
+bundle is the useful unit, and unrelated markets do not enter its segment. But
+building scopes one at a time would still repeat the same finalizer merge or
+canonical decode for overlapping intervals. The unit of source work is therefore
+the **window**, while the unit of persisted output is the **bundle scope**:
 
 ```
-for each canonical window W in the day, through a bounded worker pool:
-    decode · parse · normalise W once
-    for each event e in W:
+for each ordered finalizer record r in canonical window W:
+    parse · normalise r once
+    for each typed event e produced from r:
         for each scope S with e.instrument ∈ S.instruments,
         or e is control and S has an instrument on e's lane:
             append e to slice(W, S)
+commit canonical receipt W
+bind completed slices(W, *) to that receipt
 for each scope S:
     concatenate slice(W, S) over W in window order  →  S.segment
 ```
 
-Daily prebuild cost is then one decode of the day's canonical data regardless
-of scope count; the per-scope cost is a hash lookup and a write. Sealed windows
-are time-disjoint and internally ordered, so slices concatenate without
-re-interleaving. Never re-interleave across a window boundary by timestamp.
-`run --scope` for a single on-demand question is the degenerate case with one
-scope and is allowed to be slow.
+The normal path therefore performs one k-way source merge and one venue parse per
+record regardless of scope count; the per-scope cost is a membership lookup and
+a write. The rebuild path substitutes one audited canonical decode for the
+merge, then runs the same loop. Sealed windows are time-disjoint and internally
+ordered, so slices concatenate without re-interleaving. Never re-interleave
+across a window boundary by timestamp. `run --scope` for a single on-demand
+question is the degenerate rebuild case with one scope and is allowed to be
+slow.
 
-Phase 1 is serial. Later, the coordinator caps decode workers, open files,
+Phase 1 is serial. Later, the coordinator caps merge/rebuild workers, open files,
 per-scope sink buffers, and staged bytes from configuration and commits completed
-window slices in receipt order regardless of worker completion order. Backpressure
-blocks workers; it never drops an accepted event. Each temporary slice has an
-identity and restart journal, and is either verified and reused after a crash or
-discarded before retry. A logical outcome-space bundle is a good strategy/sink
-boundary, but not automatically an OS-thread boundary: decoding once per bundle
-would repeat the dominant work.
+window slices in receipt order regardless of worker completion order.
+Backpressure blocks derivative fan-out but may not drop an accepted event; if the
+derivative cannot make progress within its explicit failure policy, that
+derivative attempt fails without invalidating exact canonical output. Each
+temporary slice has an identity and restart journal, and is either verified and
+reused after a crash or discarded before retry. A logical outcome-space bundle
+is the persisted strategy/sink boundary, but not automatically an OS-thread
+boundary.
 
 ### 5.9 Persistence
 
 A segment is immutable once built. Its address is a function of the scope, the
-canonical inputs, and the reconciler version; none of those can change under
-it. It is also expensive to reproduce for the reason §5.8 gives. So a **final**
-segment is kept, not rebuilt, and kept the same way everything else here is
-kept: published to object storage under its own prefix with its own receipt,
-and evicted locally only once that receipt verifies.
+canonical inputs, normalized schema, normalizer bundle, and materializer version;
+none of those can change under it. It is also expensive to reproduce for the
+reason §5.8 gives. So a **final** segment is kept, not rebuilt, and kept the same
+way everything else here is kept: published to object storage under its own
+prefix with its own receipt, and evicted locally only once that receipt verifies.
 
 **Which segments are final.** Those whose scope has `end_source` of
 `retirement` or `explicit` (§3.1). A scope ending at `latest_closed_window` is a
@@ -700,18 +784,32 @@ live bundle's moving target; its segment is local only, superseded by the next
 build with a later end, and removed only by the explicit local supersession/age
 policy. It is never presented as archived.
 
-**Process ownership is explicit.** Rust writes a receipt-committed local
-`<address>/` directory containing the segment, reject sidecar, manifest, and
-local receipt using finish → fsync file → rename → fsync directory ordering. A
-separate Python publisher consumes only that local receipt and reuses
+**Process ownership is explicit.** During co-materialization, Rust writes
+per-window/per-scope slices privately while `indexer-finalize` writes exact
+canonical output. No slice or segment is committed until its canonical receipt
+exists. After all required windows exist, Rust concatenates slices in receipt
+order into a private `<address>.open/` directory, finishes the segment and reject
+frames, reads them back through the strict decoder, fsyncs them, renames the
+directory, fsyncs its parent, and publishes the local receipt last. The rebuild
+path performs the same transaction after `AuditedCanonicalReader::finish()`.
+A separate Python publisher consumes only that local receipt and reuses
 `publish_files`, `put_immutable`, the existing `ObjectStore`, and
 `verify_object`. The segment archive receipt is a third receipt kind beside the
 raw and canonical ones and carries: `segment_address`, the scope digest, the
-list of canonical receipts consumed, `reconciler_version`, and stored and
+list of canonical receipts consumed, normalized schema, normalizer bundle and
+materializer identities, input/accepted/rejected/ignored counts, and stored and
 decoded identity for every published file. The object key is
 `segments/<address>/`. `run --segment` accepts an address and resolves local
 first, archive second, verifying either. Rust receives no archive credentials in
 V1.
+
+The receipt does not prove that venue semantics were interpreted correctly;
+conformance tests and a newer version resolve parser mistakes. It proves which
+inputs, scope, code contract, and exact output bytes were committed. SHA-256 is a
+compact commitment to every byte rather than a redundant copy of every row. The
+receipt also distinguishes a complete immutable segment from a crash-truncated
+temporary file and lets retries verify identical output instead of trusting a
+filename.
 
 **Local eviction** is the reaper's dual-receipt rule with the segment receipt
 standing where the canonical receipt stood: a local segment is deletable when its
@@ -720,11 +818,11 @@ so. Live-bundle segments have no archive receipt and are evicted by age. V1 has
 no archive-object deletion or segment archive garbage collector; existing
 `ObjectStore` adapters intentionally expose no deletion authority.
 
-**A reconciler version bump** changes every address. Old segments are not
-rewritten and not deleted on the bump: the results ledger references them by
-address, and a verdict must stay traceable to the segment it was measured on.
-Archive garbage collection is outside V1 and requires a separately approved
-retention contract.
+**A schema, normalizer bundle, or materializer version bump** changes every
+address. Old segments are not rewritten and not deleted on the bump: the results
+ledger references them by address, and a verdict must stay traceable to the
+segment it was measured on. Archive garbage collection is outside V1 and
+requires a separately approved retention contract.
 
 **Sizing, to be replaced by measurement on the first real build:**
 
@@ -761,8 +859,8 @@ fixtures, and `events.py` is not extended further.
 
 ```
 engine/crates/
-  tape       reconciler: receipt selection, verification, decode,
-             normalise, filter, manifest; segment writer and reader   (§5)
+  tape       S2 types, venue normalizers, scope fan-out, canonical
+             rebuild path, manifest; segment writer and reader        (§5)
   book       captured-state projector, availability, versioned views
   cursor     serial atomic-group pull API over tape + optional overlay
   audit      optional two-pass REST comparison and control overlay
@@ -771,7 +869,8 @@ engine/crates/
   cli        replay-engine  (build · run)
 
 shared from the ingester workspace, never the reverse:
-  indexer-finalize     canonical selection, audited reader, provenance types
+  indexer-finalize     k-way merge, generic derivative sink, canonical
+                       selection, audited reader, provenance types
   indexer-types        EnvelopeView and shared identity primitives
   prediction-encoder   strict Zstandard
 ```
@@ -1029,7 +1128,7 @@ than deferring semantics until after the engine exists.
 A closed schema, defined once in `tape` and written and read by it. The reader
 rejects unknown variants rather than skipping them — same discipline as the
 envelope parser — which matters less now that writer and reader share the enum,
-and still matters for a segment file built by an older reconciler.
+and still matters for a segment file built by an older materializer.
 
 ```rust
 pub struct EventAddress {
@@ -1112,7 +1211,7 @@ pub enum FaultImpact {
 
 /// Venues disagree on what a delta carries. Polymarket `price_change` sends the
 /// new absolute size at the level; Kalshi `orderbook_delta` sends a signed
-/// change. Converting one to the other needs book state, which the reconciler
+/// change. Converting one to the other needs book state, which the normalizer
 /// does not hold (§2.2), so the segment carries what the venue said and the
 /// engine applies it.
 pub enum LevelSize {
@@ -1143,7 +1242,7 @@ addresses remain in the segment on disk, not as duplicated in-memory candidate
 states (§12.9). The official full-book SHA-1 is reproducible, but it certifies
 neither an individual delta/delivery nor suffix completeness. Kalshi's delta
 semantics are taken from its published spec and are unverified against live
-servers (§12.7); the variant exists so that verifying them is a reconciler
+servers (§12.7); the variant exists so that verifying them is a normalizer
 change, not a schema change.
 
 ### 7.3 The book and its receipt
@@ -1433,12 +1532,14 @@ python -m replay.scope resolve                    (§3.1, Python)
     --scope-out  PATH        scope.json
     --specs-out  PATH        specs.json  (§9 generator, same contexts)
     [--stage     DIR]        fetch reaped windows for the scope into a local
-                             canonical root via the bounded stager (§5.2 stage 0)
+                             canonical root via the bounded rebuild stager (§5.2)
 
 replay-engine build
-    --scope      PATH …      one or more scope descriptors; one decode pass
-                             per window, fanned out to all of them (§5.8)
-    --canonical  PATH        local canonical root (receipts + objects)
+    --scope      PATH …      one or more scope descriptors; one parse pass
+                             per record, fanned out to all of them (§5.8)
+  [ --spool      PATH        normal co-materialization source
+    --canonical-out PATH ]   exact canonical root written by indexer-finalize
+  | --canonical  PATH        rebuild source: committed receipts + objects
     --out        DIR         receipt-committed <address>/ segment directory
 
 python -m replay.publish_segments
@@ -1567,16 +1668,17 @@ own evaluation cadence and output stream.
 ## 11. Parallelism
 
 **Across canonical windows — the eventual primary axis.** Phase 1 is serial.
-After profiling, a configured bounded worker pool decodes each window once and
-fans events out to every scope (§5.8). Worker completion order never changes
-window concatenation order. This is the big lever that can make prebuild cost one
-pass over the day regardless of how many bundles it covers without making thread,
-file-descriptor, memory, or staging use proportional to window count.
+After profiling, a configured bounded worker pool finalizes or rebuilds each
+window once and fans normalized events out to every scope (§5.8). Worker
+completion order never changes window concatenation order. This is the big lever
+that keeps source merge/decode and venue parsing to one pass regardless of how
+many bundles the day covers without making thread, file-descriptor, memory, or
+staging use proportional to window count.
 
 **Across scopes — do not.** Scopes are independent, which makes one process per
-scope tempting. It multiplies the decode by the scope count, which is the cost
-§5.8 exists to remove. Scopes are the fan-out inside a window's pass, not a
-parallel axis of their own.
+scope tempting. It multiplies merge/decode and parsing by the scope count, which
+is the cost §5.8 exists to remove. Scopes are the fan-out inside a window's pass,
+not a parallel axis of their own.
 
 **Within strategy evaluation — strategy-owned and deferred.** The producer stays
 serial. A strategy may later parallelize its read-only work, but the first
@@ -1709,7 +1811,8 @@ mode inside one committed attempt are prohibited. Failure to place or replay an
 anchor is an audit-control outcome, not grounds to discard otherwise runnable
 base data.
 
-**12.11 Rust object retrieval.** Closed for V1 by stage 0 (§5.2): the Python
+**12.11 Rust object retrieval.** Closed for V1 by archived rebuild staging
+(§5.2): the Python
 resolve step stages stored archived windows into a local canonical root through
 the bounded ObjectStore stager, and Rust re-verifies on read. A Rust client via
 the `object_store` crate would remove the staging step and is worth doing only if
@@ -1764,13 +1867,14 @@ as response history and has no normative force.
 |---|---|---|
 | A — same-hash candidates | **Prior rule rejected; replacement pending** | Mandatory contiguous-run retention, a full in-memory state per candidate, and automatic ambiguity on later recurrence are rejected. Canonical addresses still remain on disk. Assessment by exact levels/metadata, order/time, and prior-anchor lineage is the proposed replacement. The bounded checkpoint/journal optimization in §12.9 is not approved. |
 | B — strategy triggers | **Approved redirection** | The producer owns only ordered atomic mutation and a pull cursor. Each strategy owns filtering, pull/evaluation cadence, dependencies, and output. No trigger registration or producer callback remains. |
-| C — malformed inputs | **Approved intent; ownership corrected by repository invariant** | Malformed canonical envelope/provenance fails in `indexer-finalize`; malformed venue/book/control payload fails in strict Rust normalization. The payload-agnostic finalizer cannot perform venue validation. `book` receives only closed events or an already classified `NormalizationFault` and never interprets malformed wire. |
+| C — malformed inputs | **Approved intent; ownership corrected by repository invariant** | Malformed canonical envelope/provenance fails in `indexer-finalize`; malformed venue/book/control payload fails in the Replay-owned strict normalizer attached as an optional derivative sink. The finalizer core remains generic and performs no venue validation. `book` receives only closed events or an already classified `NormalizationFault` and never interprets malformed wire. |
 | D — REST prerequisite | **Approved redirection** | A healthy WebSocket full book initializes a runnable captured-state book. REST is delayed optional audit evidence, never a universal promotion gate. |
 | E — previous-anchor bound | **Pending** | §12.9 gives the requested concrete checkpoint, journal, overflow, retry, and receipt example. Recommended V1 default: ship the separate two-pass auditor first and defer bounded one-pass audit. |
 | F — discrepancy consequences | **Direction approved; artifact details and Clip pending** | The producer never reruns or voids strategies. An immutable overlay reports exact invalid dependency ranges; strategies append their own voids. §7.8 gives a worked example. Whether to use the proposed one-overlay-per-run identity and whether the base selector uses `Clip` remain unapproved. |
 | G — certification modes | **Approved rejection/simplification** | No certified-only headline mode or separate “uncertified diagnostic” run type. Replay uses `AllowUncertified`, strictly verifies bytes/receipts/provenance, preserves coverage faults, and allows healthy lanes to run. |
 | H — unknown attribution | **Conditional; minimum pending** | Unknown requested books remain `NotInitialized` rather than poisoning a whole scope. A minimal adapter-owned lane→venue/stream role is still needed to tell a missing required book lane from a missing optional snapshot lane; no deployment-wide map is proposed. |
 | I — representation/parsing | **Approved** | Freeze the representation/parser/book boundary before economics. The exact intended reference is `github.com/hridyansh07/bitfrost-prime-take-home`; adopt its architecture, not verbatim unlicensed code. Fee/economic policy remains Phase 3B. |
+| J — bundle materialization | **Approved direction** | Persist one normalized segment per retained umbrella-event/bundle scope; unrelated markets are intentionally excluded. During canonical finalization, normalize each ordered record once and fan it out to every applicable scope. Exact canonical evidence remains independently retained and authoritative. The audited reader invokes the same materializer for deterministic rebuilds. Independent segment commit metadata remains required by the repository's file-protocol invariant; it proves byte identity and lineage, not semantic correctness. |
 
 ### 14.1 Smallest remaining decisions
 
@@ -1802,12 +1906,19 @@ as response history and has no normative force.
 ### 14.2 Revised completion gates
 
 1. **Phase 0 boundary integrated.** Universe responses pin context identities;
-   the Phase-0 selector rejects gaps/overlaps; the audited stream reaches EOF and
-   `finish()` before segment commit; `AllowUncertified` preserves coverage facts;
-   normalization follows the approved representation/parsing split.
-2. **Serial reconciler conformant.** Every normalized child preserves canonical
-   address, tie group, source provenance, and continuity. Malformed venue/control
-   data becomes a receipt-bound reject plus classified fault before `book`.
+   the existing Phase-0 selector rejects gaps/overlaps; the finalizer exposes a
+   generic ordered-record derivative sink without importing venue code. A segment
+   commits only after either its named canonical receipts commit on the normal
+   path or the audited rebuild stream reaches EOF and `finish()`. `AllowUncertified`
+   preserves coverage facts; normalization follows the approved
+   representation/parsing split.
+2. **Serial materializer conformant.** Each input record is normalized once and
+   fanned out to every applicable scope; unrelated instruments enter none. Every
+   normalized child preserves canonical address, tie group, source provenance,
+   and continuity. Malformed venue/control data becomes a receipt-bound reject
+   plus classified fault before `book`. Same-pass and audited-reader builds over
+   the same canonical receipts are byte-identical, and a derivative failure does
+   not prevent exact canonical commitment.
 3. **Base projector correct.** A WebSocket full book initializes without REST;
    pull updates never expose partial deliveries/tie groups; duplicates do not
    mutate; conflicts, known continuity faults, impossible relative mutations,
