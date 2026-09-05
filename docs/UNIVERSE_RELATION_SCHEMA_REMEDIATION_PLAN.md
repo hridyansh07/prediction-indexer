@@ -195,15 +195,52 @@ cross-venue non-OVERLAP relation set **exactly** (12/12 on BO3-with-maps, 8/8 on
 BO5-with-maps), while a BO3 bundle's 66 pairwise edges collapse to 8 claims and 8
 claim relations — and those 8 relations are reusable by every other BO3 event.
 
-**Still required before Phase 3:** the same gate against the real archive. The
-fixtures prove the model is sound; only `/srv/event-universe/build/universe-v5.sqlite3`
-proves it matches what the venues actually publish.
+**Real-archive result — gate passed.** Run against the intact v5 build, 158
+runs and 3,333,919 `relation_observations`, read-only:
 
 ```sh
 python scripts/verify_claim_model.py --database /srv/event-universe/build/universe-v5.sqlite3
 ```
 
-Nothing in the schema moves until that reports `defect_count: 0`.
+| measure | value |
+|---|---|
+| distinct relations | 39,025 |
+| relations the scorer reads (cross-venue, non-OVERLAP) | 5,496 |
+| **dead weight** | **85.92%** |
+| OVERLAP, either pairing | 20,355 |
+| same-venue, any type | 24,267 |
+| per-run collapse, pairwise relations to claims | **18.21x** |
+| IDENTITY clique defects on real venue data | **0** |
+
+The first run reported 51,786 relation-agreement defects. **All were a harness
+bug, not a model failure**: `relation_members` records direction in `role`, the
+check keyed on an unordered claim pair and so read `p -> q` in one bundle and
+`q <- p` in another as a contradiction. Every defect had the same shape,
+`['IMPLICATION', 'REVERSE_IMPLICATION']`. `normalize_relation` now reduces a
+directed relation to `(antecedent, consequent)` before comparing — which removes
+the false conflict while keeping a genuine one (two claims disagreeing about
+which contains which) detectable. Both cases are covered by tests.
+
+Clique completeness — the harder half, and the one that would have falsified the
+model — was **0 defects at both ends of the range**. Set equality really does
+produce complete cliques on real venue data.
+
+**Two defects confirmed on real data, not projected:**
+
+- **A.2 is already broken.** `max_relations_in_one_run` is **25,007** against a
+  1,000-row cap, so `GET /v1/targeter/runs/<run_id>` fails for complete runs in
+  the data that exists today.
+- **A.3 is arithmetic, not a risk.** `max_observations_of_one_relation` is
+  **158 — exactly the run count**. Every relation is observed in every run, so
+  the endpoint starts failing at run 1,001 of the 1,202-run history.
+
+That second number is also the redundancy stated plainly: 158/158.
+
+**Still open:** the 18.21x is the *per-run* collapse. Claims are stable across
+runs, so the stored count is the distinct class count rather than the per-run sum
+— the harness now reports `global_claims.claim_classes_upper_bound` for that, and
+deduplicating further by outcome key set (the global identity in
+`analysis.claims`) is a further reduction only mask recompilation can measure.
 
 1. Recompute claims for archived runs via Path A. Enumerate distinct
    `(space_shape, outcome_keys)` over the full history and the resulting relation

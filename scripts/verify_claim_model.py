@@ -15,9 +15,10 @@ Four things, read-only, against a schema v5 database:
 
 ```text
 1  size the dead weight the pairwise model stores (same-venue and OVERLAP)
-2  partition masks into claims from the recorded IDENTITY edges
-3  check every partition is a complete clique, as set equality requires
-4  check every edge between two claims agrees, as a claim relation requires
+2  count the claim classes the whole build holds, which is what would be stored
+3  partition masks into claims from the recorded IDENTITY edges
+4  check every partition is a complete clique, as set equality requires
+5  check every relation between two claims agrees once direction is normalized
 ```
 
 Steps 2-4 need no mask recompilation and no object store, so this runs against a
@@ -32,7 +33,6 @@ import json
 import sqlite3
 import sys
 from collections import defaultdict
-from itertools import combinations
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +43,7 @@ from analysis.claims import (  # noqa: E402
     UNINFORMATIVE_RELATIONS,
     classes_from_identity_edges,
     identity_clique_defects,
+    relation_agreement_defects,
     relation_members_to_edges,
 )
 
@@ -118,7 +119,7 @@ def _claims_per_run(connection: sqlite3.Connection, limit: int | None) -> dict[s
         run_id = str(run["run_id"])
         members = connection.execute(
             """SELECT o.relation_id, m.venue, m.venue_market_id, m.claim_key,
-                      r.relation_type
+                      m.role, r.relation_type
                FROM relation_observations o
                JOIN relations r USING (relation_id)
                JOIN relation_members m USING (relation_id)
@@ -130,7 +131,7 @@ def _claims_per_run(connection: sqlite3.Connection, limit: int | None) -> dict[s
         checked += 1
 
         by_relation: dict[int, dict[str, object]] = defaultdict(
-            lambda: {"type": None, "members": []}
+            lambda: {"type": None, "members": [], "roles": []}
         )
         for row in members:
             entry = by_relation[int(row["relation_id"])]
@@ -140,6 +141,7 @@ def _claims_per_run(connection: sqlite3.Connection, limit: int | None) -> dict[s
                 key = f"{key}#{row['claim_key']}"
             if key not in entry["members"]:
                 entry["members"].append(key)
+                entry["roles"].append(str(row["role"]))
 
         pairwise_total += len(by_relation)
         identity_rows = [
@@ -163,26 +165,28 @@ def _claims_per_run(connection: sqlite3.Connection, limit: int | None) -> dict[s
         for defect in identity_clique_defects(components, edges):
             defects.append(f"{run_id}: {defect}")
 
-        # Every edge between one pair of claims must agree: the relation is a
-        # function of the two subsets, so a disagreement falsifies the model.
+        # Every relation between one pair of claims must reduce to one
+        # descriptor: the relation is a function of the two subsets, so a
+        # genuine disagreement falsifies the model. Direction is normalized
+        # first, because a directed relation written from its other end is the
+        # same fact and comparing raw labels would report a conflict that is
+        # not there.
         owner = {
-            member: index
+            member: f"claim-{index}"
             for index, component in enumerate(components)
             for member in component
         }
-        between: dict[tuple[int, int], set[str]] = defaultdict(set)
+        recorded: list[tuple[str, list[tuple[str, str]]]] = []
         for entry in by_relation.values():
-            for left, right in combinations(sorted(entry["members"]), 2):
-                if left not in owner or right not in owner:
-                    continue
-                pair = tuple(sorted((owner[left], owner[right])))
-                if pair[0] != pair[1]:
-                    between[pair].add(str(entry["type"]))
-        for pair, kinds in between.items():
-            if len(kinds) > 1:
-                defects.append(
-                    f"{run_id}: claims {pair} carry disagreeing relations {sorted(kinds)}"
-                )
+            pairs = [
+                (role, owner[member])
+                for member, role in zip(entry["members"], entry["roles"])
+                if member in owner
+            ]
+            if len(pairs) == 2:
+                recorded.append((str(entry["type"]), pairs))
+        for defect in relation_agreement_defects(recorded):
+            defects.append(f"{run_id}: {defect}")
 
     return {
         "runs_checked": checked,
@@ -193,6 +197,53 @@ def _claims_per_run(connection: sqlite3.Connection, limit: int | None) -> dict[s
         ),
         "defects": defects[:50],
         "defect_count": len(defects),
+    }
+
+
+def _global_claims(connection: sqlite3.Connection) -> dict[str, object]:
+    """Distinct claim classes across the whole build, not summed per run.
+
+    ``relations`` is keyed by canonical hash, so its IDENTITY rows are a global
+    edge set: partitioning them once gives the number of claim classes the whole
+    database holds, which is what a `claim_classes` table would store.
+
+    This counts *event-scoped* classes, since a mask is keyed by its venue market
+    and two events' "home wins" are different markets. Deduplicating further by
+    outcome key set — the global identity in `analysis.claims` — needs mask
+    recompilation and so is measured by the Path A spike, not here. Treat this as
+    the upper bound.
+    """
+    rows = connection.execute(
+        """SELECT m.relation_id, m.venue, m.venue_market_id, m.claim_key
+           FROM relation_members m
+           JOIN relations r USING (relation_id)
+           WHERE r.relation_type = 'IDENTITY'"""
+    ).fetchall()
+    edges = relation_members_to_edges([dict(row) for row in rows])
+    every = connection.execute(
+        """SELECT DISTINCT venue, venue_market_id, claim_key FROM relation_members"""
+    ).fetchall()
+    members = {
+        f"{row['venue']}:{row['venue_market_id']}"
+        + (f"#{row['claim_key']}" if row["claim_key"] else "")
+        for row in every
+    }
+    components = classes_from_identity_edges(edges, members=members)
+    observations = connection.execute(
+        "SELECT COUNT(*) FROM relation_observations"
+    ).fetchone()[0]
+    return {
+        "masks": len(members),
+        "claim_classes_upper_bound": len(components),
+        "cross_venue_classes": sum(
+            1
+            for component in components
+            if len({member.split(":", 1)[0] for member in component}) > 1
+        ),
+        "relation_observations": observations,
+        "rows_removed_ratio": (
+            round(observations / len(components), 1) if components else None
+        ),
     }
 
 
@@ -213,6 +264,7 @@ def main() -> int:
             "database": str(arguments.database),
             "dead_weight": _dead_weight(connection),
             "observation_pressure": _observation_pressure(connection),
+            "global_claims": _global_claims(connection),
             "claim_partition": _claims_per_run(connection, arguments.limit),
         }
 

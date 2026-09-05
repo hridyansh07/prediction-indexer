@@ -43,6 +43,11 @@ CLAIM_ALGEBRA_VERSION = 1
 # scorer excludes it (`targeter/v2/selection.py`).
 UNINFORMATIVE_RELATIONS = frozenset({"OVERLAP"})
 
+# Relations whose meaning depends on which member is which. The projection
+# records the distinction in `relation_members.role`; symmetric types collapse
+# every member to role `member`.
+DIRECTED_RELATIONS = frozenset({"IMPLICATION", "REVERSE_IMPLICATION"})
+
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(
@@ -314,3 +319,65 @@ def relation_members_to_edges(
         for left, right in combinations(sorted(members), 2):
             edges.append((left, right))
     return tuple(edges)
+
+
+def normalize_relation(
+    relation_type: str,
+    member_claims: Iterable[tuple[str, str]],
+) -> tuple[str, ...]:
+    """Reduce a recorded relation to one descriptor per fact.
+
+    ``member_claims`` pairs each member's ``relation_members.role`` with the
+    claim it belongs to.
+
+    IMPLICATION and REVERSE_IMPLICATION are the same statement written from
+    opposite ends: ``relationship`` returns IMPLICATION when the left member's
+    subset is contained in the right's, and REVERSE_IMPLICATION when it is the
+    other way round. So a bundle that records ``p -> q`` and another that records
+    ``q <- p`` are agreeing, not contradicting, and comparing the raw labels over
+    an unordered pair reports a conflict that is not there.
+
+    Normalizing to ``(antecedent, consequent)`` removes that false conflict while
+    keeping a real one visible: two claims genuinely disagreeing about which
+    contains which still produce two different descriptors.
+    """
+    pairs = tuple(member_claims)
+    if relation_type in DIRECTED_RELATIONS:
+        by_role = {role: claim for role, claim in pairs}
+        if set(by_role) != {"left", "right"}:
+            raise ValueError(
+                f"{relation_type} needs one left and one right member, got {sorted(by_role)}"
+            )
+        if relation_type == "IMPLICATION":
+            antecedent, consequent = by_role["left"], by_role["right"]
+        else:
+            antecedent, consequent = by_role["right"], by_role["left"]
+        return ("IMPLICATION", antecedent, consequent)
+    return (relation_type, *sorted({claim for _role, claim in pairs}))
+
+
+def relation_agreement_defects(
+    relations: Iterable[tuple[str, Sequence[tuple[str, str]]]],
+) -> tuple[str, ...]:
+    """Report claim pairs whose recorded relations do not agree.
+
+    A relation is a function of the two claims' outcome subsets, so every
+    relation recorded between one pair of claims must reduce to one descriptor.
+    More than one falsifies the claim model for that pair.
+    """
+    seen: dict[frozenset[str], set[tuple[str, ...]]] = {}
+    for relation_type, member_claims in relations:
+        claims = {claim for _role, claim in member_claims}
+        if len(claims) != 2:
+            continue
+        seen.setdefault(frozenset(claims), set()).add(
+            normalize_relation(relation_type, member_claims)
+        )
+    defects: list[str] = []
+    for pair, descriptors in seen.items():
+        if len(descriptors) > 1:
+            defects.append(
+                f"claims {sorted(pair)} carry disagreeing relations "
+                f"{sorted(descriptors)}"
+            )
+    return tuple(sorted(defects))

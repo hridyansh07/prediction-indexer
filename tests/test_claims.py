@@ -4,6 +4,8 @@ import unittest
 
 from analysis.claims import (
     CLAIM_ALGEBRA_VERSION,
+    normalize_relation,
+    relation_agreement_defects,
     CLAIM_IDENTITY_VERSION,
     claim_id,
     classes_from_identity_edges,
@@ -264,6 +266,65 @@ class IdentityEdgeDerivation(unittest.TestCase):
                 ("kalshi:k1#claim=0", "polymarket:p1#claim=0"),
                 ("kalshi:k1#claim=1", "polymarket:p2"),
             ),
+        )
+
+
+class DirectedRelationNormalization(unittest.TestCase):
+    """Regression: a directed relation written from either end is one fact.
+
+    ``relation_members`` records direction in ``role``. Comparing raw relation
+    types over an unordered claim pair drops it, so ``p -> q`` recorded in one
+    bundle and ``q <- p`` in another look like a contradiction. Against the real
+    158-run build that false positive accounted for every one of the 51,786
+    reported defects.
+    """
+
+    def test_same_fact_from_both_ends_normalizes_alike(self) -> None:
+        forward = normalize_relation("IMPLICATION", [("left", "P"), ("right", "Q")])
+        backward = normalize_relation("REVERSE_IMPLICATION", [("left", "Q"), ("right", "P")])
+        self.assertEqual(forward, backward)
+        self.assertEqual(forward, ("IMPLICATION", "P", "Q"))
+
+    def test_opposite_labels_are_not_a_defect(self) -> None:
+        self.assertEqual(
+            relation_agreement_defects([
+                ("IMPLICATION", [("left", "P"), ("right", "Q")]),
+                ("REVERSE_IMPLICATION", [("left", "Q"), ("right", "P")]),
+            ]),
+            (),
+        )
+
+    def test_a_genuine_direction_conflict_still_fails(self) -> None:
+        """Normalizing must not become collapsing: P subset Q and Q subset P is real."""
+        defects = relation_agreement_defects([
+            ("IMPLICATION", [("left", "P"), ("right", "Q")]),
+            ("IMPLICATION", [("left", "Q"), ("right", "P")]),
+        ])
+        self.assertEqual(len(defects), 1)
+        self.assertIn("disagreeing", defects[0])
+
+    def test_a_genuine_type_conflict_still_fails(self) -> None:
+        defects = relation_agreement_defects([
+            ("IDENTITY", [("member", "P"), ("member", "Q")]),
+            ("MUTUAL_EXCLUSION", [("member", "P"), ("member", "Q")]),
+        ])
+        self.assertEqual(len(defects), 1)
+
+    def test_symmetric_relations_are_order_free(self) -> None:
+        self.assertEqual(
+            normalize_relation("MUTUAL_EXCLUSION", [("member", "Q"), ("member", "P")]),
+            normalize_relation("MUTUAL_EXCLUSION", [("member", "P"), ("member", "Q")]),
+        )
+
+    def test_directed_relation_needs_both_roles(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_relation("IMPLICATION", [("member", "P"), ("member", "Q")])
+
+    def test_agreement_ignores_self_pairs(self) -> None:
+        """Two members of one claim carry no inter-claim statement."""
+        self.assertEqual(
+            relation_agreement_defects([("IDENTITY", [("member", "P"), ("member", "P")])]),
+            (),
         )
 
 

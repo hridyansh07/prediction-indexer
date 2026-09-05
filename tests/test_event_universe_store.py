@@ -2060,6 +2060,77 @@ class ClaimModelVerificationTests(unittest.TestCase):
         self.assertFalse(report["pressure"]["run_detail_already_unservable"])
         self.assertEqual(report["pressure"]["detail_row_limit"], DETAIL_ROW_LIMIT)
 
+    def test_gate_accepts_a_directed_relation_written_from_both_ends(self) -> None:
+        """Regression: opposite labels for one fact are not a contradiction.
+
+        A bundle recording ``p -> q`` as IMPLICATION and another recording the
+        same containment as ``q <- p`` REVERSE_IMPLICATION are agreeing. Keying
+        the agreement check on an unordered claim pair dropped the direction and
+        reported every such pair as a defect; against the real 158-run build that
+        was all 51,786 of them.
+        """
+        import scripts.verify_claim_model as gate
+
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE targeter_runs(run_id TEXT, generated_at_ns INTEGER);
+            CREATE TABLE relations(relation_id INTEGER, relation_type TEXT);
+            CREATE TABLE relation_members(
+                relation_id INTEGER, venue TEXT, venue_market_id TEXT,
+                claim_key TEXT, role TEXT);
+            CREATE TABLE relation_observations(run_id TEXT, relation_id INTEGER);
+            INSERT INTO targeter_runs VALUES ('run-1', 1);
+            -- Two claims, each listed at two venues, so IDENTITY forms cliques.
+            INSERT INTO relations VALUES
+                (1, 'IDENTITY'), (2, 'IDENTITY'),
+                (3, 'IMPLICATION'), (4, 'REVERSE_IMPLICATION');
+            INSERT INTO relation_members VALUES
+                (1, 'kalshi', 'p', '', 'member'),
+                (1, 'polymarket', 'p', '', 'member'),
+                (2, 'kalshi', 'q', '', 'member'),
+                (2, 'polymarket', 'q', '', 'member'),
+                (3, 'kalshi', 'p', '', 'left'),
+                (3, 'kalshi', 'q', '', 'right'),
+                (4, 'polymarket', 'q', '', 'left'),
+                (4, 'polymarket', 'p', '', 'right');
+            INSERT INTO relation_observations VALUES
+                ('run-1', 1), ('run-1', 2), ('run-1', 3), ('run-1', 4);
+            """
+        )
+        report = gate._claims_per_run(connection, None)
+        self.assertEqual(report["defects"], [])
+        self.assertEqual(report["claims"], 2)
+
+    def test_gate_still_fails_a_genuine_direction_conflict(self) -> None:
+        """Normalizing direction must not become ignoring it."""
+        import scripts.verify_claim_model as gate
+
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE targeter_runs(run_id TEXT, generated_at_ns INTEGER);
+            CREATE TABLE relations(relation_id INTEGER, relation_type TEXT);
+            CREATE TABLE relation_members(
+                relation_id INTEGER, venue TEXT, venue_market_id TEXT,
+                claim_key TEXT, role TEXT);
+            CREATE TABLE relation_observations(run_id TEXT, relation_id INTEGER);
+            INSERT INTO targeter_runs VALUES ('run-1', 1);
+            INSERT INTO relations VALUES (1, 'IMPLICATION'), (2, 'IMPLICATION');
+            INSERT INTO relation_members VALUES
+                (1, 'kalshi', 'p', '', 'left'),
+                (1, 'kalshi', 'q', '', 'right'),
+                (2, 'kalshi', 'q', '', 'left'),
+                (2, 'kalshi', 'p', '', 'right');
+            INSERT INTO relation_observations VALUES ('run-1', 1), ('run-1', 2);
+            """
+        )
+        report = gate._claims_per_run(connection, None)
+        self.assertEqual(report["defect_count"], 1)
+        self.assertIn("disagreeing", report["defects"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
