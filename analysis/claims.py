@@ -26,7 +26,13 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from analysis.masks import IDENTITY, Mask, relationship
+from analysis.masks import (
+    IDENTITY,
+    IMPLICATION,
+    REVERSE_IMPLICATION,
+    Mask,
+    relationship,
+)
 from analysis.outcome_space import OutcomeSpace
 
 
@@ -183,11 +189,19 @@ def derive_claim_algebra(
             continue
         if informative_only and kind in UNINFORMATIVE_RELATIONS:
             continue
+        # The pair is ordered by claim_id, which says nothing about implication
+        # direction, so roughly half of all implications arrive reversed. Store
+        # one direction only: swapping the operands says the same thing and
+        # keeps (antecedent, consequent) the sole convention downstream.
+        antecedent, consequent = left, right
+        if kind == REVERSE_IMPLICATION:
+            antecedent, consequent = right, left
+            kind = IMPLICATION
         out.append(
             ClaimRelation(
-                space_shape_id=left.space_shape_id,
-                left_claim_id=left.claim_id,
-                right_claim_id=right.claim_id,
+                space_shape_id=antecedent.space_shape_id,
+                left_claim_id=antecedent.claim_id,
+                right_claim_id=consequent.claim_id,
                 relation_type=kind,
             )
         )
