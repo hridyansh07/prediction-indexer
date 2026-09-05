@@ -3,7 +3,7 @@
 Runtime schema version 5 applies the single canonical [`schema.sql`](schema.sql)
 package resource. It contains both the historical run/bundle API tables and the
 event/market view: umbrella and venue events, canonical and venue markets,
-candidate decisions, selected-market occurrences, and n-ary relationships.
+candidate decisions, selected-market occurrences, and market claims.
 
 The database is a rebuildable query index, not another evidence archive:
 
@@ -21,8 +21,9 @@ The database is a rebuildable query index, not another evidence archive:
   retryable;
 - `canonical_markets` group venue markets under explicit market-template and
   outcome-space versions;
-- `relations` plus `relation_members` normalize symmetric or directed n-ary
-  market relations; and
+- `claim_classes`, `claim_relations` and `market_claims` record the outcome
+  subset each market expresses and how those subsets relate, keyed by neither
+  run nor event; and
 - the v1 occurrence/context tables preserve historical bundle APIs and exact
   continuity/retirement provenance.
 

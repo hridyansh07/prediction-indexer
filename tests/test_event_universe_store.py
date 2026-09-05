@@ -1172,7 +1172,7 @@ class EventUniverseTests(unittest.TestCase):
             "umbrella_events",
             "canonical_markets",
             "venue_markets",
-            "relations",
+            "claim_classes",
         ):
             self.assertEqual(counts[table], 0, table)
         detail = self.database.targeter_run_detail(R1)
@@ -1428,7 +1428,11 @@ class EventUniverseTests(unittest.TestCase):
         detail = self.database.event_detail(events[0]["event_id"])
         assert detail is not None
         self.assertEqual(len(detail["venue_events"]), 2)
-        self.assertEqual(len(detail["relations"]), 1)
+        # The two venues' moneylines named one outcome subset, so they are one
+        # claim listed at both venues rather than an IDENTITY edge between them.
+        self.assertEqual(len(detail["claims"]), 1)
+        self.assertEqual(detail["claims"][0]["venue_count"], 2)
+        self.assertEqual(detail["relations"], [])
 
     def test_targeter_status_is_compact_and_uses_newest_complete_run(self) -> None:
         _publish_run(self.objects, _selection_report(R1, G1))
@@ -1489,7 +1493,7 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual(detail["run"]["run_id"], R1)
         self.assertEqual(detail["decisions"][0]["bundle_id"], "bundle-1")
         self.assertEqual(len(detail["selected_markets"]), 2)
-        self.assertEqual(len(detail["relations"]), 1)
+        self.assertNotIn("relations", detail)
         self.assertNotIn("candidates", detail)
         self.assertNotIn("relationship_analysis", json.dumps(detail))
         self.assertLess(len(json.dumps(detail, separators=(",", ":"))), 20_000)
@@ -1677,9 +1681,9 @@ class EventUniverseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     application.get(path)
 
-    def test_fresh_database_uses_canonical_schema_v5(self) -> None:
+    def test_fresh_database_uses_canonical_schema_v6(self) -> None:
         with sqlite3.connect(self.database.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -1694,12 +1698,16 @@ class EventUniverseTests(unittest.TestCase):
                 "venue_markets",
                 "candidate_decisions",
                 "selected_market_occurrences",
-                "relations",
-                "relation_members",
+                "claim_classes",
+                "claim_relations",
+                "market_claims",
             }
             <= tables
         )
         self.assertNotIn("cadence_runs", tables)
+        self.assertFalse(
+            {"relations", "relation_members", "relation_observations"} & tables
+        )
 
     def test_initialize_requires_wiping_pre_market_universe_database(self) -> None:
         legacy = self.root / "legacy.sqlite3"
@@ -1887,16 +1895,21 @@ class EventUniverseTests(unittest.TestCase):
         status, market = app.get(f"/v1/markets/{market_id}")
         self.assertEqual(status, 200)
         self.assertEqual(market["market"]["event_id"], event_id)
-        relation_id = event["relations"][0]["relation_id"]
-        status, relation = app.get(f"/v1/relations/{relation_id}")
+        claim_id = event["claims"][0]["claim_id"]
+        status, claim = app.get(f"/v1/claims/{claim_id}")
         self.assertEqual(status, 200)
-        self.assertEqual(relation["observations"][0]["event_id"], event_id)
-        self.assertEqual(len(relation["members"]), 2)
+        self.assertEqual(len(claim["members"]), 2)
+        self.assertEqual(claim["members"][0]["event_id"], event_id)
+        # Member bounds are targeter observation bounds, not lifecycle.
+        self.assertEqual(claim["members"][0]["first_seen_run_id"], R1)
+        # An invalid id raises; the HTTP handler is what maps that to 400.
+        with self.assertRaisesRegex(ValueError, "claim id must be a sha256 digest"):
+            app.get("/v1/claims/not-a-digest")
         status, relation_types = app.get("/v1/relationship-types")
         self.assertEqual(status, 200)
-        self.assertIn(
-            "MUTUAL_EXCLUSION",
+        self.assertEqual(
             {item["type"] for item in relation_types["types"]},
+            {"IMPLICATION", "MUTUAL_EXCLUSION"},
         )
         self.assertEqual(app.get("/v1/segments")[0], 404)
         with sqlite3.connect(self.database.path) as connection:
@@ -2015,6 +2028,214 @@ class EventUniverseTests(unittest.TestCase):
         path.write_text(json.dumps(document))
         with self.assertRaises(UniverseConfigError):
             load_config(path)
+
+
+
+class ClaimModelTests(unittest.TestCase):
+    """Relations are stored as claims, so nothing grows per run."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.database = UniverseStore(self.root / "universe.sqlite3")
+        self.database.initialize()
+        self.objects = LocalObjectStore(
+            self.root / "objects", store_id="archive", durability=INDEPENDENT
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _counts(self) -> dict[str, int]:
+        with sqlite3.connect(self.database.path) as connection:
+            return {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("claim_classes", "claim_relations", "market_claims")
+            }
+
+    def _ingest(self, *runs) -> None:
+        for run, generated in runs:
+            _publish_run(self.objects, _selection_report(run, generated))
+        UniverseSync(self.database, self.objects).sync(
+            now=datetime(2026, 1, 1, 0, 31, tzinfo=timezone.utc)
+        )
+
+    def test_claim_rows_do_not_grow_per_run(self) -> None:
+        """The write amplification, gone.
+
+        The pairwise model wrote one relation_observations row per relation per
+        run -- 21,101 per run against ~247 genuinely new relations. A claim is
+        content-addressed by its outcome subset, so a run that observes what
+        earlier runs observed moves last-seen markers and writes nothing.
+        """
+        self._ingest((R1, G1))
+        after_one = self._counts()
+        self.assertGreater(after_one["claim_classes"], 0)
+        self.assertGreater(after_one["market_claims"], 0)
+
+        self._ingest((R2, G2), (R3, G3))
+        self.assertEqual(self._counts(), after_one)
+
+        with sqlite3.connect(self.database.path) as connection:
+            first, last = connection.execute(
+                "SELECT first_seen_run_id, last_seen_run_id FROM claim_classes"
+            ).fetchone()
+        self.assertEqual(first, R1)
+        self.assertEqual(last, R3)
+
+    def test_re_ingesting_a_run_changes_nothing(self) -> None:
+        self._ingest((R1, G1))
+        before = self._counts()
+        UniverseSync(self.database, self.objects).sync_range(
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.assertEqual(self._counts(), before)
+
+    def test_cross_venue_equivalence_is_membership_not_an_edge(self) -> None:
+        """Equal subsets are one claim, so IDENTITY has nothing to point at."""
+        self._ingest((R1, G1))
+        with sqlite3.connect(self.database.path) as connection:
+            venues = connection.execute(
+                """SELECT COUNT(DISTINCT venue) FROM market_claims
+                   GROUP BY claim_id ORDER BY 1 DESC LIMIT 1"""
+            ).fetchone()[0]
+            stored_types = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT relation_type FROM claim_relations"
+                )
+            }
+        self.assertEqual(venues, 2)
+        self.assertNotIn("IDENTITY", stored_types)
+        self.assertNotIn("OVERLAP", stored_types)
+        self.assertNotIn("REVERSE_IMPLICATION", stored_types)
+
+    def test_claims_that_invent_a_relation_reject_the_run(self) -> None:
+        """The standing check on recomputation.
+
+        Universe rebuilds each bundle from its own projection to recompute
+        claims. If that reconstruction ever diverges from what the targeter
+        compiled, the claims imply a cross-venue relation the report never
+        recorded -- a guessed equivalence -- and the run must not commit.
+        """
+        from universe.claim_projection import verify_claims
+        from universe.market_projection import MarketProjectionError
+
+        with self.assertRaisesRegex(MarketProjectionError, "the report does not record"):
+            verify_claims({("kalshi:a#claim=0", "polymarket:b#claim=0", "IDENTITY")}, [])
+
+    def test_a_relation_the_claims_miss_is_counted_not_raised(self) -> None:
+        """A false negative costs coverage, not correctness, so it is counted."""
+        from universe.claim_projection import verify_claims
+
+        recorded = [
+            {
+                "relation_type": "IDENTITY",
+                "members": [
+                    {"venue": "kalshi", "venue_market_id": "a", "claim_key": "claim=0"},
+                    {"venue": "polymarket", "venue_market_id": "b", "claim_key": "claim=0"},
+                ],
+            }
+        ]
+        self.assertEqual(verify_claims(set(), recorded), 1)
+
+    def test_recomputed_claims_match_the_report(self) -> None:
+        """End to end: no shortfall and no invention on a real projection."""
+        from universe.claim_projection import project_claims
+        from universe.market_projection import project_market_universe
+
+        report = _selection_report(R1, G1)
+        events, markets = _catalog_rows(report)
+        projection = project_market_universe(
+            report, catalog_events=events, catalog_markets=markets
+        )
+        claims = project_claims(projection)
+        self.assertEqual(claims["relation_shortfall"], 0)
+        self.assertGreater(len(claims["market_claims"]), len(claims["claims"]))
+
+    def _projection(self):
+        from universe.market_projection import project_market_universe
+
+        report = _selection_report(R1, G1)
+        events, markets = _catalog_rows(report)
+        return project_market_universe(
+            report, catalog_events=events, catalog_markets=markets
+        )
+
+    def test_claims_respect_the_markets_the_report_excluded(self) -> None:
+        """The targeter derives relations over the bundle minus its exclusions.
+
+        `selection.py` calls ``derive_bundle_relationships(bundle,
+        excluded_market_ids=excluded)``, so a market dropped for a rules
+        contradiction, for being closed, immature, or an invalid product
+        contributes no relation to the report. Recomputing over every market
+        instead derives relations the report legitimately lacks -- and asserts
+        equivalences over markets the targeter had already judged untrustworthy.
+
+        Against the real archive this rejected all 38 attempted runs.
+        """
+        from universe.claim_projection import project_claims
+        from universe.market_projection import MarketProjectionError
+
+        projection = self._projection()
+        excluded = "kalshi:series"
+        relations = [
+            relation
+            for relation in projection["relations"]
+            if not any(
+                f"{member['venue']}:{member['venue_market_id']}" == excluded
+                for member in relation["members"]
+            )
+        ]
+        self.assertLess(len(relations), len(projection["relations"]))
+        projection["relations"] = relations
+
+        # Control: without the exclusion the recomputation invents the relation
+        # the report no longer carries, which is exactly the production failure.
+        with self.assertRaisesRegex(MarketProjectionError, "the report does not record"):
+            project_claims(projection)
+
+        for decision in projection["decisions"]:
+            decision["market_exclusions"] = {excluded: ["not_open_for_orders"]}
+        claims = project_claims(projection)
+        self.assertEqual(claims["relation_shortfall"], 0)
+        self.assertNotIn(
+            excluded,
+            {
+                f"{row['venue']}:{row['venue_market_id']}"
+                for row in claims["market_claims"]
+            },
+        )
+
+    def test_a_post_derivation_exclusion_does_not_narrow_claims(self) -> None:
+        """`no_modeled_cross_venue_relationship` is added after the derivation.
+
+        A market carrying only that reason was still in scope when the report's
+        relationships were derived, so excluding it here would drop claims the
+        report does account for.
+        """
+        from universe.claim_projection import _excluded_markets
+
+        self.assertEqual(
+            _excluded_markets(
+                {"market_exclusions": {"kalshi:a": ["no_modeled_cross_venue_relationship"]}}
+            ),
+            frozenset(),
+        )
+        self.assertEqual(
+            _excluded_markets(
+                {
+                    "market_exclusions": {
+                        "kalshi:a": [
+                            "not_open_for_orders",
+                            "no_modeled_cross_venue_relationship",
+                        ]
+                    }
+                }
+            ),
+            frozenset({"kalshi:a"}),
+        )
 
 
 if __name__ == "__main__":

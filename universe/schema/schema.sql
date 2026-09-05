@@ -349,36 +349,69 @@ CREATE INDEX selected_market_occurrences_canonical
         market_id, market_template_version, outcome_space_version, run_id
     );
 
-CREATE TABLE relations (
-    relation_id INTEGER PRIMARY KEY,
-    relation_type TEXT NOT NULL,
-    generation_version INTEGER NOT NULL CHECK(generation_version > 0),
-    canonical_hash TEXT NOT NULL,
-    UNIQUE(relation_type, canonical_hash, generation_version)
+-- A claim is the outcome subset a market resolves YES on, inside one outcome
+-- space shape. `analysis.masks.relationship` reads the two subsets and no other
+-- field, so the subset is the whole semantic content and two markets naming it
+-- are the same claim however their venues word it.
+--
+-- Outcome keys are participant-independent -- series spaces key outcomes
+-- seq:{sequence} and score spaces key them score:{h}-{a} -- so a claim id is
+-- global: one row serves every event and every run that expresses it.
+--
+-- first_seen_run_id/last_seen_run_id are targeter observation bounds, not
+-- lifecycle. Absence after last_seen_run_id is ambiguous by construction: the
+-- market may have settled, been delisted, or stopped being a candidate, and
+-- Universe cannot tell which without the venue.
+CREATE TABLE claim_classes (
+    claim_id TEXT PRIMARY KEY,
+    space_shape_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    -- Whether the space this claim is drawn from enumerates every reachable
+    -- outcome. A finding over an INCOMPLETE_COVERAGE space is conditional
+    -- discovery evidence, never an unconditional claim.
+    coverage TEXT NOT NULL,
+    outcome_key_count INTEGER NOT NULL CHECK(outcome_key_count > 0),
+    claim_identity_version INTEGER NOT NULL CHECK(claim_identity_version = 1),
+    first_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
+    last_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id)
 ) STRICT;
-CREATE TABLE relation_members (
-    relation_id INTEGER NOT NULL REFERENCES relations(relation_id) ON DELETE CASCADE,
+CREATE INDEX claim_classes_shape ON claim_classes(space_shape_id, claim_id);
+
+-- How two claims of one space shape relate. A function of the two subsets, so
+-- it names no event, run, venue, or bundle and is reusable wherever that shape
+-- occurs.
+--
+-- IDENTITY is absent by construction: equal subsets are one claim_id, so
+-- equivalence is two market_claims rows sharing a claim, never an edge.
+-- REVERSE_IMPLICATION is normalized to (antecedent, consequent) ordering, and
+-- OVERLAP -- the catch-all branch of relationship(), which the targeter's own
+-- scorer discards -- is not stored at all.
+CREATE TABLE claim_relations (
+    space_shape_id TEXT NOT NULL,
+    left_claim_id TEXT NOT NULL REFERENCES claim_classes(claim_id),
+    right_claim_id TEXT NOT NULL REFERENCES claim_classes(claim_id),
+    relation_type TEXT NOT NULL
+        CHECK(relation_type IN ('IMPLICATION', 'MUTUAL_EXCLUSION')),
+    algebra_version INTEGER NOT NULL CHECK(algebra_version = 1),
+    PRIMARY KEY(space_shape_id, left_claim_id, right_claim_id),
+    CHECK(left_claim_id <> right_claim_id)
+) STRICT;
+
+-- Which claim one venue market's tradable token expresses, and over which runs
+-- the targeter observed it doing so. One row per market per claim era: a second
+-- row appears only if the market's semantics genuinely change, never per run.
+CREATE TABLE market_claims (
     venue TEXT NOT NULL,
     venue_market_id TEXT NOT NULL,
     claim_key TEXT NOT NULL,
-    role TEXT NOT NULL,
-    PRIMARY KEY(relation_id, venue, venue_market_id, claim_key, role),
+    claim_id TEXT NOT NULL REFERENCES claim_classes(claim_id),
+    event_id TEXT NOT NULL REFERENCES umbrella_events(event_id),
+    first_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
+    last_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
+    PRIMARY KEY(venue, venue_market_id, claim_key, claim_id),
     FOREIGN KEY(venue, venue_market_id)
         REFERENCES venue_markets(venue, venue_market_id)
 ) STRICT;
-CREATE INDEX relation_members_market
-    ON relation_members(venue, venue_market_id, relation_id);
-
-CREATE TABLE relation_observations (
-    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    relation_id INTEGER NOT NULL REFERENCES relations(relation_id),
-    bundle_id TEXT NOT NULL,
-    event_id TEXT NOT NULL REFERENCES umbrella_events(event_id),
-    scope TEXT NOT NULL,
-    coverage TEXT NOT NULL,
-    PRIMARY KEY(run_id, relation_id, bundle_id)
-) STRICT;
-CREATE INDEX relation_observations_relation
-    ON relation_observations(relation_id, event_id, run_id);
-CREATE INDEX relation_observations_event
-    ON relation_observations(event_id, relation_id, run_id);
+CREATE INDEX market_claims_claim
+    ON market_claims(claim_id, event_id, venue, venue_market_id);
+CREATE INDEX market_claims_event ON market_claims(event_id, claim_id);
