@@ -39,6 +39,8 @@ import type {
 } from '../src/event-universe.js';
 
 const sha = 'a'.repeat(64);
+const otherSha = 'b'.repeat(64);
+const shapeSha = 'c'.repeat(64);
 const source = {
   manifest_key: 'targeter-v2/runs/date=2026-08-20/run=run/run_manifest.json',
   manifest_sha256: sha,
@@ -200,7 +202,6 @@ const normalizedRun = (): UniverseTargeterRunDetail => ({
     eligible: 1,
     selected_events: 1,
     selected_markets: 1,
-    relations: 1,
   },
   decisions: [
     {
@@ -238,17 +239,25 @@ const normalizedRun = (): UniverseTargeterRunDetail => ({
       origin_run_id: run().run_id,
     },
   ],
-  relations: [
-    {
-      relation_id: 1,
-      relation_type: 'IDENTITY',
-      event_id: 'event-alpha',
-      scope: 'series',
-      coverage: 'EXHAUSTIVE',
-      generation_version: 1,
-      canonical_hash: sha,
-    },
-  ],
+});
+const claimSummary = () => ({
+  claim_id: sha,
+  space_shape_id: shapeSha,
+  scope: 'series',
+  coverage: 'EXHAUSTIVE',
+  outcome_key_count: 3,
+  market_count: 2,
+  venue_count: 2,
+  first_seen_run_id: run().run_id,
+  last_seen_run_id: run().run_id,
+});
+const claimRelation = () => ({
+  space_shape_id: shapeSha,
+  left_claim_id: sha,
+  right_claim_id: otherSha,
+  relation_type: 'IMPLICATION',
+  scope: 'series',
+  coverage: 'EXHAUSTIVE',
 });
 const normalizedEvent = () => ({
   event: normalizedEventSummary(),
@@ -282,16 +291,8 @@ const normalizedEvent = () => ({
       venues: ['kalshi'],
     },
   ],
-  relations: [
-    {
-      relation_id: 1,
-      relation_type: 'IDENTITY',
-      scope: 'series',
-      coverage: 'EXHAUSTIVE',
-      generation_version: 1,
-      canonical_hash: sha,
-    },
-  ],
+  claims: [claimSummary()],
+  relations: [claimRelation()],
   observations: [
     {
       run_id: run().run_id,
@@ -302,17 +303,14 @@ const normalizedEvent = () => ({
   ],
 });
 const relationshipTypes = () => ({
-  relationship_type_catalog_version: 1,
+  relationship_type_catalog_version: 2,
   types: [
-    { type: 'IDENTITY', directed: false, member_roles: ['member'] },
-    { type: 'IMPLICATION', directed: true, member_roles: ['left', 'right'] },
     {
-      type: 'REVERSE_IMPLICATION',
+      type: 'IMPLICATION',
       directed: true,
-      member_roles: ['left', 'right'],
+      member_roles: ['antecedent', 'consequent'],
     },
     { type: 'MUTUAL_EXCLUSION', directed: false, member_roles: ['member'] },
-    { type: 'OVERLAP', directed: false, member_roles: ['member'] },
   ],
 });
 const normalizedMarket = () => ({
@@ -359,34 +357,41 @@ const normalizedMarket = () => ({
       origin_run_id: run().run_id,
     },
   ],
+  claims: normalizedEvent().claims,
   relations: normalizedEvent().relations,
 });
-const normalizedRelation = (claimKey: unknown = '') => ({
-  relation: {
-    relation_id: 1,
-    relation_type: 'IDENTITY',
-    generation_version: 1,
-    canonical_hash: sha,
+const normalizedClaim = (claimKey: unknown = '') => ({
+  claim: {
+    claim_id: sha,
+    space_shape_id: shapeSha,
+    scope: 'series',
+    coverage: 'EXHAUSTIVE',
+    outcome_key_count: 3,
+    claim_identity_version: 1,
+    first_seen_run_id: run().run_id,
+    last_seen_run_id: run().run_id,
   },
   members: [
     {
       venue: 'kalshi',
       venue_market_id: 'K-ALPHA',
+      claim_key: claimKey,
+      event_id: 'event-alpha',
       market_id: 'market-alpha',
       market_template_version: 1,
       outcome_space_version: 1,
-      claim_key: claimKey,
-      role: 'member',
+      canonical_class: 'esports.series_moneyline',
+      title: 'Alpha vs Beta',
+      first_seen_run_id: run().run_id,
+      last_seen_run_id: run().run_id,
     },
   ],
-  observations: [
+  relations: [
     {
-      run_id: run().run_id,
-      generated_at: run().generated_at,
-      bundle_id: 'bundle alpha',
-      event_id: 'event-alpha',
-      scope: 'series',
-      coverage: 'EXHAUSTIVE',
+      space_shape_id: shapeSha,
+      left_claim_id: sha,
+      right_claim_id: otherSha,
+      relation_type: 'IMPLICATION',
     },
   ],
 });
@@ -424,7 +429,7 @@ async function proxyContractCase(contract: ContractCase) {
   );
 }
 
-test('real UniverseApplication responses satisfy all eight proxy contracts', async () => {
+test('real UniverseApplication responses satisfy every proxy contract', async () => {
   const contracts = realUniverseContract();
   assert.deepEqual(
     contracts.map(({ name }) => name),
@@ -437,6 +442,8 @@ test('real UniverseApplication responses satisfy all eight proxy contracts', asy
       'events',
       'event_detail',
       'targeter_run',
+      'market_detail',
+      'claim_detail',
       'health_degraded',
     ],
   );
@@ -460,6 +467,10 @@ test('real Universe contracts remain closed to key-set drift', async () => {
     ['events', (body) => delete body.events[0].event_refs],
     ['event_detail', (body) => (body.observations[0].unexpected = true)],
     ['targeter_run', (body) => delete body.events[0].event_refs],
+    ['event_detail', (body) => delete body.claims[0].venue_count],
+    ['market_detail', (body) => (body.claims = undefined)],
+    ['claim_detail', (body) => delete body.claim.coverage],
+    ['claim_detail', (body) => (body.members[0].unexpected = true)],
   ];
   for (const [name, mutate] of mutations) {
     const contract = structuredClone(contracts.get(name)!);
@@ -748,8 +759,8 @@ test('same-origin proxy dispatches every normalized collection and detail route'
       return json(relationshipTypes());
     if (url.pathname.endsWith('/v1/markets/market-alpha'))
       return json(normalizedMarket());
-    if (url.pathname.endsWith('/v1/relations/1'))
-      return json(normalizedRelation());
+    if (url.pathname.endsWith(`/v1/claims/${sha}`))
+      return json(normalizedClaim());
     throw new Error(`unexpected route ${url.pathname}`);
   }) as typeof fetch;
   const environment = {
@@ -761,7 +772,7 @@ test('same-origin proxy dispatches every normalized collection and detail route'
     '/v1/events?limit=25&cursor=opaque-events-cursor',
     '/v1/relationship-types',
     '/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
-    '/v1/relations/1',
+    `/v1/claims/${sha}`,
   ]) {
     const [path, query = ''] = route.split('?');
     const response = await handleEventUniverseProxy(
@@ -772,7 +783,7 @@ test('same-origin proxy dispatches every normalized collection and detail route'
       upstreamFetch,
     );
     assert.equal(response.status, 200, route);
-    if (route === '/v1/relations/1')
+    if (route === `/v1/claims/${sha}`)
       assert.equal(
         response.headers.get('cache-control'),
         'private, max-age=300',
@@ -782,14 +793,14 @@ test('same-origin proxy dispatches every normalized collection and detail route'
     '/base/v1/events?limit=25&cursor=opaque-events-cursor',
     '/base/v1/relationship-types',
     '/base/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
-    '/base/v1/relations/1',
+    `/base/v1/claims/${sha}`,
   ]);
 
   for (const route of [
     '/v1/events?limit=101',
     '/v1/relationship-types?cursor=nope',
     '/v1/markets/market-alpha?market_template_version=0',
-    '/v1/relations/0',
+    '/v1/claims/0',
   ]) {
     const [path, query = ''] = route.split('?');
     const response = await handleEventUniverseProxy(
@@ -814,18 +825,18 @@ test('same-origin proxy dispatches every normalized collection and detail route'
   assert.equal(eventDetail.headers.get('cache-control'), 'no-store');
 });
 
-test('relation detail accepts an empty claim key but rejects schema drift', async () => {
+test('claim detail accepts an empty claim key but rejects schema drift', async () => {
   const valid = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedRelation())) as typeof fetch,
+    fetch: (async () => json(normalizedClaim())) as typeof fetch,
   });
-  assert.equal((await valid.relation('1')).members[0].claim_key, '');
+  assert.equal((await valid.claim(sha)).members[0].claim_key, '');
 
   const invalid = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedRelation(null))) as typeof fetch,
+    fetch: (async () => json(normalizedClaim(null))) as typeof fetch,
   });
-  await assert.rejects(() => invalid.relation('1'));
+  await assert.rejects(() => invalid.claim(sha));
 });
 
 test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
@@ -1356,7 +1367,7 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
           umbrella_events: 804,
           canonical_markets: 1912,
           venue_markets: 3618,
-          relations: 733,
+          claim_classes: 733,
         },
         sync: { pending_failures: 0 },
       });

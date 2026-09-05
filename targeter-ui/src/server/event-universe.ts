@@ -12,8 +12,9 @@ import type {
   UniverseEventDetail,
   UniverseEventPage,
   UniverseMarketDetail,
-  UniverseRelationDetail,
-  UniverseRelationSummary,
+  UniverseClaimDetail,
+  UniverseClaimRelation,
+  UniverseClaimSummary,
   UniverseRelationshipTypeCatalog,
   UniverseSelectedMarket,
   UniverseTargeterDecision,
@@ -210,12 +211,14 @@ export class EventUniverseClient {
     );
   }
 
-  relation(relationId: string) {
-    if (!/^[1-9]\d*$/.test(relationId)) throw new UniverseRequestError();
+  claim(claimId: string) {
+    // A claim is addressed by the digest of its outcome subset, so anything
+    // that is not one cannot name a claim and never reaches upstream.
+    if (!/^[0-9a-f]{64}$/.test(claimId)) throw new UniverseRequestError();
     return this.get(
-      `v1/relations/${relationId}`,
+      `v1/claims/${claimId}`,
       new URLSearchParams(),
-      validateRelationDetail,
+      validateClaimDetail,
     );
   }
 
@@ -340,10 +343,10 @@ export async function dispatchEventUniverseRequest(
   }
   match = /^\/v1\/markets\/([^/]+)$/.exec(pathname);
   if (match) return client.market(pathSegment(match[1]), query);
-  match = /^\/v1\/relations\/([^/]+)$/.exec(pathname);
+  match = /^\/v1\/claims\/([^/]+)$/.exec(pathname);
   if (match) {
     requireNoQuery(query);
-    return client.relation(pathSegment(match[1]));
+    return client.claim(pathSegment(match[1]));
   }
 
   match = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
@@ -951,15 +954,7 @@ function validateRunPage(value: unknown): UniverseRunPage {
 export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
   const item = object(
     value,
-    [
-      'run',
-      'source',
-      'counts',
-      'decisions',
-      'events',
-      'selected_markets',
-      'relations',
-    ],
+    ['run', 'source', 'counts', 'decisions', 'events', 'selected_markets'],
     'targeter run detail',
   );
   const source = object(
@@ -969,13 +964,7 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
   );
   const counts = object(
     item.counts,
-    [
-      'candidates',
-      'eligible',
-      'selected_events',
-      'selected_markets',
-      'relations',
-    ],
+    ['candidates', 'eligible', 'selected_events', 'selected_markets'],
     'targeter run counts',
   );
   const decisions = detailArray(item.decisions, validateTargeterDecision);
@@ -984,16 +973,12 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     item.selected_markets,
     validateSelectedMarket,
   );
-  const relations = detailArray(item.relations, (relation) =>
-    validateRelationSummary(relation, true),
-  );
   const eventIds = new Set(events.map((event) => event.event_id));
   const validatedCounts = {
     candidates: integer(counts.candidates),
     eligible: integer(counts.eligible),
     selected_events: integer(counts.selected_events),
     selected_markets: integer(counts.selected_markets),
-    relations: integer(counts.relations),
   };
   if (
     validatedCounts.candidates !== decisions.length ||
@@ -1002,9 +987,8 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     validatedCounts.selected_markets !== selectedMarkets.length ||
     validatedCounts.selected_events !==
       new Set(selectedMarkets.map((market) => market.event_id)).size ||
-    validatedCounts.relations !== relations.length ||
     eventIds.size !== events.length ||
-    [...decisions, ...selectedMarkets, ...relations].some(
+    [...decisions, ...selectedMarkets].some(
       (record) =>
         record.event_id === undefined || !eventIds.has(record.event_id),
     )
@@ -1022,7 +1006,6 @@ export function validateTargeterRun(value: unknown): UniverseTargeterRunDetail {
     decisions,
     events,
     selected_markets: selectedMarkets,
-    relations,
   };
 }
 
@@ -1142,28 +1125,60 @@ function validateSelectedMarket(value: unknown): UniverseSelectedMarket {
   };
 }
 
-function validateRelationSummary(
-  value: unknown,
-  includeEvent: boolean,
-): UniverseRelationSummary {
-  const keys = [
-    'relation_id',
-    'relation_type',
-    ...(includeEvent ? ['event_id'] : []),
-    'scope',
-    'coverage',
-    'generation_version',
-    'canonical_hash',
-  ];
-  const item = object(value, keys, 'relation summary');
+function validateClaimSummary(value: unknown): UniverseClaimSummary {
+  const item = object(
+    value,
+    [
+      'claim_id',
+      'space_shape_id',
+      'scope',
+      'coverage',
+      'outcome_key_count',
+      'market_count',
+      'venue_count',
+      'first_seen_run_id',
+      'last_seen_run_id',
+    ],
+    'claim summary',
+  );
   return {
-    relation_id: positiveInteger(item.relation_id),
-    relation_type: text(item.relation_type),
-    ...(includeEvent ? { event_id: text(item.event_id) } : {}),
+    claim_id: sha(item.claim_id),
+    space_shape_id: sha(item.space_shape_id),
     scope: text(item.scope),
     coverage: text(item.coverage),
-    generation_version: positiveInteger(item.generation_version),
-    canonical_hash: sha(item.canonical_hash),
+    outcome_key_count: positiveInteger(item.outcome_key_count),
+    market_count: positiveInteger(item.market_count),
+    venue_count: positiveInteger(item.venue_count),
+    first_seen_run_id: text(item.first_seen_run_id),
+    last_seen_run_id: text(item.last_seen_run_id),
+  };
+}
+
+function validateClaimRelation(value: unknown): UniverseClaimRelation {
+  const item = object(
+    value,
+    [
+      'space_shape_id',
+      'left_claim_id',
+      'right_claim_id',
+      'relation_type',
+      'scope',
+      'coverage',
+    ],
+    'claim relation',
+  );
+  const left = sha(item.left_claim_id);
+  const right = sha(item.right_claim_id);
+  // Equal subsets are one claim, so a relation between a claim and itself
+  // cannot exist and would mean the upstream partition is wrong.
+  if (left === right) throw new UniverseUpstreamError();
+  return {
+    space_shape_id: sha(item.space_shape_id),
+    left_claim_id: left,
+    right_claim_id: right,
+    relation_type: text(item.relation_type),
+    scope: text(item.scope),
+    coverage: text(item.coverage),
   };
 }
 
@@ -1255,7 +1270,7 @@ function validateCanonicalMarket(value: unknown) {
 function validateMarketDetail(value: unknown): UniverseMarketDetail {
   const item = object(
     value,
-    ['market', 'venue_markets', 'selections', 'relations'],
+    ['market', 'venue_markets', 'selections', 'claims', 'relations'],
     'market detail',
   );
   const market = validateCanonicalMarket(item.market);
@@ -1360,29 +1375,37 @@ function validateMarketDetail(value: unknown): UniverseMarketDetail {
     market,
     venue_markets: venueMarkets,
     selections,
-    relations: detailArray(item.relations, (relation) =>
-      validateRelationSummary(relation, false),
-    ),
+    claims: detailArray(item.claims, validateClaimSummary),
+    relations: detailArray(item.relations, validateClaimRelation),
   };
 }
 
-function validateRelationDetail(value: unknown): UniverseRelationDetail {
-  const item = object(
-    value,
-    ['relation', 'members', 'observations'],
-    'relation detail',
-  );
-  const relation = object(
-    item.relation,
-    ['relation_id', 'relation_type', 'generation_version', 'canonical_hash'],
-    'relation',
+function validateClaimDetail(value: unknown): UniverseClaimDetail {
+  const item = object(value, ['claim', 'members', 'relations'], 'claim detail');
+  const claim = object(
+    item.claim,
+    [
+      'claim_id',
+      'space_shape_id',
+      'scope',
+      'coverage',
+      'outcome_key_count',
+      'claim_identity_version',
+      'first_seen_run_id',
+      'last_seen_run_id',
+    ],
+    'claim',
   );
   return {
-    relation: {
-      relation_id: positiveInteger(relation.relation_id),
-      relation_type: text(relation.relation_type),
-      generation_version: positiveInteger(relation.generation_version),
-      canonical_hash: sha(relation.canonical_hash),
+    claim: {
+      claim_id: sha(claim.claim_id),
+      space_shape_id: sha(claim.space_shape_id),
+      scope: text(claim.scope),
+      coverage: text(claim.coverage),
+      outcome_key_count: positiveInteger(claim.outcome_key_count),
+      claim_identity_version: positiveInteger(claim.claim_identity_version),
+      first_seen_run_id: text(claim.first_seen_run_id),
+      last_seen_run_id: text(claim.last_seen_run_id),
     },
     members: detailArray(item.members, (value) => {
       const record = object(
@@ -1390,46 +1413,45 @@ function validateRelationDetail(value: unknown): UniverseRelationDetail {
         [
           'venue',
           'venue_market_id',
+          'claim_key',
+          'event_id',
           'market_id',
           'market_template_version',
           'outcome_space_version',
-          'claim_key',
-          'role',
+          'canonical_class',
+          'title',
+          'first_seen_run_id',
+          'last_seen_run_id',
         ],
-        'relation member',
+        'claim member',
       );
       return {
         venue: text(record.venue),
         venue_market_id: text(record.venue_market_id),
+        claim_key: possiblyEmptyText(record.claim_key),
+        event_id: text(record.event_id),
         market_id: text(record.market_id),
         market_template_version: positiveInteger(
           record.market_template_version,
         ),
         outcome_space_version: positiveInteger(record.outcome_space_version),
-        claim_key: possiblyEmptyText(record.claim_key),
-        role: text(record.role),
+        canonical_class: text(record.canonical_class),
+        title: text(record.title),
+        first_seen_run_id: text(record.first_seen_run_id),
+        last_seen_run_id: text(record.last_seen_run_id),
       };
     }),
-    observations: detailArray(item.observations, (value) => {
+    relations: detailArray(item.relations, (value) => {
       const record = object(
         value,
-        [
-          'run_id',
-          'generated_at',
-          'bundle_id',
-          'event_id',
-          'scope',
-          'coverage',
-        ],
-        'relation observation',
+        ['space_shape_id', 'left_claim_id', 'right_claim_id', 'relation_type'],
+        'claim detail relation',
       );
       return {
-        run_id: text(record.run_id),
-        generated_at: timestamp(record.generated_at),
-        bundle_id: text(record.bundle_id),
-        event_id: text(record.event_id),
-        scope: text(record.scope),
-        coverage: text(record.coverage),
+        space_shape_id: sha(record.space_shape_id),
+        left_claim_id: sha(record.left_claim_id),
+        right_claim_id: sha(record.right_claim_id),
+        relation_type: text(record.relation_type),
       };
     }),
   };
@@ -1443,14 +1465,15 @@ function validateRelationshipTypes(
     ['relationship_type_catalog_version', 'types'],
     'relationship type catalog',
   );
-  if (item.relationship_type_catalog_version !== 1)
+  if (item.relationship_type_catalog_version !== 2)
     throw new UniverseUpstreamError();
+  // Only what a claim pair can carry. IDENTITY is absent because equal outcome
+  // subsets are one claim, so equivalence is a claim listed at more than one
+  // venue rather than a relation. REVERSE_IMPLICATION is normalized to
+  // IMPLICATION with the antecedent first, and OVERLAP is never stored.
   const expected = new Map<string, { directed: boolean; roles: string[] }>([
-    ['IDENTITY', { directed: false, roles: ['member'] }],
-    ['IMPLICATION', { directed: true, roles: ['left', 'right'] }],
-    ['REVERSE_IMPLICATION', { directed: true, roles: ['left', 'right'] }],
+    ['IMPLICATION', { directed: true, roles: ['antecedent', 'consequent'] }],
     ['MUTUAL_EXCLUSION', { directed: false, roles: ['member'] }],
-    ['OVERLAP', { directed: false, roles: ['member'] }],
   ]);
   const types = array(item.types, (value) => {
     const record = object(
@@ -1477,13 +1500,13 @@ function validateRelationshipTypes(
     })
   )
     throw new UniverseUpstreamError();
-  return { relationship_type_catalog_version: 1, types };
+  return { relationship_type_catalog_version: 2, types };
 }
 
 export function validateEventDetail(value: unknown): UniverseEventDetail {
   const item = object(
     value,
-    ['event', 'venue_events', 'markets', 'relations', 'observations'],
+    ['event', 'venue_events', 'markets', 'claims', 'relations', 'observations'],
     'event detail',
   );
   const event = validateEvent(item.event);
@@ -1523,9 +1546,8 @@ export function validateEventDetail(value: unknown): UniverseEventDetail {
     event,
     venue_events: venueEvents,
     markets,
-    relations: detailArray(item.relations, (relation) =>
-      validateRelationSummary(relation, false),
-    ),
+    claims: detailArray(item.claims, validateClaimSummary),
+    relations: detailArray(item.relations, validateClaimRelation),
     observations: detailArray(item.observations, (value) => {
       const record = object(
         value,
@@ -1729,7 +1751,7 @@ function validateHealth(value: unknown): UniverseHealth {
       'umbrella_events',
       'canonical_markets',
       'venue_markets',
-      'relations',
+      'claim_classes',
     ],
     'counts',
   );
@@ -1778,7 +1800,7 @@ function validateHealth(value: unknown): UniverseHealth {
       umbrella_events: integer(counts.umbrella_events),
       canonical_markets: integer(counts.canonical_markets),
       venue_markets: integer(counts.venue_markets),
-      relations: integer(counts.relations),
+      claim_classes: integer(counts.claim_classes),
     },
     sync: { pending_failures: pendingFailures },
   };

@@ -70,6 +70,26 @@ def generate_contract() -> dict:
                     _response(application, f"/v1/targeter/runs/{R1}"),
                 ),
             ]
+            # Market and claim detail carry the claim model's two response
+            # shapes, so they are generated from the real application rather
+            # than hand-written, the same as every other contract here.
+            event_detail = _response(application, f"/v1/events/{event_id}")
+            market_id = event_detail["markets"][0]["market_id"]
+            cases.append(
+                _case(
+                    "market_detail",
+                    f"/v1/markets/{market_id}",
+                    _response(application, f"/v1/markets/{market_id}"),
+                )
+            )
+            claim_id = event_detail["claims"][0]["claim_id"]
+            cases.append(
+                _case(
+                    "claim_detail",
+                    f"/v1/claims/{claim_id}",
+                    _response(application, f"/v1/claims/{claim_id}"),
+                )
+            )
             database.record_sync_failure(
                 "targeter-v2/runs/date=2026-01-01/run=bad/run_manifest.json",
                 "contract fixture",

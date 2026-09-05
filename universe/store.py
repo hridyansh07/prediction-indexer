@@ -1731,21 +1731,31 @@ class UniverseStore:
                    LIMIT ?""",
                 (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+            # Counts are event-scoped in both this response and event detail,
+            # so one claim summary means the same thing wherever it appears.
             claims = connection.execute(
-                """SELECT DISTINCT claim.claim_id, claim.space_shape_id,
-                          claim.scope, claim.coverage, claim.outcome_key_count,
-                          claim.first_seen_run_id, claim.last_seen_run_id
-                   FROM venue_markets venue
-                   JOIN market_claims member
-                     ON member.venue = venue.venue
-                    AND member.venue_market_id = venue.venue_market_id
-                   JOIN claim_classes claim USING (claim_id)
-                   WHERE venue.market_id = ?
-                     AND venue.market_template_version = ?
-                     AND venue.outcome_space_version = ?
-                   ORDER BY claim.claim_id
+                """SELECT claim.claim_id, claim.space_shape_id, claim.scope,
+                          claim.coverage, claim.outcome_key_count,
+                          claim.first_seen_run_id, claim.last_seen_run_id,
+                          COUNT(*) AS market_count,
+                          COUNT(DISTINCT scoped.venue) AS venue_count
+                   FROM claim_classes claim
+                   JOIN market_claims scoped USING (claim_id)
+                   WHERE scoped.event_id = ?
+                     AND claim.claim_id IN (
+                         SELECT member.claim_id
+                         FROM venue_markets venue
+                         JOIN market_claims member
+                           ON member.venue = venue.venue
+                          AND member.venue_market_id = venue.venue_market_id
+                         WHERE venue.market_id = ?
+                           AND venue.market_template_version = ?
+                           AND venue.outcome_space_version = ?
+                     )
+                   GROUP BY claim.claim_id
+                   ORDER BY venue_count DESC, claim.claim_id
                    LIMIT ?""",
-                (*key, DETAIL_ROW_LIMIT + 1),
+                (market["event_id"], *key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
         _ensure_detail_rows(
             (venue_markets, selections, relations, claims), "market detail"
