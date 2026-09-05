@@ -2154,6 +2154,89 @@ class ClaimModelTests(unittest.TestCase):
         self.assertEqual(claims["relation_shortfall"], 0)
         self.assertGreater(len(claims["market_claims"]), len(claims["claims"]))
 
+    def _projection(self):
+        from universe.market_projection import project_market_universe
+
+        report = _selection_report(R1, G1)
+        events, markets = _catalog_rows(report)
+        return project_market_universe(
+            report, catalog_events=events, catalog_markets=markets
+        )
+
+    def test_claims_respect_the_markets_the_report_excluded(self) -> None:
+        """The targeter derives relations over the bundle minus its exclusions.
+
+        `selection.py` calls ``derive_bundle_relationships(bundle,
+        excluded_market_ids=excluded)``, so a market dropped for a rules
+        contradiction, for being closed, immature, or an invalid product
+        contributes no relation to the report. Recomputing over every market
+        instead derives relations the report legitimately lacks -- and asserts
+        equivalences over markets the targeter had already judged untrustworthy.
+
+        Against the real archive this rejected all 38 attempted runs.
+        """
+        from universe.claim_projection import project_claims
+        from universe.market_projection import MarketProjectionError
+
+        projection = self._projection()
+        excluded = "kalshi:series"
+        relations = [
+            relation
+            for relation in projection["relations"]
+            if not any(
+                f"{member['venue']}:{member['venue_market_id']}" == excluded
+                for member in relation["members"]
+            )
+        ]
+        self.assertLess(len(relations), len(projection["relations"]))
+        projection["relations"] = relations
+
+        # Control: without the exclusion the recomputation invents the relation
+        # the report no longer carries, which is exactly the production failure.
+        with self.assertRaisesRegex(MarketProjectionError, "the report does not record"):
+            project_claims(projection)
+
+        for decision in projection["decisions"]:
+            decision["market_exclusions"] = {excluded: ["not_open_for_orders"]}
+        claims = project_claims(projection)
+        self.assertEqual(claims["relation_shortfall"], 0)
+        self.assertNotIn(
+            excluded,
+            {
+                f"{row['venue']}:{row['venue_market_id']}"
+                for row in claims["market_claims"]
+            },
+        )
+
+    def test_a_post_derivation_exclusion_does_not_narrow_claims(self) -> None:
+        """`no_modeled_cross_venue_relationship` is added after the derivation.
+
+        A market carrying only that reason was still in scope when the report's
+        relationships were derived, so excluding it here would drop claims the
+        report does account for.
+        """
+        from universe.claim_projection import _excluded_markets
+
+        self.assertEqual(
+            _excluded_markets(
+                {"market_exclusions": {"kalshi:a": ["no_modeled_cross_venue_relationship"]}}
+            ),
+            frozenset(),
+        )
+        self.assertEqual(
+            _excluded_markets(
+                {
+                    "market_exclusions": {
+                        "kalshi:a": [
+                            "not_open_for_orders",
+                            "no_modeled_cross_venue_relationship",
+                        ]
+                    }
+                }
+            ),
+            frozenset({"kalshi:a"}),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

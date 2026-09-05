@@ -11,6 +11,15 @@ The projection document already carries every input the mask engine reads --
 are recomputed here from the run's own projection, with no database read and no
 targeter change. That is what lets the whole archive re-project.
 
+Two things must match what the targeter did, not merely resemble it. Claims are
+grouped **per candidate bundle**, because that is the unit the targeter derives
+relationships over, and they are computed over the bundle **minus its excluded
+markets**, because `selection.py` derives the report's relationships from
+`derive_bundle_relationships(bundle, excluded_market_ids=excluded)`. Recomputing
+over every market instead produces relations the report legitimately does not
+contain -- and asserts equivalences over markets the targeter had already judged
+untrustworthy.
+
 Recomputation is the risk: a bundle rebuilt here must compile the same masks the
 targeter compiled at report time. `verify_claims` is the standing check, and it
 is deliberately asymmetric. A relation the claims *invent* is a guessed
@@ -50,13 +59,43 @@ _RECONSTRUCTED_CLASSIFICATION = (
 )
 
 
-def project_claims(projection: Mapping[str, Any]) -> dict[str, Any]:
+# Added to `market_exclusions` only *after* the report's relationships are
+# derived, so a market carrying this and nothing else was still in scope for
+# that derivation. Every other reason predates it.
+_POST_DERIVATION_EXCLUSION = "no_modeled_cross_venue_relationship"
+
+
+def _excluded_markets(decision: Mapping[str, Any]) -> frozenset[str]:
+    """The markets the targeter had already dropped when it derived relations."""
+    exclusions = decision.get("market_exclusions") or {}
+    if not isinstance(exclusions, Mapping):
+        return frozenset()
+    return frozenset(
+        target_id
+        for target_id, reasons in exclusions.items()
+        if set(reasons or ()) - {_POST_DERIVATION_EXCLUSION}
+    )
+
+
+def project_claims(
+    projection: Mapping[str, Any],
+    *,
+    event_id_for_bundle: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """Return the claim rows one run's projection implies.
 
     Raises ``MarketProjectionError`` when the recomputed claims assert a
     cross-venue relation the report did not record.
     """
+    # One raw projection event is one candidate bundle, which is the unit the
+    # targeter derives relationships over. `event_id_for_bundle` maps that
+    # bundle onto the umbrella event the resolved projection assigned it, so a
+    # stored claim references the canonical event without the grouping ever
+    # merging two bundles that happen to share one.
     events = {row["event_id"]: row for row in projection["events"]}
+    exclusions = {
+        row["event_id"]: _excluded_markets(row) for row in projection["decisions"]
+    }
     venue_events: dict[str, list[Mapping[str, Any]]] = {}
     for row in projection["venue_events"]:
         venue_events.setdefault(row["event_id"], []).append(row)
@@ -74,7 +113,12 @@ def project_claims(projection: Mapping[str, Any]) -> dict[str, Any]:
                          venue_markets.get(event_id, ()))
         if bundle is None:
             continue
-        groups = derive_bundle_claims(bundle)
+        resolved_event_id = (event_id_for_bundle or {}).get(
+            events[event_id]["source_bundle_id"], event_id
+        )
+        groups = derive_bundle_claims(
+            bundle, excluded_market_ids=exclusions.get(event_id, frozenset())
+        )
         implied |= implied_market_relations(groups)
         for group in groups:
             for claim in group.claims:
@@ -98,7 +142,7 @@ def project_claims(projection: Mapping[str, Any]) -> dict[str, Any]:
                             "venue_market_id": venue_market_id,
                             "claim_key": claim_key,
                             "claim_id": claim.claim_id,
-                            "event_id": event_id,
+                            "event_id": resolved_event_id,
                         },
                     )
             for relation in group.relations:

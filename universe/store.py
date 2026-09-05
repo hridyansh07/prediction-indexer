@@ -373,6 +373,7 @@ class UniverseStore:
                 connection,
                 run_id=run_id,
                 projection=resolved_market_projection,
+                raw_projection=market_projection,
                 projection_sha256=market_sha256,
                 projection_row_count=market_row_count,
                 occurrences=normalized,
@@ -453,6 +454,7 @@ class UniverseStore:
         *,
         run_id: str,
         projection: Mapping[str, Any],
+        raw_projection: Mapping[str, Any],
         projection_sha256: str,
         projection_row_count: int,
         occurrences: Iterable[Mapping[str, Any]],
@@ -792,7 +794,7 @@ class UniverseStore:
                 ),
             )
 
-        self._insert_claims(connection, run_id, projection)
+        self._insert_claims(connection, run_id, raw_projection, projection)
 
         connection.execute(
             """INSERT INTO universe_run_projections(
@@ -809,7 +811,8 @@ class UniverseStore:
         self,
         connection: sqlite3.Connection,
         run_id: str,
-        projection: Mapping[str, Any],
+        raw_projection: Mapping[str, Any],
+        resolved_projection: Mapping[str, Any],
     ) -> None:
         """Record which claim each market expresses, and how claims relate.
 
@@ -819,8 +822,17 @@ class UniverseStore:
         and only moves last-seen markers. That is what removes the per-run
         relation growth the pairwise model had.
         """
+        # Claims are grouped per candidate bundle, which the raw projection's
+        # event rows are one-to-one with; the resolved projection supplies the
+        # umbrella event each bundle was assigned so stored rows reference it.
+        event_id_for_bundle = {
+            row["source_bundle_id"]: row["event_id"]
+            for row in resolved_projection["events"]
+        }
         try:
-            claims = project_claims(projection)
+            claims = project_claims(
+                raw_projection, event_id_for_bundle=event_id_for_bundle
+            )
         except MarketProjectionError as error:
             raise EvidenceConflict(str(error)) from error
 

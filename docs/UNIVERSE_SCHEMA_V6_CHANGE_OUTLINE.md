@@ -105,11 +105,25 @@ and `scope` — every field `_base_view` and `_meaningful_labels` read;
 targeter alias config is needed. So the full history re-projects with no targeter
 change, no adapter change, and no new configuration.
 
+**Two things must match what the targeter did, not merely resemble it.** Claims
+are grouped **per candidate bundle** — the unit `derive_bundle_relationships`
+works over — and computed over the bundle **minus its excluded markets**, since
+`selection.py:276` derives the report's relations from
+`derive_bundle_relationships(bundle, excluded_market_ids=excluded)`. The first
+real backfill missed the second of these and every one of 38 runs was rejected.
+Note that `market_exclusions` in the report is a *superset* of the set used for
+that derivation: `no_modeled_cross_venue_relationship` is appended afterwards, so
+a market carrying only that reason was still in scope.
+
 **The reconstruction is the one genuinely risky part**, because a bundle rebuilt
 from Universe rows must compile the *same* masks the targeter compiled at report
-time. Two known gaps: `venue_events` stores no per-venue participants, so
-`_event_for`/`_side_label` must fall back to umbrella participants; and any field
-the reconstruction misses fails silently as a missing claim rather than an error.
+time. One known residual: `venue_events` stores no per-venue participants, so
+`_side_label` falls back to the umbrella participants. Where a venue spells a
+team differently, the targeter's `_team_side` may have failed to resolve a label
+that the reconstruction resolves, compiling a mask the report has no relation
+for. That direction is an *invention* and so blocks the run rather than passing
+silently; the fix, if it fires, is to carry venue participants in the
+projection.
 
 Mitigation, and the thing that makes this safe: **the equivalence check becomes a
 permanent ingestion-time assertion.** At ingest Universe computes claims, rebuilds
