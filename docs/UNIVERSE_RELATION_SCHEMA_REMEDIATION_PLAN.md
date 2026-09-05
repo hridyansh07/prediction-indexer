@@ -236,11 +236,32 @@ produce complete cliques on real venue data.
 
 That second number is also the redundancy stated plainly: 158/158.
 
-**Still open:** the 18.21x is the *per-run* collapse. Claims are stable across
-runs, so the stored count is the distinct class count rather than the per-run sum
-— the harness now reports `global_claims.claim_classes_upper_bound` for that, and
-deduplicating further by outcome key set (the global identity in
-`analysis.claims`) is a further reduction only mask recompilation can measure.
+**Second run, after the direction fix: `defect_count: 0`, exit 0.** Both halves
+of the gate hold on real venue data.
+
+The storage number is the global one, not the per-run one. Partitioning the
+IDENTITY edges once across the whole build:
+
+| measure | value |
+|---|---|
+| masks | 3,484 |
+| **distinct claim classes** | **2,239** |
+| cross-venue classes | 1,199 (54%) |
+| `relation_observations` | 3,333,919 |
+| **rows removed** | **1,489x** |
+
+The 18.21x figure counts claims once per run; 1,489x is what a `claim_classes`
+table would actually hold. It is also a floor twice over: the count is
+event-scoped, since a mask is keyed by venue market and two events' "home wins"
+are different markets, so deduplicating by outcome key set can only shrink it;
+and claim classes grow with the market universe rather than with run count, so
+the ratio improves on the full 1,202-run backfill rather than degrading.
+
+`dead_weight_fraction` and `run_detail_already_unservable` recomputed identically
+across both runs, so the case for the change never rested on the checker fix.
+
+**Next:** [`UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md`](./UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md)
+carries the file-by-file change list.
 
 1. Recompute claims for archived runs via Path A. Enumerate distinct
    `(space_shape, outcome_keys)` over the full history and the resulting relation
