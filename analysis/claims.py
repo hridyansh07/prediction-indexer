@@ -207,177 +207,46 @@ def _probe(claim: Claim) -> Mask:
     )
 
 
-# ---------------------------------------------------------------------------
-# Independent derivation, for cross-checking the model against stored evidence
-# ---------------------------------------------------------------------------
+def implied_market_relations(
+    groups: Iterable[Any],
+) -> set[tuple[str, str, str]]:
+    """Rebuild market-pair relations from claims alone.
 
+    Two markets in one claim are IDENTITY; two markets in different claims take
+    their claims' relation. Only cross-venue pairs are returned, since those are
+    the ones the selection scorer reads and the only ones worth asserting on.
 
-def classes_from_identity_edges(
-    edges: Iterable[tuple[str, str]],
-    *,
-    members: Iterable[str] = (),
-) -> tuple[frozenset[str], ...]:
-    """Partition mask keys by the IDENTITY edges recorded for a bundle.
+    ``groups`` are ``BundleClaims``-shaped: each carries ``claims`` and
+    ``relations``. Keys are mask keys, ``venue:venue_market_id#claim_key``.
 
-    ``relationship`` returns IDENTITY exactly when two key sets are equal, so the
-    IDENTITY subgraph is a disjoint union of complete cliques and its connected
-    components are the claim classes. This reconstructs the partition from an
-    already-recorded edge list, without recompiling any mask — an independent
-    check on ``derive_claims``.
+    This is the check that keeps a recomputed claim honest: if Universe rebuilds
+    a bundle slightly differently from the targeter, the relations implied here
+    stop matching the ones the report recorded.
     """
-    parent: dict[str, str] = {}
-
-    def find(node: str) -> str:
-        parent.setdefault(node, node)
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
-
-    def union(left: str, right: str) -> None:
-        a, b = find(left), find(right)
-        if a != b:
-            parent[b] = a
-
-    for node in members:
-        find(node)
-    for left, right in edges:
-        union(left, right)
-
-    grouped: dict[str, set[str]] = {}
-    for node in parent:
-        grouped.setdefault(find(node), set()).add(node)
-    return tuple(sorted((frozenset(group) for group in grouped.values()), key=sorted))
-
-
-def identity_clique_defects(
-    components: Sequence[frozenset[str]],
-    edges: Iterable[tuple[str, str]],
-) -> tuple[str, ...]:
-    """Report components whose IDENTITY edges do not form a complete clique.
-
-    A component of size k must carry exactly k(k-1)/2 IDENTITY edges. A shortfall
-    means the recorded edge list is not the transitive closure it is assumed to
-    be, and the partition cannot be trusted.
-    """
-    seen: dict[frozenset[str], int] = {}
-    for left, right in edges:
-        seen[frozenset((left, right))] = seen.get(frozenset((left, right)), 0) + 1
-    defects: list[str] = []
-    for component in components:
-        size = len(component)
-        if size < 2:
-            continue
-        expected = size * (size - 1) // 2
-        found = sum(
-            1 for pair in combinations(sorted(component), 2) if frozenset(pair) in seen
-        )
-        if found != expected:
-            defects.append(
-                f"component of {size} masks carries {found} IDENTITY edges, expected {expected}"
-            )
-    return tuple(defects)
-
-
-def compare_partitions(
-    derived: Sequence[Claim],
-    recorded: Sequence[frozenset[str]],
-) -> tuple[str, ...]:
-    """Diff claim classes computed from key sets against those from edges.
-
-    The two derivations share no code path, so any disagreement is a real defect
-    in one of them. Returns human-readable differences, empty when they agree.
-    """
-    left = {frozenset(mask.market_key for mask in claim.members) for claim in derived}
-    right = {frozenset(group) for group in recorded}
-    problems: list[str] = []
-    for group in sorted(left - right, key=sorted):
-        problems.append(f"only in key-set derivation: {sorted(group)}")
-    for group in sorted(right - left, key=sorted):
-        problems.append(f"only in identity-edge derivation: {sorted(group)}")
-    return tuple(problems)
-
-
-def relation_members_to_edges(
-    rows: Iterable[Mapping[str, Any]],
-) -> tuple[tuple[str, str], ...]:
-    """Build an IDENTITY edge list from stored ``relation_members`` rows.
-
-    Rows must already be restricted to IDENTITY relations. Members are keyed the
-    way the projection writes them — ``venue:venue_market_id#claim_key`` — so the
-    partition lands at claim granularity rather than market granularity.
-    """
-    grouped: dict[Any, list[str]] = {}
-    for row in rows:
-        member = f"{row['venue']}:{row['venue_market_id']}"
-        claim_key = row.get("claim_key") or ""
-        if claim_key:
-            member = f"{member}#{claim_key}"
-        grouped.setdefault(row["relation_id"], []).append(member)
-    edges: list[tuple[str, str]] = []
-    for members in grouped.values():
-        for left, right in combinations(sorted(members), 2):
-            edges.append((left, right))
-    return tuple(edges)
-
-
-def normalize_relation(
-    relation_type: str,
-    member_claims: Iterable[tuple[str, str]],
-) -> tuple[str, ...]:
-    """Reduce a recorded relation to one descriptor per fact.
-
-    ``member_claims`` pairs each member's ``relation_members.role`` with the
-    claim it belongs to.
-
-    IMPLICATION and REVERSE_IMPLICATION are the same statement written from
-    opposite ends: ``relationship`` returns IMPLICATION when the left member's
-    subset is contained in the right's, and REVERSE_IMPLICATION when it is the
-    other way round. So a bundle that records ``p -> q`` and another that records
-    ``q <- p`` are agreeing, not contradicting, and comparing the raw labels over
-    an unordered pair reports a conflict that is not there.
-
-    Normalizing to ``(antecedent, consequent)`` removes that false conflict while
-    keeping a real one visible: two claims genuinely disagreeing about which
-    contains which still produce two different descriptors.
-    """
-    pairs = tuple(member_claims)
-    if relation_type in DIRECTED_RELATIONS:
-        by_role = {role: claim for role, claim in pairs}
-        if set(by_role) != {"left", "right"}:
-            raise ValueError(
-                f"{relation_type} needs one left and one right member, got {sorted(by_role)}"
-            )
-        if relation_type == "IMPLICATION":
-            antecedent, consequent = by_role["left"], by_role["right"]
-        else:
-            antecedent, consequent = by_role["right"], by_role["left"]
-        return ("IMPLICATION", antecedent, consequent)
-    return (relation_type, *sorted({claim for _role, claim in pairs}))
-
-
-def relation_agreement_defects(
-    relations: Iterable[tuple[str, Sequence[tuple[str, str]]]],
-) -> tuple[str, ...]:
-    """Report claim pairs whose recorded relations do not agree.
-
-    A relation is a function of the two claims' outcome subsets, so every
-    relation recorded between one pair of claims must reduce to one descriptor.
-    More than one falsifies the claim model for that pair.
-    """
-    seen: dict[frozenset[str], set[tuple[str, ...]]] = {}
-    for relation_type, member_claims in relations:
-        claims = {claim for _role, claim in member_claims}
-        if len(claims) != 2:
-            continue
-        seen.setdefault(frozenset(claims), set()).add(
-            normalize_relation(relation_type, member_claims)
-        )
-    defects: list[str] = []
-    for pair, descriptors in seen.items():
-        if len(descriptors) > 1:
-            defects.append(
-                f"claims {sorted(pair)} carry disagreeing relations "
-                f"{sorted(descriptors)}"
-            )
-    return tuple(sorted(defects))
+    out: set[tuple[str, str, str]] = set()
+    for group in groups:
+        by_id = {claim.claim_id: claim for claim in group.claims}
+        for claim in group.claims:
+            for index, left in enumerate(claim.members):
+                for right in claim.members[index + 1:]:
+                    if left.venue != right.venue:
+                        out.add((*sorted((left.market_key, right.market_key)), IDENTITY))
+        for relation in group.relations:
+            left_claim = by_id[relation.left_claim_id]
+            right_claim = by_id[relation.right_claim_id]
+            for left in left_claim.members:
+                for right in right_claim.members:
+                    if left.venue == right.venue:
+                        continue
+                    ordered = sorted((left.market_key, right.market_key))
+                    kind = relation.relation_type
+                    # The recorded edge is written from whichever member came
+                    # first; flip the direction when sorting reverses the pair.
+                    if ordered[0] != left.market_key and kind in {
+                        "IMPLICATION", "REVERSE_IMPLICATION"
+                    }:
+                        kind = (
+                            "REVERSE_IMPLICATION" if kind == "IMPLICATION" else "IMPLICATION"
+                        )
+                    out.add((*ordered, kind))
+    return out

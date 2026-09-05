@@ -79,18 +79,14 @@ class UniverseApplication:
             if detail is None:
                 return HTTPStatus.NOT_FOUND, {"error": "market not found"}
             return HTTPStatus.OK, detail
-        if parsed.path.startswith("/v1/relations/"):
+        if parsed.path.startswith("/v1/claims/"):
             _only(query, set())
-            raw_id = _path_value(
-                parsed.path.removeprefix("/v1/relations/"), "relation id"
+            claim_id = _path_value(
+                parsed.path.removeprefix("/v1/claims/"), "claim id"
             )
-            try:
-                relation_id = int(raw_id)
-            except ValueError as error:
-                raise ValueError("relation id must be a positive integer") from error
-            detail = self.database.relation_detail(relation_id)
+            detail = self.database.claim_detail(claim_id)
             if detail is None:
-                return HTTPStatus.NOT_FOUND, {"error": "relation not found"}
+                return HTTPStatus.NOT_FOUND, {"error": "claim not found"}
             return HTTPStatus.OK, detail
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
             bundle_id = _path_value(
@@ -427,31 +423,24 @@ def _event_cursor(value: str | None) -> tuple[int, str] | None:
 
 
 def _relationship_types() -> dict[str, Any]:
+    """The relation types a claim pair can carry.
+
+    IDENTITY is absent by construction: equal outcome subsets are one claim, so
+    equivalence is shared membership rather than a relation. REVERSE_IMPLICATION
+    is normalized to IMPLICATION with the antecedent named first. OVERLAP is the
+    catch-all branch of the mask comparison rather than a finding, and the
+    targeter's own scorer discards it, so it is never stored.
+    """
     return {
-        "relationship_type_catalog_version": 1,
+        "relationship_type_catalog_version": 2,
         "types": [
-            {
-                "type": "IDENTITY",
-                "directed": False,
-                "member_roles": ["member"],
-            },
             {
                 "type": "IMPLICATION",
                 "directed": True,
-                "member_roles": ["left", "right"],
-            },
-            {
-                "type": "REVERSE_IMPLICATION",
-                "directed": True,
-                "member_roles": ["left", "right"],
+                "member_roles": ["antecedent", "consequent"],
             },
             {
                 "type": "MUTUAL_EXCLUSION",
-                "directed": False,
-                "member_roles": ["member"],
-            },
-            {
-                "type": "OVERLAP",
                 "directed": False,
                 "member_roles": ["member"],
             },

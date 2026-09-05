@@ -4,16 +4,10 @@ import unittest
 
 from analysis.claims import (
     CLAIM_ALGEBRA_VERSION,
-    normalize_relation,
-    relation_agreement_defects,
     CLAIM_IDENTITY_VERSION,
     claim_id,
-    classes_from_identity_edges,
-    compare_partitions,
     derive_claim_algebra,
     derive_claims,
-    identity_clique_defects,
-    relation_members_to_edges,
     space_shape_id,
     usable_masks,
 )
@@ -195,139 +189,6 @@ class ClaimAlgebra(unittest.TestCase):
             derive_claim_algebra([*claims_three, *claims_five])
 
 
-class IdentityEdgeDerivation(unittest.TestCase):
-    """The independent check on ``derive_claims``, using recorded edges only."""
-
-    def test_components_recover_the_partition(self) -> None:
-        edges = [("a", "b"), ("b", "c"), ("d", "e")]
-        self.assertEqual(
-            classes_from_identity_edges(edges, members=["a", "b", "c", "d", "e", "f"]),
-            (frozenset({"a", "b", "c"}), frozenset({"d", "e"}), frozenset({"f"})),
-        )
-
-    def test_incomplete_cliques_are_reported(self) -> None:
-        """A component of k masks must carry k(k-1)/2 IDENTITY edges."""
-        edges = [("a", "b"), ("b", "c")]
-        components = classes_from_identity_edges(edges)
-        self.assertEqual(components, (frozenset({"a", "b", "c"}),))
-        defects = identity_clique_defects(components, edges)
-        self.assertEqual(len(defects), 1)
-        self.assertIn("expected 3", defects[0])
-
-    def test_complete_clique_has_no_defect(self) -> None:
-        edges = [("a", "b"), ("b", "c"), ("a", "c")]
-        components = classes_from_identity_edges(edges)
-        self.assertEqual(identity_clique_defects(components, edges), ())
-
-    def test_two_derivations_agree(self) -> None:
-        space = _space()
-        masks = [
-            _named(space, "kalshi:k1#claim=0", "kalshi",
-                   market_type="series_moneyline", outcome_label="H"),
-            _named(space, "polymarket:p1#claim=0", "polymarket",
-                   market_type="series_moneyline", group_item_title="H to win"),
-            _named(space, "kalshi:k2#claim=0", "kalshi",
-                   market_type="series_moneyline", outcome_label="A"),
-        ]
-        claims = derive_claims(masks, space)
-        edges = [
-            (left.market_key, right.market_key)
-            for index, left in enumerate(masks)
-            for right in masks[index + 1:]
-            if relationship(left, right) == IDENTITY
-        ]
-        recorded = classes_from_identity_edges(
-            edges, members=[mask.market_key for mask in masks]
-        )
-        self.assertEqual(compare_partitions(claims, recorded), ())
-
-    def test_disagreement_is_reported(self) -> None:
-        space = _space()
-        masks = [
-            _named(space, "kalshi:k1#claim=0", "kalshi",
-                   market_type="series_moneyline", outcome_label="H"),
-            _named(space, "kalshi:k2#claim=0", "kalshi",
-                   market_type="series_moneyline", outcome_label="A"),
-        ]
-        claims = derive_claims(masks, space)
-        wrong = (frozenset({"kalshi:k1#claim=0", "kalshi:k2#claim=0"}),)
-        self.assertNotEqual(compare_partitions(claims, wrong), ())
-
-    def test_edges_are_built_at_claim_granularity(self) -> None:
-        rows = [
-            {"relation_id": 1, "venue": "kalshi", "venue_market_id": "k1", "claim_key": "claim=0"},
-            {"relation_id": 1, "venue": "polymarket", "venue_market_id": "p1", "claim_key": "claim=0"},
-            {"relation_id": 2, "venue": "kalshi", "venue_market_id": "k1", "claim_key": "claim=1"},
-            {"relation_id": 2, "venue": "polymarket", "venue_market_id": "p2", "claim_key": ""},
-        ]
-        self.assertEqual(
-            relation_members_to_edges(rows),
-            (
-                ("kalshi:k1#claim=0", "polymarket:p1#claim=0"),
-                ("kalshi:k1#claim=1", "polymarket:p2"),
-            ),
-        )
-
-
-class DirectedRelationNormalization(unittest.TestCase):
-    """Regression: a directed relation written from either end is one fact.
-
-    ``relation_members`` records direction in ``role``. Comparing raw relation
-    types over an unordered claim pair drops it, so ``p -> q`` recorded in one
-    bundle and ``q <- p`` in another look like a contradiction. Against the real
-    158-run build that false positive accounted for every one of the 51,786
-    reported defects.
-    """
-
-    def test_same_fact_from_both_ends_normalizes_alike(self) -> None:
-        forward = normalize_relation("IMPLICATION", [("left", "P"), ("right", "Q")])
-        backward = normalize_relation("REVERSE_IMPLICATION", [("left", "Q"), ("right", "P")])
-        self.assertEqual(forward, backward)
-        self.assertEqual(forward, ("IMPLICATION", "P", "Q"))
-
-    def test_opposite_labels_are_not_a_defect(self) -> None:
-        self.assertEqual(
-            relation_agreement_defects([
-                ("IMPLICATION", [("left", "P"), ("right", "Q")]),
-                ("REVERSE_IMPLICATION", [("left", "Q"), ("right", "P")]),
-            ]),
-            (),
-        )
-
-    def test_a_genuine_direction_conflict_still_fails(self) -> None:
-        """Normalizing must not become collapsing: P subset Q and Q subset P is real."""
-        defects = relation_agreement_defects([
-            ("IMPLICATION", [("left", "P"), ("right", "Q")]),
-            ("IMPLICATION", [("left", "Q"), ("right", "P")]),
-        ])
-        self.assertEqual(len(defects), 1)
-        self.assertIn("disagreeing", defects[0])
-
-    def test_a_genuine_type_conflict_still_fails(self) -> None:
-        defects = relation_agreement_defects([
-            ("IDENTITY", [("member", "P"), ("member", "Q")]),
-            ("MUTUAL_EXCLUSION", [("member", "P"), ("member", "Q")]),
-        ])
-        self.assertEqual(len(defects), 1)
-
-    def test_symmetric_relations_are_order_free(self) -> None:
-        self.assertEqual(
-            normalize_relation("MUTUAL_EXCLUSION", [("member", "Q"), ("member", "P")]),
-            normalize_relation("MUTUAL_EXCLUSION", [("member", "P"), ("member", "Q")]),
-        )
-
-    def test_directed_relation_needs_both_roles(self) -> None:
-        with self.assertRaises(ValueError):
-            normalize_relation("IMPLICATION", [("member", "P"), ("member", "Q")])
-
-    def test_agreement_ignores_self_pairs(self) -> None:
-        """Two members of one claim carry no inter-claim statement."""
-        self.assertEqual(
-            relation_agreement_defects([("IDENTITY", [("member", "P"), ("member", "P")])]),
-            (),
-        )
-
-
 class Versioning(unittest.TestCase):
     def test_versions_are_recorded(self) -> None:
         self.assertIsInstance(CLAIM_IDENTITY_VERSION, int)
@@ -355,6 +216,7 @@ from targeter.v2.domain import (  # noqa: E402
     ClassificationEvidence,
 )
 from targeter.v2.matching import match_events  # noqa: E402
+from analysis.claims import implied_market_relations  # noqa: E402
 from targeter.v2.relationships import (  # noqa: E402
     derive_bundle_claims,
     derive_bundle_relationships,
@@ -452,36 +314,8 @@ def _pairwise_signal(analysis) -> set[tuple[str, str, str]]:
 
 
 def _reconstructed_signal(spaces) -> set[tuple[str, str, str]]:
-    """Rebuild market-pair relations from claims alone.
-
-    Two markets in one claim are IDENTITY; two markets in different claims take
-    their claims' relation. Nothing here consults the pairwise edge list.
-    """
-    out: set[tuple[str, str, str]] = set()
-    for group in spaces:
-        by_id = {claim.claim_id: claim for claim in group.claims}
-        for claim in group.claims:
-            for index, left in enumerate(claim.members):
-                for right in claim.members[index + 1:]:
-                    if left.venue != right.venue:
-                        out.add((*sorted((left.market_key, right.market_key)), IDENTITY))
-        for relation in group.relations:
-            left_claim = by_id[relation.left_claim_id]
-            right_claim = by_id[relation.right_claim_id]
-            for left in left_claim.members:
-                for right in right_claim.members:
-                    if left.venue == right.venue:
-                        continue
-                    ordered = sorted((left.market_key, right.market_key))
-                    kind = relation.relation_type
-                    if ordered[0] != left.market_key and kind in {
-                        IMPLICATION, "REVERSE_IMPLICATION"
-                    }:
-                        kind = (
-                            "REVERSE_IMPLICATION" if kind == IMPLICATION else IMPLICATION
-                        )
-                    out.add((*ordered, kind))
-    return out
+    """The production reconstruction, exercised against real bundles."""
+    return implied_market_relations(spaces)
 
 
 class ClaimAlgebraReproducesPairwiseModel(unittest.TestCase):

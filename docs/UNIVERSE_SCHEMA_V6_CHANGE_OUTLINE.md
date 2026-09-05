@@ -1,6 +1,7 @@
 # Event Universe schema v6 — change outline
 
-**Status:** proposed, awaiting sign-off. No code written against it yet.
+**Status:** implemented. The server side landed as described; `targeter-ui` is
+deferred per §4.4 and is the only outstanding piece.
 **Gate:** passed. See
 [`UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md`](./UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md)
 for the model and the archive run that validated it.
@@ -134,9 +135,9 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
   resolution — upsert `claim_classes`, upsert `claim_relations`, upsert
   `market_claims` with first/last-seen maintenance. Add the equivalence
   assertion.
-- **`run_detail`** (`:1440-1499`): relations for a run become a join over the
-  run's market set (see §4.1). `counts.relations` stays; the inline array moves
-  behind pagination.
+- **`run_detail`** (`:1440-1499`): **drop relations and `counts.relations`
+  entirely** (§4.1). This is what fixes A.2 — the 25,007-row array stops
+  existing rather than being paged.
 - **`event_detail`** (`:1576-1617`): drop the `NOT EXISTS ... newer` subquery —
   it exists only to reconstruct current state from an append-only log. Relations
   become a self-join of `market_claims` on `event_id` through `claim_relations`,
@@ -144,7 +145,8 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
 - **`market_detail`** (`:1687-1722`): same, scoped by canonical market.
 - **`relation_detail`** (`:1727-1760`): becomes claim detail. `observations`
   (one row per run) becomes the claim's member markets with their first/last-seen
-  runs — bounded by the data, not by elapsed time. Fixes A.3 outright.
+  runs — bounded by the data, not by elapsed time, and carrying targeter
+  observation bounds rather than any lifecycle claim. Fixes A.3 outright.
 - **healthz counts** (`:1289`): `relations` → `claim_classes`.
 - `_market_projection_identity` (`:2479`, `:2513`): projection field set changes
   if §4.2 lands.
@@ -157,8 +159,6 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
 ### `universe/api.py`
 - `/v1/relations/<relation_id>` → `/v1/claims/<claim_id>` (ids become hashes, so
   the positive-integer parse at `:85-90` changes to a hex check).
-- New `GET /v1/targeter/runs/<run_id>/relations?limit=&cursor=` — 1-100 limit,
-  opaque cursor, per the existing list contract.
 - `/v1/relationship-types` (`:429`) drops OVERLAP and REVERSE_IMPLICATION from
   the catalogue, since neither is stored.
 
@@ -170,7 +170,7 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
   `identity_clique_defects`, `compare_partitions`, `relation_members_to_edges`,
   `relation_agreement_defects`.
 
-### `targeter-ui/src/server/event-universe.ts`
+### `targeter-ui/` — deferred (§4.4)
 - `validateTargeterRunDetail` (`:955-1030`): `counts.relations !== relations.length`
   (`:1005`) and the "every relation carries a known `event_id`" check (`:1007`)
   both break under pagination and must be revised with the server.
@@ -188,27 +188,53 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
   with the old schema. Its job moves into the ingestion assertion.
 - Its two integration tests in `tests/test_event_universe_store.py`.
 
-## 4. Decisions needed before implementation
+## 4. Decisions — resolved
 
-**4.1 — What "relations in run N" means.** Relations derive from *candidate*
-bundles, not just selected ones. The candidate market set per run lives in
-`candidate_decisions.eligible_market_ids_json`, so preserving today's semantics
-means a `json_each` join. The cheaper alternative scopes run relations to
-`selected_market_occurrences`, which is indexed and smaller but changes the
-contract. **Recommend: preserve semantics via `json_each`**, and revisit only if
-it measures badly.
+**4.1 — Per-run relation membership is dropped entirely.** Holding "which
+relations did run N see" buys nothing: replaying a run and asking Universe for
+context needs only *when the targeter first saw a market and when it last saw
+it*. So `run_detail` stops carrying relations altogether, and `counts.relations`
+goes with it — computing a count would require the per-run market set, which is
+the thing not worth holding.
 
-**4.2 — Whether the projection carries claims or relations.** The projection
-document is what `projection_sha256` hashes. Either it keeps emitting relations
-(the assertion's input, storage derived at write time) or it emits claims
-directly (smaller document, but the assertion then needs the report separately).
-**Recommend: keep relations in the projection.** It keeps the assertion's two
-sides independent, which is the property that makes it worth having.
+This removes work rather than adding it: no `json_each` over
+`candidate_decisions.eligible_market_ids_json`, and **no run-relation pagination
+endpoint**. A.2 is fixed by removal, not by paging 25,007 rows.
 
-**4.3 — Whether the targeter emits `claim_id`.** Not required: Universe can
-recompute for all history. Emitting it later would let new runs skip
-recomputation and would turn the assertion into an equality check. **Recommend:
-not in this change** — one system at a time.
+**The temporal record is `first_seen_run_id` / `last_seen_run_id`, in targeter
+terms only.** These are observation bounds, not lifecycle. `last_seen_run_id`
+means "the last run in which the targeter observed this", and absence afterwards
+is ambiguous by construction — the market may have settled, been delisted, or
+simply stopped being a candidate. Universe cannot distinguish those without
+talking to the venue, and must not imply that it can. This matches the existing
+idiom on `venue_markets`, `canonical_markets` and `umbrella_events`, and the
+`EVENT_UNIVERSE_STORE_V1.md` §5 rule that terminal observation is an upper bound.
+The spec update states it for claims explicitly.
+
+**4.2 — The projection keeps carrying `relations`.**
+`project_market_universe()` builds a document — `events`, `venue_events`,
+`markets`, `venue_markets`, `decisions`, `selected_markets`, `relations` — and
+`_market_projection_identity()` hashes it into `projection_sha256`, which is how
+re-ingesting a run is detected as producing the same result. The choice was
+whether that document keeps the pairwise `relations` list or switches to
+`claims`. It keeps `relations`: the writer then has the report's own edges on one
+side and its recomputed claims on the other, which is what gives the ingestion
+assertion two independent sides. Storage is derived at write time; the edges are
+never persisted.
+
+**4.3 — The targeter does not emit `claim_id`.** Deferred. Universe recomputes
+for all history; emitting it later is a pure optimization.
+
+**4.4 — All UI work is deferred** until the server lands in full.
+
+> **This breaks the UI in the interim, and it fails hard rather than degrading.**
+> `targeter-ui/src/server/event-universe.ts` validates strictly:
+> `validateTargeterRunDetail` requires a `relations` key and a
+> `counts.relations` that equals its length (`:1005`), and
+> `validateRelationDetail` requires per-run `observations`. Both will throw
+> against a v6 server. The UI is a separate deployable and universe-server still
+> serves v0.11.0, so nothing in production breaks — but the UI cannot be pointed
+> at a v6 server until its own change lands.
 
 ## 5. Tests
 
@@ -216,8 +242,8 @@ Each defect needs a falsifying regression that fails first, per `AGENTS.md` §3.
 
 1. **A.1** — ingest several runs over the same markets; assert no table grows per
    run. Fails today.
-2. **A.2** — a run referencing `DETAIL_ROW_LIMIT + 1` relations is served across
-   pages, not as `DetailTooLarge`. Fails today.
+2. **A.2** — a run whose markets carry more than `DETAIL_ROW_LIMIT` relations is
+   served, because run detail no longer carries them. Fails today.
 3. **A.3** — a claim observed across `DETAIL_ROW_LIMIT + 1` runs is served. Fails
    today.
 4. **Equivalence assertion** — a run whose recomputed claims contradict the
@@ -238,8 +264,7 @@ Four commits, each leaving the tree green:
 
 1. Schema v6 plus the writer and the equivalence assertion.
 2. The four readers and the healthz counts.
-3. API: claim detail, run-relation pagination, catalogue trim; UI validators and
-   client together.
+3. API: claim detail and catalogue trim.
 4. Removals, spec updates (`EVENT_UNIVERSE_STORE_V1.md` §4 and §8,
    `universe/schema/README.md`), and marking the write-amplification document
    superseded.

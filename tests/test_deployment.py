@@ -205,7 +205,10 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn("observed_activation_at", schema)
         self.assertIn("CREATE TABLE universe_sync_failures", schema)
         self.assertIn("CREATE TABLE canonical_markets", schema)
-        self.assertIn("CREATE TABLE relation_members", schema)
+        self.assertIn("CREATE TABLE claim_classes", schema)
+        self.assertIn("CREATE TABLE claim_relations", schema)
+        self.assertIn("CREATE TABLE market_claims", schema)
+        self.assertNotIn("CREATE TABLE relation_observations", schema)
         self.assertNotIn("CREATE TABLE cadence_runs", schema)
         for stale in ("segment_receipts", "control_records", "connection_epochs"):
             self.assertNotIn(stale, schema)

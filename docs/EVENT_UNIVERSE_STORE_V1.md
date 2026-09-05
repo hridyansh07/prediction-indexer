@@ -101,21 +101,57 @@ First- and last-seen run IDs make continuity explicit. Re-ingesting the same
 verified run is idempotent. API `event_refs` are derived in stable order from
 the alias edges rather than stored as immutable umbrella content.
 
-## 4. Relationships
+## 4. Claims and relationships
 
-Relationships are normalized into `relations`, `relation_members`, and
-`relation_observations`. A relation supports any number of members and optional
-claim keys even though current Targeter reports emit two members.
+A market's semantic content, for relationship purposes, is the subset of the
+outcome space it resolves YES on. Two markets naming the same subset are the
+same **claim** however their venues word it, and the relationship between two
+markets is a function of their two subsets and nothing else — the mask
+comparison reads no other field.
 
-The canonical hash contains only the relationship type and normalized members.
-It excludes event, run, bundle, scope, coverage, generation version, market
-template version, and outcome-space version. Symmetric types normalize every
-member to role `member` and sort by venue, venue market ID, claim key, and role.
-Directed types preserve `left`/`right` roles. Generation version is an explicit
-database key column rather than part of the hash input.
+Outcome keys are participant-independent, so a claim is identified globally by
+its subset: one `claim_classes` row serves every event and every run that
+expresses it. `claim_relations` relates two claims of one space shape and names
+no event, run, venue, or bundle. `market_claims` records which claim a venue
+market's tradable token expresses.
 
-`GET /v1/relationship-types` publishes the closed current type catalogue and
-its directed/member-role semantics.
+Nothing is keyed by run. A run that observes what earlier runs observed writes
+no rows and only moves last-seen markers. This supersedes the former
+`relations` / `relation_members` / `relation_observations` tables, which wrote
+one row per relation per run — 21,101 rows per run against ~247 genuinely new
+relations, and 3.3 M rows for 2,239 distinct claims.
+
+Three consequences are structural rather than incidental:
+
+- **IDENTITY is not a relation.** Equal subsets are one `claim_id`, so
+  cross-venue equivalence is two `market_claims` rows sharing a claim.
+- **REVERSE_IMPLICATION is normalized** to IMPLICATION with the antecedent
+  named first, since it is the same containment written from the other end.
+- **OVERLAP is not stored.** It is the catch-all branch of the mask comparison
+  rather than a finding, and selection already discards it.
+
+`coverage` on a claim records whether its space enumerates every reachable
+outcome. A finding over an `INCOMPLETE_COVERAGE` space stays conditional
+discovery evidence, never an unconditional claim.
+
+`first_seen_run_id` and `last_seen_run_id`, on both claims and market claims,
+are **targeter observation bounds, not lifecycle**. `last_seen_run_id` is the
+last run in which the targeter observed the market expressing the claim.
+Absence afterwards is ambiguous by construction — the market may have settled,
+been delisted, or stopped being a candidate — and Universe cannot distinguish
+those without the venue. This is the same upper-bound rule §5 states for
+terminal observation.
+
+Claims are recomputed from each run's own projection, which already carries
+every input the mask engine reads, so the whole archive re-projects with no
+Targeter change. Because that reconstruction must compile the same masks the
+Targeter compiled, ingestion checks it: the claims' implied cross-venue
+relations are compared against the ones the report recorded. A relation the
+claims **invent** is a guessed equivalence and rejects the run; a relation they
+**miss** is a visible false negative, counted rather than raised, per §2's
+preference for a false negative over a guess.
+
+`GET /v1/relationship-types` publishes the closed stored type catalogue.
 
 ## 5. Selection continuity and history
 
@@ -227,17 +263,18 @@ limits are 1–100 and list cursors are opaque and query-specific.
 |---|---|
 | `GET /healthz` | Schema, latest run, staleness, and normalized counts |
 | `GET /v1/targeter/status?limit=5` | Compact landing status and newest complete selection counts |
-| `GET /v1/targeter/runs/<run_id>` | Bounded decisions and normalized event/market/relation references |
+| `GET /v1/targeter/runs/<run_id>` | Bounded decisions and normalized event/market references |
 | `GET /v1/events?limit=&cursor=` | Canonical event summaries with identity coordinates and native aliases |
-| `GET /v1/events/<event_id>` | Event, venue events, canonical markets, relations, observations |
-| `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, relations |
-| `GET /v1/relations/<relation_id>` | Relation, normalized members, observations |
+| `GET /v1/events/<event_id>` | Event, venue events, canonical markets, claims, claim relations, observations |
+| `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, claims, claim relations |
+| `GET /v1/claims/<claim_id>` | Claim, the markets expressing it, and its claim relations |
 | `GET /v1/relationship-types` | Closed relationship-type catalogue |
 | `GET /v1/runs`, `/v1/selections`, `/v1/bundles` | Historical compatibility APIs |
 
 `GET /v1/targeter/cadence` returns 404. Run detail intentionally omits raw
-candidate relationship arrays and raw report payloads; clients follow event,
-market, and relation IDs for detail.
+candidate relationship arrays and raw report payloads, and carries no relations
+of its own: what a run saw is answered by the markets it names plus each claim's
+observation bounds. Clients follow event, market, and claim IDs for detail.
 
 The API process reads SQLite only and needs no object-store credentials. Sync
 owns all verified archive retrieval.
