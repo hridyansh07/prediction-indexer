@@ -116,7 +116,7 @@ function cacheMaxAge(pathname: string) {
       pathname.startsWith('/v1/bundles') ||
       pathname.startsWith('/v1/events') ||
       pathname.startsWith('/v1/markets/') ||
-      pathname.startsWith('/v1/relations/') ||
+      pathname.startsWith('/v1/claims/') ||
       pathname === '/v1/relationship-types' ||
       pathname.startsWith('/v1/runs/') ||
       pathname === '/v1/runs' ||

@@ -426,7 +426,10 @@ function NormalizedTargetDrawer({
             <b>{new Set(markets.map((market) => market.venue)).size}</b> venues
           </span>
           <span>
-            <b>{detail.relations.length}</b> relations
+            <b>{detail.claims.length}</b> claims
+          </span>
+          <span>
+            <b>{detail.relations.length}</b> claim relations
           </span>
         </div>
         <div className="drawer-body market-list">
@@ -449,12 +452,38 @@ function NormalizedTargetDrawer({
               <em>{label(market.selection_reason)}</em>
             </div>
           ))}
+          {detail.claims.map((claim) => (
+            <div className="proof-card" key={claim.claim_id}>
+              <b>
+                {claim.venue_count > 1
+                  ? `Same claim at ${claim.venue_count} venues`
+                  : 'Claim at one venue'}{' '}
+                · {label(claim.coverage)}
+              </b>
+              <span>
+                {claim.market_count} markets · {claim.outcome_key_count}{' '}
+                outcomes · {label(claim.scope)}
+              </span>
+              {/* Observation bounds, not lifecycle: the targeter cannot tell a
+                  settled market from a delisted or unselected one. */}
+              <span>
+                Observed {claim.first_seen_run_id} to {claim.last_seen_run_id}
+              </span>
+              <code>{claim.claim_id}</code>
+            </div>
+          ))}
           {detail.relations.map((relation) => (
-            <div className="proof-card" key={relation.relation_id}>
+            <div
+              className="proof-card"
+              key={`${relation.left_claim_id}:${relation.right_claim_id}`}
+            >
               <b>
                 {label(relation.relation_type)} · {label(relation.coverage)}
               </b>
-              <code>Relation {relation.relation_id}</code>
+              <code>
+                {relation.left_claim_id.slice(0, 12)} →{' '}
+                {relation.right_claim_id.slice(0, 12)}
+              </code>
             </div>
           ))}
           {detail.observations.map((observation) => (

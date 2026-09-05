@@ -1,7 +1,7 @@
 # Event Universe schema v6 — change outline
 
-**Status:** implemented. The server side landed as described; `targeter-ui` is
-deferred per §4.4 and is the only outstanding piece.
+**Status:** implemented, server and UI. The UI landed on its own branch stacked
+on the server one, per §4.4's deferral.
 **Gate:** passed. See
 [`UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md`](./UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md)
 for the model and the archive run that validated it.
@@ -239,16 +239,25 @@ never persisted.
 **4.3 — The targeter does not emit `claim_id`.** Deferred. Universe recomputes
 for all history; emitting it later is a pure optimization.
 
-**4.4 — All UI work is deferred** until the server lands in full.
+**4.4 — UI work was deferred** until the server landed, then done on a branch
+stacked on top of it. Both go to master together, so the strict-validator break
+below never reaches a deployed pairing.
 
-> **This breaks the UI in the interim, and it fails hard rather than degrading.**
-> `targeter-ui/src/server/event-universe.ts` validates strictly:
-> `validateTargeterRunDetail` requires a `relations` key and a
-> `counts.relations` that equals its length (`:1005`), and
-> `validateRelationDetail` requires per-run `observations`. Both will throw
-> against a v6 server. The UI is a separate deployable and universe-server still
-> serves v0.11.0, so nothing in production breaks — but the UI cannot be pointed
-> at a v6 server until its own change lands.
+The UI now matches v6: run detail carries no `relations` and no
+`counts.relations`; event and market detail carry `claims` alongside
+`relations`; `/v1/relations/<id>` became `/v1/claims/<id>`, addressed by the
+digest of the claim's outcome subset rather than a serial integer; the
+relationship-type catalogue is version 2 with only the two types a claim pair
+can carry; and `healthz` counts `claim_classes`.
+
+`market_detail`'s claim summaries were reshaped to match `event_detail`'s —
+event-scoped `market_count` and `venue_count` in both — so one claim summary
+means the same thing wherever it appears and the UI needs one validator rather
+than two near-identical ones.
+
+`tests/generate_event_universe_contract.py` now also emits `market_detail` and
+`claim_detail`, so the two most-changed responses are checked against the real
+application rather than against hand-written fixtures, including key-set drift.
 
 ## 5. Tests
 
