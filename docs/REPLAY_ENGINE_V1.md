@@ -34,6 +34,24 @@ types into `indexer-types` is withdrawn. That implementation is not assumed to b
 present on this branch until its source-thread commit
 `343db932ac216cfa0ba1c467254a0f6bac6ba589` is integrated.
 
+**Simplification amendment (2026-09-05).** The A–I product response supersedes
+the earlier proposal that REST verification gates Polymarket book usability,
+that the producer owns strategy triggers, that every same-hash candidate state
+is retained, or that a central finalizer re-types episodes. V1 now has three
+separate contracts:
+
+1. strict normalization and a captured-state book projector;
+2. a strategy-owned pull loop over atomic book updates and generic dependency
+   coordinates; and
+3. an optional, immutable REST-audit overlay containing discrepancy and
+   invalidation controls.
+
+A WebSocket full book may initialize a usable captured-state book without REST.
+REST remains delayed audit evidence: it can identify a past discrepancy but
+cannot reset a later current state or prove a complete suffix. Canonical evidence
+and prior strategy output are never rewritten. Sections 3–14 have been revised
+to keep those boundaries explicit.
+
 ---
 
 ## 1. Purpose and boundary
@@ -42,7 +60,7 @@ The replay engine answers one question repeatedly and cheaply:
 
 > Over a scoped interval of committed canonical evidence, where did a declared
 > strategy see an opportunity, for how long did it survive, and was every book it
-> priced usable at that instant?
+> priced available from captured evidence at that instant?
 
 It assumes canonical records exist. It does not produce, repair, or reinterpret
 them. It does verify every selected committed object and consumes the
@@ -68,11 +86,11 @@ one gate's output could not feed several strategy runs, and the terminal verdict
 | Retired | Survives as |
 |---|---|
 | Gate 1 capture checks | reconciler admissibility (§5.6) |
-| Gate 2 mandatory trust evidence | book state + verification age on every episode (§6.4, §7.4) |
+| Gate 2 mandatory trust evidence | captured-state book availability plus optional audit controls (§6.4, §7.8) |
 | Gate 3 economics | Python netting over episodes (§9) |
 | Gate 4 depth survival | episode lifetime, intrinsic to detection (§6.8) |
 | Gate 5 frozen policy | per-strategy precommitted thresholds (§6.6) |
-| Gate 2 retrospective walk-back (`trust.py`) | Python demotion of episodes later proven wrong (§9.1) |
+| Gate 2 retrospective walk-back (`trust.py`) | optional two-pass audit overlay; strategy-owned void records (§9.1) |
 | Gate 3 matched placebo null | one of several Python nulls (§9) |
 | Gate 5 leg-skew strata | `last_update_ns` per leg (§7.7), stratified in Python |
 | Gate 5 resolution reconciliation, `catalog.py` condition identity | input to fungibility derivation (§12.5); `catalog.py` kept |
@@ -85,10 +103,11 @@ and `events.py`, which stays as the **conformance oracle** for the Rust
 normaliser (§5.10) and as the typer for game-state and reference-tick events that
 other consumers read and the segment schema does not carry.
 
-Three pieces of retired code port rather than die: the anchor walk-back in
-`trust.py` becomes §9.1, the canonical-form logic in `books.py` seeds §12.9, and
-the venue interpretation in `events.py` is ported line for line into the
-reconciler with its tests as fixtures.
+Two pieces of retired code remain useful as conformance evidence rather than
+runtime dependencies: the canonical-form logic in `books.py` seeds the optional
+two-pass auditor (§12.9), and the venue interpretation in `events.py` is ported
+into the reconciler with its tests as fixtures. The retired gate orchestration
+does not survive.
 
 ---
 
@@ -109,21 +128,25 @@ or repositioned records. Those are derived, they are ours rather than the
 venue's, and they belong in engine output. A tape that carries our conclusions
 stops being evidence.
 
-**2.3 A book is usable or it is not, and only an event can change that.** No
-inference, no backfill, no reconciliation of a book we already doubt. §6.4.
+**2.3 Captured-state availability and retrospective audit are distinct.** A
+healthy in-stream full book initializes the captured-state projector. Known
+continuity or mutation faults can make it unavailable. A delayed REST snapshot
+does not gate initialization: an auditor may instead append a control that
+invalidates an exact historical dependency range. §6.4.
 
 **2.4 Rust owns what scales with tape size; Python owns what scales with episode
 count.** A bundle-scoped segment is 10^5–10^6 events; a full capture day is ~10^7
 (6.2M records/day for 20 Polymarket assets; 14.4M over 19 hours across three
 venues). Episodes are 10^3–10^4. Rust is justified by the daily prebuild across
-every scope, by analytics consumers that walk whole days, and by the live driver
-(§12.8) that must run the same books and consumers against a socket — **not** by
+every scope, by analytics clients that walk whole days, and by the live driver
+(§12.8) that must run the same books and pull API against a socket — **not** by
 any single segment being too large for Python. The honest reason is the one that
 survives scrutiny.
 
-**2.5 Adding a hypothesis is a config change, never a Rust change.** The capture
-side already holds this for markets. Strategy *families* are code; strategy
-*instances* are data (§6.6).
+**2.5 The producer has no strategy trigger semantics.** Replay applies canonical
+atomic groups and exposes a pull cursor. A strategy decides which updates to
+inspect and when to evaluate; strategy *families* are code and instances are
+data (§6.6).
 
 **2.6 A weaker claim is a different type, never a flag.** An episode depending on
 assumed fills, or found on a spliced tape, is not a measurement with a caveat.
@@ -156,20 +179,23 @@ crate, and the same normaliser that builds a segment is the one a live driver
         ┌─────────────────────▼─────────────────────┐
         │  ENGINE                          Rust     │
         │                                           │
-        │   apply ──► route ──► evaluate            │
-        │     │         │           │               │
-        │  books    dispatch    consumers           │
-        │  (state   index       strategies          │
-        │   machine)            analytics           │
+        │   ReplayCursor::next()                     │
+        │     ├── apply one canonical atomic group  │
+        │     ├── expose touched books + versions   │
+        │     └── expose audit controls             │
         └─────────────────────┬─────────────────────┘
-                              │  episodes.ndjson
-                              │  revisions.ndjson
-                              │  intervals.ndjson
-                              │  analytics.ndjson
+                              │  strategy-owned pull/evaluation
+                              │  episodes + revisions + dependency records
         ┌─────────────────────▼─────────────────────┐
         │  ECONOMICS + STATISTICS          Python   │
-        │  exact fee netting · nulls · verdicts     │
+        │  exact fee netting · voids · nulls · verdicts │
         └───────────────────────────────────────────┘
+
+  optional, separate pass:
+
+  segment + REST anchors ──► TWO-PASS AUDITOR ──► immutable audit overlay
+                                                   (verification/invalidation
+                                                    controls, manifest, receipt)
 ```
 
 ### 3.1 Scope resolution
@@ -244,13 +270,6 @@ the workspace and the contract above does not change.
     "retirement_disposition": "all_markets_terminal | terminal_clamp_elapsed | null",
     "terminal_observed_at_ns": null
   },
-  "deployment": {
-    "lane_role_map_version": 1,
-    "lane_role_map_sha256": "…",
-    "expected_lane_roles": [
-      { "lane_id": "polymarket", "venue": "polymarket", "stream": "book" }
-    ]
-  },
   "instruments": [
     {
       "id": "polymarket:0x1f3a…",
@@ -269,16 +288,17 @@ the workspace and the contract above does not change.
 - `instruments` is the filter (§5.3). `id` is the venue-qualified instrument the
   engine keys on (§7.1); the other fields are provenance so an episode can be
   read back to a market without another Universe query.
-- **Lanes are not in the descriptor.** Canonical windows carry every lane, and
-  the tape's own `connection_opened` records list the instruments each lane
-  subscribed. The reconciler derives lane membership from those, which is what
-  §5.3 needs for control-record retention. That evidence is insufficient when a
-  lane is wholly absent or its subscription record precedes the selected
-  prologue. Deployment therefore supplies a versioned lane-role map that binds
-  expected lanes to venue/stream/subscription roles. Runtime evidence may refine
-  it but may not contradict it. If an incomplete lane cannot be attributed to
-  instruments, affected scopes fail closed rather than treating blindness as a
-  quiet market. Universe does not own this deployment fact.
+- **Lanes are not in the descriptor.** Canonical windows carry every admitted
+  lane. Pending §14.1(2), the proposed minimum is for normalizer adapters to bind
+  recognized lane ids to minimal venue/stream roles. Runtime
+  `connection_opened` evidence narrows a present lane
+  to instruments. No separate deployment-wide lane map is required in V1. If a
+  required recognized book lane is wholly missing or invalid, requested books
+  for that venue stay `NotInitialized`; a missing REST snapshot lane removes
+  audit coverage but does not disable the WebSocket book. An unrecognized lane
+  fault remains receipt evidence and does not poison unrelated requested books.
+  Twin or custom lane layouts require explicit adapter configuration before they
+  can be attributed; V1 does not guess.
 - **The window end is retirement, not activation.** The retired §12.1 text said
   `capture_start_at_ns → activation_at_ns`. That is the pre-match window only;
   for esports the in-play evidence is the point. `end_ns` comes from the bundle's
@@ -317,23 +337,30 @@ in the Phase-0 `indexer-finalize` work:
 
 - **Universe is implemented** (§3.1). This is a contract test plus two field
   additions, not an API build.
-- **Money representation is adopted, not designed.** Integer tick/lot handling
-  with no floating point exists in our other Rust implementation of this work and
-  is vendored in rather than rewritten. Phase 0 fixes the per-venue scales and
-  the conversion/rounding rules at the boundary; it does not re-derive the
-  primitives. *(Pending: point this at the source repository once shared.)*
+- **Money representation is adopted, not designed.** The intended reference is
+  [`hridyansh07/bitfrost-prime-take-home`](https://github.com/hridyansh07/bitfrost-prime-take-home):
+  `crates/types` separates borrowed venue decoders from a closed canonical enum,
+  checked fixed-point price/quantity/money primitives, and fallible conversion;
+  `crates/market` prepares a complete mutation before atomic publication. Replay
+  adopts that architecture while preserving its own provenance and stricter
+  reject contract. The reference repository exposes no license file or Cargo
+  license metadata, so implementation may not copy code verbatim without
+  explicit permission/license clarification.
 
 What genuinely has to be settled first: integrating and pinning that public
-boundary, the versioned lane-role map, fee inputs, half-open scope interval, and
-the explicit selector policies in §14. Integration must preserve the implemented
-API and capability lifecycle rather than re-implementing its audit in Replay.
+boundary, the minimal adapter-owned lane role, fixed-point representation, and
+the half-open scope interval decision in §14. Integration must preserve the
+implemented API and capability lifecycle rather than re-implementing its audit
+in Replay. Fee formulae and strategy economics do not block this boundary.
 
 Acceptance: one fixture resolves to the same canonical scope bytes repeatedly;
 `select_canonical_windows` proves unique minimal adjacent coverage of
 `[T0 − prologue, T1)`; the stream is consumed through `Ok(None)` and only
-`finish()` mints `AuditedCanonicalSelection`; retirement is recorded as an
-observation/clamp rather than asserted to be the exact event end; selector policy
-choices are recorded in the segment manifest; and the completed §12.9 evidence
+`finish()` mints `AuditedCanonicalSelection`; Replay explicitly selects
+`AllowUncertified` while preserving receipt coverage faults; retirement is
+recorded as an observation/clamp rather than asserted to be the exact event end;
+selector policy choices are recorded in the segment manifest; and the completed
+§12.9 evidence
 is pinned. An object, record prefix, or successful decode without the finished
 audit capability cannot commit a segment.
 
@@ -347,23 +374,32 @@ Acceptance: Rust reproduces `replay/events.py` on fixtures and real canonical
 windows (§5.10); duplicate/conflict/gap fixtures exercise the provenance policy;
 equal-time tie groups remain atomic; Kalshi fixtures cover relative deltas; and
 an independent reader verifies every output identity. No reject is silent and
-no rejected payload can produce a usable book.
+no rejected payload can produce an available book.
 
-**Phase 2 — Engine core.** Books as a state machine, serial dispatch, one
-partition-sum family, measurement episodes and repricing revisions only.
-Acceptance: malformed/overflowing deltas, unknown controls, missing full books,
-sink failure, reconnects, and continuity faults fail as specified; snapshot
-fixtures prove historical Polymarket placement and two-pass suffix recovery
-(§6.4, §12.9); every candidate keeps its canonical address; all five named anchor
-outcomes are covered; and final episodes overlapping retrospectively provisional
-or unusable intervals are demoted. Production one-pass remains out of scope until
-the independent replacement gate in §12.9 passes.
+**Phase 2 — Captured-state projector and pull API.** Serial book mutation plus
+`ReplayCursor::next`; no producer-owned dispatch, strategy family, REST promotion,
+or economics. Acceptance: each valid WebSocket full book initializes its book;
+canonical duplicate/conflict/fault behavior is exact; reconnect, impossible
+relative mutation, overflow, missing full book, and output-reader failure produce
+the specified availability state; every pull returns the completed vendor/
+tie-group update and generic book dependency tokens; malformed wire/control
+payloads cannot reach the book crate; repeated runs are byte-identical.
 
-**Phase 3 — Deterministic economics.** Add the pinned, offline fee module and
-verdict pipeline only after representation is settled. Acceptance: each emitted
-revision can be netted exactly from its event-time inputs; official SDK results
-are checked against hand-calculated vectors; candidate substitution closes and
-reopens an episode; and repeated runs are byte-identical.
+**Phase 3A — Optional two-pass audit overlay.** Stream the fixed base segment and
+REST anchors, compare historical reconstructed levels, and emit immutable,
+receipt-bound verification/invalidation controls without changing base books or
+strategy output. Acceptance: split same-hash deliveries, recurrence, delayed H2
+at current H3, known continuity faults, no candidate, and missing suffix produce
+deterministic controls and exact dependency ranges; retries verify/no-op or get a
+new address; a fresh run and later reconciliation consume the same controls.
+
+**Phase 3B — First strategy and deterministic economics.** A strategy owns its
+pull loop, evaluation cadence, dependencies, episodes, revisions, and voids. Add
+the pinned offline fee module only after representation is settled. Acceptance:
+each emitted revision can be netted exactly from event-time inputs; official SDK
+results are checked against hand-calculated vectors; candidate substitution
+closes/reopens; a late invalidation voids exactly intersecting decisions; and
+repeated runs are byte-identical.
 
 **Phase 4 — Durable publication and operations.** A separate Python publisher
 uploads final local segments through the existing `ObjectStore`; add the index,
@@ -430,9 +466,11 @@ The caller must consume through `Ok(None)` and call `finish()`. Only `finish()`
 returns the opaque `AuditedCanonicalSelection` that pins receipt SHA-256 and byte
 length; records yielded earlier are untrusted. Segment output may be staged while
 streaming but its commit receipt cannot be published without this capability.
-The final upper bound is always clipped. Lower-bound and certification behavior
-remain explicit `SelectionPolicy` choices (§14), and both the selected policy and
-effective interval enter the segment manifest and address.
+The final upper bound is always clipped. Replay uses `AllowUncertified`: strict
+object/receipt/provenance verification still applies, while known coverage and
+clock faults remain visible rather than preventing healthy lanes from replaying.
+The lower-bound choice remains open (§14). Both the selected policy and effective
+interval enter the segment manifest and address.
 
 These APIs and their receipt/provenance types remain owned by
 `indexer-finalize`; Replay must not fork them into `indexer-types` or duplicate
@@ -463,7 +501,7 @@ lineage with its own receipts and is selected as such, never merged in.
 This does not mean duplicate records are impossible. Canonicalization preserves
 the exact envelope and classifies each line. A `duplicate` provenance verdict is
 retained but never mutates a book; `conflict`, `gap_proven`, and other continuity
-faults transition affected books to `Unusable` before their payload could mutate
+faults transition affected books to `Unavailable` before their payload could mutate
 state. That policy is especially important for relative Kalshi deltas.
 
 **Stage 5 is a port, not a design.** `replay/events.py` already interprets
@@ -488,8 +526,8 @@ never written into a canonical file. The engine may depend on ingester crates;
 the ingester never depends on the engine.
 
 **Twin lanes.** `record_id` is per-splice, so if a redundant-lane experiment ever
-runs, both records reach the engine. Cross-lane arbitration is a consumer (§6.6),
-not a reconciler stage.
+runs, both records reach the engine. Cross-lane arbitration is client-owned
+policy (§6.6), not a reconciler stage.
 
 ### 5.3 What the filter keeps
 
@@ -498,16 +536,23 @@ not a reconciler stage.
   or not the control record names an instrument. A `connection_failed` that names
   nothing is exactly the record the engine needs.
 
-Normalisation has exactly two outcomes: a closed `SegmentEvent`, or a
-`ParseReject`. Rejects are appended to `rejects.ndjson` with the canonical
-header, exact canonical envelope line, parser version, optional safely extracted
-instrument hint, and stable error code. The sidecar and its counts/identity are
-committed by the segment manifest. A reject with a proven in-scope instrument
-makes that instrument unusable. When instrument identity cannot be parsed, every
-reject on a relevant lane is retained and the affected scope is unobservable
-unless the lane-role map proves it irrelevant. Parse failure is vendor drift or
-an adapter bug; canonical frame/envelope corruption has already failed stage 2
-or 4.
+Normalisation has two evidence outcomes: an accepted closed venue
+`SegmentEvent`, or a `ParseReject` accompanied by a closed
+`NormalizationFault` classification. Rejects are appended to `rejects.ndjson`
+with the canonical header, exact canonical envelope line, parser version,
+optional safely extracted instrument hint, and stable error code. The sidecar and
+its counts/identity are committed by the segment manifest. Canonical
+frame/envelope corruption has already failed stage 2 or 4; venue payload and
+control-shape validation belongs only here. Rejected wire never enters `book` and
+the runtime never attempts to classify an unknown control.
+
+A reject with a proven in-scope instrument marks that book unavailable at its
+coordinate. When the instrument cannot be extracted, the adapter's recognized
+lane role determines the smallest affected set: a book-lane reject affects
+requested books for that venue; a snapshot-lane reject removes only audit
+coverage. An unrecognized lane reject is retained but does not poison unrelated
+books. This is deliberately less machinery than a deployment lane map and must
+be extended explicitly before custom/twin lanes are used.
 
 Out-of-scope records are excluded and the exclusion is **counted in the
 manifest**. Lossless with respect to scope is the honest claim; lossless
@@ -525,9 +570,10 @@ array order. The reconciler re-derives none of it.
 > order, not our clock (§6.2).
 
 `visible_tie_group` crosses the type boundary. All records in one group are
-applied before any strategy evaluates, then interested consumers evaluate once
-against the resulting books. The deterministic lane rank remains serialization,
-not an economically meaningful ordering between simultaneous observations.
+applied before `ReplayCursor::next()` returns the resulting update. A strategy
+may inspect or ignore that update but cannot observe a partial tie group. The
+deterministic lane rank remains serialization, not an economically meaningful
+ordering between simultaneous observations.
 
 The last selected canonical window is clipped at `T1`: records with
 `visible_ns >= T1` do not enter the segment or affect books, episodes, or final
@@ -561,23 +607,22 @@ Fatal **per instrument**, which refuses that instrument's legs rather than the
 segment:
 
 4. no full book anywhere in prologue + window, so the book can never leave
-   `NotBootstrapped`.
+   `NotInitialized`.
 
 Recorded in the manifest, not fatal:
 
 5. `bootstrap_offset_ns` per instrument — how far into the segment its first
-   usable book appears. Normally near zero thanks to the prologue; when it is
+   available book appears. Normally near zero thanks to the prologue; when it is
    not, the loss is visible instead of silent.
 6. delivery-index discontinuities per lane, read from the provenance index's
-   continuity verdicts and passed to the engine as an `UnusableCause` at that
+   continuity verdicts and passed to the engine as an `UnavailableCause` at that
    position.
 7. an `incomplete` receipt — a lane missing or invalid for the whole window. The
-   window is admitted; every instrument on the faulted lane is passed to the
-   engine as `SegmentDiscontinuity` spanning the window. This is what stops one
-   wedged splice from hiding the other venues' evidence, and what stops it from
-   being mistaken for a quiet market. If neither deployment lane-role evidence
-   nor runtime subscription evidence can attribute the lane, the scope is
-   unobservable and emits no measurement episodes.
+   window is admitted under `AllowUncertified`. A recognized missing book lane
+   leaves requested books for that venue `NotInitialized` over the affected
+   interval; a recognized missing snapshot lane records absent audit coverage
+   only. Healthy lanes continue. If a lane id has no adapter-owned role, Replay
+   preserves the receipt fault and makes no guessed book attribution.
 
 ### 5.7 Identity
 
@@ -636,7 +681,7 @@ per-scope sink buffers, and staged bytes from configuration and commits complete
 window slices in receipt order regardless of worker completion order. Backpressure
 blocks workers; it never drops an accepted event. Each temporary slice has an
 identity and restart journal, and is either verified and reused after a crash or
-discarded before retry. A logical outcome-space bundle is a good consumer/sink
+discarded before retry. A logical outcome-space bundle is a good strategy/sink
 boundary, but not automatically an OS-thread boundary: decoding once per bundle
 would repeat the dominant work.
 
@@ -718,10 +763,11 @@ fixtures, and `events.py` is not extended further.
 engine/crates/
   tape       reconciler: receipt selection, verification, decode,
              normalise, filter, manifest; segment writer and reader   (§5)
-  book       book state machine, UsableBook receipts
-  price      ladder walk, combination arithmetic, fee envelope
-  consume    dispatch index, consumer trait, episode lifecycle
-  families   strategy families
+  book       captured-state projector, availability, versioned views
+  cursor     serial atomic-group pull API over tape + optional overlay
+  audit      optional two-pass REST comparison and control overlay
+  price      ladder walk and checked fill primitives used by strategies
+  strategies strategy-owned loops, families, episodes, and void records
   cli        replay-engine  (build · run)
 
 shared from the ingester workspace, never the reverse:
@@ -730,42 +776,41 @@ shared from the ingester workspace, never the reverse:
   prediction-encoder   strict Zstandard
 ```
 
-`book` and `price` know nothing about strategies. Nothing outside `book` can
-construct a `UsableBook`. Nothing outside `tape` sees venue JSON.
+`tape`, `book`, and `cursor` know nothing about strategy trigger semantics.
+Nothing outside `book` can construct an available book view. Nothing outside
+`tape` sees venue JSON. `audit` never mutates a base segment or primary book.
 
 ### 6.2 The walk
 
-Single pass, **per atomic observation group**, strictly sequential.
+The projector is single pass, **per atomic observation group**, strictly
+sequential. The strategy owns the loop:
 
 ```
-   apply     mutate book / state machine       (write)
-   route     dispatch index → interested set   (read)
-   evaluate  consumers over routed set         (read-only)
+while let Some(update) = replay.next()? {       // applies one complete group
+    if strategy.wants(&update) {                // strategy-owned policy
+        strategy.evaluate(replay.books(), &update, output)?;
+    }
+}
 ```
 
-Normally evaluation is per event, not per delivery, so an episode boundary is
-attributable to one canonical record. Two larger atomic groups override that
-default:
+`ReplayCursor::next()` returns touched instruments, the group's inclusive first
+and last canonical addresses, tie-group identity, applied book-version tokens,
+and any audit controls effective at that coordinate. It neither registers
+interests nor invokes strategy code. A strategy may evaluate every update, only
+updates touching selected books, a time bucket, or terminal controls. Its
+versioned policy determines observability and belongs in its output identity.
+
+Mutation always completes these boundaries before returning:
 
 1. every entry in one vendor batch whose semantics describe one update is
-   applied before evaluation; and
-2. every canonical `visible_tie_group` is applied before evaluation, because
+   applied together; and
+2. every canonical `visible_tie_group` is applied before the cursor returns, because
    lane rank is not evidence that one simultaneous market moved first.
 
-The boundary is attributed to the last canonical address in the group and also
-records the tie-group identifier.
-
-Polymarket same-hash candidate runs are **not automatically a third economic
-atomic group**. The live sample found ten candidate occurrences where exact
-levels appeared only after the next same-asset, same-hash delivery. This makes a
-maximal contiguous run useful for anchor verification, but does not prove that
-the venue intended all intervening deliveries to become one strategy-observation
-instant. Every delivery and normalized child therefore retains its
-`EventAddress`; the verifier may derive a candidate-run range without replacing,
-pooling, or repositioning those records. Whether strategy evaluation waits for a
-candidate-run end is an explicit protocol/product choice in §14. Recommended
-pending approval: evaluate canonical deliveries normally and use the run only
-for retrospective verification and demotion.
+Polymarket repeated hashes are not an atomic group. Every canonical address
+remains on disk and every delivery boundary remains visible to the pull cursor;
+the auditor may compare historical delivery-end states without keeping a full
+in-memory state per occurrence (§12.9).
 
 There is **no heartbeat and no synthetic record**. Staleness and timeout closures
 are applied **backdated** at the next evaluation: the tracker knows each leg's
@@ -776,144 +821,100 @@ open.
 
 ### 6.3 Events survived
 
-Per-event evaluation yields a second lifetime measure for free. An episode carries
-both `duration_ns` and `events_survived`. One that survived 40 events is a
-different animal from one that survived 1 at the same wall duration.
+A strategy that evaluates each relevant update may record both `duration_ns` and
+`updates_survived`. A coarser strategy records its own observation count instead.
+The producer does not manufacture a strategy-specific lifetime measure.
 
-### 6.4 The book and anchor state machines
+### 6.4 Captured-state availability and independent audit
 
 ```
-  NotBootstrapped ──current full book──► Provisional ──verified frontier──► Usable
-          ▲                                  │                                 │
-          │                                  └──── fault/divergence ──────────┤
-          │                                                                    ▼
-          └──────────── unusable until later usable full anchor ◄───────── Unusable
-
-  anchor: Pending ──candidate run closes──► Placed ──suffix replay──► Recovered
-              │                               │             │
-              └── bound/end ─► AnchorPending  │             └──► MissingSuffix
-                                              ├──► Divergence
-                                              ├──► AmbiguousAnchor
-                                              └──► AnchorTooOld
+  NotInitialized ──valid in-stream full book──► Available
+          ▲                                      │
+          │                                      ├── canonical continuity fault
+          │                                      ├── classified normalization fault
+          │                                      ├── impossible relative mutation
+          │                                      └── arithmetic overflow
+          │                                                        │
+          └──────────── later valid in-stream full book ◄──── Unavailable
 ```
 
-- Deltas apply in `Provisional` and `Usable`. In `Unusable` they are journaled as
-  evidence when required for later suffix analysis but do not mutate the primary
-  book: they act on state we do not trust and recovery uses scratch replay.
 - Canonical provenance is applied first. `duplicate` records do not mutate;
-  conflict and continuity-fault records make the affected book unusable before
-  venue semantics run.
-- A current full book bootstraps observed levels. Whether that starts as `Usable`
-  or `Provisional` is venue/trust-policy specific; Polymarket's unsequenced delta
-  path remains provisional until the approved independent-anchor condition is
-  met. `Usable` means usable under the declared captured-tape trust contract,
-  never venue-proven completeness.
-- Recovery requires a **full book at the recovery frontier**, or a historical
-  full book followed by complete deterministic replay of the retained captured
-  suffix. A hash match alone cannot move a frozen book forward.
-- Missed deltas are never recovered. We only ever bound when trust was lost and
-  regained.
-- Bootstrap and recovery are the same transition, so segment start is not a
-  special case.
-- Relative-size underflow, negative resulting levels, integer overflow,
-  malformed price/size, and unsupported book controls are state-machine errors,
-  not strategy outcomes. They make the affected book unusable. An unknown
-  control whose scope cannot be proven fails the scope closed.
+  conflicts and attributable continuity faults make affected books unavailable
+  before venue semantics run.
+- A valid Polymarket WebSocket `book` is a captured full state and immediately
+  initializes `Available`. REST is not a promotion prerequisite. `Available`
+  means reconstructable from admitted captured evidence, never venue-proven
+  completeness.
+- Reconnect/epoch change prevents deltas from extending the old epoch until a
+  new full book arrives. A full book is the only bootstrap/reset operation.
+- Malformed price, size, and control payloads are rejected and classified by the
+  strict normalizer before `book`; the projector receives only a closed
+  `NormalizationFault` with an already determined impact set. It does not parse
+  or guess malformed wire semantics.
+- A syntactically valid but impossible relative mutation, negative resulting
+  level, or checked-arithmetic overflow is a projector error and makes only the
+  affected book unavailable.
+- No-full-book is ordinary `NotInitialized`, not a crash. Strategies querying
+  that book receive no available view.
 
-**The rule that is easy to get backwards:** an independent snapshot describes
-its source observation frontier, not its later receipt frontier. While `Usable`,
-it verifies the reconstructed historical state at that frontier and never resets
-the current book. Comparing it with the current book creates false mismatches;
-resetting the current book to it rewinds state.
+**The rule that is easy to get backwards:** an independent REST snapshot
+describes its source observation frontier, not its later receipt frontier. It is
+compared with the reconstructed historical state and never resets the current
+book. Comparing it with current H3 creates a false mismatch; resetting H3 to
+stale H2 rewinds state. The optional auditor therefore writes a control overlay
+rather than mutating the primary projector.
 
-Placing that frontier begins by enumerating **all** same-asset/hash canonical
-addresses (§12.9). Hash equality identifies candidates, not necessarily one
-frontier: consecutive repeats can describe a split update, and non-contiguous
-recurrence remains uncharacterised. Replay compares full levels at every
-delivery-end candidate and applies only the approved candidate-run rule. Request
-and receipt clocks never select among candidates. There is no permissive
-time-window placement fallback (§12.10).
-
-While `Unusable`, a historical snapshot is a recovery anchor only after replaying
-the complete captured suffix from its observation frontier to the current replay
-frontier. If continuity of that suffix is not provable, the anchor verifies only
-its own instant and the book remains unusable until a later full book. The engine
-retains bounded checkpoints or performs a second serial pass; it never applies a
-stale anchor at receipt time.
-
-Anchor processing has five closed outcomes: `AnchorPending` while a candidate
-run may still arrive or close; `AnchorTooOld` when every candidate is outside a
-declared journal; `AmbiguousAnchor` when candidate recurrence/runs cannot be
-resolved; `MissingSuffix` when exact transport from historical H2 to current H3
-is unavailable; and `Divergence` when the completed candidate state disagrees.
-The first four never promote trust; divergence makes the affected interval and
-current book unusable unless exact suffix recovery succeeds from the anchor.
-None permits a best-effort reset.
-
-On mismatch, the confirmed state preceding the first known fault remains valid.
-The interval from that fault—or, when no tighter bound exists, the previous
-successful verification—to the snapshot frontier is retrospectively unusable.
-The snapshot frontier is a confirmed instant, not automatically confirmed
-current state. A later endpoint match restores that endpoint but does not prove
-an intermediate path containing a known gap.
-
-**Causal usability is weaker than the retrospective audit, by design.** A future
-live driver cannot retract its past, so the first engine pass may emit provisional
-episodes. Replay finalization can and must: episodes in a later-invalidated blind
-window are retained as evidence but **demoted before headline verdicts** once the
-second trust pass has placed snapshots and suffixes (§9.1). The engine stays
-causal; committed replay results preserve the audit.
+On mismatch, the narrowest conservative invalidation begins after the previous
+accepted anchor (or segment start when none exists) and ends at the recovered
+current frontier. If a complete captured suffix cannot be reconstructed, the
+range is open-ended until a later recovery control. This is audit evidence, not
+an automatic current-book transition: each strategy decides whether its recorded
+dependencies require an append-only void (§9.1).
 
 ### 6.5 Detection and recovery latency are different
 
-| Venue | In-band gap detection | Recovery source | Typical blind window |
+| Venue | In-band gap detection | Captured-state reset | Delayed audit evidence |
 |---|---|---|---|
-| Limitless | n/a — every message is a full book | every message | ~one message |
-| Kalshi | `update_range` — immediate | 30s sweep + subscribe | ≤ 30s |
-| Polymarket | **none** | candidate-positioned poll anchor + exact suffix, or later full book | detection poll-dependent; recovery evidence-dependent |
+| Limitless | n/a — every message is a full book | every message | not required for bootstrap |
+| Kalshi | `update_range` — immediate | 30s sweep + subscribe | source-sequence evidence where present |
+| Polymarket | **none** | next in-stream full book | historical REST anchor + captured suffix; no venue-completeness proof |
 
 Polymarket is uniquely exposed: no sequence numbers, so divergence is detected
 only when a full-book poll is received. A delayed poll can anchor its historical
-state but restores the receipt frontier only when the intervening suffix is
-complete; otherwise a later full book is required. A book can therefore be
-silently wrong for up to a poll interval before detection, and first-pass
-episodes in that interval are provisional.
+state, but no hash proves that the suffix from that state to current is complete.
+The base captured-state book remains runnable; audit consequences arrive later
+as controls with exact dependency coordinates.
 
 In the ten-minute sample, chosen anchor→REST receipt lag reached **155.659 s**
 and six anchors became visible on WebSocket only after REST receipt. This is a
 lower bound on journal demand, not a production recovery bound. Detection
 latency is poll schedule + request/anchor delay. Recovery latency additionally
-includes candidate-run closure and availability of an exact suffix; it can run
-until a later usable full anchor. Both distributions are reported separately.
+includes historical placement and availability of a captured suffix or later
+full book; it can remain unknown. Both distributions are reported separately.
 
-The response is annotation in the engine and demotion in Python (§9.1), never
-retraction of the tape: every episode carries `verification_age_ns` per leg, so a
-consumer can require recent confirmation without the engine buffering or
-rewriting anything, and the Python side re-types what hindsight later condemns.
+The response is an immutable audit control (§7.8), never retraction of the tape
+or a producer-owned demotion. Strategies may ignore audit controls, block on
+them, or append voids for intersecting dependencies; that policy and its output
+identity remain strategy-owned.
 
 §12.9 records why hash equality enumerates historical candidates and what
 reproducing the venue digest proves. Neither uniquely positions every snapshot,
 turns a hash into per-delivery verification, or proves suffix completeness.
 
-### 6.6 Consumers
+### 6.6 Strategy-owned pull and evaluation
 
-Strategies and analytics are the same interface. Both register interests, both are
-routed by the dispatch index, both emit to sinks. Analytics is not a pipeline
-stage — it is a consumer on the same single walk.
+Strategies and analytics are clients of the same pull API, not callbacks owned
+by Replay. Each client owns filtering, cadence, internal state, and output sinks.
+An optional client-side instrument index may optimize its own work, but it is not
+part of the producer contract or segment identity.
 
-The dispatch index is keyed by instrument and is **many-to-many**: the instrument
-is the key, not the scope of a consumer. A cross-venue strategy watching five
-instruments registers on all five; one delta routes to every consumer watching
-that instrument. The alternative is broadcast, which is the O(events × consumers)
-loop this exists to kill.
-
-**Legs are candidate sets.** A leg is not one instrument. If YES is unusable on
-venue A but usable on venue B, and NO is usable on B, the basket is still
+**Legs are candidate sets.** A leg is not one instrument. If YES is unavailable on
+venue A but available on venue B, and NO is available on B, the basket is still
 priceable.
 
-- dispatch registers the strategy on **every** candidate;
+- the strategy considers every declared candidate it needs;
 - the episode records **which instrument was actually used** per leg;
-- when several candidates are usable, **best price wins** — and that selection is
+- when several candidates are available, **best price wins** — and that selection is
   the "which venue held the most competitive odds" analytic, falling out of
   evaluation rather than needing a pass;
 - substitution requires `IDENTITY`. A `NEAR_IDENTITY` candidate standing in
@@ -929,13 +930,14 @@ Three families come from machinery that already exists in `analysis/masks.py` an
 IMPLICATION → `ask_A < bid_B`. The retired pipeline could express none of them
 beyond the trivial 2-partition.
 
-### 6.7 Evaluation states
+### 6.7 Price/depth strategy states
 
-**No open episode.** Maintain the combination incrementally — reprice only the leg
-whose instrument the event touched, update Σ, test the threshold. Never recompute
-the basket from scratch.
+These are implementation choices for the first price/depth strategy, not engine
+semantics. With no open episode, it may maintain the combination incrementally —
+reprice only the leg whose instrument the pulled update touched, update Σ, and
+test the threshold.
 
-**Open episode.** Apply the fingerprint guard before repricing: *did this event
+With an open episode, it may apply the fingerprint guard before repricing: *did this event
 touch at-or-inside this leg's priced slice, or improve its best?* A fingerprint is
 per episode, per leg — a three-leg episode holds three priced slices.
 
@@ -959,7 +961,7 @@ Three rules that decide whether the lifetime number means anything:
   price, quantity, verification status, or fee input changes; aggregates alone
   cannot reconstruct exact nonlinear fees.
 - **Right-censor.** Still open at segment end is censored, not short.
-- **Backdate every close.** Staleness and `Unusable` closures are recorded at the
+- **Backdate every close.** Staleness and `Unavailable` closures are recorded at the
   moment the condition began, not when it was observed. Closing at detection would
   inflate the lifetime preceding every corruption event — biasing the headline
   metric upward, which is the direction that flatters the hypothesis.
@@ -991,8 +993,8 @@ when pinned by version, callable offline for historical runs, and checked agains
 hand-calculated fixtures. A replay may not consult a venue's current fee service
 to price historical evidence.
 
-The receipt then guarantees exactly what Rust can honestly guarantee: **usable,
-gross-priced, envelope-cleared.** Python owns the economic verdict. A too-tight
+The receipt then guarantees exactly what Rust can honestly guarantee: **available
+from captured evidence, gross-priced, envelope-cleared.** Python owns the economic verdict. A too-tight
 envelope silently loses real episodes, so it is conservative by construction and
 recorded on every episode.
 
@@ -1056,6 +1058,8 @@ pub struct CanonicalProvenance {
 pub enum SegmentEvent {
     Control(ControlEvent),
     Book(BookEvent),
+    AuditAnchor(AuditAnchor),
+    NormalizationFault(NormalizationFault),
     Trade(TradeEvent),
 }
 
@@ -1071,7 +1075,6 @@ pub enum BookEvent {
         asks: Vec<(Px, Qty)>,
         snapshot_hash: Option<Arc<str>>,
         source_observed_ns: Option<i64>,
-        independent: bool,          // polled, versus in-stream
     },
     Delta {
         instrument: InstrumentId,
@@ -1080,6 +1083,31 @@ pub enum BookEvent {
         size: LevelSize,
         book_hash: Option<Arc<str>>,   // venue digest; see §12.9
     },
+}
+
+/// Independently polled REST `/books` evidence. The primary book projector does
+/// not apply this as a current full book; only the optional auditor consumes it.
+pub struct AuditAnchor {
+    pub instrument: InstrumentId,
+    pub bids: Vec<(Px, Qty)>,
+    pub asks: Vec<(Px, Qty)>,
+    pub snapshot_hash: Arc<str>,
+    pub source_observed_ns: Option<i64>,
+}
+
+/// A venue/control payload rejected by strict normalization. Exact bytes and the
+/// stable parser error remain in the committed reject sidecar. Impact is decided
+/// by the adapter before the book crate and is never inferred by the runtime.
+pub struct NormalizationFault {
+    pub reject_id: Arc<str>,
+    pub impact: FaultImpact,
+}
+
+pub enum FaultImpact {
+    Instrument(InstrumentId),
+    RequestedVenueBooks(Arc<str>),
+    AuditCoverageOnly(Arc<str>),
+    UnattributedLane(LaneId),
 }
 
 /// Venues disagree on what a delta carries. Polymarket `price_change` sends the
@@ -1110,63 +1138,56 @@ collapse distinct upstream evidence into a generic fault.
 
 `Absolute` application is idempotent; `Relative` is not, which is one more reason
 a book fed by relative deltas can never re-converge after a gap without a full
-book (§6.4). `book_hash` is carried verbatim and used with the asset and preserved
-addresses to enumerate anchor candidates (§12.9). The official full-book SHA-1
-is reproducible, but it certifies neither an individual delta/delivery nor suffix
-completeness. Kalshi's delta semantics are taken from its published spec and are
-unverified against live servers (§12.7); the variant exists so that verifying
-them is a reconciler change, not a schema change.
+book (§6.4). `book_hash` is carried verbatim for audit comparison; canonical
+addresses remain in the segment on disk, not as duplicated in-memory candidate
+states (§12.9). The official full-book SHA-1 is reproducible, but it certifies
+neither an individual delta/delivery nor suffix completeness. Kalshi's delta
+semantics are taken from its published spec and are unverified against live
+servers (§12.7); the variant exists so that verifying them is a reconciler
+change, not a schema change.
 
 ### 7.3 The book and its receipt
 
 ```rust
 pub enum BookState {
-    NotBootstrapped,
-    Provisional { since_ns: i64, reason: ProvisionalReason },
-    Usable   { since_ns: i64, last_verified_ns: Option<i64> },
-    Unusable { since_ns: i64, cause: UnusableCause },
+    NotInitialized,
+    Available { since_ns: i64 },
+    Unavailable { since_ns: i64, cause: UnavailableCause },
 }
 
-pub enum ProvisionalReason {
-    AwaitingIndependentAnchor,
-    AnchorPending,
-    SuffixNotYetVerified,
-}
-
-pub enum UnusableCause {
-    AnchorMismatch,          // poll disagreed with our reconstruction
-    AnchorConflict,          // two polls, same hash, different contents
-    AnchorTooOld,
-    AmbiguousAnchor,
-    MissingSuffix,
+pub enum UnavailableCause {
     EpochReset,              // reconnect; prior book cannot carry over
     LaneInterrupted,         // connection_failed covering this instrument
     SegmentDiscontinuity,    // manifest-declared delivery gap
     CanonicalConflict,
-    ParseReject,
-    MalformedDelta,
+    NormalizationFault,
+    InvalidRelativeMutation,
     ArithmeticOverflow,
-    UnknownControl,
-    Stale { threshold_ns: i64 },
 }
 
-/// The receipt. No public constructor: only `BookStore::usable` mints one.
-pub struct UsableBook<'a> { /* private */ }
+pub struct BookDependency {
+    pub instrument: InstrumentId,
+    pub epoch: Arc<str>,
+    pub from_full_book: EventAddress,
+    pub through: EventAddress,
+}
 
-impl<'a> UsableBook<'a> {
+/// No public constructor: only `BookStore::available` mints one.
+pub struct AvailableBook<'a> { /* private */ }
+
+impl<'a> AvailableBook<'a> {
     pub fn instrument(&self) -> &InstrumentId;
     pub fn levels(&self, side: Side) -> &[(Px, Qty)];
-    pub fn usable_since_ns(&self) -> i64;
-    /// None when never positively confirmed since bootstrap.
-    pub fn verification_age_ns(&self) -> Option<i64>;
+    pub fn available_since_ns(&self) -> i64;
+    pub fn dependency(&self) -> &BookDependency;
 }
 
 pub struct BookStore { /* … */ }
 
 impl BookStore {
     pub fn apply(&mut self, hdr: &EventHeader, ev: &SegmentEvent) -> Touched;
-    pub fn usable(&self, id: &InstrumentId, at_ns: i64) -> Option<UsableBook<'_>>;
-    /// Always available, including when `usable` returns None.
+    pub fn available(&self, id: &InstrumentId) -> Option<AvailableBook<'_>>;
+    /// Always available, including when `available` returns None.
     pub fn state(&self, id: &InstrumentId) -> &BookState;
 }
 ```
@@ -1174,35 +1195,38 @@ impl BookStore {
 ### 7.4 Pricing requires the receipt
 
 ```rust
-pub fn walk_ladder(book: &UsableBook<'_>, side: Side, size: Contracts) -> Fill;
+pub fn walk_ladder(book: &AvailableBook<'_>, side: Side, size: Contracts) -> Fill;
 ```
 
-This one signature is the enforcement point. "Economics ran on a book we did not
-trust" is not a bug to be tested for; it does not compile.
+This signature prevents pricing an unavailable captured-state book. Independent
+audit policy remains strategy-owned and is enforced by the strategy's treatment
+of overlay controls, not by forging a different book type.
 
-### 7.5 Consumers
+### 7.5 Pull cursor
 
 ```rust
 pub struct Touched(SmallVec<[InstrumentId; 4]>);
 
-pub struct Ctx<'a> {
-    pub books: &'a BookStore,
-    pub now_ns: i64,
-    pub window_start_ns: i64,
-    pub segment_address: &'a str,
+pub struct ReplayUpdate {
+    pub first: EventAddress,
+    pub last: EventAddress,
+    pub visible_tie_group: Option<u64>,
+    pub touched: Touched,
+    pub controls: Vec<AuditControl>,
 }
 
-pub trait Consumer {
-    fn interests(&self) -> &[InstrumentId];
-    fn on_event(&mut self, ctx: &Ctx<'_>, hdr: &EventHeader,
-                ev: &SegmentEvent, out: &mut dyn Sink);
-    fn finalize(&mut self, ctx: &Ctx<'_>, out: &mut dyn Sink);
-}
+pub struct ReplayCursor { /* tape, optional pinned overlay, books */ }
 
-pub struct DispatchIndex {
-    by_instrument: HashMap<InstrumentId, SmallVec<[ConsumerId; 4]>>,
+impl ReplayCursor {
+    pub fn next(&mut self) -> Result<Option<ReplayUpdate>, ReplayError>;
+    pub fn books(&self) -> &BookStore;
+    pub fn finish(self) -> Result<FinishedReplay, ReplayError>;
 }
 ```
+
+`next()` applies one complete vendor/tie atomic group and merges controls from
+the one overlay identity pinned by the run. It never calls strategy code. The
+strategy's own loop decides whether and when to query `books()`.
 
 ### 7.6 Specs
 
@@ -1238,7 +1262,7 @@ pub enum EpisodeKind {
 
 pub enum CloseReason {
     NoLongerQualifies, DepthInsufficient,
-    LegUnusable { cause: UnusableCause },
+    LegUnavailable { cause: UnavailableCause },
     LegStale, SegmentEnd,
 }
 
@@ -1246,8 +1270,8 @@ pub struct LegFill {
     pub instrument: InstrumentId,        // which candidate was chosen
     pub side: Side,
     pub fill: Fill,
-    pub verification_age_ns: Option<i64>,
-    pub book_usable_since_ns: i64,
+    pub dependency: BookDependency,
+    pub book_available_since_ns: i64,
     pub last_update_ns: i64,             // the retired leg-skew stratum, per leg
 }
 
@@ -1264,7 +1288,7 @@ pub struct Episode {
     pub closed_at: EventAddress,
     pub opened_tie_group: Option<u64>,
     pub closed_tie_group: Option<u64>,
-    pub events_survived: u32,
+    pub observations_survived: u32,      // under this strategy's pull policy
     pub right_censored: bool,
     pub close_reason: CloseReason,
 
@@ -1290,52 +1314,114 @@ pub struct EpisodeRevision {
 time-weighted aggregates and fees from it; Rust never retains all revisions in
 memory merely to compute a median.
 
-### 7.8 Interval records
+### 7.8 Availability and audit-overlay records
 
-`Unusable` intervals are engine **output**, never tape (§2.2).
+The base availability record is settled by the captured-state boundary. The
+overlay identity/range shape below is the concrete recommendation pending
+§14.1(4), not a recorded approval.
 
-```rust
-pub struct UnusableInterval {
-    pub instrument: InstrumentId,
-    pub start_ns: i64,
-    pub end_ns: i64,
-    pub right_censored: bool,
-    pub cause: UnusableCause,
-}
-```
-
-Emitted so that "no episodes here" is never ambiguous between *no edge existed*
-and *we were blind*. Those have opposite implications for whether to keep going.
-
-Every anchor comparison against a `Provisional` or `Usable` book is emitted too.
-Positive results matter as much as negative ones: §9.1 needs the last instant a
-book was proven right, and `verification_age_ns` on an episode only looks
-backwards.
+Captured-state availability intervals are engine output, never canonical tape.
+They distinguish “no edge” from “no reconstructable book.”
 
 ```rust
-pub struct VerificationRecord {
+pub struct UnavailableInterval {
     pub instrument: InstrumentId,
-    pub source_observed_ns: i64,
-    pub received_ns: i64,
-    pub candidate_addresses: Vec<EventAddress>,
-    pub chosen_run: Option<(EventAddress, EventAddress)>,
-    pub recovered_frontier: Option<EventAddress>,
-    pub snapshot_hash: Arc<str>,
-    pub outcome: AnchorOutcome,
-    pub detection_latency_ns: Option<i64>,
-    pub recovery_latency_ns: Option<i64>,
+    pub start: EventAddress,
+    pub end: Option<EventAddress>,
+    pub cause: UnavailableCause,
 }
 
-pub enum AnchorOutcome {
-    Verified,
-    Recovered,
+pub enum RangeStart {
+    SegmentStart,
+    After(EventAddress),       // exclusive
+}
+
+pub struct InvalidationRange {
+    pub start: RangeStart,
+    pub through: Option<EventAddress>, // inclusive; None is open-ended
+}
+
+/// One endpoint or an equivalence range of level-identical endpoints. A range
+/// does not assert that any one member is the unique venue frontier.
+pub struct AnchorPlacement {
+    pub first: EventAddress,
+    pub last: EventAddress,
+}
+
+pub enum AuditControl {
+    VerifiedAt {
+        instrument: InstrumentId,
+        anchor_record: EventAddress,
+        placement: AnchorPlacement,
+    },
+    Invalidated {
+        instrument: InstrumentId,
+        range: InvalidationRange,
+        discovered_at: EventAddress,
+        previous_verified_through: Option<EventAddress>,
+        anchor_record: EventAddress,
+        candidate_placement: Option<AnchorPlacement>,
+        recovered_frontier: Option<EventAddress>,
+    },
+    AuditCoverageLost {
+        instrument: InstrumentId,
+        discovered_at: EventAddress,
+        reason: AuditFailure,
+    },
+    RecoveryAt {
+        instrument: InstrumentId,
+        at: EventAddress,
+        closes_control_id: Arc<str>,
+    },
+}
+
+pub enum AuditFailure {
+    AnchorPending,
     AnchorTooOld,
     AmbiguousAnchor,
     MissingSuffix,
     Divergence,
-    AnchorPending,
+    JournalBoundExceeded,
 }
 ```
+
+Controls live in an immutable artifact, not the base segment:
+
+```
+audit-overlays/<overlay_address>/
+  controls.ndjson.zst
+  manifest.json
+  receipt.json                 # commit marker, written last
+```
+
+The versioned, domain-separated overlay address binds the base segment address,
+auditor version/policy, exact anchor input receipt identities, and canonical
+control bytes. Controls sort by `(discovered_at, instrument, control_seq)`. A run
+pins zero or one complete overlay identity; arbitrary overlays are never merged.
+A changed auditor, input, or policy produces a new address. Re-running identical
+inputs verifies the existing receipt as a no-op or reports conflict. A later
+audit creates a new complete overlay that names the prior overlay it supersedes;
+it never appends to a committed file.
+
+`controls.ndjson.zst` is append-only while its private build transaction is open;
+the receipt seals it. “Append-only control stream” means new facts do not rewrite
+canonical evidence or old controls, not that a committed compressed frame can be
+mutated. The manifest records control count, logical/stored identities, base
+segment address, anchor receipts, auditor policy (including journal bounds), and
+superseded-overlay identity when present.
+
+A fresh strategy run merges controls when `ReplayCursor` reaches
+`discovered_at`. Reconciliation of an already committed strategy run reads that
+same pinned overlay and the strategy's recorded `BookDependency` values, then
+appends strategy-owned void records. The projector/auditor does not know what an
+episode is.
+
+**Worked invalidation.** Strategy episode E records Polymarket dependency
+`[320,340]` and Kalshi dependency `[700,706]`. A control discovered at coordinate
+501 invalidates Polymarket `(300,430]`. E intersects and the strategy appends
+`EpisodeVoided { episode_id: E, control_id, overlapping_dependency }`. An episode
+depending only on Polymarket 450+ remains. Canonical evidence, the original
+episode, the control, and the void are all immutable.
 
 ### 7.9 CLI
 
@@ -1359,14 +1445,18 @@ python -m replay.publish_segments
     --segments   DIR         receipt-committed local segment root
     --config     PATH        ObjectStore destination; publish final segments (§5.9)
 
+replay-engine audit
+    --segment    PATH        immutable base segment
+    --out        DIR         receipt-committed audit overlay
+
 replay-engine run
     --scope      PATH        build in-process without materialising a segment
   | --segment    PATH        a materialised segment, or its manifest
     --canonical  PATH        required with --scope
+    [--overlay   PATH]       zero or one verified audit overlay
     --specs      PATH        strategy specs, JSON
     --out        DIR         receipt-committed run directory containing
                              episodes, revisions, intervals, analytics, summary
-    [--parallel-evaluate]    off by default (§11)
 ```
 
 ---
@@ -1375,8 +1465,9 @@ replay-engine run
 
 ### 8.1 Episode NDJSON
 
-One episode per line, self-describing: strategy, spec hash, segment address, which
-instrument each leg used, verification ages, and bounded gross aggregates.
+One episode per line, self-describing: strategy, spec hash, segment and optional
+overlay addresses, which instrument each leg used, generic book dependencies,
+and bounded gross aggregates.
 `revisions.ndjson` carries every economically relevant fill/input change needed
 for exact netting and median calculation. Neither carries a netted number or
 verdict — those are §9's to add.
@@ -1400,54 +1491,42 @@ The same rule applies to spliced tapes: injecting book data from another source 
 time produces a synthetic segment, and episodes on one are typed differently, not
 flagged.
 
-Day 0 emits `Measurement` only. A third kind, `MeasurementDoubted`, exists on the
-Python side alone (§9.1): the engine never emits it, because only hindsight can.
+Day 0 emits `Measurement` only. Audit discrepancy does not create a producer-
+defined episode kind; each strategy's explicit policy determines whether to emit
+an append-only void (§9.1).
 
 ### 8.3 Run transaction and sink failure
 
-All output sinks write into one private run directory. The engine streams and
-fsyncs each file, writes a manifest containing every stored/logical identity,
+All strategy output sinks write into one private run directory. The strategy
+streams and fsyncs each file, writes a manifest containing every stored/logical identity,
 atomically renames the directory, fsyncs its parent, then publishes the run
 receipt last. Any sink error aborts the run: no partial file is a committed
-result and no strategy continues after another sink has failed. Retry with the
-same segment/spec/engine identities either verifies the committed run as a no-op
-or conflicts; it never appends to it.
+result. Retry with the same segment/overlay/spec/engine identities either verifies
+the committed run as a no-op or conflicts. A later reconciliation writes a new
+receipt-committed void artifact; it never appends to the committed run directory.
 
 ---
 
 ## 9. Python side
 
-Consumes `episodes.ndjson`, `revisions.ndjson`, `intervals.ndjson`, and the
-verification records from a committed run. Scales with episode/revision count,
+Consumes strategy-owned episodes, revisions, dependencies, and void records from
+a committed run. Scales with episode/revision count,
 so it is free to be slow, exploratory, and rewritten weekly.
 
-### 9.1 Retrospective demotion
+### 9.1 Strategy-owned discrepancy reconciliation
 
-The engine is causal (§6.4). Replay finalization is not, and holds the whole run.
-V1 performs the two-pass oracle in §12.9: it preserves every snapshot and
-candidate address, places an anchor by the approved completed-run rule, replays
-the exact captured suffix in scratch state, and derives maximal verified,
-provisional, and unusable intervals per instrument. `source_observed_ns` is
-evidence attached to the anchor, not sufficient placement by itself. Known
-continuity faults tighten the left boundary; a matching endpoint never validates
-a path containing a known gap.
+The optional two-pass auditor (§12.9) reads only base evidence and writes only
+the overlay in §7.8. It does not read episodes and does not decide whether a
+strategy result remains valid.
 
-Every episode leg is intersected with those final intervals. Any overlap with a
-provisional or unusable interval re-types the episode
-`MeasurementDoubted { reason, evidence_range }`. A type, not a flag (§2.6), and
-excluded from headline verdicts. The original episode and verification evidence
-remain immutable; finalization emits a derived verdict file rather than rewriting
-engine output.
-
-This restores the walk-back `trust.py` performed, in the layer that scales with
-episode count, without putting hindsight into an engine that must one day run
-live. The demoted count and gross magnitude are reported beside the headline: they
-measure the practical cost of delayed verification and continuity faults.
-
-A future one-pass engine may emit the same final intervals only after passing the
-byte-identical differential gate in §12.9. Before then its output is explicitly
-experimental/provisional and cannot feed headline verdicts merely because its
-book levels happen to match at run end.
+A strategy choosing audit sensitivity records the `BookDependency` values used
+for every decision. In a fresh run it receives controls at their deterministic
+`discovered_at` coordinate. If an overlay is produced after a run, the strategy's
+reconciler intersects that same control range with its prior dependencies and
+writes a separate receipt-committed void artifact. Original episodes remain
+immutable. No result is silently rerun, re-typed, or omitted by a central layer.
+Strategies that intentionally do not depend on price-path audit may choose a
+different policy, which must be versioned and included in their run identity.
 
 ### 9.2 Stages
 
@@ -1468,7 +1547,8 @@ book levels happen to match at run end.
 
 ## 10. Analytics
 
-A consumer (§6.6), not a stage. Same walk, same tape, own output stream.
+A pull client (§6.6), not a producer-owned stage. Same tape and book projector,
+own evaluation cadence and output stream.
 
 - **Time-weighted aggregates** over instrument state: average spread, depth at k
   ticks, quote uptime, and which venue held the most competitive odds for an event
@@ -1498,11 +1578,10 @@ scope tempting. It multiplies the decode by the scope count, which is the cost
 §5.8 exists to remove. Scopes are the fan-out inside a window's pass, not a
 parallel axis of their own.
 
-**Within a segment's evaluate phase — off by default.** Evaluation is read-only
-over book state and consumer state is per-consumer, so `rayon` over the routed set
-is safe. But once dispatch has filtered, an evaluation is a handful of comparisons
-and adds. Parallelising that behind a synchronisation barrier is a losing trade
-until profiled otherwise.
+**Within strategy evaluation — strategy-owned and deferred.** The producer stays
+serial. A strategy may later parallelize its read-only work, but the first
+implementation proves deterministic serial pull/output before adding barriers or
+worker pools.
 
 ---
 
@@ -1534,21 +1613,24 @@ implemented day 0.
 day 0 and the engine refuses substitution or locked baskets on non-`IDENTITY`
 legs. The tier is not yet *derived* automatically, so cross-venue families wait.
 
-**12.6 Money representation.** Integer tick/lot primitives with no floating
-point are taken from our existing Rust implementation (§4, Phase 0). What
-remains is per-venue scale, checked conversion, overflow, rounding, contract
-orientation, and fee-schedule identity — a Phase 0 decision, not deferred engine
-work.
+**12.6 Representation and parsing.** Phase 0 adapts the decode → normalize →
+prepare mutation → atomic publish pattern from the exact Bitfrost repository
+named in §4. It freezes integer price/quantity representation, scales, checked
+decimal parsing/rescaling, overflow, absolute/relative size, side, and contract
+orientation. Fee formulae, effective schedules, payout-currency conversion, and
+strategy-specific rounding wait for Phase 3B. Because the reference repository
+has no discoverable license declaration, its code is not copied verbatim without
+explicit permission.
 
 **12.7 Kalshi.** Its splice remains unverified against live servers
 (`ARCHITECTURE.md` §8). Kalshi legs stay out of headline results until a live
 segment exists.
 
-**12.8 Live driver.** Same books, same state machine, same consumers, and the
+**12.8 Live driver.** Same books, same state machine, same pull contract, and the
 same normaliser (§5.2 stage 5) fed from a socket instead of a canonical window.
-Not built, but the consumer API is forbidden from depending on anything only a
-replay has, and the normaliser is forbidden from depending on anything only a
-receipt has, which is what keeps it possible.
+Not built, but client strategies are forbidden from requiring producer callbacks
+or anything only a historical replay has. The normaliser remains independent of
+receipt mechanics.
 
 **12.9 Polymarket's book hash: what it is, and what we may conclude from it.**
 
@@ -1562,11 +1644,13 @@ hash space.
 That does **not** make a hash a per-delta or per-delivery certificate. Ten cases
 had two consecutive same-hash WebSocket delivery candidates: the first state
 differed from REST at one level and the second matched. Replay must preserve all
-canonical addresses and compare delivery-end states. It may use “end of the
-maximal contiguous same-asset same-hash run” as an approved, predeclared candidate
-rule, but the short sample gives only moderate confidence and no protocol
-guarantee. Non-contiguous recurrence is `AmbiguousAnchor`, not an invitation to
-pick the nearest occurrence.
+canonical addresses on disk and compare delivery-end states. V1 does **not**
+retain a full state per candidate, impose a maximal contiguous-run rule, or make
+a later hash recurrence automatically ambiguous. The auditor assesses hash,
+exact full levels/metadata, canonical order and time, and lineage after the prior
+accepted anchor. If several endpoints remain level-identical, it records their
+range and makes only conclusions valid for every placement; it does not pick the
+nearest occurrence.
 
 The SHA-1 preimage includes market, asset, timestamp, both sides, minimum order
 size, tick size, negative-risk status, and last trade. Reproduction is an
@@ -1575,52 +1659,55 @@ transition arrived, every delivery is complete, or H2→H3 suffix completeness.
 Polymarket publishes no dense source sequence. Our delivery index proves recorder
 accepted-order continuity only.
 
-**Approved for V1: two-pass is the normative oracle and default.** Pass one
-indexes every independent snapshot occurrence without collapsing equal
-`(asset, hash)` pairs.
-Pass two reconstructs WebSocket state, closes the approved candidate run,
-compares the historical frontier, resets scratch state to the full anchor when
-appropriate, and replays the exact captured suffix to the later frontier. It
-then emits final trust intervals and demotions. This is exact relative to the
-captured tape, not proof the venue emitted a complete tape.
+**V1 audit is a separate two-pass stream.** Pass one spools compact REST-anchor
+metadata and identities; pass two reconstructs WebSocket state once, compares
+delivery-end states, and emits the immutable overlay in §7.8. It never gates the
+base projector, stores a full state for every hash occurrence, resets the base
+book, or reads strategy output. Canonical evidence remains the lossless address
+journal on disk. This is exact relative to the captured tape; without a dense
+venue sequence it is not proof that the venue emitted a complete suffix.
 
-**A production one-pass path is experimental until its replacement gate
-passes.** It must predeclare a bound and retain, per asset:
+**Optional one-pass audit uses a previous-anchor checkpoint and compact journal,
+not candidate-state retention.** Per asset it keeps current levels, one latest
+accepted-anchor full checkpoint, compact normalized deltas with canonical
+addresses, and small pending-anchor metadata. Time, event-count, and byte caps
+bound each journal, and a separate global byte cap bounds the sum across a large
+bundle. A scratch book starts from the checkpoint and replays only the needed
+delta range. Overflow never makes the healthy base projector unavailable:
+it emits `AuditCoverageLost`, and an operator may explicitly run the separately
+identified two-pass audit. There is no silent fallback or hidden second tape
+walk inside one receipt.
 
-- current reconstructed levels and hash-relevant metadata;
-- every `EventAddress` in the open contiguous same-hash candidate run;
-- a bounded lossless journal/reference containing byte cost, epoch,
-  source/receipt/canonical times, parse status, and before/after frontier;
-- provisional trust and output boundaries that can be retrospectively demoted.
-
-At anchor arrival it enumerates every in-bound candidate, preserves mismatches,
-applies only the approved run rule, and replays the exact H2→current suffix in
-scratch state before replacing current state. It must not cross an epoch, parse
-reject, missing address, or known continuity fault. Journal overflow fails closed
-with `AnchorTooOld` or `MissingSuffix`; it never truncates evidence and continues
-as trusted. `AnchorPending` waits for the candidate/run closure only within the
-approved horizon. `AmbiguousAnchor`, `Divergence`, and all unresolved pending
-anchors remain explicit outcomes. Automatic two-pass fallback, if approved, uses
-a separately identified output attempt and cannot silently change semantics
-inside one committed result.
+**Worked previous-anchor bound.** A0 is accepted at coordinate 100. Store its
+full levels once; journal normalized deltas/addresses 101–500 while the primary
+captured-state book advances normally. REST anchor A1 is received at 501 but
+describes a state near 420. Copy A0 into scratch, replay 101–420, and compare A1
+using its hash, exact levels/metadata, order/time, and A0 lineage. If it matches,
+emit `VerifiedAt`; the primary book at 500 is untouched. If hash candidates exist
+but none has exact levels, emit an invalidation discovered at 501 covering
+`start = After(A0), through = None`; do not reset the current book or guess a
+suffix start. A later valid in-stream full book at 550 can emit `RecoveryAt` and
+close that range through 549. If the journal cap already evicted 101–420, emit
+`AuditCoverageLost` rather
+than asserting divergence, and keep the base captured-state book runnable. An
+explicit two-pass retry gets its own overlay address and receipt.
 
 The observed anchor→receipt maximum of **155.659 seconds** falsifies any shorter
-time bound but does not establish a production bound. Before one-pass can replace
-two-pass, run a predeclared 24-hour minimum, preferably 72-hour, stratified sample.
-It must have zero too-old, ambiguous, missing-suffix, unhandled-shape, and silent
-fallback outcomes; retain every candidate/suffix within measured byte/event/time
-bounds; and produce byte-identical books and trust intervals, reasons, demotion
-starts, and recovery ends versus two-pass. Adversarial fixtures cover startup,
-reconnect, split same-hash runs, unchanged and non-contiguous recurrence, late
-candidate arrival, stale H2/current H3, parse/continuity faults, and every bound
-overflow.
+time cap but does not establish a production bound. A one-pass optimization may
+replace the two-pass auditor only after a predeclared 24-hour minimum, preferably
+72-hour, stratified run is byte-identical in overlay controls and ranges. Tests
+cover startup, reconnect, split same-hash deliveries, unchanged and
+non-contiguous recurrence, multiple level-identical placements, late candidates,
+stale H2/current H3, parse/continuity faults, every cap overflow, and explicit
+retry identity.
 
-**12.10 No heuristic frontier fallback.** A snapshot with no unique valid hash
-candidate yields `AnchorPending`, `AnchorTooOld`, `AmbiguousAnchor`, or
-`Divergence` according to retained evidence. Source/request/receipt timestamps may
-be reported diagnostically but cannot place it. Arrival-time comparison,
-nearest-time matching, arbitrary equal-hash selection, and healthy-current-book
-reset are prohibited regardless of observed frequency.
+**12.10 No heuristic reset or hidden fallback.** Source/request/receipt times may
+constrain candidate lineage and be reported, but do not by themselves certify a
+frontier. Arrival-time comparison, nearest-time selection, arbitrary equal-hash
+selection, applying an old REST anchor to the current book, and changing audit
+mode inside one committed attempt are prohibited. Failure to place or replay an
+anchor is an audit-control outcome, not grounds to discard otherwise runnable
+base data.
 
 **12.11 Rust object retrieval.** Closed for V1 by stage 0 (§5.2): the Python
 resolve step stages stored archived windows into a local canonical root through
@@ -1646,9 +1733,8 @@ publisher writes immutable segment objects, and neither can delete archive data.
 
 - **Segment order and `event_index` are serialization orders.** `visible_ns`
   carries real timing. No lead-lag conclusion rests on either.
-- **Usability is causal and therefore strictly weaker than a retrospective
-  audit.** That is the point. The difference is measurable by replaying one
-  segment both ways.
+- **Captured-state availability is not venue completeness.** A healthy
+  WebSocket reconstruction is intentionally runnable before delayed REST audit.
 - **The engine cannot observe queue position, acknowledgements, or fills.** An
   episode is a displayed-depth opportunity, never labelled captured or filled.
 - **The fee envelope is conservative, so trigger recall is bounded below.** An
@@ -1656,9 +1742,10 @@ publisher writes immutable segment objects, and neither can delete archive data.
   recorded so the loss is quantifiable.
 - **Polymarket first-pass episodes can be emitted on a book that was already
   wrong**, for up to one poll interval before divergence is detectable (§6.5).
-  They remain provisional and are demoted after the trust pass (§9.1). Hash
-  candidates can locate a historical state (§12.9) but do not eliminate
-  uncertainty across a known gap or prove the current state.
+  An optional overlay later identifies a conservative invalid dependency range;
+  only the strategy can void a dependent decision (§9.1). Hash candidates can
+  locate a historical state (§12.9) but do not eliminate uncertainty across a
+  known gap or prove the current state.
 - **The shared hash space is strongly evidenced, not a protocol guarantee.** It
   held for 216/216 post-bootstrap snapshots and official SHA-1 reproduction held
   for 240/240. The sample had no reconnect or tick-size change and does not prove
@@ -1666,13 +1753,92 @@ publisher writes immutable segment objects, and neither can delete archive data.
 
 ---
 
-## 14. Approval checklist and completion gates
+## 14. Current A–I approval ledger and completion gates
 
-The evidence constrains safe behavior but does not choose product policy. This
-ledger records the user's numbered response on 2026-09-04. “Approved” means the
-exact contract is settled. “Partial” or “conditional” does not authorize the
-recommended default. Implementations may expose unresolved alternatives behind
-types and tests but may not select one in a committed segment or headline result.
+This ledger interprets the latest A–I response as a simplification of the
+architecture, not as approval of the earlier recommendations. Only explicit
+choices are marked approved. The prior numbered ledger is retained in Appendix A
+as response history and has no normative force.
+
+| Item | Status | Current disposition |
+|---|---|---|
+| A — same-hash candidates | **Prior rule rejected; replacement pending** | Mandatory contiguous-run retention, a full in-memory state per candidate, and automatic ambiguity on later recurrence are rejected. Canonical addresses still remain on disk. Assessment by exact levels/metadata, order/time, and prior-anchor lineage is the proposed replacement. The bounded checkpoint/journal optimization in §12.9 is not approved. |
+| B — strategy triggers | **Approved redirection** | The producer owns only ordered atomic mutation and a pull cursor. Each strategy owns filtering, pull/evaluation cadence, dependencies, and output. No trigger registration or producer callback remains. |
+| C — malformed inputs | **Approved intent; ownership corrected by repository invariant** | Malformed canonical envelope/provenance fails in `indexer-finalize`; malformed venue/book/control payload fails in strict Rust normalization. The payload-agnostic finalizer cannot perform venue validation. `book` receives only closed events or an already classified `NormalizationFault` and never interprets malformed wire. |
+| D — REST prerequisite | **Approved redirection** | A healthy WebSocket full book initializes a runnable captured-state book. REST is delayed optional audit evidence, never a universal promotion gate. |
+| E — previous-anchor bound | **Pending** | §12.9 gives the requested concrete checkpoint, journal, overflow, retry, and receipt example. Recommended V1 default: ship the separate two-pass auditor first and defer bounded one-pass audit. |
+| F — discrepancy consequences | **Direction approved; artifact details and Clip pending** | The producer never reruns or voids strategies. An immutable overlay reports exact invalid dependency ranges; strategies append their own voids. §7.8 gives a worked example. Whether to use the proposed one-overlay-per-run identity and whether the base selector uses `Clip` remain unapproved. |
+| G — certification modes | **Approved rejection/simplification** | No certified-only headline mode or separate “uncertified diagnostic” run type. Replay uses `AllowUncertified`, strictly verifies bytes/receipts/provenance, preserves coverage faults, and allows healthy lanes to run. |
+| H — unknown attribution | **Conditional; minimum pending** | Unknown requested books remain `NotInitialized` rather than poisoning a whole scope. A minimal adapter-owned lane→venue/stream role is still needed to tell a missing required book lane from a missing optional snapshot lane; no deployment-wide map is proposed. |
+| I — representation/parsing | **Approved** | Freeze the representation/parser/book boundary before economics. The exact intended reference is `github.com/hridyansh07/bitfrost-prime-take-home`; adopt its architecture, not verbatim unlicensed code. Fee/economic policy remains Phase 3B. |
+
+### 14.1 Smallest remaining decisions
+
+1. **Input lower bound.** Keep `[T0 − prologue, T1)` as the exact base input and
+   use `LowerBoundPolicy::Clip` after auditing the complete first storage window?
+   This only excludes pre-bound records; it never substitutes a prior price or
+   imposes tick tolerance. **Recommended: yes.** The alternative,
+   `ExpandToWindowStart`, changes segment bytes/address and exposes earlier state.
+2. **Minimal attribution.** Approve the normalizer adapter registry's stable
+   `lane_id → venue/stream role`, used only so a missing book lane leaves its
+   requested books `NotInitialized` while a missing REST lane removes audit
+   coverage? For example, a missing recognized `polymarket` WebSocket lane affects
+   requested Polymarket books; a missing `polymarket_snapshots` lane affects only
+   REST audit. The finalizer proves the lane fault but, because it is payload-
+   agnostic, cannot infer those affected Replay scopes. **Recommended: yes.**
+   Custom/twin lanes then require explicit adapter configuration rather than
+   guessed attribution.
+3. **One-pass audit.** Defer it and ship only the receipt-bound two-pass overlay,
+   or include the bounded previous-anchor optimization later? If included,
+   approve `AuditCoverageLost` on overflow plus a separately addressed/receipted
+   two-pass retry, never silent fallback. **Recommended: defer until the 24–72 h
+   equivalence study.**
+4. **Overlay selection.** Approve one complete immutable overlay identity pinned
+   per strategy run, with a new complete superseding overlay for changed evidence
+   or policy and no arbitrary merge of independently produced overlays?
+   **Recommended: yes;** this avoids undefined control ordering and duplicate
+   invalidations.
+
+### 14.2 Revised completion gates
+
+1. **Phase 0 boundary integrated.** Universe responses pin context identities;
+   the Phase-0 selector rejects gaps/overlaps; the audited stream reaches EOF and
+   `finish()` before segment commit; `AllowUncertified` preserves coverage facts;
+   normalization follows the approved representation/parsing split.
+2. **Serial reconciler conformant.** Every normalized child preserves canonical
+   address, tie group, source provenance, and continuity. Malformed venue/control
+   data becomes a receipt-bound reject plus classified fault before `book`.
+3. **Base projector correct.** A WebSocket full book initializes without REST;
+   pull updates never expose partial deliveries/tie groups; duplicates do not
+   mutate; conflicts, known continuity faults, impossible relative mutations,
+   reconnects, and overflows have deterministic availability outcomes.
+4. **Audit overlay correct.** Two-pass output is immutable, ordered, base/input-
+   bound, and independently verified. It covers split/repeated hashes, delayed
+   H2/current H3, level-identical placements, missing suffixes, open invalidation
+   ranges, and explicit retry identity without modifying the base projector.
+5. **Strategy contract correct.** Strategy-owned cadence is in run identity;
+   every decision records generic book dependencies; a late control voids exactly
+   intersecting decisions and leaves unrelated decisions unchanged.
+6. **Economics and operations bounded.** Offline pinned fee vectors are exact;
+   sink failures cannot commit partial output; workers, staging, temporary slices,
+   and storage have measured caps; publication reuses the Python `ObjectStore`;
+   V1 has no archive deletion authority.
+
+Phase 0–2 may proceed without resolving the optional one-pass optimization.
+Lower-bound and minimal-attribution decisions are required before a production
+segment contract is frozen; overlay selection is required before Phase 3A commits
+audit artifacts.
+
+---
+
+## Appendix A. Superseded numbered response ledger
+
+> Historical context only. The decision requests below were superseded by the
+> A–I response and must not be treated as current approval requirements.
+
+The table below records the earlier numbered response on 2026-09-04. Its statuses
+and decision requests are superseded by §14 and are retained only to explain how
+the design changed.
 
 | # | Decision | Status | Recorded disposition |
 |---:|---|---|---|
@@ -1689,9 +1855,9 @@ types and tests but may not select one in a committed segment or headline result
 | 11 | Deployment lane attribution | **Pending explanation/decision** | `indexer-finalize` detects missing/invalid lanes and preserves provenance, but cannot infer which Replay instruments a wholly absent or pre-prologue lane carried. See §14.1.8. |
 | 12 | Money and fee inputs | **Conditional** | Fixed-point/economic semantics are approved only in conjunction with the economics implementation. The minimum boundary primitives versus deferred fee policy still need confirmation. See §14.1.9. |
 
-### 14.1 Clarifications and exact decision requests
+### A.1 Prior clarifications and decision requests
 
-#### 14.1.1 Same-hash candidate completion (#2)
+#### A.1.1 Same-hash candidate completion (#2)
 
 A *maximal contiguous same-asset/same-hash candidate run* is the longest sequence
 of adjacent canonical WebSocket deliveries for one asset carrying hash H, ending
@@ -1715,7 +1881,7 @@ WebSocket recurrence.
 a versioned V1 *anchor-candidate* rule, with every constituent address retained
 and any non-contiguous recurrence reported as `AmbiguousAnchor`?
 
-#### 14.1.2 Mutation, evaluation, and observability (#3)
+#### A.1.2 Mutation, evaluation, and observability (#3)
 
 Book mutation order is not strategy-specific: normalized changes apply in
 canonical order, after completing only proven atomic boundaries (one vendor
@@ -1734,7 +1900,7 @@ the strategy specification.
 **Decision request:** approve this per-consumer trigger contract, with
 price/depth consumers triggered after every relevant completed mutation group?
 
-#### 14.1.3 Unknown controls (#4)
+#### A.1.3 Unknown controls (#4)
 
 The control's exact canonical envelope may contain anything and is always
 preserved. Replay must not invent semantics for an unknown shape. A known
@@ -1749,7 +1915,7 @@ unknown, #11 decides whether the whole scope becomes unobservable.
 unknown or malformed controls stale every attributable book, while preserving the
 exact record and reject”?
 
-#### 14.1.4 Anchors, pending, and first snapshot (#6 and #10)
+#### A.1.4 Anchors, pending, and first snapshot (#6 and #10)
 
 The independent anchors in this design are full-book responses from the separate
 Polymarket snapshot lane polling REST `POST /books`. A WebSocket `book` event is
@@ -1771,7 +1937,7 @@ interval but may not read beyond `T1` merely to manufacture resolution.
 placed independent REST anchor plus required suffix handling, and approve the
 pending horizon above?
 
-#### 14.1.5 Explicit retry versus silent fallback (#7)
+#### A.1.5 Explicit retry versus silent fallback (#7)
 
 Silent fallback means one committed run starts with bounded one-pass semantics,
 encounters an old/ambiguous anchor, secretly rereads arbitrary history with
@@ -1787,7 +1953,7 @@ This is reproducible and operationally schedulable, but costs another tape walk.
 **Decision request:** allow that explicit two-pass retry, or require the asset to
 remain unavailable until a later full anchor with no automatic retry?
 
-#### 14.1.6 Lower-bound clipping is not price imputation (#8)
+#### A.1.6 Lower-bound clipping is not price imputation (#8)
 
 Canonical windows are 30-minute storage units. If the requested Replay input
 starts at 10:07, `Clip` audits the whole 10:00 window but yields only records at
@@ -1805,7 +1971,7 @@ increments, not how far an unseen book may have moved.
 previous-price imputation and `NotBootstrapped` until real full-book evidence in
 the admitted prologue/interval?
 
-#### 14.1.7 Certified canonical windows (#9)
+#### A.1.7 Certified canonical windows (#9)
 
 The finalizer may commit an immutable window even when expected evidence was
 missing or unsafe, so healthy lanes are not blocked forever. Its receipt sets
@@ -1822,7 +1988,7 @@ intervals but must not silently call absence “no opportunity.”
 **Decision request:** require certified windows for headline results and permit
 uncertified windows only in a separately typed diagnostic run?
 
-#### 14.1.8 What the finalizer cannot attribute (#11)
+#### A.1.8 What the finalizer cannot attribute (#11)
 
 `indexer-finalize` proves which deployment lanes were expected, present, missing,
 or invalid; verifies every admitted envelope/provenance pair; and preserves each
@@ -1841,7 +2007,7 @@ Replay scopes.
 scope closed when neither it nor runtime evidence can prove a missing lane
 irrelevant?
 
-#### 14.1.9 Boundary primitives versus economics policy (#12)
+#### A.1.9 Boundary primitives versus economics policy (#12)
 
 Phase 0 must freeze only what the typed normalizer/book needs to be deterministic:
 integer-backed price and quantity types; explicit scale/unit metadata; exact
@@ -1859,7 +2025,7 @@ headline output. No current venue service may price historical evidence.
 Phase 0, and freeze fee/conversion policy with the Phase 3 economics module before
 headline use?
 
-### 14.2 Phase acceptance
+### A.2 Prior phase acceptance
 
 1. **Phase 0 boundary integrated.** Universe responses pin all context identities;
    the lane-role map and approved selector policies are versioned; the Phase-0
