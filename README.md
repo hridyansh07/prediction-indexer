@@ -44,6 +44,7 @@ targeter/            v2 motivation and sports discovery/archive/publication; leg
 ingester/            Rust: daily fact-store partitions, sequencing, continuity, retention
 encoder/             the shared Zstandard codec — Python and Rust, streaming only
 archive/             raw/canonical archiver, immutable object store, dual-receipt reaper
+engine/              Rust Replay domain/numeric boundary (S2; no venue adapters)
 analysis/             masks, outcome space, void policy, partition sums
 scripts/             analysis pipelines and historical pulls
 docs/                cross-cutting specs, deployment guide, venue API notes
