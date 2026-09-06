@@ -1,5 +1,5 @@
+use canonical_normalizer::validate_code;
 use replay_domain::{EventHeader, FaultImpact, InstrumentId, SEGMENT_SCHEMA_VERSION, Sha256};
-use replay_normalize::validate_code;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_VERSION: u16 = 1;

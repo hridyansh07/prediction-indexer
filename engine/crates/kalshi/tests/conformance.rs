@@ -1,8 +1,8 @@
+use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
+use kalshi_normalizer::{Config, Kalshi, NORMALIZER_BUNDLE_ID};
 use replay_domain::{BookEvent, ContractOrientation, SegmentEvent, Side};
-use replay_kalshi::{ADAPTER_BUNDLE_ID, Config, Kalshi};
-use replay_normalize::{Normalization, Normalize, Normalizer, segment_record};
 use serde_json::{Value, json};
 
 const SNAPSHOT: &str = include_str!("fixtures/orderbook_snapshot.json");
@@ -91,7 +91,7 @@ fn descriptor_is_versioned_and_config_changes_identity() {
     );
     assert_eq!(
         default.descriptor().bundle_sha256,
-        Sha256::digest(ADAPTER_BUNDLE_ID.as_bytes())
+        Sha256::digest(NORMALIZER_BUNDLE_ID.as_bytes())
     );
     assert_eq!(
         default.descriptor().config_sha256,

@@ -5,6 +5,9 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use canonical_normalizer::{
+    Normalization, Normalize, NormalizerDescriptor, NormalizerError, ParseReject,
+};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract as CanonicalCompression, DecodedIdentity, InputSegment,
     Receipt as CanonicalReceipt, StoredIdentity as CanonicalStored, window_directory,
@@ -14,9 +17,6 @@ use prediction_encoder::{
     StreamingDecoder, encode_stream, encoder_version,
 };
 use replay_domain::{ControlEvent, FaultImpact, LaneId, SEGMENT_SCHEMA_VERSION, SegmentEvent};
-use replay_normalize::{
-    Normalization, Normalize, NormalizerDescriptor, NormalizerError, ParseReject,
-};
 use serde_json::{Value, json};
 use tempdir::TempDir;
 

@@ -36,6 +36,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "canonical-normalizer"
+version = "0.1.0"
+dependencies = [
+ "indexer-finalize",
+ "indexer-types",
+ "replay-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,6 +225,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kalshi-normalizer"
+version = "0.1.0"
+dependencies = [
+ "canonical-normalizer",
+ "indexer-finalize",
+ "indexer-types",
+ "prediction-encoder",
+ "replay-domain",
+ "replay-materialize",
+ "serde",
+ "serde_json",
+ "tempdir",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,45 +362,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "replay-kalshi"
-version = "0.1.0"
-dependencies = [
- "indexer-finalize",
- "indexer-types",
- "prediction-encoder",
- "replay-domain",
- "replay-materialize",
- "replay-normalize",
- "serde",
- "serde_json",
- "tempdir",
-]
-
-[[package]]
 name = "replay-materialize"
 version = "0.1.0"
 dependencies = [
+ "canonical-normalizer",
  "fs2",
  "indexer-finalize",
  "indexer-types",
  "prediction-encoder",
  "replay-domain",
- "replay-normalize",
  "serde",
  "serde_json",
  "sha2",
  "tempdir",
-]
-
-[[package]]
-name = "replay-normalize"
-version = "0.1.0"
-dependencies = [
- "indexer-finalize",
- "indexer-types",
- "replay-domain",
- "serde",
- "serde_json",
 ]
 
 [[package]]

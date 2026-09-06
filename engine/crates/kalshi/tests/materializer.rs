@@ -1,18 +1,18 @@
 use std::fs;
 use std::io::Cursor;
 
+use canonical_normalizer::{Normalize, Normalizer};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract as CanonicalCompression, DecodedIdentity, InputSegment,
     Receipt as CanonicalReceipt, StoredIdentity as CanonicalStored, window_directory,
 };
 use indexer_types::{ContentHash, EnvelopeView, Sha256};
+use kalshi_normalizer::Kalshi;
 use prediction_encoder::{DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version};
 use replay_domain::SEGMENT_SCHEMA_VERSION;
-use replay_kalshi::Kalshi;
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
-use replay_normalize::{Normalize, Normalizer};
 use serde_json::json;
 use tempdir::TempDir;
 

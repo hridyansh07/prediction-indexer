@@ -1,16 +1,16 @@
 use std::collections::BTreeSet;
 
+use canonical_normalizer::{CanonicalEnvelope, Normalization, NormalizerError, VenueAdapter};
 use indexer_types::{RecordKind, SourceCursor, Stream, Venue};
-use replay_normalize::{CanonicalEnvelope, Normalization, NormalizerError, VenueAdapter};
 use serde_json::Value;
 
 use crate::{
-    ADAPTER_BUNDLE_ID, Config, PARSER_VERSION,
+    Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION,
     message::{MessageOutcome, ProcessOutcome, normalize_message, normalize_process},
 };
 
 /// Kalshi's venue-specific extension. Canonical-envelope handling, descriptor
-/// construction, and lifecycle are inherited from `replay_normalize::Normalizer`.
+/// construction, and lifecycle are inherited from `canonical_normalizer::Normalizer`.
 pub struct Kalshi {
     config: Config,
 }
@@ -39,7 +39,7 @@ impl VenueAdapter for Kalshi {
 
     const VENUE: Venue = Venue::Kalshi;
     const PARSER_VERSION: u32 = PARSER_VERSION;
-    const BUNDLE_ID: &'static str = ADAPTER_BUNDLE_ID;
+    const BUNDLE_ID: &'static str = NORMALIZER_BUNDLE_ID;
 
     fn config_identity(&self) -> Self::ConfigIdentity {
         self.config

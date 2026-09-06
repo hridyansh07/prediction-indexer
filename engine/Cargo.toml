@@ -16,7 +16,7 @@ prediction-encoder = { path = "../encoder/rust" }
 indexer-finalize = { path = "../ingester/crates/finalize" }
 indexer-types = { path = "../ingester/crates/types" }
 replay-domain = { path = "crates/domain" }
-replay-normalize = { path = "crates/normalize" }
+canonical-normalizer = { path = "crates/normalize" }
 replay-materialize = { path = "crates/materialize" }
 
 [workspace.lints.rust]

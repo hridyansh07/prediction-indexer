@@ -1,7 +1,7 @@
-# Kalshi Replay normalizer v1
+# Kalshi normalizer v1
 
-`replay-kalshi` is the first venue extension for the shared
-`replay_normalize::Normalizer`. The shared normalizer consumes an audited
+`kalshi-normalizer` is the first venue extension for the shared
+`canonical_normalizer::Normalizer`. The shared normalizer consumes an audited
 `JoinedCanonicalRecord`, validates and decodes its envelope and raw JSON once,
 then passes a `CanonicalEnvelope` to `Kalshi` through the `VenueAdapter` trait.
 The adapter returns Replay-domain events, an intentional ignore, or one stable
@@ -17,7 +17,7 @@ closed Replay event invariants remain in `replay-domain`.
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of
-  `prediction-indexer/replay-kalshi/v1`. Semantic changes require a version
+  `prediction-indexer/kalshi-normalizer/v1`. Semantic changes require a version
   bump.
 - `Config` exposes typed price scale, quantity scale, and `use_yes_price`
   variables. The shared normalizer hashes its canonical struct serialization

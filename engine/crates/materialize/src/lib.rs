@@ -17,6 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use canonical_normalizer::{Normalization, Normalize, event_header, segment_record, validate_code};
 use fs2::FileExt;
 use indexer_finalize::{
     CanonicalSelection, CertifiedPolicy, LowerBoundPolicy, SelectionPolicy, create_dir_all_durable,
@@ -26,8 +27,7 @@ pub use indexer_types::Sha256;
 use prediction_encoder::{
     CODEC_VERSION, DEFAULT_ZSTD_LEVEL, EncodeResult, StreamingEncoder, encoder_version,
 };
-use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent};
-use replay_normalize::{Normalization, Normalize, event_header, segment_record, validate_code};
+use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentRecord};
 use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
@@ -203,7 +203,7 @@ where
             Normalization::Events(children) if children.is_empty() => {
                 let header = event_header(&source, 0)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                let envelope = String::from_utf8(source.envelope.clone())
+                let envelope = String::from_utf8(source.envelope)
                     .map_err(|error| BuildError::Serialization(error.to_string()))?;
                 let ignored = RejectRecord::ignored(header, envelope, "zero_children".to_owned())
                     .map_err(BuildError::Serialization)?;
@@ -238,7 +238,7 @@ where
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
                 let header = event_header(&source, 0)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                let envelope = String::from_utf8(source.envelope.clone())
+                let envelope = String::from_utf8(source.envelope)
                     .map_err(|error| BuildError::Serialization(error.to_string()))?;
                 let ignored = RejectRecord::ignored(header, envelope, reason_code)
                     .map_err(BuildError::Serialization)?;
@@ -260,7 +260,11 @@ where
                     reject_id(&address, &source, reject.parser_version, &reject.error_code);
                 let header = event_header(&source, 0)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                let envelope = String::from_utf8(source.envelope.clone())
+                // A reject produces both a sidecar record and a domain fault.
+                // Duplicate their small typed header, then consume the sole raw
+                // envelope allocation into the sidecar.
+                let fault_header = header.clone();
+                let envelope = String::from_utf8(source.envelope)
                     .map_err(|error| BuildError::Serialization(error.to_string()))?;
                 let sidecar = RejectRecord::parse_reject(
                     header,
@@ -282,8 +286,9 @@ where
                 write_line(&mut rejects, &encoded, REJECTS_FILE)?;
                 let fault = NormalizationFault::new(reject_id, reject.impact)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                let record = segment_record(&source, 0, SegmentEvent::NormalizationFault(fault))
-                    .map_err(|error| BuildError::Normalizer(error.to_string()))?;
+                let record =
+                    SegmentRecord::new(fault_header, SegmentEvent::NormalizationFault(fault))
+                        .map_err(|error| BuildError::Normalizer(error.to_string()))?;
                 write_line(&mut events, &record.to_canonical_json(), EVENTS_FILE)?;
                 counts.rejected_source_records =
                     checked_add(counts.rejected_source_records, 1, "rejected_source_records")?;

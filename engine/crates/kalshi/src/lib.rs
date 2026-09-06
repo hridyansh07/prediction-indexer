@@ -1,4 +1,4 @@
-//! Kalshi venue support for the shared Replay normalizer.
+//! Kalshi venue support for canonical-envelope normalization.
 
 mod adapter;
 mod config;
@@ -11,4 +11,4 @@ pub use adapter::Kalshi;
 pub use config::Config;
 
 pub const PARSER_VERSION: u32 = 1;
-pub const ADAPTER_BUNDLE_ID: &str = "prediction-indexer/replay-kalshi/v1";
+pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/kalshi-normalizer/v1";

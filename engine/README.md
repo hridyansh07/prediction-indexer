@@ -59,7 +59,7 @@ position and event index remain serialization order, never event time.
 Phase 0 continues to own `CanonicalSelection`, `AuditedCanonicalReader`,
 `JoinedCanonicalRecord`, canonical receipt identities, and its finished-audit
 capability in `indexer-finalize`. Replay deliberately duplicates none of them.
-`replay-normalize` performs one exhaustive conversion from each audited joined
+`canonical-normalizer` performs one exhaustive conversion from each audited joined
 record into:
 
 ```text
@@ -80,7 +80,7 @@ conversion uses an exhaustive match, not string fallback.
 
 ## Normalization and materialization
 
-`replay-normalize::Normalizer<A>` implements the normalization lifecycle once.
+`canonical-normalizer::Normalizer<A>` implements the normalization lifecycle once.
 It decodes each canonical envelope and raw JSON payload, routes by venue, hashes
 the adapter's typed canonical configuration, and delegates venue wire semantics
 through `VenueAdapter`. Its `Normalize` implementation returns zero/many closed

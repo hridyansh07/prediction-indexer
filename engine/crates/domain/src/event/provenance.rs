@@ -18,7 +18,7 @@ pub enum ContinuityVerdict {
     Conflict,
 }
 
-/// Replay-owned downstream provenance. `replay-normalize` converts from the
+/// Replay-owned downstream provenance. `canonical-normalizer` converts from the
 /// audited Phase 0 record; no finalizer receipt type is copied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

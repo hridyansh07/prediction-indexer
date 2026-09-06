@@ -1,5 +1,5 @@
 [package]
-name = "replay-kalshi"
+name = "kalshi-normalizer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ workspace = true
 indexer-finalize = { workspace = true }
 indexer-types = { workspace = true }
 replay-domain = { workspace = true }
-replay-normalize = { workspace = true }
+canonical-normalizer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
