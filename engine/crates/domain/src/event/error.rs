@@ -4,7 +4,6 @@ use core::fmt;
 pub enum DomainError {
     Empty(&'static str),
     InvalidInstrumentId,
-    InvalidDigest,
     InvalidCanonicalSequence,
     InvalidSourceLine,
     OrderClockMismatch,
@@ -26,7 +25,6 @@ impl fmt::Display for DomainError {
             Self::InvalidInstrumentId => {
                 formatter.write_str("instrument_id must be venue-qualified")
             }
-            Self::InvalidDigest => formatter.write_str("digest must be 64 lowercase hex bytes"),
             Self::InvalidCanonicalSequence => formatter.write_str("canonical_seq must be positive"),
             Self::InvalidSourceLine => formatter.write_str("source_line_number must be positive"),
             Self::OrderClockMismatch => {

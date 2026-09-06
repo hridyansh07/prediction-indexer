@@ -24,6 +24,10 @@ use super::*;
 
 const SOURCE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+fn digest(byte: char) -> Sha256 {
+    Sha256::from_hex(&byte.to_string().repeat(64)).unwrap()
+}
+
 #[derive(Clone)]
 enum FakeMode {
     Normal,
@@ -47,8 +51,8 @@ impl IgnoreAllNormalizer {
     fn new() -> Self {
         Self {
             descriptor: NormalizerDescriptor {
-                bundle_sha256: "b".repeat(64),
-                config_sha256: "c".repeat(64),
+                bundle_sha256: digest('b'),
+                config_sha256: digest('c'),
             },
         }
     }
@@ -79,8 +83,8 @@ impl FakeNormalizer {
             mode,
             finished: false,
             descriptor: NormalizerDescriptor {
-                bundle_sha256: "b".repeat(64),
-                config_sha256: "c".repeat(64),
+                bundle_sha256: digest('b'),
+                config_sha256: digest('c'),
             },
         }
     }
@@ -141,10 +145,10 @@ impl Normalizer for FakeNormalizer {
 fn spec() -> DerivativeSpec {
     DerivativeSpec {
         normalized_schema_version: SEGMENT_SCHEMA_VERSION,
-        normalizer_bundle_sha256: "b".repeat(64),
-        normalizer_config_sha256: "c".repeat(64),
+        normalizer_bundle_sha256: digest('b'),
+        normalizer_config_sha256: digest('c'),
         policy: NormalizationPolicy {
-            policy_sha256: "d".repeat(64),
+            policy_sha256: digest('d'),
             effective_from_ns: 0,
             effective_until_ns: Some(10),
         },
@@ -268,12 +272,12 @@ fn event_indexes(derivative: &VerifiedDerivative) -> Vec<(i64, u32)> {
     let output = &derivative.manifest.events;
     let file = fs::File::open(derivative.directory.join("events.ndjson.zst")).unwrap();
     let logical = CodecLogical {
-        sha256: output.logical.sha256.clone(),
+        sha256: output.logical.sha256.as_hex(),
         byte_length: output.logical.byte_length,
         line_count: output.logical.line_count,
     };
     let stored = CodecStored {
-        sha256: output.stored.sha256.clone(),
+        sha256: output.stored.sha256.as_hex(),
         byte_length: output.stored.byte_length,
     };
     let decoder =
@@ -308,12 +312,12 @@ fn first_reject_json(derivative: &VerifiedDerivative) -> Vec<u8> {
     let output = &derivative.manifest.rejects;
     let file = fs::File::open(derivative.directory.join("rejects.ndjson.zst")).unwrap();
     let logical = CodecLogical {
-        sha256: output.logical.sha256.clone(),
+        sha256: output.logical.sha256.as_hex(),
         byte_length: output.logical.byte_length,
         line_count: output.logical.line_count,
     };
     let stored = CodecStored {
-        sha256: output.stored.sha256.clone(),
+        sha256: output.stored.sha256.as_hex(),
         byte_length: output.stored.byte_length,
     };
     let decoder =
@@ -358,7 +362,7 @@ fn streams_zero_many_and_rejects_then_commits_a_verified_derivative() {
     );
     assert_eq!(event_indexes(&built.derivative), [(1, 0), (1, 1), (3, 0)]);
     assert_eq!(built.derivative.pin.derivative_address.len(), 64);
-    assert_eq!(built.derivative.pin.receipt_sha256.len(), 64);
+    assert_eq!(built.derivative.pin.receipt_sha256.as_bytes().len(), 32);
     assert!(built.derivative.directory.join("receipt.json").is_file());
 }
 
@@ -428,7 +432,7 @@ fn mismatched_normalizer_descriptor_commits_nothing() {
     let output = TempDir::new("normalized").unwrap();
     canonical_fixture(canonical.path());
     let mut normalizer = FakeNormalizer::new(FakeMode::Normal);
-    normalizer.descriptor.config_sha256 = "e".repeat(64);
+    normalizer.descriptor.config_sha256 = digest('e');
     let error = build_window(
         canonical.path(),
         output.path(),
@@ -470,29 +474,33 @@ fn address_binds_every_version_and_policy_input() {
         window_start_ns: 0,
         window_end_ns: 10,
         byte_length: 100,
-        sha256: "a".repeat(64),
+        sha256: digest('a'),
         certified: true,
     };
     let base = spec();
     let base_address = derivative_address(&source, &base).unwrap();
+    assert_eq!(
+        base_address,
+        "a77a7b7a98b6aa5f62e65dc8a82221ea761fecedf977fc0be7ce64fb8ea0e5cf"
+    );
     let mut variants = Vec::new();
     let mut changed = base.clone();
     changed.normalized_schema_version += 1;
     variants.push(derivative_address(&source, &changed).unwrap());
     changed = base.clone();
-    changed.normalizer_bundle_sha256 = "e".repeat(64);
+    changed.normalizer_bundle_sha256 = digest('e');
     variants.push(derivative_address(&source, &changed).unwrap());
     changed = base.clone();
-    changed.normalizer_config_sha256 = "e".repeat(64);
+    changed.normalizer_config_sha256 = digest('e');
     variants.push(derivative_address(&source, &changed).unwrap());
     changed = base.clone();
-    changed.policy.policy_sha256 = "e".repeat(64);
+    changed.policy.policy_sha256 = digest('e');
     variants.push(derivative_address(&source, &changed).unwrap());
     changed = base.clone();
     changed.policy.effective_until_ns = Some(11);
     variants.push(derivative_address(&source, &changed).unwrap());
     let mut changed_source = source;
-    changed_source.sha256 = "f".repeat(64);
+    changed_source.sha256 = digest('f');
     variants.push(derivative_address(&changed_source, &base).unwrap());
     assert!(variants.iter().all(|address| address != &base_address));
     assert_eq!(
@@ -663,6 +671,9 @@ fn strict_reader_rejects_unknown_versions_fields_and_corrupt_frames() {
     let mut manifest = serde_json::to_value(&built.derivative.manifest).unwrap();
     manifest["unknown"] = json!(true);
     assert!(serde_json::from_value::<DerivativeManifest>(manifest).is_err());
+    let mut manifest = serde_json::to_value(&built.derivative.manifest).unwrap();
+    manifest["normalizer_bundle_sha256"] = json!("B".repeat(64));
+    assert!(serde_json::from_value::<DerivativeManifest>(manifest).is_err());
 
     let frame = built.derivative.directory.join("events.ndjson.zst");
     let mut bytes = fs::read(&frame).unwrap();
@@ -686,9 +697,9 @@ fn changed_source_receipt_and_normalizer_versions_coexist() {
     )
     .unwrap();
     let mut newer = spec();
-    newer.normalizer_bundle_sha256 = "e".repeat(64);
+    newer.normalizer_bundle_sha256 = digest('e');
     let mut newer_normalizer = FakeNormalizer::new(FakeMode::Normal);
-    newer_normalizer.descriptor.bundle_sha256 = "e".repeat(64);
+    newer_normalizer.descriptor.bundle_sha256 = digest('e');
     let second = build_window(
         canonical.path(),
         output.path(),

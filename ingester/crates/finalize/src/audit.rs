@@ -8,12 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use indexer_types::EnvelopeView;
+use indexer_types::{EnvelopeView, Sha256};
 use prediction_encoder::{
     LogicalIdentity, StoredIdentity as CodecStoredIdentity, StreamingDecoder,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::canonical::{
     CanonicalOutput, CanonicalOutputsState, Receipt, canonical_outputs_state, committed_windows,
@@ -66,7 +65,7 @@ pub struct ReceiptIdentity {
     pub window_start_ns: u64,
     pub window_end_ns: u64,
     pub byte_length: u64,
-    pub sha256: String,
+    pub sha256: Sha256,
     pub certified: bool,
 }
 
@@ -240,10 +239,10 @@ pub enum ContinuityVerdict {
 pub struct CanonicalProvenance {
     pub canonical_seq: i64,
     pub lane_id: String,
-    pub source_segment_sha256: String,
+    pub source_segment_sha256: Sha256,
     pub source_line_number: u64,
     pub record_id: String,
-    pub content_hash: String,
+    pub content_hash: Sha256,
     pub continuity_verdict: ContinuityVerdict,
     pub visible_tie_group: Option<u64>,
 }
@@ -267,9 +266,9 @@ pub struct JoinedCanonicalRecord {
     pub visible_tie_group: Option<u64>,
     pub event_address: EventAddress,
     pub record_id: String,
-    pub source_segment_sha256: String,
+    pub source_segment_sha256: Sha256,
     pub source_line_number: u64,
-    pub content_hash: String,
+    pub content_hash: Sha256,
     pub continuity: ContinuityVerdict,
 }
 
@@ -305,7 +304,7 @@ struct WindowReader {
     receipt: Receipt,
     evidence: std::io::BufReader<StreamingDecoder<std::fs::File>>,
     provenance: std::io::BufReader<StreamingDecoder<std::fs::File>>,
-    sources: BTreeMap<(String, String), BTreeSet<u64>>,
+    sources: BTreeMap<(String, Sha256), BTreeSet<u64>>,
     count: u64,
 }
 
@@ -331,8 +330,14 @@ impl WindowReader {
             std::io::BufReader::new(open_decoder(&directory, &selected.receipt.provenance)?);
         let mut sources = BTreeMap::<_, BTreeSet<_>>::new();
         for input in &selected.receipt.inputs {
+            let source_sha256 = Sha256::from_hex(&input.sha256).map_err(|error| {
+                format!(
+                    "canonical input {} has invalid sha256: {error}",
+                    input.data_file
+                )
+            })?;
             sources
-                .entry((input.lane.clone(), input.sha256.clone()))
+                .entry((input.lane.clone(), source_sha256))
                 .or_default()
                 .insert(input.line_count);
         }
@@ -389,10 +394,7 @@ impl WindowReader {
         }
         let source_lines = self
             .sources
-            .get(&(
-                provenance.lane_id.clone(),
-                provenance.source_segment_sha256.clone(),
-            ))
+            .get(&(provenance.lane_id.clone(), provenance.source_segment_sha256))
             .ok_or_else(|| {
                 format!(
                     "window {} provenance line {} names no canonical input",
@@ -432,7 +434,9 @@ impl WindowReader {
                 self.receipt.window_start_ns, self.count
             ));
         }
-        let content_hash = indexer_types::ContentHash::hash(view.raw_payload.as_bytes()).to_hex();
+        let content_hash = Sha256::from_bytes(
+            *indexer_types::ContentHash::hash(view.raw_payload.as_bytes()).as_bytes(),
+        );
         if content_hash != provenance.content_hash {
             return Err(format!(
                 "window {} line {} content_hash disagrees with provenance",
@@ -632,7 +636,7 @@ fn receipt_identity(root: &Path, receipt: &Receipt) -> Result<ReceiptIdentity, S
         window_start_ns: receipt.window_start_ns,
         window_end_ns: receipt.window_end_ns,
         byte_length: bytes.len() as u64,
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        sha256: Sha256::digest(&bytes),
         certified: receipt.certified,
     })
 }

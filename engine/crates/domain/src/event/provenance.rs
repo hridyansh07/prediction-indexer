@@ -1,37 +1,7 @@
+use indexer_types::Sha256;
 use serde::{Deserialize, Serialize};
 
 use super::{DomainError, LaneId, validate_text};
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-struct Sha256Digest(String);
-
-impl Sha256Digest {
-    fn new(value: impl Into<String>) -> Result<Self, DomainError> {
-        let value = value.into();
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(DomainError::InvalidDigest);
-        }
-        Ok(Self(value))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for Sha256Digest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,45 +18,45 @@ pub enum ContinuityVerdict {
     Conflict,
 }
 
-/// Replay-owned downstream provenance. The future Phase-0 adapter converts from
-/// `indexer_finalize::CanonicalProvenance`; no finalizer receipt type is copied.
+/// Replay-owned downstream provenance. `replay-normalize` converts from the
+/// audited Phase 0 record; no finalizer receipt type is copied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalProvenance {
-    source_segment_sha256: Sha256Digest,
+    source_segment_sha256: Sha256,
     source_line_number: u64,
-    content_hash: Sha256Digest,
+    content_hash: Sha256,
     continuity: ContinuityVerdict,
 }
 
 impl CanonicalProvenance {
     pub fn new(
-        source_segment_sha256: impl Into<String>,
+        source_segment_sha256: Sha256,
         source_line_number: u64,
-        content_hash: impl Into<String>,
+        content_hash: Sha256,
         continuity: ContinuityVerdict,
     ) -> Result<Self, DomainError> {
         if source_line_number == 0 {
             return Err(DomainError::InvalidSourceLine);
         }
         Ok(Self {
-            source_segment_sha256: Sha256Digest::new(source_segment_sha256)?,
+            source_segment_sha256,
             source_line_number,
-            content_hash: Sha256Digest::new(content_hash)?,
+            content_hash,
             continuity,
         })
     }
 
-    pub fn source_segment_sha256(&self) -> &str {
-        self.source_segment_sha256.as_str()
+    pub const fn source_segment_sha256(&self) -> &Sha256 {
+        &self.source_segment_sha256
     }
 
     pub const fn source_line_number(&self) -> u64 {
         self.source_line_number
     }
 
-    pub fn content_hash(&self) -> &str {
-        self.content_hash.as_str()
+    pub const fn content_hash(&self) -> &Sha256 {
+        &self.content_hash
     }
 
     pub const fn continuity(&self) -> ContinuityVerdict {

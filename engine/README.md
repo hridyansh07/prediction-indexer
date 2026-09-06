@@ -83,6 +83,10 @@ conversion uses an exhaustive match, not string fallback.
 `replay-normalize::Normalizer` exposes the bundle/config descriptor used by the
 address, returns zero/many closed `SegmentEvent` children, an explicit ignored
 reason, or an expected `ParseReject`, and has a final consistency `finish()`.
+Every SHA-256 identity crossing this boundary uses `indexer_types::Sha256`, an
+invariant-preserving 32-byte value whose unchanged JSON representation is
+canonical lowercase hex. Domain-separated derivative and reject addresses remain
+distinct string identifiers rather than being conflated with source digests.
 Zero children are also an intentional ignore. The materializer records that
 source in the sidecar so ignored evidence remains provenance-addressable. An
 expected reject produces both an exact-envelope sidecar record and one paired

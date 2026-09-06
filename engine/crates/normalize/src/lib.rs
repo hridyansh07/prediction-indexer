@@ -8,7 +8,7 @@ use std::fmt;
 use indexer_finalize::JoinedCanonicalRecord;
 use replay_domain::{
     CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader, FaultImpact, InstrumentId,
-    LaneId, SegmentEvent, SegmentRecord,
+    LaneId, SegmentEvent, SegmentRecord, Sha256,
 };
 
 /// One deterministic decision for one canonical source record.
@@ -81,15 +81,8 @@ pub trait Normalizer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizerDescriptor {
-    pub bundle_sha256: String,
-    pub config_sha256: String,
-}
-
-impl NormalizerDescriptor {
-    pub fn validate(&self) -> Result<(), NormalizerError> {
-        validate_digest(&self.bundle_sha256, "bundle_sha256")?;
-        validate_digest(&self.config_sha256, "config_sha256")
-    }
+    pub bundle_sha256: Sha256,
+    pub config_sha256: Sha256,
 }
 
 /// Wraps a normalized child in the closed S2 schema while preserving every
@@ -117,9 +110,9 @@ pub fn event_header(
     )
     .map_err(|error| NormalizerError::new(error.to_string()))?;
     let provenance = CanonicalProvenance::new(
-        source.source_segment_sha256.clone(),
+        source.source_segment_sha256,
         source.source_line_number,
-        source.content_hash.clone(),
+        source.content_hash,
         continuity(source.continuity),
     )
     .map_err(|error| NormalizerError::new(error.to_string()))?;
@@ -163,19 +156,6 @@ pub fn validate_code(value: &str, field: &'static str) -> Result<(), NormalizerE
     {
         return Err(NormalizerError::new(format!(
             "{field} must be non-empty lowercase snake case"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_digest(value: &str, field: &'static str) -> Result<(), NormalizerError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(NormalizerError::new(format!(
-            "{field} must be 64 lowercase hexadecimal characters"
         )));
     }
     Ok(())

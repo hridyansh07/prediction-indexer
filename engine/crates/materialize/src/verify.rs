@@ -4,13 +4,13 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use indexer_types::EnvelopeView;
+use indexer_types::Sha256;
 use prediction_encoder::{
     LogicalIdentity as CodecLogicalIdentity, StoredIdentity as CodecStoredIdentity,
     StreamingDecoder,
 };
 use replay_domain::{SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
 use super::{DerivativeSpec, EVENTS_FILE, MANIFEST_FILE, RECEIPT_FILE, REJECTS_FILE};
@@ -26,7 +26,7 @@ struct VerifiedRejects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivativePin {
     pub derivative_address: String,
-    pub receipt_sha256: String,
+    pub receipt_sha256: Sha256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,8 +89,8 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
     }
     let spec = DerivativeSpec {
         normalized_schema_version: manifest.normalized_schema_version,
-        normalizer_bundle_sha256: manifest.normalizer_bundle_sha256.clone(),
-        normalizer_config_sha256: manifest.normalizer_config_sha256.clone(),
+        normalizer_bundle_sha256: manifest.normalizer_bundle_sha256,
+        normalizer_config_sha256: manifest.normalizer_config_sha256,
         policy: manifest.policy.clone(),
     };
     let expected_address = super::derivative_address(&manifest.source_receipt, &spec)
@@ -242,8 +242,9 @@ fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
     if envelope.record_id.as_str() != header.record_id()
         || envelope.delivery_index != header.address().delivery_index()
         || envelope.visible_ns.ns() != header.visible_ns()
-        || indexer_types::ContentHash::hash(envelope.raw_payload.as_bytes()).to_hex()
-            != header.provenance().content_hash()
+        || Sha256::from_bytes(
+            *indexer_types::ContentHash::hash(envelope.raw_payload.as_bytes()).as_bytes(),
+        ) != *header.provenance().content_hash()
     {
         return Err("reject header does not bind its exact canonical envelope".to_owned());
     }
@@ -261,12 +262,12 @@ where
     let source =
         File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
     let logical = CodecLogicalIdentity {
-        sha256: output.logical.sha256.clone(),
+        sha256: output.logical.sha256.as_hex(),
         byte_length: output.logical.byte_length,
         line_count: output.logical.line_count,
     };
     let stored = CodecStoredIdentity {
-        sha256: output.stored.sha256.clone(),
+        sha256: output.stored.sha256.as_hex(),
         byte_length: output.stored.byte_length,
     };
     let decoder = StreamingDecoder::new(source, &logical, Some(&stored), Some(logical.byte_length))
@@ -323,6 +324,6 @@ where
     Ok((value, canonical))
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+fn sha256(bytes: &[u8]) -> Sha256 {
+    Sha256::digest(bytes)
 }

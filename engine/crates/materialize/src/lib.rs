@@ -22,13 +22,14 @@ use indexer_finalize::{
     CanonicalSelection, CertifiedPolicy, LowerBoundPolicy, SelectionPolicy, create_dir_all_durable,
     select_canonical_windows,
 };
+pub use indexer_types::Sha256;
 use prediction_encoder::{
     CODEC_VERSION, DEFAULT_ZSTD_LEVEL, EncodeResult, StreamingEncoder, encoder_version,
 };
 use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent};
 use replay_normalize::{Normalization, Normalizer, event_header, segment_record, validate_code};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256 as Sha256Hasher};
 
 pub use schema::{
     CompressedOutput, CompressionContract, DerivativeCounts, DerivativeManifest, DerivativeReceipt,
@@ -145,10 +146,6 @@ where
     let (window_start_ns, window_end_ns) = selection.requested_interval();
     spec.validate_for(window_start_ns, window_end_ns)
         .map_err(BuildError::InvalidSpec)?;
-    normalizer
-        .descriptor()
-        .validate()
-        .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;
     if normalizer.descriptor().bundle_sha256 != spec.normalizer_bundle_sha256
         || normalizer.descriptor().config_sha256 != spec.normalizer_config_sha256
     {
@@ -177,7 +174,7 @@ where
         window_start_ns: selected.window_start_ns,
         window_end_ns: selected.window_end_ns,
         byte_length: selected.byte_length,
-        sha256: selected.sha256.clone(),
+        sha256: selected.sha256,
         certified: selected.certified,
     };
     let address = derivative_address(&source_receipt, spec)?;
@@ -274,8 +271,8 @@ where
                         error_code: reject.error_code,
                         instrument_hint: reject.instrument_hint,
                         impact: reject.impact.clone(),
-                        normalizer_bundle_sha256: spec.normalizer_bundle_sha256.clone(),
-                        normalizer_config_sha256: spec.normalizer_config_sha256.clone(),
+                        normalizer_bundle_sha256: spec.normalizer_bundle_sha256,
+                        normalizer_config_sha256: spec.normalizer_config_sha256,
                     },
                 )
                 .map_err(BuildError::Serialization)?;
@@ -333,8 +330,8 @@ where
     sync_directory(&stage)?;
     checkpoint(Checkpoint::FilesSynced)?;
 
-    let events_output = compressed_output(EVENTS_FILE, events_result);
-    let rejects_output = compressed_output(REJECTS_FILE, rejects_result);
+    let events_output = compressed_output(EVENTS_FILE, events_result)?;
+    let rejects_output = compressed_output(REJECTS_FILE, rejects_result)?;
     checkpoint(Checkpoint::BeforeManifestSerialization)?;
     let manifest = DerivativeManifest {
         manifest_version: schema::MANIFEST_VERSION,
@@ -348,8 +345,8 @@ where
         event_serialization_version: schema::EVENT_SERIALIZATION_VERSION,
         reject_serialization_version: schema::REJECT_SERIALIZATION_VERSION,
         materializer_version: schema::MATERIALIZER_VERSION,
-        normalizer_bundle_sha256: spec.normalizer_bundle_sha256.clone(),
-        normalizer_config_sha256: spec.normalizer_config_sha256.clone(),
+        normalizer_bundle_sha256: spec.normalizer_bundle_sha256,
+        normalizer_config_sha256: spec.normalizer_config_sha256,
         policy: spec.policy.clone(),
         counts,
         events: events_output.clone(),
@@ -372,9 +369,9 @@ where
         source_receipt_sha256: source_receipt.sha256,
         normalized_schema_version: SEGMENT_SCHEMA_VERSION,
         materializer_version: schema::MATERIALIZER_VERSION,
-        normalizer_bundle_sha256: spec.normalizer_bundle_sha256.clone(),
-        normalizer_config_sha256: spec.normalizer_config_sha256.clone(),
-        policy_sha256: spec.policy.policy_sha256.clone(),
+        normalizer_bundle_sha256: spec.normalizer_bundle_sha256,
+        normalizer_config_sha256: spec.normalizer_config_sha256,
+        policy_sha256: spec.policy.policy_sha256,
         manifest: manifest_output,
         events: events_output,
         rejects: rejects_output,
@@ -421,7 +418,7 @@ where
 }
 
 fn derivative_address(source: &SourceReceipt, spec: &DerivativeSpec) -> Result<String, BuildError> {
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     digest.update(ADDRESS_DOMAIN);
     for bytes in [canonical_value(source)?, canonical_value(spec)?] {
         digest.update((bytes.len() as u64).to_be_bytes());
@@ -449,7 +446,7 @@ fn reject_id_from_header(
     parser_version: u32,
     error_code: &str,
 ) -> String {
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     digest.update(REJECT_DOMAIN);
     for bytes in [
         address.as_bytes(),
@@ -465,17 +462,17 @@ fn reject_id_from_header(
     format!("{:x}", digest.finalize())
 }
 
-fn compressed_output(file: &str, result: EncodeResult) -> CompressedOutput {
-    CompressedOutput {
+fn compressed_output(file: &str, result: EncodeResult) -> Result<CompressedOutput, BuildError> {
+    Ok(CompressedOutput {
         file: file.to_owned(),
         content_encoding: "zstd".to_owned(),
         logical: LogicalIdentity {
-            sha256: result.logical.sha256,
+            sha256: parse_codec_sha256(&result.logical.sha256)?,
             byte_length: result.logical.byte_length,
             line_count: result.logical.line_count,
         },
         stored: StoredIdentity {
-            sha256: result.stored.sha256,
+            sha256: parse_codec_sha256(&result.stored.sha256)?,
             byte_length: result.stored.byte_length,
         },
         compression: CompressionContract {
@@ -489,7 +486,7 @@ fn compressed_output(file: &str, result: EncodeResult) -> CompressedOutput {
                 encoder_version()
             ),
         },
-    }
+    })
 }
 
 fn canonical_document<T: Serialize>(value: &T) -> Result<Vec<u8>, BuildError> {
@@ -577,8 +574,14 @@ fn checked_add(value: u64, amount: u64, field: &str) -> Result<u64, BuildError> 
         .ok_or_else(|| BuildError::Serialization(format!("{field} overflows u64")))
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+fn sha256(bytes: &[u8]) -> Sha256 {
+    Sha256::digest(bytes)
+}
+
+fn parse_codec_sha256(hex: &str) -> Result<Sha256, BuildError> {
+    Sha256::from_hex(hex).map_err(|error| {
+        BuildError::Serialization(format!("encoder returned invalid SHA-256: {error}"))
+    })
 }
 
 fn io_error(context: &str) -> impl FnOnce(std::io::Error) -> BuildError + '_ {

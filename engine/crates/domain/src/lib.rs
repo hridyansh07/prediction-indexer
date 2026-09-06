@@ -15,6 +15,7 @@ pub use event::{
     LaneId, Level, LevelSize, LevelSizeMode, NormalizationFault, SegmentEvent, SegmentRecord, Side,
     TradeEvent,
 };
+pub use indexer_types::Sha256;
 pub use mutation::{
     ApplyError, MutationReceipt, PrepareError, PreparedMutation, Revision, Revisioned,
 };

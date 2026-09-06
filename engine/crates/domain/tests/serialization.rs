@@ -13,8 +13,13 @@ fn scale(value: u8) -> DecimalScale {
 
 fn record() -> SegmentRecord {
     let address = EventAddress::new(42, LaneId::new("lane-book-a").unwrap(), 9001, 3).unwrap();
-    let provenance =
-        CanonicalProvenance::new(DIGEST_A, 17, DIGEST_B, ContinuityVerdict::Continuous).unwrap();
+    let provenance = CanonicalProvenance::new(
+        DIGEST_A.parse().unwrap(),
+        17,
+        DIGEST_B.parse().unwrap(),
+        ContinuityVerdict::Continuous,
+    )
+    .unwrap();
     let header = EventHeader::new(
         1_785_409_600_000_000_000,
         1_785_409_600_000_000_000,
@@ -71,9 +76,12 @@ fn provenance_tie_and_address_survive_serialization() {
     assert_eq!(header.address().lane().as_str(), "lane-book-a");
     assert_eq!(header.address().delivery_index(), 9001);
     assert_eq!(header.address().event_index(), 3);
-    assert_eq!(header.provenance().source_segment_sha256(), DIGEST_A);
+    assert_eq!(
+        header.provenance().source_segment_sha256().as_hex(),
+        DIGEST_A
+    );
     assert_eq!(header.provenance().source_line_number(), 17);
-    assert_eq!(header.provenance().content_hash(), DIGEST_B);
+    assert_eq!(header.provenance().content_hash().as_hex(), DIGEST_B);
     assert_eq!(
         header.provenance().continuity(),
         ContinuityVerdict::Continuous

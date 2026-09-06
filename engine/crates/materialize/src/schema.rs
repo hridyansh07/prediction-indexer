@@ -1,4 +1,4 @@
-use replay_domain::{EventHeader, FaultImpact, InstrumentId, SEGMENT_SCHEMA_VERSION};
+use replay_domain::{EventHeader, FaultImpact, InstrumentId, SEGMENT_SCHEMA_VERSION, Sha256};
 use replay_normalize::validate_code;
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ pub const MATERIALIZER_VERSION: u16 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizationPolicy {
-    pub policy_sha256: String,
+    pub policy_sha256: Sha256,
     pub effective_from_ns: u64,
     pub effective_until_ns: Option<u64>,
 }
@@ -21,8 +21,8 @@ pub struct NormalizationPolicy {
 #[serde(deny_unknown_fields)]
 pub struct DerivativeSpec {
     pub normalized_schema_version: u16,
-    pub normalizer_bundle_sha256: String,
-    pub normalizer_config_sha256: String,
+    pub normalizer_bundle_sha256: Sha256,
+    pub normalizer_config_sha256: Sha256,
     pub policy: NormalizationPolicy,
 }
 
@@ -34,9 +34,6 @@ impl DerivativeSpec {
                 self.normalized_schema_version
             ));
         }
-        validate_digest(&self.normalizer_bundle_sha256, "normalizer_bundle_sha256")?;
-        validate_digest(&self.normalizer_config_sha256, "normalizer_config_sha256")?;
-        validate_digest(&self.policy.policy_sha256, "policy_sha256")?;
         if self.policy.effective_from_ns > start_ns
             || self
                 .policy
@@ -56,7 +53,7 @@ pub type SourceReceipt = indexer_finalize::ReceiptIdentity;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogicalIdentity {
-    pub sha256: String,
+    pub sha256: Sha256,
     pub byte_length: u64,
     pub line_count: u64,
 }
@@ -64,7 +61,7 @@ pub struct LogicalIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredIdentity {
-    pub sha256: String,
+    pub sha256: Sha256,
     pub byte_length: u64,
 }
 
@@ -93,7 +90,7 @@ pub struct CompressedOutput {
 #[serde(deny_unknown_fields)]
 pub struct PlainOutput {
     pub file: String,
-    pub sha256: String,
+    pub sha256: Sha256,
     pub byte_length: u64,
 }
 
@@ -122,8 +119,8 @@ pub struct DerivativeManifest {
     pub event_serialization_version: u16,
     pub reject_serialization_version: u16,
     pub materializer_version: u16,
-    pub normalizer_bundle_sha256: String,
-    pub normalizer_config_sha256: String,
+    pub normalizer_bundle_sha256: Sha256,
+    pub normalizer_config_sha256: Sha256,
     pub policy: NormalizationPolicy,
     pub counts: DerivativeCounts,
     pub events: CompressedOutput,
@@ -146,16 +143,15 @@ impl DerivativeManifest {
         }
         let spec = DerivativeSpec {
             normalized_schema_version: self.normalized_schema_version,
-            normalizer_bundle_sha256: self.normalizer_bundle_sha256.clone(),
-            normalizer_config_sha256: self.normalizer_config_sha256.clone(),
+            normalizer_bundle_sha256: self.normalizer_bundle_sha256,
+            normalizer_config_sha256: self.normalizer_config_sha256,
             policy: self.policy.clone(),
         };
         spec.validate_for(
             self.source_receipt.window_start_ns,
             self.source_receipt.window_end_ns,
         )?;
-        validate_digest(&self.derivative_address, "derivative_address")?;
-        validate_digest(&self.source_receipt.sha256, "source receipt sha256")?;
+        validate_address(&self.derivative_address, "derivative_address")?;
         validate_output(&self.events, "events.ndjson.zst")?;
         validate_output(&self.rejects, "rejects.ndjson.zst")?;
         if self.requested_start_ns != self.source_receipt.window_start_ns
@@ -185,12 +181,12 @@ impl DerivativeManifest {
 pub struct DerivativeReceipt {
     pub receipt_version: u16,
     pub derivative_address: String,
-    pub source_receipt_sha256: String,
+    pub source_receipt_sha256: Sha256,
     pub normalized_schema_version: u16,
     pub materializer_version: u16,
-    pub normalizer_bundle_sha256: String,
-    pub normalizer_config_sha256: String,
-    pub policy_sha256: String,
+    pub normalizer_bundle_sha256: Sha256,
+    pub normalizer_config_sha256: Sha256,
+    pub policy_sha256: Sha256,
     pub manifest: PlainOutput,
     pub events: CompressedOutput,
     pub rejects: CompressedOutput,
@@ -210,16 +206,7 @@ impl DerivativeReceipt {
         if self.materializer_version != MATERIALIZER_VERSION {
             return Err("unsupported materializer version in receipt".to_owned());
         }
-        for (value, field) in [
-            (&self.derivative_address, "derivative_address"),
-            (&self.source_receipt_sha256, "source_receipt_sha256"),
-            (&self.normalizer_bundle_sha256, "normalizer_bundle_sha256"),
-            (&self.normalizer_config_sha256, "normalizer_config_sha256"),
-            (&self.policy_sha256, "policy_sha256"),
-            (&self.manifest.sha256, "manifest.sha256"),
-        ] {
-            validate_digest(value, field)?;
-        }
+        validate_address(&self.derivative_address, "derivative_address")?;
         if self.manifest.file != "manifest.json" {
             return Err("receipt names an unsupported manifest file".to_owned());
         }
@@ -251,8 +238,8 @@ pub enum RejectDisposition {
         error_code: String,
         instrument_hint: Option<InstrumentId>,
         impact: FaultImpact,
-        normalizer_bundle_sha256: String,
-        normalizer_config_sha256: String,
+        normalizer_bundle_sha256: Sha256,
+        normalizer_config_sha256: Sha256,
     },
     IntentionallyIgnored {
         reason_code: String,
@@ -342,17 +329,13 @@ impl RejectRecord {
                 reject_id,
                 parser_version,
                 error_code,
-                normalizer_bundle_sha256,
-                normalizer_config_sha256,
                 ..
             } => {
-                validate_digest(reject_id, "reject_id")?;
+                validate_address(reject_id, "reject_id")?;
                 if *parser_version == 0 {
                     return Err("reject parser_version must be positive".to_owned());
                 }
                 validate_code(error_code, "error_code").map_err(|error| error.to_string())?;
-                validate_digest(normalizer_bundle_sha256, "normalizer_bundle_sha256")?;
-                validate_digest(normalizer_config_sha256, "normalizer_config_sha256")?;
             }
             RejectDisposition::IntentionallyIgnored { reason_code } => {
                 validate_code(reason_code, "reason_code").map_err(|error| error.to_string())?;
@@ -377,7 +360,7 @@ impl<'de> Deserialize<'de> for RejectRecord {
     }
 }
 
-pub fn validate_digest(value: &str, field: &str) -> Result<(), String> {
+pub fn validate_address(value: &str, field: &str) -> Result<(), String> {
     if value.len() != 64
         || !value
             .bytes()
@@ -396,8 +379,6 @@ fn validate_output(output: &CompressedOutput, expected_file: &str) -> Result<(),
             "invalid compressed output contract for {expected_file}"
         ));
     }
-    validate_digest(&output.logical.sha256, "logical sha256")?;
-    validate_digest(&output.stored.sha256, "stored sha256")?;
     if output.compression.algorithm != "zstd"
         || output.compression.level != 3
         || !output.compression.frame_checksum

@@ -152,7 +152,7 @@ fn read_all(
         assert_eq!(record.order_ns, record.visible_ns);
         assert_eq!(record.canonical_seq, record.event_address.canonical_seq);
         assert_eq!(record.record_id, format!("pm-e-{}", record.canonical_seq));
-        assert_eq!(record.source_segment_sha256, SOURCE_SHA);
+        assert_eq!(record.source_segment_sha256.as_hex(), SOURCE_SHA);
         seqs.push(record.canonical_seq);
     }
     Ok((seqs, reader.finish()?))
@@ -174,7 +174,7 @@ fn minimal_exact_adjacent_selection_streams_in_finalizer_order_and_retains_recei
         audited
             .receipt_identities()
             .iter()
-            .all(|id| id.sha256.len() == 64)
+            .all(|id| id.sha256.as_bytes().len() == 32)
     );
     assert_eq!(audited.records_verified(), 2);
 }

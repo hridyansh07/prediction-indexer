@@ -330,6 +330,7 @@ dependencies = [
 name = "replay-domain"
 version = "0.1.0"
 dependencies = [
+ "indexer-types",
  "serde",
  "serde_json",
 ]
