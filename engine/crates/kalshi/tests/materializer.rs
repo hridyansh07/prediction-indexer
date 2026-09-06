@@ -8,11 +8,11 @@ use indexer_finalize::{
 use indexer_types::{ContentHash, EnvelopeView, Sha256};
 use prediction_encoder::{DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version};
 use replay_domain::SEGMENT_SCHEMA_VERSION;
-use replay_kalshi::KalshiNormalizer;
+use replay_kalshi::Kalshi;
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
-use replay_normalize::Normalizer;
+use replay_normalize::{Normalize, Normalizer};
 use serde_json::json;
 use tempdir::TempDir;
 
@@ -142,7 +142,7 @@ fn canonical_fixture(root: &std::path::Path) {
     fs::write(directory.join("receipt.json"), bytes).unwrap();
 }
 
-fn spec(normalizer: &KalshiNormalizer) -> DerivativeSpec {
+fn spec(normalizer: &Normalizer<Kalshi>) -> DerivativeSpec {
     DerivativeSpec {
         normalized_schema_version: SEGMENT_SCHEMA_VERSION,
         normalizer_bundle_sha256: normalizer.descriptor().bundle_sha256,
@@ -160,7 +160,7 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
     let canonical = TempDir::new("kalshi-canonical").unwrap();
     let output = TempDir::new("kalshi-normalized").unwrap();
     canonical_fixture(canonical.path());
-    let mut first_normalizer = KalshiNormalizer::default();
+    let mut first_normalizer = Normalizer::new(Kalshi::default()).unwrap();
     let spec = spec(&first_normalizer);
     let first = build_window(
         canonical.path(),
@@ -196,7 +196,7 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
         0,
         10,
         &spec,
-        &mut KalshiNormalizer::default(),
+        &mut Normalizer::new(Kalshi::default()).unwrap(),
     )
     .unwrap();
     assert_eq!(retry.disposition, BuildDisposition::VerifiedNoOp);

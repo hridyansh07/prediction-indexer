@@ -1,8 +1,8 @@
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
 use replay_domain::{BookEvent, ContractOrientation, SegmentEvent, Side};
-use replay_kalshi::{ADAPTER_BUNDLE_ID, DEFAULT_CONFIG_ID, KalshiConfig, KalshiNormalizer};
-use replay_normalize::{Normalization, Normalizer, segment_record};
+use replay_kalshi::{ADAPTER_BUNDLE_ID, Config, Kalshi};
+use replay_normalize::{Normalization, Normalize, Normalizer, segment_record};
 use serde_json::{Value, json};
 
 const SNAPSHOT: &str = include_str!("fixtures/orderbook_snapshot.json");
@@ -57,7 +57,10 @@ fn sequenced(payload: &str, stream: &str, seq: u64) -> JoinedCanonicalRecord {
 }
 
 fn normalize(source: &JoinedCanonicalRecord) -> Normalization {
-    KalshiNormalizer::default().normalize(source).unwrap()
+    Normalizer::new(Kalshi::default())
+        .unwrap()
+        .normalize(source)
+        .unwrap()
 }
 
 fn events(value: Normalization) -> Vec<SegmentEvent> {
@@ -76,28 +79,40 @@ fn reject_code(value: Normalization) -> String {
 
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
-    let default = KalshiNormalizer::default();
+    let default = Normalizer::new(Kalshi::default()).unwrap();
+    let default_config = serde_json::to_vec(&Config::default()).unwrap();
+    assert_eq!(
+        default_config,
+        br#"{"price_scale":4,"quantity_scale":2,"use_yes_price":false}"#
+    );
+    assert_eq!(
+        serde_json::from_slice::<Config>(&default_config).unwrap(),
+        Config::default()
+    );
     assert_eq!(
         default.descriptor().bundle_sha256,
         Sha256::digest(ADAPTER_BUNDLE_ID.as_bytes())
     );
     assert_eq!(
         default.descriptor().config_sha256,
-        Sha256::digest(DEFAULT_CONFIG_ID.as_bytes())
+        Sha256::digest(&default_config)
     );
-    let changed = KalshiNormalizer::new(KalshiConfig {
-        price_scale: replay_domain::DecimalScale::new(3).unwrap(),
-        ..KalshiConfig::default()
-    })
+    let changed = Normalizer::new(
+        Kalshi::try_from(Config {
+            price_scale: replay_domain::DecimalScale::new(3).unwrap(),
+            ..Config::default()
+        })
+        .unwrap(),
+    )
     .unwrap();
     assert_ne!(
         changed.descriptor().config_sha256,
         default.descriptor().config_sha256
     );
     assert!(
-        KalshiNormalizer::new(KalshiConfig {
+        Kalshi::try_from(Config {
             use_yes_price: true,
-            ..KalshiConfig::default()
+            ..Config::default()
         })
         .is_err()
     );
@@ -184,7 +199,7 @@ fn ticker_is_strictly_validated_then_explicitly_ignored() {
     assert_eq!(
         normalize(&source),
         Normalization::Ignored {
-            reason_code: "ticker_not_in_s2".to_owned()
+            reason_code: "ticker_not_in_replay_domain".to_owned()
         }
     );
 }
@@ -199,14 +214,14 @@ fn venue_controls_validate_nested_values_and_sequence_edges() {
             json!({"type":"unsequenced","counter":9}),
         )),
         Normalization::Ignored {
-            reason_code: "venue_control_not_in_s2".to_owned()
+            reason_code: "venue_control_not_in_replay_domain".to_owned()
         }
     );
     let unsubscribed = r#"{"id":2,"sid":2,"seq":4,"type":"unsubscribed"}"#;
     assert_eq!(
         normalize(&sequenced(unsubscribed, "public_book", 4)),
         Normalization::Ignored {
-            reason_code: "venue_control_not_in_s2".to_owned()
+            reason_code: "venue_control_not_in_replay_domain".to_owned()
         }
     );
     let malformed_error = r#"{"id":2,"type":"error","msg":{"code":"27","msg":"slow down"}}"#;

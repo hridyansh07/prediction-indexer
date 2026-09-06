@@ -1,20 +1,30 @@
 # Kalshi Replay normalizer v1
 
-`replay-kalshi` is the first venue adapter on the generic normalize-once
-boundary. It consumes one audited Phase 0 `JoinedCanonicalRecord` and returns
-zero or more closed S2 `SegmentEvent` values, an intentional ignore, or one
-stable `ParseReject`. It neither owns nor mutates book state.
+`replay-kalshi` is the first venue extension for the shared
+`replay_normalize::Normalizer`. The shared normalizer consumes an audited
+`JoinedCanonicalRecord`, validates and decodes its envelope and raw JSON once,
+then passes a `CanonicalEnvelope` to `Kalshi` through the `VenueAdapter` trait.
+The adapter returns Replay-domain events, an intentional ignore, or one stable
+`ParseReject`. It neither owns nor mutates book state.
+
+The crate is split by responsibility: `adapter` integrates Kalshi with the
+shared normalizer, `config` owns runtime variables, `message` owns Kalshi wire
+shapes and their checked conversions, `value` provides checked JSON conversion
+traits, and `error` owns stable reject classification. Snapshot, relative-delta,
+and trade values become events through `TryFrom`; constructors that enforce the
+closed Replay event invariants remain in `replay-domain`.
 
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of
   `prediction-indexer/replay-kalshi/v1`. Semantic changes require a version
   bump.
-- Config identity is SHA-256 of the canonical config string containing the
-  price scale, quantity scale, and `use_yes_price` mode. Changing any field
+- `Config` exposes typed price scale, quantity scale, and `use_yes_price`
+  variables. The shared normalizer hashes its canonical struct serialization
+  directly; there is no hand-built identity string. Changing any variable
   changes the derivative address.
 - V1 defaults to price scale 4 and quantity scale 2. Decimal strings pass
-  through S2's exact parser. Extra fractional zeroes are accepted; non-zero
+  through the Replay domain's exact parser. Extra fractional zeroes are accepted; non-zero
   discarded digits, exponent notation, floats, overflow, and implicit rounding
   reject.
 - The current splice omits Kalshi's `use_yes_price` subscription option, whose
@@ -33,10 +43,10 @@ stable `ParseReject`. It neither owns nor mutates book state.
 | Retained `yes` / `no` integer snapshot shape | two `BookEvent::Full` children | Integer cents and contracts are exactly rescaled. Mixing old and new fields rejects. |
 | `orderbook_delta` | one relative `BookEvent::Delta` | `side=yes/no` becomes `Outcome/Complement`; the order-book side remains `Bid`. Positive and negative deltas are syntactically valid. Applying before a snapshot, deleting a missing level, and underflow are book-preparation concerns. A zero relative delta rejects as a malformed no-op. |
 | `trade` | one `TradeEvent` | The exact YES price and count are emitted. `taker_outcome_side`, `taker_book_side`, and legacy `taker_side` must agree. NO price, trade ID, block flag, and timestamps remain in the exact source envelope. No fee is read or calculated. |
-| `ticker` | intentional ignore: `ticker_not_in_s2` | The complete authoritative shape and all exact numerics are validated first. S2 has no quote-summary event, so it is not misrepresented as a book or trade. |
-| server `subscribed`, `unsubscribed`, `ok`, `error` | intentional ignore: `venue_control_not_in_s2` | Closed shape, IDs, sequence/cursor, and nested control values are validated. The exact frame remains in the sidecar. |
+| `ticker` | intentional ignore: `ticker_not_in_replay_domain` | The complete authoritative shape and all exact numerics are validated first. The Replay domain has no quote-summary event, so it is not misrepresented as a book or trade. |
+| server `subscribed`, `unsubscribed`, `ok`, `error` | intentional ignore: `venue_control_not_in_replay_domain` | Closed shape, IDs, sequence/cursor, and nested control values are validated. The exact frame remains in the sidecar. |
 | splice `connection_opened`, `connection_closed`, `connection_failed`, `subscription_changed`, `target_metadata_changed` | typed `ControlEvent` | Epoch comes from the envelope. Asset IDs become venue-qualified instruments. |
-| splice subscription, closing, reconciliation, unreadable-target, and non-UTF8 notices | stable intentional ignore | These are validated capture operations with no closed S2 control variant; their exact envelopes remain in the sidecar. |
+| splice subscription, closing, reconciliation, unreadable-target, and non-UTF8 notices | stable intentional ignore | These are validated capture operations with no corresponding closed Replay control variant; their exact envelopes remain in the sidecar. |
 | top-level JSON array | flattened in array order | Capture records an array delivery as unsequenced because its cursor parser cannot attribute one update range to multiple children. Each child's positive `seq` is still validated, snapshot expansion order is YES then NO, and the materializer assigns contiguous zero-based child indexes. Empty arrays intentionally produce zero children. |
 
 Malformed JSON, non-object children, unknown fields/types, missing required
@@ -65,5 +75,5 @@ adapter gaps still require a retained live-contract acceptance corpus:
 5. add lifecycle-channel schemas only if capture subscribes to those channels.
 
 Unknown future and non-captured private/lifecycle/reference channels reject
-rather than being guessed into S2. Fee mechanics, books/projectors, strategies,
+rather than being guessed into the Replay domain. Fee mechanics, books/projectors, strategies,
 and economics are explicitly outside this adapter.

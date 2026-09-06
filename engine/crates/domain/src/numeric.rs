@@ -64,7 +64,7 @@ impl<'de> Deserialize<'de> for DecimalScale {
 }
 
 /// Unit of a price atom. Currency identity and conversion are intentionally not
-/// part of S2; a segment manifest will bind the quote currency later.
+/// part of the numeric domain; a segment manifest will bind the quote currency later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceUnit {

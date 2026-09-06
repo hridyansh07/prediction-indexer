@@ -1,15 +1,19 @@
-//! Generic boundary between audited canonical records and Replay domain events.
+//! One normalization boundary extended by venue adapters.
 //!
-//! Implementations interpret payloads, but this crate contains no venue schema.
-//! It only preserves the Phase 0 address/provenance and assigns child indexes.
+//! `Normalizer` owns canonical-envelope decoding, raw JSON decoding, descriptor
+//! identity, and venue routing. Adapters own only their venue schema and its
+//! conversion into Replay domain events.
 
 use std::fmt;
 
 use indexer_finalize::JoinedCanonicalRecord;
+use indexer_types::{EnvelopeView, Venue};
 use replay_domain::{
     CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader, FaultImpact, InstrumentId,
     LaneId, SegmentEvent, SegmentRecord, Sha256,
 };
+use serde::Serialize;
+use serde_json::Value;
 
 /// One deterministic decision for one canonical source record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +46,29 @@ impl ParseReject {
         }
         validate_code(&self.error_code, "error_code")
     }
+
+    pub fn for_source(
+        parser_version: u32,
+        error_code: &'static str,
+        source: &JoinedCanonicalRecord,
+        instrument: Option<InstrumentId>,
+    ) -> Normalization {
+        let impact = instrument
+            .clone()
+            .map(FaultImpact::Instrument)
+            .unwrap_or_else(|| {
+                FaultImpact::UnattributedLane(
+                    LaneId::new(source.event_address.lane_id.clone())
+                        .expect("audited lane is non-empty"),
+                )
+            });
+        Normalization::Reject(Self {
+            parser_version,
+            error_code: error_code.to_owned(),
+            instrument_hint: instrument,
+            impact,
+        })
+    }
 }
 
 /// A fatal adapter defect or failed final consistency check. This is never a
@@ -63,9 +90,8 @@ impl fmt::Display for NormalizerError {
 
 impl std::error::Error for NormalizerError {}
 
-/// Stateful only within one privately staged derivative build. Implementations
-/// must be deterministic for their pinned bundle/config identities.
-pub trait Normalizer {
+/// The materializer-facing behavior implemented once by [`Normalizer`].
+pub trait Normalize {
     /// Immutable semantic identity checked against the derivative address.
     fn descriptor(&self) -> &NormalizerDescriptor;
 
@@ -74,9 +100,99 @@ pub trait Normalizer {
         source: &JoinedCanonicalRecord,
     ) -> Result<Normalization, NormalizerError>;
 
-    /// Called only after Phase 0 returned `Ok(None)`. A failure is fatal and
-    /// prevents frame finalization and receipt publication.
+    /// Called only after the audited canonical reader returned `Ok(None)`. A
+    /// failure is fatal and prevents frame finalization and receipt publication.
     fn finish(&mut self) -> Result<(), NormalizerError>;
+}
+
+/// Venue-specific extension point. Implementations receive only a fully decoded
+/// canonical envelope and JSON payload; shared seam failures cannot be handled
+/// differently by each venue.
+pub trait VenueAdapter {
+    type ConfigIdentity: Serialize;
+
+    const VENUE: Venue;
+    const PARSER_VERSION: u32;
+    const BUNDLE_ID: &'static str;
+
+    fn config_identity(&self) -> Self::ConfigIdentity;
+
+    fn normalize(&mut self, input: CanonicalEnvelope<'_>)
+    -> Result<Normalization, NormalizerError>;
+
+    fn finish(&mut self) -> Result<(), NormalizerError> {
+        Ok(())
+    }
+}
+
+/// The single reusable normalizer. A venue is an adapter parameter, not a
+/// separately reimplemented normalization lifecycle.
+pub struct Normalizer<A> {
+    adapter: A,
+    descriptor: NormalizerDescriptor,
+}
+
+impl<A: VenueAdapter> Normalizer<A> {
+    pub fn new(adapter: A) -> Result<Self, NormalizerError> {
+        let config = serde_json::to_vec(&adapter.config_identity()).map_err(|error| {
+            NormalizerError::new(format!(
+                "normalizer config identity is not serializable: {error}"
+            ))
+        })?;
+        Ok(Self {
+            adapter,
+            descriptor: NormalizerDescriptor {
+                bundle_sha256: Sha256::digest(A::BUNDLE_ID.as_bytes()),
+                config_sha256: Sha256::digest(&config),
+            },
+        })
+    }
+
+    pub const fn adapter(&self) -> &A {
+        &self.adapter
+    }
+}
+
+impl<A: VenueAdapter> Normalize for Normalizer<A> {
+    fn descriptor(&self) -> &NormalizerDescriptor {
+        &self.descriptor
+    }
+
+    fn normalize(
+        &mut self,
+        source: &JoinedCanonicalRecord,
+    ) -> Result<Normalization, NormalizerError> {
+        let envelope = EnvelopeView::parse(&source.envelope).map_err(|error| {
+            NormalizerError::new(format!(
+                "audited canonical envelope became invalid: {error}"
+            ))
+        })?;
+        if envelope.venue != A::VENUE {
+            return Ok(Normalization::Ignored {
+                reason_code: "different_venue".to_owned(),
+            });
+        }
+        let payload = match serde_json::from_str(&envelope.raw_payload) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Ok(ParseReject::for_source(
+                    A::PARSER_VERSION,
+                    "invalid_json",
+                    source,
+                    None,
+                ));
+            }
+        };
+        self.adapter.normalize(CanonicalEnvelope {
+            source,
+            envelope,
+            payload,
+        })
+    }
+
+    fn finish(&mut self) -> Result<(), NormalizerError> {
+        self.adapter.finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,8 +201,45 @@ pub struct NormalizerDescriptor {
     pub config_sha256: Sha256,
 }
 
-/// Wraps a normalized child in the closed S2 schema while preserving every
-/// Phase 0 provenance/address field and assigning its zero-based child index.
+/// A canonical source record whose envelope and raw JSON have passed the shared
+/// normalization seam. Venue adapters consume this value into events or a
+/// rejection; they never reparse canonical bytes themselves.
+pub struct CanonicalEnvelope<'a> {
+    source: &'a JoinedCanonicalRecord,
+    envelope: EnvelopeView<'a>,
+    payload: Value,
+}
+
+impl<'a> CanonicalEnvelope<'a> {
+    pub const fn source(&self) -> &'a JoinedCanonicalRecord {
+        self.source
+    }
+
+    pub const fn envelope(&self) -> &EnvelopeView<'a> {
+        &self.envelope
+    }
+
+    pub const fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> Value {
+        self.payload
+    }
+
+    pub fn reject(
+        &self,
+        parser_version: u32,
+        error_code: &'static str,
+        instrument: Option<InstrumentId>,
+    ) -> Normalization {
+        ParseReject::for_source(parser_version, error_code, self.source, instrument)
+    }
+}
+
+/// Wraps a normalized child in the closed Replay domain, preserves every
+/// provenance/address field from the audited canonical record, and assigns its
+/// zero-based child index.
 pub fn segment_record(
     source: &JoinedCanonicalRecord,
     event_index: u32,

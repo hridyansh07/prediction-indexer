@@ -25,13 +25,13 @@ book, strategy, publisher, deployment, or scheduler.
   explicitly before comparing values expressed at different scales.
 - `Side::{Bid, Ask}` is order-book side.
   `ContractOrientation::{Outcome, Complement}` independently records whether a
-  price refers to the named outcome or its logical complement. S2 performs no
+  price refers to the named outcome or its logical complement. The Replay domain performs no
   implicit `1 - p` conversion.
 
 Currency identity, legal price bounds, tick/lot schedules, payout denomination,
 currency conversion, fee arithmetic, and strategy rounding are economic/product
 choices deferred to their owning later phases. A future segment manifest must
-bind currency and the scales expected for each instrument; S2 does not guess
+bind currency and the scales expected for each instrument; the Replay domain does not guess
 them from a venue.
 
 ## Closed event contract
@@ -80,9 +80,12 @@ conversion uses an exhaustive match, not string fallback.
 
 ## Normalization and materialization
 
-`replay-normalize::Normalizer` exposes the bundle/config descriptor used by the
-address, returns zero/many closed `SegmentEvent` children, an explicit ignored
-reason, or an expected `ParseReject`, and has a final consistency `finish()`.
+`replay-normalize::Normalizer<A>` implements the normalization lifecycle once.
+It decodes each canonical envelope and raw JSON payload, routes by venue, hashes
+the adapter's typed canonical configuration, and delegates venue wire semantics
+through `VenueAdapter`. Its `Normalize` implementation returns zero/many closed
+`SegmentEvent` children, an explicit ignored reason, or an expected
+`ParseReject`, and has a final consistency `finish()`.
 Every SHA-256 identity crossing this boundary uses `indexer_types::Sha256`, an
 invariant-preserving 32-byte value whose unchanged JSON representation is
 canonical lowercase hex. Domain-separated derivative and reject addresses remain
@@ -139,13 +142,13 @@ returns an opaque, owned, non-cloneable `PreparedMutation<T>`. `apply` first
 checks that the current revision equals `prepared_from`; a stale mutation writes
 nothing. After that check it performs only the complete replacement and revision
 advance. Future books can use this boundary without giving venue adapters or
-strategies mutation authority. No book implementation is included in S2.
+strategies mutation authority. No book implementation is included in this workspace.
 
 ## Concepts adapted from Bitfrost
 
 The implementation is original. The reference repository
 `github.com/hridyansh07/bitfrost-prime-take-home` has no discovered license file
-or Cargo license metadata, so no code was copied. S2 adapts these concepts:
+or Cargo license metadata, so no code was copied. The Replay domain adapts these concepts:
 
 - temporary decode followed by a closed, owned normalized domain;
 - distinct financial newtypes, exact decimal lexemes, checked rescaling, and no
@@ -154,7 +157,7 @@ or Cargo license metadata, so no code was copied. S2 adapts these concepts:
 - canonical provenance retained beside normalized values;
 - complete prepared mutations and stale-before-write atomic publication.
 
-Unlike the reference, S2 adds Replay's canonical lane/delivery/child address,
+Unlike the reference, the Replay domain adds the canonical lane/delivery/child address,
 visible tie group, source segment identity, exact continuity vocabulary,
 absolute/relative level semantics, and explicit contract orientation.
 

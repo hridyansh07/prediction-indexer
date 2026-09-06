@@ -371,7 +371,10 @@ name = "replay-normalize"
 version = "0.1.0"
 dependencies = [
  "indexer-finalize",
+ "indexer-types",
  "replay-domain",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

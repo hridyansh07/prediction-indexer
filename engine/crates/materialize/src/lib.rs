@@ -27,7 +27,7 @@ use prediction_encoder::{
     CODEC_VERSION, DEFAULT_ZSTD_LEVEL, EncodeResult, StreamingEncoder, encoder_version,
 };
 use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent};
-use replay_normalize::{Normalization, Normalizer, event_header, segment_record, validate_code};
+use replay_normalize::{Normalization, Normalize, event_header, segment_record, validate_code};
 use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
@@ -93,7 +93,7 @@ impl std::error::Error for BuildError {}
 ///
 /// The exact-window restriction is compositional with Phase 0: no API change or
 /// second read is needed, and each derivative binds one canonical receipt.
-pub fn build_window<N: Normalizer>(
+pub fn build_window<N: Normalize>(
     canonical_root: &Path,
     output_root: &Path,
     window_start_ns: u64,
@@ -113,7 +113,7 @@ pub fn build_window<N: Normalizer>(
 
 /// Materializes a caller-selected Phase 0 input. The selection must contain one
 /// exact canonical window; the materializer consumes it and owns publication.
-pub fn materialize_window<N: Normalizer>(
+pub fn materialize_window<N: Normalize>(
     selection: CanonicalSelection,
     output_root: &Path,
     spec: &DerivativeSpec,
@@ -140,7 +140,7 @@ fn build_window_inner<N, H>(
     mut checkpoint: H,
 ) -> Result<BuildOutcome, BuildError>
 where
-    N: Normalizer,
+    N: Normalize,
     H: FnMut(Checkpoint) -> Result<(), BuildError>,
 {
     let (window_start_ns, window_end_ns) = selection.requested_interval();

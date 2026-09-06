@@ -15,7 +15,7 @@ use prediction_encoder::{
 };
 use replay_domain::{ControlEvent, FaultImpact, LaneId, SEGMENT_SCHEMA_VERSION, SegmentEvent};
 use replay_normalize::{
-    Normalization, Normalizer, NormalizerDescriptor, NormalizerError, ParseReject,
+    Normalization, Normalize, NormalizerDescriptor, NormalizerError, ParseReject,
 };
 use serde_json::{Value, json};
 use tempdir::TempDir;
@@ -58,7 +58,7 @@ impl IgnoreAllNormalizer {
     }
 }
 
-impl Normalizer for IgnoreAllNormalizer {
+impl Normalize for IgnoreAllNormalizer {
     fn descriptor(&self) -> &NormalizerDescriptor {
         &self.descriptor
     }
@@ -90,7 +90,7 @@ impl FakeNormalizer {
     }
 }
 
-impl Normalizer for FakeNormalizer {
+impl Normalize for FakeNormalizer {
     fn descriptor(&self) -> &NormalizerDescriptor {
         &self.descriptor
     }

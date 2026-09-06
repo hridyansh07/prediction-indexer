@@ -9,4 +9,7 @@ workspace = true
 
 [dependencies]
 indexer-finalize = { workspace = true }
+indexer-types = { workspace = true }
 replay-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

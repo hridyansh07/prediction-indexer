@@ -21,5 +21,5 @@ pub use mutation::{
 };
 pub use numeric::{DecimalScale, NumericError, PriceUnit, Px, Qty, QuantityUnit};
 
-/// Canonical persisted schema emitted and consumed by Replay S2.
+/// Canonical persisted schema emitted and consumed by the Replay engine.
 pub const SEGMENT_SCHEMA_VERSION: u16 = 1;
