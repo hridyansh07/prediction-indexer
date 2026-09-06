@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/domain", "crates/normalize", "crates/materialize"]
+members = ["crates/domain", "crates/normalize", "crates/materialize", "crates/kalshi"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,7 @@ indexer-finalize = { path = "../ingester/crates/finalize" }
 indexer-types = { path = "../ingester/crates/types" }
 replay-domain = { path = "crates/domain" }
 replay-normalize = { path = "crates/normalize" }
+replay-materialize = { path = "crates/materialize" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

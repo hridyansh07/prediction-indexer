@@ -1,0 +1,21 @@
+[package]
+name = "replay-kalshi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+indexer-finalize = { workspace = true }
+indexer-types = { workspace = true }
+replay-domain = { workspace = true }
+replay-normalize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+prediction-encoder = { workspace = true }
+replay-materialize = { workspace = true }
+tempdir = "0.3"
