@@ -379,7 +379,7 @@ CREATE TABLE claim_classes (
     -- discovery evidence, never an unconditional claim.
     coverage TEXT NOT NULL,
     outcome_key_count INTEGER NOT NULL CHECK(outcome_key_count > 0),
-    claim_identity_version INTEGER NOT NULL CHECK(claim_identity_version = 1),
+    claim_identity_version INTEGER NOT NULL CHECK(claim_identity_version = 2),
     first_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id),
     last_seen_run_id TEXT NOT NULL REFERENCES targeter_runs(run_id)
 ) STRICT;

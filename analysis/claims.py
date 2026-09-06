@@ -38,7 +38,9 @@ from analysis.outcome_space import OutcomeSpace
 
 # Bumped when claim identity changes meaning. Stored alongside derived rows so a
 # database built under an older rule is detectable rather than silently mixed.
-CLAIM_IDENTITY_VERSION = 1
+# 2 added the space shape to the digest: the same outcome subset under two
+# shapes had been one id, so ids minted under 1 are not comparable to these.
+CLAIM_IDENTITY_VERSION = 2
 
 # Bumped when the pairwise classification changes. Independent of identity: the
 # same claims can be re-related without their identities moving.
@@ -50,8 +52,8 @@ CLAIM_ALGEBRA_VERSION = 1
 UNINFORMATIVE_RELATIONS = frozenset({"OVERLAP"})
 
 # Relations whose meaning depends on which member is which. The projection
-# records the distinction in `relation_members.role`; symmetric types collapse
-# every member to role `member`.
+# The targeter's own relationship records carry the distinction in a member
+# role; symmetric types name every member `member`.
 DIRECTED_RELATIONS = frozenset({"IMPLICATION", "REVERSE_IMPLICATION"})
 
 

@@ -95,9 +95,11 @@ class UniverseStore:
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
-        for statement in path.read_text(encoding="utf-8").split(";"):
-            if statement.strip():
-                connection.execute(statement)
+        # `executescript` parses SQL rather than splitting text on ";", so a
+        # semicolon inside a comment or a literal cannot truncate the statement
+        # it sits in. Splitting silently produced a table missing every column
+        # after such a comment.
+        connection.executescript(path.read_text(encoding="utf-8"))
 
     @classmethod
     def _execute_schema_transaction(
@@ -1809,6 +1811,7 @@ class UniverseStore:
                          WHERE venue.market_id = ?
                            AND venue.market_template_version = ?
                            AND venue.outcome_space_version = ?
+                           AND {_current_era('scoped')}
                      )
                      AND {_current_era('member')}
                      AND {_current_era('counterpart')}
@@ -1911,6 +1914,21 @@ class UniverseStore:
             },
             "claim detail",
         )
+
+    def claim_exists(self, claim_id: str) -> bool:
+        """Whether a claim is known, without building its detail.
+
+        The paged markets route needs only this; calling `claim_detail` would
+        re-run its counts aggregate and relations query on every page.
+        """
+        identifier = _claim_identifier(claim_id)
+        with closing(self.connect(readonly=True)) as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM claim_classes WHERE claim_id = ?", (identifier,)
+                ).fetchone()
+                is not None
+            )
 
     def claim_markets(
         self,

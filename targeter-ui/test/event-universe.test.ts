@@ -882,6 +882,17 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   assert.match(querySource, /BUNDLE_PAGE_SIZE = 100/);
   assert.match(querySource, /enabled: Boolean\(eventId\)/);
 
+  // Claim detail and its paged markets are reachable, not merely implemented.
+  // Both endpoints were fully validated and contract-tested while the drawer
+  // rendered the claim digest as inert text with nothing to click.
+  assert.match(querySource, /enabled: Boolean\(claimId\)/);
+  assert.match(source, /useClaimDetail\(claimId\)/);
+  assert.match(source, /useClaimMarkets\(claimId\)/);
+  assert.match(source, /onClick=\{\(\) => openClaim\(claim\.claim_id\)\}/);
+  assert.match(source, /openClaim=\{setClaimId\}/);
+  // A relation names the claims it relates rather than showing two digests.
+  assert.match(source, /claimName\(relation\.left_claim_id, detail\.claims\)/);
+
   const records = Array.from({ length: 1000 }, (_, index) => index);
   const first = boundedRenderPage(records, 0);
   const last = boundedRenderPage(records, 9);

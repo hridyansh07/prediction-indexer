@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  UniverseClaimSummary,
   UniverseEvent,
   UniverseEventDetail,
   UniverseSelectedMarket,
@@ -10,6 +11,8 @@ import type {
 import { Chevron, EventIcon, gameName, SearchIcon, VenueStack } from './icons';
 import { boundedRenderPage } from './event-universe-view-model';
 import {
+  useClaimDetail,
+  useClaimMarkets,
   useEventDetail,
   useTargeterRun,
   useTargeterStatus,
@@ -22,6 +25,125 @@ const label = (value: string | null | undefined) =>
   value
     ?.replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase()) ?? '—';
+
+/**
+ * A short, stable name for a claim within one event.
+ *
+ * A claim is addressed by a 64-character digest, which is unreadable and says
+ * nothing about what the claim is. Within an event the claims are few and
+ * ordered, so numbering them makes a relation card read as a statement about
+ * two things on screen rather than as two hashes.
+ */
+function claimName(
+  claim: UniverseClaimSummary | string,
+  claims: UniverseClaimSummary[],
+): string {
+  const identifier = typeof claim === 'string' ? claim : claim.claim_id;
+  const index = claims.findIndex((item) => item.claim_id === identifier);
+  return index < 0 ? `Claim ${identifier.slice(0, 8)}` : `Claim ${index + 1}`;
+}
+
+function ClaimDrawer({
+  claimId,
+  close,
+  opener,
+}: {
+  claimId: string | null;
+  close: () => void;
+  opener: React.MutableRefObject<HTMLElement | null>;
+}) {
+  const dialog = useDrawerFocus(Boolean(claimId), close, opener);
+  const detail = useClaimDetail(claimId);
+  const markets = useClaimMarkets(claimId);
+  if (!claimId) return null;
+  const claim = detail.data?.claim;
+  const counts = detail.data?.counts;
+  const page = markets.data?.markets ?? [];
+  return (
+    <div className="drawer-layer">
+      <button
+        className="drawer-backdrop"
+        onClick={close}
+        aria-label="Close claim detail"
+      />
+      <div
+        className="bundle-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Claim detail"
+        tabIndex={-1}
+        ref={dialog}
+      >
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow">CLAIM</span>
+            <h2>
+              {claim
+                ? `${claim.outcome_key_count} outcomes · ${label(claim.scope)}`
+                : 'Loading'}
+            </h2>
+            <code>{claimId}</code>
+          </div>
+          <button
+            className="close-button"
+            onClick={close}
+            aria-label="Close"
+            autoFocus
+          >
+            ×
+          </button>
+        </div>
+        <div className="drawer-facts">
+          <span>
+            <b>{counts?.markets ?? 0}</b> markets
+          </span>
+          <span>
+            <b>{counts?.venues ?? 0}</b> venues
+          </span>
+          <span>
+            <b>{counts?.events ?? 0}</b> events
+          </span>
+        </div>
+        <div className="drawer-body market-list">
+          {claim && (
+            <div className="proof-card">
+              <b>{label(claim.coverage)}</b>
+              {/* Observation bounds, never lifecycle. */}
+              <span>
+                Observed {claim.first_seen_run_id} to {claim.last_seen_run_id}
+              </span>
+              <code>Shape {claim.space_shape_id.slice(0, 12)}</code>
+            </div>
+          )}
+          {page.map((market) => (
+            <div
+              className="market-row"
+              key={`${market.venue}:${market.venue_market_id}:${market.claim_key}`}
+            >
+              <VenueStack venues={[market.venue]} />
+              <span>
+                <b>{market.title}</b>
+                <code>{market.market_id}</code>
+              </span>
+              <em>{label(market.canonical_class)}</em>
+            </div>
+          ))}
+          {counts && counts.markets > page.length && (
+            <div className="proof-card">
+              <b>
+                Showing {page.length} of {counts.markets} markets
+              </b>
+              <span>
+                A claim is global, so the markets expressing it grow with the
+                market universe rather than with the number of runs.
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function useDrawerFocus(
   open: boolean,
@@ -200,6 +322,7 @@ export function TargetsPage() {
   const [event, setEvent] = useState('');
   const [page, setPage] = useState(0);
   const [detailId, setDetailId] = useState<string | null>(null);
+  const [claimId, setClaimId] = useState<string | null>(null);
   const opener = useRef<HTMLElement | null>(null);
   const selectedDetail = useEventDetail(detailId);
   const grouped = useMemo(() => {
@@ -338,6 +461,12 @@ export function TargetsPage() {
         }
         close={() => setDetailId(null)}
         opener={opener}
+        openClaim={setClaimId}
+      />
+      <ClaimDrawer
+        claimId={claimId}
+        close={() => setClaimId(null)}
+        opener={opener}
       />
     </div>
   );
@@ -380,11 +509,13 @@ function NormalizedTargetDrawer({
   markets,
   close,
   opener,
+  openClaim,
 }: {
   detail: UniverseEventDetail | null;
   markets: UniverseSelectedMarket[];
   close: () => void;
   opener: React.MutableRefObject<HTMLElement | null>;
+  openClaim: (claimId: string) => void;
 }) {
   const dialog = useDrawerFocus(Boolean(detail), close, opener);
   if (!detail) return null;
@@ -453,15 +584,20 @@ function NormalizedTargetDrawer({
             </div>
           ))}
           {detail.claims.map((claim) => (
-            <div className="proof-card" key={claim.claim_id}>
+            <button
+              type="button"
+              className="proof-card claim-card"
+              key={claim.claim_id}
+              onClick={() => openClaim(claim.claim_id)}
+            >
               <b>
-                {claim.venue_count > 1
-                  ? `Same claim at ${claim.venue_count} venues`
-                  : 'Claim at one venue'}{' '}
-                · {label(claim.coverage)}
+                {claimName(claim, detail.claims)} · {label(claim.coverage)}
               </b>
               <span>
-                {claim.market_count} markets · {claim.outcome_key_count}{' '}
+                {claim.venue_count > 1
+                  ? `Listed at ${claim.venue_count} venues`
+                  : 'Listed at one venue'}{' '}
+                · {claim.market_count} markets · {claim.outcome_key_count}{' '}
                 outcomes · {label(claim.scope)}
               </span>
               {/* Observation bounds, not lifecycle: the targeter cannot tell a
@@ -469,8 +605,7 @@ function NormalizedTargetDrawer({
               <span>
                 Observed {claim.first_seen_run_id} to {claim.last_seen_run_id}
               </span>
-              <code>{claim.claim_id}</code>
-            </div>
+            </button>
           ))}
           {detail.relations.map((relation) => (
             <div
@@ -481,10 +616,10 @@ function NormalizedTargetDrawer({
                 {label(relation.relation_type)} ·{' '}
                 {label(relation.antecedent_coverage)}
               </b>
-              <code>
-                {relation.left_claim_id.slice(0, 12)} →{' '}
-                {relation.right_claim_id.slice(0, 12)}
-              </code>
+              <span>
+                {claimName(relation.left_claim_id, detail.claims)} →{' '}
+                {claimName(relation.right_claim_id, detail.claims)}
+              </span>
             </div>
           ))}
           {detail.observations.map((observation) => (

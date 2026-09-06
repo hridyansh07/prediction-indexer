@@ -6,6 +6,8 @@ import {
   useQuery,
 } from '@tanstack/react-query';
 import type {
+  UniverseClaimDetail,
+  UniverseClaimMarketPage,
   UniverseBundlePage,
   UniverseEventDetail,
   UniverseSelectionDetail,
@@ -34,6 +36,9 @@ export const universeKeys = {
   bundleHistory: (bundleId: string, sort: 'selected', limit: number) =>
     [...universeKeys.all, 'bundle-history', bundleId, { sort, limit }] as const,
   event: (eventId: string) => [...universeKeys.all, 'event', eventId] as const,
+  claim: (claimId: string) => [...universeKeys.all, 'claim', claimId] as const,
+  claimMarkets: (claimId: string, limit: number) =>
+    [...universeKeys.all, 'claim-markets', claimId, { limit }] as const,
 };
 
 export function createUniverseQueryClient() {
@@ -155,6 +160,46 @@ export function useBundleHistory(bundleId: string | null) {
   return useQuery({
     ...bundleHistoryQuery(bundleId ?? ''),
     enabled: Boolean(bundleId),
+  });
+}
+
+export const claimDetailQuery = (claimId: string) =>
+  queryOptions({
+    queryKey: universeKeys.claim(claimId),
+    queryFn: ({ signal }) =>
+      universeGet<UniverseClaimDetail>(
+        `/v1/claims/${encodeURIComponent(claimId)}`,
+        signal,
+      ),
+    staleTime: 0,
+    gcTime: 0,
+  });
+
+// The markets expressing a claim grow with the market universe, so the drawer
+// shows a bounded first page and the claim's own counts say how many there are.
+export const claimMarketsQuery = (claimId: string, limit: number) =>
+  queryOptions({
+    queryKey: universeKeys.claimMarkets(claimId, limit),
+    queryFn: ({ signal }) =>
+      universeGet<UniverseClaimMarketPage>(
+        `/v1/claims/${encodeURIComponent(claimId)}/markets?limit=${limit}`,
+        signal,
+      ),
+    staleTime: 0,
+    gcTime: 0,
+  });
+
+export function useClaimDetail(claimId: string | null) {
+  return useQuery({
+    ...claimDetailQuery(claimId ?? ''),
+    enabled: Boolean(claimId),
+  });
+}
+
+export function useClaimMarkets(claimId: string | null, limit = 25) {
+  return useQuery({
+    ...claimMarketsQuery(claimId ?? '', limit),
+    enabled: Boolean(claimId),
   });
 }
 

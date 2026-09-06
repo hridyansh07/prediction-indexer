@@ -39,8 +39,12 @@ Three tables replace three. Nothing is written per run.
 -- Content-addressed and participant-independent, so one row serves every event
 -- and every run that expresses it.
 CREATE TABLE claim_classes (
+    -- Digest of the outcome subset *and* the space shape. A score space is
+    -- capped from the lines the venues listed, so an identical subset can occur
+    -- under two shapes while meaning different things.
     claim_id TEXT PRIMARY KEY,
     space_shape_id TEXT NOT NULL,
+    coverage TEXT NOT NULL,
     scope TEXT NOT NULL,
     outcome_key_count INTEGER NOT NULL CHECK(outcome_key_count > 0),
     claim_identity_version INTEGER NOT NULL CHECK(claim_identity_version = 1),
@@ -157,11 +161,24 @@ script becomes an invariant that holds forever, which also satisfies `AGENTS.md`
   become a self-join of `market_claims` on `event_id` through `claim_relations`,
   plus same-claim membership for equivalence.
 - **`market_detail`** (`:1687-1722`): same, scoped by canonical market.
-- **`relation_detail`** (`:1727-1760`): becomes claim detail. `observations`
-  (one row per run) becomes the claim's member markets with their first/last-seen
-  runs — bounded by the data, not by elapsed time, and carrying targeter
-  observation bounds rather than any lifecycle claim. Fixes A.3 outright.
-- **healthz counts** (`:1289`): `relations` → `claim_classes`.
+- **`relation_detail`** (`:1727-1760`): becomes claim detail. The per-run
+  `observations` list is gone. Its first replacement — inlining the claim's
+  member markets — rebuilt the same row-cap wall one axis over, because a claim
+  is global and the markets expressing it grow with the market universe. Detail
+  now returns counts and `GET /v1/claims/<claim_id>/markets` pages the members.
+- **healthz counts** (`:1289`): `relations` → `claim_classes`, plus a
+  `claim_coverage` block summing the per-run recomputation shortfall.
+- **Seen bounds** on both new tables resolve through `_seen_run_ids` against
+  `targeter_runs.generated_at_ns`, never the ingesting run: sync drains retries
+  before its date walk and bootstraps newest-first, so recording the ingesting
+  run as both bounds inverts them for most of a backfill.
+- **Every read filters to a market's current claim era**, including the
+  subquery that scopes market detail to its canonical market. A superseded era
+  left unfiltered keeps contributing membership and relations, and in the
+  scoping subquery it also pulled in relations belonging to other markets.
+- **`universe_run_projections`** gains `claim_relation_shortfall` and
+  `unreconstructed_bundles`, so a recomputation that falls short of the report
+  is visible rather than merely not raised.
 - `_market_projection_identity` (`:2479`, `:2513`): projection field set changes
   if §4.2 lands.
 
@@ -240,7 +257,9 @@ never persisted.
 for all history; emitting it later is a pure optimization.
 
 **4.4 — UI work was deferred** until the server landed, then done on a branch
-stacked on top of it. Both go to master together, so the strict-validator break
+stacked on top of it. Claim detail and its paged markets are reachable from the
+event drawer; a claim card opens them, and a relation names the two claims it
+relates rather than printing two digests. Both go to master together, so the strict-validator break
 below never reaches a deployed pairing.
 
 The UI now matches v6: run detail carries no `relations` and no

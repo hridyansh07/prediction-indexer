@@ -205,13 +205,6 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn("observed_activation_at", schema)
         self.assertIn("CREATE TABLE universe_sync_failures", schema)
         self.assertIn("CREATE TABLE canonical_markets", schema)
-        # `_execute_statements` splits the schema on ";", so a semicolon inside
-        # a comment silently truncates the statement it sits in. That produced a
-        # table missing every column after the comment.
-        for line in schema.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("--"):
-                self.assertNotIn(";", stripped, stripped)
         self.assertIn("CREATE TABLE claim_classes", schema)
         self.assertIn("CREATE TABLE claim_relations", schema)
         self.assertIn("CREATE TABLE market_claims", schema)

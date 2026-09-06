@@ -85,7 +85,7 @@ class UniverseApplication:
                 parsed.path.removeprefix("/v1/claims/").removesuffix("/markets"),
                 "claim id",
             )
-            if self.database.claim_detail(claim_id) is None:
+            if not self.database.claim_exists(claim_id):
                 return HTTPStatus.NOT_FOUND, {"error": "claim not found"}
             return HTTPStatus.OK, self._claim_markets(claim_id, query)
         if parsed.path.startswith("/v1/claims/"):
