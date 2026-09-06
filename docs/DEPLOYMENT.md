@@ -855,7 +855,8 @@ run for its targets and decisions views. The response contains only freshness,
 latest/current-complete run summaries, and selected counts.
 `GET /v1/targeter/runs/<run_id>` returns bounded normalized decisions
 and references. Event, market, and relationship detail is available from
-`/v1/events`, `/v1/markets/<market_id>`, and `/v1/relations/<relation_id>`.
+`/v1/events`, `/v1/markets/<market_id>`, `/v1/claims/<claim_id>`, and
+`/v1/claims/<claim_id>/markets`.
 `GET /v1/targeter/cadence` has been removed and returns 404. Universe and the UI
 proxy enforce a 1.75 MB serialized response budget; list limits are capped at
 100.

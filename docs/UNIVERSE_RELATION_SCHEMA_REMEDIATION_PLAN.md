@@ -187,8 +187,10 @@ data we already have, before any schema is touched.
 (`targeter/v2/relationships.py`) compiles claims through `_scope_masks`, the same
 path `derive_bundle_relationships` uses, so the two cannot drift.
 `tests/test_claims.py` locks the properties and runs the reconstruction diff
-against real bundle fixtures; `scripts/verify_claim_model.py` runs the same gate
-against a built database.
+against real bundle fixtures. The gate also ran as `scripts/verify_claim_model.py`
+against a built v5 database; that script read `relation_observations` and was
+removed with the table once schema v6 landed, and the check it performed now runs
+on every ingestion instead (see `universe/claim_projection.py`).
 
 Offline result: on two-venue esports bundles the reconstruction reproduces the
 cross-venue non-OVERLAP relation set **exactly** (12/12 on BO3-with-maps, 8/8 on
@@ -199,6 +201,7 @@ claim relations — and those 8 relations are reusable by every other BO3 event.
 runs and 3,333,919 `relation_observations`, read-only:
 
 ```sh
+# Run against the v5 build, before schema v6 removed the script's input tables.
 python scripts/verify_claim_model.py --database /srv/event-universe/build/universe-v5.sqlite3
 ```
 

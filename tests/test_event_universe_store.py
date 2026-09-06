@@ -37,7 +37,8 @@ from universe.store import (
     UniverseStore,
     file_sha256,
 )
-from universe.sync import BOOTSTRAP_RUN_BUDGET, UniverseSync
+from analysis.claims import CLAIM_IDENTITY_VERSION
+from universe.sync import BOOTSTRAP_RUN_BUDGET, SyncResult, UniverseSync
 
 R1 = "20260101T000000.000001Z"
 R2 = "20260101T001000.000002Z"
@@ -1898,10 +1899,22 @@ class EventUniverseTests(unittest.TestCase):
         claim_id = event["claims"][0]["claim_id"]
         status, claim = app.get(f"/v1/claims/{claim_id}")
         self.assertEqual(status, 200)
-        self.assertEqual(len(claim["members"]), 2)
-        self.assertEqual(claim["members"][0]["event_id"], event_id)
+        self.assertEqual(claim["counts"], {"markets": 2, "venues": 2, "events": 1})
+        # The markets expressing a claim grow with the market universe, so they
+        # are paged rather than inlined.
+        status, page = app.get(f"/v1/claims/{claim_id}/markets?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page["markets"]), 1)
+        self.assertIsNotNone(page["next_cursor"])
+        self.assertEqual(page["markets"][0]["event_id"], event_id)
         # Member bounds are targeter observation bounds, not lifecycle.
-        self.assertEqual(claim["members"][0]["first_seen_run_id"], R1)
+        self.assertEqual(page["markets"][0]["first_seen_run_id"], R1)
+        status, rest = app.get(
+            f"/v1/claims/{claim_id}/markets?cursor={page['next_cursor']}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(rest["markets"]), 1)
+        self.assertIsNone(rest["next_cursor"])
         # An invalid id raises; the HTTP handler is what maps that to 400.
         with self.assertRaisesRegex(ValueError, "claim id must be a sha256 digest"):
             app.get("/v1/claims/not-a-digest")
@@ -2236,6 +2249,301 @@ class ClaimModelTests(unittest.TestCase):
             ),
             frozenset({"kalshi:a"}),
         )
+
+    def test_seen_bounds_follow_generated_time_not_ingestion_order(self) -> None:
+        """Bootstrap walks newest-first and retries drain before the date walk.
+
+        Recording the ingesting run as both bounds inverts them for every run
+        that arrives out of generated order, which is the whole backfill. The
+        rest of the schema resolves bounds through ``_seen_run_ids``; these
+        tables must too.
+        """
+        keys = []
+        for run, generated in ((R1, G1), (R3, G3)):
+            _publish_run(self.objects, _selection_report(run, generated))
+            date = generated.split("T", 1)[0]
+            keys.append(
+                f"targeter-v2/runs/date={date}/run={run}/run_manifest.json"
+            )
+        sync = UniverseSync(self.database, self.objects)
+        result = SyncResult()
+        for key in reversed(keys):
+            sync._ingest_direct(key, result, now_ns=1767226200000000000)
+        self.assertEqual(result.failures, [])
+
+        with sqlite3.connect(self.database.path) as connection:
+            for table in ("venue_markets", "claim_classes", "market_claims"):
+                first, last = connection.execute(
+                    f"SELECT first_seen_run_id, last_seen_run_id FROM {table} LIMIT 1"
+                ).fetchone()
+                self.assertEqual((table, first, last), (table, R1, R3))
+
+    def test_readers_use_only_a_market_s_current_claim_era(self) -> None:
+        """A market whose semantics change opens an era rather than rewriting.
+
+        Only the newest era describes the market now. Without that filter a
+        stale era contributes relations and claim membership permanently --
+        the same defect the removed current-state subqueries existed to avoid.
+        """
+        # Bootstrap walks newest-first, so ingest in two passes to land both.
+        self._ingest((R1, G1))
+        self._ingest((R3, G3))
+        events, _more = self.database.list_events()
+        event_id = events[0]["event_id"]
+        before = self.database.event_detail(event_id)
+        assert before is not None
+        stale_claim = before["claims"][0]["claim_id"]
+
+        superseding = "f" * 64
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                """INSERT INTO claim_classes(
+                       claim_id, space_shape_id, scope, coverage,
+                       outcome_key_count, claim_identity_version,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, 'series', 'EXHAUSTIVE', 2, ?, ?, ?)""",
+                (superseding, "e" * 64, CLAIM_IDENTITY_VERSION, R3, R3),
+            )
+            members = connection.execute(
+                """SELECT venue, venue_market_id, claim_key, event_id
+                   FROM market_claims WHERE claim_id = ?""",
+                (stale_claim,),
+            ).fetchall()
+            self.assertTrue(members)
+            # Every market expressing the claim moves on: the stale era stops at
+            # R1 and the new one runs to R3. Retiring only one would leave the
+            # claim legitimately current on the rest.
+            for member in members:
+                connection.execute(
+                    """UPDATE market_claims SET last_seen_run_id = ?
+                       WHERE venue = ? AND venue_market_id = ?
+                         AND claim_key = ? AND claim_id = ?""",
+                    (R1, member[0], member[1], member[2], stale_claim),
+                )
+                connection.execute(
+                    """INSERT INTO market_claims(
+                           venue, venue_market_id, claim_key, claim_id, event_id,
+                           first_seen_run_id, last_seen_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (member[0], member[1], member[2], superseding, member[3], R3, R3),
+                )
+
+        after = self.database.event_detail(event_id)
+        assert after is not None
+        claim_ids = {claim["claim_id"] for claim in after["claims"]}
+        self.assertIn(superseding, claim_ids)
+        # The stale era is excluded outright, not merely reduced in count.
+        self.assertNotIn(stale_claim, claim_ids)
+        detail = self.database.claim_detail(superseding)
+        assert detail is not None
+        self.assertEqual(detail["counts"]["markets"], len(members))
+        stale = self.database.claim_detail(stale_claim)
+        assert stale is not None
+        self.assertEqual(stale["counts"]["markets"], 0)
+
+    def test_claim_markets_page_past_the_detail_row_limit(self) -> None:
+        """A claim is global, so its markets grow with the market universe.
+
+        Inlining them rebuilt the wall that per-run observations had, one axis
+        over. They are counted in detail and paged here.
+        """
+        self._ingest((R1, G1))
+        events, _more = self.database.list_events()
+        detail = self.database.event_detail(events[0]["event_id"])
+        assert detail is not None
+        claim_id = detail["claims"][0]["claim_id"]
+        venue_market = self.database.claim_markets(claim_id)[0][0]
+
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for index in range(DETAIL_ROW_LIMIT + 1):
+                identifier = f"filler-{index}"
+                connection.execute(
+                    """INSERT INTO venue_markets
+                       SELECT venue, ?, venue_event_id, event_id, market_id,
+                              market_template_version, outcome_space_version,
+                              canonical_class, market_type, scope, title,
+                              parameters_json, subscription_ids_json,
+                              outcome_labels_json, status, accepting_orders,
+                              rules_hash, rule_template_id, source_ref,
+                              created_at, volume_24h, volume_total,
+                              volume_total_usd, liquidity, first_seen_run_id,
+                              last_seen_run_id
+                       FROM venue_markets
+                       WHERE venue = ? AND venue_market_id = ?""",
+                    (identifier, venue_market["venue"], venue_market["venue_market_id"]),
+                )
+                connection.execute(
+                    """INSERT INTO market_claims(
+                           venue, venue_market_id, claim_key, claim_id, event_id,
+                           first_seen_run_id, last_seen_run_id
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        venue_market["venue"], identifier,
+                        venue_market["claim_key"], claim_id,
+                        venue_market["event_id"], R1, R1,
+                    ),
+                )
+
+        # Detail stays servable because it counts rather than lists.
+        detail = self.database.claim_detail(claim_id)
+        assert detail is not None
+        self.assertGreater(detail["counts"]["markets"], DETAIL_ROW_LIMIT)
+        page, has_more = self.database.claim_markets(claim_id, limit=100)
+        self.assertEqual(len(page), 100)
+        self.assertTrue(has_more)
+
+    def test_run_detail_survives_a_run_whose_markets_carry_many_claims(self) -> None:
+        """A.2: the 25,007-row relation array is gone rather than paged."""
+        self._ingest((R1, G1))
+        detail = self.database.targeter_run_detail(R1)
+        assert detail is not None
+        self.assertNotIn("relations", detail)
+        self.assertNotIn("relations", detail["counts"])
+
+    def test_claim_shortfall_is_recorded_and_surfaced(self) -> None:
+        """A false negative that nothing reports is not a visible one."""
+        self._ingest((R1, G1))
+        with sqlite3.connect(self.database.path) as connection:
+            stored = connection.execute(
+                """SELECT claim_relation_shortfall, unreconstructed_bundles
+                   FROM universe_run_projections WHERE run_id = ?""",
+                (R1,),
+            ).fetchone()
+        self.assertEqual(stored, (0, 0))
+        coverage = self.database.status()["claim_coverage"]
+        self.assertEqual(
+            coverage,
+            {
+                "relation_shortfall": 0,
+                "unreconstructed_bundles": 0,
+                "runs_with_shortfall": 0,
+            },
+        )
+
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute(
+                "UPDATE universe_run_projections SET claim_relation_shortfall = 4"
+            )
+        surfaced = self.database.status()["claim_coverage"]
+        self.assertEqual(surfaced["relation_shortfall"], 4)
+        self.assertEqual(surfaced["runs_with_shortfall"], 1)
+
+    def test_market_relations_exclude_a_retired_claim_era(self) -> None:
+        """A market's retired era must not pull its old claim's relations back.
+
+        The claims query filters its scoping subquery to the current era; the
+        relations query used the same subquery without it. A retired claim then
+        stayed in the IN-list, and any other market in the event whose *current*
+        claim was that one satisfied the join -- reporting that market's
+        relations as this one's.
+        """
+        self._ingest((R1, G1))
+        self._ingest((R3, G3))
+        events, _more = self.database.list_events()
+        event_id = events[0]["event_id"]
+
+        retired = "a" * 64
+        current = "b" * 64
+        other = "c" * 64
+        shape = "d" * 64
+        with sqlite3.connect(self.database.path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for claim in (retired, current, other):
+                connection.execute(
+                    """INSERT INTO claim_classes(
+                           claim_id, space_shape_id, scope, coverage,
+                           outcome_key_count, claim_identity_version,
+                           first_seen_run_id, last_seen_run_id
+                       ) VALUES (?, ?, 'series', 'EXHAUSTIVE', 2, ?, ?, ?)""",
+                    (claim, shape, CLAIM_IDENTITY_VERSION, R1, R3),
+                )
+            # The retired claim is the antecedent of a relation, so if it leaks
+            # into the market's scope the relation surfaces with it.
+            connection.execute(
+                """INSERT INTO claim_relations(
+                       space_shape_id, left_claim_id, right_claim_id,
+                       relation_type, algebra_version
+                   ) VALUES (?, ?, ?, 'IMPLICATION', 1)""",
+                (shape, retired, other),
+            )
+            rows = connection.execute(
+                """SELECT market_id, venue, venue_market_id, 'claim=0', event_id
+                   FROM venue_markets WHERE event_id = ?
+                   ORDER BY market_id, venue, venue_market_id""",
+                (event_id,),
+            ).fetchall()
+            subject = rows[0]
+            neighbour = next(row for row in rows if row[0] != subject[0])
+            connection.execute("DELETE FROM market_claims")
+            # Subject market: retired era on the old claim, current era on a new
+            # one. Neighbour market in the same event still holds the old claim.
+            connection.execute(
+                """INSERT INTO market_claims(
+                       venue, venue_market_id, claim_key, claim_id, event_id,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (subject[1], subject[2], subject[3], retired, subject[4], R1, R1),
+            )
+            connection.execute(
+                """INSERT INTO market_claims(
+                       venue, venue_market_id, claim_key, claim_id, event_id,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (subject[1], subject[2], subject[3], current, subject[4], R3, R3),
+            )
+            connection.execute(
+                """INSERT INTO market_claims(
+                       venue, venue_market_id, claim_key, claim_id, event_id,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (neighbour[1], neighbour[2], neighbour[3], retired,
+                 neighbour[4], R3, R3),
+            )
+            # The relation's consequent needs a live member in the event, or
+            # the join cannot fire and the leak stays hidden.
+            connection.execute(
+                """INSERT INTO market_claims(
+                       venue, venue_market_id, claim_key, claim_id, event_id,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, 'claim=1', ?, ?, ?, ?)""",
+                (neighbour[1], neighbour[2], other, neighbour[4], R3, R3),
+            )
+
+        detail = self.database.market_detail(subject[0])
+        assert detail is not None
+        self.assertEqual(
+            [claim["claim_id"] for claim in detail["claims"]], [current]
+        )
+        self.assertEqual(
+            [relation["left_claim_id"] for relation in detail["relations"]],
+            [],
+            "a retired era pulled its old claim's relations into this market",
+        )
+
+    def test_schema_load_survives_a_semicolon_inside_a_comment(self) -> None:
+        """Loading parses SQL rather than splitting text on ";".
+
+        Splitting truncated the statement a commented semicolon sat in, leaving
+        a table missing every column after it. Linting the committed file would
+        only have caught today's comments; parsing removes the hazard.
+        """
+        source = self.root / "with_comment.sql"
+        source.write_text(
+            "CREATE TABLE probe (\n"
+            "    a INTEGER, -- keys are sorted; then hashed\n"
+            "    b INTEGER\n"
+            ") STRICT;\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(self.root / "probe.sqlite3") as connection:
+            UniverseStore._execute_statements(connection, source)
+            columns = [
+                row[1]
+                for row in connection.execute("PRAGMA table_info(probe)")
+            ]
+        self.assertEqual(columns, ["a", "b"])
 
 
 if __name__ == "__main__":

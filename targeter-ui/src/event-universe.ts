@@ -1,4 +1,4 @@
-export const EVENT_UNIVERSE_SCHEMA_VERSION = 5 as const;
+export const EVENT_UNIVERSE_SCHEMA_VERSION = 6 as const;
 
 export type UniverseSort = 'activation' | 'selected';
 export type OccurrenceKind = 'complete' | 'retained';
@@ -229,14 +229,40 @@ export interface UniverseCanonicalMarket {
   venues: string[];
 }
 
-export interface UniverseRelationSummary {
-  relation_id: number;
-  relation_type: string;
-  event_id?: string;
+/** One distinct outcome subset, and how far it reaches inside an event. */
+export interface UniverseClaimSummary {
+  claim_id: string;
+  space_shape_id: string;
   scope: string;
+  /**
+   * Whether the outcome space enumerates every reachable outcome. A claim over
+   * an INCOMPLETE_COVERAGE space is conditional discovery evidence.
+   */
   coverage: string;
-  generation_version: number;
-  canonical_hash: string;
+  outcome_key_count: number;
+  /** Event-scoped, and identically scoped in event and market detail. */
+  market_count: number;
+  venue_count: number;
+  /** Targeter observation bounds, never a lifecycle or settlement claim. */
+  first_seen_run_id: string;
+  last_seen_run_id: string;
+}
+
+/**
+ * How two claims relate. IDENTITY never appears: equal subsets are one claim,
+ * so equivalence shows up as a claim listed at more than one venue. Implication
+ * is always written antecedent first, and OVERLAP is never stored.
+ */
+export interface UniverseClaimRelation {
+  space_shape_id: string;
+  left_claim_id: string;
+  right_claim_id: string;
+  relation_type: string;
+  /** Of the antecedent and consequent, so neither is described by the other. */
+  antecedent_scope: string;
+  antecedent_coverage: string;
+  consequent_scope: string;
+  consequent_coverage: string;
 }
 
 export interface UniverseEventDetail {
@@ -254,7 +280,8 @@ export interface UniverseEventDetail {
     last_seen_run_id: string;
   }>;
   markets: UniverseCanonicalMarket[];
-  relations: UniverseRelationSummary[];
+  claims: UniverseClaimSummary[];
+  relations: UniverseClaimRelation[];
   observations: Array<{
     run_id: string;
     generated_at: string;
@@ -305,37 +332,58 @@ export interface UniverseMarketDetail {
     selection_reason: UniverseSelectedMarket['selection_reason'];
     origin_run_id: string;
   }>;
-  relations: UniverseRelationSummary[];
+  claims: UniverseClaimSummary[];
+  relations: UniverseClaimRelation[];
 }
 
-export interface UniverseRelationDetail {
-  relation: {
-    relation_id: number;
-    relation_type: string;
-    generation_version: number;
-    canonical_hash: string;
+export interface UniverseClaimDetail {
+  claim: {
+    claim_id: string;
+    space_shape_id: string;
+    scope: string;
+    coverage: string;
+    outcome_key_count: number;
+    claim_identity_version: number;
+    first_seen_run_id: string;
+    last_seen_run_id: string;
   };
-  members: Array<{
+  /**
+   * A claim is global, so the markets expressing it grow with the market
+   * universe. They are counted here and paged through `claimMarkets`.
+   */
+  counts: {
+    markets: number;
+    venues: number;
+    events: number;
+  };
+  relations: Array<{
+    space_shape_id: string;
+    left_claim_id: string;
+    right_claim_id: string;
+    relation_type: string;
+  }>;
+}
+
+export interface UniverseClaimMarketPage {
+  markets: Array<{
     venue: string;
     venue_market_id: string;
+    claim_key: string;
+    event_id: string;
     market_id: string;
     market_template_version: number;
     outcome_space_version: number;
-    claim_key: string;
-    role: string;
+    canonical_class: string;
+    title: string;
+    /** Targeter observation bounds, never a lifecycle or settlement claim. */
+    first_seen_run_id: string;
+    last_seen_run_id: string;
   }>;
-  observations: Array<{
-    run_id: string;
-    generated_at: string;
-    bundle_id: string;
-    event_id: string;
-    scope: string;
-    coverage: string;
-  }>;
+  next_cursor: string | null;
 }
 
 export interface UniverseRelationshipTypeCatalog {
-  relationship_type_catalog_version: 1;
+  relationship_type_catalog_version: 2;
   types: Array<{
     type: string;
     directed: boolean;
@@ -387,12 +435,10 @@ export interface UniverseTargeterRunDetail {
     eligible: number;
     selected_events: number;
     selected_markets: number;
-    relations: number;
   };
   decisions: UniverseTargeterDecision[];
   events: UniverseEvent[];
   selected_markets: UniverseSelectedMarket[];
-  relations: UniverseRelationSummary[];
 }
 
 export interface UniverseHealth {
@@ -416,7 +462,16 @@ export interface UniverseHealth {
     umbrella_events: number;
     canonical_markets: number;
     venue_markets: number;
-    relations: number;
+    claim_classes: number;
+  };
+  /**
+   * Claim coverage the recomputation did not reach. Zero on a healthy build;
+   * non-zero means reduced coverage rather than ordinary absence.
+   */
+  claim_coverage: {
+    relation_shortfall: number;
+    unreconstructed_bundles: number;
+    runs_with_shortfall: number;
   };
   sync: {
     pending_failures: number;

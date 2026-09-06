@@ -602,6 +602,20 @@ main {
 .evidence-list code {
   color: #8c8c99;
 }
+/* A claim card opens claim detail, so it reads and behaves as a control
+   rather than as one more static card in the list. */
+.claim-card {
+  width: 100%;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  justify-items: start;
+}
+.claim-card:hover,
+.claim-card:focus-visible {
+  border-color: var(--accent, #5a5aff);
+}
 .history-timeline {
   display: grid;
   gap: 0;
