@@ -60,7 +60,8 @@ pub struct SelectionPolicy {
 
 /// Exact identity of one selected commit marker. These identities, rather than
 /// paths, are suitable for a later segment manifest.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptIdentity {
     pub window_start_ns: u64,
     pub window_end_ns: u64,

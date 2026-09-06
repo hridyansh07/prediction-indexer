@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/domain"]
+members = ["crates/domain", "crates/normalize", "crates/materialize"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +10,13 @@ rust-version = "1.85"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+fs2 = "0.4"
+prediction-encoder = { path = "../encoder/rust" }
+indexer-finalize = { path = "../ingester/crates/finalize" }
+indexer-types = { path = "../ingester/crates/types" }
+replay-domain = { path = "crates/domain" }
+replay-normalize = { path = "crates/normalize" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

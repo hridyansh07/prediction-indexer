@@ -1,8 +1,9 @@
-# Replay Engine S2 domain boundary
+# Replay normalized derivative boundary
 
-This workspace contains only the stable, venue-independent Replay domain and
-numeric boundary. It does not contain a venue decoder/normalizer, book,
-strategy, segment writer, publisher, or Phase 0 integration.
+This workspace contains the stable, venue-independent Replay domain and the
+generic boundary that turns one Phase 0 canonical window into one immutable,
+verified normalized derivative. It contains no venue decoder, venue schema,
+book, strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
 
@@ -40,7 +41,7 @@ downstream canonical provenance, and a closed `SegmentEvent`. Book events use
 validated constructors, canonical bid-descending/ask-ascending level ordering,
 one scale per full book, and no duplicate prices. `NormalizationFault` carries a
 closed impact classification selected before book state. Exact rejected bytes
-and parser error codes belong in the future reject sidecar, not this event.
+and parser error codes live in the committed reject sidecar, not this event.
 
 Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
 Struct field order and adjacent enum tags are schema. The strict reader rejects
@@ -57,9 +58,9 @@ position and event index remain serialization order, never event time.
 
 Phase 0 continues to own `CanonicalSelection`, `AuditedCanonicalReader`,
 `JoinedCanonicalRecord`, canonical receipt identities, and its finished-audit
-capability in `indexer-finalize`. S2 deliberately duplicates none of them. After
-stacking onto `origin/rework/replay-pipeline`, the tape crate should add one
-conversion from each audited joined record into:
+capability in `indexer-finalize`. Replay deliberately duplicates none of them.
+`replay-normalize` performs one exhaustive conversion from each audited joined
+record into:
 
 ```text
 JoinedCanonicalRecord                    replay-domain
@@ -72,10 +73,60 @@ record_id ------------------------------> EventHeader.record_id
 source digest/line/content/continuity ---> CanonicalProvenance
 ```
 
-That conversion may stage records while streaming, but later segment publication
-must still require Phase 0's `AuditedCanonicalSelection` produced only at verified
-EOF. The Replay continuity enum intentionally has the same ten closed labels; the
-adapter must use an exhaustive match, not string fallback.
+The conversion stages records while streaming, but derivative publication still
+requires Phase 0's `AuditedCanonicalSelection` produced only at verified EOF.
+The Replay continuity enum intentionally has the same ten closed labels; the
+conversion uses an exhaustive match, not string fallback.
+
+## Normalization and materialization
+
+`replay-normalize::Normalizer` exposes the bundle/config descriptor used by the
+address, returns zero/many closed `SegmentEvent` children, an explicit ignored
+reason, or an expected `ParseReject`, and has a final consistency `finish()`.
+Zero children are also an intentional ignore. The materializer records that
+source in the sidecar so ignored evidence remains provenance-addressable. An
+expected reject produces both an exact-envelope sidecar record and one paired
+closed `NormalizationFault`; a normalizer error, panic, invalid domain value,
+audit failure, serialization failure, or sink failure is fatal and publishes no
+receipt.
+
+`replay-materialize::build_window` intentionally accepts the exact bounds of one
+canonical receipt. This is the smallest composition with Phase 0's selected-run
+API: selecting exact receipt bounds yields one window and one post-EOF capability,
+so no canonical input is reopened and no selector/audit lifecycle changes. The
+existing Phase 0 `ReceiptIdentity` gains strict serde support so the derivative
+manifest can reuse it directly rather than duplicate its schema. A caller
+wanting a range builds each canonical receipt independently and pins the
+resulting `DerivativePin` values.
+
+The immutable layout is:
+
+```text
+window=<window-start-ns>/<derivative-address>/
+  events.ndjson.zst
+  rejects.ndjson.zst
+  manifest.json
+  receipt.json            # sole commit marker, written last
+```
+
+The domain-separated address binds the complete source receipt identity and
+bounds, normalized schema version, normalizer bundle and config digests, policy
+digest/effective interval, event/reject serialization versions, and materializer
+version. There is no mutable `latest`. Corrected versions coexist under new
+addresses.
+
+Both NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
+and carry logical and stored identities. The strict verifier checks canonical
+JSON, closed versions and fields, frame EOF and both identities, event/child
+order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
+
+Builds use unique private staging directories. After EOF and both `finish()`
+calls, they finish and fsync frames, rename and fsync data, write and fsync the
+manifest, atomically publish the uncommitted directory, and write/fsync/rename
+the receipt last. Publication is serialized per address with an OS advisory lock
+that is released by process death. An unreceipted directory is crash debris and
+is rebuilt. A retry rebuilds the candidate: identical receipt bytes verify/no-op;
+different bytes at the same address are an immutable conflict.
 
 ## Prepared mutation boundary
 
@@ -106,7 +157,7 @@ absolute/relative level semantics, and explicit contract orientation.
 ## Checks
 
 ```bash
-cargo fmt --manifest-path engine/Cargo.toml -- --check
+cargo fmt --manifest-path engine/Cargo.toml --all --check
 cargo test --manifest-path engine/Cargo.toml --workspace
 cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 ```
