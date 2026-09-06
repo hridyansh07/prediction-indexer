@@ -79,6 +79,15 @@ class UniverseApplication:
             if detail is None:
                 return HTTPStatus.NOT_FOUND, {"error": "market not found"}
             return HTTPStatus.OK, detail
+        if parsed.path.startswith("/v1/claims/") and parsed.path.endswith("/markets"):
+            _only(query, {"limit", "cursor"})
+            claim_id = _path_value(
+                parsed.path.removeprefix("/v1/claims/").removesuffix("/markets"),
+                "claim id",
+            )
+            if self.database.claim_detail(claim_id) is None:
+                return HTTPStatus.NOT_FOUND, {"error": "claim not found"}
+            return HTTPStatus.OK, self._claim_markets(claim_id, query)
         if parsed.path.startswith("/v1/claims/"):
             _only(query, set())
             claim_id = _path_value(
@@ -218,6 +227,28 @@ class UniverseApplication:
                 ]
             )
         return {"bundles": bundles, "next_cursor": next_cursor}
+
+    def _claim_markets(
+        self, claim_id: str, query: dict[str, list[str]]
+    ) -> dict[str, Any]:
+        after = _claim_market_cursor(_optional(query, "cursor"))
+        markets, has_more = self.database.claim_markets(
+            claim_id,
+            after=after,
+            limit=_integer(query, "limit", default=100),
+        )
+        next_cursor = None
+        if has_more and markets:
+            last = markets[-1]
+            next_cursor = _encode_cursor(
+                [
+                    "claim_markets",
+                    last["venue"],
+                    last["venue_market_id"],
+                    last["claim_key"],
+                ]
+            )
+        return {"markets": markets, "next_cursor": next_cursor}
 
     def _events(self, query: dict[str, list[str]]) -> dict[str, Any]:
         _only(query, {"limit", "cursor"})
@@ -363,6 +394,19 @@ def _decode_cursor(value: str) -> list[Any]:
     if not isinstance(decoded, list):
         raise ValueError("cursor is invalid")
     return decoded
+
+
+def _claim_market_cursor(value: str | None) -> tuple[str, str, str] | None:
+    if value is None:
+        return None
+    decoded = _decode_cursor(value)
+    if (
+        len(decoded) != 4
+        or decoded[0] != "claim_markets"
+        or not all(isinstance(item, str) for item in decoded[1:])
+    ):
+        raise ValueError("cursor is invalid")
+    return (decoded[1], decoded[2], decoded[3])
 
 
 def _run_cursor(value: str | None) -> tuple[int, str] | None:

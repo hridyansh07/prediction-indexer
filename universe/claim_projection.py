@@ -103,6 +103,7 @@ def project_claims(
     for row in projection["venue_markets"]:
         venue_markets.setdefault(row["event_id"], []).append(row)
 
+    unreconstructed = 0
     claims: dict[str, dict[str, Any]] = {}
     relations: dict[tuple[str, str, str], dict[str, Any]] = {}
     market_claims: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -112,6 +113,10 @@ def project_claims(
         bundle = _bundle(events[event_id], venue_events.get(event_id, ()),
                          venue_markets.get(event_id, ()))
         if bundle is None:
+            # A bundle that cannot be rebuilt contributes no claims. Counting it
+            # keeps that visible; silently skipping would make missing evidence
+            # look like ordinary absence.
+            unreconstructed += 1
             continue
         resolved_event_id = (event_id_for_bundle or {}).get(
             events[event_id]["source_bundle_id"], event_id
@@ -168,6 +173,7 @@ def project_claims(
         "claim_relations": [relations[key] for key in sorted(relations)],
         "market_claims": [market_claims[key] for key in sorted(market_claims)],
         "relation_shortfall": shortfall,
+        "unreconstructed_bundles": unreconstructed,
     }
 
 

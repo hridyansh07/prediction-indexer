@@ -45,12 +45,27 @@ def _named(space, key: str, venue: str, **market) -> Mask:
 
 class ClaimIdentity(unittest.TestCase):
     def test_identity_is_the_outcome_subset(self) -> None:
-        self.assertEqual(claim_id(["b", "a"]), claim_id(["a", "b"]))
-        self.assertNotEqual(claim_id(["a"]), claim_id(["a", "b"]))
+        self.assertEqual(claim_id(["b", "a"], "shape"), claim_id(["a", "b"], "shape"))
+        self.assertNotEqual(claim_id(["a"], "shape"), claim_id(["a", "b"], "shape"))
 
-    def test_a_claim_must_name_an_outcome(self) -> None:
+    def test_identity_is_scoped_to_the_space_shape(self) -> None:
+        """An identical subset in two shapes is two claims, not one.
+
+        Score spaces are capped at min(20, max(8, max(lines, scores) + 5)), so
+        "under 2.5 goals" names the same three outcomes whether the grid runs to
+        8 or 12. Keying on the subset alone gave that one id spanning two shapes,
+        freezing space_shape_id, scope and coverage at whichever run wrote first.
+        """
+        self.assertNotEqual(
+            claim_id(["score:0-0", "score:1-0"], "shape-cap-8"),
+            claim_id(["score:0-0", "score:1-0"], "shape-cap-12"),
+        )
+
+    def test_a_claim_must_name_an_outcome_and_a_shape(self) -> None:
         with self.assertRaises(ValueError):
-            claim_id([])
+            claim_id([], "shape")
+        with self.assertRaises(ValueError):
+            claim_id(["a"], "")
 
     def test_claims_are_participant_independent(self) -> None:
         """The property the whole model rests on: a claim is global.
@@ -63,7 +78,10 @@ class ClaimIdentity(unittest.TestCase):
         self.assertEqual(space_shape_id(one), space_shape_id(two))
         left = _mask(one, market_type="series_moneyline", outcome_label="PARI")
         right = _mask(two, market_type="series_moneyline", outcome_label="Liquid")
-        self.assertEqual(claim_id(left.outcome_keys), claim_id(right.outcome_keys))
+        self.assertEqual(
+            claim_id(left.outcome_keys, space_shape_id(one)),
+            claim_id(right.outcome_keys, space_shape_id(two)),
+        )
 
     def test_shapes_differ_between_series_formats(self) -> None:
         self.assertNotEqual(space_shape_id(_space(3)), space_shape_id(_space(5)))
@@ -75,8 +93,12 @@ class ClaimIdentity(unittest.TestCase):
                         yes_label="Over 2.5", group_item_title="Over 2.5")
         over_35 = _mask(space, market_type="total_maps",
                         yes_label="Over 3.5", group_item_title="Over 3.5")
+        shape = space_shape_id(space)
         self.assertEqual(over_25.resolver, over_35.resolver)
-        self.assertNotEqual(claim_id(over_25.outcome_keys), claim_id(over_35.outcome_keys))
+        self.assertNotEqual(
+            claim_id(over_25.outcome_keys, shape),
+            claim_id(over_35.outcome_keys, shape),
+        )
         self.assertEqual(relationship(over_35, over_25), IMPLICATION)
 
 

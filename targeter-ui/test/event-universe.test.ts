@@ -256,8 +256,23 @@ const claimRelation = () => ({
   left_claim_id: sha,
   right_claim_id: otherSha,
   relation_type: 'IMPLICATION',
-  scope: 'series',
-  coverage: 'EXHAUSTIVE',
+  antecedent_scope: 'series',
+  antecedent_coverage: 'EXHAUSTIVE',
+  consequent_scope: 'series',
+  consequent_coverage: 'EXHAUSTIVE',
+});
+const claimMarket = (claimKey: unknown = '') => ({
+  venue: 'kalshi',
+  venue_market_id: 'K-ALPHA',
+  claim_key: claimKey,
+  event_id: 'event-alpha',
+  market_id: 'market-alpha',
+  market_template_version: 1,
+  outcome_space_version: 1,
+  canonical_class: 'esports.series_moneyline',
+  title: 'Alpha vs Beta',
+  first_seen_run_id: run().run_id,
+  last_seen_run_id: run().run_id,
 });
 const normalizedEvent = () => ({
   event: normalizedEventSummary(),
@@ -360,7 +375,7 @@ const normalizedMarket = () => ({
   claims: normalizedEvent().claims,
   relations: normalizedEvent().relations,
 });
-const normalizedClaim = (claimKey: unknown = '') => ({
+const normalizedClaim = () => ({
   claim: {
     claim_id: sha,
     space_shape_id: shapeSha,
@@ -371,21 +386,7 @@ const normalizedClaim = (claimKey: unknown = '') => ({
     first_seen_run_id: run().run_id,
     last_seen_run_id: run().run_id,
   },
-  members: [
-    {
-      venue: 'kalshi',
-      venue_market_id: 'K-ALPHA',
-      claim_key: claimKey,
-      event_id: 'event-alpha',
-      market_id: 'market-alpha',
-      market_template_version: 1,
-      outcome_space_version: 1,
-      canonical_class: 'esports.series_moneyline',
-      title: 'Alpha vs Beta',
-      first_seen_run_id: run().run_id,
-      last_seen_run_id: run().run_id,
-    },
-  ],
+  counts: { markets: 2, venues: 2, events: 1 },
   relations: [
     {
       space_shape_id: shapeSha,
@@ -394,6 +395,10 @@ const normalizedClaim = (claimKey: unknown = '') => ({
       relation_type: 'IMPLICATION',
     },
   ],
+});
+const normalizedClaimMarkets = (claimKey: unknown = '') => ({
+  markets: [claimMarket(claimKey)],
+  next_cursor: null,
 });
 const json = (value: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(value), {
@@ -444,6 +449,7 @@ test('real UniverseApplication responses satisfy every proxy contract', async ()
       'targeter_run',
       'market_detail',
       'claim_detail',
+      'claim_markets',
       'health_degraded',
     ],
   );
@@ -470,7 +476,9 @@ test('real Universe contracts remain closed to key-set drift', async () => {
     ['event_detail', (body) => delete body.claims[0].venue_count],
     ['market_detail', (body) => (body.claims = undefined)],
     ['claim_detail', (body) => delete body.claim.coverage],
-    ['claim_detail', (body) => (body.members[0].unexpected = true)],
+    ['claim_detail', (body) => delete body.counts.venues],
+    ['claim_markets', (body) => (body.markets[0].unexpected = true)],
+    ['health_ok', (body) => delete body.claim_coverage],
   ];
   for (const [name, mutate] of mutations) {
     const contract = structuredClone(contracts.get(name)!);
@@ -825,18 +833,21 @@ test('same-origin proxy dispatches every normalized collection and detail route'
   assert.equal(eventDetail.headers.get('cache-control'), 'no-store');
 });
 
-test('claim detail accepts an empty claim key but rejects schema drift', async () => {
+test('claim markets accept an empty claim key but reject schema drift', async () => {
   const valid = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedClaim())) as typeof fetch,
+    fetch: (async () => json(normalizedClaimMarkets())) as typeof fetch,
   });
-  assert.equal((await valid.claim(sha)).members[0].claim_key, '');
+  assert.equal(
+    (await valid.claimMarkets(sha, new URLSearchParams())).markets[0].claim_key,
+    '',
+  );
 
   const invalid = new EventUniverseClient({
     baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedClaim(null))) as typeof fetch,
+    fetch: (async () => json(normalizedClaimMarkets(null))) as typeof fetch,
   });
-  await assert.rejects(() => invalid.claim(sha));
+  await assert.rejects(() => invalid.claimMarkets(sha, new URLSearchParams()));
 });
 
 test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
@@ -1368,6 +1379,11 @@ test('Vercel proxy drops the rewrite group the platform echoes into the query', 
           canonical_markets: 1912,
           venue_markets: 3618,
           claim_classes: 733,
+        },
+        claim_coverage: {
+          relation_shortfall: 0,
+          unreconstructed_bundles: 0,
+          runs_with_shortfall: 0,
         },
         sync: { pending_failures: 0 },
       });

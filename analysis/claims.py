@@ -62,17 +62,34 @@ def _digest(value: Any) -> str:
     ).hexdigest()
 
 
-def claim_id(outcome_keys: Iterable[str]) -> str:
-    """Identify a claim by the outcome subset it resolves YES on.
+def claim_id(outcome_keys: Iterable[str], space_shape: str) -> str:
+    """Identify a claim by its outcome subset *within one space shape*.
 
     Participant-independent, so the same claim in two different events of the
-    same shape yields the same id. Two claims in *different* shapes draw from
-    different key universes and so never collide.
+    same shape yields the same id.
+
+    The shape is part of the identity rather than merely implied by the key
+    set. A subset can be identical across two shapes while meaning different
+    things: score spaces are capped at
+    ``min(20, max(8, max(lines, scores) + 5))``, so "under 2.5 goals" names the
+    same three outcomes whether the grid runs to 8 or to 12, while "home wins"
+    names a different set in each. Keying on the subset alone would give the
+    first of those one id spanning two shapes, freezing `space_shape_id`,
+    `scope` and `coverage` at whichever run wrote first and returning a claim
+    pair twice from any join that ignores the shape.
     """
     keys = sorted(str(key) for key in outcome_keys)
     if not keys:
         raise ValueError("a claim must name at least one outcome")
-    return _digest({"version": CLAIM_IDENTITY_VERSION, "outcome_keys": keys})
+    if not space_shape:
+        raise ValueError("a claim must name the space shape it is drawn from")
+    return _digest(
+        {
+            "version": CLAIM_IDENTITY_VERSION,
+            "space_shape_id": space_shape,
+            "outcome_keys": keys,
+        }
+    )
 
 
 def space_shape_id(space: OutcomeSpace) -> str:
@@ -151,7 +168,7 @@ def derive_claims(masks: Iterable[Mask], space: OutcomeSpace) -> tuple[Claim, ..
     grouped: dict[str, list[Mask]] = {}
     keys: dict[str, frozenset[str]] = {}
     for mask in usable_masks(masks, space):
-        identifier = claim_id(mask.outcome_keys)
+        identifier = claim_id(mask.outcome_keys, shape)
         grouped.setdefault(identifier, []).append(mask)
         keys[identifier] = mask.outcome_keys
     return tuple(

@@ -13,6 +13,7 @@ import type {
   UniverseEventPage,
   UniverseMarketDetail,
   UniverseClaimDetail,
+  UniverseClaimMarketPage,
   UniverseClaimRelation,
   UniverseClaimSummary,
   UniverseRelationshipTypeCatalog,
@@ -55,6 +56,7 @@ const RESPONSE_BUDGET_BYTES = 1_750_000;
 const DETAIL_ROW_LIMIT = 1000;
 const BUNDLE_QUERY = new Set(['limit', 'cursor']);
 const EVENT_QUERY = new Set(['limit', 'cursor']);
+const CLAIM_MARKET_QUERY = new Set(['limit', 'cursor']);
 const MARKET_QUERY = new Set([
   'market_template_version',
   'outcome_space_version',
@@ -211,6 +213,15 @@ export class EventUniverseClient {
     );
   }
 
+  claimMarkets(claimId: string, query: URLSearchParams) {
+    if (!/^[0-9a-f]{64}$/.test(claimId)) throw new UniverseRequestError();
+    return this.get(
+      `v1/claims/${claimId}/markets`,
+      validateUniverseQuery(query, CLAIM_MARKET_QUERY),
+      validateClaimMarketPage,
+    );
+  }
+
   claim(claimId: string) {
     // A claim is addressed by the digest of its outcome subset, so anything
     // that is not one cannot name a claim and never reaches upstream.
@@ -343,6 +354,8 @@ export async function dispatchEventUniverseRequest(
   }
   match = /^\/v1\/markets\/([^/]+)$/.exec(pathname);
   if (match) return client.market(pathSegment(match[1]), query);
+  match = /^\/v1\/claims\/([^/]+)\/markets$/.exec(pathname);
+  if (match) return client.claimMarkets(pathSegment(match[1]), query);
   match = /^\/v1\/claims\/([^/]+)$/.exec(pathname);
   if (match) {
     requireNoQuery(query);
@@ -1162,8 +1175,10 @@ function validateClaimRelation(value: unknown): UniverseClaimRelation {
       'left_claim_id',
       'right_claim_id',
       'relation_type',
-      'scope',
-      'coverage',
+      'antecedent_scope',
+      'antecedent_coverage',
+      'consequent_scope',
+      'consequent_coverage',
     ],
     'claim relation',
   );
@@ -1177,8 +1192,10 @@ function validateClaimRelation(value: unknown): UniverseClaimRelation {
     left_claim_id: left,
     right_claim_id: right,
     relation_type: text(item.relation_type),
-    scope: text(item.scope),
-    coverage: text(item.coverage),
+    antecedent_scope: text(item.antecedent_scope),
+    antecedent_coverage: text(item.antecedent_coverage),
+    consequent_scope: text(item.consequent_scope),
+    consequent_coverage: text(item.consequent_coverage),
   };
 }
 
@@ -1381,7 +1398,7 @@ function validateMarketDetail(value: unknown): UniverseMarketDetail {
 }
 
 function validateClaimDetail(value: unknown): UniverseClaimDetail {
-  const item = object(value, ['claim', 'members', 'relations'], 'claim detail');
+  const item = object(value, ['claim', 'counts', 'relations'], 'claim detail');
   const claim = object(
     item.claim,
     [
@@ -1396,6 +1413,11 @@ function validateClaimDetail(value: unknown): UniverseClaimDetail {
     ],
     'claim',
   );
+  const counts = object(
+    item.counts,
+    ['markets', 'venues', 'events'],
+    'claim counts',
+  );
   return {
     claim: {
       claim_id: sha(claim.claim_id),
@@ -1407,7 +1429,31 @@ function validateClaimDetail(value: unknown): UniverseClaimDetail {
       first_seen_run_id: text(claim.first_seen_run_id),
       last_seen_run_id: text(claim.last_seen_run_id),
     },
-    members: detailArray(item.members, (value) => {
+    counts: {
+      markets: integer(counts.markets),
+      venues: integer(counts.venues),
+      events: integer(counts.events),
+    },
+    relations: detailArray(item.relations, (value) => {
+      const record = object(
+        value,
+        ['space_shape_id', 'left_claim_id', 'right_claim_id', 'relation_type'],
+        'claim detail relation',
+      );
+      return {
+        space_shape_id: sha(record.space_shape_id),
+        left_claim_id: sha(record.left_claim_id),
+        right_claim_id: sha(record.right_claim_id),
+        relation_type: text(record.relation_type),
+      };
+    }),
+  };
+}
+
+function validateClaimMarketPage(value: unknown): UniverseClaimMarketPage {
+  const item = object(value, ['markets', 'next_cursor'], 'claim market page');
+  return {
+    markets: pageArray(item.markets, (value) => {
       const record = object(
         value,
         [
@@ -1423,7 +1469,7 @@ function validateClaimDetail(value: unknown): UniverseClaimDetail {
           'first_seen_run_id',
           'last_seen_run_id',
         ],
-        'claim member',
+        'claim market',
       );
       return {
         venue: text(record.venue),
@@ -1441,19 +1487,7 @@ function validateClaimDetail(value: unknown): UniverseClaimDetail {
         last_seen_run_id: text(record.last_seen_run_id),
       };
     }),
-    relations: detailArray(item.relations, (value) => {
-      const record = object(
-        value,
-        ['space_shape_id', 'left_claim_id', 'right_claim_id', 'relation_type'],
-        'claim detail relation',
-      );
-      return {
-        space_shape_id: sha(record.space_shape_id),
-        left_claim_id: sha(record.left_claim_id),
-        right_claim_id: sha(record.right_claim_id),
-        relation_type: text(record.relation_type),
-      };
-    }),
+    next_cursor: item.next_cursor === null ? null : text(item.next_cursor),
   };
 }
 
@@ -1732,7 +1766,14 @@ function validateRunDetail(value: unknown): UniverseRunDetail {
 function validateHealth(value: unknown): UniverseHealth {
   const item = object(
     value,
-    ['status', 'schema_version', 'latest_run', 'counts', 'sync'],
+    [
+      'status',
+      'schema_version',
+      'latest_run',
+      'counts',
+      'claim_coverage',
+      'sync',
+    ],
     'health',
   );
   if (
@@ -1754,6 +1795,11 @@ function validateHealth(value: unknown): UniverseHealth {
       'claim_classes',
     ],
     'counts',
+  );
+  const coverage = object(
+    item.claim_coverage,
+    ['relation_shortfall', 'unreconstructed_bundles', 'runs_with_shortfall'],
+    'claim coverage',
   );
   const sync = object(item.sync, ['pending_failures'], 'sync');
   const pendingFailures = integer(sync.pending_failures);
@@ -1801,6 +1847,11 @@ function validateHealth(value: unknown): UniverseHealth {
       canonical_markets: integer(counts.canonical_markets),
       venue_markets: integer(counts.venue_markets),
       claim_classes: integer(counts.claim_classes),
+    },
+    claim_coverage: {
+      relation_shortfall: integer(coverage.relation_shortfall),
+      unreconstructed_bundles: integer(coverage.unreconstructed_bundles),
+      runs_with_shortfall: integer(coverage.runs_with_shortfall),
     },
     sync: { pending_failures: pendingFailures },
   };

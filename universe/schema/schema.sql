@@ -170,7 +170,15 @@ CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
     projection_version INTEGER NOT NULL CHECK(projection_version = 3),
     projection_sha256 TEXT NOT NULL,
-    projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0)
+    projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0),
+    -- Claims are recomputed from the run's own projection, and where that
+    -- recomputation falls short of what the report recorded the gap is a
+    -- visible false negative rather than a rejection. Both counts are zero on
+    -- a healthy run, and a non-zero total surfaces on /healthz so reduced
+    -- coverage cannot pass as ordinary absence.
+    claim_relation_shortfall INTEGER NOT NULL
+        CHECK(claim_relation_shortfall >= 0),
+    unreconstructed_bundles INTEGER NOT NULL CHECK(unreconstructed_bundles >= 0)
 ) STRICT;
 
 CREATE TABLE umbrella_events (

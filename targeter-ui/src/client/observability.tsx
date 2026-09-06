@@ -478,7 +478,8 @@ function NormalizedTargetDrawer({
               key={`${relation.left_claim_id}:${relation.right_claim_id}`}
             >
               <b>
-                {label(relation.relation_type)} · {label(relation.coverage)}
+                {label(relation.relation_type)} ·{' '}
+                {label(relation.antecedent_coverage)}
               </b>
               <code>
                 {relation.left_claim_id.slice(0, 12)} →{' '}

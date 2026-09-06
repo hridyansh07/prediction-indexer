@@ -134,8 +134,19 @@ Three consequences are structural rather than incidental:
 outcome. A finding over an `INCOMPLETE_COVERAGE` space stays conditional
 discovery evidence, never an unconditional claim.
 
+A claim id covers its outcome subset **and its space shape**. The two are not
+interchangeable: a score space is capped from the lines the venues listed, so an
+identical subset can occur under two shapes while meaning different things.
+Keying on the subset alone would give such a claim one row spanning both, with
+its shape, scope and coverage frozen at whichever run wrote first. A shape that
+moves therefore mints a new claim and a new era, which is visible rather than
+silent; making the cap configuration per sport, so shapes stop drifting, remains
+open.
+
 `first_seen_run_id` and `last_seen_run_id`, on both claims and market claims,
-are **targeter observation bounds, not lifecycle**. `last_seen_run_id` is the
+are **targeter observation bounds, not lifecycle**. They resolve against
+`targeter_runs.generated_at_ns`, never ingestion order, because sync drains
+retries before its date walk and bootstraps newest-first. `last_seen_run_id` is the
 last run in which the targeter observed the market expressing the claim.
 Absence afterwards is ambiguous by construction — the market may have settled,
 been delisted, or stopped being a candidate — and Universe cannot distinguish
@@ -267,7 +278,8 @@ limits are 1–100 and list cursors are opaque and query-specific.
 | `GET /v1/events?limit=&cursor=` | Canonical event summaries with identity coordinates and native aliases |
 | `GET /v1/events/<event_id>` | Event, venue events, canonical markets, claims, claim relations, observations |
 | `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, claims, claim relations |
-| `GET /v1/claims/<claim_id>` | Claim, the markets expressing it, and its claim relations |
+| `GET /v1/claims/<claim_id>` | Claim, how far it reaches, and its claim relations |
+| `GET /v1/claims/<claim_id>/markets?limit=&cursor=` | The markets expressing one claim, paged |
 | `GET /v1/relationship-types` | Closed relationship-type catalogue |
 | `GET /v1/runs`, `/v1/selections`, `/v1/bundles` | Historical compatibility APIs |
 

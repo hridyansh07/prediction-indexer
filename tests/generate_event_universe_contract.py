@@ -90,6 +90,13 @@ def generate_contract() -> dict:
                     _response(application, f"/v1/claims/{claim_id}"),
                 )
             )
+            cases.append(
+                _case(
+                    "claim_markets",
+                    f"/v1/claims/{claim_id}/markets?limit=100",
+                    _response(application, f"/v1/claims/{claim_id}/markets?limit=100"),
+                )
+            )
             database.record_sync_failure(
                 "targeter-v2/runs/date=2026-01-01/run=bad/run_manifest.json",
                 "contract fixture",

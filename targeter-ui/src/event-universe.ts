@@ -258,8 +258,11 @@ export interface UniverseClaimRelation {
   left_claim_id: string;
   right_claim_id: string;
   relation_type: string;
-  scope: string;
-  coverage: string;
+  /** Of the antecedent and consequent, so neither is described by the other. */
+  antecedent_scope: string;
+  antecedent_coverage: string;
+  consequent_scope: string;
+  consequent_coverage: string;
 }
 
 export interface UniverseEventDetail {
@@ -345,10 +348,24 @@ export interface UniverseClaimDetail {
     last_seen_run_id: string;
   };
   /**
-   * The markets expressing this claim. Bounded by those markets rather than by
-   * elapsed time, which is why this replaced the per-run observation list.
+   * A claim is global, so the markets expressing it grow with the market
+   * universe. They are counted here and paged through `claimMarkets`.
    */
-  members: Array<{
+  counts: {
+    markets: number;
+    venues: number;
+    events: number;
+  };
+  relations: Array<{
+    space_shape_id: string;
+    left_claim_id: string;
+    right_claim_id: string;
+    relation_type: string;
+  }>;
+}
+
+export interface UniverseClaimMarketPage {
+  markets: Array<{
     venue: string;
     venue_market_id: string;
     claim_key: string;
@@ -358,15 +375,11 @@ export interface UniverseClaimDetail {
     outcome_space_version: number;
     canonical_class: string;
     title: string;
+    /** Targeter observation bounds, never a lifecycle or settlement claim. */
     first_seen_run_id: string;
     last_seen_run_id: string;
   }>;
-  relations: Array<{
-    space_shape_id: string;
-    left_claim_id: string;
-    right_claim_id: string;
-    relation_type: string;
-  }>;
+  next_cursor: string | null;
 }
 
 export interface UniverseRelationshipTypeCatalog {
@@ -450,6 +463,15 @@ export interface UniverseHealth {
     canonical_markets: number;
     venue_markets: number;
     claim_classes: number;
+  };
+  /**
+   * Claim coverage the recomputation did not reach. Zero on a healthy build;
+   * non-zero means reduced coverage rather than ordinary absence.
+   */
+  claim_coverage: {
+    relation_shortfall: number;
+    unreconstructed_bundles: number;
+    runs_with_shortfall: number;
   };
   sync: {
     pending_failures: number;
