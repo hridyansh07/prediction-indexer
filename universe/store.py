@@ -17,10 +17,11 @@ from archive.common.durable import fsync_directory
 from archive.storage.base import normalize_key
 from targeter.v2.models import isoformat, parse_timestamp
 from universe.event_identity import EventIdentityError, resolve_market_projection
-from universe.market_projection import MARKET_PROJECTION_VERSION
+from universe.claim_projection import project_claims
+from universe.market_projection import MARKET_PROJECTION_VERSION, MarketProjectionError
 from universe.projection import PROJECTION_VERSION
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 STALE_AFTER_SECONDS = 3_600
 TARGETER_RUN_INTERVAL_SECONDS = 600
 EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES = 1_750_000
@@ -94,9 +95,11 @@ class UniverseStore:
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:
-        for statement in path.read_text(encoding="utf-8").split(";"):
-            if statement.strip():
-                connection.execute(statement)
+        # `executescript` parses SQL rather than splitting text on ";", so a
+        # semicolon inside a comment or a literal cannot truncate the statement
+        # it sits in. Splitting silently produced a table missing every column
+        # after such a comment.
+        connection.executescript(path.read_text(encoding="utf-8"))
 
     @classmethod
     def _execute_schema_transaction(
@@ -372,6 +375,7 @@ class UniverseStore:
                 connection,
                 run_id=run_id,
                 projection=resolved_market_projection,
+                raw_projection=market_projection,
                 projection_sha256=market_sha256,
                 projection_row_count=market_row_count,
                 occurrences=normalized,
@@ -452,6 +456,7 @@ class UniverseStore:
         *,
         run_id: str,
         projection: Mapping[str, Any],
+        raw_projection: Mapping[str, Any],
         projection_sha256: str,
         projection_row_count: int,
         occurrences: Iterable[Mapping[str, Any]],
@@ -791,80 +796,142 @@ class UniverseStore:
                 ),
             )
 
-        for relation in projection["relations"]:
-            connection.execute(
-                """INSERT INTO relations(
-                       relation_type, generation_version, canonical_hash
-                   ) VALUES (?, ?, ?)
-                   ON CONFLICT(relation_type, canonical_hash, generation_version)
-                   DO NOTHING""",
-                (
-                    relation["relation_type"], relation["generation_version"],
-                    relation["canonical_hash"],
-                ),
-            )
-            stored = connection.execute(
-                """SELECT relation_id FROM relations
-                   WHERE relation_type = ? AND canonical_hash = ?
-                     AND generation_version = ?""",
-                (
-                    relation["relation_type"], relation["canonical_hash"],
-                    relation["generation_version"],
-                ),
-            ).fetchone()
-            assert stored is not None
-            relation_id = int(stored["relation_id"])
-            existing_members = connection.execute(
-                """SELECT venue, venue_market_id, claim_key, role
-                   FROM relation_members WHERE relation_id = ?
-                   ORDER BY role, venue, venue_market_id, claim_key""",
-                (relation_id,),
-            ).fetchall()
-            members = sorted(
-                relation["members"],
-                key=lambda item: (
-                    item["role"], item["venue"], item["venue_market_id"],
-                    item["claim_key"],
-                ),
-            )
-            if existing_members:
-                if [_row_record(row) for row in existing_members] != members:
-                    raise EvidenceConflict(
-                        f"relation {relation['canonical_hash']} members conflict"
-                    )
-            else:
-                connection.executemany(
-                    """INSERT INTO relation_members(
-                           relation_id, venue, venue_market_id, claim_key, role
-                       ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        (
-                            relation_id, member["venue"],
-                            member["venue_market_id"], member["claim_key"],
-                            member["role"],
-                        )
-                        for member in members
-                    ),
-                )
-            connection.execute(
-                """INSERT INTO relation_observations(
-                       run_id, relation_id, bundle_id, event_id, scope, coverage
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    run_id, relation_id, relation["bundle_id"], relation["event_id"],
-                    relation["scope"], relation["coverage"],
-                ),
-            )
+        shortfall, unreconstructed = self._insert_claims(
+            connection, run_id, raw_projection, projection
+        )
 
         connection.execute(
             """INSERT INTO universe_run_projections(
                    run_id, projection_version, projection_sha256,
-                   projection_row_count
-               ) VALUES (?, ?, ?, ?)""",
+                   projection_row_count, claim_relation_shortfall,
+                   unreconstructed_bundles
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 run_id, MARKET_PROJECTION_VERSION, projection_sha256,
-                projection_row_count,
+                projection_row_count, shortfall, unreconstructed,
             ),
+        )
+
+    def _insert_claims(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        raw_projection: Mapping[str, Any],
+        resolved_projection: Mapping[str, Any],
+    ) -> tuple[int, int]:
+        """Record which claim each market expresses, and how claims relate.
+
+        Nothing here is keyed by run: a claim is content-addressed by its
+        outcome subset and a claim relation names no event, run, or venue, so a
+        run that observes what earlier runs already observed writes no new rows
+        and only moves last-seen markers. That is what removes the per-run
+        relation growth the pairwise model had.
+        """
+        # Claims are grouped per candidate bundle, which the raw projection's
+        # event rows are one-to-one with; the resolved projection supplies the
+        # umbrella event each bundle was assigned so stored rows reference it.
+        event_id_for_bundle = {
+            row["source_bundle_id"]: row["event_id"]
+            for row in resolved_projection["events"]
+        }
+        try:
+            claims = project_claims(
+                raw_projection, event_id_for_bundle=event_id_for_bundle
+            )
+        except MarketProjectionError as error:
+            raise EvidenceConflict(str(error)) from error
+
+        for claim in claims["claims"]:
+            # Bounds resolve against generated time, never ingestion order:
+            # sync drains retries before the date walk and bootstraps
+            # newest-first, so a run seen second is often the older one.
+            existing = connection.execute(
+                "SELECT first_seen_run_id, last_seen_run_id FROM claim_classes "
+                "WHERE claim_id = ?",
+                (claim["claim_id"],),
+            ).fetchone()
+            first_seen, last_seen = (
+                (run_id, run_id)
+                if existing is None
+                else _seen_run_ids(connection, existing, run_id)
+            )
+            connection.execute(
+                """INSERT INTO claim_classes(
+                       claim_id, space_shape_id, scope, coverage,
+                       outcome_key_count, claim_identity_version,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(claim_id) DO UPDATE SET
+                       first_seen_run_id = excluded.first_seen_run_id,
+                       last_seen_run_id = excluded.last_seen_run_id""",
+                (
+                    claim["claim_id"], claim["space_shape_id"], claim["scope"],
+                    claim["coverage"], claim["outcome_key_count"],
+                    claim["claim_identity_version"], first_seen, last_seen,
+                ),
+            )
+        for relation in claims["claim_relations"]:
+            connection.execute(
+                """INSERT INTO claim_relations(
+                       space_shape_id, left_claim_id, right_claim_id,
+                       relation_type, algebra_version
+                   ) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(space_shape_id, left_claim_id, right_claim_id)
+                   DO NOTHING""",
+                (
+                    relation["space_shape_id"], relation["left_claim_id"],
+                    relation["right_claim_id"], relation["relation_type"],
+                    relation["algebra_version"],
+                ),
+            )
+            stored = connection.execute(
+                """SELECT relation_type FROM claim_relations
+                   WHERE space_shape_id = ? AND left_claim_id = ?
+                     AND right_claim_id = ?""",
+                (
+                    relation["space_shape_id"], relation["left_claim_id"],
+                    relation["right_claim_id"],
+                ),
+            ).fetchone()
+            if stored is not None and stored["relation_type"] != relation["relation_type"]:
+                # A claim relation is a function of the two outcome subsets, so
+                # it cannot change. Disagreement means the subsets did.
+                raise EvidenceConflict(
+                    f"claim relation {relation['left_claim_id'][:12]}/"
+                    f"{relation['right_claim_id'][:12]} conflicts with prior ingestion"
+                )
+        for member in claims["market_claims"]:
+            existing = connection.execute(
+                """SELECT first_seen_run_id, last_seen_run_id FROM market_claims
+                   WHERE venue = ? AND venue_market_id = ? AND claim_key = ?
+                     AND claim_id = ?""",
+                (
+                    member["venue"], member["venue_market_id"],
+                    member["claim_key"], member["claim_id"],
+                ),
+            ).fetchone()
+            first_seen, last_seen = (
+                (run_id, run_id)
+                if existing is None
+                else _seen_run_ids(connection, existing, run_id)
+            )
+            connection.execute(
+                """INSERT INTO market_claims(
+                       venue, venue_market_id, claim_key, claim_id, event_id,
+                       first_seen_run_id, last_seen_run_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(venue, venue_market_id, claim_key, claim_id)
+                   DO UPDATE SET
+                       first_seen_run_id = excluded.first_seen_run_id,
+                       last_seen_run_id = excluded.last_seen_run_id""",
+                (
+                    member["venue"], member["venue_market_id"], member["claim_key"],
+                    member["claim_id"], member["event_id"], first_seen, last_seen,
+                ),
+            )
+        return (
+            int(claims["relation_shortfall"]),
+            int(claims["unreconstructed_bundles"]),
         )
 
     def _insert_context(
@@ -1286,7 +1353,7 @@ class UniverseStore:
                     "umbrella_events",
                     "canonical_markets",
                     "venue_markets",
-                    "relations",
+                    "claim_classes",
                 )
             }
             latest = connection.execute(
@@ -1294,6 +1361,18 @@ class UniverseStore:
                           indexed_at_ns, input_complete
                    FROM targeter_runs
                    ORDER BY generated_at_ns DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
+            # Claim coverage the recomputation did not reach. Reported beside
+            # pending failures so a false negative stays visible rather than
+            # looking like ordinary absence, per AGENTS.md's no-silent-loss rule.
+            claims_row = connection.execute(
+                """SELECT COALESCE(SUM(claim_relation_shortfall), 0),
+                          COALESCE(SUM(unreconstructed_bundles), 0),
+                          COUNT(*) FILTER (
+                              WHERE claim_relation_shortfall > 0
+                                 OR unreconstructed_bundles > 0
+                          )
+                   FROM universe_run_projections"""
             ).fetchone()
             pending_failures = int(
                 connection.execute(
@@ -1320,6 +1399,11 @@ class UniverseStore:
             "latest_run": latest_record,
             "counts": counts,
             "sync": {"pending_failures": pending_failures},
+            "claim_coverage": {
+                "relation_shortfall": int(claims_row[0]),
+                "unreconstructed_bundles": int(claims_row[1]),
+                "runs_with_shortfall": int(claims_row[2]),
+            },
         }
 
     def targeter_status_snapshot(
@@ -1437,16 +1521,6 @@ class UniverseStore:
                    LIMIT ?""",
                 (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
-            relations = connection.execute(
-                """SELECT relation.relation_id, relation.relation_type,
-                          observed.event_id, observed.scope, observed.coverage,
-                          relation.generation_version, relation.canonical_hash
-                   FROM relation_observations observed
-                   JOIN relations relation USING (relation_id)
-                   WHERE observed.run_id = ? ORDER BY relation.relation_id
-                   LIMIT ?""",
-                (run_id, DETAIL_ROW_LIMIT + 1),
-            ).fetchall()
             events = connection.execute(
                 f"""SELECT DISTINCT event.*,
                           {_event_refs_sql('event')} AS event_refs_json
@@ -1458,7 +1532,7 @@ class UniverseStore:
                 (run_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
         _ensure_detail_rows(
-            (decisions, selected, relations, events), "targeter run detail"
+            (decisions, selected, events), "targeter run detail"
         )
         return _bounded_detail(
             {
@@ -1474,7 +1548,6 @@ class UniverseStore:
                     "eligible": sum(bool(row["eligible"]) for row in decisions),
                     "selected_events": len({row["event_id"] for row in selected}),
                     "selected_markets": len(selected),
-                    "relations": len(relations),
                 },
                 "decisions": [
                     {
@@ -1496,7 +1569,6 @@ class UniverseStore:
                 ],
                 "events": [_event_record(row) for row in events],
                 "selected_markets": [_row_record(row) for row in selected],
-                "relations": [_row_record(row) for row in relations],
             },
             "targeter run detail",
         )
@@ -1574,25 +1646,43 @@ class UniverseStore:
                 (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
             relations = connection.execute(
-                """SELECT relation.relation_id, relation.relation_type,
-                          observed.scope, observed.coverage,
-                          relation.generation_version, relation.canonical_hash
-                   FROM relations relation
-                   JOIN relation_observations observed USING (relation_id)
-                   JOIN targeter_runs observed_run USING (run_id)
-                   WHERE observed.event_id = ?
-                     AND NOT EXISTS (
-                         SELECT 1
-                         FROM relation_observations newer
-                         JOIN targeter_runs newer_run USING (run_id)
-                         WHERE newer.relation_id = observed.relation_id
-                           AND newer.event_id = observed.event_id
-                           AND (newer_run.generated_at_ns,
-                                newer.run_id, newer.bundle_id) >
-                               (observed_run.generated_at_ns,
-                                observed_run.run_id, observed.bundle_id)
-                     )
-                   ORDER BY relation.relation_type, relation.relation_id
+                f"""SELECT DISTINCT related.relation_type,
+                          related.left_claim_id, related.right_claim_id,
+                          related.space_shape_id,
+                          antecedent.scope AS antecedent_scope,
+                          antecedent.coverage AS antecedent_coverage,
+                          consequent.scope AS consequent_scope,
+                          consequent.coverage AS consequent_coverage
+                   FROM market_claims left_member
+                   JOIN claim_relations related
+                     ON related.left_claim_id = left_member.claim_id
+                   JOIN market_claims right_member
+                     ON right_member.claim_id = related.right_claim_id
+                    AND right_member.event_id = left_member.event_id
+                   JOIN claim_classes antecedent
+                     ON antecedent.claim_id = related.left_claim_id
+                   JOIN claim_classes consequent
+                     ON consequent.claim_id = related.right_claim_id
+                   WHERE left_member.event_id = ?
+                     AND {_current_era('left_member')}
+                     AND {_current_era('right_member')}
+                   ORDER BY related.relation_type, related.left_claim_id,
+                            related.right_claim_id
+                   LIMIT ?""",
+                (event_id, DETAIL_ROW_LIMIT + 1),
+            ).fetchall()
+            claims = connection.execute(
+                f"""SELECT claim.claim_id, claim.space_shape_id, claim.scope,
+                          claim.coverage, claim.outcome_key_count,
+                          claim.first_seen_run_id, claim.last_seen_run_id,
+                          COUNT(*) AS market_count,
+                          COUNT(DISTINCT member.venue) AS venue_count
+                   FROM claim_classes claim
+                   JOIN market_claims member USING (claim_id)
+                   WHERE member.event_id = ?
+                     AND {_current_era('member')}
+                   GROUP BY claim.claim_id
+                   ORDER BY venue_count DESC, claim.claim_id
                    LIMIT ?""",
                 (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
@@ -1607,13 +1697,14 @@ class UniverseStore:
                 (event_id, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
         _ensure_detail_rows(
-            (venue_events, markets, relations, observations), "event detail"
+            (venue_events, markets, relations, claims, observations), "event detail"
         )
         return _bounded_detail(
             {
                 "event": _event_record(event),
                 "venue_events": [_row_record(row) for row in venue_events],
                 "markets": [_canonical_market_record(row) for row in markets],
+                "claims": [_row_record(row) for row in claims],
                 "relations": [_row_record(row) for row in relations],
                 "observations": [_row_record(row) for row in observations],
             },
@@ -1684,87 +1775,197 @@ class UniverseStore:
                    LIMIT ?""",
                 (*key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
+            # Scoped to the market's own event, like the claim summaries below.
+            # `claim_relations` is global, so joining on claim alone would
+            # return every edge the claim takes part in anywhere.
             relations = connection.execute(
-                """SELECT DISTINCT relation.relation_id,
-                          relation.relation_type, observed.scope,
-                          observed.coverage, relation.generation_version,
-                          relation.canonical_hash
-                   FROM relation_members member
-                   JOIN relations relation USING (relation_id)
-                   JOIN relation_observations observed USING (relation_id)
-                   JOIN targeter_runs observed_run USING (run_id)
-                   JOIN venue_markets venue
-                     ON venue.venue = member.venue
-                    AND venue.venue_market_id = member.venue_market_id
-                   WHERE venue.market_id = ?
-                     AND venue.market_template_version = ?
-                     AND venue.outcome_space_version = ?
-                     AND NOT EXISTS (
-                         SELECT 1
-                         FROM relation_observations newer
-                         JOIN targeter_runs newer_run USING (run_id)
-                         WHERE newer.relation_id = observed.relation_id
-                           AND (newer_run.generated_at_ns,
-                                newer_run.run_id, newer.bundle_id) >
-                               (observed_run.generated_at_ns,
-                                observed_run.run_id, observed.bundle_id)
+                f"""SELECT DISTINCT related.relation_type,
+                          related.left_claim_id, related.right_claim_id,
+                          related.space_shape_id,
+                          antecedent.scope AS antecedent_scope,
+                          antecedent.coverage AS antecedent_coverage,
+                          consequent.scope AS consequent_scope,
+                          consequent.coverage AS consequent_coverage
+                   FROM market_claims member
+                   JOIN claim_relations related
+                     ON related.left_claim_id = member.claim_id
+                     OR related.right_claim_id = member.claim_id
+                   JOIN market_claims counterpart
+                     ON counterpart.event_id = member.event_id
+                    AND counterpart.claim_id = CASE
+                          WHEN related.left_claim_id = member.claim_id
+                          THEN related.right_claim_id
+                          ELSE related.left_claim_id
+                        END
+                   JOIN claim_classes antecedent
+                     ON antecedent.claim_id = related.left_claim_id
+                   JOIN claim_classes consequent
+                     ON consequent.claim_id = related.right_claim_id
+                   WHERE member.event_id = ?
+                     AND member.claim_id IN (
+                         SELECT scoped.claim_id
+                         FROM venue_markets venue
+                         JOIN market_claims scoped
+                           ON scoped.venue = venue.venue
+                          AND scoped.venue_market_id = venue.venue_market_id
+                         WHERE venue.market_id = ?
+                           AND venue.market_template_version = ?
+                           AND venue.outcome_space_version = ?
+                           AND {_current_era('scoped')}
                      )
-                   ORDER BY relation.relation_type, relation.relation_id
+                     AND {_current_era('member')}
+                     AND {_current_era('counterpart')}
+                   ORDER BY related.relation_type, related.left_claim_id,
+                            related.right_claim_id
                    LIMIT ?""",
-                (*key, DETAIL_ROW_LIMIT + 1),
+                (market["event_id"], *key, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
-        _ensure_detail_rows((venue_markets, selections, relations), "market detail")
+            # Counts are event-scoped in both this response and event detail,
+            # so one claim summary means the same thing wherever it appears.
+            claims = connection.execute(
+                f"""SELECT claim.claim_id, claim.space_shape_id, claim.scope,
+                          claim.coverage, claim.outcome_key_count,
+                          claim.first_seen_run_id, claim.last_seen_run_id,
+                          COUNT(*) AS market_count,
+                          COUNT(DISTINCT scoped.venue) AS venue_count
+                   FROM claim_classes claim
+                   JOIN market_claims scoped USING (claim_id)
+                   WHERE scoped.event_id = ?
+                     AND claim.claim_id IN (
+                         SELECT member.claim_id
+                         FROM venue_markets venue
+                         JOIN market_claims member
+                           ON member.venue = venue.venue
+                          AND member.venue_market_id = venue.venue_market_id
+                         WHERE venue.market_id = ?
+                           AND venue.market_template_version = ?
+                           AND venue.outcome_space_version = ?
+                           AND {_current_era('member')}
+                     )
+                     AND {_current_era('scoped')}
+                   GROUP BY claim.claim_id
+                   ORDER BY venue_count DESC, claim.claim_id
+                   LIMIT ?""",
+                (market["event_id"], *key, DETAIL_ROW_LIMIT + 1),
+            ).fetchall()
+        _ensure_detail_rows(
+            (venue_markets, selections, relations, claims), "market detail"
+        )
         return _bounded_detail(
             {
                 "market": _canonical_market_record(market),
                 "venue_markets": [_venue_market_record(row) for row in venue_markets],
                 "selections": [_row_record(row) for row in selections],
+                "claims": [_row_record(row) for row in claims],
                 "relations": [_row_record(row) for row in relations],
             },
             "market detail",
         )
 
-    def relation_detail(self, relation_id: int) -> dict[str, Any] | None:
-        if isinstance(relation_id, bool) or not isinstance(relation_id, int) or relation_id <= 0:
-            raise ValueError("relation id must be a positive integer")
+    def claim_detail(self, claim_id: str) -> dict[str, Any] | None:
+        """One claim: how far it reaches, and what it relates to.
+
+        A claim is global, so the markets expressing it grow with the market
+        universe -- every best-of-3 event contributes its own moneyline markets
+        to one "home wins a best-of-3" claim. That set is unbounded in the same
+        way the per-run observation list was, just on a slower axis, so it is
+        counted here and paged through ``claim_markets`` rather than inlined.
+
+        Bounds are targeter observation bounds, not lifecycle. A market's
+        ``last_seen_run_id`` is the last run in which the targeter observed it
+        expressing this claim; absence afterwards may mean the market settled,
+        was delisted, or simply stopped being a candidate, and Universe cannot
+        distinguish those without the venue.
+        """
+        identifier = _claim_identifier(claim_id)
         with closing(self.connect(readonly=True)) as connection:
-            relation = connection.execute(
-                "SELECT * FROM relations WHERE relation_id = ?", (relation_id,)
+            claim = connection.execute(
+                "SELECT * FROM claim_classes WHERE claim_id = ?", (identifier,)
             ).fetchone()
-            if relation is None:
+            if claim is None:
                 return None
-            members = connection.execute(
-                """SELECT member.venue, member.venue_market_id,
-                          venue.market_id, venue.market_template_version,
-                          venue.outcome_space_version, member.claim_key,
-                          member.role
-                   FROM relation_members member
-                   JOIN venue_markets venue USING (venue, venue_market_id)
-                   WHERE member.relation_id = ?
-                   ORDER BY member.role, member.venue,
-                            member.venue_market_id, member.claim_key
+            counts = connection.execute(
+                f"""SELECT COUNT(*) AS market_count,
+                          COUNT(DISTINCT member.venue) AS venue_count,
+                          COUNT(DISTINCT member.event_id) AS event_count
+                   FROM market_claims member
+                   WHERE member.claim_id = ? AND {_current_era('member')}""",
+                (identifier,),
+            ).fetchone()
+            relations = connection.execute(
+                """SELECT space_shape_id, left_claim_id, right_claim_id,
+                          relation_type
+                   FROM claim_relations
+                   WHERE left_claim_id = ? OR right_claim_id = ?
+                   ORDER BY relation_type, left_claim_id, right_claim_id
                    LIMIT ?""",
-                (relation_id, DETAIL_ROW_LIMIT + 1),
+                (identifier, identifier, DETAIL_ROW_LIMIT + 1),
             ).fetchall()
-            observations = connection.execute(
-                """SELECT observed.run_id, run.generated_at, observed.bundle_id,
-                          observed.event_id, observed.scope, observed.coverage
-                   FROM relation_observations observed
-                   JOIN targeter_runs run USING (run_id)
-                   WHERE observed.relation_id = ?
-                   ORDER BY run.generated_at_ns, observed.run_id, observed.bundle_id
-                   LIMIT ?""",
-                (relation_id, DETAIL_ROW_LIMIT + 1),
-            ).fetchall()
-        _ensure_detail_rows((members, observations), "relation detail")
+        _ensure_detail_rows((relations,), "claim detail")
         return _bounded_detail(
             {
-                "relation": _row_record(relation),
-                "members": [_row_record(row) for row in members],
-                "observations": [_row_record(row) for row in observations],
+                "claim": _row_record(claim),
+                "counts": {
+                    "markets": int(counts["market_count"]),
+                    "venues": int(counts["venue_count"]),
+                    "events": int(counts["event_count"]),
+                },
+                "relations": [_row_record(row) for row in relations],
             },
-            "relation detail",
+            "claim detail",
         )
+
+    def claim_exists(self, claim_id: str) -> bool:
+        """Whether a claim is known, without building its detail.
+
+        The paged markets route needs only this; calling `claim_detail` would
+        re-run its counts aggregate and relations query on every page.
+        """
+        identifier = _claim_identifier(claim_id)
+        with closing(self.connect(readonly=True)) as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM claim_classes WHERE claim_id = ?", (identifier,)
+                ).fetchone()
+                is not None
+            )
+
+    def claim_markets(
+        self,
+        claim_id: str,
+        *,
+        after: tuple[str, str, str] | None = None,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """The markets expressing one claim, paged.
+
+        Only each market's current era: a market whose semantics changed opens a
+        new era rather than rewriting the old row, and only the newest describes
+        it now.
+        """
+        identifier = _claim_identifier(claim_id)
+        bounded = _limit(limit)
+        where = ""
+        parameters: list[Any] = []
+        if after is not None:
+            where = "AND (member.venue, member.venue_market_id, member.claim_key) > (?, ?, ?)"
+            parameters.extend(after)
+        with closing(self.connect(readonly=True)) as connection:
+            rows = connection.execute(
+                f"""SELECT member.venue, member.venue_market_id, member.claim_key,
+                          member.event_id, member.first_seen_run_id,
+                          member.last_seen_run_id, venue.market_id,
+                          venue.market_template_version, venue.outcome_space_version,
+                          venue.canonical_class, venue.title
+                   FROM market_claims member
+                   JOIN venue_markets venue USING (venue, venue_market_id)
+                   WHERE member.claim_id = ? {where}
+                     AND {_current_era('member')}
+                   ORDER BY member.venue, member.venue_market_id, member.claim_key
+                   LIMIT ?""",
+                (identifier, *parameters, bounded + 1),
+            ).fetchall()
+        return [_row_record(row) for row in rows[:bounded]], len(rows) > bounded
 
     def list_runs(
         self,
@@ -2457,6 +2658,42 @@ def _selection_record(row: sqlite3.Row) -> dict[str, Any]:
             "report_sha256": row["origin_report_sha256"],
         },
     }
+
+
+# A market's claim can change if its semantics do, which opens a new era rather
+# than rewriting the old row. Only the newest era describes the market now, so
+# every read filters to it. Eras are near-always one row, unlike the per-run
+# observations this model replaced.
+_CURRENT_ERA = """
+    NOT EXISTS (
+        SELECT 1 FROM market_claims superseding
+        JOIN targeter_runs superseding_run
+          ON superseding_run.run_id = superseding.last_seen_run_id
+        JOIN targeter_runs current_run
+          ON current_run.run_id = {alias}.last_seen_run_id
+        WHERE superseding.venue = {alias}.venue
+          AND superseding.venue_market_id = {alias}.venue_market_id
+          AND superseding.claim_key = {alias}.claim_key
+          AND (superseding_run.generated_at_ns, superseding.last_seen_run_id)
+            > (current_run.generated_at_ns, {alias}.last_seen_run_id)
+    )
+"""
+
+
+def _current_era(alias: str) -> str:
+    return _CURRENT_ERA.format(alias=alias)
+
+
+def _claim_identifier(value: str) -> str:
+    """A claim is addressed by the digest of its outcome subset and shape."""
+    identifier = str(value)
+    if len(identifier) != 64 or not _is_hex(identifier):
+        raise ValueError("claim id must be a sha256 digest")
+    return identifier
+
+
+def _is_hex(value: str) -> bool:
+    return all(character in "0123456789abcdef" for character in value)
 
 
 def _row_record(row: sqlite3.Row) -> dict[str, Any]:

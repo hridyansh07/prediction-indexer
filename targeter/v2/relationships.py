@@ -7,6 +7,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from analysis.claims import (
+    Claim,
+    ClaimRelation,
+    derive_claim_algebra,
+    derive_claims,
+    space_shape_id,
+)
 from analysis.masks import Mask, compile_mask, relationship
 from analysis.outcome_space import (
     COVERAGE_INCOMPLETE,
@@ -396,6 +403,39 @@ def _spaces(bundle: EventBundle) -> tuple[tuple[OutcomeSpace, ...], tuple[str, .
     return tuple(spaces), tuple(diagnostics)
 
 
+def _scope_masks(
+    bundle: EventBundle,
+    space: OutcomeSpace,
+    excluded: frozenset[str],
+) -> list[Mask]:
+    """Every mask this bundle contributes to one outcome space.
+
+    Extracted so relationship derivation and claim derivation compile masks
+    through exactly one code path; the two must never drift.
+    """
+    return [
+        mask
+        for market in bundle.markets
+        if market.target_id not in excluded
+        and (
+            market.scope == space.scope
+            or (
+                space.scope == SCOPE_SERIES
+                and market.market_type
+                in {"map_winner", "total_maps", "map_handicap"}
+            )
+        )
+        for mask in validate_esports_market(bundle, market, space)[0]
+        if bundle.game
+    ] + [
+        compile_mask(view, space)
+        for market in bundle.markets
+        if not bundle.game and market.target_id not in excluded
+        and market.scope == space.scope
+        for view in _market_views(bundle, market)
+    ]
+
+
 def derive_bundle_relationships(
     bundle: EventBundle,
     *,
@@ -406,26 +446,7 @@ def derive_bundle_relationships(
     masks: list[Mask] = []
     relationships: list[Relationship] = []
     for space in spaces:
-        scope_masks = [mask
-            for market in bundle.markets
-            if market.target_id not in excluded
-            and (
-                market.scope == space.scope
-                or (
-                    space.scope == SCOPE_SERIES
-                    and market.market_type
-                    in {"map_winner", "total_maps", "map_handicap"}
-                )
-            )
-            for mask in validate_esports_market(bundle, market, space)[0]
-            if bundle.game
-        ] + [
-            compile_mask(view, space)
-            for market in bundle.markets
-            if not bundle.game and market.target_id not in excluded
-            and market.scope == space.scope
-            for view in _market_views(bundle, market)
-        ]
+        scope_masks = _scope_masks(bundle, space, excluded)
         masks.extend(scope_masks)
         usable = [
             mask
@@ -458,3 +479,48 @@ def derive_bundle_relationships(
         spaces=spaces,
         diagnostics=diagnostics,
     )
+
+
+@dataclass(frozen=True)
+class BundleClaims:
+    """One outcome space's claims and the algebra over them."""
+
+    space_shape_id: str
+    scope: str
+    coverage: str
+    claims: tuple[Claim, ...]
+    relations: tuple[ClaimRelation, ...]
+
+
+def derive_bundle_claims(
+    bundle: EventBundle,
+    *,
+    excluded_market_ids: Iterable[str] = (),
+    informative_only: bool = True,
+) -> tuple[BundleClaims, ...]:
+    """Collapse a bundle's markets to claims and relate the claims.
+
+    Compiles masks through ``_scope_masks``, the same path
+    ``derive_bundle_relationships`` uses, then identifies each mask by the
+    outcome subset it resolves YES on. Markets naming one subset become one
+    claim however many venues list them, so the result is linear in distinct
+    claims rather than quadratic in market pairs, and the relations it carries
+    depend on the space shape alone — never on this event, run, or bundle.
+    """
+    excluded = frozenset(excluded_market_ids)
+    spaces, _diagnostics = _spaces(bundle)
+    out: list[BundleClaims] = []
+    for space in spaces:
+        claims = derive_claims(_scope_masks(bundle, space, excluded), space)
+        out.append(
+            BundleClaims(
+                space_shape_id=space_shape_id(space),
+                scope=space.scope,
+                coverage=space.coverage,
+                claims=claims,
+                relations=derive_claim_algebra(
+                    claims, informative_only=informative_only
+                ),
+            )
+        )
+    return tuple(out)
