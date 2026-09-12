@@ -548,7 +548,7 @@ fn address_binds_every_version_and_policy_input() {
     let base_address = derivative_address(&source, &base).unwrap();
     assert_eq!(
         base_address,
-        "2686e65a0efab98187210cfccb7008c02413933e75eed1004f799108f471d70c"
+        "71df204dafc347cee916dcf38a9ffcc4b765f2bd612e5cbc65300885f35268b0"
     );
     let mut variants = Vec::new();
     let mut changed = base.clone();

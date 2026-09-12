@@ -1,7 +1,8 @@
 use replay_domain::{
-    BookDelta, BookEvent, CanonicalProvenance, ConditionalMarketPrice, ContinuityVerdict,
-    ContractOrientation, DecimalScale, DomainError, EventAddress, EventHeader, FullBook,
-    InstrumentId, LaneId, Level, LevelChange, PositiveQty, Qty, SegmentEvent, SegmentRecord, Side,
+    BookDelta, BookEvent, BookStateHash, CanonicalProvenance, ConditionalMarketPrice,
+    ContinuityVerdict, ContractOrientation, DecimalScale, DomainError, EventAddress, EventHeader,
+    FullBook, InstrumentId, LaneId, Level, LevelChange, PositiveQty, Qty, SegmentEvent,
+    SegmentRecord, Sha1, Side,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -35,7 +36,9 @@ fn record() -> SegmentRecord {
         Side::Bid,
         ConditionalMarketPrice::parse("0.5100", scale(4)).unwrap(),
         LevelChange::Decrease(PositiveQty::parse("2.50", scale(2)).unwrap()),
-        Some("venue-book-hash".to_owned()),
+        Some(BookStateHash::Sha1(
+            Sha1::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        )),
     )
     .unwrap();
     SegmentRecord::new(header, SegmentEvent::Book(BookEvent::Delta(delta))).unwrap()
@@ -44,7 +47,7 @@ fn record() -> SegmentRecord {
 #[test]
 fn canonical_json_matches_the_golden_vector_and_round_trips() {
     let expected = concat!(
-        "{\"schema_version\":2,\"header\":{\"order_ns\":1785409600000000000,",
+        "{\"schema_version\":3,\"header\":{\"order_ns\":1785409600000000000,",
         "\"visible_ns\":1785409600000000000,\"visible_tie_group\":7,",
         "\"address\":{\"canonical_seq\":42,\"lane\":\"lane-book-a\",",
         "\"delivery_index\":9001,\"event_index\":3},\"record_id\":\"record-42\",",
@@ -56,7 +59,7 @@ fn canonical_json_matches_the_golden_vector_and_round_trips() {
         "\"side\":\"bid\",\"price\":{\"atoms\":5100,\"scale\":4,",
         "\"unit\":\"quote_per_contract\"},\"change\":{\"kind\":\"decrease\",",
         "\"value\":{\"atoms\":250,\"scale\":2,\"unit\":\"contracts\"}},",
-        "\"book_hash\":\"venue-book-hash\"}}}}"
+        "\"book_hash\":{\"algorithm\":\"sha1\",\"digest\":\"0123456789abcdef0123456789abcdef01234567\"}}}}}"
     );
     assert_eq!(record().to_canonical_json(), expected.as_bytes());
     assert_eq!(
@@ -109,8 +112,8 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
     let cases = [
         canonical.replacen(
-            "{\"schema_version\":2",
-            "{\"unknown\":0,\"schema_version\":2",
+            "{\"schema_version\":3",
+            "{\"unknown\":0,\"schema_version\":3",
             1,
         ),
         canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
@@ -126,11 +129,25 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     for invalid in cases {
         assert!(SegmentRecord::from_canonical_json(invalid.as_bytes()).is_err());
     }
-    let future = canonical.replacen("\"schema_version\":2", "\"schema_version\":3", 1);
+    let future = canonical.replacen("\"schema_version\":3", "\"schema_version\":4", 1);
     assert_eq!(
         SegmentRecord::from_canonical_json(future.as_bytes()),
-        Err(DomainError::UnsupportedSchemaVersion(3))
+        Err(DomainError::UnsupportedSchemaVersion(4))
     );
+}
+
+#[test]
+fn state_hashes_are_algorithm_typed_and_strict() {
+    let digest = "0123456789abcdef0123456789abcdef01234567";
+    let hash = Sha1::from_hex(digest).unwrap();
+    assert_eq!(hash.as_hex(), digest);
+    assert_eq!(
+        serde_json::to_string(&BookStateHash::Sha1(hash)).unwrap(),
+        format!(r#"{{"algorithm":"sha1","digest":"{digest}"}}"#)
+    );
+    assert!(Sha1::from_hex(&"a".repeat(39)).is_err());
+    assert!(Sha1::from_hex(&"A".repeat(40)).is_err());
+    assert!(Sha1::from_hex(&"g".repeat(40)).is_err());
 }
 
 #[test]

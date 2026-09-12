@@ -119,6 +119,16 @@ pub trait VenueAdapter {
     fn normalize(&mut self, input: CanonicalEnvelope<'_>)
     -> Result<Normalization, NormalizerError>;
 
+    /// Optional handling for venue text controls that are not JSON. Returning
+    /// `None` preserves the shared `invalid_json` reject behavior.
+    fn normalize_non_json(
+        &mut self,
+        _source: &JoinedCanonicalRecord,
+        _envelope: &EnvelopeView<'_>,
+    ) -> Result<Option<Normalization>, NormalizerError> {
+        Ok(None)
+    }
+
     fn finish(&mut self) -> Result<(), NormalizerError> {
         Ok(())
     }
@@ -197,6 +207,9 @@ impl<A: VenueAdapter> Normalize for Normalizer<A> {
         let payload = match serde_json::from_str(&envelope.raw_payload) {
             Ok(payload) => payload,
             Err(_) => {
+                if let Some(normalized) = self.adapter.normalize_non_json(source, &envelope)? {
+                    return Ok(normalized);
+                }
                 return Ok(ParseReject::for_source(
                     A::PARSER_VERSION,
                     "invalid_json",
