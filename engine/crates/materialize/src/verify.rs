@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,12 +14,18 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
 use super::{DerivativeSpec, EVENTS_FILE, MANIFEST_FILE, RECEIPT_FILE, REJECTS_FILE};
 
-type FaultBindings = BTreeMap<String, Vec<u8>>;
-
-struct VerifiedRejects {
-    lines: u64,
-    bindings: FaultBindings,
+#[derive(Default)]
+struct VerificationCounts {
+    event_lines: u64,
+    faults: u64,
+    reject_lines: u64,
+    parse_rejects: u64,
     ignored: u64,
+}
+
+struct Binding {
+    reject_id: String,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,13 +57,31 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
         return Err("derivative has no receipt commit marker".to_owned());
     }
     let (receipt, receipt_bytes) = read_canonical_document::<DerivativeReceipt>(&receipt_path)?;
+    verify_contents(directory, receipt, receipt_bytes, true)
+}
+
+pub(crate) fn verify_candidate(directory: &Path, receipt_bytes: &[u8]) -> Result<(), String> {
+    let synthetic_path = directory.join(RECEIPT_FILE);
+    let (receipt, canonical) =
+        decode_canonical_document::<DerivativeReceipt>(receipt_bytes, &synthetic_path)?;
+    verify_contents(directory, receipt, canonical, false).map(|_| ())
+}
+
+fn verify_contents(
+    directory: &Path,
+    receipt: DerivativeReceipt,
+    receipt_bytes: Vec<u8>,
+    require_addressed_directory: bool,
+) -> Result<VerifiedDerivative, String> {
     receipt.validate()?;
-    let directory_name = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "derivative directory has no UTF-8 address".to_owned())?;
-    if directory_name != receipt.derivative_address {
-        return Err("derivative directory does not match receipt address".to_owned());
+    if require_addressed_directory {
+        let directory_name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "derivative directory has no UTF-8 address".to_owned())?;
+        if directory_name != receipt.derivative_address {
+            return Err("derivative directory does not match receipt address".to_owned());
+        }
     }
 
     let manifest_path = directory.join(MANIFEST_FILE);
@@ -99,16 +122,12 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
         return Err("derivative address does not match its domain-separated inputs".to_owned());
     }
 
-    let (event_lines, faults) = verify_events(directory, &manifest)?;
-    let rejects = verify_rejects(directory, &manifest)?;
-    if faults != rejects.bindings {
-        return Err("normalization fault events do not pair exactly with parse rejects".to_owned());
-    }
-    if event_lines != manifest.events.logical.line_count
-        || rejects.lines != manifest.rejects.logical.line_count
-        || faults.len() as u64 != manifest.counts.normalization_fault_events
-        || faults.len() as u64 != manifest.counts.rejected_source_records
-        || rejects.ignored != manifest.counts.intentionally_ignored_records
+    let counts = verify_event_reject_pairing(directory, &manifest)?;
+    if counts.event_lines != manifest.events.logical.line_count
+        || counts.reject_lines != manifest.rejects.logical.line_count
+        || counts.faults != manifest.counts.normalization_fault_events
+        || counts.parse_rejects != manifest.counts.rejected_source_records
+        || counts.ignored != manifest.counts.intentionally_ignored_records
     {
         return Err("verified derivative lines disagree with manifest counts".to_owned());
     }
@@ -125,36 +144,64 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
     })
 }
 
-fn verify_events(
+fn verify_event_reject_pairing(
     directory: &Path,
     manifest: &DerivativeManifest,
-) -> Result<(u64, FaultBindings), String> {
-    let mut lines = 0_u64;
-    let mut faults = BTreeMap::new();
-    let mut previous = None;
-    read_compressed_lines(&directory.join(EVENTS_FILE), &manifest.events, |line| {
+) -> Result<VerificationCounts, String> {
+    let mut events = VerifiedLines::open(&directory.join(EVENTS_FILE), &manifest.events)?;
+    let mut rejects = VerifiedLines::open(&directory.join(REJECTS_FILE), &manifest.rejects)?;
+    let mut counts = VerificationCounts::default();
+    let mut previous_event = None;
+    let mut previous_reject_seq = None;
+    loop {
+        let fault = next_fault(&mut events, &mut previous_event, &mut counts)?;
+        let reject = next_parse_reject(
+            &mut rejects,
+            &mut previous_reject_seq,
+            &mut counts,
+            manifest,
+        )?;
+        match (fault, reject) {
+            (None, None) => break,
+            (Some(left), Some(right))
+                if left.reject_id == right.reject_id && left.bytes == right.bytes => {}
+            _ => {
+                return Err(
+                    "normalization fault events do not pair exactly with parse rejects".to_owned(),
+                );
+            }
+        }
+    }
+    events.finish()?;
+    rejects.finish()?;
+    Ok(counts)
+}
+
+fn next_fault(
+    lines: &mut VerifiedLines,
+    previous: &mut Option<(i64, u32)>,
+    counts: &mut VerificationCounts,
+) -> Result<Option<Binding>, String> {
+    while let Some(line) = lines.next_line()? {
         let record = SegmentRecord::from_canonical_json(line)
             .map_err(|error| format!("invalid normalized event: {error}"))?;
         let current = (
             record.header().address().canonical_seq(),
             record.header().address().event_index(),
         );
-        verify_event_order(previous, current)?;
-        previous = Some(current);
+        verify_event_order(*previous, current)?;
+        *previous = Some(current);
+        counts.event_lines += 1;
         if let SegmentEvent::NormalizationFault(fault) = record.event() {
-            let binding = serde_json::to_vec(&(record.header(), fault.impact()))
-                .map_err(|error| format!("encoding normalization fault binding: {error}"))?;
-            if faults
-                .insert(fault.reject_id().to_owned(), binding)
-                .is_some()
-            {
-                return Err("duplicate normalization fault reject_id".to_owned());
-            }
+            counts.faults += 1;
+            return Ok(Some(Binding {
+                reject_id: fault.reject_id().to_owned(),
+                bytes: serde_json::to_vec(&(record.header(), fault.impact()))
+                    .map_err(|error| format!("encoding normalization fault binding: {error}"))?,
+            }));
         }
-        lines += 1;
-        Ok(())
-    })?;
-    Ok((lines, faults))
+    }
+    Ok(None)
 }
 
 pub(crate) fn verify_event_order(
@@ -175,22 +222,21 @@ pub(crate) fn verify_event_order(
     }
 }
 
-fn verify_rejects(
-    directory: &Path,
+fn next_parse_reject(
+    lines: &mut VerifiedLines,
+    previous_seq: &mut Option<i64>,
+    counts: &mut VerificationCounts,
     manifest: &DerivativeManifest,
-) -> Result<VerifiedRejects, String> {
-    let mut lines = 0_u64;
-    let mut ignored = 0_u64;
-    let mut rejects = BTreeMap::new();
-    let mut previous_seq = None;
-    read_compressed_lines(&directory.join(REJECTS_FILE), &manifest.rejects, |line| {
+) -> Result<Option<Binding>, String> {
+    while let Some(line) = lines.next_line()? {
         let record = RejectRecord::from_canonical_json(line)?;
         verify_reject_source(&record)?;
         let current_seq = record.header().address().canonical_seq();
         if previous_seq.is_some_and(|previous| current_seq <= previous) {
             return Err("reject records are not in canonical source order".to_owned());
         }
-        previous_seq = Some(current_seq);
+        *previous_seq = Some(current_seq);
+        counts.reject_lines += 1;
         match record.disposition() {
             RejectDisposition::ParseReject {
                 reject_id,
@@ -217,22 +263,17 @@ fn verify_rejects(
                         "parse reject_id does not bind its source and parser result".to_owned()
                     );
                 }
-                let binding = serde_json::to_vec(&(record.header(), impact))
-                    .map_err(|error| format!("encoding parse reject binding: {error}"))?;
-                if rejects.insert(reject_id.clone(), binding).is_some() {
-                    return Err("duplicate parse reject_id".to_owned());
-                }
+                counts.parse_rejects += 1;
+                return Ok(Some(Binding {
+                    reject_id: reject_id.clone(),
+                    bytes: serde_json::to_vec(&(record.header(), impact))
+                        .map_err(|error| format!("encoding parse reject binding: {error}"))?,
+                }));
             }
-            RejectDisposition::IntentionallyIgnored { .. } => ignored += 1,
+            RejectDisposition::IntentionallyIgnored { .. } => counts.ignored += 1,
         }
-        lines += 1;
-        Ok(())
-    })?;
-    Ok(VerifiedRejects {
-        lines,
-        bindings: rejects,
-        ignored,
-    })
+    }
+    Ok(None)
 }
 
 fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
@@ -251,50 +292,64 @@ fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
     Ok(())
 }
 
-fn read_compressed_lines<F>(
-    path: &Path,
-    output: &super::CompressedOutput,
-    mut consume: F,
-) -> Result<(), String>
-where
-    F: FnMut(&[u8]) -> Result<(), String>,
-{
-    let source =
-        File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
-    let logical = CodecLogicalIdentity {
-        sha256: output.logical.sha256.as_hex(),
-        byte_length: output.logical.byte_length,
-        line_count: output.logical.line_count,
-    };
-    let stored = CodecStoredIdentity {
-        sha256: output.stored.sha256.as_hex(),
-        byte_length: output.stored.byte_length,
-    };
-    let decoder = StreamingDecoder::new(source, &logical, Some(&stored), Some(logical.byte_length))
-        .map_err(|error| format!("opening {}: {error}", path.display()))?;
-    let mut reader = BufReader::new(decoder);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("decoding {}: {error}", path.display()))?;
+struct VerifiedLines {
+    path: PathBuf,
+    reader: Option<BufReader<StreamingDecoder<File>>>,
+    line: Vec<u8>,
+}
+
+impl VerifiedLines {
+    fn open(path: &Path, output: &super::CompressedOutput) -> Result<Self, String> {
+        let source =
+            File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
+        let logical = CodecLogicalIdentity {
+            sha256: output.logical.sha256.as_hex(),
+            byte_length: output.logical.byte_length,
+            line_count: output.logical.line_count,
+        };
+        let stored = CodecStoredIdentity {
+            sha256: output.stored.sha256.as_hex(),
+            byte_length: output.stored.byte_length,
+        };
+        let decoder =
+            StreamingDecoder::new(source, &logical, Some(&stored), Some(logical.byte_length))
+                .map_err(|error| format!("opening {}: {error}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            reader: Some(BufReader::new(decoder)),
+            line: Vec::new(),
+        })
+    }
+
+    fn next_line(&mut self) -> Result<Option<&[u8]>, String> {
+        self.line.clear();
+        let read = self
+            .reader
+            .as_mut()
+            .expect("reader is open")
+            .read_until(b'\n', &mut self.line)
+            .map_err(|error| format!("decoding {}: {error}", self.path.display()))?;
         if read == 0 {
-            break;
+            return Ok(None);
         }
-        if line.last() != Some(&b'\n') {
+        if self.line.last() != Some(&b'\n') {
             return Err(format!(
                 "{} contains a non-LF-terminated record",
-                path.display()
+                self.path.display()
             ));
         }
-        consume(&line[..line.len() - 1])?;
+        Ok(Some(&self.line[..self.line.len() - 1]))
     }
-    reader
-        .into_inner()
-        .finish()
-        .map_err(|error| format!("verifying {}: {error}", path.display()))?;
-    Ok(())
+
+    fn finish(mut self) -> Result<(), String> {
+        self.reader
+            .take()
+            .expect("reader is open")
+            .into_inner()
+            .finish()
+            .map(|_| ())
+            .map_err(|error| format!("verifying {}: {error}", self.path.display()))
+    }
 }
 
 fn read_canonical_document<T>(path: &Path) -> Result<(T, Vec<u8>), String>

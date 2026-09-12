@@ -35,7 +35,7 @@ pub(crate) fn normalize_message(
         "orderbook_snapshot" => snapshot(envelope, object, config, batched),
         "orderbook_delta" => delta(envelope, object, config, batched),
         "trade" => trade(envelope, object, config, batched),
-        "ticker" => ticker(envelope, object, config),
+        "ticker" => ticker(envelope, object, config, batched),
         "subscribed" => subscribed(envelope, object),
         "unsubscribed" => unsubscribed(envelope, object, batched),
         "ok" => ok_response(envelope, object, batched),
@@ -124,9 +124,9 @@ fn delta(
     let instrument = instrument(msg)?;
     optional_nonempty_text(msg.get("market_id"), "invalid_market_id")?;
     optional_nonempty_text(msg.get("client_order_id"), "invalid_client_order_id")?;
-    optional_i64(msg.get("subaccount"), "invalid_subaccount")?;
+    optional_nonnegative_u64(msg.get("subaccount"), "invalid_subaccount")?;
     optional_nonempty_text(msg.get("ts"), "invalid_source_time")?;
-    optional_i64(msg.get("ts_ms"), "invalid_source_time")?;
+    optional_positive_u64(msg.get("ts_ms"), "invalid_source_time")?;
     let orientation = match msg.checked_required("side")?.checked_text("invalid_side")? {
         "yes" => ContractOrientation::Outcome,
         "no" => ContractOrientation::Complement,
@@ -156,7 +156,9 @@ fn trade(
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
     outer.checked_fields(&["type", "sid", "seq", "msg"])?;
-    expect_stream(envelope, Stream::PublicTrade)?;
+    if !batched {
+        expect_stream(envelope, Stream::PublicTrade)?;
+    }
     sequence(outer, envelope, batched)?;
     outer
         .checked_required("sid")?
@@ -183,12 +185,13 @@ fn trade(
     msg.checked_required("no_price_dollars")?
         .checked_price(config.price_scale)
         .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    msg.checked_required("is_block_trade")?
-        .checked_bool("invalid_block_trade")?;
+    if let Some(block) = msg.get("is_block_trade") {
+        block.checked_bool("invalid_block_trade")?;
+    }
     msg.checked_required("ts")?
-        .checked_i64("invalid_source_time")?;
+        .checked_positive_u64("invalid_source_time")?;
     msg.checked_required("ts_ms")?
-        .checked_i64("invalid_source_time")?;
+        .checked_positive_u64("invalid_source_time")?;
     let outcome = msg
         .checked_required("taker_outcome_side")?
         .checked_text("invalid_trade_direction")?;
@@ -242,9 +245,12 @@ fn ticker(
     envelope: &EnvelopeView<'_>,
     outer: &Map<String, Value>,
     config: Config,
+    batched: bool,
 ) -> Result<MessageOutcome, Failure> {
     outer.checked_fields(&["type", "sid", "msg"])?;
-    expect_stream(envelope, Stream::PublicQuote)?;
+    if !batched {
+        expect_stream(envelope, Stream::PublicQuote)?;
+    }
     expect_unsequenced(envelope)?;
     outer
         .checked_required("sid")?
@@ -288,9 +294,13 @@ fn ticker(
             .checked_quantity(config.quantity_scale)
             .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
     }
-    for field in ["dollar_volume", "dollar_open_interest", "ts", "ts_ms"] {
+    for field in ["dollar_volume", "dollar_open_interest"] {
         msg.checked_required(field)?
-            .checked_nonnegative_i64("invalid_ticker_integer")?;
+            .checked_nonnegative_u64("invalid_ticker_integer")?;
+    }
+    for field in ["ts", "ts_ms"] {
+        msg.checked_required(field)?
+            .checked_positive_u64("invalid_source_time")?;
     }
     msg.checked_required("time")?
         .checked_nonempty_text("invalid_source_time")?;
@@ -304,7 +314,7 @@ fn subscribed(
     outer.checked_fields(&["id", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     expect_unsequenced(envelope)?;
-    optional_nonnegative_u64(outer.get("id"), "invalid_command_id")?;
+    optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     let msg = outer
         .checked_required("msg")?
         .checked_object("invalid_subscribed_msg")?;
@@ -326,7 +336,7 @@ fn unsubscribed(
     outer.checked_fields(&["id", "sid", "seq", "type"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     sequence(outer, envelope, batched)?;
-    optional_nonnegative_u64(outer.get("id"), "invalid_command_id")?;
+    optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     outer
         .checked_required("sid")?
         .checked_positive_u64("invalid_sid")?;
@@ -342,7 +352,7 @@ fn ok_response(
 ) -> Result<MessageOutcome, Failure> {
     outer.checked_fields(&["id", "sid", "seq", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
-    optional_nonnegative_u64(outer.get("id"), "invalid_command_id")?;
+    optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     optional_positive_u64(outer.get("sid"), "invalid_sid")?;
     if outer.contains_key("seq") {
         sequence(outer, envelope, batched)?;
@@ -383,7 +393,7 @@ fn error_response(
 ) -> Result<MessageOutcome, Failure> {
     outer.checked_fields(&["id", "sid", "seq", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
-    optional_nonnegative_u64(outer.get("id"), "invalid_command_id")?;
+    optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     optional_positive_u64(outer.get("sid"), "invalid_sid")?;
     if outer.contains_key("seq") {
         sequence(outer, envelope, batched)?;
@@ -466,6 +476,34 @@ pub(crate) fn normalize_process(
                         .map_err(|_| "invalid_control_asset_ids")?,
                 );
             }
+            object
+                .get("target_count")
+                .ok_or("invalid_control_target_count")?
+                .checked_nonnegative_u64("invalid_control_target_count")
+                .map_err(|_| "invalid_control_target_count")
+                .and_then(|count| {
+                    (count == assets.len() as u64)
+                        .then_some(())
+                        .ok_or("control_target_count_mismatch")
+                })?;
+            required_text_field(object, "targets_path")?;
+            optional_text_field(object, "target_metadata_digest")?;
+            optional_text_field(object, "target_metadata_path")?;
+            for field in [
+                "fsync_interval_seconds",
+                "snapshot_sweep_seconds",
+                "snapshot_max_age_seconds",
+                "snapshot_request_cooldown_seconds",
+            ] {
+                required_nonnegative_number(object, field)?;
+            }
+            required_nonnegative_u64(object, "repaired_bytes_on_start")?;
+            validate_clock_scope(object.get("clock_scope"))?;
+            required_text_field(object, "url")?;
+            required_text_array(object.get("channels"), "invalid_control_channels")?;
+            required_bool(object, "send_initial_snapshot")?;
+            required_bool(object, "verified_against_live_socket")?;
+            optional_text_field(object, "key_id")?;
             let delivers_deltas = object
                 .get("delivers_deltas")
                 .and_then(Value::as_bool)
@@ -482,6 +520,8 @@ pub(crate) fn normalize_process(
         }
         "connection_closed" => {
             exact_field_names(object, &["event", "seconds_open", "records_this_epoch"])?;
+            required_nonnegative_number(object, "seconds_open")?;
+            required_nonnegative_u64(object, "records_this_epoch")?;
             Ok(ProcessOutcome::Event(SegmentEvent::Control(
                 ControlEvent::ConnectionClosed { epoch },
             )))
@@ -498,6 +538,9 @@ pub(crate) fn normalize_process(
                 ],
             )?;
             let reason = required_text_field(object, "error")?;
+            required_text_field(object, "error_type")?;
+            required_nonnegative_number(object, "seconds_open")?;
+            required_nonnegative_u64(object, "frames_this_epoch")?;
             Ok(ProcessOutcome::Event(SegmentEvent::Control(
                 ControlEvent::ConnectionFailed { epoch, reason },
             )))
@@ -507,6 +550,8 @@ pub(crate) fn normalize_process(
                 object,
                 &["event", "from_digest", "to_digest", "added", "removed"],
             )?;
+            required_text_array(object.get("added"), "invalid_control_asset_ids")?;
+            required_text_array(object.get("removed"), "invalid_control_asset_ids")?;
             Ok(ProcessOutcome::Event(SegmentEvent::Control(
                 ControlEvent::SubscriptionChanged {
                     from: optional_text_field(object, "from_digest")?,
@@ -525,6 +570,8 @@ pub(crate) fn normalize_process(
                     "metadata_path",
                 ],
             )?;
+            required_text_field(object, "target_digest")?;
+            optional_text_field(object, "metadata_path")?;
             Ok(ProcessOutcome::Event(SegmentEvent::Control(
                 ControlEvent::MetadataChanged {
                     from: optional_text_field(object, "from_metadata_digest")?,
@@ -534,10 +581,13 @@ pub(crate) fn normalize_process(
         }
         "subscription_sent" => {
             exact_field_names(object, &["event", "target_digest", "target_count"])?;
+            required_text_field(object, "target_digest")?;
+            required_nonnegative_u64(object, "target_count")?;
             Ok(ProcessOutcome::Ignored("subscription_sent"))
         }
         "connection_closing" => {
             exact_field_names(object, &["event", "reason"])?;
+            required_text_field(object, "reason")?;
             Ok(ProcessOutcome::Ignored("connection_closing"))
         }
         "orderbook_reconciliation_request" => {
@@ -545,6 +595,10 @@ pub(crate) fn normalize_process(
                 object,
                 &["event", "sid", "command_id", "market_tickers", "reason"],
             )?;
+            required_positive_u64(object, "sid")?;
+            required_positive_u64(object, "command_id")?;
+            required_text_array(object.get("market_tickers"), "invalid_control_asset_ids")?;
+            required_text_field(object, "reason")?;
             Ok(ProcessOutcome::Ignored("reconciliation_request"))
         }
         "orderbook_reconciliation_disabled" => {
@@ -561,6 +615,13 @@ pub(crate) fn normalize_process(
                     "detail",
                 ],
             )?;
+            required_text_field(object, "reason")?;
+            optional_text_field(object, "channel")?;
+            optional_positive_u64_field(object, "command_id")?;
+            optional_text_field(object, "error_type")?;
+            optional_text_field(object, "error")?;
+            optional_code(object.get("code"))?;
+            optional_text_field(object, "detail")?;
             Ok(ProcessOutcome::Ignored("reconciliation_disabled"))
         }
         "orderbook_reconciliation_backoff" => {
@@ -575,14 +636,21 @@ pub(crate) fn normalize_process(
                     "detail",
                 ],
             )?;
+            required_positive_u64(object, "command_id")?;
+            optional_code(object.get("code"))?;
+            required_nonnegative_number(object, "from_sweep_seconds")?;
+            required_nonnegative_number(object, "to_sweep_seconds")?;
+            optional_text_field(object, "detail")?;
             Ok(ProcessOutcome::Ignored("reconciliation_backoff"))
         }
         "targets_unreadable" => {
             exact_field_names(object, &["event", "error"])?;
+            required_text_field(object, "error")?;
             Ok(ProcessOutcome::Ignored("targets_unreadable"))
         }
         "frame_not_utf8" => {
             exact_field_names(object, &["event", "bytes"])?;
+            required_positive_u64(object, "bytes")?;
             Ok(ProcessOutcome::Ignored("frame_not_utf8"))
         }
         _ => Err("unsupported_control_event"),
@@ -736,18 +804,105 @@ fn optional_text_field(
     object.checked_optional_text(field)
 }
 
-fn optional_i64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
+fn optional_nonnegative_u64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
     match value {
-        Some(value) => value.checked_i64(code).map(|_| ()),
+        Some(value) => value.checked_nonnegative_u64(code).map(|_| ()),
         None => Ok(()),
     }
 }
 
-fn optional_nonnegative_u64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
-    match value {
-        Some(value) => value.as_u64().map(|_| ()).ok_or_else(|| Failure::new(code)),
+fn required_nonnegative_u64(object: &Map<String, Value>, field: &str) -> Result<(), &'static str> {
+    object
+        .get(field)
+        .ok_or("missing_control_field")?
+        .as_u64()
+        .map(|_| ())
+        .ok_or("invalid_control_integer")
+}
+
+fn required_positive_u64(object: &Map<String, Value>, field: &str) -> Result<(), &'static str> {
+    object
+        .get(field)
+        .ok_or("missing_control_field")?
+        .as_u64()
+        .filter(|value| *value > 0)
+        .map(|_| ())
+        .ok_or("invalid_control_integer")
+}
+
+fn optional_positive_u64_field(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<(), &'static str> {
+    match object.get(field) {
         None => Ok(()),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(|_| ())
+            .ok_or("invalid_control_integer"),
     }
+}
+
+fn required_nonnegative_number(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<(), &'static str> {
+    object
+        .get(field)
+        .ok_or("missing_control_field")?
+        .checked_nonnegative_number("invalid_control_number")
+        .map(|_| ())
+        .map_err(|_| "invalid_control_number")
+}
+
+fn required_bool(object: &Map<String, Value>, field: &str) -> Result<(), &'static str> {
+    object
+        .get(field)
+        .and_then(Value::as_bool)
+        .map(|_| ())
+        .ok_or("invalid_control_flag")
+}
+
+fn required_text_array(value: Option<&Value>, code: &'static str) -> Result<(), &'static str> {
+    let values = value.and_then(Value::as_array).ok_or(code)?;
+    for value in values {
+        value
+            .as_str()
+            .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+            .ok_or(code)?;
+    }
+    Ok(())
+}
+
+fn optional_code(value: Option<&Value>) -> Result<(), &'static str> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) if !value.is_empty() => Ok(()),
+        Some(Value::Number(value)) if value.as_u64().is_some() => Ok(()),
+        _ => Err("invalid_control_code"),
+    }
+}
+
+fn validate_clock_scope(value: Option<&Value>) -> Result<(), &'static str> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or("invalid_clock_scope")?;
+    exact_field_names(
+        object,
+        &[
+            "lane",
+            "clock",
+            "scope",
+            "scope_id",
+            "comparable_across_processes",
+            "platform",
+        ],
+    )?;
+    for field in ["lane", "clock", "scope", "scope_id", "platform"] {
+        required_text_field(object, field)?;
+    }
+    required_bool(object, "comparable_across_processes")
 }
 
 fn optional_positive_u64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {

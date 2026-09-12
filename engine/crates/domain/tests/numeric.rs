@@ -42,6 +42,13 @@ fn decimal_grammar_is_closed() {
 }
 
 #[test]
+fn unicode_decimal_input_is_rejected_without_byte_boundary_panics() {
+    let scale = scale(4);
+    assert_eq!(Px::parse("0.000é", scale), Err(NumericError::InvalidSyntax));
+    assert_eq!(Qty::parse("1.0é", scale), Err(NumericError::InvalidSyntax));
+}
+
+#[test]
 fn quantity_logical_width_is_capped_below_its_u64_storage_width() {
     assert_eq!(
         Qty::parse("9223372036854775807", scale(0)).unwrap().atoms(),

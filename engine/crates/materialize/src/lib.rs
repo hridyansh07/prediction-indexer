@@ -127,6 +127,7 @@ enum Checkpoint {
     FramesFinished,
     FilesSynced,
     BeforeManifestSerialization,
+    CandidateVerified,
     DirectoryPublished,
     ReceiptSynced,
     ReceiptRenamed,
@@ -170,13 +171,7 @@ where
             "requested bounds do not match one canonical receipt".to_owned(),
         ));
     }
-    let source_receipt = SourceReceipt {
-        window_start_ns: selected.window_start_ns,
-        window_end_ns: selected.window_end_ns,
-        byte_length: selected.byte_length,
-        sha256: selected.sha256,
-        certified: selected.certified,
-    };
+    let source_receipt = SourceReceipt::from(selected);
     let address = derivative_address(&source_receipt, spec)?;
     let stage = stage_path(&window_root, &address);
     create_dir_all_durable(&stage).map_err(BuildError::Io)?;
@@ -383,6 +378,8 @@ where
     };
     receipt.validate().map_err(BuildError::Serialization)?;
     let receipt_bytes = canonical_document(&receipt)?;
+    verify::verify_candidate(&stage, &receipt_bytes).map_err(BuildError::Verification)?;
+    checkpoint(Checkpoint::CandidateVerified)?;
 
     let lock = acquire_lock(&window_root, &address)?;
     let final_directory = window_root.join(&address);

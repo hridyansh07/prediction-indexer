@@ -24,4 +24,4 @@ pub use numeric::{
 };
 
 /// Canonical persisted schema emitted and consumed by the Replay engine.
-pub const SEGMENT_SCHEMA_VERSION: u16 = 1;
+pub const SEGMENT_SCHEMA_VERSION: u16 = 2;

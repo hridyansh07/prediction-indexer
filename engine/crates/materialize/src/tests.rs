@@ -35,6 +35,7 @@ enum FakeMode {
     FailRecord,
     Panic,
     FailFinish,
+    UnpairedFault,
 }
 
 struct FakeNormalizer {
@@ -45,6 +46,43 @@ struct FakeNormalizer {
 
 struct IgnoreAllNormalizer {
     descriptor: NormalizerDescriptor,
+}
+
+struct RejectAllNormalizer {
+    descriptor: NormalizerDescriptor,
+}
+
+impl RejectAllNormalizer {
+    fn new() -> Self {
+        Self {
+            descriptor: NormalizerDescriptor {
+                bundle_sha256: digest('b'),
+                config_sha256: digest('c'),
+            },
+        }
+    }
+}
+
+impl Normalize for RejectAllNormalizer {
+    fn descriptor(&self) -> &NormalizerDescriptor {
+        &self.descriptor
+    }
+
+    fn normalize(
+        &mut self,
+        _source: &indexer_finalize::JoinedCanonicalRecord,
+    ) -> Result<Normalization, NormalizerError> {
+        Ok(Normalization::Reject(ParseReject {
+            parser_version: 1,
+            error_code: "synthetic_reject".to_owned(),
+            instrument_hint: None,
+            impact: FaultImpact::UnattributedLane(LaneId::new("polymarket").unwrap()),
+        }))
+    }
+
+    fn finish(&mut self) -> Result<(), NormalizerError> {
+        Ok(())
+    }
 }
 
 impl IgnoreAllNormalizer {
@@ -103,6 +141,17 @@ impl Normalize for FakeNormalizer {
             FakeMode::FailRecord => return Err(NormalizerError::new("internal defect")),
             FakeMode::Panic => panic!("adapter panic"),
             FakeMode::Normal | FakeMode::Divergent | FakeMode::FailFinish => {}
+            FakeMode::UnpairedFault => {
+                return Ok(Normalization::Events(vec![
+                    SegmentEvent::NormalizationFault(
+                        NormalizationFault::new(
+                            "a".repeat(64),
+                            FaultImpact::UnattributedLane(LaneId::new("polymarket").unwrap()),
+                        )
+                        .unwrap(),
+                    ),
+                ]));
+            }
         }
         match source.canonical_seq {
             1 => {
@@ -427,6 +476,24 @@ fn fatal_normalizer_failures_and_panics_commit_nothing() {
 }
 
 #[test]
+fn invalid_candidate_is_verified_before_receipt_publication() {
+    let canonical = TempDir::new("canonical").unwrap();
+    let output = TempDir::new("normalized").unwrap();
+    canonical_fixture(canonical.path());
+    let error = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::UnpairedFault),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BuildError::Verification(_)));
+    assert!(output_directories(output.path()).is_empty());
+}
+
+#[test]
 fn mismatched_normalizer_descriptor_commits_nothing() {
     let canonical = TempDir::new("canonical").unwrap();
     let output = TempDir::new("normalized").unwrap();
@@ -481,7 +548,7 @@ fn address_binds_every_version_and_policy_input() {
     let base_address = derivative_address(&source, &base).unwrap();
     assert_eq!(
         base_address,
-        "a77a7b7a98b6aa5f62e65dc8a82221ea761fecedf977fc0be7ce64fb8ea0e5cf"
+        "2686e65a0efab98187210cfccb7008c02413933e75eed1004f799108f471d70c"
     );
     let mut variants = Vec::new();
     let mut changed = base.clone();
@@ -518,6 +585,7 @@ fn crash_boundaries_recover_and_receipt_rename_is_commit_point() {
         Checkpoint::FramesFinished,
         Checkpoint::FilesSynced,
         Checkpoint::BeforeManifestSerialization,
+        Checkpoint::CandidateVerified,
         Checkpoint::DirectoryPublished,
         Checkpoint::ReceiptSynced,
         Checkpoint::ReceiptRenamed,
@@ -773,4 +841,35 @@ fn large_synthetic_window_uses_the_same_streaming_path() {
         built.derivative.manifest.rejects.logical.line_count,
         RECORDS as u64
     );
+}
+
+#[test]
+fn large_reject_window_pairs_faults_in_stream_order() {
+    const RECORDS: i64 = 10_000;
+    const END_NS: u64 = RECORDS as u64 + 1;
+    let canonical = TempDir::new("canonical-rejects").unwrap();
+    let output = TempDir::new("normalized-rejects").unwrap();
+    canonical_fixture_count(canonical.path(), RECORDS, END_NS);
+    let mut large_spec = spec();
+    large_spec.policy.effective_until_ns = Some(END_NS);
+
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        END_NS,
+        &large_spec,
+        &mut RejectAllNormalizer::new(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        built.derivative.manifest.counts.rejected_source_records,
+        RECORDS as u64
+    );
+    assert_eq!(
+        built.derivative.manifest.counts.normalization_fault_events,
+        RECORDS as u64
+    );
+    verify_derivative(&built.derivative.directory).unwrap();
 }

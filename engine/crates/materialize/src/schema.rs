@@ -48,7 +48,29 @@ impl DerivativeSpec {
     }
 }
 
-pub type SourceReceipt = indexer_finalize::ReceiptIdentity;
+/// Materializer-owned projection of the canonical receipt identity. This wire
+/// shape is intentionally independent of additions to Phase 0's reader type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceReceipt {
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub byte_length: u64,
+    pub sha256: Sha256,
+    pub certified: bool,
+}
+
+impl From<&indexer_finalize::ReceiptIdentity> for SourceReceipt {
+    fn from(value: &indexer_finalize::ReceiptIdentity) -> Self {
+        Self {
+            window_start_ns: value.window_start_ns,
+            window_end_ns: value.window_end_ns,
+            byte_length: value.byte_length,
+            sha256: value.sha256,
+            certified: value.certified,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,5 +1,7 @@
+use canonical_normalizer::{ConfigValue, NormalizerConfigIdentity};
 use replay_domain::DecimalScale;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const DEFAULT_PRICE_SCALE: u8 = 4;
 pub const DEFAULT_QUANTITY_SCALE: u8 = 2;
@@ -23,6 +25,28 @@ impl Default for Config {
             price_scale: DecimalScale::new(DEFAULT_PRICE_SCALE).expect("constant scale"),
             quantity_scale: DecimalScale::new(DEFAULT_QUANTITY_SCALE).expect("constant scale"),
             use_yes_price: DEFAULT_USE_YES_PRICE,
+        }
+    }
+}
+
+impl Config {
+    pub(crate) fn identity(self) -> NormalizerConfigIdentity {
+        NormalizerConfigIdentity {
+            schema_version: 1,
+            variables: BTreeMap::from([
+                (
+                    "price_scale".to_owned(),
+                    ConfigValue::Unsigned(u64::from(self.price_scale.exponent())),
+                ),
+                (
+                    "quantity_scale".to_owned(),
+                    ConfigValue::Unsigned(u64::from(self.quantity_scale.exponent())),
+                ),
+                (
+                    "use_yes_price".to_owned(),
+                    ConfigValue::Boolean(self.use_yes_price),
+                ),
+            ]),
         }
     }
 }

@@ -80,14 +80,18 @@ fn reject_code(value: Normalization) -> String {
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
-    let default_config = serde_json::to_vec(&Config::default()).unwrap();
+    let default_config = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "variables": {
+            "price_scale": {"type":"unsigned", "value":4},
+            "quantity_scale": {"type":"unsigned", "value":2},
+            "use_yes_price": {"type":"boolean", "value":false}
+        }
+    }))
+    .unwrap();
     assert_eq!(
-        default_config,
-        br#"{"price_scale":4,"quantity_scale":2,"use_yes_price":false}"#
-    );
-    assert_eq!(
-        serde_json::from_slice::<Config>(&default_config).unwrap(),
-        Config::default()
+        default.descriptor().config_sha256,
+        Sha256::digest(&default_config)
     );
     assert_eq!(
         default.descriptor().bundle_sha256,
@@ -106,13 +110,12 @@ fn descriptor_is_versioned_and_config_changes_identity() {
             quantity_scale: replay_domain::DecimalScale::new(3).unwrap(),
             ..Config::default()
         },
-        Config {
-            use_yes_price: true,
-            ..Config::default()
-        },
     ] {
         assert_ne!(
-            Sha256::digest(&serde_json::to_vec(&changed_config).unwrap()),
+            Normalizer::new(Kalshi::try_from(changed_config).unwrap())
+                .unwrap()
+                .descriptor()
+                .config_sha256,
             default.descriptor().config_sha256
         );
     }
@@ -241,6 +244,67 @@ fn trade_uses_exact_yes_price_and_validated_direction() {
 }
 
 #[test]
+fn historical_trade_without_block_flag_is_unknown_not_false() {
+    let mut trade: Value = serde_json::from_str(TRADE).unwrap();
+    trade["msg"]
+        .as_object_mut()
+        .unwrap()
+        .remove("is_block_trade");
+    assert_eq!(
+        events(normalize(&sequenced(&trade.to_string(), "public_trade", 2))).len(),
+        1
+    );
+
+    trade["msg"]["is_block_trade"] = json!(0);
+    assert_eq!(
+        reject_code(normalize(&sequenced(&trade.to_string(), "public_trade", 2))),
+        "invalid_block_trade"
+    );
+}
+
+#[test]
+fn timestamps_ids_and_counts_reject_negative_or_zero_where_required() {
+    let mut trade: Value = serde_json::from_str(TRADE).unwrap();
+    for (field, value) in [("ts", json!(-1)), ("ts_ms", json!(0))] {
+        let original = trade["msg"][field].clone();
+        trade["msg"][field] = value;
+        assert_eq!(
+            reject_code(normalize(&sequenced(&trade.to_string(), "public_trade", 2))),
+            "invalid_source_time"
+        );
+        trade["msg"][field] = original;
+    }
+
+    let mut ticker: Value = serde_json::from_str(TICKER).unwrap();
+    ticker["msg"]["dollar_volume"] = json!(-1);
+    assert_eq!(
+        reject_code(normalize(&source(
+            &ticker.to_string(),
+            "public_quote",
+            json!({"type":"unsequenced","counter":9}),
+        ))),
+        "invalid_ticker_integer"
+    );
+}
+
+#[test]
+fn snapshot_schema_families_are_explicit_and_empty_current_snapshot_is_valid() {
+    let empty = json!({
+        "type":"orderbook_snapshot","sid":1,"seq":1,
+        "msg":{"market_ticker":"KX-EMPTY","market_id":"id"}
+    });
+    let normalized = events(normalize(&sequenced(&empty.to_string(), "public_book", 1)));
+    assert_eq!(normalized.len(), 2);
+
+    let mut mixed: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    mixed["msg"]["yes"] = json!([[51, 1]]);
+    assert_eq!(
+        reject_code(normalize(&sequenced(&mixed.to_string(), "public_book", 2))),
+        "mixed_snapshot_schema"
+    );
+}
+
+#[test]
 fn snapshot_and_trade_quantities_are_positive_at_the_parse_boundary() {
     let mut snapshot: Value = serde_json::from_str(SNAPSHOT).unwrap();
     for (quantity, code) in [
@@ -277,13 +341,13 @@ fn snapshot_and_trade_quantities_are_positive_at_the_parse_boundary() {
 
 #[test]
 fn ticker_is_strictly_validated_then_explicitly_ignored() {
-    let source = source(
+    let ticker_source = source(
         TICKER.trim(),
         "public_quote",
         json!({"type":"unsequenced","counter":9}),
     );
     assert_eq!(
-        normalize(&source),
+        normalize(&ticker_source),
         Normalization::Ignored {
             reason_code: "ticker_not_in_replay_domain".to_owned()
         }
@@ -370,6 +434,51 @@ fn arrays_flatten_in_source_order_and_empty_array_has_zero_children() {
 }
 
 #[test]
+fn captured_arrays_route_children_by_type_and_reject_as_one_delivery() {
+    let trade: Value = serde_json::from_str(TRADE).unwrap();
+    let ticker: Value = serde_json::from_str(TICKER).unwrap();
+    let batch_source = source(
+        &json!([trade, ticker]).to_string(),
+        "public_book",
+        json!({"type":"unsequenced","counter":9}),
+    );
+    let normalized = events(normalize(&batch_source));
+    assert_eq!(normalized.len(), 1);
+    assert!(matches!(normalized[0], SegmentEvent::Trade(_)));
+
+    let mut valid: Value = serde_json::from_str(DELTA).unwrap();
+    valid["msg"]["market_ticker"] = json!("KX-A");
+    let mut invalid = valid.clone();
+    invalid["msg"]["market_ticker"] = json!("KX-B");
+    invalid["msg"]["delta_fp"] = json!("bad");
+    let rejected = normalize(&source(
+        &json!([valid, invalid]).to_string(),
+        "public_book",
+        json!({"type":"unsequenced","counter":9}),
+    ));
+    let Normalization::Reject(reject) = rejected else {
+        panic!("expected atomic batch reject")
+    };
+    assert!(matches!(
+        reject.impact,
+        replay_domain::FaultImpact::UnattributedLane(_)
+    ));
+    assert!(reject.instrument_hint.is_none());
+}
+
+#[test]
+fn malformed_unicode_decimal_is_a_stable_reject_not_a_panic() {
+    let mut delta: Value = serde_json::from_str(DELTA).unwrap();
+    for value in ["0.000é", "1.0é"] {
+        delta["msg"]["delta_fp"] = json!(value);
+        assert_eq!(
+            reject_code(normalize(&sequenced(&delta.to_string(), "public_book", 3))),
+            "invalid_quantity"
+        );
+    }
+}
+
+#[test]
 fn malformed_unknown_and_ambiguous_shapes_have_stable_reject_codes() {
     let cases = [
         ("not-json", "invalid_json"),
@@ -411,9 +520,24 @@ fn malformed_unknown_and_ambiguous_shapes_have_stable_reject_codes() {
 fn process_lifecycle_is_typed_and_unknown_control_fields_reject() {
     let opened = json!({
         "event":"connection_opened",
+        "target_count":2,
         "asset_ids":["KX-A","KX-B"],
         "delivers_deltas":true,
-        "target_digest":"digest"
+        "target_digest":"digest",
+        "targets_path":"targets.json",
+        "target_metadata_digest":"metadata",
+        "target_metadata_path":"run.json",
+        "fsync_interval_seconds":1.0,
+        "repaired_bytes_on_start":0,
+        "clock_scope":{"lane":"kalshi","clock":"monotonic","scope":"boot","scope_id":"id","comparable_across_processes":true,"platform":"linux"},
+        "url":"wss://example.invalid",
+        "channels":["orderbook_delta","trade"],
+        "send_initial_snapshot":true,
+        "verified_against_live_socket":false,
+        "snapshot_sweep_seconds":30.0,
+        "snapshot_max_age_seconds":600.0,
+        "snapshot_request_cooldown_seconds":60.0,
+        "key_id":null
     })
     .to_string();
     let opened_source = source(&opened, "process", Value::Null);
@@ -440,6 +564,33 @@ fn process_lifecycle_is_typed_and_unknown_control_fields_reject() {
         reject_code(normalize(&source(&malformed, "process", Value::Null))),
         "unknown_field"
     );
+}
+
+#[test]
+fn process_control_values_are_validated_and_channels_are_open_world() {
+    let valid_unknown_channel =
+        json!({"id":1,"type":"subscribed","msg":{"channel":"future_channel","sid":2}});
+    assert!(matches!(
+        normalize(&source(
+            &valid_unknown_channel.to_string(),
+            "public_book",
+            json!({"type":"unsequenced","counter":9}),
+        )),
+        Normalization::Ignored { .. }
+    ));
+
+    for payload in [
+        json!({"event":"connection_closed","seconds_open":-0.1,"records_this_epoch":2}),
+        json!({"event":"connection_failed","error_type":"IOError","error":"x","seconds_open":1,"frames_this_epoch":-1}),
+        json!({"event":"subscription_sent","target_digest":"digest","target_count":-1}),
+        json!({"event":"frame_not_utf8","bytes":0}),
+        json!({"event":"orderbook_reconciliation_request","sid":1,"command_id":0,"market_tickers":["KX"],"reason":"stale"}),
+    ] {
+        assert!(matches!(
+            normalize(&source(&payload.to_string(), "process", Value::Null)),
+            Normalization::Reject(_)
+        ));
+    }
 }
 
 #[test]

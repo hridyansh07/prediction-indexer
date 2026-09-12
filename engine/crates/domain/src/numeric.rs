@@ -435,6 +435,9 @@ fn parse_unsigned_decimal(text: &str, scale: DecimalScale) -> Result<u128, Numer
     if text.is_empty() {
         return Err(NumericError::Empty);
     }
+    if !text.is_ascii() {
+        return Err(NumericError::InvalidSyntax);
+    }
     if text.starts_with(['+', '-']) {
         return Err(NumericError::InvalidSyntax);
     }

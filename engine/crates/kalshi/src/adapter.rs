@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use canonical_normalizer::{CanonicalEnvelope, Normalization, NormalizerError, VenueAdapter};
+use canonical_normalizer::{
+    CanonicalEnvelope, Normalization, NormalizerConfigIdentity, NormalizerError, VenueAdapter,
+};
 use indexer_types::{RecordKind, SourceCursor, Stream, Venue};
 use serde_json::Value;
 
@@ -35,14 +37,12 @@ impl Default for Kalshi {
 }
 
 impl VenueAdapter for Kalshi {
-    type ConfigIdentity = Config;
-
     const VENUE: Venue = Venue::Kalshi;
     const PARSER_VERSION: u32 = PARSER_VERSION;
     const BUNDLE_ID: &'static str = NORMALIZER_BUNDLE_ID;
 
-    fn config_identity(&self) -> Self::ConfigIdentity {
-        self.config
+    fn config_identity(&self) -> NormalizerConfigIdentity {
+        self.config.identity()
     }
 
     fn normalize(
@@ -88,7 +88,11 @@ impl VenueAdapter for Kalshi {
                     ignored.insert(reason);
                 }
                 Err(reject) => {
-                    return Ok(input.reject(PARSER_VERSION, reject.code, reject.instrument));
+                    return Ok(input.reject(
+                        PARSER_VERSION,
+                        reject.code,
+                        if batched { None } else { reject.instrument },
+                    ));
                 }
             }
         }

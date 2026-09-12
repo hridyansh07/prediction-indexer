@@ -44,7 +44,7 @@ fn record() -> SegmentRecord {
 #[test]
 fn canonical_json_matches_the_golden_vector_and_round_trips() {
     let expected = concat!(
-        "{\"schema_version\":1,\"header\":{\"order_ns\":1785409600000000000,",
+        "{\"schema_version\":2,\"header\":{\"order_ns\":1785409600000000000,",
         "\"visible_ns\":1785409600000000000,\"visible_tie_group\":7,",
         "\"address\":{\"canonical_seq\":42,\"lane\":\"lane-book-a\",",
         "\"delivery_index\":9001,\"event_index\":3},\"record_id\":\"record-42\",",
@@ -109,8 +109,8 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
     let cases = [
         canonical.replacen(
-            "{\"schema_version\":1",
-            "{\"unknown\":0,\"schema_version\":1",
+            "{\"schema_version\":2",
+            "{\"unknown\":0,\"schema_version\":2",
             1,
         ),
         canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
@@ -126,10 +126,10 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     for invalid in cases {
         assert!(SegmentRecord::from_canonical_json(invalid.as_bytes()).is_err());
     }
-    let future = canonical.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+    let future = canonical.replacen("\"schema_version\":2", "\"schema_version\":3", 1);
     assert_eq!(
         SegmentRecord::from_canonical_json(future.as_bytes()),
-        Err(DomainError::UnsupportedSchemaVersion(2))
+        Err(DomainError::UnsupportedSchemaVersion(3))
     );
 }
 

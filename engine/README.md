@@ -85,7 +85,8 @@ source digest/line/content/continuity ---> CanonicalProvenance
 ```
 
 The conversion stages records while streaming, but derivative publication still
-requires Phase 0's `AuditedCanonicalSelection` produced only at verified EOF.
+requires Phase 0's `CanonicalSelection`, whose reader yields its audited result
+only at verified EOF.
 The Replay continuity enum intentionally has the same ten closed labels; the
 conversion uses an exhaustive match, not string fallback.
 
@@ -93,7 +94,7 @@ conversion uses an exhaustive match, not string fallback.
 
 `canonical-normalizer::Normalizer<A>` implements the normalization lifecycle once.
 It decodes each canonical envelope and raw JSON payload, routes by venue, hashes
-the adapter's typed canonical configuration, and delegates venue wire semantics
+the adapter's closed, key-sorted canonical configuration, and delegates venue wire semantics
 through `VenueAdapter`. Its `Normalize` implementation returns zero/many closed
 `SegmentEvent` children, an explicit ignored reason, or an expected
 `ParseReject`, and has a final consistency `finish()`.
@@ -112,8 +113,8 @@ receipt.
 canonical receipt. This is the smallest composition with Phase 0's selected-run
 API: selecting exact receipt bounds yields one window and one post-EOF capability,
 so no canonical input is reopened and no selector/audit lifecycle changes. The
-existing Phase 0 `ReceiptIdentity` gains strict serde support so the derivative
-manifest can reuse it directly rather than duplicate its schema. A caller
+derivative manifest owns a closed `SourceReceipt` projection converted explicitly
+from Phase 0's evolving `ReceiptIdentity`. A caller
 wanting a range builds each canonical receipt independently and pins the
 resulting `DerivativePin` values.
 
@@ -140,8 +141,9 @@ order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
 
 Builds use unique private staging directories. After EOF and both `finish()`
 calls, they finish and fsync frames, rename and fsync data, write and fsync the
-manifest, atomically publish the uncommitted directory, and write/fsync/rename
-the receipt last. Publication is serialized per address with an OS advisory lock
+manifest, and strictly verify the complete candidate against the constructed
+receipt bytes. Only then do they atomically publish the uncommitted directory and
+write/fsync/rename the receipt last. Publication is serialized per address with an OS advisory lock
 that is released by process death. An unreceipted directory is crash debris and
 is rebuilt. A retry rebuilds the candidate: identical receipt bytes verify/no-op;
 different bytes at the same address are an immutable conflict.

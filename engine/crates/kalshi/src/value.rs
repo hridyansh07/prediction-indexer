@@ -11,7 +11,9 @@ pub(crate) trait CheckedValue {
     fn checked_nonempty_text(&self, code: &'static str) -> Result<&str, Reject>;
     fn checked_i64(&self, code: &'static str) -> Result<i64, Reject>;
     fn checked_nonnegative_i64(&self, code: &'static str) -> Result<i64, Reject>;
+    fn checked_nonnegative_u64(&self, code: &'static str) -> Result<u64, Reject>;
     fn checked_positive_u64(&self, code: &'static str) -> Result<u64, Reject>;
+    fn checked_nonnegative_number(&self, code: &'static str) -> Result<f64, Reject>;
     fn checked_bool(&self, code: &'static str) -> Result<bool, Reject>;
     fn checked_price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str>;
     fn checked_quantity(&self, scale: DecimalScale) -> Result<Qty, &'static str>;
@@ -52,9 +54,19 @@ impl CheckedValue for Value {
         })
     }
 
+    fn checked_nonnegative_u64(&self, code: &'static str) -> Result<u64, Reject> {
+        self.as_u64().ok_or_else(|| Reject::new(code))
+    }
+
     fn checked_positive_u64(&self, code: &'static str) -> Result<u64, Reject> {
         self.as_u64()
             .filter(|value| *value > 0)
+            .ok_or_else(|| Reject::new(code))
+    }
+
+    fn checked_nonnegative_number(&self, code: &'static str) -> Result<f64, Reject> {
+        self.as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
             .ok_or_else(|| Reject::new(code))
     }
 
@@ -117,7 +129,7 @@ impl CheckedObject for Map<String, Value> {
     fn checked_required_text(&self, field: &str) -> Result<String, &'static str> {
         self.get(field)
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
             .map(str::to_owned)
             .ok_or("invalid_control_field")
     }
@@ -125,7 +137,11 @@ impl CheckedObject for Map<String, Value> {
     fn checked_optional_text(&self, field: &str) -> Result<Option<String>, &'static str> {
         match self.get(field) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+            Some(Value::String(value))
+                if !value.is_empty() && !value.chars().any(char::is_control) =>
+            {
+                Ok(Some(value.clone()))
+            }
             _ => Err("invalid_control_field"),
         }
     }

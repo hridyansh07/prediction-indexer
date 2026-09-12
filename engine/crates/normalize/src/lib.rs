@@ -4,6 +4,7 @@
 //! identity, and venue routing. Adapters own only their venue schema and its
 //! conversion into Replay domain events.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use indexer_finalize::JoinedCanonicalRecord;
@@ -12,7 +13,7 @@ use replay_domain::{
     CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader, FaultImpact, InstrumentId,
     LaneId, SegmentEvent, SegmentRecord, Sha256,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One deterministic decision for one canonical source record.
@@ -109,13 +110,11 @@ pub trait Normalize {
 /// canonical envelope and JSON payload; shared seam failures cannot be handled
 /// differently by each venue.
 pub trait VenueAdapter {
-    type ConfigIdentity: Serialize;
-
     const VENUE: Venue;
     const PARSER_VERSION: u32;
     const BUNDLE_ID: &'static str;
 
-    fn config_identity(&self) -> Self::ConfigIdentity;
+    fn config_identity(&self) -> NormalizerConfigIdentity;
 
     fn normalize(&mut self, input: CanonicalEnvelope<'_>)
     -> Result<Normalization, NormalizerError>;
@@ -123,6 +122,29 @@ pub trait VenueAdapter {
     fn finish(&mut self) -> Result<(), NormalizerError> {
         Ok(())
     }
+}
+
+/// Closed, canonically ordered variables that participate in derivative identity.
+/// Adapters cannot supply an insertion-ordered map or a custom serializer whose
+/// bytes vary while its runtime meaning stays the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizerConfigIdentity {
+    pub schema_version: u16,
+    pub variables: BTreeMap<String, ConfigValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ConfigValue {
+    Boolean(bool),
+    Unsigned(u64),
+    Text(String),
 }
 
 /// The single reusable normalizer. A venue is an adapter parameter, not a
