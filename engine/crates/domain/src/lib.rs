@@ -12,14 +12,16 @@ mod numeric;
 pub use event::{
     AuditAnchor, BookDelta, BookEvent, CanonicalProvenance, ContinuityVerdict, ContractOrientation,
     ControlEvent, DomainError, EventAddress, EventHeader, FaultImpact, FullBook, InstrumentId,
-    LaneId, Level, LevelSize, LevelSizeMode, NormalizationFault, SegmentEvent, SegmentRecord, Side,
-    TradeEvent,
+    LaneId, Level, LevelChange, NormalizationFault, SegmentEvent, SegmentRecord, Side, TradeEvent,
 };
 pub use indexer_types::Sha256;
 pub use mutation::{
     ApplyError, MutationReceipt, PrepareError, PreparedMutation, Revision, Revisioned,
 };
-pub use numeric::{DecimalScale, NumericError, PriceUnit, Px, Qty, QuantityUnit};
+pub use numeric::{
+    ConditionalMarketPrice, DecimalScale, MAX_QUANTITY_ATOMS, Magnitude, NumericError, PositiveQty,
+    PriceUnit, Px, Qty, QuantityUnit,
+};
 
 /// Canonical persisted schema emitted and consumed by the Replay engine.
 pub const SEGMENT_SCHEMA_VERSION: u16 = 1;

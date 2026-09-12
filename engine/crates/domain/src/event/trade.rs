@@ -1,16 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Px, Qty};
+use crate::{ConditionalMarketPrice, PositiveQty};
 
-use super::{ContractOrientation, DomainError, InstrumentId, Side};
+use super::{ContractOrientation, InstrumentId, Side};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TradeEvent {
     instrument: InstrumentId,
     orientation: ContractOrientation,
-    price: Px,
-    quantity: Qty,
+    price: ConditionalMarketPrice,
+    quantity: PositiveQty,
     aggressor: Option<Side>,
 }
 
@@ -18,20 +18,17 @@ impl TradeEvent {
     pub fn new(
         instrument: InstrumentId,
         orientation: ContractOrientation,
-        price: Px,
-        quantity: Qty,
+        price: ConditionalMarketPrice,
+        quantity: PositiveQty,
         aggressor: Option<Side>,
-    ) -> Result<Self, DomainError> {
-        if quantity.atoms() <= 0 {
-            return Err(DomainError::NonPositiveLevel);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             instrument,
             orientation,
             price,
             quantity,
             aggressor,
-        })
+        }
     }
 
     pub fn instrument(&self) -> &InstrumentId {
@@ -42,23 +39,15 @@ impl TradeEvent {
         self.orientation
     }
 
-    pub const fn price(&self) -> Px {
+    pub const fn price(&self) -> ConditionalMarketPrice {
         self.price
     }
 
-    pub const fn quantity(&self) -> Qty {
+    pub const fn quantity(&self) -> PositiveQty {
         self.quantity
     }
 
     pub const fn aggressor(&self) -> Option<Side> {
         self.aggressor
-    }
-
-    pub(super) fn validate(&self) -> Result<(), DomainError> {
-        if self.quantity.atoms() <= 0 {
-            Err(DomainError::NonPositiveLevel)
-        } else {
-            Ok(())
-        }
     }
 }

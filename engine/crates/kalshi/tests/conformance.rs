@@ -2,7 +2,7 @@ use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record}
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
 use kalshi_normalizer::{Config, Kalshi, NORMALIZER_BUNDLE_ID};
-use replay_domain::{BookEvent, ContractOrientation, SegmentEvent, Side};
+use replay_domain::{BookEvent, ContractOrientation, LevelChange, SegmentEvent, Side};
 use serde_json::{Value, json};
 
 const SNAPSHOT: &str = include_str!("fixtures/orderbook_snapshot.json");
@@ -97,18 +97,25 @@ fn descriptor_is_versioned_and_config_changes_identity() {
         default.descriptor().config_sha256,
         Sha256::digest(&default_config)
     );
-    let changed = Normalizer::new(
-        Kalshi::try_from(Config {
+    for changed_config in [
+        Config {
             price_scale: replay_domain::DecimalScale::new(3).unwrap(),
             ..Config::default()
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    assert_ne!(
-        changed.descriptor().config_sha256,
-        default.descriptor().config_sha256
-    );
+        },
+        Config {
+            quantity_scale: replay_domain::DecimalScale::new(3).unwrap(),
+            ..Config::default()
+        },
+        Config {
+            use_yes_price: true,
+            ..Config::default()
+        },
+    ] {
+        assert_ne!(
+            Sha256::digest(&serde_json::to_vec(&changed_config).unwrap()),
+            default.descriptor().config_sha256
+        );
+    }
     assert!(
         Kalshi::try_from(Config {
             use_yes_price: true,
@@ -174,7 +181,51 @@ fn relative_delta_is_typed_without_requiring_initialized_state() {
     assert_eq!(delta.orientation(), ContractOrientation::Outcome);
     assert_eq!(delta.side(), Side::Bid);
     assert_eq!(delta.price().atoms(), 9600);
-    assert_eq!(delta.size().quantity().atoms(), -5400);
+    let LevelChange::Decrease(quantity) = delta.change() else {
+        panic!("expected decreasing level change")
+    };
+    assert_eq!(quantity.atoms(), 5400);
+}
+
+#[test]
+fn delta_sign_is_consumed_once_and_magnitude_stays_positive() {
+    let with_delta = |delta: &str| {
+        let mut payload: Value = serde_json::from_str(DELTA).unwrap();
+        payload["msg"]["delta_fp"] = json!(delta);
+        payload.to_string()
+    };
+
+    let increased = events(normalize(&sequenced(
+        &with_delta("92233720368547758.07"),
+        "public_book",
+        3,
+    )));
+    let SegmentEvent::Book(BookEvent::Delta(delta)) = &increased[0] else {
+        panic!("expected delta")
+    };
+    let LevelChange::Increase(quantity) = delta.change() else {
+        panic!("expected increasing level change")
+    };
+    assert_eq!(quantity.atoms(), i64::MAX as u64);
+
+    for (lexeme, code) in [
+        ("0.00", "zero_relative_delta"),
+        ("-0.00", "zero_relative_delta"),
+        ("+1.00", "invalid_quantity"),
+        ("1e2", "invalid_quantity"),
+        (" 1.00", "invalid_quantity"),
+        ("1.001", "inexact_quantity"),
+        ("92233720368547758.08", "quantity_overflow"),
+        ("-92233720368547758.08", "quantity_overflow"),
+    ] {
+        assert_eq!(
+            reject_code(normalize(
+                &sequenced(&with_delta(lexeme), "public_book", 3,)
+            )),
+            code,
+            "unexpected classification for {lexeme:?}"
+        );
+    }
 }
 
 #[test]
@@ -187,6 +238,41 @@ fn trade_uses_exact_yes_price_and_validated_direction() {
     assert_eq!(trade.price().atoms(), 3600);
     assert_eq!(trade.quantity().atoms(), 13_600);
     assert_eq!(trade.aggressor(), Some(Side::Ask));
+}
+
+#[test]
+fn snapshot_and_trade_quantities_are_positive_at_the_parse_boundary() {
+    let mut snapshot: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    for (quantity, code) in [
+        ("0.00", "non_positive_snapshot_quantity"),
+        ("-1.00", "invalid_quantity"),
+        ("92233720368547758.08", "quantity_overflow"),
+    ] {
+        snapshot["msg"]["yes_dollars_fp"][0][1] = json!(quantity);
+        assert_eq!(
+            reject_code(normalize(&sequenced(
+                &snapshot.to_string(),
+                "public_book",
+                2,
+            ))),
+            code
+        );
+    }
+
+    let mut trade: Value = serde_json::from_str(TRADE).unwrap();
+    for (quantity, code) in [
+        ("0.00", "non_positive_trade_quantity"),
+        ("-1.00", "invalid_quantity"),
+        ("92233720368547758.08", "quantity_overflow"),
+    ] {
+        trade["msg"]["count_fp"] = json!(quantity);
+        assert_eq!(
+            reject_code(normalize(
+                &sequenced(&trade.to_string(), "public_trade", 2,)
+            )),
+            code
+        );
+    }
 }
 
 #[test]
@@ -299,6 +385,10 @@ fn malformed_unknown_and_ambiguous_shapes_have_stable_reject_codes() {
         (
             r#"{"type":"orderbook_delta","sid":1,"seq":1,"msg":{"market_ticker":"KX-X","price_dollars":"0.50001","delta_fp":"1.00","side":"yes"}}"#,
             "inexact_price",
+        ),
+        (
+            r#"{"type":"orderbook_delta","sid":1,"seq":1,"msg":{"market_ticker":"KX-X","price_dollars":"1.0001","delta_fp":"1.00","side":"yes"}}"#,
+            "price_out_of_range",
         ),
         (
             r#"{"type":"orderbook_delta","sid":1,"seq":1,"msg":{"market_ticker":"KX-X","price_dollars":"0.5000","delta_fp":"0.00","side":"yes"}}"#,

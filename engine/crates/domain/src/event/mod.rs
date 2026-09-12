@@ -10,8 +10,7 @@ mod record;
 mod trade;
 
 pub use book::{
-    AuditAnchor, BookDelta, BookEvent, ContractOrientation, FullBook, Level, LevelSize,
-    LevelSizeMode, Side,
+    AuditAnchor, BookDelta, BookEvent, ContractOrientation, FullBook, Level, LevelChange, Side,
 };
 pub use control::ControlEvent;
 pub use error::DomainError;

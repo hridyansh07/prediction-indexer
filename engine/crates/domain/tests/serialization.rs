@@ -1,7 +1,7 @@
 use replay_domain::{
-    BookDelta, BookEvent, CanonicalProvenance, ContinuityVerdict, ContractOrientation,
-    DecimalScale, DomainError, EventAddress, EventHeader, FullBook, InstrumentId, LaneId, Level,
-    LevelSize, LevelSizeMode, Px, Qty, SegmentEvent, SegmentRecord, Side,
+    BookDelta, BookEvent, CanonicalProvenance, ConditionalMarketPrice, ContinuityVerdict,
+    ContractOrientation, DecimalScale, DomainError, EventAddress, EventHeader, FullBook,
+    InstrumentId, LaneId, Level, LevelChange, PositiveQty, Qty, SegmentEvent, SegmentRecord, Side,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -33,8 +33,8 @@ fn record() -> SegmentRecord {
         InstrumentId::new("venue:market-yes").unwrap(),
         ContractOrientation::Complement,
         Side::Bid,
-        Px::parse("0.5100", scale(4)).unwrap(),
-        LevelSize::relative(Qty::parse("-2.50", scale(2)).unwrap()).unwrap(),
+        ConditionalMarketPrice::parse("0.5100", scale(4)).unwrap(),
+        LevelChange::Decrease(PositiveQty::parse("2.50", scale(2)).unwrap()),
         Some("venue-book-hash".to_owned()),
     )
     .unwrap();
@@ -54,8 +54,8 @@ fn canonical_json_matches_the_golden_vector_and_round_trips() {
         "\"value\":{\"kind\":\"delta\",\"value\":{",
         "\"instrument\":\"venue:market-yes\",\"orientation\":\"complement\",",
         "\"side\":\"bid\",\"price\":{\"atoms\":5100,\"scale\":4,",
-        "\"unit\":\"quote_per_contract\"},\"size\":{\"mode\":\"relative\",",
-        "\"quantity\":{\"atoms\":-250,\"scale\":2,\"unit\":\"contracts\"}},",
+        "\"unit\":\"quote_per_contract\"},\"change\":{\"kind\":\"decrease\",",
+        "\"value\":{\"atoms\":250,\"scale\":2,\"unit\":\"contracts\"}},",
         "\"book_hash\":\"venue-book-hash\"}}}}"
     );
     assert_eq!(record().to_canonical_json(), expected.as_bytes());
@@ -115,6 +115,12 @@ fn unknown_fields_variants_and_versions_are_rejected() {
         ),
         canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
         canonical.replacen("\"kind\":\"delta\"", "\"kind\":\"replace\"", 1),
+        canonical.replacen("\"kind\":\"decrease\"", "\"kind\":\"shift\"", 1),
+        canonical.replacen(
+            "\"kind\":\"decrease\",\"value\"",
+            "\"kind\":\"decrease\",\"unknown\":0,\"value\"",
+            1,
+        ),
         canonical.replacen("\"atoms\":5100", "\"atoms\":5100,\"float\":0.51", 1),
     ];
     for invalid in cases {
@@ -141,8 +147,13 @@ fn malformed_financial_states_are_rejected_on_decode() {
     let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
     let negative_price = canonical.replacen("\"atoms\":5100", "\"atoms\":-1", 1);
     assert!(SegmentRecord::from_canonical_json(negative_price.as_bytes()).is_err());
-    let invalid_relative = canonical.replacen("\"atoms\":-250", "\"atoms\":0", 1);
-    assert!(SegmentRecord::from_canonical_json(invalid_relative.as_bytes()).is_err());
+    let zero_change = canonical.replacen("\"atoms\":250", "\"atoms\":0", 1);
+    assert!(SegmentRecord::from_canonical_json(zero_change.as_bytes()).is_err());
+    let negative_quantity = canonical.replacen("\"atoms\":250", "\"atoms\":-1", 1);
+    assert!(SegmentRecord::from_canonical_json(negative_quantity.as_bytes()).is_err());
+    let excessive_quantity =
+        canonical.replacen("\"atoms\":250", "\"atoms\":9223372036854775808", 1);
+    assert!(SegmentRecord::from_canonical_json(excessive_quantity.as_bytes()).is_err());
 }
 
 #[test]
@@ -153,54 +164,55 @@ fn side_orientation_and_absolute_relative_semantics_stay_distinct() {
     };
     assert_eq!(delta.side(), Side::Bid);
     assert_eq!(delta.orientation(), ContractOrientation::Complement);
-    assert_eq!(delta.size().mode(), LevelSizeMode::Relative);
-    assert_eq!(delta.size().quantity().atoms(), -250);
-    assert!(LevelSize::absolute(Qty::from_atoms(-1, scale(0))).is_err());
-    assert!(LevelSize::absolute(Qty::from_atoms(0, scale(0))).is_ok());
-    assert!(LevelSize::relative(Qty::from_atoms(0, scale(0))).is_err());
-}
-
-#[test]
-fn level_size_golden_vectors_round_trip() {
-    let absolute = LevelSize::absolute(Qty::from_atoms(0, scale(3))).unwrap();
-    let relative = LevelSize::relative(Qty::from_atoms(-25, scale(2))).unwrap();
-    let vectors = [
-        (
-            absolute,
-            r#"{"mode":"absolute","quantity":{"atoms":0,"scale":3,"unit":"contracts"}}"#,
-        ),
-        (
-            relative,
-            r#"{"mode":"relative","quantity":{"atoms":-25,"scale":2,"unit":"contracts"}}"#,
-        ),
-    ];
-    for (value, expected) in vectors {
-        assert_eq!(serde_json::to_string(&value).unwrap(), expected);
-        assert_eq!(serde_json::from_str::<LevelSize>(expected).unwrap(), value);
-    }
-    assert!(
-        serde_json::from_str::<LevelSize>(
-            r#"{"mode":"relative","quantity":{"atoms":0,"scale":2,"unit":"contracts"}}"#,
-        )
-        .is_err()
+    assert_eq!(
+        delta.change(),
+        LevelChange::Decrease(PositiveQty::parse("2.50", scale(2)).unwrap())
     );
 }
 
 #[test]
+fn level_change_golden_vectors_round_trip() {
+    let quantity = PositiveQty::parse("0.25", scale(2)).unwrap();
+    let vectors = [
+        (
+            LevelChange::Set(quantity),
+            r#"{"kind":"set","value":{"atoms":25,"scale":2,"unit":"contracts"}}"#,
+        ),
+        (LevelChange::Delete, r#"{"kind":"delete"}"#),
+        (
+            LevelChange::Increase(quantity),
+            r#"{"kind":"increase","value":{"atoms":25,"scale":2,"unit":"contracts"}}"#,
+        ),
+        (
+            LevelChange::Decrease(quantity),
+            r#"{"kind":"decrease","value":{"atoms":25,"scale":2,"unit":"contracts"}}"#,
+        ),
+    ];
+    for (value, expected) in vectors {
+        assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<LevelChange>(expected).unwrap(),
+            value
+        );
+    }
+    assert!(
+        serde_json::from_str::<LevelChange>(
+            r#"{"kind":"increase","value":{"atoms":0,"scale":2,"unit":"contracts"}}"#,
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<LevelChange>(r#"{"kind":"future"}"#).is_err());
+}
+
+#[test]
 fn full_books_sort_sides_and_reject_duplicate_or_nonpositive_levels() {
-    let px = |atoms| Px::from_atoms(atoms, scale(2)).unwrap();
-    let qty = |atoms| Qty::from_atoms(atoms, scale(0));
+    let px = |atoms| ConditionalMarketPrice::from_atoms(atoms, scale(2)).unwrap();
+    let qty = |atoms| PositiveQty::new(Qty::from_atoms(atoms, scale(0)).unwrap()).unwrap();
     let book = FullBook::new(
         InstrumentId::new("venue:asset").unwrap(),
         ContractOrientation::Outcome,
-        vec![
-            Level::new(px(40), qty(2)).unwrap(),
-            Level::new(px(50), qty(1)).unwrap(),
-        ],
-        vec![
-            Level::new(px(70), qty(1)).unwrap(),
-            Level::new(px(60), qty(2)).unwrap(),
-        ],
+        vec![Level::new(px(40), qty(2)), Level::new(px(50), qty(1))],
+        vec![Level::new(px(70), qty(1)), Level::new(px(60), qty(2))],
         None,
         None,
     )
@@ -219,15 +231,12 @@ fn full_books_sort_sides_and_reject_duplicate_or_nonpositive_levels() {
             .collect::<Vec<_>>(),
         [60, 70]
     );
-    assert!(Level::new(px(50), qty(0)).is_err());
+    assert!(PositiveQty::new(Qty::from_atoms(0, scale(0)).unwrap()).is_err());
     assert!(
         FullBook::new(
             InstrumentId::new("venue:asset").unwrap(),
             ContractOrientation::Outcome,
-            vec![
-                Level::new(px(50), qty(1)).unwrap(),
-                Level::new(px(50), qty(2)).unwrap()
-            ],
+            vec![Level::new(px(50), qty(1)), Level::new(px(50), qty(2))],
             vec![],
             None,
             None,

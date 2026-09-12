@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Px, Qty};
+use crate::{ConditionalMarketPrice, PositiveQty};
 
 use super::{DomainError, InstrumentId, validate_optional_text, validate_text};
 
@@ -23,32 +23,21 @@ pub enum ContractOrientation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Level {
-    price: Px,
-    quantity: Qty,
+    price: ConditionalMarketPrice,
+    quantity: PositiveQty,
 }
 
 impl Level {
-    pub fn new(price: Px, quantity: Qty) -> Result<Self, DomainError> {
-        if quantity.atoms() <= 0 {
-            return Err(DomainError::NonPositiveLevel);
-        }
-        Ok(Self { price, quantity })
+    pub const fn new(price: ConditionalMarketPrice, quantity: PositiveQty) -> Self {
+        Self { price, quantity }
     }
 
-    pub const fn price(self) -> Px {
+    pub const fn price(self) -> ConditionalMarketPrice {
         self.price
     }
 
-    pub const fn quantity(self) -> Qty {
+    pub const fn quantity(self) -> PositiveQty {
         self.quantity
-    }
-
-    fn validate(&self) -> Result<(), DomainError> {
-        if self.quantity.atoms() <= 0 {
-            Err(DomainError::NonPositiveLevel)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -120,83 +109,17 @@ impl FullBook {
     }
 }
 
+/// A complete, direction-explicit instruction for one book level.
+///
+/// Sign never carries operation semantics. Set and relative changes require a
+/// positive quantity, while deletion is represented by its own variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LevelSizeMode {
-    Absolute,
-    Relative,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LevelSize {
-    mode: LevelSizeMode,
-    quantity: Qty,
-}
-
-impl LevelSize {
-    pub fn absolute(quantity: Qty) -> Result<Self, DomainError> {
-        if quantity.atoms() < 0 {
-            Err(DomainError::NegativeAbsoluteLevel)
-        } else {
-            Ok(Self {
-                mode: LevelSizeMode::Absolute,
-                quantity,
-            })
-        }
-    }
-
-    pub fn relative(quantity: Qty) -> Result<Self, DomainError> {
-        if quantity.atoms() == 0 {
-            Err(DomainError::ZeroRelativeLevel)
-        } else {
-            Ok(Self {
-                mode: LevelSizeMode::Relative,
-                quantity,
-            })
-        }
-    }
-
-    pub const fn mode(self) -> LevelSizeMode {
-        self.mode
-    }
-
-    pub const fn quantity(self) -> Qty {
-        self.quantity
-    }
-
-    fn validate(self) -> Result<(), DomainError> {
-        match self.mode {
-            LevelSizeMode::Absolute if self.quantity.atoms() < 0 => {
-                Err(DomainError::NegativeAbsoluteLevel)
-            }
-            LevelSizeMode::Relative if self.quantity.atoms() == 0 => {
-                Err(DomainError::ZeroRelativeLevel)
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for LevelSize {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            mode: LevelSizeMode,
-            quantity: Qty,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        match wire.mode {
-            LevelSizeMode::Absolute => Self::absolute(wire.quantity),
-            LevelSizeMode::Relative => Self::relative(wire.quantity),
-        }
-        .map_err(serde::de::Error::custom)
-    }
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum LevelChange {
+    Set(PositiveQty),
+    Delete,
+    Increase(PositiveQty),
+    Decrease(PositiveQty),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,8 +128,8 @@ pub struct BookDelta {
     instrument: InstrumentId,
     orientation: ContractOrientation,
     side: Side,
-    price: Px,
-    size: LevelSize,
+    price: ConditionalMarketPrice,
+    change: LevelChange,
     book_hash: Option<String>,
 }
 
@@ -215,18 +138,17 @@ impl BookDelta {
         instrument: InstrumentId,
         orientation: ContractOrientation,
         side: Side,
-        price: Px,
-        size: LevelSize,
+        price: ConditionalMarketPrice,
+        change: LevelChange,
         book_hash: Option<String>,
     ) -> Result<Self, DomainError> {
-        size.validate()?;
         validate_optional_text(&book_hash, "book_hash")?;
         Ok(Self {
             instrument,
             orientation,
             side,
             price,
-            size,
+            change,
             book_hash,
         })
     }
@@ -243,16 +165,15 @@ impl BookDelta {
         self.side
     }
 
-    pub const fn price(&self) -> Px {
+    pub const fn price(&self) -> ConditionalMarketPrice {
         self.price
     }
 
-    pub const fn size(&self) -> LevelSize {
-        self.size
+    pub const fn change(&self) -> LevelChange {
+        self.change
     }
 
     pub(super) fn validate(&self) -> Result<(), DomainError> {
-        self.size.validate()?;
         validate_optional_text(&self.book_hash, "book_hash")
     }
 }
@@ -348,9 +269,7 @@ fn validate_level_scales(bids: &[Level], asks: &[Level]) -> Result<(), DomainErr
     let Some(first) = levels.next() else {
         return Ok(());
     };
-    first.validate()?;
     for level in levels {
-        level.validate()?;
         if level.price.scale() != first.price.scale()
             || level.quantity.scale() != first.quantity.scale()
         {

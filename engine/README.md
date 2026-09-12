@@ -1,22 +1,28 @@
 # Replay normalized derivative boundary
 
-This workspace contains the stable, venue-independent Replay domain and the
+This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
-verified normalized derivative. It contains no venue decoder, venue schema,
-book, strategy, publisher, deployment, or scheduler.
+verified normalized derivative, and the Kalshi normalizer. It contains no book,
+strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
 
-- `Px` is a non-negative `i64` atom count in `10^-scale` quote units per
-  contract. `PriceUnit` is closed at `quote_per_contract`.
-- `Qty` is a signed `i64` atom count in `10^-scale` contracts. Signed quantities
-  exist for relative mutations; full-book levels and trades require positive
-  quantities, absolute updates permit zero as deletion, and relative updates
-  reject zero as a no-op.
+- `Magnitude` is unit-free unsigned exact arithmetic (`u64` atoms plus scale).
+  It is not serialized alone and has no financial meaning.
+- `Qty` wraps `Magnitude` with `QuantityUnit::Contracts` and is always
+  nonnegative. Its storage is `u64`, but V1 deliberately caps persisted atoms at
+  `i64::MAX`; constructors, parsing, arithmetic, rescaling, and deserialization
+  all enforce that logical maximum. `PositiveQty` additionally makes zero
+  unrepresentable for levels, trades, and level changes.
+- `Px` remains the general nonnegative `i64` fixed-point price primitive in
+  `10^-scale` quote units per contract. `ConditionalMarketPrice` wraps it for
+  current market events and rejects values outside the inclusive `[0, 1]`
+  interval; it never clamps or rounds.
 - `DecimalScale` is the inclusive range 0–18. Decimal input is plain ASCII
-  `[0-9]+(.[0-9]+)?`, with `-` permitted only for quantity. Whitespace, `+`,
-  exponent notation, missing whole/fractional digits, and binary floats are not
-  accepted.
+  `[0-9]+(.[0-9]+)?`. Whitespace, either lexical sign, exponent notation,
+  missing whole/fractional digits, and binary floats are not accepted by the
+  domain quantities. A venue adapter may consume a directional wire sign before
+  constructing domain values.
 - Extra fractional zeroes are exact and accepted. A non-zero discarded digit is
   inexact. Checked rescaling distinguishes a non-zero value below the coarser
   quantum (`Underflow`), other discarded remainder (`InexactRescale`), and
@@ -27,20 +33,25 @@ book, strategy, publisher, deployment, or scheduler.
   `ContractOrientation::{Outcome, Complement}` independently records whether a
   price refers to the named outcome or its logical complement. The Replay domain performs no
   implicit `1 - p` conversion.
+- `LevelChange::{Set, Delete, Increase, Decrease}` carries operation semantics
+  explicitly. Every quantity-bearing variant contains `PositiveQty`; no signed
+  or zero relative change can enter the persisted domain.
 
-Currency identity, legal price bounds, tick/lot schedules, payout denomination,
-currency conversion, fee arithmetic, and strategy rounding are economic/product
-choices deferred to their owning later phases. A future segment manifest must
-bind currency and the scales expected for each instrument; the Replay domain does not guess
-them from a venue.
+Currency identity, venue-specific price bands, tick/lot schedules, payout
+denomination, currency conversion, fee arithmetic, and strategy rounding are
+economic/product choices deferred to their owning later phases. A future
+segment manifest must bind currency and the scales expected for each instrument;
+the Replay domain does not guess them from a venue.
 
 ## Closed event contract
 
 `SegmentRecord` schema version 1 owns `EventHeader`, `EventAddress`, complete
 downstream canonical provenance, and a closed `SegmentEvent`. Book events use
 validated constructors, canonical bid-descending/ask-ascending level ordering,
-one scale per full book, and no duplicate prices. `NormalizationFault` carries a
-closed impact classification selected before book state. Exact rejected bytes
+one scale per full book, positive level quantities, conditional-market prices,
+direction-explicit level changes, and no duplicate prices. This is the initial
+undeployed V1 contract; no legacy signed V1 exists. `NormalizationFault` carries
+a closed impact classification selected before book state. Exact rejected bytes
 and parser error codes live in the committed reject sidecar, not this event.
 
 Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
@@ -157,9 +168,9 @@ or Cargo license metadata, so no code was copied. The Replay domain adapts these
 - canonical provenance retained beside normalized values;
 - complete prepared mutations and stale-before-write atomic publication.
 
-Unlike the reference, the Replay domain adds the canonical lane/delivery/child address,
-visible tie group, source segment identity, exact continuity vocabulary,
-absolute/relative level semantics, and explicit contract orientation.
+Unlike the reference, the Replay domain adds the canonical lane/delivery/child
+address, visible tie group, source segment identity, exact continuity vocabulary,
+direction-explicit level changes, and explicit contract orientation.
 
 ## Checks
 

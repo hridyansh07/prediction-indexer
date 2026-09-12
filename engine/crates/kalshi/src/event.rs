@@ -1,6 +1,6 @@
 use replay_domain::{
-    BookDelta, BookEvent, ContractOrientation, FullBook, InstrumentId, Level, LevelSize, Px, Qty,
-    SegmentEvent, Side, TradeEvent,
+    BookDelta, BookEvent, ConditionalMarketPrice, ContractOrientation, FullBook, InstrumentId,
+    Level, LevelChange, PositiveQty, SegmentEvent, Side, TradeEvent,
 };
 
 use crate::{error::Reject, message::MessageOutcome};
@@ -45,22 +45,20 @@ impl TryFrom<Snapshot> for MessageOutcome {
 pub(crate) struct RelativeDelta {
     pub(crate) instrument: InstrumentId,
     pub(crate) orientation: ContractOrientation,
-    pub(crate) price: Px,
-    pub(crate) quantity: Qty,
+    pub(crate) price: ConditionalMarketPrice,
+    pub(crate) change: LevelChange,
 }
 
 impl TryFrom<RelativeDelta> for MessageOutcome {
     type Error = Reject;
 
     fn try_from(delta: RelativeDelta) -> Result<Self, Self::Error> {
-        let size = LevelSize::relative(delta.quantity)
-            .map_err(|_| Reject::for_instrument("zero_relative_delta", delta.instrument.clone()))?;
         let event = BookDelta::new(
             delta.instrument.clone(),
             delta.orientation,
             Side::Bid,
             delta.price,
-            size,
+            delta.change,
             None,
         )
         .map_err(|_| Reject::for_instrument("invalid_delta", delta.instrument))?;
@@ -72,8 +70,8 @@ impl TryFrom<RelativeDelta> for MessageOutcome {
 
 pub(crate) struct Trade {
     pub(crate) instrument: InstrumentId,
-    pub(crate) price: Px,
-    pub(crate) quantity: Qty,
+    pub(crate) price: ConditionalMarketPrice,
+    pub(crate) quantity: PositiveQty,
     pub(crate) aggressor: Side,
 }
 
@@ -87,8 +85,7 @@ impl TryFrom<Trade> for MessageOutcome {
             trade.price,
             trade.quantity,
             Some(trade.aggressor),
-        )
-        .map_err(|_| Reject::for_instrument("non_positive_trade_quantity", trade.instrument))?;
+        );
         Ok(Self::Events(vec![SegmentEvent::Trade(event)]))
     }
 }

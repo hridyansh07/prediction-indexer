@@ -23,7 +23,7 @@ impl SegmentEvent {
             Self::Book(book) => book.validate(),
             Self::AuditAnchor(anchor) => anchor.validate(),
             Self::NormalizationFault(fault) => fault.validate(),
-            Self::Trade(trade) => trade.validate(),
+            Self::Trade(_) => Ok(()),
         }
     }
 }

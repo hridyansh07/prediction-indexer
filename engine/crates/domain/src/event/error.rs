@@ -7,9 +7,6 @@ pub enum DomainError {
     InvalidCanonicalSequence,
     InvalidSourceLine,
     OrderClockMismatch,
-    NonPositiveLevel,
-    NegativeAbsoluteLevel,
-    ZeroRelativeLevel,
     ScaleMismatch,
     DuplicatePrice,
     NonCanonicalLevelOrder,
@@ -29,13 +26,6 @@ impl fmt::Display for DomainError {
             Self::InvalidSourceLine => formatter.write_str("source_line_number must be positive"),
             Self::OrderClockMismatch => {
                 formatter.write_str("order_ns must equal visible_ns in schema v1")
-            }
-            Self::NonPositiveLevel => formatter.write_str("full-book quantities must be positive"),
-            Self::NegativeAbsoluteLevel => {
-                formatter.write_str("absolute level quantity cannot be negative")
-            }
-            Self::ZeroRelativeLevel => {
-                formatter.write_str("relative level quantity cannot be zero")
             }
             Self::ScaleMismatch => {
                 formatter.write_str("book levels must use one price and quantity scale")

@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use indexer_types::{EnvelopeView, RecordKind, SourceCursor, Stream};
 use replay_domain::{
-    ContractOrientation, ControlEvent, DecimalScale, InstrumentId, Level, Px, Qty, SegmentEvent,
-    Side,
+    ConditionalMarketPrice, ContractOrientation, ControlEvent, DecimalScale, InstrumentId, Level,
+    PositiveQty, Px, Qty, SegmentEvent, Side,
 };
 use serde_json::{Map, Value};
 
@@ -136,15 +136,15 @@ fn delta(
         .checked_required("price_dollars")?
         .checked_price(config.price_scale)
         .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    let quantity = msg
+    let change = msg
         .checked_required("delta_fp")?
-        .checked_quantity(config.quantity_scale)
+        .checked_level_change(config.quantity_scale)
         .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
     RelativeDelta {
         instrument,
         orientation,
         price,
-        quantity,
+        change,
     }
     .try_into()
 }
@@ -220,8 +220,15 @@ fn trade(
         .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
     let quantity = msg
         .checked_required("count_fp")?
-        .checked_quantity(config.quantity_scale)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
+        .checked_positive_quantity(config.quantity_scale)
+        .map_err(|code| {
+            let code = if code == "zero_quantity" {
+                "non_positive_trade_quantity"
+            } else {
+                code
+            };
+            Failure::for_instrument(code, instrument.clone())
+        })?;
     Trade {
         instrument,
         price,
@@ -610,14 +617,16 @@ fn levels(
                 (
                     Px::from_atoms(cents, cents_scale)
                         .and_then(|price| price.checked_rescale(config.price_scale))
+                        .and_then(ConditionalMarketPrice::try_from)
                         .map_err(|error| {
                             Failure::for_instrument(
                                 numeric_code(error, "price"),
                                 instrument.clone(),
                             )
                         })?,
-                    Qty::from_atoms(contracts, contracts_scale)
-                        .checked_rescale(config.quantity_scale)
+                    Qty::from_atoms(contracts as u64, contracts_scale)
+                        .and_then(PositiveQty::new)
+                        .and_then(|quantity| quantity.checked_rescale(config.quantity_scale))
                         .map_err(|error| {
                             Failure::for_instrument(
                                 numeric_code(error, "quantity"),
@@ -631,13 +640,18 @@ fn levels(
                         .checked_price(config.price_scale)
                         .map_err(|code| Failure::for_instrument(code, instrument.clone()))?,
                     pair[1]
-                        .checked_quantity(config.quantity_scale)
-                        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?,
+                        .checked_positive_quantity(config.quantity_scale)
+                        .map_err(|code| {
+                            let code = if code == "zero_quantity" {
+                                "non_positive_snapshot_quantity"
+                            } else {
+                                code
+                            };
+                            Failure::for_instrument(code, instrument.clone())
+                        })?,
                 )
             };
-            Level::new(price, quantity).map_err(|_| {
-                Failure::for_instrument("non_positive_snapshot_quantity", instrument.clone())
-            })
+            Ok(Level::new(price, quantity))
         })
         .collect()
 }
