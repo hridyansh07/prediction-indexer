@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ConditionalMarketPrice, PositiveQty};
+use crate::{BookStateHash, ConditionalMarketPrice, PositiveQty};
 
-use super::{DomainError, InstrumentId, validate_optional_text, validate_text};
+use super::{DomainError, InstrumentId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,7 +48,7 @@ pub struct FullBook {
     orientation: ContractOrientation,
     bids: Vec<Level>,
     asks: Vec<Level>,
-    snapshot_hash: Option<String>,
+    snapshot_hash: Option<BookStateHash>,
     source_observed_ns: Option<u64>,
 }
 
@@ -58,10 +58,9 @@ impl FullBook {
         orientation: ContractOrientation,
         mut bids: Vec<Level>,
         mut asks: Vec<Level>,
-        snapshot_hash: Option<String>,
+        snapshot_hash: Option<BookStateHash>,
         source_observed_ns: Option<u64>,
     ) -> Result<Self, DomainError> {
-        validate_optional_text(&snapshot_hash, "snapshot_hash")?;
         validate_level_scales(&bids, &asks)?;
         bids.sort_by_key(|level| core::cmp::Reverse(level.price.atoms()));
         asks.sort_by_key(|level| level.price.atoms());
@@ -93,8 +92,8 @@ impl FullBook {
         &self.asks
     }
 
-    pub fn snapshot_hash(&self) -> Option<&str> {
-        self.snapshot_hash.as_deref()
+    pub const fn snapshot_hash(&self) -> Option<BookStateHash> {
+        self.snapshot_hash
     }
 
     pub const fn source_observed_ns(&self) -> Option<u64> {
@@ -102,7 +101,6 @@ impl FullBook {
     }
 
     pub(super) fn validate(&self) -> Result<(), DomainError> {
-        validate_optional_text(&self.snapshot_hash, "snapshot_hash")?;
         validate_level_scales(&self.bids, &self.asks)?;
         validate_order(&self.bids, Side::Bid)?;
         validate_order(&self.asks, Side::Ask)
@@ -130,7 +128,7 @@ pub struct BookDelta {
     side: Side,
     price: ConditionalMarketPrice,
     change: LevelChange,
-    book_hash: Option<String>,
+    book_hash: Option<BookStateHash>,
 }
 
 impl BookDelta {
@@ -140,9 +138,8 @@ impl BookDelta {
         side: Side,
         price: ConditionalMarketPrice,
         change: LevelChange,
-        book_hash: Option<String>,
+        book_hash: Option<BookStateHash>,
     ) -> Result<Self, DomainError> {
-        validate_optional_text(&book_hash, "book_hash")?;
         Ok(Self {
             instrument,
             orientation,
@@ -173,8 +170,12 @@ impl BookDelta {
         self.change
     }
 
+    pub const fn book_hash(&self) -> Option<BookStateHash> {
+        self.book_hash
+    }
+
     pub(super) fn validate(&self) -> Result<(), DomainError> {
-        validate_optional_text(&self.book_hash, "book_hash")
+        Ok(())
     }
 }
 
@@ -202,7 +203,7 @@ pub struct AuditAnchor {
     orientation: ContractOrientation,
     bids: Vec<Level>,
     asks: Vec<Level>,
-    snapshot_hash: String,
+    snapshot_hash: BookStateHash,
     source_observed_ns: Option<u64>,
 }
 
@@ -212,11 +213,9 @@ impl AuditAnchor {
         orientation: ContractOrientation,
         mut bids: Vec<Level>,
         mut asks: Vec<Level>,
-        snapshot_hash: impl Into<String>,
+        snapshot_hash: BookStateHash,
         source_observed_ns: Option<u64>,
     ) -> Result<Self, DomainError> {
-        let snapshot_hash = snapshot_hash.into();
-        validate_text(&snapshot_hash, "snapshot_hash")?;
         validate_level_scales(&bids, &asks)?;
         bids.sort_by_key(|level| core::cmp::Reverse(level.price.atoms()));
         asks.sort_by_key(|level| level.price.atoms());
@@ -248,8 +247,8 @@ impl AuditAnchor {
         &self.asks
     }
 
-    pub fn snapshot_hash(&self) -> &str {
-        &self.snapshot_hash
+    pub const fn snapshot_hash(&self) -> BookStateHash {
+        self.snapshot_hash
     }
 
     pub const fn source_observed_ns(&self) -> Option<u64> {
@@ -257,7 +256,6 @@ impl AuditAnchor {
     }
 
     pub(super) fn validate(&self) -> Result<(), DomainError> {
-        validate_text(&self.snapshot_hash, "snapshot_hash")?;
         validate_level_scales(&self.bids, &self.asks)?;
         validate_order(&self.bids, Side::Bid)?;
         validate_order(&self.asks, Side::Ask)
