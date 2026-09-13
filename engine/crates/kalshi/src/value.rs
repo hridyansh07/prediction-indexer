@@ -1,9 +1,10 @@
+use canonical_normalizer::{CheckedDecimal, DecimalError};
 use replay_domain::{
     ConditionalMarketPrice, DecimalScale, LevelChange, NumericError, PositiveQty, Qty,
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::error::Reject;
+pub(crate) use canonical_normalizer::CheckedObject;
 
 pub(crate) trait CheckedKalshiValue {
     fn checked_price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str>;
@@ -14,53 +15,32 @@ pub(crate) trait CheckedKalshiValue {
 
 impl CheckedKalshiValue for Value {
     fn checked_price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str> {
-        let text = self.as_str().ok_or("invalid_price")?;
-        ConditionalMarketPrice::parse(text, scale).map_err(|error| numeric_code(error, "price"))
+        CheckedDecimal::checked_price(self, scale).map_err(|error| decimal_code(error, "price"))
     }
 
     fn checked_quantity(&self, scale: DecimalScale) -> Result<Qty, &'static str> {
-        let text = self.as_str().ok_or("invalid_quantity")?;
-        Qty::parse(text, scale).map_err(|error| numeric_code(error, "quantity"))
+        CheckedDecimal::checked_quantity(self, scale)
+            .map_err(|error| decimal_code(error, "quantity"))
     }
 
     fn checked_positive_quantity(&self, scale: DecimalScale) -> Result<PositiveQty, &'static str> {
-        PositiveQty::new(self.checked_quantity(scale)?).map_err(|_| "zero_quantity")
+        CheckedDecimal::checked_positive_quantity(self, scale)
+            .map_err(|error| decimal_code(error, "quantity"))
     }
 
     fn checked_level_change(&self, scale: DecimalScale) -> Result<LevelChange, &'static str> {
-        let text = self.as_str().ok_or("invalid_quantity")?;
-        let (decrease, magnitude) = match text.strip_prefix('-') {
-            Some(magnitude) => (true, magnitude),
-            None => (false, text),
-        };
-        let quantity =
-            Qty::parse(magnitude, scale).map_err(|error| numeric_code(error, "quantity"))?;
-        let quantity = PositiveQty::new(quantity).map_err(|_| "zero_relative_delta")?;
-        Ok(if decrease {
-            LevelChange::Decrease(quantity)
-        } else {
-            LevelChange::Increase(quantity)
-        })
+        CheckedDecimal::checked_level_change(self, scale)
+            .map_err(|error| decimal_code(error, "quantity"))
     }
 }
 
-pub(crate) trait CheckedObject {
-    fn checked_fields(&self, allowed: &[&str]) -> Result<(), Reject>;
-    fn checked_required(&self, field: &str) -> Result<&Value, Reject>;
-}
-
-impl CheckedObject for Map<String, Value> {
-    fn checked_fields(&self, allowed: &[&str]) -> Result<(), Reject> {
-        if self.keys().any(|key| !allowed.contains(&key.as_str())) {
-            Err(Reject::new("unknown_field"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn checked_required(&self, field: &str) -> Result<&Value, Reject> {
-        self.get(field)
-            .ok_or_else(|| Reject::new("missing_required_field"))
+fn decimal_code(error: DecimalError, field: &'static str) -> &'static str {
+    match error {
+        DecimalError::Numeric(error) => numeric_code(error, field),
+        DecimalError::ZeroQuantity => "zero_quantity",
+        DecimalError::ZeroRelativeDelta => "zero_relative_delta",
+        DecimalError::WrongType if field == "price" => "invalid_price",
+        DecimalError::WrongType => "invalid_quantity",
     }
 }
 

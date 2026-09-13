@@ -1,16 +1,13 @@
 use canonical_normalizer::CheckedValue;
 use indexer_types::{EnvelopeView, SourceCursor, Stream};
-use replay_domain::{
-    ConditionalMarketPrice, ContractOrientation, DecimalScale, InstrumentId, Level, PositiveQty,
-    Px, Qty, SegmentEvent, Side,
-};
+use replay_domain::SegmentEvent;
 use serde_json::{Map, Value};
 
 use crate::{
     Config,
     error::Reject,
-    event::{RelativeDelta, Snapshot, Trade},
-    value::{CheckedKalshiValue, CheckedObject, numeric_code},
+    event::{RelativeDelta, Snapshot, Trade, instrument},
+    value::{CheckedKalshiValue, CheckedObject},
 };
 
 type Failure = Reject;
@@ -59,44 +56,8 @@ fn snapshot(
         .checked_required("sid")?
         .checked_positive_u64()
         .map_err(|_| Reject::new("invalid_sid"))?;
-    let msg = outer
-        .checked_required("msg")?
-        .checked_object()
-        .map_err(|_| Reject::new("invalid_snapshot_msg"))?;
-    let modern = msg.contains_key("yes_dollars_fp") || msg.contains_key("no_dollars_fp");
-    let legacy = msg.contains_key("yes") || msg.contains_key("no");
-    if modern && legacy {
-        return Err(Failure::new("mixed_snapshot_schema"));
-    }
-    let instrument = instrument(msg)?;
-    if modern {
-        msg.checked_fields(&[
-            "market_ticker",
-            "market_id",
-            "yes_dollars_fp",
-            "no_dollars_fp",
-        ])?;
-    } else {
-        msg.checked_fields(&["market_ticker", "market_id", "yes", "no"])?;
-    }
-    optional_nonempty_text(msg.get("market_id"), "invalid_market_id")?;
-    let (yes, no) = if modern {
-        (
-            levels(msg.get("yes_dollars_fp"), config, false, &instrument)?,
-            levels(msg.get("no_dollars_fp"), config, false, &instrument)?,
-        )
-    } else {
-        (
-            levels(msg.get("yes"), config, true, &instrument)?,
-            levels(msg.get("no"), config, true, &instrument)?,
-        )
-    };
-    Snapshot {
-        instrument,
-        yes,
-        no,
-    }
-    .try_into()
+    let event = Snapshot::parse(outer.checked_required("msg")?, config)?;
+    Ok(MessageOutcome::Events(event.into()))
 }
 
 fn delta(
@@ -112,51 +73,8 @@ fn delta(
         .checked_required("sid")?
         .checked_positive_u64()
         .map_err(|_| Reject::new("invalid_sid"))?;
-    let msg = outer
-        .checked_required("msg")?
-        .checked_object()
-        .map_err(|_| Reject::new("invalid_delta_msg"))?;
-    msg.checked_fields(&[
-        "market_ticker",
-        "market_id",
-        "price_dollars",
-        "delta_fp",
-        "side",
-        "client_order_id",
-        "subaccount",
-        "ts",
-        "ts_ms",
-    ])?;
-    let instrument = instrument(msg)?;
-    optional_nonempty_text(msg.get("market_id"), "invalid_market_id")?;
-    optional_nonempty_text(msg.get("client_order_id"), "invalid_client_order_id")?;
-    optional_nonnegative_u64(msg.get("subaccount"), "invalid_subaccount")?;
-    optional_nonempty_text(msg.get("ts"), "invalid_source_time")?;
-    optional_positive_u64(msg.get("ts_ms"), "invalid_source_time")?;
-    let orientation = match msg
-        .checked_required("side")?
-        .checked_text()
-        .map_err(|_| Reject::new("invalid_side"))?
-    {
-        "yes" => ContractOrientation::Outcome,
-        "no" => ContractOrientation::Complement,
-        _ => return Err(Failure::for_instrument("invalid_side", instrument)),
-    };
-    let price = msg
-        .checked_required("price_dollars")?
-        .checked_price(config.price_scale)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    let change = msg
-        .checked_required("delta_fp")?
-        .checked_level_change(config.quantity_scale)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    RelativeDelta {
-        instrument,
-        orientation,
-        price,
-        change,
-    }
-    .try_into()
+    let event = RelativeDelta::parse(outer.checked_required("msg")?, config)?;
+    Ok(MessageOutcome::Events(event.into()))
 }
 
 fn trade(
@@ -174,91 +92,8 @@ fn trade(
         .checked_required("sid")?
         .checked_positive_u64()
         .map_err(|_| Reject::new("invalid_sid"))?;
-    let msg = outer
-        .checked_required("msg")?
-        .checked_object()
-        .map_err(|_| Reject::new("invalid_trade_msg"))?;
-    msg.checked_fields(&[
-        "trade_id",
-        "market_ticker",
-        "yes_price_dollars",
-        "no_price_dollars",
-        "count_fp",
-        "taker_side",
-        "taker_outcome_side",
-        "taker_book_side",
-        "is_block_trade",
-        "ts",
-        "ts_ms",
-    ])?;
-    let instrument = instrument(msg)?;
-    msg.checked_required("trade_id")?
-        .checked_nonempty_text()
-        .map_err(|_| Reject::new("invalid_trade_id"))?;
-    msg.checked_required("no_price_dollars")?
-        .checked_price(config.price_scale)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    if let Some(block) = msg.get("is_block_trade") {
-        block
-            .checked_bool()
-            .map_err(|_| Reject::new("invalid_block_trade"))?;
-    }
-    msg.checked_required("ts")?
-        .checked_positive_u64()
-        .map_err(|_| Reject::new("invalid_source_time"))?;
-    msg.checked_required("ts_ms")?
-        .checked_positive_u64()
-        .map_err(|_| Reject::new("invalid_source_time"))?;
-    let outcome = msg
-        .checked_required("taker_outcome_side")?
-        .checked_text()
-        .map_err(|_| Reject::new("invalid_trade_direction"))?;
-    let legacy = msg
-        .checked_required("taker_side")?
-        .checked_text()
-        .map_err(|_| Reject::new("invalid_trade_direction"))?;
-    let book = msg
-        .checked_required("taker_book_side")?
-        .checked_text()
-        .map_err(|_| Reject::new("invalid_trade_direction"))?;
-    let (expected_outcome, aggressor) = match book {
-        "bid" => ("yes", Side::Bid),
-        "ask" => ("no", Side::Ask),
-        _ => {
-            return Err(Failure::for_instrument(
-                "invalid_trade_direction",
-                instrument,
-            ));
-        }
-    };
-    if outcome != expected_outcome || legacy != outcome {
-        return Err(Failure::for_instrument(
-            "inconsistent_trade_direction",
-            instrument,
-        ));
-    }
-    let price = msg
-        .checked_required("yes_price_dollars")?
-        .checked_price(config.price_scale)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    let quantity = msg
-        .checked_required("count_fp")?
-        .checked_positive_quantity(config.quantity_scale)
-        .map_err(|code| {
-            let code = if code == "zero_quantity" {
-                "non_positive_trade_quantity"
-            } else {
-                code
-            };
-            Failure::for_instrument(code, instrument.clone())
-        })?;
-    Trade {
-        instrument,
-        price,
-        quantity,
-        aggressor,
-    }
-    .try_into()
+    let event = Trade::parse(outer.checked_required("msg")?, config)?;
+    Ok(MessageOutcome::Events(event.into()))
 }
 
 fn ticker(
@@ -450,85 +285,6 @@ fn error_response(
     ))
 }
 
-fn levels(
-    value: Option<&Value>,
-    config: Config,
-    legacy: bool,
-    instrument: &InstrumentId,
-) -> Result<Vec<Level>, Failure> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let rows = value
-        .as_array()
-        .ok_or_else(|| Failure::for_instrument("invalid_snapshot_levels", instrument.clone()))?;
-    rows.iter()
-        .map(|row| {
-            let pair = row
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| {
-                    Failure::for_instrument("invalid_snapshot_level", instrument.clone())
-                })?;
-            let (price, quantity) = if legacy {
-                let cents = pair[0]
-                    .checked_nonnegative_i64()
-                    .map_err(|_| Failure::for_instrument("invalid_price", instrument.clone()))?;
-                let contracts = pair[1]
-                    .checked_nonnegative_i64()
-                    .map_err(|_| Failure::for_instrument("invalid_quantity", instrument.clone()))?;
-                let cents_scale = DecimalScale::new(2).expect("constant scale");
-                let contracts_scale = DecimalScale::new(0).expect("constant scale");
-                (
-                    Px::from_atoms(cents, cents_scale)
-                        .and_then(|price| price.checked_rescale(config.price_scale))
-                        .and_then(ConditionalMarketPrice::try_from)
-                        .map_err(|error| {
-                            Failure::for_instrument(
-                                numeric_code(error, "price"),
-                                instrument.clone(),
-                            )
-                        })?,
-                    Qty::from_atoms(contracts as u64, contracts_scale)
-                        .and_then(PositiveQty::new)
-                        .and_then(|quantity| quantity.checked_rescale(config.quantity_scale))
-                        .map_err(|error| {
-                            Failure::for_instrument(
-                                numeric_code(error, "quantity"),
-                                instrument.clone(),
-                            )
-                        })?,
-                )
-            } else {
-                (
-                    pair[0]
-                        .checked_price(config.price_scale)
-                        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?,
-                    pair[1]
-                        .checked_positive_quantity(config.quantity_scale)
-                        .map_err(|code| {
-                            let code = if code == "zero_quantity" {
-                                "non_positive_snapshot_quantity"
-                            } else {
-                                code
-                            };
-                            Failure::for_instrument(code, instrument.clone())
-                        })?,
-                )
-            };
-            Ok(Level::new(price, quantity))
-        })
-        .collect()
-}
-
-fn instrument(msg: &Map<String, Value>) -> Result<InstrumentId, Failure> {
-    let ticker = msg
-        .checked_required("market_ticker")?
-        .checked_nonempty_text()
-        .map_err(|_| Failure::new("invalid_market_ticker"))?;
-    InstrumentId::new(format!("kalshi:{ticker}")).map_err(|_| Failure::new("invalid_market_ticker"))
-}
-
 fn sequence(
     outer: &Map<String, Value>,
     envelope: &EnvelopeView<'_>,
@@ -570,16 +326,6 @@ fn expect_stream(envelope: &EnvelopeView<'_>, expected: Stream) -> Result<(), Fa
     }
 }
 
-fn optional_nonempty_text(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
-    match value {
-        Some(value) => value
-            .checked_nonempty_text()
-            .map(|_| ())
-            .map_err(|_| Failure::new(code)),
-        None => Ok(()),
-    }
-}
-
 fn optional_text_array(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
     let Some(value) = value else {
         return Ok(());
@@ -591,16 +337,6 @@ fn optional_text_array(value: Option<&Value>, code: &'static str) -> Result<(), 
             .map_err(|_| Failure::new(code))?;
     }
     Ok(())
-}
-
-fn optional_nonnegative_u64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {
-    match value {
-        Some(value) => value
-            .checked_nonnegative_u64()
-            .map(|_| ())
-            .map_err(|_| Failure::new(code)),
-        None => Ok(()),
-    }
 }
 
 fn optional_positive_u64(value: Option<&Value>, code: &'static str) -> Result<(), Failure> {

@@ -7,6 +7,7 @@ mod event;
 mod message;
 mod process;
 mod value;
+mod wire;
 
 pub use adapter::Kalshi;
 pub use config::Config;

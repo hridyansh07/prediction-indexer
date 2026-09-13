@@ -8,13 +8,27 @@ The adapter returns Replay-domain events, an intentional ignore, or one stable
 `ParseReject`. It neither owns nor mutates book state.
 
 The crate is split by responsibility: `adapter` integrates Kalshi with the
-shared normalizer, `config` owns runtime variables, `message` owns Kalshi wire
-shapes and their checked conversions, `process` owns typed splice-control
-records, `value` provides Kalshi-specific exact numeric conversions, and
-`error` owns stable reject classification. Shared structural JSON conversions
-live at the generic normalizer boundary. Snapshot, relative-delta, and trade
-values become events through `TryFrom`; constructors that enforce the closed
-Replay event invariants remain in `replay-domain`.
+shared normalizer, `config` owns runtime variables, and `message` dispatches
+deliveries and checks stream/SID/sequence/batch rules. `wire` owns closed serde
+payload schemas; `event` owns all snapshot, delta, and trade validation.
+`process` owns typed splice-control records. Shared structural JSON and exact
+decimal conversions live in `canonical_normalizer::validation`; `value` and
+`error` only map those neutral failures into Kalshi's stable reject taxonomy.
+
+`Snapshot`, `RelativeDelta`, and `Trade` have private fields containing completed
+`FullBook`, `BookDelta`, and `TradeEvent` values. Their `TryFrom<(wire, Config)>`
+constructors finish every payload check, including full-book validation, before
+an instance exists. `From` into `Vec<SegmentEvent>` is infallible and preserves
+YES-before-NO child order. The materializer never sees Kalshi wire types.
+
+To preserve v3 reject precedence even for multiply-invalid inputs, typed wire
+values are converted to an in-memory JSON value for one ordered constructor
+validator. On serde shape failure, that same validator diagnoses the original
+value; serde error text is never persisted. This trades an extra per-message
+allocation for a single validation implementation, without reparsing source
+bytes. Optional fields preserve absence through that conversion and reject
+present nulls. Canonical byte-hash and reject-precedence regressions retain v3
+parser, bundle, and configuration identity unchanged.
 
 ## Identity and exactness
 

@@ -187,6 +187,26 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
             .intentionally_ignored_records,
         1
     );
+    assert_eq!(
+        first.derivative.manifest.events.logical.sha256.as_hex(),
+        "9209ae1f808002e7ca5db49494c755f6ab7418c7a20debef04c024bb1a3a5eb7"
+    );
+    assert_eq!(first.derivative.manifest.events.logical.byte_length, 2304);
+    assert_eq!(first.derivative.manifest.events.logical.line_count, 3);
+    assert_eq!(
+        first.derivative.manifest.rejects.logical.sha256.as_hex(),
+        "fbc00f6196a98769669c473d8e718c69404360a1107cd5d4361c61e5564a6ba1"
+    );
+    assert_eq!(first.derivative.manifest.rejects.logical.byte_length, 2113);
+    assert_eq!(first.derivative.manifest.rejects.logical.line_count, 2);
+    assert_eq!(
+        first.derivative.pin.derivative_address,
+        "6c430f806007a342107ec7b28400c3a6a3a3a2eb6a7655e9ee3be9b1c2900fc1"
+    );
+    assert_eq!(
+        first.derivative.pin.receipt_sha256.as_hex(),
+        "9079a57c9a87708abd5fdb776d3527e0bba40c98a945ca431667144b93908dbc"
+    );
     let independently_verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(independently_verified.pin, first.derivative.pin);
 

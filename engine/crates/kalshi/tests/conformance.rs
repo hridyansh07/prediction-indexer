@@ -77,6 +77,158 @@ fn reject_code(value: Normalization) -> String {
     }
 }
 
+fn canonical_event_hashes(payload: &str, stream: &str, seq: u64) -> Vec<String> {
+    let source = sequenced(payload, stream, seq);
+    events(normalize(&source))
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let record = segment_record(&source, index as u32, event).unwrap();
+            Sha256::digest(&record.to_canonical_json()).as_hex()
+        })
+        .collect()
+}
+
+#[test]
+fn canonical_segment_records_preserve_existing_wire_output() {
+    let modern = json!({"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"KX-EQUIV","yes_dollars_fp":[["0.5100","300.00"]],"no_dollars_fp":[["0.4800","120.00"]]}}).to_string();
+    let legacy = json!({"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"KX-EQUIV","yes":[[51,300]],"no":[[48,120]]}}).to_string();
+    assert_eq!(
+        events(normalize(&sequenced(&modern, "public_book", 1))),
+        events(normalize(&sequenced(&legacy, "public_book", 1)))
+    );
+    for (payload, stream, seq, expected) in [
+        (
+            modern.as_str(),
+            "public_book",
+            1,
+            &[
+                "4cde3fc7786c79abd172076199f3b479afd40e88f941d11350852ecd3a601a8b",
+                "52b7bb555a14f85e9b134c56545660cf57a69ff67daa7264f78891bef1a806f2",
+            ][..],
+        ),
+        (
+            legacy.as_str(),
+            "public_book",
+            1,
+            &[
+                "9c15f960d0ebe686ffe62000e5585617adb6fb96a79d925864f5f0c33bc79e64",
+                "e592ee71f2a8fff06dfcf56d513a158fbbd9a806edff1b94a12554a5a3bfb9f9",
+            ][..],
+        ),
+        (
+            DELTA.trim(),
+            "public_book",
+            3,
+            &["53a53b02519f7769b7062f269eaac5c69cfef2a25c3fba3c6f08caf0de5ffd5b"],
+        ),
+        (
+            TRADE.trim(),
+            "public_trade",
+            2,
+            &["34354144f393735d34b6b6c29b58d93f0b6002cd4ec20dd2d02a2e04af41ff0c"],
+        ),
+    ] {
+        assert_eq!(canonical_event_hashes(payload, stream, seq), expected);
+    }
+}
+
+#[test]
+fn multiply_invalid_messages_preserve_reject_precedence() {
+    let mut mixed_bad_ticker: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    mixed_bad_ticker["msg"]["yes"] = json!([[51, 1]]);
+    mixed_bad_ticker["msg"]["market_ticker"] = json!("");
+
+    let mut snapshot_bad_ticker: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    snapshot_bad_ticker["msg"]["market_ticker"] = json!("");
+    snapshot_bad_ticker["msg"]["future"] = json!(true);
+
+    let mut delta_unknown: Value = serde_json::from_str(DELTA).unwrap();
+    delta_unknown["msg"]["market_ticker"] = json!("");
+    delta_unknown["msg"]["future"] = json!(true);
+
+    let mut trade_unknown: Value = serde_json::from_str(TRADE).unwrap();
+    trade_unknown["msg"]["market_ticker"] = json!("");
+    trade_unknown["msg"]["future"] = json!(true);
+
+    let mut no_before_block: Value = serde_json::from_str(TRADE).unwrap();
+    no_before_block["msg"]["no_price_dollars"] = json!("bad");
+    no_before_block["msg"]["is_block_trade"] = json!(0);
+
+    let mut block_before_time: Value = serde_json::from_str(TRADE).unwrap();
+    block_before_time["msg"]["is_block_trade"] = json!(0);
+    block_before_time["msg"]["ts"] = json!(0);
+
+    let mut direction_before_yes: Value = serde_json::from_str(TRADE).unwrap();
+    direction_before_yes["msg"]["taker_side"] = json!("yes");
+    direction_before_yes["msg"]["yes_price_dollars"] = json!("bad");
+
+    let mut duplicate_before_bad_no: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    duplicate_before_bad_no["msg"]["yes_dollars_fp"] =
+        json!([["0.0800", "1.00"], ["0.0800", "2.00"]]);
+    duplicate_before_bad_no["msg"]["no_dollars_fp"] = json!([[]]);
+
+    let cases = [
+        (
+            mixed_bad_ticker,
+            "public_book",
+            2,
+            "mixed_snapshot_schema",
+            None,
+        ),
+        (
+            snapshot_bad_ticker,
+            "public_book",
+            2,
+            "invalid_market_ticker",
+            None,
+        ),
+        (delta_unknown, "public_book", 3, "unknown_field", None),
+        (trade_unknown, "public_trade", 2, "unknown_field", None),
+        (
+            no_before_block,
+            "public_trade",
+            2,
+            "invalid_price",
+            Some("kalshi:HIGHNY-22DEC23-B53.5"),
+        ),
+        (
+            block_before_time,
+            "public_trade",
+            2,
+            "invalid_block_trade",
+            None,
+        ),
+        (
+            direction_before_yes,
+            "public_trade",
+            2,
+            "inconsistent_trade_direction",
+            Some("kalshi:HIGHNY-22DEC23-B53.5"),
+        ),
+        (
+            duplicate_before_bad_no,
+            "public_book",
+            2,
+            "invalid_snapshot_level",
+            Some("kalshi:FED-23DEC-T3.00"),
+        ),
+    ];
+    for (payload, stream, seq, expected_code, expected_instrument) in cases {
+        let Normalization::Reject(reject) =
+            normalize(&sequenced(&payload.to_string(), stream, seq))
+        else {
+            panic!("expected reject for {expected_code}")
+        };
+        assert_eq!(reject.error_code, expected_code);
+        assert_eq!(
+            reject.instrument_hint.as_ref().map(|value| value.as_str()),
+            expected_instrument,
+            "instrument hint for {expected_code}"
+        );
+    }
+}
+
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
