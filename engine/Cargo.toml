@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/domain", "crates/normalize", "crates/materialize", "crates/kalshi"]
+members = [
+    "crates/domain",
+    "crates/normalize",
+    "crates/materialize",
+    "crates/kalshi",
+    "crates/polymarket",
+]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +24,7 @@ indexer-types = { path = "../ingester/crates/types" }
 replay-domain = { path = "crates/domain" }
 canonical-normalizer = { path = "crates/normalize" }
 replay-materialize = { path = "crates/materialize" }
+polymarket-normalizer = { path = "crates/polymarket" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

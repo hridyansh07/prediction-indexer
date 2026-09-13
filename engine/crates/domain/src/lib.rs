@@ -6,6 +6,7 @@
 //! `JoinedCanonicalRecord` into these owned values while preserving every field.
 
 mod event;
+mod hash;
 mod mutation;
 mod numeric;
 
@@ -14,6 +15,7 @@ pub use event::{
     ControlEvent, DomainError, EventAddress, EventHeader, FaultImpact, FullBook, InstrumentId,
     LaneId, Level, LevelChange, NormalizationFault, SegmentEvent, SegmentRecord, Side, TradeEvent,
 };
+pub use hash::{BookStateHash, Sha1, Sha1Error};
 pub use indexer_types::Sha256;
 pub use mutation::{
     ApplyError, MutationReceipt, PrepareError, PreparedMutation, Revision, Revisioned,
@@ -24,4 +26,4 @@ pub use numeric::{
 };
 
 /// Canonical persisted schema emitted and consumed by the Replay engine.
-pub const SEGMENT_SCHEMA_VERSION: u16 = 2;
+pub const SEGMENT_SCHEMA_VERSION: u16 = 3;
