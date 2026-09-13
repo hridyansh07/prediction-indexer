@@ -60,7 +60,13 @@ impl CheckedValue for Value {
     }
 
     fn checked_nonnegative_u64(&self) -> Result<u64, CheckedValueError> {
-        self.as_u64().ok_or(CheckedValueError::Negative)
+        match self.as_u64() {
+            Some(value) => Ok(value),
+            None if self.as_i64().is_some_and(|value| value < 0) => {
+                Err(CheckedValueError::Negative)
+            }
+            None => Err(CheckedValueError::WrongType),
+        }
     }
 
     fn checked_positive_u64(&self) -> Result<u64, CheckedValueError> {
@@ -177,6 +183,12 @@ mod checked_value_tests {
             json!(-1).checked_nonnegative_u64(),
             Err(CheckedValueError::Negative)
         );
+        for wrong_type in [json!("1"), json!(true), json!(null), json!(1.5)] {
+            assert_eq!(
+                wrong_type.checked_nonnegative_u64(),
+                Err(CheckedValueError::WrongType)
+            );
+        }
         assert_eq!(
             json!(0).checked_positive_u64(),
             Err(CheckedValueError::Zero)

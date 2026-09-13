@@ -2,13 +2,37 @@ use serde::{Deserialize, Serialize};
 
 use super::{DomainError, InstrumentId, LaneId, validate_text};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum FaultImpact {
     Instrument(InstrumentId),
     RequestedVenueBooks(String),
     AuditCoverageOnly(String),
     UnattributedLane(LaneId),
+}
+
+impl<'de> Deserialize<'de> for FaultImpact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+        enum Wire {
+            Instrument(InstrumentId),
+            RequestedVenueBooks(String),
+            AuditCoverageOnly(String),
+            UnattributedLane(LaneId),
+        }
+        let impact = match Wire::deserialize(deserializer)? {
+            Wire::Instrument(value) => Self::Instrument(value),
+            Wire::RequestedVenueBooks(value) => Self::RequestedVenueBooks(value),
+            Wire::AuditCoverageOnly(value) => Self::AuditCoverageOnly(value),
+            Wire::UnattributedLane(value) => Self::UnattributedLane(value),
+        };
+        impact.validate().map_err(serde::de::Error::custom)?;
+        Ok(impact)
+    }
 }
 
 impl FaultImpact {
@@ -22,11 +46,27 @@ impl FaultImpact {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizationFault {
     reject_id: String,
     impact: FaultImpact,
+}
+
+impl<'de> Deserialize<'de> for NormalizationFault {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            reject_id: String,
+            impact: FaultImpact,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.reject_id, wire.impact).map_err(serde::de::Error::custom)
+    }
 }
 
 impl NormalizationFault {

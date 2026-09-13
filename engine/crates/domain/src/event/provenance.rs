@@ -20,13 +20,37 @@ pub enum ContinuityVerdict {
 
 /// Replay-owned downstream provenance. `canonical-normalizer` converts from the
 /// audited Phase 0 record; no finalizer receipt type is copied.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalProvenance {
     source_segment_sha256: Sha256,
     source_line_number: u64,
     content_hash: Sha256,
     continuity: ContinuityVerdict,
+}
+
+impl<'de> Deserialize<'de> for CanonicalProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            source_segment_sha256: Sha256,
+            source_line_number: u64,
+            content_hash: Sha256,
+            continuity: ContinuityVerdict,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.source_segment_sha256,
+            wire.source_line_number,
+            wire.content_hash,
+            wire.continuity,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl CanonicalProvenance {
@@ -72,13 +96,37 @@ impl CanonicalProvenance {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventAddress {
     canonical_seq: i64,
     lane: LaneId,
     delivery_index: u64,
     event_index: u32,
+}
+
+impl<'de> Deserialize<'de> for EventAddress {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            canonical_seq: i64,
+            lane: LaneId,
+            delivery_index: u64,
+            event_index: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.canonical_seq,
+            wire.lane,
+            wire.delivery_index,
+            wire.event_index,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl EventAddress {
@@ -133,7 +181,7 @@ impl EventAddress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventHeader {
     order_ns: u64,
@@ -142,6 +190,34 @@ pub struct EventHeader {
     address: EventAddress,
     record_id: String,
     provenance: CanonicalProvenance,
+}
+
+impl<'de> Deserialize<'de> for EventHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            order_ns: u64,
+            visible_ns: u64,
+            visible_tie_group: Option<u64>,
+            address: EventAddress,
+            record_id: String,
+            provenance: CanonicalProvenance,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.order_ns,
+            wire.visible_ns,
+            wire.visible_tie_group,
+            wire.address,
+            wire.record_id,
+            wire.provenance,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl EventHeader {
@@ -192,7 +268,7 @@ impl EventHeader {
         &self.provenance
     }
 
-    pub(super) fn validate(&self) -> Result<(), DomainError> {
+    pub fn validate(&self) -> Result<(), DomainError> {
         if self.order_ns != self.visible_ns {
             return Err(DomainError::OrderClockMismatch);
         }

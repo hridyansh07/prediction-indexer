@@ -41,7 +41,7 @@ impl Level {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FullBook {
     instrument: InstrumentId,
@@ -50,6 +50,35 @@ pub struct FullBook {
     asks: Vec<Level>,
     snapshot_hash: Option<BookStateHash>,
     source_observed_ns: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for FullBook {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            instrument: InstrumentId,
+            orientation: ContractOrientation,
+            bids: Vec<Level>,
+            asks: Vec<Level>,
+            snapshot_hash: Option<BookStateHash>,
+            source_observed_ns: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let book = Self {
+            instrument: wire.instrument,
+            orientation: wire.orientation,
+            bids: wire.bids,
+            asks: wire.asks,
+            snapshot_hash: wire.snapshot_hash,
+            source_observed_ns: wire.source_observed_ns,
+        };
+        book.validate().map_err(serde::de::Error::custom)?;
+        Ok(book)
+    }
 }
 
 impl FullBook {
@@ -196,7 +225,7 @@ impl BookEvent {
 }
 
 /// Independently observed full-book evidence. It is not a current-state reset.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditAnchor {
     instrument: InstrumentId,
@@ -205,6 +234,35 @@ pub struct AuditAnchor {
     asks: Vec<Level>,
     snapshot_hash: BookStateHash,
     source_observed_ns: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for AuditAnchor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            instrument: InstrumentId,
+            orientation: ContractOrientation,
+            bids: Vec<Level>,
+            asks: Vec<Level>,
+            snapshot_hash: BookStateHash,
+            source_observed_ns: Option<u64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let anchor = Self {
+            instrument: wire.instrument,
+            orientation: wire.orientation,
+            bids: wire.bids,
+            asks: wire.asks,
+            snapshot_hash: wire.snapshot_hash,
+            source_observed_ns: wire.source_observed_ns,
+        };
+        anchor.validate().map_err(serde::de::Error::custom)?;
+        Ok(anchor)
+    }
 }
 
 impl AuditAnchor {

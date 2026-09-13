@@ -340,12 +340,9 @@ impl RejectRecord {
         if !wire.canonical_envelope.ends_with('\n') {
             return Err("canonical reject envelope must end in LF".to_owned());
         }
-        if wire.header.order_ns() != wire.header.visible_ns()
-            || wire.header.address().canonical_seq() <= 0
-            || wire.header.provenance().source_line_number() == 0
-        {
-            return Err("reject header contains an invalid normalized state".to_owned());
-        }
+        wire.header
+            .validate()
+            .map_err(|_| "reject header contains an invalid normalized state".to_owned())?;
         match &wire.disposition {
             RejectDisposition::ParseReject {
                 reject_id,

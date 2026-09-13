@@ -21,8 +21,8 @@ pub use mutation::{
     ApplyError, MutationReceipt, PrepareError, PreparedMutation, Revision, Revisioned,
 };
 pub use numeric::{
-    ConditionalMarketPrice, DecimalScale, MAX_QUANTITY_ATOMS, Magnitude, NumericError, PositiveQty,
-    PriceUnit, Px, Qty, QuantityUnit,
+    ConditionalMarketPrice, DecimalScale, MAX_DECIMAL_SCALE, MAX_QUANTITY_ATOMS, Magnitude,
+    NumericError, PositiveQty, PriceUnit, Px, Qty, QuantityUnit,
 };
 
 /// Canonical persisted schema emitted and consumed by the Replay engine.

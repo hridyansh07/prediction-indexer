@@ -416,6 +416,44 @@ fn streams_zero_many_and_rejects_then_commits_a_verified_derivative() {
 }
 
 #[test]
+fn verifier_rejects_rehashed_inflated_input_and_accepted_source_counts() {
+    let canonical = TempDir::new("canonical").unwrap();
+    let output = TempDir::new("normalized").unwrap();
+    canonical_fixture(canonical.path());
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+
+    let manifest_path = built.derivative.directory.join("manifest.json");
+    let mut manifest = built.derivative.manifest.clone();
+    manifest.counts.input_records += 1;
+    manifest.counts.accepted_source_records += 1;
+    let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    manifest_bytes.push(b'\n');
+    fs::write(&manifest_path, &manifest_bytes).unwrap();
+
+    let receipt_path = built.derivative.directory.join("receipt.json");
+    let mut receipt = built.derivative.receipt.clone();
+    receipt.manifest.byte_length = manifest_bytes.len() as u64;
+    receipt.manifest.sha256 = Sha256::digest(&manifest_bytes);
+    let mut receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+    receipt_bytes.push(b'\n');
+    fs::write(receipt_path, receipt_bytes).unwrap();
+
+    let error = verify_derivative(&built.derivative.directory).unwrap_err();
+    assert_eq!(
+        error,
+        "verified derivative lines disagree with manifest counts"
+    );
+}
+
+#[test]
 fn identical_retry_is_noop_and_divergent_same_address_conflicts() {
     let canonical = TempDir::new("canonical").unwrap();
     let output = TempDir::new("normalized").unwrap();
@@ -724,6 +762,18 @@ fn strict_reader_rejects_unknown_versions_fields_and_corrupt_frames() {
     )
     .unwrap();
     let reject_json = first_reject_json(&built.derivative);
+    let valid_reject = String::from_utf8(reject_json.clone()).unwrap();
+    assert!(RejectRecord::from_canonical_json(valid_reject.as_bytes()).is_ok());
+    for invalid_id in ["", "bad\\nrecord"] {
+        let invalid_reject = valid_reject.replacen(
+            "\"record_id\":\"record-2\"",
+            &format!("\"record_id\":\"{invalid_id}\""),
+            1,
+        );
+        assert_ne!(invalid_reject, valid_reject);
+        assert!(serde_json::from_str::<RejectRecord>(&invalid_reject).is_err());
+        assert!(RejectRecord::from_canonical_json(invalid_reject.as_bytes()).is_err());
+    }
     let mut reject: Value = serde_json::from_slice(&reject_json).unwrap();
     reject["unknown"] = json!(true);
     assert!(

@@ -40,8 +40,8 @@ pub struct SegmentRecord {
 #[serde(deny_unknown_fields)]
 struct SegmentRecordWire {
     schema_version: u16,
-    header: EventHeader,
-    event: SegmentEvent,
+    header: Box<serde_json::value::RawValue>,
+    event: Box<serde_json::value::RawValue>,
 }
 
 impl SegmentRecord {
@@ -89,12 +89,16 @@ impl SegmentRecord {
         if wire.schema_version != SEGMENT_SCHEMA_VERSION {
             return Err(DomainError::UnsupportedSchemaVersion(wire.schema_version));
         }
-        wire.header.validate()?;
-        wire.event.validate()?;
+        let header: EventHeader = serde_json::from_str(wire.header.get())
+            .map_err(|error| DomainError::Json(error.to_string()))?;
+        let event: SegmentEvent = serde_json::from_str(wire.event.get())
+            .map_err(|error| DomainError::Json(error.to_string()))?;
+        header.validate()?;
+        event.validate()?;
         Ok(Self {
             schema_version: wire.schema_version,
-            header: wire.header,
-            event: wire.event,
+            header,
+            event,
         })
     }
 }

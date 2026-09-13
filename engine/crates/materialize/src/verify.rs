@@ -19,6 +19,8 @@ use super::{
 
 #[derive(Default)]
 struct VerificationCounts {
+    input_records: u64,
+    accepted_source_records: u64,
     event_lines: u64,
     faults: u64,
     reject_lines: u64,
@@ -125,8 +127,11 @@ fn verify_contents(
         return Err("derivative address does not match its domain-separated inputs".to_owned());
     }
 
-    let counts = verify_event_reject_pairing(directory, &manifest)?;
-    if counts.event_lines != manifest.events.logical.line_count
+    let mut counts = verify_event_reject_pairing(directory, &manifest)?;
+    verify_source_dispositions(directory, &manifest, &mut counts)?;
+    if counts.input_records != manifest.counts.input_records
+        || counts.accepted_source_records != manifest.counts.accepted_source_records
+        || counts.event_lines != manifest.events.logical.line_count
         || counts.reject_lines != manifest.rejects.logical.line_count
         || counts.faults != manifest.counts.normalization_fault_events
         || counts.parse_rejects != manifest.counts.rejected_source_records
@@ -180,6 +185,78 @@ fn verify_event_reject_pairing(
     events.finish()?;
     rejects.finish()?;
     Ok(counts)
+}
+
+fn verify_source_dispositions(
+    directory: &Path,
+    manifest: &DerivativeManifest,
+    counts: &mut VerificationCounts,
+) -> Result<(), String> {
+    let mut events =
+        VerifiedLines::open(&directory.join(DERIVATIVE_EVENTS_FILE), &manifest.events)?;
+    let mut rejects =
+        VerifiedLines::open(&directory.join(DERIVATIVE_REJECTS_FILE), &manifest.rejects)?;
+    let mut previous_event_seq = None;
+    let mut accepted = next_accepted_source(&mut events, &mut previous_event_seq)?;
+    let mut rejected = next_reject_source(&mut rejects)?;
+
+    while accepted.is_some() || rejected.is_some() {
+        match (accepted, rejected) {
+            (Some(left), Some(right)) if left == right => {
+                return Err("source has more than one normalization disposition".to_owned());
+            }
+            (Some(left), Some(right)) if left < right => {
+                counts.accepted_source_records += 1;
+                counts.input_records += 1;
+                accepted = next_accepted_source(&mut events, &mut previous_event_seq)?;
+            }
+            (Some(_), Some(_)) => {
+                counts.input_records += 1;
+                rejected = next_reject_source(&mut rejects)?;
+            }
+            (Some(_), None) => {
+                counts.accepted_source_records += 1;
+                counts.input_records += 1;
+                accepted = next_accepted_source(&mut events, &mut previous_event_seq)?;
+            }
+            (None, Some(_)) => {
+                counts.input_records += 1;
+                rejected = next_reject_source(&mut rejects)?;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    events.finish()?;
+    rejects.finish()?;
+    Ok(())
+}
+
+fn next_accepted_source(
+    lines: &mut VerifiedLines,
+    previous_seq: &mut Option<i64>,
+) -> Result<Option<i64>, String> {
+    while let Some(line) = lines.next_line()? {
+        let record = SegmentRecord::from_canonical_json(line)
+            .map_err(|error| format!("invalid normalized event: {error}"))?;
+        let seq = record.header().address().canonical_seq();
+        if !matches!(record.event(), SegmentEvent::NormalizationFault(_))
+            && *previous_seq != Some(seq)
+        {
+            *previous_seq = Some(seq);
+            return Ok(Some(seq));
+        }
+    }
+    Ok(None)
+}
+
+fn next_reject_source(lines: &mut VerifiedLines) -> Result<Option<i64>, String> {
+    lines
+        .next_line()?
+        .map(|line| {
+            RejectRecord::from_canonical_json(line)
+                .map(|record| record.header().address().canonical_seq())
+        })
+        .transpose()
 }
 
 fn next_fault(

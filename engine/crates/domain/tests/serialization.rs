@@ -1,8 +1,8 @@
 use replay_domain::{
-    BookDelta, BookEvent, BookStateHash, CanonicalProvenance, ConditionalMarketPrice,
+    AuditAnchor, BookDelta, BookEvent, BookStateHash, CanonicalProvenance, ConditionalMarketPrice,
     ContinuityVerdict, ContractOrientation, DecimalScale, DomainError, EventAddress, EventHeader,
-    FullBook, InstrumentId, LaneId, Level, LevelChange, PositiveQty, Qty, SegmentEvent,
-    SegmentRecord, Sha1, Side,
+    FaultImpact, FullBook, InstrumentId, LaneId, Level, LevelChange, NormalizationFault,
+    PositiveQty, Qty, SegmentEvent, SegmentRecord, Sha1, Side,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -171,6 +171,107 @@ fn malformed_financial_states_are_rejected_on_decode() {
     let excessive_quantity =
         canonical.replacen("\"atoms\":250", "\"atoms\":9223372036854775808", 1);
     assert!(SegmentRecord::from_canonical_json(excessive_quantity.as_bytes()).is_err());
+}
+
+#[test]
+fn invariant_bearing_composites_validate_when_deserialized_directly() {
+    let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    let header = &value["header"];
+    let address = &header["address"];
+    let provenance = &header["provenance"];
+
+    let mut invalid_address = address.clone();
+    invalid_address["canonical_seq"] = 0.into();
+    assert!(serde_json::from_value::<EventAddress>(invalid_address).is_err());
+
+    let mut invalid_provenance = provenance.clone();
+    invalid_provenance["source_line_number"] = 0.into();
+    assert!(serde_json::from_value::<CanonicalProvenance>(invalid_provenance).is_err());
+
+    let mut invalid_header = header.clone();
+    invalid_header["visible_ns"] = 1.into();
+    assert!(serde_json::from_value::<EventHeader>(invalid_header).is_err());
+
+    let px = |atoms| ConditionalMarketPrice::from_atoms(atoms, scale(2)).unwrap();
+    let qty = |atoms| PositiveQty::new(Qty::from_atoms(atoms, scale(0)).unwrap()).unwrap();
+    let full = FullBook::new(
+        InstrumentId::new("venue:asset").unwrap(),
+        ContractOrientation::Outcome,
+        vec![Level::new(px(50), qty(1)), Level::new(px(40), qty(1))],
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    let invalid_full =
+        serde_json::to_string(&full)
+            .unwrap()
+            .replacen("\"atoms\":50", "\"atoms\":40", 1);
+    assert!(serde_json::from_str::<FullBook>(&invalid_full).is_err());
+    let mut unsorted_full = serde_json::to_value(&full).unwrap();
+    unsorted_full["bids"].as_array_mut().unwrap().reverse();
+    assert!(serde_json::from_value::<FullBook>(unsorted_full).is_err());
+    let mut mixed_scale_full = serde_json::to_value(&full).unwrap();
+    mixed_scale_full["bids"][1]["price"]["scale"] = 3.into();
+    assert!(serde_json::from_value::<FullBook>(mixed_scale_full).is_err());
+
+    let anchor = AuditAnchor::new(
+        InstrumentId::new("venue:asset").unwrap(),
+        ContractOrientation::Outcome,
+        vec![Level::new(px(50), qty(1)), Level::new(px(40), qty(1))],
+        vec![],
+        BookStateHash::Sha1(Sha1::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap()),
+        None,
+    )
+    .unwrap();
+    let invalid_anchor =
+        serde_json::to_string(&anchor)
+            .unwrap()
+            .replacen("\"atoms\":50", "\"atoms\":40", 1);
+    assert!(serde_json::from_str::<AuditAnchor>(&invalid_anchor).is_err());
+
+    assert!(
+        serde_json::from_str::<FaultImpact>(r#"{"kind":"requested_venue_books","value":""}"#)
+            .is_err()
+    );
+    assert!(
+        serde_json::from_str::<NormalizationFault>(
+            r#"{"reject_id":"","impact":{"kind":"unattributed_lane","value":"lane-a"}}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unsupported_segment_version_precedes_nested_invariant_failure() {
+    let invalid = String::from_utf8(record().to_canonical_json())
+        .unwrap()
+        .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
+        .replacen("\"canonical_seq\":42", "\"canonical_seq\":0", 1);
+    assert_eq!(
+        SegmentRecord::from_canonical_json(invalid.as_bytes()),
+        Err(DomainError::UnsupportedSchemaVersion(4))
+    );
+}
+
+#[test]
+fn direct_record_decode_preserves_duplicate_field_rejection() {
+    let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SegmentRecord>(&canonical).unwrap(),
+        record()
+    );
+    assert_eq!(
+        serde_json::from_value::<SegmentRecord>(serde_json::to_value(record()).unwrap()).unwrap(),
+        record()
+    );
+    let duplicate = canonical.replacen(
+        "\"canonical_seq\":42",
+        "\"canonical_seq\":42,\"canonical_seq\":42",
+        1,
+    );
+    assert!(serde_json::from_str::<SegmentRecord>(&duplicate).is_err());
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use replay_domain::{
-    ConditionalMarketPrice, DecimalScale, Magnitude, NumericError, PositiveQty, PriceUnit, Px, Qty,
-    QuantityUnit,
+    ConditionalMarketPrice, DecimalScale, MAX_DECIMAL_SCALE, Magnitude, NumericError, PositiveQty,
+    PriceUnit, Px, Qty, QuantityUnit,
 };
 
 fn scale(value: u8) -> DecimalScale {
@@ -39,6 +39,12 @@ fn decimal_grammar_is_closed() {
         Px::parse("-0.1", scale(2)),
         Err(NumericError::NegativePrice)
     );
+}
+
+#[test]
+fn exported_scale_limit_matches_constructor_boundary() {
+    assert!(DecimalScale::new(MAX_DECIMAL_SCALE).is_ok());
+    assert!(DecimalScale::new(MAX_DECIMAL_SCALE + 1).is_err());
 }
 
 #[test]

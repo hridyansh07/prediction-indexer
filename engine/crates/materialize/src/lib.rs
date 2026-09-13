@@ -255,10 +255,14 @@ where
                 reject
                     .validate()
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                let reject_id =
-                    reject_id(&address, &source, reject.parser_version, &reject.error_code);
                 let header = event_header(&source, 0)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
+                let reject_id = reject_id_from_header(
+                    &address,
+                    &header,
+                    reject.parser_version,
+                    &reject.error_code,
+                );
                 // A reject produces both a sidecar record and a domain fault.
                 // Duplicate their small typed header, then consume the sole raw
                 // envelope allocation into the sidecar.
@@ -446,16 +450,6 @@ fn derivative_address(source: &SourceReceipt, spec: &DerivativeSpec) -> Result<S
     digest.update(schema::REJECT_SERIALIZATION_VERSION.to_be_bytes());
     digest.update(schema::MATERIALIZER_VERSION.to_be_bytes());
     Ok(format!("{:x}", digest.finalize()))
-}
-
-fn reject_id(
-    address: &str,
-    source: &indexer_finalize::JoinedCanonicalRecord,
-    parser_version: u32,
-    error_code: &str,
-) -> String {
-    let header = event_header(source, 0).expect("Phase 0 source was validated before reject id");
-    reject_id_from_header(address, &header, parser_version, error_code)
 }
 
 fn reject_id_from_header(
