@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/domain", "crates/normalize", "crates/materialize", "crates/kalshi"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+fs2 = "0.4"
+prediction-encoder = { path = "../encoder/rust" }
+indexer-finalize = { path = "../ingester/crates/finalize" }
+indexer-types = { path = "../ingester/crates/types" }
+replay-domain = { path = "crates/domain" }
+canonical-normalizer = { path = "crates/normalize" }
+replay-materialize = { path = "crates/materialize" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"

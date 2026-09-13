@@ -20,7 +20,7 @@ pub mod sink;
 
 pub use envelope::EnvelopeView;
 pub use error::{DecodeError, EnvelopeError};
-pub use hash::{ContentHash, Digest32, EvidenceHash, FactHash, StreamHasher};
+pub use hash::{ContentHash, Digest32, EvidenceHash, FactHash, Sha256, Sha256Error, StreamHasher};
 pub use identity::{EpochId, LogicalTime, RecordId, RecordKind, SourceCursor, Stream, Venue};
 pub use receipt::{Committed, Positioned};
 pub use sequence::{CanonicalSeq, EvidenceSeq, FactSeq};
