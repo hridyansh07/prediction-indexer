@@ -13,6 +13,57 @@ const TRADE: &str = include_str!("fixtures/last_trade_price.json");
 const REST_BOOK: &str = include_str!("fixtures/rest_book.json");
 const TICK_SIZE: &str = include_str!("fixtures/tick_size_change.json");
 
+#[test]
+fn frozen_branch_behavior_corpus() {
+    // Frozen against the original branch before refactoring. Include both
+    // single and paired shape failures, optional omission, strict/additive
+    // policy, nested children, and exact canonical records (not Debug events).
+    let mut transcript = Vec::new();
+    for fixture in [BOOK, PRICE_CHANGE, TRADE, REST_BOOK, TICK_SIZE] {
+        let original: Value = serde_json::from_str(fixture).unwrap();
+        let fields: Vec<_> = original.as_object().unwrap().keys().cloned().collect();
+        let mut cases = vec![original.clone()];
+        for field in &fields {
+            for replacement in [None, Some(Value::Null), Some(json!(false)), Some(json!(-1)),
+                Some(json!(0)), Some(json!(1.5)), Some(json!("")), Some(json!("bad")),
+                Some(json!([])), Some(json!({}))] {
+                let mut value = original.clone();
+                match &replacement {
+                    Some(replacement) => value[field] = replacement.clone(),
+                    None => { value.as_object_mut().unwrap().remove(field); }
+                }
+                cases.push(value.clone());
+                for second in &fields {
+                    if second != field {
+                        let mut paired = value.clone();
+                        paired[second] = Value::Null;
+                        cases.push(paired);
+                    }
+                }
+            }
+        }
+        for value in cases {
+            for additive in [true, false] {
+                let payload = value.to_string();
+                let input = if fixture == REST_BOOK {
+                    source(&payload, "public_snapshot", json!({"type":"snapshot", "source_time_ms": original["timestamp"].as_str().unwrap().parse::<u64>().unwrap()}), "venue_frame")
+                } else { ws(&payload) };
+                let result = normalize_with(Config { accept_additive_fields: additive, ..Config::default() }, &input);
+                match result {
+                    Normalization::Events(events) => {
+                        for (index, event) in events.into_iter().enumerate() {
+                            transcript.extend(segment_record(&input, index as u32, event).unwrap().to_canonical_json());
+                        }
+                    }
+                    other => transcript.extend(format!("{other:?}").bytes()),
+                }
+                transcript.push(b'\n');
+            }
+        }
+    }
+    assert_eq!(Sha256::digest(&transcript).as_hex(), "d3676175e3606e7f3d3808c7673a1325fa515fb89aedfcfd57c2313aae421c99");
+}
+
 fn source(payload: &str, stream: &str, cursor: Value, kind: &str) -> JoinedCanonicalRecord {
     let envelope = format!(
         "{}\n",
