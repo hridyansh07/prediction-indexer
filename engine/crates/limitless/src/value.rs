@@ -1,53 +1,37 @@
+use canonical_normalizer::{CheckedDecimal, DecimalError};
 use replay_domain::{ConditionalMarketPrice, DecimalScale, NumericError, PositiveQty, Qty};
 use serde_json::{Map, Number, Value};
 
 use crate::error::Reject;
 
-pub(crate) trait CheckedValue {
+pub(crate) use canonical_normalizer::CheckedObject;
+
+// Only Limitless's stable error mapping belongs here, not JSON validation.
+pub(crate) trait CheckedLimitlessValue {
     fn checked_object(&self, code: &'static str) -> Result<&Map<String, Value>, Reject>;
     fn checked_nonempty_text(&self, code: &'static str) -> Result<&str, Reject>;
     fn checked_u64(&self, code: &'static str) -> Result<u64, Reject>;
     fn checked_price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str>;
 }
 
-impl CheckedValue for Value {
+impl CheckedLimitlessValue for Value {
     fn checked_object(&self, code: &'static str) -> Result<&Map<String, Value>, Reject> {
-        self.as_object().ok_or_else(|| Reject::new(code))
+        canonical_normalizer::CheckedValue::checked_object(self).map_err(|_| Reject::new(code))
     }
 
     fn checked_nonempty_text(&self, code: &'static str) -> Result<&str, Reject> {
-        self.as_str()
-            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
-            .ok_or_else(|| Reject::new(code))
+        canonical_normalizer::CheckedValue::checked_nonempty_text(self)
+            .map_err(|_| Reject::new(code))
     }
 
     fn checked_u64(&self, code: &'static str) -> Result<u64, Reject> {
-        self.as_u64().ok_or_else(|| Reject::new(code))
+        canonical_normalizer::CheckedValue::checked_nonnegative_u64(self)
+            .map_err(|_| Reject::new(code))
     }
 
     fn checked_price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str> {
         let number = self.as_number().ok_or("invalid_price")?;
         parse_price_number(number, scale)
-    }
-}
-
-pub(crate) trait CheckedObject {
-    fn checked_fields(&self, allowed: &[&str]) -> Result<(), Reject>;
-    fn checked_required(&self, field: &str) -> Result<&Value, Reject>;
-}
-
-impl CheckedObject for Map<String, Value> {
-    fn checked_fields(&self, allowed: &[&str]) -> Result<(), Reject> {
-        if self.keys().any(|key| !allowed.contains(&key.as_str())) {
-            Err(Reject::new("unknown_field"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn checked_required(&self, field: &str) -> Result<&Value, Reject> {
-        self.get(field)
-            .ok_or_else(|| Reject::new("missing_required_field"))
     }
 }
 
@@ -65,17 +49,19 @@ pub(crate) fn quantity_from_raw_atoms(
 
 pub(crate) fn validate_derived_price(value: &Value) -> Result<(), &'static str> {
     let scale = DecimalScale::new(18).expect("constant scale");
-    value.checked_price(scale).map(|_| ())
+    CheckedLimitlessValue::checked_price(value, scale).map(|_| ())
 }
 
 pub(crate) fn validate_decimal_text_price(
     value: &Value,
     scale: DecimalScale,
 ) -> Result<(), &'static str> {
-    let text = value.as_str().ok_or("invalid_price")?;
-    ConditionalMarketPrice::parse(text, scale)
+    CheckedDecimal::checked_price(value, scale)
         .map(|_| ())
-        .map_err(|error| numeric_code(error, "price"))
+        .map_err(|error| match error {
+            DecimalError::Numeric(error) => numeric_code(error, "price"),
+            _ => "invalid_price",
+        })
 }
 
 fn parse_price_number(

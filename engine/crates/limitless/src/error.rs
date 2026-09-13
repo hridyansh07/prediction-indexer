@@ -1,5 +1,14 @@
 use replay_domain::InstrumentId;
 
+impl From<canonical_normalizer::ObjectError> for Reject {
+    fn from(error: canonical_normalizer::ObjectError) -> Self {
+        Self::new(match error {
+            canonical_normalizer::ObjectError::UnknownField => "unknown_field",
+            canonical_normalizer::ObjectError::MissingRequiredField => "missing_required_field",
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Reject {
     pub(crate) code: &'static str,

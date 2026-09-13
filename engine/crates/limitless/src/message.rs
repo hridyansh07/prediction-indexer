@@ -6,13 +6,14 @@ use replay_domain::{
     BookEvent, ConditionalMarketPrice, ContractOrientation, ControlEvent, DecimalScale, FullBook,
     InstrumentId, Level, SegmentEvent,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
     Config,
     error::Reject,
     value::{
-        CheckedObject, CheckedValue, quantity_from_raw_atoms, validate_decimal_text_price,
+        CheckedLimitlessValue, CheckedObject, quantity_from_raw_atoms, validate_decimal_text_price,
         validate_derived_price,
     },
 };
@@ -60,15 +61,7 @@ fn orderbook_update(
     value: &Value,
     config: Config,
 ) -> Result<MessageOutcome, Failure> {
-    let data = value.checked_object("invalid_orderbook_update")?;
-    data.checked_fields(&["marketSlug", "orderbook", "version", "timestamp"])?;
-    let instrument = instrument(
-        data.checked_required("marketSlug")?
-            .checked_nonempty_text("invalid_market_slug")?,
-    )?;
-    let version = data
-        .checked_required("version")?
-        .checked_u64("invalid_version")?;
+    let (instrument, version) = book_identity(value)?;
     match envelope.source_cursor {
         Some(SourceCursor::SnapshotId { last_update_id }) if last_update_id == version => {}
         _ => {
@@ -78,68 +71,171 @@ fn orderbook_update(
             ));
         }
     }
-    let source_observed_ns = source_time_ns(data.checked_required("timestamp")?)
-        .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
-    let book = data
-        .checked_required("orderbook")?
-        .checked_object("invalid_orderbook")?;
-    let rich = book.keys().any(|field| {
-        matches!(
-            field.as_str(),
-            "adjustedMidpoint" | "maxSpread" | "midpoint" | "minSize" | "tokenId"
-        )
-    });
-    if rich {
-        book.checked_fields(&[
-            "adjustedMidpoint",
-            "asks",
-            "bids",
-            "maxSpread",
-            "midpoint",
-            "minSize",
-            "tokenId",
-        ])?;
-        for field in ["adjustedMidpoint", "midpoint", "maxSpread"] {
-            validate_derived_price(book.checked_required(field)?)
-                .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
+    Ok(MessageOutcome::Events(vec![
+        Snapshot::parse(value, config)?.into(),
+    ]))
+}
+
+fn book_identity(value: &Value) -> Result<(InstrumentId, u64), Failure> {
+    let data = value.checked_object("invalid_orderbook_update")?;
+    data.checked_fields(&["marketSlug", "orderbook", "version", "timestamp"])?;
+    let instrument = instrument(
+        data.checked_required("marketSlug")?
+            .checked_nonempty_text("invalid_market_slug")?,
+    )?;
+    let version = data
+        .checked_required("version")?
+        .checked_u64("invalid_version")?;
+    Ok((instrument, version))
+}
+
+// The wire is private and closed; decimals retain their original number lexemes.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SnapshotWire {
+    market_slug: String,
+    orderbook: BookWire,
+    version: u64,
+    timestamp: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum BookWire {
+    Rich(RichBookWire),
+    Compact(CompactBookWire),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RichBookWire {
+    adjusted_midpoint: serde_json::Number,
+    midpoint: serde_json::Number,
+    max_spread: serde_json::Number,
+    min_size: u64,
+    token_id: String,
+    bids: Vec<RichLevelWire>,
+    asks: Vec<RichLevelWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompactBookWire {
+    bids: Vec<CompactLevelWire>,
+    asks: Vec<CompactLevelWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RichLevelWire {
+    price: serde_json::Number,
+    size: u64,
+    side: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompactLevelWire {
+    price: serde_json::Number,
+    size: u64,
+}
+
+struct Snapshot {
+    book: FullBook,
+}
+
+impl Snapshot {
+    fn parse(value: &Value, config: Config) -> Result<Self, Failure> {
+        match SnapshotWire::deserialize(value) {
+            Ok(wire) => Self::try_from((wire, config)),
+            // Serde diagnostics are not the public taxonomy. Preserve the
+            // established validation order even for multiply malformed inputs.
+            Err(_) => match Self::validate(value, config) {
+                Err(reject) => Err(reject),
+                Ok(_) => panic!("Limitless snapshot wire schema and validator disagree"),
+            },
         }
-        book.checked_required("minSize")?
-            .checked_u64("invalid_min_size")?;
-        let token = book
-            .checked_required("tokenId")?
-            .checked_nonempty_text("invalid_token_id")?;
-        if !token.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(Failure::for_instrument("invalid_token_id", instrument));
-        }
-    } else {
-        book.checked_fields(&["asks", "bids"])?;
     }
-    let bids = levels(
-        book.checked_required("bids")?,
-        true,
-        rich,
-        config,
-        &instrument,
-    )?;
-    let asks = levels(
-        book.checked_required("asks")?,
-        false,
-        rich,
-        config,
-        &instrument,
-    )?;
-    let full = FullBook::new(
-        instrument.clone(),
-        ContractOrientation::Outcome,
-        bids,
-        asks,
-        None,
-        Some(source_observed_ns),
-    )
-    .map_err(|_| Failure::for_instrument("invalid_orderbook_levels", instrument))?;
-    Ok(MessageOutcome::Events(vec![SegmentEvent::Book(
-        BookEvent::Full(full),
-    )]))
+
+    fn validate(value: &Value, config: Config) -> Result<Self, Failure> {
+        let (instrument, _) = book_identity(value)?;
+        let data = value.checked_object("invalid_orderbook_update")?;
+        let source_observed_ns = source_time_ns(data.checked_required("timestamp")?)
+            .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
+        let book = data
+            .checked_required("orderbook")?
+            .checked_object("invalid_orderbook")?;
+        let rich = book.keys().any(|field| {
+            matches!(
+                field.as_str(),
+                "adjustedMidpoint" | "maxSpread" | "midpoint" | "minSize" | "tokenId"
+            )
+        });
+        if rich {
+            book.checked_fields(&[
+                "adjustedMidpoint",
+                "asks",
+                "bids",
+                "maxSpread",
+                "midpoint",
+                "minSize",
+                "tokenId",
+            ])?;
+            for field in ["adjustedMidpoint", "midpoint", "maxSpread"] {
+                validate_derived_price(book.checked_required(field)?)
+                    .map_err(|code| Failure::for_instrument(code, instrument.clone()))?;
+            }
+            book.checked_required("minSize")?
+                .checked_u64("invalid_min_size")?;
+            let token = book
+                .checked_required("tokenId")?
+                .checked_nonempty_text("invalid_token_id")?;
+            if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(Failure::for_instrument("invalid_token_id", instrument));
+            }
+        } else {
+            book.checked_fields(&["asks", "bids"])?;
+        }
+        let bids = levels(
+            book.checked_required("bids")?,
+            true,
+            rich,
+            config,
+            &instrument,
+        )?;
+        let asks = levels(
+            book.checked_required("asks")?,
+            false,
+            rich,
+            config,
+            &instrument,
+        )?;
+        let full = FullBook::new(
+            instrument.clone(),
+            ContractOrientation::Outcome,
+            bids,
+            asks,
+            None,
+            Some(source_observed_ns),
+        )
+        .map_err(|_| Failure::for_instrument("invalid_orderbook_levels", instrument))?;
+        Ok(Self { book: full })
+    }
+}
+
+impl TryFrom<(SnapshotWire, Config)> for Snapshot {
+    type Error = Failure;
+
+    fn try_from((wire, config): (SnapshotWire, Config)) -> Result<Self, Self::Error> {
+        let value = serde_json::to_value(wire).expect("Limitless snapshot wire must serialize");
+        Self::validate(&value, config)
+    }
+}
+
+impl From<Snapshot> for SegmentEvent {
+    fn from(snapshot: Snapshot) -> Self {
+        Self::Book(BookEvent::Full(snapshot.book))
+    }
 }
 
 fn levels(
@@ -298,10 +394,8 @@ fn market_resolved(value: &Value) -> Result<MessageOutcome, Failure> {
 }
 
 fn system(value: &Value) -> Result<MessageOutcome, Failure> {
-    if let Some(message) = value.as_str() {
-        if message.is_empty() || message.chars().any(char::is_control) {
-            return Err(Failure::new("invalid_system_message"));
-        }
+    if value.is_string() {
+        value.checked_nonempty_text("invalid_system_message")?;
         return Ok(MessageOutcome::Ignored("venue_system_control"));
     }
     let data = value.checked_object("invalid_system_message")?;
@@ -509,25 +603,27 @@ pub(crate) fn normalize_process(
 }
 
 fn exact_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), &'static str> {
-    object.checked_fields(allowed).map_err(|reject| reject.code)
+    object
+        .checked_fields(allowed)
+        .map_err(|error| Reject::from(error).code)
 }
 
 fn required_text(object: &Map<String, Value>, field: &str) -> Result<String, &'static str> {
     object
         .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .ok_or("invalid_control_field")?
+        .checked_nonempty_text("invalid_control_field")
         .map(str::to_owned)
-        .ok_or("invalid_control_field")
+        .map_err(|reject| reject.code)
 }
 
 fn optional_text(object: &Map<String, Value>, field: &str) -> Result<Option<String>, &'static str> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.is_empty() && !value.chars().any(char::is_control) => {
-            Ok(Some(value.clone()))
-        }
-        _ => Err("invalid_control_field"),
+        Some(value) => value
+            .checked_nonempty_text("invalid_control_field")
+            .map(|text| Some(text.to_owned()))
+            .map_err(|reject| reject.code),
     }
 }
 
@@ -550,9 +646,8 @@ fn required_text_array<'a>(
         .iter()
         .map(|value| {
             value
-                .as_str()
-                .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
-                .ok_or(code)
+                .checked_nonempty_text(code)
+                .map_err(|reject| reject.code)
         })
         .collect()
 }
@@ -566,14 +661,18 @@ fn text_array(value: &Value, code: &'static str) -> Result<(), Failure> {
 fn required_u64(object: &Map<String, Value>, field: &str) -> Result<u64, &'static str> {
     object
         .get(field)
-        .and_then(Value::as_u64)
-        .ok_or("invalid_control_integer")
+        .ok_or("invalid_control_integer")?
+        .checked_u64("invalid_control_integer")
+        .map_err(|reject| reject.code)
 }
 
 fn required_nonnegative_number(
     object: &Map<String, Value>,
     field: &str,
 ) -> Result<(), &'static str> {
+    // Limitless's existing diagnostic-number contract is lexical, including
+    // rejection of -0 and acceptance of large positive exponent lexemes.
+    // The shared f64 helper intentionally has different semantics.
     let value = object
         .get(field)
         .and_then(Value::as_number)
@@ -608,4 +707,122 @@ fn validate_clock_scope(value: Option<&Value>) -> Result<(), &'static str> {
         .and_then(Value::as_bool)
         .ok_or("invalid_clock_scope")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn compact() -> Value {
+        json!({"marketSlug":"market-a", "version":17,
+            "timestamp":"2026-09-12T10:00:00Z",
+            "orderbook":{"bids":[{"price":0.317,"size":7000001}],
+                "asks":[{"price":0.629,"size":9000003}]}})
+    }
+
+    #[test]
+    fn typed_constructor_finishes_validation_before_infallible_conversion() {
+        let wire: SnapshotWire = serde_json::from_value(compact()).unwrap();
+        let event: SegmentEvent = Snapshot::try_from((wire, Config::default()))
+            .unwrap()
+            .into();
+        let SegmentEvent::Book(BookEvent::Full(book)) = event else {
+            panic!("full book")
+        };
+        assert_eq!(book.bids()[0].price().atoms(), 317);
+        assert_eq!(book.bids()[0].quantity().atoms(), 7000001);
+        assert_eq!(book.asks()[0].price().atoms(), 629);
+        assert_eq!(book.asks()[0].quantity().atoms(), 9000003);
+
+        for (field, value, code) in [
+            ("size", json!(0), "non_positive_level_quantity"),
+            ("size", json!(9223372036854775808_u64), "quantity_overflow"),
+            ("price", json!(0.3171), "inexact_price"),
+            ("price", json!(1), "price_out_of_venue_range"),
+        ] {
+            let value = {
+                let mut v = compact();
+                v["orderbook"]["bids"][0][field] = value;
+                v
+            };
+            let wire: SnapshotWire = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                Snapshot::try_from((wire, Config::default()))
+                    .err()
+                    .unwrap()
+                    .code,
+                code
+            );
+        }
+        let mut value = compact();
+        value["orderbook"]["bids"] = json!([
+            {"price":0.317,"size":7000001}, {"price":0.317,"size":9000003}]);
+        let wire: SnapshotWire = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            Snapshot::try_from((wire, Config::default()))
+                .err()
+                .unwrap()
+                .code,
+            "invalid_orderbook_levels"
+        );
+    }
+
+    #[test]
+    fn wire_failures_keep_ordered_rejects_and_optional_shapes() {
+        for fixture in [
+            compact(),
+            serde_json::from_str::<Value>(include_str!(
+                "../tests/fixtures/orderbook_update_live_2026_09_12.json"
+            ))
+            .unwrap()["data"]
+                .clone(),
+        ] {
+            let wire: SnapshotWire = serde_json::from_value(fixture.clone()).unwrap();
+            assert_eq!(serde_json::to_value(wire).unwrap(), fixture);
+            for path in ["", "/orderbook", "/orderbook/bids/0", "/orderbook/asks/0"] {
+                let fields: Vec<_> = fixture
+                    .pointer(path)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for field in &fields {
+                    for replacement in [
+                        None,
+                        Some(Value::Null),
+                        Some(json!([])),
+                        Some(json!(-1)),
+                        Some(json!("")),
+                        Some(json!(false)),
+                    ] {
+                        for second in &fields {
+                            let mut value = fixture.clone();
+                            let object = value.pointer_mut(path).unwrap().as_object_mut().unwrap();
+                            match &replacement {
+                                Some(v) => {
+                                    object.insert(field.clone(), v.clone());
+                                }
+                                None => {
+                                    object.remove(field);
+                                }
+                            }
+                            if second != field {
+                                object.insert(second.clone(), Value::Null);
+                            }
+                            let actual = Snapshot::parse(&value, Config::default())
+                                .map(SegmentEvent::from)
+                                .map_err(|r| (r.code, r.instrument));
+                            let expected = Snapshot::validate(&value, Config::default())
+                                .map(SegmentEvent::from)
+                                .map_err(|r| (r.code, r.instrument));
+                            assert_eq!(actual, expected, "{path}/{field}/{second}: {value}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
