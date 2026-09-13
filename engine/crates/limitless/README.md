@@ -9,6 +9,16 @@ Bundle identity is SHA-256 of
 bundle version. Closed config identity contains the resolved price and quantity
 scales (defaults 3 and 6).
 
+The snapshot boundary follows Kalshi's validated-event construction: private,
+closed serde wire structs feed a fallible constructor holding a complete
+`FullBook`; conversion to `SegmentEvent` is infallible. Ordered validation maps
+serde failures to the existing reject taxonomy. Envelope kind, stream, and cursor
+binding remain delivery checks, before event construction. Shared JSON and decimal
+validation comes from `canonical-normalizer`; local helpers retain Limitless's
+error codes, JSON-number price lexemes, raw share units, and lexical diagnostic
+number rule. No shared API extension is needed. The pre-refactor canonical/reject
+baseline and direct-constructor tests pin the unchanged v1 semantics.
+
 ## Full-book semantics and exact values
 
 Every `orderbookUpdate` is one complete YES-oriented CLOB book. It produces one

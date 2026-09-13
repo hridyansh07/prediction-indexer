@@ -15,7 +15,14 @@ const SYSTEM: &str = include_str!("fixtures/system_live_2026_09_12.json");
 #[test]
 fn frozen_baseline_canonical_bytes_and_reject_order() {
     let mut cases = Vec::new();
-    for fixture in [CAPTURED_BOOK, DOCUMENTED_BOOK, PRICE_DATA, CREATED, RESOLVED, SYSTEM] {
+    for fixture in [
+        CAPTURED_BOOK,
+        DOCUMENTED_BOOK,
+        PRICE_DATA,
+        CREATED,
+        RESOLVED,
+        SYSTEM,
+    ] {
         let original: Value = serde_json::from_str(fixture).unwrap();
         cases.push(original.clone());
         if let Some(data) = original["data"].as_object() {
@@ -23,8 +30,11 @@ fn frozen_baseline_canonical_bytes_and_reject_order() {
                 for replacement in [None, Some(Value::Null), Some(json!([])), Some(json!(""))] {
                     let mut changed = original.clone();
                     let object = changed["data"].as_object_mut().unwrap();
-                    if let Some(value) = replacement { object.insert(field.clone(), value); }
-                    else { object.remove(field); }
+                    if let Some(value) = replacement {
+                        object.insert(field.clone(), value);
+                    } else {
+                        object.remove(field);
+                    }
                     cases.push(changed);
                 }
             }
@@ -32,16 +42,29 @@ fn frozen_baseline_canonical_bytes_and_reject_order() {
     }
     let mut bytes = Vec::new();
     for value in cases {
-        let source = source(&value.to_string(), "public_book", json!({"type":"snapshot","last_update_id":value["data"]["version"].as_u64().unwrap_or(1)}));
+        let source = source(
+            &value.to_string(),
+            "public_book",
+            json!({"type":"snapshot","last_update_id":value["data"]["version"].as_u64().unwrap_or(1)}),
+        );
         match normalize(&source) {
-            Normalization::Events(events) => for (index, event) in events.into_iter().enumerate() {
-                bytes.extend(segment_record(&source, index as u32, event).unwrap().to_canonical_json());
-            },
+            Normalization::Events(events) => {
+                for (index, event) in events.into_iter().enumerate() {
+                    bytes.extend(
+                        segment_record(&source, index as u32, event)
+                            .unwrap()
+                            .to_canonical_json(),
+                    );
+                }
+            }
             outcome => bytes.extend(format!("{outcome:?}").as_bytes()),
         }
         bytes.push(b'\n');
     }
-    assert_eq!(Sha256::digest(&bytes).to_string(), "bd99b0059f37272df72392c3119ce5d2d1eab653348fabf4bfd89aeb7cd5a6df");
+    assert_eq!(
+        Sha256::digest(&bytes).to_string(),
+        "bd99b0059f37272df72392c3119ce5d2d1eab653348fabf4bfd89aeb7cd5a6df"
+    );
 }
 
 fn source(payload: &str, stream: &str, cursor: Value) -> JoinedCanonicalRecord {
