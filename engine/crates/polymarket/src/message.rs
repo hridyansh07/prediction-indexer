@@ -1,16 +1,19 @@
 use std::collections::BTreeSet;
 
+use canonical_normalizer::{CheckedObject as _, CheckedValue as _};
 use indexer_types::{EnvelopeView, RecordKind, SourceCursor, Stream};
 use replay_domain::{
     AuditAnchor, BookDelta, BookEvent, BookStateHash, ContractOrientation, ControlEvent,
     InstrumentId, Level, LevelChange, SegmentEvent, Sha1, Side, TradeEvent,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
     Config,
     error::Reject,
     value::{CheckedObject, CheckedValue},
+    wire,
 };
 
 const U256_MAX: &str =
@@ -36,8 +39,16 @@ pub(crate) fn normalize_message(
         .nonempty_text("invalid_message_type")?;
     match event_type {
         "book" => full_book(envelope, object, config, false),
-        "price_change" => price_change(envelope, object, config),
-        "last_trade_price" => last_trade(envelope, object, config),
+        "price_change" => {
+            expect_public_book(envelope)?;
+            Ok(MessageOutcome::Events(
+                PriceChange::parse(object, config)?.into(),
+            ))
+        }
+        "last_trade_price" => {
+            expect_public_book(envelope)?;
+            Ok(MessageOutcome::Events(Trade::parse(object, config)?.into()))
+        }
         "tick_size_change" => unsupported_tick_size(envelope, object, config),
         "best_bid_ask" => unsupported_best_bid_ask(envelope, object, config),
         "new_market" => unsupported_new_market(envelope, object, config),
@@ -68,35 +79,38 @@ fn full_book(
             Stream::PublicBook
         },
     )?;
-    let allowed = if independent {
-        &[
-            "market",
-            "asset_id",
-            "timestamp",
-            "hash",
-            "bids",
-            "asks",
-            "min_order_size",
-            "tick_size",
-            "neg_risk",
-            "last_trade_price",
-        ][..]
+    // Prefix validation preserves the historical cursor-failure precedence.
+    // Event construction below is independent of delivery/envelope state.
+    let (instrument, timestamp_ms) = book_prefix(object, config, independent)?;
+    if independent {
+        if !matches!(envelope.source_cursor, Some(SourceCursor::SnapshotTime { source_time_ms }) if source_time_ms == timestamp_ms)
+        {
+            return Err(Reject::for_instrument(
+                "snapshot_cursor_mismatch",
+                instrument,
+            ));
+        }
     } else {
-        &[
-            "event_type",
-            "market",
-            "asset_id",
-            "timestamp",
-            "hash",
-            "bids",
-            "asks",
-            "tick_size",
-            "last_trade_price",
-            "min_order_size",
-            "neg_risk",
-        ][..]
-    };
-    object.fields(allowed, config.accept_additive_fields)?;
+        expect_unsequenced(envelope)?;
+    }
+    Ok(MessageOutcome::Events(
+        Snapshot::parse(object, config, independent)?.into(),
+    ))
+}
+
+fn book_prefix(
+    object: &Map<String, Value>,
+    config: Config,
+    independent: bool,
+) -> Result<(InstrumentId, u64), Reject> {
+    object.fields(
+        if independent {
+            wire::REST_FIELDS
+        } else {
+            wire::BOOK_FIELDS
+        },
+        config.accept_additive_fields,
+    )?;
     if !independent
         && object
             .required("event_type")?
@@ -110,214 +124,315 @@ fn full_book(
         .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
     let timestamp_ms = timestamp(object.required("timestamp")?)
         .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-    if independent {
-        match envelope.source_cursor {
-            Some(SourceCursor::SnapshotTime { source_time_ms })
-                if source_time_ms == timestamp_ms => {}
-            _ => {
-                return Err(Reject::for_instrument(
-                    "snapshot_cursor_mismatch",
-                    instrument,
-                ));
-            }
-        }
-        object
-            .required("min_order_size")?
-            .positive_quantity(config.quantity_scale)
-            .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        object
-            .required("tick_size")?
-            .price(config.price_scale)
-            .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        object
-            .required("neg_risk")?
-            .as_bool()
-            .ok_or_else(|| Reject::for_instrument("invalid_neg_risk", instrument.clone()))?;
-        object
-            .required("last_trade_price")?
-            .price(config.price_scale)
-            .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-    } else {
-        expect_unsequenced(envelope)?;
-        optional_price(object.get("tick_size"), config, &instrument)?;
-        optional_price(object.get("last_trade_price"), config, &instrument)?;
-        optional_positive_quantity(object.get("min_order_size"), config, &instrument)?;
-        if object
-            .get("neg_risk")
-            .is_some_and(|value| !value.is_boolean())
-        {
-            return Err(Reject::for_instrument("invalid_neg_risk", instrument));
-        }
-    }
-    let hash = if independent {
-        Some(
-            state_hash(object.required("hash")?)
-                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?,
-        )
-    } else {
-        object
-            .get("hash")
-            .map(state_hash)
-            .transpose()
-            .map_err(|code| Reject::for_instrument(code, instrument.clone()))?
-    };
-    let bids = levels(object.required("bids")?, config, &instrument)?;
-    let asks = levels(object.required("asks")?, config, &instrument)?;
-    let observed_ns = timestamp_ms
-        .checked_mul(1_000_000)
-        .ok_or_else(|| Reject::for_instrument("source_time_overflow", instrument.clone()))?;
-    let event = if independent {
-        SegmentEvent::AuditAnchor(
-            AuditAnchor::new(
-                instrument.clone(),
-                ContractOrientation::Outcome,
-                bids,
-                asks,
-                hash.expect("independent snapshot hash is required above"),
-                Some(observed_ns),
-            )
-            .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?,
-        )
-    } else {
-        SegmentEvent::Book(BookEvent::Full(
-            replay_domain::FullBook::new(
-                instrument.clone(),
-                ContractOrientation::Outcome,
-                bids,
-                asks,
-                hash,
-                Some(observed_ns),
-            )
-            .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?,
-        ))
-    };
-    Ok(MessageOutcome::Events(vec![event]))
+    Ok((instrument, timestamp_ms))
 }
 
-fn price_change(
-    envelope: &EnvelopeView<'_>,
-    object: &Map<String, Value>,
-    config: Config,
-) -> Result<MessageOutcome, Reject> {
-    expect_public_book(envelope)?;
-    object.fields(
-        &["event_type", "market", "price_changes", "timestamp"],
-        config.accept_additive_fields,
-    )?;
-    validate_market(object.required("market")?).map_err(Reject::new)?;
-    timestamp(object.required("timestamp")?).map_err(Reject::new)?;
-    let changes = object
-        .required("price_changes")?
-        .as_array()
-        .ok_or_else(|| Reject::new("invalid_price_changes"))?;
-    let mut events = Vec::with_capacity(changes.len());
-    for value in changes {
-        let change = value.object("price_change_not_object")?;
-        change.fields(
-            &[
-                "asset_id", "price", "size", "side", "hash", "best_bid", "best_ask",
-            ],
+struct Snapshot {
+    event: SnapshotEvent,
+}
+
+enum SnapshotEvent {
+    Full(replay_domain::FullBook),
+    Audit(AuditAnchor),
+}
+
+impl Snapshot {
+    fn parse(
+        object: &Map<String, Value>,
+        config: Config,
+        independent: bool,
+    ) -> Result<Self, Reject> {
+        let value = wire::project(
+            object,
+            if independent {
+                wire::REST_FIELDS
+            } else {
+                wire::BOOK_FIELDS
+            },
             config.accept_additive_fields,
-        )?;
-        let instrument = instrument(change.required("asset_id")?)?;
-        let price = change
-            .required("price")?
-            .price(config.price_scale)
+        );
+        match wire::Book::deserialize(&value) {
+            Ok(wire) => Self::try_from((wire, config, independent)),
+            Err(_) => match Self::validate(object, config, independent) {
+                Err(reject) => Err(reject),
+                Ok(_) => panic!("Polymarket book wire schema and validator disagree"),
+            },
+        }
+    }
+
+    fn validate(
+        object: &Map<String, Value>,
+        config: Config,
+        independent: bool,
+    ) -> Result<Self, Reject> {
+        let (instrument, timestamp_ms) = book_prefix(object, config, independent)?;
+        if independent {
+            object
+                .required("min_order_size")?
+                .positive_quantity(config.quantity_scale)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+            object
+                .required("tick_size")?
+                .price(config.price_scale)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+            object
+                .required("neg_risk")?
+                .as_bool()
+                .ok_or_else(|| Reject::for_instrument("invalid_neg_risk", instrument.clone()))?;
+            object
+                .required("last_trade_price")?
+                .price(config.price_scale)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+        } else {
+            optional_price(object.get("tick_size"), config, &instrument)?;
+            optional_price(object.get("last_trade_price"), config, &instrument)?;
+            optional_positive_quantity(object.get("min_order_size"), config, &instrument)?;
+            if object
+                .get("neg_risk")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(Reject::for_instrument("invalid_neg_risk", instrument));
+            }
+        }
+        let hash = if independent {
+            Some(
+                state_hash(object.required("hash")?)
+                    .map_err(|code| Reject::for_instrument(code, instrument.clone()))?,
+            )
+        } else {
+            object
+                .get("hash")
+                .map(state_hash)
+                .transpose()
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?
+        };
+        let bids = levels(object.required("bids")?, config, &instrument)?;
+        let asks = levels(object.required("asks")?, config, &instrument)?;
+        let observed_ns = timestamp_ms
+            .checked_mul(1_000_000)
+            .ok_or_else(|| Reject::for_instrument("source_time_overflow", instrument.clone()))?;
+        let event = if independent {
+            SnapshotEvent::Audit(
+                AuditAnchor::new(
+                    instrument.clone(),
+                    ContractOrientation::Outcome,
+                    bids,
+                    asks,
+                    hash.expect("independent snapshot hash is required above"),
+                    Some(observed_ns),
+                )
+                .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?,
+            )
+        } else {
+            SnapshotEvent::Full(
+                replay_domain::FullBook::new(
+                    instrument.clone(),
+                    ContractOrientation::Outcome,
+                    bids,
+                    asks,
+                    hash,
+                    Some(observed_ns),
+                )
+                .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?,
+            )
+        };
+        Ok(Self { event })
+    }
+}
+
+impl TryFrom<(wire::Book, Config, bool)> for Snapshot {
+    type Error = Reject;
+
+    fn try_from((wire, config, independent): (wire::Book, Config, bool)) -> Result<Self, Reject> {
+        let value = serde_json::to_value(wire).expect("book wire must serialize");
+        Self::validate(value.as_object().expect("book object"), config, independent)
+    }
+}
+
+impl From<Snapshot> for Vec<SegmentEvent> {
+    fn from(snapshot: Snapshot) -> Self {
+        vec![match snapshot.event {
+            SnapshotEvent::Full(book) => SegmentEvent::Book(BookEvent::Full(book)),
+            SnapshotEvent::Audit(anchor) => SegmentEvent::AuditAnchor(anchor),
+        }]
+    }
+}
+
+struct PriceChange {
+    events: Vec<BookDelta>,
+}
+
+impl PriceChange {
+    fn parse(object: &Map<String, Value>, config: Config) -> Result<Self, Reject> {
+        let value = wire::project(object, wire::CHANGE_FIELDS, config.accept_additive_fields);
+        match wire::PriceChange::deserialize(&value) {
+            Ok(wire) => Self::try_from((wire, config)),
+            Err(_) => match Self::validate(object, config) {
+                Err(reject) => Err(reject),
+                Ok(_) => panic!("Polymarket price-change wire schema and validator disagree"),
+            },
+        }
+    }
+
+    fn validate(object: &Map<String, Value>, config: Config) -> Result<Self, Reject> {
+        object.fields(wire::CHANGE_FIELDS, config.accept_additive_fields)?;
+        expect_event_type(object, "price_change")?;
+        validate_market(object.required("market")?).map_err(Reject::new)?;
+        timestamp(object.required("timestamp")?).map_err(Reject::new)?;
+        let changes = object
+            .required("price_changes")?
+            .as_array()
+            .ok_or_else(|| Reject::new("invalid_price_changes"))?;
+        let mut events = Vec::with_capacity(changes.len());
+        for value in changes {
+            let change = value.object("price_change_not_object")?;
+            change.fields(wire::CHILD_FIELDS, config.accept_additive_fields)?;
+            let instrument = instrument(change.required("asset_id")?)?;
+            let price = change
+                .required("price")?
+                .price(config.price_scale)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+            let quantity = change
+                .required("size")?
+                .quantity(config.quantity_scale)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+            let side = match change.required("side")?.text("invalid_side")? {
+                "BUY" => Side::Bid,
+                "SELL" => Side::Ask,
+                _ => return Err(Reject::for_instrument("invalid_side", instrument)),
+            };
+            let hash = state_hash(change.required("hash")?)
+                .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+            optional_price(change.get("best_bid"), config, &instrument)?;
+            optional_price(change.get("best_ask"), config, &instrument)?;
+            let level_change = if quantity.atoms() == 0 {
+                LevelChange::Delete
+            } else {
+                LevelChange::Set(
+                    replay_domain::PositiveQty::new(quantity)
+                        .expect("nonzero quantity checked immediately above"),
+                )
+            };
+            events.push(
+                BookDelta::new(
+                    instrument.clone(),
+                    ContractOrientation::Outcome,
+                    side,
+                    price,
+                    level_change,
+                    Some(hash),
+                )
+                .map_err(|_| Reject::for_instrument("invalid_delta", instrument))?,
+            );
+        }
+        Ok(Self { events })
+    }
+}
+
+impl TryFrom<(wire::PriceChange, Config)> for PriceChange {
+    type Error = Reject;
+
+    fn try_from((wire, config): (wire::PriceChange, Config)) -> Result<Self, Reject> {
+        let value = serde_json::to_value(wire).expect("price-change wire must serialize");
+        Self::validate(value.as_object().expect("price-change object"), config)
+    }
+}
+
+impl From<PriceChange> for Vec<SegmentEvent> {
+    fn from(change: PriceChange) -> Self {
+        change
+            .events
+            .into_iter()
+            .map(|event| SegmentEvent::Book(BookEvent::Delta(event)))
+            .collect()
+    }
+}
+
+struct Trade {
+    event: TradeEvent,
+}
+
+impl Trade {
+    fn parse(object: &Map<String, Value>, config: Config) -> Result<Self, Reject> {
+        let value = wire::project(object, wire::TRADE_FIELDS, config.accept_additive_fields);
+        match wire::Trade::deserialize(&value) {
+            Ok(wire) => Self::try_from((wire, config)),
+            Err(_) => match Self::validate(object, config) {
+                Err(reject) => Err(reject),
+                Ok(_) => panic!("Polymarket trade wire schema and validator disagree"),
+            },
+        }
+    }
+
+    fn validate(object: &Map<String, Value>, config: Config) -> Result<Self, Reject> {
+        object.fields(wire::TRADE_FIELDS, config.accept_additive_fields)?;
+        expect_event_type(object, "last_trade_price")?;
+        let instrument = instrument(object.required("asset_id")?)?;
+        validate_market(object.required("market")?)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        let quantity = change
-            .required("size")?
-            .quantity(config.quantity_scale)
+        timestamp(object.required("timestamp")?)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        let side = match change.required("side")?.text("invalid_side")? {
+        optional_unsigned_decimal(object.get("fee_rate_bps"), "invalid_fee_rate")?;
+        optional_hash256(object.get("transaction_hash"), "invalid_transaction_hash")?;
+        let aggressor = match object.required("side")?.text("invalid_side")? {
             "BUY" => Side::Bid,
             "SELL" => Side::Ask,
             _ => return Err(Reject::for_instrument("invalid_side", instrument)),
         };
-        let hash = state_hash(change.required("hash")?)
+        let price = object
+            .required("price")?
+            .price(config.price_scale)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        optional_price(change.get("best_bid"), config, &instrument)?;
-        optional_price(change.get("best_ask"), config, &instrument)?;
-        let level_change = if quantity.atoms() == 0 {
-            LevelChange::Delete
-        } else {
-            LevelChange::Set(
-                replay_domain::PositiveQty::new(quantity)
-                    .expect("nonzero quantity checked immediately above"),
-            )
-        };
-        events.push(SegmentEvent::Book(BookEvent::Delta(
-            BookDelta::new(
-                instrument.clone(),
+        let quantity = object
+            .required("size")?
+            .positive_quantity(config.quantity_scale)
+            .map_err(|code| {
+                Reject::for_instrument(
+                    if code == "zero_quantity" {
+                        "non_positive_trade_quantity"
+                    } else {
+                        code
+                    },
+                    instrument.clone(),
+                )
+            })?;
+        Ok(Self {
+            event: TradeEvent::new(
+                instrument,
                 ContractOrientation::Outcome,
-                side,
                 price,
-                level_change,
-                Some(hash),
-            )
-            .map_err(|_| Reject::for_instrument("invalid_delta", instrument))?,
-        )));
+                quantity,
+                Some(aggressor),
+            ),
+        })
     }
-    Ok(MessageOutcome::Events(events))
 }
 
-fn last_trade(
-    envelope: &EnvelopeView<'_>,
-    object: &Map<String, Value>,
-    config: Config,
-) -> Result<MessageOutcome, Reject> {
-    expect_public_book(envelope)?;
-    object.fields(
-        &[
-            "event_type",
-            "market",
-            "asset_id",
-            "price",
-            "size",
-            "fee_rate_bps",
-            "side",
-            "timestamp",
-            "transaction_hash",
-        ],
-        config.accept_additive_fields,
-    )?;
-    let instrument = instrument(object.required("asset_id")?)?;
-    validate_market(object.required("market")?)
-        .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-    timestamp(object.required("timestamp")?)
-        .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-    optional_unsigned_decimal(object.get("fee_rate_bps"), "invalid_fee_rate")?;
-    optional_hash256(object.get("transaction_hash"), "invalid_transaction_hash")?;
-    let aggressor = match object.required("side")?.text("invalid_side")? {
-        "BUY" => Side::Bid,
-        "SELL" => Side::Ask,
-        _ => return Err(Reject::for_instrument("invalid_side", instrument)),
-    };
-    let price = object
-        .required("price")?
-        .price(config.price_scale)
-        .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-    let quantity = object
-        .required("size")?
-        .positive_quantity(config.quantity_scale)
-        .map_err(|code| {
-            Reject::for_instrument(
-                if code == "zero_quantity" {
-                    "non_positive_trade_quantity"
-                } else {
-                    code
-                },
-                instrument.clone(),
-            )
-        })?;
-    Ok(MessageOutcome::Events(vec![SegmentEvent::Trade(
-        TradeEvent::new(
-            instrument,
-            ContractOrientation::Outcome,
-            price,
-            quantity,
-            Some(aggressor),
-        ),
-    )]))
+impl TryFrom<(wire::Trade, Config)> for Trade {
+    type Error = Reject;
+
+    fn try_from((wire, config): (wire::Trade, Config)) -> Result<Self, Reject> {
+        let value = serde_json::to_value(wire).expect("trade wire must serialize");
+        Self::validate(value.as_object().expect("trade object"), config)
+    }
+}
+
+impl From<Trade> for Vec<SegmentEvent> {
+    fn from(trade: Trade) -> Self {
+        vec![SegmentEvent::Trade(trade.event)]
+    }
+}
+
+fn expect_event_type(object: &Map<String, Value>, expected: &str) -> Result<(), Reject> {
+    if object
+        .required("event_type")?
+        .text("invalid_message_type")?
+        != expected
+    {
+        Err(Reject::new("invalid_message_type"))
+    } else {
+        Ok(())
+    }
 }
 
 fn unsupported_tick_size(
@@ -819,48 +934,44 @@ fn validate_text_array(value: &Value, code: &'static str) -> Result<(), Reject> 
 }
 
 fn process_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), &'static str> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        Err("unknown_field")
-    } else {
-        Ok(())
-    }
+    object.checked_fields(allowed).map_err(|_| "unknown_field")
 }
 
 fn required_text(object: &Map<String, Value>, field: &str) -> Result<String, &'static str> {
     object
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .checked_required(field)
+        .map_err(|_| "invalid_control_field")?
+        .checked_nonempty_text()
         .map(str::to_owned)
-        .ok_or("invalid_control_field")
+        .map_err(|_| "invalid_control_field")
 }
 
 fn optional_text(object: &Map<String, Value>, field: &str) -> Result<Option<String>, &'static str> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.is_empty() && !value.chars().any(char::is_control) => {
-            Ok(Some(value.clone()))
-        }
-        _ => Err("invalid_control_field"),
+        Some(value) => value
+            .checked_nonempty_text()
+            .map(|value| Some(value.to_owned()))
+            .map_err(|_| "invalid_control_field"),
     }
 }
 
 fn required_u64(object: &Map<String, Value>, field: &str) -> Result<(), &'static str> {
     object
-        .get(field)
-        .and_then(Value::as_u64)
+        .checked_required(field)
+        .map_err(|_| "invalid_control_integer")?
+        .checked_nonnegative_u64()
         .map(|_| ())
-        .ok_or("invalid_control_integer")
+        .map_err(|_| "invalid_control_integer")
 }
 
 fn optional_positive_u64(object: &Map<String, Value>, field: &str) -> Result<(), &'static str> {
     match object.get(field) {
         None => Ok(()),
         Some(value) => value
-            .as_u64()
-            .filter(|value| *value > 0)
+            .checked_positive_u64()
             .map(|_| ())
-            .ok_or("invalid_control_integer"),
+            .map_err(|_| "invalid_control_integer"),
     }
 }
 
@@ -869,11 +980,11 @@ fn required_nonnegative_number(
     field: &str,
 ) -> Result<(), &'static str> {
     object
-        .get(field)
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && *value >= 0.0)
+        .checked_required(field)
+        .map_err(|_| "invalid_control_number")?
+        .checked_nonnegative_number()
         .map(|_| ())
-        .ok_or("invalid_control_number")
+        .map_err(|_| "invalid_control_number")
 }
 
 fn optional_nonnegative_number(
@@ -910,4 +1021,173 @@ fn validate_clock_scope(value: Option<&Value>) -> Result<(), &'static str> {
         .and_then(Value::as_bool)
         .ok_or("invalid_control_clock_scope")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn book() -> Value {
+        json!({"event_type":"book", "market":format!("0x{}", "a".repeat(64)),
+            "asset_id":"17", "timestamp":"123", "bids":[
+                {"price":"0.21", "size":"3.7"}, {"price":"0.63", "size":"1.9"}],
+            "asks":[{"price":"0.87", "size":"4.1"}, {"price":"0.72", "size":"2.3"}]})
+    }
+
+    #[test]
+    fn typed_books_finish_domain_validation_before_conversion() {
+        for independent in [false, true] {
+            let mut value = book();
+            if independent {
+                value.as_object_mut().unwrap().remove("event_type");
+                value["hash"] = json!("a".repeat(40));
+                value["min_order_size"] = json!("1");
+                value["tick_size"] = json!("0.01");
+                value["last_trade_price"] = json!("0.41");
+                value["neg_risk"] = json!(false);
+            }
+            let wire = wire::Book::deserialize(&value).unwrap();
+            let events: Vec<SegmentEvent> =
+                Snapshot::try_from((wire, Config::default(), independent))
+                    .unwrap()
+                    .into();
+            let (bids, asks, time) = match &events[0] {
+                SegmentEvent::Book(BookEvent::Full(book)) if !independent => {
+                    (book.bids(), book.asks(), book.source_observed_ns())
+                }
+                SegmentEvent::AuditAnchor(book) if independent => {
+                    (book.bids(), book.asks(), book.source_observed_ns())
+                }
+                other => panic!("wrong book semantics: {other:?}"),
+            };
+            assert_eq!(
+                bids.iter().map(|l| l.price().atoms()).collect::<Vec<_>>(),
+                [6300, 2100]
+            );
+            assert_eq!(
+                asks.iter().map(|l| l.price().atoms()).collect::<Vec<_>>(),
+                [7200, 8700]
+            );
+            assert_eq!(bids[0].quantity().atoms(), 1_900_000);
+            assert_eq!(time, Some(123_000_000));
+
+            value["bids"][1]["price"] = json!("0.2100");
+            let wire = wire::Book::deserialize(&value).unwrap();
+            assert_eq!(
+                Snapshot::try_from((wire, Config::default(), independent))
+                    .err()
+                    .unwrap()
+                    .code,
+                "invalid_snapshot_levels"
+            );
+            // A malformed ask still wins over duplicate bid validation.
+            value["asks"][0]["size"] = json!("bad");
+            let wire = wire::Book::deserialize(&value).unwrap();
+            assert_eq!(
+                Snapshot::try_from((wire, Config::default(), independent))
+                    .err()
+                    .unwrap()
+                    .code,
+                "invalid_quantity"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_delta_and_trade_constructors_enforce_semantics() {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/price_change.json")).unwrap();
+        let wire = wire::PriceChange::deserialize(&value).unwrap();
+        let events: Vec<SegmentEvent> = PriceChange::try_from((wire, Config::default()))
+            .unwrap()
+            .into();
+        assert_eq!(events.len(), 2);
+        let SegmentEvent::Book(BookEvent::Delta(first)) = &events[0] else {
+            panic!("delta")
+        };
+        assert_eq!(first.side(), Side::Bid);
+        assert!(matches!(first.change(), LevelChange::Set(q) if q.atoms() == 12_366_000_000));
+        let SegmentEvent::Book(BookEvent::Delta(second)) = &events[1] else {
+            panic!("delta")
+        };
+        assert_eq!(second.side(), Side::Ask);
+        assert_eq!(second.change(), LevelChange::Delete);
+        value["price_changes"][1]["size"] = json!("-1");
+        let wire = wire::PriceChange::deserialize(&value).unwrap();
+        assert_eq!(
+            PriceChange::try_from((wire, Config::default()))
+                .err()
+                .unwrap()
+                .code,
+            "invalid_quantity"
+        );
+
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/last_trade_price.json")).unwrap();
+        let wire = wire::Trade::deserialize(&value).unwrap();
+        let events: Vec<SegmentEvent> = Trade::try_from((wire, Config::default())).unwrap().into();
+        assert!(
+            matches!(&events[0], SegmentEvent::Trade(trade) if trade.price().atoms() == 4700 && trade.quantity().atoms() == 5_000_000 && trade.aggressor() == Some(Side::Ask))
+        );
+        value["size"] = json!("0");
+        let wire = wire::Trade::deserialize(&value).unwrap();
+        assert_eq!(
+            Trade::try_from((wire, Config::default()))
+                .err()
+                .unwrap()
+                .code,
+            "non_positive_trade_quantity"
+        );
+    }
+
+    #[test]
+    fn closed_wire_preserves_omission_and_rejects_unknown_or_null_fields() {
+        let value = book();
+        let wire = wire::Book::deserialize(&value).unwrap();
+        let roundtrip = serde_json::to_value(wire).unwrap();
+        for optional in [
+            "hash",
+            "tick_size",
+            "min_order_size",
+            "last_trade_price",
+            "neg_risk",
+        ] {
+            assert!(roundtrip.get(optional).is_none());
+            let mut invalid = value.clone();
+            invalid[optional] = Value::Null;
+            assert!(wire::Book::deserialize(&invalid).is_err());
+        }
+        let mut unknown = value.clone();
+        unknown["future"] = json!(true);
+        assert!(wire::Book::deserialize(&unknown).is_err());
+        let mut nested = value;
+        nested["bids"][0]["future"] = json!(true);
+        assert!(wire::Book::deserialize(&nested).is_err());
+    }
+
+    #[test]
+    fn rest_constructor_requires_independent_evidence_and_time_conversion() {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/rest_book.json")).unwrap();
+        value.as_object_mut().unwrap().remove("hash");
+        let wire = wire::Book::deserialize(&value).unwrap();
+        assert_eq!(
+            Snapshot::try_from((wire, Config::default(), true))
+                .err()
+                .unwrap()
+                .code,
+            "missing_required_field"
+        );
+        let mut value = book();
+        value["timestamp"] = json!(u64::MAX.to_string());
+        let wire = wire::Book::deserialize(&value).unwrap();
+        assert_eq!(
+            Snapshot::try_from((wire, Config::default(), false))
+                .err()
+                .unwrap()
+                .code,
+            "source_time_overflow"
+        );
+    }
 }

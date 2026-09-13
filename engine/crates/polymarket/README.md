@@ -5,6 +5,20 @@ shared `canonical_normalizer::Normalizer`. It consumes audited Phase 0 records
 and emits only the existing closed Replay domain. It does not own a book,
 recovery journal, fee calculation, strategy, publisher, or live connection.
 
+Supported event constructors consume private closed serde wire types and finish
+all validation before returning wrappers containing Replay domain objects.
+Conversion to `SegmentEvent` is infallible. The ordered validators deliberately
+map serde shape failures to the existing venue reject codes, never serde text.
+An explicit additive-field projection retains the configured open vendor policy;
+it does not coerce known fields or replace absent optional fields with null.
+Delivery checks remain outside constructors. Book prefix validation precedes
+cursor checks to preserve historical rejection precedence.
+
+JSON and exact-decimal checks reuse `canonical-normalizer`'s neutral validation
+helpers; local helpers only map errors to Polymarket's established taxonomy.
+The conformance corpus and materializer logical hashes/address are frozen against
+the original branch to detect semantic or identity drift during refactoring.
+
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of

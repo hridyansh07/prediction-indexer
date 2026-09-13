@@ -14,6 +14,48 @@ const REST_BOOK: &str = include_str!("fixtures/rest_book.json");
 const TICK_SIZE: &str = include_str!("fixtures/tick_size_change.json");
 
 #[test]
+fn delivery_cursor_errors_preserve_prefix_and_level_precedence() {
+    for (fixture, stream, cursor_code) in [
+        (BOOK, "public_book", "unexpected_sequence_cursor"),
+        (REST_BOOK, "public_snapshot", "snapshot_cursor_mismatch"),
+    ] {
+        let mut value: Value = serde_json::from_str(fixture).unwrap();
+        value["bids"] = Value::Null;
+        let input = source(&value.to_string(), stream, Value::Null, "venue_frame");
+        assert_eq!(reject(normalize(&input)).error_code, cursor_code);
+        value["market"] = json!("bad");
+        let input = source(&value.to_string(), stream, Value::Null, "venue_frame");
+        assert_eq!(reject(normalize(&input)).error_code, "invalid_market_id");
+    }
+}
+
+#[test]
+fn nested_additive_projection_preserves_events_and_known_field_rejects() {
+    for (fixture, field) in [(BOOK, "bids"), (PRICE_CHANGE, "price_changes")] {
+        let mut value: Value = serde_json::from_str(fixture).unwrap();
+        let expected = normalize(&ws(&value.to_string()));
+        value[field][0]["future"] = json!({"opaque":true});
+        assert_eq!(normalize(&ws(&value.to_string())), expected);
+        assert_eq!(
+            reject(normalize_with(
+                Config {
+                    accept_additive_fields: false,
+                    ..Config::default()
+                },
+                &ws(&value.to_string())
+            ))
+            .error_code,
+            "unknown_field"
+        );
+        value[field][0]["price"] = json!("0.00001");
+        assert_eq!(
+            reject(normalize(&ws(&value.to_string()))).error_code,
+            "inexact_price"
+        );
+    }
+}
+
+#[test]
 fn frozen_branch_behavior_corpus() {
     // Frozen against the original branch before refactoring. Include both
     // single and paired shape failures, optional omission, strict/additive
@@ -24,13 +66,24 @@ fn frozen_branch_behavior_corpus() {
         let fields: Vec<_> = original.as_object().unwrap().keys().cloned().collect();
         let mut cases = vec![original.clone()];
         for field in &fields {
-            for replacement in [None, Some(Value::Null), Some(json!(false)), Some(json!(-1)),
-                Some(json!(0)), Some(json!(1.5)), Some(json!("")), Some(json!("bad")),
-                Some(json!([])), Some(json!({}))] {
+            for replacement in [
+                None,
+                Some(Value::Null),
+                Some(json!(false)),
+                Some(json!(-1)),
+                Some(json!(0)),
+                Some(json!(1.5)),
+                Some(json!("")),
+                Some(json!("bad")),
+                Some(json!([])),
+                Some(json!({})),
+            ] {
                 let mut value = original.clone();
                 match &replacement {
                     Some(replacement) => value[field] = replacement.clone(),
-                    None => { value.as_object_mut().unwrap().remove(field); }
+                    None => {
+                        value.as_object_mut().unwrap().remove(field);
+                    }
                 }
                 cases.push(value.clone());
                 for second in &fields {
@@ -46,13 +99,30 @@ fn frozen_branch_behavior_corpus() {
             for additive in [true, false] {
                 let payload = value.to_string();
                 let input = if fixture == REST_BOOK {
-                    source(&payload, "public_snapshot", json!({"type":"snapshot", "source_time_ms": original["timestamp"].as_str().unwrap().parse::<u64>().unwrap()}), "venue_frame")
-                } else { ws(&payload) };
-                let result = normalize_with(Config { accept_additive_fields: additive, ..Config::default() }, &input);
+                    source(
+                        &payload,
+                        "public_snapshot",
+                        json!({"type":"snapshot", "source_time_ms": original["timestamp"].as_str().unwrap().parse::<u64>().unwrap()}),
+                        "venue_frame",
+                    )
+                } else {
+                    ws(&payload)
+                };
+                let result = normalize_with(
+                    Config {
+                        accept_additive_fields: additive,
+                        ..Config::default()
+                    },
+                    &input,
+                );
                 match result {
                     Normalization::Events(events) => {
                         for (index, event) in events.into_iter().enumerate() {
-                            transcript.extend(segment_record(&input, index as u32, event).unwrap().to_canonical_json());
+                            transcript.extend(
+                                segment_record(&input, index as u32, event)
+                                    .unwrap()
+                                    .to_canonical_json(),
+                            );
                         }
                     }
                     other => transcript.extend(format!("{other:?}").bytes()),
@@ -61,7 +131,10 @@ fn frozen_branch_behavior_corpus() {
             }
         }
     }
-    assert_eq!(Sha256::digest(&transcript).as_hex(), "d3676175e3606e7f3d3808c7673a1325fa515fb89aedfcfd57c2313aae421c99");
+    assert_eq!(
+        Sha256::digest(&transcript).as_hex(),
+        "d3676175e3606e7f3d3808c7673a1325fa515fb89aedfcfd57c2313aae421c99"
+    );
 }
 
 fn source(payload: &str, stream: &str, cursor: Value, kind: &str) -> JoinedCanonicalRecord {

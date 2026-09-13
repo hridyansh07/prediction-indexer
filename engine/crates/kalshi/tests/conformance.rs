@@ -91,6 +91,8 @@ fn canonical_event_hashes(payload: &str, stream: &str, seq: u64) -> Vec<String> 
 
 #[test]
 fn canonical_segment_records_preserve_existing_wire_output() {
+    // Native schema-3 bytes frozen on the original Polymarket branch. Its
+    // inherited SHA-1 domain addition changed the schema, not Kalshi events.
     let modern = json!({"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"KX-EQUIV","yes_dollars_fp":[["0.5100","300.00"]],"no_dollars_fp":[["0.4800","120.00"]]}}).to_string();
     let legacy = json!({"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"KX-EQUIV","yes":[[51,300]],"no":[[48,120]]}}).to_string();
     assert_eq!(
@@ -103,8 +105,8 @@ fn canonical_segment_records_preserve_existing_wire_output() {
             "public_book",
             1,
             &[
-                "4cde3fc7786c79abd172076199f3b479afd40e88f941d11350852ecd3a601a8b",
-                "52b7bb555a14f85e9b134c56545660cf57a69ff67daa7264f78891bef1a806f2",
+                "396d489901837103620a3a82f0934eb8e7895b52d5e1892bebb79c781eb66398",
+                "13628abdf1fa99163021f0f09275a3618256942d6962f0e88c9b8ff31fe0f648",
             ][..],
         ),
         (
@@ -112,21 +114,21 @@ fn canonical_segment_records_preserve_existing_wire_output() {
             "public_book",
             1,
             &[
-                "9c15f960d0ebe686ffe62000e5585617adb6fb96a79d925864f5f0c33bc79e64",
-                "e592ee71f2a8fff06dfcf56d513a158fbbd9a806edff1b94a12554a5a3bfb9f9",
+                "0c7e34c8379096335587b004ace5fb41d0024b8fbd9c09accd18d2794802521b",
+                "82d5eaf0797824dd5c279c73729436d36281fbad59bc9e6f4e13e1c7a5840506",
             ][..],
         ),
         (
             DELTA.trim(),
             "public_book",
             3,
-            &["53a53b02519f7769b7062f269eaac5c69cfef2a25c3fba3c6f08caf0de5ffd5b"],
+            &["7e9e27578af8be628be21f8367b465c8cd2b3be46c63be6594591aaab22d77d1"],
         ),
         (
             TRADE.trim(),
             "public_trade",
             2,
-            &["34354144f393735d34b6b6c29b58d93f0b6002cd4ec20dd2d02a2e04af41ff0c"],
+            &["e5170692476557e7529fd838566348ea48739057105b9dad619658c2e722070b"],
         ),
     ] {
         assert_eq!(canonical_event_hashes(payload, stream, seq), expected);

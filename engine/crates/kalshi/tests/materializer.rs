@@ -187,25 +187,31 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
             .intentionally_ignored_records,
         1
     );
+    // Native schema-3 baseline measured after rebasing but before the Polymarket
+    // refactor. Original Polymarket already used schema 3, but inherited Kalshi
+    // parser/bundle v2: its events/rejects hashes were 28257b1b… / c53c8de2…
+    // and its address 0d57dad8…. Latest Kalshi's v3 identity changes the paired
+    // fault reference, reject sidecar, derivative address, and receipt. These
+    // are rebase identities, not changes introduced by the Polymarket adapter.
     assert_eq!(
         first.derivative.manifest.events.logical.sha256.as_hex(),
-        "9209ae1f808002e7ca5db49494c755f6ab7418c7a20debef04c024bb1a3a5eb7"
+        "dd6920a17dd6c0ecb4218d94ea15e6b8b043e51546cd3a28b9ef3f3e99868e7e"
     );
     assert_eq!(first.derivative.manifest.events.logical.byte_length, 2304);
     assert_eq!(first.derivative.manifest.events.logical.line_count, 3);
     assert_eq!(
         first.derivative.manifest.rejects.logical.sha256.as_hex(),
-        "fbc00f6196a98769669c473d8e718c69404360a1107cd5d4361c61e5564a6ba1"
+        "052479e1a2c668721c9626ddaa699ed3bb0a0b810a27d2b730f358d219c4fa44"
     );
     assert_eq!(first.derivative.manifest.rejects.logical.byte_length, 2113);
     assert_eq!(first.derivative.manifest.rejects.logical.line_count, 2);
     assert_eq!(
         first.derivative.pin.derivative_address,
-        "6c430f806007a342107ec7b28400c3a6a3a3a2eb6a7655e9ee3be9b1c2900fc1"
+        "a6e70b8ad8f7702720744467a251c02ece56d0482e1dadc67d587b9c49d25002"
     );
     assert_eq!(
         first.derivative.pin.receipt_sha256.as_hex(),
-        "9079a57c9a87708abd5fdb776d3527e0bba40c98a945ca431667144b93908dbc"
+        "9f9fbf53591172486d470d8b2a14470e5f5adef586cc43b3199d6605279a7128"
     );
     let independently_verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(independently_verified.pin, first.derivative.pin);

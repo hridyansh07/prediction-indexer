@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod message;
 mod value;
+mod wire;
 
 pub use adapter::Polymarket;
 pub use config::Config;

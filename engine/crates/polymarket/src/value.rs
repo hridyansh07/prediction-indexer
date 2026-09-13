@@ -1,8 +1,11 @@
+use canonical_normalizer::{CheckedDecimal, CheckedObject as _, CheckedValue as _, DecimalError};
 use replay_domain::{ConditionalMarketPrice, DecimalScale, NumericError, PositiveQty, Qty};
 use serde_json::{Map, Value};
 
 use crate::error::Reject;
 
+// Venue error taxonomy only; the shared normalizer owns all JSON and decimal
+// validation. These methods preserve the adapter's established reject codes.
 pub(crate) trait CheckedValue {
     fn object(&self, code: &'static str) -> Result<&Map<String, Value>, Reject>;
     fn text(&self, code: &'static str) -> Result<&str, Reject>;
@@ -14,35 +17,30 @@ pub(crate) trait CheckedValue {
 
 impl CheckedValue for Value {
     fn object(&self, code: &'static str) -> Result<&Map<String, Value>, Reject> {
-        self.as_object().ok_or_else(|| Reject::new(code))
+        self.checked_object().map_err(|_| Reject::new(code))
     }
 
     fn text(&self, code: &'static str) -> Result<&str, Reject> {
-        self.as_str().ok_or_else(|| Reject::new(code))
+        self.checked_text().map_err(|_| Reject::new(code))
     }
 
     fn nonempty_text(&self, code: &'static str) -> Result<&str, Reject> {
-        self.text(code).and_then(|value| {
-            if value.is_empty() || value.chars().any(char::is_control) {
-                Err(Reject::new(code))
-            } else {
-                Ok(value)
-            }
-        })
+        self.checked_nonempty_text().map_err(|_| Reject::new(code))
     }
 
     fn price(&self, scale: DecimalScale) -> Result<ConditionalMarketPrice, &'static str> {
-        let text = self.as_str().ok_or("invalid_price")?;
-        ConditionalMarketPrice::parse(text, scale).map_err(|error| numeric_code(error, "price"))
+        self.checked_price(scale)
+            .map_err(|error| decimal_code(error, "price"))
     }
 
     fn quantity(&self, scale: DecimalScale) -> Result<Qty, &'static str> {
-        let text = self.as_str().ok_or("invalid_quantity")?;
-        Qty::parse(text, scale).map_err(|error| numeric_code(error, "quantity"))
+        self.checked_quantity(scale)
+            .map_err(|error| decimal_code(error, "quantity"))
     }
 
     fn positive_quantity(&self, scale: DecimalScale) -> Result<PositiveQty, &'static str> {
-        PositiveQty::new(self.quantity(scale)?).map_err(|_| "zero_quantity")
+        self.checked_positive_quantity(scale)
+            .map_err(|error| decimal_code(error, "quantity"))
     }
 }
 
@@ -53,16 +51,27 @@ pub(crate) trait CheckedObject {
 
 impl CheckedObject for Map<String, Value> {
     fn required(&self, field: &str) -> Result<&Value, Reject> {
-        self.get(field)
-            .ok_or_else(|| Reject::new("missing_required_field"))
+        self.checked_required(field)
+            .map_err(|_| Reject::new("missing_required_field"))
     }
 
     fn fields(&self, allowed: &[&str], additive: bool) -> Result<(), Reject> {
-        if !additive && self.keys().any(|key| !allowed.contains(&key.as_str())) {
-            Err(Reject::new("unknown_field"))
-        } else {
+        if additive {
             Ok(())
+        } else {
+            self.checked_fields(allowed)
+                .map_err(|_| Reject::new("unknown_field"))
         }
+    }
+}
+
+fn decimal_code(error: DecimalError, field: &'static str) -> &'static str {
+    match error {
+        DecimalError::Numeric(error) => numeric_code(error, field),
+        DecimalError::ZeroQuantity => "zero_quantity",
+        DecimalError::ZeroRelativeDelta => unreachable!("Polymarket uses absolute quantities"),
+        DecimalError::WrongType if field == "price" => "invalid_price",
+        DecimalError::WrongType => "invalid_quantity",
     }
 }
 

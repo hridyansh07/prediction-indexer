@@ -254,6 +254,17 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
     );
     let verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(verified.pin, first.derivative.pin);
+    // Frozen original-branch logical outputs and semantic address, independent
+    // of compression-library versions and local paths.
+    assert_eq!(
+        format!(
+            "{}:{}:{}",
+            verified.pin.derivative_address,
+            verified.manifest.events.logical.sha256.as_hex(),
+            verified.manifest.rejects.logical.sha256.as_hex()
+        ),
+        "ece474880acef006d52f49ae8b9bb465ee4d68c06672ed34aa56d5db724cb96b:8687397894f525a646b9fc5c53d87b82830d1c682dcbdbf04993039aaf279a9f:9dc89e2bd6a4e606253dadb0b2d75c271881e7f632b84ef9dd388a6e3bd2819d"
+    );
     let records = read_events(&verified);
     let malformed_fault = records
         .iter()
