@@ -2,8 +2,8 @@
 
 This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
-verified normalized derivative, and the Kalshi normalizer. It contains no book,
-strategy, publisher, deployment, or scheduler.
+verified normalized derivative, and the Kalshi and Polymarket normalizers. It
+contains no book, strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
 
@@ -36,6 +36,10 @@ strategy, publisher, deployment, or scheduler.
 - `LevelChange::{Set, Delete, Increase, Decrease}` carries operation semantics
   explicitly. Every quantity-bearing variant contains `PositiveQty`; no signed
   or zero relative change can enter the persisted domain.
+- `BookStateHash` records the algorithm with the digest. Its current `Sha1`
+  variant is a strict lowercase 40-hex newtype for Polymarket full-state
+  evidence and cannot be confused with the typed SHA-256 identities used for
+  canonical and derivative content.
 
 Currency identity, venue-specific price bands, tick/lot schedules, payout
 denomination, currency conversion, fee arithmetic, and strategy rounding are
@@ -45,13 +49,13 @@ the Replay domain does not guess them from a venue.
 
 ## Closed event contract
 
-`SegmentRecord` schema version 1 owns `EventHeader`, `EventAddress`, complete
+`SegmentRecord` schema version 3 owns `EventHeader`, `EventAddress`, complete
 downstream canonical provenance, and a closed `SegmentEvent`. Book events use
 validated constructors, canonical bid-descending/ask-ascending level ordering,
 one scale per full book, positive level quantities, conditional-market prices,
-direction-explicit level changes, and no duplicate prices. This is the initial
-undeployed V1 contract; no legacy signed V1 exists. `NormalizationFault` carries
-a closed impact classification selected before book state. Exact rejected bytes
+direction-explicit level changes, and no duplicate prices. This is an undeployed
+contract; no legacy signed schema exists. `NormalizationFault` carries a closed
+impact classification selected before book state. Exact rejected bytes
 and parser error codes live in the committed reject sidecar, not this event.
 
 Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
