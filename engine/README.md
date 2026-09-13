@@ -2,8 +2,8 @@
 
 This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
-verified normalized derivative, and the Kalshi normalizer. It contains no book,
-strategy, publisher, deployment, or scheduler.
+verified normalized derivative, and the Kalshi and Limitless normalizers. It
+contains no book, strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
 
@@ -98,6 +98,13 @@ the adapter's closed, key-sorted canonical configuration, and delegates venue wi
 through `VenueAdapter`. Its `Normalize` implementation returns zero/many closed
 `SegmentEvent` children, an explicit ignored reason, or an expected
 `ParseReject`, and has a final consistency `finish()`.
+`serde_json` arbitrary-precision number retention is enabled at this shared decode
+seam because Limitless publishes financial values as JSON numbers. Adapters read
+the original decimal number lexeme into fixed point; they never round-trip it
+through binary floating point. Kalshi continues to require its documented decimal
+strings or exact integers, so this seam does not change its accepted shapes.
+The seam rejects serde_json's private `Number`/`RawValue` object keys before
+deserialization so captured objects cannot be coerced into accepted scalar values.
 Every SHA-256 identity crossing this boundary uses `indexer_types::Sha256`, an
 invariant-preserving 32-byte value whose unchanged JSON representation is
 canonical lowercase hex. Domain-separated derivative and reject addresses remain
