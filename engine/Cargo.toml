@@ -5,6 +5,7 @@ members = [
     "crates/materialize",
     "crates/kalshi",
     "crates/polymarket",
+    "crates/limitless",
 ]
 resolver = "2"
 
@@ -15,7 +16,8 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha2 = "0.10"
 fs2 = "0.4"
 prediction-encoder = { path = "../encoder/rust" }
@@ -25,6 +27,7 @@ replay-domain = { path = "crates/domain" }
 canonical-normalizer = { path = "crates/normalize" }
 replay-materialize = { path = "crates/materialize" }
 polymarket-normalizer = { path = "crates/polymarket" }
+limitless-normalizer = { path = "crates/limitless" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,0 +1,1 @@
+{"event":"orderbookUpdate","data":{"marketSlug":"btc-100k-weekly","orderbook":{"bids":[{"price":0.53,"size":100000000},{"price":0.52,"size":9223372036854775807}],"asks":[{"price":0.55,"size":80000000}]},"version":48213,"timestamp":"2024-01-01T00:00:00.000Z"}}
