@@ -194,6 +194,14 @@ impl<A: VenueAdapter> Normalize for Normalizer<A> {
                 reason_code: "different_venue".to_owned(),
             });
         }
+        if contains_reserved_value_key(&envelope.raw_payload) {
+            return Ok(ParseReject::for_source(
+                A::PARSER_VERSION,
+                "reserved_json_value_key",
+                source,
+                None,
+            ));
+        }
         let payload = match serde_json::from_str(&envelope.raw_payload) {
             Ok(payload) => payload,
             Err(_) => {
@@ -214,6 +222,73 @@ impl<A: VenueAdapter> Normalize for Normalizer<A> {
 
     fn finish(&mut self) -> Result<(), NormalizerError> {
         self.adapter.finish()
+    }
+}
+
+// With serde_json's `arbitrary_precision` and `raw_value` features, maps whose
+// keys decode to these private markers are internal representations of numbers
+// and recursively parsed raw JSON. Actual JSON objects using either key would
+// otherwise be indistinguishable from their coerced value after `Value`
+// deserialization. Inspect object-key tokens in the raw JSON first so venue
+// adapters can rely on captured number-versus-object shape.
+fn contains_reserved_value_key(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] != b'"' {
+            offset += 1;
+            continue;
+        }
+        let start = offset;
+        offset += 1;
+        while offset < bytes.len() {
+            match bytes[offset] {
+                b'\\' => offset = offset.saturating_add(2),
+                b'"' => break,
+                _ => offset += 1,
+            }
+        }
+        if offset >= bytes.len() {
+            return false;
+        }
+        let end = offset;
+        offset += 1;
+        let mut next = offset;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if next == bytes.len() || bytes[next] != b':' {
+            continue;
+        }
+        if serde_json::from_str::<String>(&raw[start..=end]).is_ok_and(|key| {
+            matches!(
+                key.as_str(),
+                "$serde_json::private::Number" | "$serde_json::private::RawValue"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_reserved_value_key;
+
+    #[test]
+    fn private_serde_keys_are_found_without_matching_string_values() {
+        for raw in [
+            r#"{"value":{"$serde_json::private::Number":"0.5"}}"#,
+            r#"{"value":{"\u0024serde_json::private::Number":"0.5"}}"#,
+            r#"{"value":{"$serde_json::private::RawValue":"0.5"}}"#,
+            r#"{"value":{"$serde_json::private::RawValue":"{\"$serde_json::private::Number\":\"0.5\"}"}}"#,
+        ] {
+            assert!(contains_reserved_value_key(raw), "missed {raw}");
+        }
+        assert!(!contains_reserved_value_key(
+            r#"{"diagnostic":"literal $serde_json::private::Number: text"}"#
+        ));
     }
 }
 
