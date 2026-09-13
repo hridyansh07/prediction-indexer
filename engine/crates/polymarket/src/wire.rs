@@ -61,13 +61,8 @@ pub(crate) struct Level {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Book {
-    #[serde(
-        default,
-        deserialize_with = "present",
-        skip_serializing_if = "Option::is_none"
-    )]
-    event_type: Option<String>,
+pub(crate) struct Snapshot {
+    event_type: String,
     market: String,
     asset_id: String,
     timestamp: String,
@@ -103,6 +98,21 @@ pub(crate) struct Book {
         skip_serializing_if = "Option::is_none"
     )]
     neg_risk: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuditSnapshot {
+    market: String,
+    asset_id: String,
+    timestamp: String,
+    bids: Vec<Level>,
+    asks: Vec<Level>,
+    hash: String,
+    tick_size: String,
+    last_trade_price: String,
+    min_order_size: String,
+    neg_risk: bool,
 }
 
 #[derive(Deserialize, Serialize)]

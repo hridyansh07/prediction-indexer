@@ -7,6 +7,10 @@ recovery journal, fee calculation, strategy, publisher, or live connection.
 
 Supported event constructors consume private closed serde wire types and finish
 all validation before returning wrappers containing Replay domain objects.
+As in Kalshi, `message.rs` dispatches to constructors in `event.rs`, with closed
+serde shapes in `wire.rs`. Websocket `Snapshot` and REST `AuditSnapshot` are
+distinct types holding `FullBook` and `AuditAnchor`, respectively; no boolean
+selects event semantics during construction or conversion.
 Conversion to `SegmentEvent` is infallible. The ordered validators deliberately
 map serde shape failures to the existing venue reject codes, never serde text.
 An explicit additive-field projection retains the configured open vendor policy;

@@ -3,6 +3,7 @@
 mod adapter;
 mod config;
 mod error;
+mod event;
 mod message;
 mod value;
 mod wire;
