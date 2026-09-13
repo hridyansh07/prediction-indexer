@@ -63,6 +63,16 @@ fn frozen_baseline_canonical_bytes_and_reject_order() {
     }
     assert_eq!(
         Sha256::digest(&bytes).to_string(),
+        "af1a38e453917c20ff43c45946b818d82c1af184d7fca2af04f7c353bb22969b"
+    );
+    // The upstream Polymarket merge advances the shared record schema from 2
+    // to 3. Prove that this version tag is the only change to our frozen bytes,
+    // including all canonical fields and ordered reject diagnostics.
+    let previous_schema = String::from_utf8(bytes)
+        .unwrap()
+        .replace("\"schema_version\":3", "\"schema_version\":2");
+    assert_eq!(
+        Sha256::digest(previous_schema.as_bytes()).to_string(),
         "bd99b0059f37272df72392c3119ce5d2d1eab653348fabf4bfd89aeb7cd5a6df"
     );
 }
