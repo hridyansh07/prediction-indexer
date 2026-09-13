@@ -81,11 +81,10 @@ fn reject_code(value: Normalization) -> String {
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
     let default_config = serde_json::to_vec(&json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "variables": {
             "price_scale": {"type":"unsigned", "value":4},
-            "quantity_scale": {"type":"unsigned", "value":2},
-            "use_yes_price": {"type":"boolean", "value":false}
+            "quantity_scale": {"type":"unsigned", "value":2}
         }
     }))
     .unwrap();
@@ -112,20 +111,13 @@ fn descriptor_is_versioned_and_config_changes_identity() {
         },
     ] {
         assert_ne!(
-            Normalizer::new(Kalshi::try_from(changed_config).unwrap())
+            Normalizer::new(Kalshi::from(changed_config))
                 .unwrap()
                 .descriptor()
                 .config_sha256,
             default.descriptor().config_sha256
         );
     }
-    assert!(
-        Kalshi::try_from(Config {
-            use_yes_price: true,
-            ..Config::default()
-        })
-        .is_err()
-    );
 }
 
 #[test]

@@ -14,7 +14,133 @@ use replay_domain::{
     LaneId, SegmentEvent, SegmentRecord, Sha256,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedValueError {
+    WrongType,
+    EmptyOrControlText,
+    Negative,
+    Zero,
+    NonFinite,
+}
+
+/// Structural JSON conversions shared by venue adapters. Venue code maps these
+/// neutral boundary failures to its stable reject taxonomy.
+pub trait CheckedValue {
+    fn checked_object(&self) -> Result<&Map<String, Value>, CheckedValueError>;
+    fn checked_text(&self) -> Result<&str, CheckedValueError>;
+    fn checked_nonempty_text(&self) -> Result<&str, CheckedValueError>;
+    fn checked_i64(&self) -> Result<i64, CheckedValueError>;
+    fn checked_nonnegative_i64(&self) -> Result<i64, CheckedValueError>;
+    fn checked_nonnegative_u64(&self) -> Result<u64, CheckedValueError>;
+    fn checked_positive_u64(&self) -> Result<u64, CheckedValueError>;
+    fn checked_nonnegative_number(&self) -> Result<f64, CheckedValueError>;
+    fn checked_bool(&self) -> Result<bool, CheckedValueError>;
+}
+
+impl CheckedValue for Value {
+    fn checked_object(&self) -> Result<&Map<String, Value>, CheckedValueError> {
+        self.as_object().ok_or(CheckedValueError::WrongType)
+    }
+
+    fn checked_text(&self) -> Result<&str, CheckedValueError> {
+        self.as_str().ok_or(CheckedValueError::WrongType)
+    }
+
+    fn checked_nonempty_text(&self) -> Result<&str, CheckedValueError> {
+        self.checked_text().and_then(|value| {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                Err(CheckedValueError::EmptyOrControlText)
+            } else {
+                Ok(value)
+            }
+        })
+    }
+
+    fn checked_i64(&self) -> Result<i64, CheckedValueError> {
+        self.as_i64().ok_or(CheckedValueError::WrongType)
+    }
+
+    fn checked_nonnegative_i64(&self) -> Result<i64, CheckedValueError> {
+        self.checked_i64().and_then(|value| {
+            if value < 0 {
+                Err(CheckedValueError::Negative)
+            } else {
+                Ok(value)
+            }
+        })
+    }
+
+    fn checked_nonnegative_u64(&self) -> Result<u64, CheckedValueError> {
+        self.as_u64().ok_or(CheckedValueError::Negative)
+    }
+
+    fn checked_positive_u64(&self) -> Result<u64, CheckedValueError> {
+        self.checked_nonnegative_u64().and_then(|value| {
+            if value == 0 {
+                Err(CheckedValueError::Zero)
+            } else {
+                Ok(value)
+            }
+        })
+    }
+
+    fn checked_nonnegative_number(&self) -> Result<f64, CheckedValueError> {
+        self.as_f64()
+            .ok_or(CheckedValueError::WrongType)
+            .and_then(|value| {
+                if !value.is_finite() {
+                    Err(CheckedValueError::NonFinite)
+                } else if value < 0.0 {
+                    Err(CheckedValueError::Negative)
+                } else {
+                    Ok(value)
+                }
+            })
+    }
+
+    fn checked_bool(&self) -> Result<bool, CheckedValueError> {
+        self.as_bool().ok_or(CheckedValueError::WrongType)
+    }
+}
+
+#[cfg(test)]
+mod checked_value_tests {
+    use serde_json::json;
+
+    use super::{CheckedValue, CheckedValueError};
+
+    #[test]
+    fn integer_sign_constraints_are_enforced_at_the_shared_boundary() {
+        assert_eq!(json!(0).checked_nonnegative_u64(), Ok(0));
+        assert_eq!(json!(1).checked_positive_u64(), Ok(1));
+        assert_eq!(
+            json!(-1).checked_nonnegative_u64(),
+            Err(CheckedValueError::Negative)
+        );
+        assert_eq!(
+            json!(0).checked_positive_u64(),
+            Err(CheckedValueError::Zero)
+        );
+    }
+
+    #[test]
+    fn checked_text_rejects_empty_and_control_characters() {
+        assert_eq!(
+            json!("").checked_nonempty_text(),
+            Err(CheckedValueError::EmptyOrControlText)
+        );
+        assert_eq!(
+            json!("bad\nvalue").checked_nonempty_text(),
+            Err(CheckedValueError::EmptyOrControlText)
+        );
+        assert_eq!(
+            json!("open-world-name").checked_nonempty_text(),
+            Ok("open-world-name")
+        );
+    }
+}
 
 /// One deterministic decision for one canonical source record.
 #[derive(Clone, Debug, PartialEq, Eq)]

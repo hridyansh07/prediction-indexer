@@ -12,7 +12,10 @@ use replay_domain::{SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
-use super::{DerivativeSpec, EVENTS_FILE, MANIFEST_FILE, RECEIPT_FILE, REJECTS_FILE};
+use super::{
+    DERIVATIVE_EVENTS_FILE, DERIVATIVE_MANIFEST_FILE, DERIVATIVE_RECEIPT_FILE,
+    DERIVATIVE_REJECTS_FILE, DerivativeSpec,
+};
 
 #[derive(Default)]
 struct VerificationCounts {
@@ -52,7 +55,7 @@ impl VerifiedDerivative {
 /// Independently verifies the marker, strict schemas, canonical JSON, both
 /// Zstandard identities, one-frame EOF, line schemas, and reject/fault pairing.
 pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String> {
-    let receipt_path = directory.join(RECEIPT_FILE);
+    let receipt_path = directory.join(DERIVATIVE_RECEIPT_FILE);
     if !receipt_path.is_file() {
         return Err("derivative has no receipt commit marker".to_owned());
     }
@@ -61,7 +64,7 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
 }
 
 pub(crate) fn verify_candidate(directory: &Path, receipt_bytes: &[u8]) -> Result<(), String> {
-    let synthetic_path = directory.join(RECEIPT_FILE);
+    let synthetic_path = directory.join(DERIVATIVE_RECEIPT_FILE);
     let (receipt, canonical) =
         decode_canonical_document::<DerivativeReceipt>(receipt_bytes, &synthetic_path)?;
     verify_contents(directory, receipt, canonical, false).map(|_| ())
@@ -84,7 +87,7 @@ fn verify_contents(
         }
     }
 
-    let manifest_path = directory.join(MANIFEST_FILE);
+    let manifest_path = directory.join(DERIVATIVE_MANIFEST_FILE);
     let manifest_bytes = std::fs::read(&manifest_path)
         .map_err(|error| format!("reading {}: {error}", manifest_path.display()))?;
     if manifest_bytes.len() as u64 != receipt.manifest.byte_length
@@ -148,8 +151,10 @@ fn verify_event_reject_pairing(
     directory: &Path,
     manifest: &DerivativeManifest,
 ) -> Result<VerificationCounts, String> {
-    let mut events = VerifiedLines::open(&directory.join(EVENTS_FILE), &manifest.events)?;
-    let mut rejects = VerifiedLines::open(&directory.join(REJECTS_FILE), &manifest.rejects)?;
+    let mut events =
+        VerifiedLines::open(&directory.join(DERIVATIVE_EVENTS_FILE), &manifest.events)?;
+    let mut rejects =
+        VerifiedLines::open(&directory.join(DERIVATIVE_REJECTS_FILE), &manifest.rejects)?;
     let mut counts = VerificationCounts::default();
     let mut previous_event = None;
     let mut previous_reject_seq = None;

@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use canonical_normalizer::{
     CanonicalEnvelope, Normalization, NormalizerConfigIdentity, NormalizerError, VenueAdapter,
 };
@@ -8,7 +6,8 @@ use serde_json::Value;
 
 use crate::{
     Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION,
-    message::{MessageOutcome, ProcessOutcome, normalize_message, normalize_process},
+    message::{MessageOutcome, normalize_message},
+    process::{ProcessOutcome, normalize_process},
 };
 
 /// Kalshi's venue-specific extension. Canonical-envelope handling, descriptor
@@ -17,22 +16,15 @@ pub struct Kalshi {
     config: Config,
 }
 
-impl TryFrom<Config> for Kalshi {
-    type Error = NormalizerError;
-
-    fn try_from(config: Config) -> Result<Self, Self::Error> {
-        if config.use_yes_price {
-            return Err(NormalizerError::new(
-                "Kalshi v1 does not support use_yes_price=true captures",
-            ));
-        }
-        Ok(Self { config })
+impl From<Config> for Kalshi {
+    fn from(config: Config) -> Self {
+        Self { config }
     }
 }
 
 impl Default for Kalshi {
     fn default() -> Self {
-        Self::try_from(Config::default()).expect("default Kalshi config is supported")
+        Self::from(Config::default())
     }
 }
 
@@ -80,12 +72,14 @@ impl VenueAdapter for Kalshi {
             return Ok(Normalization::Events(Vec::new()));
         }
         let mut events = Vec::new();
-        let mut ignored = BTreeSet::new();
+        let mut ignored = Vec::new();
         for value in messages {
             match normalize_message(envelope, value, self.config, batched) {
                 Ok(MessageOutcome::Events(mut children)) => events.append(&mut children),
                 Ok(MessageOutcome::Ignored(reason)) => {
-                    ignored.insert(reason);
+                    if !ignored.contains(&reason) {
+                        ignored.push(reason);
+                    }
                 }
                 Err(reject) => {
                     return Ok(input.reject(

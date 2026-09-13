@@ -1,4 +1,4 @@
-# Kalshi normalizer v2
+# Kalshi normalizer v3
 
 `kalshi-normalizer` is the first venue extension for the shared
 `canonical_normalizer::Normalizer`. The shared normalizer consumes an audited
@@ -9,28 +9,30 @@ The adapter returns Replay-domain events, an intentional ignore, or one stable
 
 The crate is split by responsibility: `adapter` integrates Kalshi with the
 shared normalizer, `config` owns runtime variables, `message` owns Kalshi wire
-shapes and their checked conversions, `value` provides checked JSON conversion
-traits, and `error` owns stable reject classification. Snapshot, relative-delta,
-and trade values become events through `TryFrom`; constructors that enforce the
-closed Replay event invariants remain in `replay-domain`.
+shapes and their checked conversions, `process` owns typed splice-control
+records, `value` provides Kalshi-specific exact numeric conversions, and
+`error` owns stable reject classification. Shared structural JSON conversions
+live at the generic normalizer boundary. Snapshot, relative-delta, and trade
+values become events through `TryFrom`; constructors that enforce the closed
+Replay event invariants remain in `replay-domain`.
 
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of
-  `prediction-indexer/kalshi-normalizer/v2`. Semantic changes require a version
+  `prediction-indexer/kalshi-normalizer/v3`. Semantic changes require a version
   bump.
-- `Config` exposes typed price scale, quantity scale, and `use_yes_price`
-  variables. The shared normalizer hashes a closed identity structure with
+- `Config` exposes typed price and quantity scales. The shared normalizer hashes
+  a closed identity structure with
   sorted variable keys and scalar value variants. Resolved defaults and an
   explicitly equivalent config therefore hash identically; changing any
   supported variable changes the derivative address.
-- V2 defaults to price scale 4 and quantity scale 2. Decimal strings pass
+- V3 defaults to price scale 4 and quantity scale 2. Decimal strings pass
   through the Replay domain's exact parser. Extra fractional zeroes are accepted;
   non-zero discarded digits, exponent notation, floats, values above the
   `i64::MAX` quantity-atom logical limit, overflow, and implicit rounding reject.
-- The current splice omits Kalshi's `use_yes_price` subscription option, whose
-  documented default is `false`. V1 therefore supports only legacy per-outcome
-  book pricing and rejects a `use_yes_price=true` config.
+- The captured snapshot fields identify legacy integer-cents versus current
+  fixed-point pricing directly. This is evidence in each frame, not a runtime
+  normalizer switch.
 - Every emitted record gets its zero-based child `event_index` from
   `replay-materialize`; the adapter cannot alter canonical sequence, lane,
   delivery index, clocks, record ID, source segment/line, content hash, or
@@ -72,8 +74,7 @@ adapter gaps still require a retained live-contract acceptance corpus:
    omitted simultaneously;
 2. confirm every optional delta and trade field shape observed in production;
 3. confirm whether Kalshi ever batches top-level WebSocket messages;
-4. pin the eventual `use_yes_price` migration before changing the splice;
-5. add lifecycle-channel schemas only if capture subscribes to those channels.
+4. add lifecycle-channel schemas only if capture subscribes to those channels.
 
 Well-formed unknown channel names inside supported controls are retained as
 intentional ignores. An unknown top-level message type could be state-bearing;

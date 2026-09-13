@@ -40,10 +40,10 @@ pub use verify::{DerivativePin, VerifiedDerivative, verify_derivative};
 
 const ADDRESS_DOMAIN: &[u8] = b"prediction-indexer/replay-normalized-derivative/v1";
 const REJECT_DOMAIN: &[u8] = b"prediction-indexer/replay-normalization-reject/v1";
-const EVENTS_FILE: &str = "events.ndjson.zst";
-const REJECTS_FILE: &str = "rejects.ndjson.zst";
-const MANIFEST_FILE: &str = "manifest.json";
-const RECEIPT_FILE: &str = "receipt.json";
+const DERIVATIVE_EVENTS_FILE: &str = "events.ndjson.zst";
+const DERIVATIVE_REJECTS_FILE: &str = "rejects.ndjson.zst";
+const DERIVATIVE_MANIFEST_FILE: &str = "manifest.json";
+const DERIVATIVE_RECEIPT_FILE: &str = "receipt.json";
 static STAGE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,8 +177,8 @@ where
     create_dir_all_durable(&stage).map_err(BuildError::Io)?;
     let mut stage_guard = StageGuard::new(stage.clone());
 
-    let events_file = create_file(&stage.join(format!("{EVENTS_FILE}.open")))?;
-    let rejects_file = create_file(&stage.join(format!("{REJECTS_FILE}.open")))?;
+    let events_file = create_file(&stage.join(format!("{DERIVATIVE_EVENTS_FILE}.open")))?;
+    let rejects_file = create_file(&stage.join(format!("{DERIVATIVE_REJECTS_FILE}.open")))?;
     let mut events = StreamingEncoder::new(events_file, DEFAULT_ZSTD_LEVEL)
         .map_err(|error| BuildError::Io(error.to_string()))?;
     let mut rejects = StreamingEncoder::new(rejects_file, DEFAULT_ZSTD_LEVEL)
@@ -205,7 +205,7 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, REJECTS_FILE)?;
+                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -223,7 +223,11 @@ where
                     })?;
                     let record = segment_record(&source, index, event)
                         .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                    write_line(&mut events, &record.to_canonical_json(), EVENTS_FILE)?;
+                    write_line(
+                        &mut events,
+                        &record.to_canonical_json(),
+                        DERIVATIVE_EVENTS_FILE,
+                    )?;
                     counts.accepted_events =
                         checked_add(counts.accepted_events, 1, "accepted_events")?;
                 }
@@ -240,7 +244,7 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, REJECTS_FILE)?;
+                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -278,13 +282,17 @@ where
                 let encoded = sidecar
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, REJECTS_FILE)?;
+                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
                 let fault = NormalizationFault::new(reject_id, reject.impact)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
                 let record =
                     SegmentRecord::new(fault_header, SegmentEvent::NormalizationFault(fault))
                         .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                write_line(&mut events, &record.to_canonical_json(), EVENTS_FILE)?;
+                write_line(
+                    &mut events,
+                    &record.to_canonical_json(),
+                    DERIVATIVE_EVENTS_FILE,
+                )?;
                 counts.rejected_source_records =
                     checked_add(counts.rejected_source_records, 1, "rejected_source_records")?;
                 counts.normalization_fault_events = checked_add(
@@ -325,13 +333,21 @@ where
         .map_err(io_error("fsyncing rejects"))?;
     drop(events_file);
     drop(rejects_file);
-    rename_in_stage(&stage, &format!("{EVENTS_FILE}.open"), EVENTS_FILE)?;
-    rename_in_stage(&stage, &format!("{REJECTS_FILE}.open"), REJECTS_FILE)?;
+    rename_in_stage(
+        &stage,
+        &format!("{DERIVATIVE_EVENTS_FILE}.open"),
+        DERIVATIVE_EVENTS_FILE,
+    )?;
+    rename_in_stage(
+        &stage,
+        &format!("{DERIVATIVE_REJECTS_FILE}.open"),
+        DERIVATIVE_REJECTS_FILE,
+    )?;
     sync_directory(&stage)?;
     checkpoint(Checkpoint::FilesSynced)?;
 
-    let events_output = compressed_output(EVENTS_FILE, events_result)?;
-    let rejects_output = compressed_output(REJECTS_FILE, rejects_result)?;
+    let events_output = compressed_output(DERIVATIVE_EVENTS_FILE, events_result)?;
+    let rejects_output = compressed_output(DERIVATIVE_REJECTS_FILE, rejects_result)?;
     checkpoint(Checkpoint::BeforeManifestSerialization)?;
     let manifest = DerivativeManifest {
         manifest_version: schema::MANIFEST_VERSION,
@@ -354,12 +370,12 @@ where
     };
     manifest.validate().map_err(BuildError::Serialization)?;
     let manifest_bytes = canonical_document(&manifest)?;
-    let manifest_open = format!("{MANIFEST_FILE}.open");
+    let manifest_open = format!("{DERIVATIVE_MANIFEST_FILE}.open");
     write_synced(&stage.join(&manifest_open), &manifest_bytes)?;
-    rename_in_stage(&stage, &manifest_open, MANIFEST_FILE)?;
+    rename_in_stage(&stage, &manifest_open, DERIVATIVE_MANIFEST_FILE)?;
     sync_directory(&stage)?;
     let manifest_output = PlainOutput {
-        file: MANIFEST_FILE.to_owned(),
+        file: DERIVATIVE_MANIFEST_FILE.to_owned(),
         sha256: sha256(&manifest_bytes),
         byte_length: manifest_bytes.len() as u64,
     };
@@ -383,7 +399,7 @@ where
 
     let lock = acquire_lock(&window_root, &address)?;
     let final_directory = window_root.join(&address);
-    if final_directory.join(RECEIPT_FILE).is_file() {
+    if final_directory.join(DERIVATIVE_RECEIPT_FILE).is_file() {
         let existing = verify_derivative(&final_directory).map_err(|error| {
             BuildError::Conflict(format!(
                 "address {address} has an invalid committed derivative: {error}"
@@ -536,10 +552,10 @@ fn write_receipt_last<H>(
 where
     H: FnMut(Checkpoint) -> Result<(), BuildError>,
 {
-    let temporary = directory.join(format!("{RECEIPT_FILE}.open"));
+    let temporary = directory.join(format!("{DERIVATIVE_RECEIPT_FILE}.open"));
     write_synced(&temporary, bytes)?;
     checkpoint(Checkpoint::ReceiptSynced)?;
-    std::fs::rename(&temporary, directory.join(RECEIPT_FILE))
+    std::fs::rename(&temporary, directory.join(DERIVATIVE_RECEIPT_FILE))
         .map_err(io_error("renaming derivative receipt"))?;
     checkpoint(Checkpoint::ReceiptRenamed)?;
     sync_directory(directory)
