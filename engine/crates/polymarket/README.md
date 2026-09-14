@@ -1,4 +1,4 @@
-# Polymarket normalizer v1
+# Polymarket normalizer v2
 
 `polymarket-normalizer` implements Polymarket as a `VenueAdapter` for the
 shared `canonical_normalizer::Normalizer`. It consumes audited Phase 0 records
@@ -26,7 +26,9 @@ the original branch to detect semantic or identity drift during refactoring.
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of
-  `prediction-indexer/polymarket-normalizer/v1`. Any semantic change requires a
+  `prediction-indexer/polymarket-normalizer/v2`. V2 classifies malformed
+  over-precision decimals as invalid syntax rather than inexact rescaling; valid
+  canonical event bytes are unchanged. Any semantic change requires a
   version bump.
 - The closed config identity contains price scale (default 4), quantity scale
   (default 6), and the additive-field policy (default enabled). Explicit

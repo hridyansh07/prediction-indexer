@@ -1,7 +1,7 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use kalshi_normalizer::{Config, Kalshi, NORMALIZER_BUNDLE_ID};
+use kalshi_normalizer::{Config, Kalshi, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use replay_domain::{BookEvent, ContractOrientation, LevelChange, SegmentEvent, Side};
 use serde_json::{Value, json};
 
@@ -234,6 +234,7 @@ fn multiply_invalid_messages_preserve_reject_precedence() {
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
+    assert_eq!(PARSER_VERSION, 4);
     let default_config = serde_json::to_vec(&json!({
         "schema_version": 2,
         "variables": {
@@ -287,6 +288,15 @@ fn authoritative_snapshot_is_two_explicit_sorted_bid_books() {
         .collect::<Vec<_>>();
     assert_eq!(books[0].orientation(), ContractOrientation::Outcome);
     assert_eq!(books[1].orientation(), ContractOrientation::Complement);
+    assert_eq!(books[0].instrument(), books[1].instrument());
+    assert_ne!(books[0].book_key(), books[1].book_key());
+    let keyed: std::collections::HashMap<_, _> = books
+        .iter()
+        .map(|book| (book.book_key(), book.bids()[0].price().atoms()))
+        .collect();
+    assert_eq!(keyed.len(), 2);
+    assert_eq!(keyed[&books[0].book_key()], 2200);
+    assert_eq!(keyed[&books[1].book_key()], 5600);
     assert!(books.iter().all(|book| book.asks().is_empty()));
     assert_eq!(
         books[0]
@@ -622,6 +632,16 @@ fn malformed_unicode_decimal_is_a_stable_reject_not_a_panic() {
             "invalid_quantity"
         );
     }
+}
+
+#[test]
+fn malformed_discarded_decimal_tail_persists_as_invalid_syntax() {
+    let mut delta: Value = serde_json::from_str(DELTA).unwrap();
+    delta["msg"]["price_dollars"] = json!("0.5000abc");
+    assert_eq!(
+        reject_code(normalize(&sequenced(&delta.to_string(), "public_book", 3))),
+        "invalid_price"
+    );
 }
 
 #[test]

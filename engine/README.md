@@ -47,6 +47,29 @@ economic/product choices deferred to their owning later phases. A future
 segment manifest must bind currency and the scales expected for each instrument;
 the Replay domain does not guess them from a venue.
 
+## Book identity preserves venue-native ladders
+
+`BookKey { instrument, orientation }` identifies the captured ladder used by
+future book stores and book dependencies. `FullBook`, `BookDelta`, and
+`AuditAnchor` expose `book_key()` without changing their persisted fields.
+A full snapshot resets only that key, never every orientation of an instrument.
+
+- [Kalshi](https://docs.kalshi.com/getting_started/orderbook_responses) exposes
+  two bid ladders for one market ticker. YES bids use `(kalshi:TICKER, Outcome)`;
+  NO bids use `(kalshi:TICKER, Complement)`. These are complementary views of
+  one binary market, not independent liquidity: a NO bid at 0.56 implies a YES
+  ask at 0.44. Normalization preserves both bid ladders without that conversion.
+  Empty `asks` means no explicit ask ladder was emitted, not no implied asks.
+- [Polymarket](https://docs.polymarket.com/market-data/overview) gives each
+  outcome its own token ID. YES and NO remain different `polymarket:TOKEN_ID`
+  instruments, both with `Outcome` orientation relative to their own token.
+  Never collapse token IDs to a shared condition ID or reinterpret the NO
+  token as `Complement` of the YES token during normalization.
+
+The key distinguishes stored evidence; it does not assert cross-book economic
+independence. Any complementary-price view belongs in an explicit later consumer.
+No book store or implied-ask projection is implemented here yet.
+
 ## Closed event contract
 
 `SegmentRecord` schema version 3 owns `EventHeader`, `EventAddress`, complete
@@ -144,6 +167,12 @@ bounds, normalized schema version, normalizer bundle and config digests, policy
 digest/effective interval, event/reject serialization versions, and materializer
 version. There is no mutable `latest`. Corrected versions coexist under new
 addresses.
+
+This is the first undeployed format. Reader dispatch for historical schema or
+materializer formats is intentionally deferred; the current reader accepts only
+the current format. Bundle/config changes within that format coexist without a
+version-specific reader. Before a persisted format is deployed and later changed,
+its historical-pin compatibility policy must be settled rather than implied.
 
 Both NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
 and carry logical and stored identities. The strict verifier checks canonical

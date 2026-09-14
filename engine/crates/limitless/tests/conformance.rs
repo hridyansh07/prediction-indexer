@@ -1,7 +1,7 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use limitless_normalizer::{Config, Limitless, NORMALIZER_BUNDLE_ID};
+use limitless_normalizer::{Config, Limitless, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use replay_domain::{BookEvent, FaultImpact, SegmentEvent};
 use serde_json::{Value, json};
 
@@ -63,14 +63,19 @@ fn frozen_baseline_canonical_bytes_and_reject_order() {
     }
     assert_eq!(
         Sha256::digest(&bytes).to_string(),
+        "bed9a4a409066da479a5c072d1159e780a0a64c240425ae64d44590719677c9c"
+    );
+    // This corpus contains no newly classified malformed decimals. Restoring
+    // only the debug reject parser-version field must reproduce the old hash.
+    let previous_parser = String::from_utf8(bytes)
+        .unwrap()
+        .replace("parser_version: 2", "parser_version: 1");
+    assert_eq!(
+        Sha256::digest(previous_parser.as_bytes()).to_string(),
         "af1a38e453917c20ff43c45946b818d82c1af184d7fca2af04f7c353bb22969b"
     );
-    // The upstream Polymarket merge advances the shared record schema from 2
-    // to 3. Prove that this version tag is the only change to our frozen bytes,
-    // including all canonical fields and ordered reject diagnostics.
-    let previous_schema = String::from_utf8(bytes)
-        .unwrap()
-        .replace("\"schema_version\":3", "\"schema_version\":2");
+    // Retain the original schema-2 compatibility check as well.
+    let previous_schema = previous_parser.replace("\"schema_version\":3", "\"schema_version\":2");
     assert_eq!(
         Sha256::digest(previous_schema.as_bytes()).to_string(),
         "bd99b0059f37272df72392c3119ce5d2d1eab653348fabf4bfd89aeb7cd5a6df"
@@ -160,6 +165,7 @@ fn reject(value: Normalization) -> canonical_normalizer::ParseReject {
 #[test]
 fn descriptor_binds_bundle_and_every_config_variable() {
     let default = Normalizer::new(Limitless::default()).unwrap();
+    assert_eq!(PARSER_VERSION, 2);
     let identity = serde_json::to_vec(&json!({
         "schema_version":1,
         "variables":{
@@ -283,7 +289,7 @@ fn financial_values_never_round_or_pass_through_binary_float() {
     let exponent = CAPTURED_BOOK.replacen("0.555", "5.55e-1", 1);
     assert_eq!(
         reject(normalize(&book_source(&exponent))).error_code,
-        "inexact_price"
+        "invalid_price"
     );
 
     for (field, value) in [("price", "0.555"), ("size", "20000000")] {

@@ -9,5 +9,5 @@ mod value;
 pub use adapter::Limitless;
 pub use config::Config;
 
-pub const PARSER_VERSION: u32 = 1;
-pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/limitless-normalizer/v1";
+pub const PARSER_VERSION: u32 = 2;
+pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/limitless-normalizer/v2";

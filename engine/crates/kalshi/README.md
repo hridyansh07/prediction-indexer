@@ -1,4 +1,4 @@
-# Kalshi normalizer v3
+# Kalshi normalizer v4
 
 `kalshi-normalizer` is the first venue extension for the shared
 `canonical_normalizer::Normalizer`. The shared normalizer consumes an audited
@@ -21,26 +21,26 @@ constructors finish every payload check, including full-book validation, before
 an instance exists. `From` into `Vec<SegmentEvent>` is infallible and preserves
 YES-before-NO child order. The materializer never sees Kalshi wire types.
 
-To preserve v3 reject precedence even for multiply-invalid inputs, typed wire
+To preserve reject precedence even for multiply-invalid inputs, typed wire
 values are converted to an in-memory JSON value for one ordered constructor
 validator. On serde shape failure, that same validator diagnoses the original
 value; serde error text is never persisted. This trades an extra per-message
 allocation for a single validation implementation, without reparsing source
 bytes. Optional fields preserve absence through that conversion and reject
-present nulls. Canonical byte-hash and reject-precedence regressions retain v3
-parser, bundle, and configuration identity unchanged.
+present nulls. V4 changes malformed over-precision decimal classification from
+inexact to invalid syntax; canonical valid event bytes remain unchanged.
 
 ## Identity and exactness
 
 - Bundle identity is SHA-256 of
-  `prediction-indexer/kalshi-normalizer/v3`. Semantic changes require a version
+  `prediction-indexer/kalshi-normalizer/v4`. Semantic changes require a version
   bump.
 - `Config` exposes typed price and quantity scales. The shared normalizer hashes
   a closed identity structure with
   sorted variable keys and scalar value variants. Resolved defaults and an
   explicitly equivalent config therefore hash identically; changing any
   supported variable changes the derivative address.
-- V3 defaults to price scale 4 and quantity scale 2. Decimal strings pass
+- V4 defaults to price scale 4 and quantity scale 2. Decimal strings pass
   through the Replay domain's exact parser. Extra fractional zeroes are accepted;
   non-zero discarded digits, exponent notation, floats, values above the
   `i64::MAX` quantity-atom logical limit, overflow, and implicit rounding reject.

@@ -11,9 +11,10 @@ mod mutation;
 mod numeric;
 
 pub use event::{
-    AuditAnchor, BookDelta, BookEvent, CanonicalProvenance, ContinuityVerdict, ContractOrientation,
-    ControlEvent, DomainError, EventAddress, EventHeader, FaultImpact, FullBook, InstrumentId,
-    LaneId, Level, LevelChange, NormalizationFault, SegmentEvent, SegmentRecord, Side, TradeEvent,
+    AuditAnchor, BookDelta, BookEvent, BookKey, CanonicalProvenance, ContinuityVerdict,
+    ContractOrientation, ControlEvent, DomainError, EventAddress, EventHeader, FaultImpact,
+    FullBook, InstrumentId, LaneId, Level, LevelChange, NormalizationFault, SegmentEvent,
+    SegmentRecord, Side, TradeEvent,
 };
 pub use hash::{BookStateHash, Sha1, Sha1Error};
 pub use indexer_types::Sha256;

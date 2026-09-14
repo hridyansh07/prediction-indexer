@@ -1,12 +1,14 @@
-# Limitless normalizer v1
+# Limitless normalizer v2
 
 `limitless-normalizer` is a `VenueAdapter` for the shared
 `canonical_normalizer::Normalizer`. It consumes the splice's lossless Socket.IO
 wrapper, emits only closed `replay-domain` events, and relies on the normalized
 derivative materializer for Phase 0 provenance and zero-based `event_index`.
 Bundle identity is SHA-256 of
-`prediction-indexer/limitless-normalizer/v1`; semantic changes require a new
-bundle version. Closed config identity contains the resolved price and quantity
+`prediction-indexer/limitless-normalizer/v2`; v2 classifies malformed
+over-precision decimals as invalid syntax rather than inexact rescaling while
+preserving valid canonical event bytes. Semantic changes require a new bundle
+version. Closed config identity contains the resolved price and quantity
 scales (defaults 3 and 6).
 
 The snapshot boundary follows Kalshi's validated-event construction: private,
@@ -16,8 +18,8 @@ serde failures to the existing reject taxonomy. Envelope kind, stream, and curso
 binding remain delivery checks, before event construction. Shared JSON and decimal
 validation comes from `canonical-normalizer`; local helpers retain Limitless's
 error codes, JSON-number price lexemes, raw share units, and lexical diagnostic
-number rule. No shared API extension is needed. The pre-refactor canonical/reject
-baseline and direct-constructor tests pin the unchanged v1 semantics.
+number rule. No shared API extension is needed. The conformance and
+direct-constructor tests pin the intended v2 semantics.
 
 ## Full-book semantics and exact values
 

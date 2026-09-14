@@ -448,6 +448,13 @@ fn parse_unsigned_decimal(text: &str, scale: DecimalScale) -> Result<u128, Numer
         return Err(NumericError::InvalidSyntax);
     }
     let mut fractional = fraction.unwrap_or("");
+    if !whole
+        .bytes()
+        .chain(fractional.bytes())
+        .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(NumericError::InvalidSyntax);
+    }
     let scale_len = usize::from(scale.exponent());
     if fractional.len() > scale_len {
         let (kept, discarded) = fractional.split_at(scale_len);

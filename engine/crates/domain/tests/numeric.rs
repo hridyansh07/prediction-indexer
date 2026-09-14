@@ -96,6 +96,22 @@ fn excess_zero_precision_is_exact_but_nonzero_precision_is_rejected() {
 }
 
 #[test]
+fn decimal_syntax_is_validated_before_discarded_precision_exactness() {
+    assert_eq!(Px::parse("0.5000", scale(2)).unwrap().atoms(), 50);
+    assert_eq!(
+        Px::parse("0.5001", scale(2)),
+        Err(NumericError::InexactRescale)
+    );
+    for malformed in ["a.00", "a.001", "0.a0", "0.00abc", "0.abc", "0.5e1"] {
+        assert_eq!(
+            Px::parse(malformed, scale(2)),
+            Err(NumericError::InvalidSyntax),
+            "wrong taxonomy for {malformed:?}"
+        );
+    }
+}
+
+#[test]
 fn rescale_distinguishes_underflow_inexactness_and_overflow() {
     assert_eq!(
         Px::parse("0.5100", scale(4))

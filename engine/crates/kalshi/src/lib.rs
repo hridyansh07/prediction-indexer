@@ -12,5 +12,5 @@ mod wire;
 pub use adapter::Kalshi;
 pub use config::Config;
 
-pub const PARSER_VERSION: u32 = 3;
-pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/kalshi-normalizer/v3";
+pub const PARSER_VERSION: u32 = 4;
+pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/kalshi-normalizer/v4";

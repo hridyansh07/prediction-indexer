@@ -13,11 +13,21 @@ pub enum Side {
 
 /// Whether prices refer to the named outcome or its logical complement.
 /// Conversion between orientations is never implicit at this boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContractOrientation {
     Outcome,
     Complement,
+}
+
+/// Identity of a captured ladder, not a claim of independent economic liquidity.
+/// Kalshi partitions one ticker by orientation; token-addressed venues retain
+/// distinct instrument IDs, each with orientation relative to its own token.
+/// Future book stores and dependencies must use this key, not instrument alone.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BookKey {
+    pub instrument: InstrumentId,
+    pub orientation: ContractOrientation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +123,13 @@ impl FullBook {
         self.orientation
     }
 
+    pub fn book_key(&self) -> BookKey {
+        BookKey {
+            instrument: self.instrument.clone(),
+            orientation: self.orientation,
+        }
+    }
+
     pub fn bids(&self) -> &[Level] {
         &self.bids
     }
@@ -185,6 +202,13 @@ impl BookDelta {
 
     pub const fn orientation(&self) -> ContractOrientation {
         self.orientation
+    }
+
+    pub fn book_key(&self) -> BookKey {
+        BookKey {
+            instrument: self.instrument.clone(),
+            orientation: self.orientation,
+        }
     }
 
     pub const fn side(&self) -> Side {
@@ -295,6 +319,13 @@ impl AuditAnchor {
 
     pub const fn orientation(&self) -> ContractOrientation {
         self.orientation
+    }
+
+    pub fn book_key(&self) -> BookKey {
+        BookKey {
+            instrument: self.instrument.clone(),
+            orientation: self.orientation,
+        }
     }
 
     pub fn bids(&self) -> &[Level] {

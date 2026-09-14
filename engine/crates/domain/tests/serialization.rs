@@ -12,6 +12,60 @@ fn scale(value: u8) -> DecimalScale {
     DecimalScale::new(value).unwrap()
 }
 
+#[test]
+fn book_keys_preserve_orientation_and_token_identity() {
+    let mut books = std::collections::HashMap::new();
+    for (id, orientation, atoms) in [
+        ("kalshi:TEST", ContractOrientation::Outcome, 41),
+        ("kalshi:TEST", ContractOrientation::Complement, 56),
+        ("polymarket:17", ContractOrientation::Outcome, 37),
+        ("polymarket:29", ContractOrientation::Outcome, 62),
+    ] {
+        let book = FullBook::new(
+            InstrumentId::new(id).unwrap(),
+            orientation,
+            vec![Level::new(
+                ConditionalMarketPrice::from_atoms(atoms, scale(2)).unwrap(),
+                PositiveQty::parse("3", scale(0)).unwrap(),
+            )],
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        let key = book.book_key();
+        assert_eq!(key.instrument.as_str(), id);
+        assert_eq!(key.orientation, orientation);
+        assert!(books.insert(key, book).is_none());
+    }
+    assert_eq!(books.len(), 4);
+    for (orientation, atoms) in [
+        (ContractOrientation::Outcome, 41),
+        (ContractOrientation::Complement, 56),
+    ] {
+        let delta = BookDelta::new(
+            InstrumentId::new("kalshi:TEST").unwrap(),
+            orientation,
+            Side::Bid,
+            ConditionalMarketPrice::from_atoms(atoms, scale(2)).unwrap(),
+            LevelChange::Delete,
+            None,
+        )
+        .unwrap();
+        assert_eq!(books[&delta.book_key()].bids()[0].price().atoms(), atoms);
+        let anchor = AuditAnchor::new(
+            delta.instrument().clone(),
+            orientation,
+            vec![],
+            vec![],
+            BookStateHash::Sha1(Sha1::from_hex(&"a".repeat(40)).unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(anchor.book_key(), delta.book_key());
+    }
+}
+
 fn record() -> SegmentRecord {
     let address = EventAddress::new(42, LaneId::new("lane-book-a").unwrap(), 9001, 3).unwrap();
     let provenance = CanonicalProvenance::new(

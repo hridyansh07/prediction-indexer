@@ -187,31 +187,28 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
             .intentionally_ignored_records,
         1
     );
-    // Native schema-3 baseline measured after rebasing but before the Polymarket
-    // refactor. Original Polymarket already used schema 3, but inherited Kalshi
-    // parser/bundle v2: its events/rejects hashes were 28257b1b… / c53c8de2…
-    // and its address 0d57dad8…. Latest Kalshi's v3 identity changes the paired
-    // fault reference, reject sidecar, derivative address, and receipt. These
-    // are rebase identities, not changes introduced by the Polymarket adapter.
+    // V4 changes parser/bundle identity and therefore the paired fault
+    // reference, reject sidecar, derivative address, and receipt. Accepted
+    // non-fault event wire bytes remain covered by conformance tests.
     assert_eq!(
         first.derivative.manifest.events.logical.sha256.as_hex(),
-        "dd6920a17dd6c0ecb4218d94ea15e6b8b043e51546cd3a28b9ef3f3e99868e7e"
+        "5aa1f34d50b28dd4527f7912714b98e4c054ef9195557c4afebad1f2908272b3"
     );
     assert_eq!(first.derivative.manifest.events.logical.byte_length, 2304);
     assert_eq!(first.derivative.manifest.events.logical.line_count, 3);
     assert_eq!(
         first.derivative.manifest.rejects.logical.sha256.as_hex(),
-        "052479e1a2c668721c9626ddaa699ed3bb0a0b810a27d2b730f358d219c4fa44"
+        "1995c4bd43c818b87f1bf62b7c7cabd3c2fed2dcfe67e6ea5826126bd6590a96"
     );
     assert_eq!(first.derivative.manifest.rejects.logical.byte_length, 2113);
     assert_eq!(first.derivative.manifest.rejects.logical.line_count, 2);
     assert_eq!(
         first.derivative.pin.derivative_address,
-        "a6e70b8ad8f7702720744467a251c02ece56d0482e1dadc67d587b9c49d25002"
+        "f1015f60cc79cd4345717ef5ee7d04233ce46f2b36401c4116b41b147d2d1481"
     );
     assert_eq!(
         first.derivative.pin.receipt_sha256.as_hex(),
-        "9f9fbf53591172486d470d8b2a14470e5f5adef586cc43b3199d6605279a7128"
+        "e86294dd94d2779858cddd7d215d0dffe16baacd451e8630122191c753eef726"
     );
     let independently_verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(independently_verified.pin, first.derivative.pin);

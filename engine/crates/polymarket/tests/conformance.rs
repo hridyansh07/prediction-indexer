@@ -1,7 +1,7 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use polymarket_normalizer::{Config, NORMALIZER_BUNDLE_ID, Polymarket};
+use polymarket_normalizer::{Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION, Polymarket};
 use replay_domain::{
     BookEvent, BookStateHash, ContractOrientation, FaultImpact, LevelChange, SegmentEvent, Side,
 };
@@ -133,6 +133,15 @@ fn frozen_branch_behavior_corpus() {
     }
     assert_eq!(
         Sha256::digest(&transcript).as_hex(),
+        "67e0fe72078a786134226606f02d6903b19bbcefbed318d56a4cfe7e18d07a59"
+    );
+    // No newly classified malformed decimals occur in this corpus; only the
+    // debug reject parser-version field differs from its pre-F8 baseline.
+    let previous_parser = String::from_utf8(transcript)
+        .unwrap()
+        .replace("parser_version: 2", "parser_version: 1");
+    assert_eq!(
+        Sha256::digest(previous_parser.as_bytes()).as_hex(),
         "d3676175e3606e7f3d3808c7673a1325fa515fb89aedfcfd57c2313aae421c99"
     );
 }
@@ -230,6 +239,7 @@ fn reject(value: Normalization) -> canonical_normalizer::ParseReject {
 #[test]
 fn descriptor_binds_every_behavior_variable_and_bundle_version() {
     let default = Normalizer::new(Polymarket::default()).unwrap();
+    assert_eq!(PARSER_VERSION, 2);
     let canonical = serde_json::to_vec(&json!({
         "schema_version":1,
         "variables":{
@@ -309,6 +319,26 @@ fn batched_price_changes_preserve_source_order_and_absolute_set_delete_semantics
     assert_eq!(second.change(), LevelChange::Delete);
     assert_ne!(first.book_hash(), second.book_hash());
     assert!(matches!(first.book_hash(), Some(BookStateHash::Sha1(_))));
+}
+
+#[test]
+fn outcome_token_ids_remain_distinct_book_keys() {
+    let mut keyed = std::collections::HashMap::new();
+    for asset_id in ["17", "29"] {
+        let mut payload: Value = serde_json::from_str(BOOK).unwrap();
+        payload["asset_id"] = json!(asset_id);
+        let normalized = events(normalize(&ws(&payload.to_string())));
+        let SegmentEvent::Book(BookEvent::Full(book)) = &normalized[0] else {
+            panic!("expected full book");
+        };
+        assert_eq!(book.book_key().orientation, ContractOrientation::Outcome);
+        assert_eq!(
+            book.book_key().instrument.as_str(),
+            format!("polymarket:{asset_id}")
+        );
+        assert!(keyed.insert(book.book_key(), book.clone()).is_none());
+    }
+    assert_eq!(keyed.len(), 2);
 }
 
 #[test]
@@ -396,6 +426,16 @@ fn exact_fixed_point_boundary_rejects_float_rounding_and_invalid_quantities() {
     assert_eq!(
         reject(normalize(&ws(&delta.to_string()))).error_code,
         "quantity_overflow"
+    );
+}
+
+#[test]
+fn malformed_discarded_decimal_tail_persists_as_invalid_syntax() {
+    let mut delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
+    delta["price_changes"][0]["price"] = json!("0.3000abc");
+    assert_eq!(
+        reject(normalize(&ws(&delta.to_string()))).error_code,
+        "invalid_price"
     );
 }
 
