@@ -173,6 +173,10 @@ where
     }
     let source_receipt = SourceReceipt::from(selected);
     let address = derivative_address(&source_receipt, spec)?;
+    // Hold ownership before creating any stage, through cleanup and publication.
+    // Declaring this before StageGuard also keeps the lock held during its Drop.
+    let _lock = acquire_lock(&window_root, &address)?;
+    prune_abandoned_stages(output_root, Some((&window_root, &address)))?;
     let stage = stage_path(&window_root, &address);
     create_dir_all_durable(&stage).map_err(BuildError::Io)?;
     let mut stage_guard = StageGuard::new(stage.clone());
@@ -401,7 +405,6 @@ where
     verify::verify_candidate(&stage, &receipt_bytes).map_err(BuildError::Verification)?;
     checkpoint(Checkpoint::CandidateVerified)?;
 
-    let lock = acquire_lock(&window_root, &address)?;
     let final_directory = window_root.join(&address);
     if final_directory.join(DERIVATIVE_RECEIPT_FILE).is_file() {
         let existing = verify_derivative(&final_directory).map_err(|error| {
@@ -410,7 +413,6 @@ where
             ))
         })?;
         if existing.receipt_bytes() == receipt_bytes {
-            drop(lock);
             return Ok(BuildOutcome {
                 disposition: BuildDisposition::VerifiedNoOp,
                 derivative: existing,
@@ -431,7 +433,6 @@ where
     sync_directory(&window_root)?;
     checkpoint(Checkpoint::DirectoryPublished)?;
     write_receipt_last(&final_directory, &receipt_bytes, &mut checkpoint)?;
-    drop(lock);
     let derivative = verify_derivative(&final_directory).map_err(BuildError::Verification)?;
     Ok(BuildOutcome {
         disposition: BuildDisposition::Committed,
@@ -555,18 +556,108 @@ where
     sync_directory(directory)
 }
 
-fn acquire_lock(output_root: &Path, address: &str) -> Result<File, BuildError> {
-    let path = output_root.join(format!(".{address}.lock"));
-    let file = OpenOptions::new()
+fn open_lock(window_root: &Path, address: &str) -> Result<File, BuildError> {
+    let path = window_root.join(format!(".{address}.lock"));
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(io_error("opening derivative publication lock"))?;
+        .map_err(io_error("opening derivative publication lock"))
+}
+
+fn acquire_lock(window_root: &Path, address: &str) -> Result<File, BuildError> {
+    let file = open_lock(window_root, address)?;
     file.lock_exclusive()
         .map_err(io_error("locking derivative publication"))?;
     Ok(file)
+}
+
+fn sorted_directories(root: &Path) -> Result<Vec<PathBuf>, BuildError> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(io_error("listing materializer directories"))? {
+        let entry = entry.map_err(io_error("reading materializer directory entry"))?;
+        if entry
+            .file_type()
+            .map_err(io_error("checking materializer directory type"))?
+            .is_dir()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Metadata-only cleanup. All builders must hold the address lock from before
+/// stage creation; older publication-only-lock binaries must be stopped first.
+fn prune_abandoned_stages(
+    output_root: &Path,
+    owned_address: Option<(&Path, &str)>,
+) -> Result<(), BuildError> {
+    for window in sorted_directories(output_root)? {
+        let Some(start) = window
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("window="))
+        else {
+            continue;
+        };
+        if start.parse::<u64>().is_err() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        for stage in sorted_directories(&window)? {
+            let Some(name) = stage
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('.'))
+                .and_then(|name| name.strip_suffix(".open"))
+            else {
+                continue;
+            };
+            let fields: Vec<_> = name.split('.').collect();
+            let [address, pid, nonce] = fields.as_slice() else {
+                continue;
+            };
+            if schema::validate_address(address, "stage address").is_err()
+                || pid.parse::<u32>().ok().filter(|pid| *pid > 0).is_none()
+                || nonce.parse::<u64>().is_err()
+                || !pid
+                    .bytes()
+                    .chain(nonce.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                continue;
+            }
+            let _lock = if owned_address == Some((window.as_path(), *address)) {
+                None // The caller already holds this lock, before enumeration.
+            } else {
+                let lock = open_lock(&window, address)?;
+                match lock.try_lock_exclusive() {
+                    Ok(()) => Some(lock),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(io_error("locking abandoned stage")(error)),
+                }
+            };
+            // Another sweeper or a completed builder may have removed this
+            // entry since enumeration. Never follow a directory symlink.
+            match std::fs::symlink_metadata(&stage) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error("checking abandoned stage")(error)),
+            }
+            match std::fs::symlink_metadata(stage.join(DERIVATIVE_RECEIPT_FILE)) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("checking stage commit marker")(error)),
+            }
+            std::fs::remove_dir_all(&stage).map_err(io_error("removing abandoned stage"))?;
+            sync_directory(&window)?;
+        }
+    }
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), BuildError> {

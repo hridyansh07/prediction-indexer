@@ -183,8 +183,23 @@ Builds use unique private staging directories. After EOF and both `finish()`
 calls, they finish and fsync frames, rename and fsync data, write and fsync the
 manifest, and strictly verify the complete candidate against the constructed
 receipt bytes. Only then do they atomically publish the uncommitted directory and
-write/fsync/rename the receipt last. Publication is serialized per address with an OS advisory lock
-that is released by process death. An unreceipted directory is crash debris and
+write/fsync/rename the receipt last. Each build holds its per-address OS advisory
+lock from before stage creation through publication and cleanup; process death
+releases it. Builds of the same address serialize, while different addresses can
+run concurrently. Before writing a new stage, every run scans directory names
+under its normalized output root for `window=*/.{address}.{pid}.{nonce}.open`
+directories. It prunes only unreceipted stages whose address lock it owns or can
+acquire without waiting. Busy stages, directory symlinks, unrelated paths,
+committed derivatives, and persistent lock files are preserved. This reads
+directory metadata, not compressed payloads; deletion traverses the abandoned
+directory and fsyncs its parent. Cleanup failures abort before new stage writes.
+
+Stop all older materializer binaries before upgrading: older binaries lock only
+during publication and cannot safely run alongside automatic stage cleanup.
+Use a dedicated normalized output root on a filesystem with working OS advisory
+locks. No raw/canonical input or archive object is pruned.
+
+An unreceipted final address directory is crash debris and
 is rebuilt. A retry rebuilds the candidate: identical receipt bytes verify/no-op;
 different bytes at the same address are an immutable conflict.
 

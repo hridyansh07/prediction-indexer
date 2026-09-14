@@ -685,6 +685,163 @@ fn crash_boundaries_recover_and_receipt_rename_is_commit_point() {
 }
 
 #[test]
+fn startup_prunes_only_abandoned_stages_across_windows() {
+    let canonical = TempDir::new("canonical").unwrap();
+    let output = TempDir::new("normalized").unwrap();
+    canonical_fixture(canonical.path());
+    let old_window = output.path().join("window=99");
+    fs::create_dir(&old_window).unwrap();
+    let address = "a".repeat(64);
+    let orphan = old_window.join(format!(".{address}.123.0.open"));
+    fs::create_dir(&orphan).unwrap();
+    fs::write(
+        orphan.join("events.ndjson.zst.open"),
+        b"torn frame, not decodable",
+    )
+    .unwrap();
+
+    let active_address = "b".repeat(64);
+    let active = old_window.join(format!(".{active_address}.456.0.open"));
+    fs::create_dir(&active).unwrap();
+    let active_lock = acquire_lock(&old_window, &active_address).unwrap();
+    let committed = old_window.join(&address);
+    let marked_stage = old_window.join(format!(".{address}.123.1.open"));
+    let unrelated = old_window.join(".unrelated.open");
+    for directory in [&active, &committed, &marked_stage, &unrelated] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("keep"), b"unchanged").unwrap();
+    }
+    fs::write(committed.join("receipt.json"), b"commit marker").unwrap();
+    fs::write(marked_stage.join("receipt.json"), b"never delete a marker").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            &unrelated,
+            old_window.join(format!(".{address}.123.2.open")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&old_window, output.path().join("window=100")).unwrap();
+    }
+
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    assert!(
+        !orphan.exists(),
+        "startup must prune the abandoned private stage"
+    );
+    for directory in [&active, &committed, &marked_stage, &unrelated] {
+        assert_eq!(fs::read(directory.join("keep")).unwrap(), b"unchanged");
+    }
+    verify_derivative(&built.derivative.directory).unwrap();
+    drop(active_lock);
+    build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    assert!(
+        !active.exists(),
+        "released ownership makes the old stage eligible"
+    );
+    assert!(old_window.join(format!(".{active_address}.lock")).exists());
+}
+
+#[test]
+fn hard_killed_builder_leaves_stage_that_next_run_prunes() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const CHILD_ROOT: &str = "REPLAY_MATERIALIZE_CRASH_TEST_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let selection = select_canonical_windows(
+            &root.join("canonical"),
+            0,
+            10,
+            SelectionPolicy {
+                certified: CertifiedPolicy::AllowUncertified,
+                lower_bound: LowerBoundPolicy::RequireWindowBoundary,
+            },
+        )
+        .unwrap();
+        build_window_inner(
+            selection,
+            &root.join("normalized"),
+            &spec(),
+            &mut FakeNormalizer::new(FakeMode::Normal),
+            |point| {
+                if point == Checkpoint::FramesFinished {
+                    fs::write(root.join("ready"), b"ready").unwrap();
+                    thread::sleep(Duration::from_secs(30));
+                    panic!("parent did not kill paused builder");
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        panic!("child unexpectedly finished");
+    }
+    let root = TempDir::new("hard-kill").unwrap();
+    let canonical = root.path().join("canonical");
+    let output = root.path().join("normalized");
+    fs::create_dir_all(&canonical).unwrap();
+    canonical_fixture(&canonical);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::hard_killed_builder_leaves_stage_that_next_run_prunes",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, root.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !root.path().join("ready").exists() && start.elapsed() < Duration::from_secs(10) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "builder exited before checkpoint"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ready = root.path().join("ready").exists();
+    let window = output.join("window=0");
+    if ready {
+        let stages = sorted_directories(&window).unwrap();
+        assert_eq!(stages.len(), 1);
+        prune_abandoned_stages(&output, None).unwrap();
+        assert!(stages[0].exists(), "a live builder must retain its stage");
+    }
+    child.kill().unwrap(); // SIGKILL on Unix: no Rust destructors run.
+    assert!(!child.wait().unwrap().success());
+    assert!(ready, "builder did not reach checkpoint before timeout");
+    let stages = sorted_directories(&window).unwrap();
+    assert_eq!(stages.len(), 1);
+    assert!(stages[0].join("events.ndjson.zst.open").is_file());
+    let built = build_window(
+        &canonical,
+        &output,
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    assert!(!stages[0].exists());
+    verify_derivative(&built.derivative.directory).unwrap();
+}
+
+#[test]
 fn concurrent_identical_builders_publish_one_derivative() {
     let canonical = TempDir::new("canonical").unwrap();
     let output = TempDir::new("normalized").unwrap();
