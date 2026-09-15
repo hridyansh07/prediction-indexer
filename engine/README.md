@@ -2,7 +2,8 @@
 
 This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
-verified normalized derivative, and the Kalshi, Polymarket, and Limitless normalizers. It
+verified normalized derivative, the Kalshi, Polymarket, and Limitless normalizers,
+and a pull-based verified derivative walker. It
 contains no book, strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
@@ -168,11 +169,13 @@ digest/effective interval, event/reject serialization versions, and materializer
 version. There is no mutable `latest`. Corrected versions coexist under new
 addresses.
 
-This is the first undeployed format. Reader dispatch for historical schema or
-materializer formats is intentionally deferred; the current reader accepts only
-the current format. Bundle/config changes within that format coexist without a
-version-specific reader. Before a persisted format is deployed and later changed,
-its historical-pin compatibility policy must be settled rather than implied.
+The first supported reader profile is frozen independently of writer selection:
+normalized schema 3, receipt/manifest/event/reject serialization/materializer 1.
+Address verification uses the recorded, validated versions, never current writer
+constants. Future formats must add explicit closed readers while retaining this
+profile's wire types and exact serialization. Experimental schemas 1/2 and unknown
+profiles are unsupported; there is no migration or readdressing. Explicitly pinned
+bundle/config revisions can coexist without loading historical normalizers.
 
 Both NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
 and carry logical and stored identities. The strict verifier checks canonical
@@ -202,6 +205,35 @@ locks. No raw/canonical input or archive object is pruned.
 An unreceipted final address directory is crash debris and
 is rebuilt. A retry rebuilds the candidate: identical receipt bytes verify/no-op;
 different bytes at the same address are an immutable conflict.
+
+## Verified derivative traversal
+
+[`VERIFIED_DERIVATIVE_WALKER_V1.md`](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md)
+defines the reviewed contract and acceptance cases.
+
+- `replay-materialize::{inspect_pinned, open_pinned}` binds the caller's exact
+  `DerivativePin` to receipt, manifest, addressed directory, and compressed data.
+  Open verifies a private bounded per-window snapshot completely before exposing
+  records; source replacement cannot change the verified stream.
+- `replay-tape::DerivativeWalker::open` takes explicit pins, requested bounds,
+  `ScopeFilter { instruments, lanes }`, `ReadLimits`, and a required
+  `LowerBoundPolicy` with no default. It orders adjacent windows and validates
+  source sequence and per-lane delivery order, including excluded data.
+- `next_item()` yields a verified `WindowStatus` and immutable `AtomicGroup`s.
+  A group contains a whole source delivery or complete cross-lane visible tie.
+  Filtering retains original child indexes, source spans, provenance, relevant
+  controls/faults, and every selected instrument orientation. `book_keys()` keeps
+  Kalshi Outcome/Complement distinct; it performs no projection or mutation.
+- Both reader and walker require explicit clean EOF before consuming `finish()`
+  can mint a completion capability. Errors poison the attempt. A future cursor
+  must apply every complete group even when its strategy skips evaluation.
+
+RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
+holds one bounded compressed window. Oversized groups fail rather than split.
+Window status includes uncertified/empty evidence but reports detailed coverage
+as `NotRecordedInDerivativeV1`: missing/invalid lane details were not persisted.
+No production interval policy, scope resolver, projector, strategy, or audit
+overlay is implemented or approved by this generic traversal boundary.
 
 ## Prepared mutation boundary
 

@@ -4,6 +4,7 @@
 //! privately while Phase 0 is consumed, and cannot be published until verified
 //! EOF, normalizer `finish`, frame finish, and file fsync all succeed.
 
+mod reader;
 mod schema;
 mod verify;
 
@@ -31,6 +32,10 @@ use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent, Se
 use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
+pub use reader::{
+    DerivativeMetadata, FinishedWindow, PinnedDerivative, ReadLimits, SourceDelivery,
+    VerifiedWindowReader, inspect_pinned, open_pinned,
+};
 pub use schema::{
     CompressedOutput, CompressionContract, DerivativeCounts, DerivativeManifest, DerivativeReceipt,
     DerivativeSpec, LogicalIdentity, NormalizationPolicy, PlainOutput, RejectDisposition,
@@ -441,15 +446,31 @@ where
 }
 
 fn derivative_address(source: &SourceReceipt, spec: &DerivativeSpec) -> Result<String, BuildError> {
+    derivative_address_versions(
+        source,
+        spec,
+        schema::EVENT_SERIALIZATION_VERSION,
+        schema::REJECT_SERIALIZATION_VERSION,
+        schema::MATERIALIZER_VERSION,
+    )
+}
+
+fn derivative_address_versions(
+    source: &SourceReceipt,
+    spec: &DerivativeSpec,
+    events: u16,
+    rejects: u16,
+    materializer: u16,
+) -> Result<String, BuildError> {
     let mut digest = Sha256Hasher::new();
     digest.update(ADDRESS_DOMAIN);
     for bytes in [canonical_value(source)?, canonical_value(spec)?] {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
-    digest.update(schema::EVENT_SERIALIZATION_VERSION.to_be_bytes());
-    digest.update(schema::REJECT_SERIALIZATION_VERSION.to_be_bytes());
-    digest.update(schema::MATERIALIZER_VERSION.to_be_bytes());
+    digest.update(events.to_be_bytes());
+    digest.update(rejects.to_be_bytes());
+    digest.update(materializer.to_be_bytes());
     Ok(format!("{:x}", digest.finalize()))
 }
 

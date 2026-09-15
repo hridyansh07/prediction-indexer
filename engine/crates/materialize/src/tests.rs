@@ -454,6 +454,81 @@ fn verifier_rejects_rehashed_inflated_input_and_accepted_source_counts() {
 }
 
 #[test]
+fn verifier_rejects_mismatched_child_source_header() {
+    let canonical = TempDir::new("canonical").unwrap();
+    let output = TempDir::new("normalized").unwrap();
+    canonical_fixture(canonical.path());
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    let directory = &built.derivative.directory;
+    let output = &built.derivative.manifest.events;
+    let logical = CodecLogical {
+        sha256: output.logical.sha256.as_hex(),
+        byte_length: output.logical.byte_length,
+        line_count: output.logical.line_count,
+    };
+    let stored = CodecStored {
+        sha256: output.stored.sha256.as_hex(),
+        byte_length: output.stored.byte_length,
+    };
+    let decoder = StreamingDecoder::new(
+        File::open(directory.join("events.ndjson.zst")).unwrap(),
+        &logical,
+        Some(&stored),
+        Some(logical.byte_length),
+    )
+    .unwrap();
+    let mut lines = BufReader::new(decoder);
+    let mut payload = Vec::new();
+    let mut index = 0;
+    let mut line = String::new();
+    while lines.read_line(&mut line).unwrap() != 0 {
+        let text = line.trim_end_matches('\n').to_owned();
+        let text = if index == 1 {
+            text.replace("\"lane\":\"polymarket\"", "\"lane\":\"other\"")
+        } else {
+            text
+        };
+        payload.extend_from_slice(text.as_bytes());
+        payload.push(b'\n');
+        index += 1;
+        line.clear();
+    }
+    lines.into_inner().finish().unwrap();
+    let result = encode_stream(
+        Cursor::new(payload),
+        File::create(directory.join("events.ndjson.zst")).unwrap(),
+        DEFAULT_ZSTD_LEVEL,
+    )
+    .unwrap();
+    let events = compressed_output("events.ndjson.zst", result).unwrap();
+    let mut manifest = built.derivative.manifest.clone();
+    manifest.events = events.clone();
+    let bytes = canonical_document(&manifest).unwrap();
+    fs::write(directory.join("manifest.json"), &bytes).unwrap();
+    let mut receipt = built.derivative.receipt.clone();
+    receipt.events = events;
+    receipt.manifest.sha256 = Sha256::digest(&bytes);
+    receipt.manifest.byte_length = bytes.len() as u64;
+    fs::write(
+        directory.join("receipt.json"),
+        canonical_document(&receipt).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        verify_derivative(directory).is_err(),
+        "different source lanes within one delivery must fail"
+    );
+}
+
+#[test]
 fn identical_retry_is_noop_and_divergent_same_address_conflicts() {
     let canonical = TempDir::new("canonical").unwrap();
     let output = TempDir::new("normalized").unwrap();
@@ -588,6 +663,18 @@ fn address_binds_every_version_and_policy_input() {
         base_address,
         "71df204dafc347cee916dcf38a9ffcc4b765f2bd612e5cbc65300885f35268b0"
     );
+    // A newer writer selection must not retarget historical address verification.
+    assert_eq!(
+        derivative_address_versions(&source, &base, 1, 1, 1).unwrap(),
+        base_address
+    );
+    for versions in [(2, 1, 1), (1, 2, 1), (1, 1, 2)] {
+        assert_ne!(
+            derivative_address_versions(&source, &base, versions.0, versions.1, versions.2)
+                .unwrap(),
+            base_address,
+        );
+    }
     let mut variants = Vec::new();
     let mut changed = base.clone();
     changed.normalized_schema_version += 1;
@@ -1079,4 +1166,74 @@ fn large_reject_window_pairs_faults_in_stream_order() {
         RECORDS as u64
     );
     verify_derivative(&built.derivative.directory).unwrap();
+}
+
+#[test]
+fn pinned_snapshot_races_and_post_verification_io_errors_fail_closed() {
+    use crate::reader::{ReadCheckpoint, open_pinned_with_checkpoint};
+
+    for stage in [
+        ReadCheckpoint::MetadataCaptured,
+        ReadCheckpoint::SnapshotCopied,
+        ReadCheckpoint::ReaderOpened,
+    ] {
+        let canonical = TempDir::new("read-race-source").unwrap();
+        let output = TempDir::new("read-race-output").unwrap();
+        canonical_fixture(canonical.path());
+        let built = build_window(
+            canonical.path(),
+            output.path(),
+            0,
+            10,
+            &spec(),
+            &mut FakeNormalizer::new(FakeMode::Normal),
+        )
+        .unwrap();
+        let input = PinnedDerivative {
+            directory: built.derivative.directory,
+            pin: built.derivative.pin,
+        };
+        let original = fs::read(input.directory.join("events.ndjson.zst")).unwrap();
+        let result =
+            open_pinned_with_checkpoint(&input, &ReadLimits::default(), |checkpoint, path| {
+                if checkpoint == stage {
+                    // After copy, destroy the ORIGINAL. After decoder open, inject
+                    // a private-file I/O failure before its first delivery read.
+                    let directory = if stage == ReadCheckpoint::SnapshotCopied {
+                        &input.directory
+                    } else {
+                        path
+                    };
+                    fs::write(directory.join("events.ndjson.zst"), []).unwrap();
+                }
+            });
+        if stage == ReadCheckpoint::MetadataCaptured {
+            assert!(result.is_err());
+        } else {
+            let mut reader = result.unwrap();
+            if stage == ReadCheckpoint::ReaderOpened {
+                assert!(reader.next_delivery().is_err());
+                assert_eq!(
+                    reader.next_delivery().unwrap_err(),
+                    "derivative reader is poisoned"
+                );
+                assert!(reader.finish().is_err());
+            } else {
+                let mut sequences = Vec::new();
+                while let Some(delivery) = reader.next_delivery().unwrap() {
+                    sequences.push(delivery.header().address().canonical_seq());
+                }
+                assert_eq!(sequences, [1, 2, 3]);
+                assert_eq!(reader.finish().unwrap().metadata().pin(), &input.pin);
+            }
+        }
+        fs::write(input.directory.join("events.ndjson.zst"), original).unwrap();
+        let mut retry = open_pinned(&input, &ReadLimits::default()).unwrap();
+        let mut sources = 0;
+        while retry.next_delivery().unwrap().is_some() {
+            sources += 1;
+        }
+        assert_eq!(sources, 3);
+        assert_eq!(retry.finish().unwrap().metadata().pin(), &input.pin);
+    }
 }
