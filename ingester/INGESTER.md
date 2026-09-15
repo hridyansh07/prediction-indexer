@@ -224,14 +224,46 @@ the same sample finalization took 67.52 seconds versus 58.51 seconds before the
 change, while peak RSS fell by 97.4%. The independent canonical audit verified
 all 2,670,449 evidence/provenance pairs.
 
+## Replay Phase-0 boundary
+
+`indexer-finalize` now owns the public canonical-window boundary used by the
+Replay design. `select_canonical_windows` chooses the minimal adjacent committed
+window run covering a requested half-open interval. `CanonicalSelection::open`
+streams each exact envelope joined to its closed, versioned provenance record in
+receipt order. The reader reuses the canonical audit mechanics: it validates the
+commit marker and closed receipt schema, both stored and decoded object
+identities, strict Zstandard EOF, per-line source binding, record/content
+identity, window bounds, and canonical sequence continuity. It never merges the
+windows again or sorts them by timestamp.
+
+The successful audit result is an opaque `AuditedCanonicalSelection`, minted
+only by consuming through `next_record() == None` and then calling `finish()`.
+It retains the exact SHA-256 and byte length of every selected `receipt.json`.
+Records observed before `finish()` are not verified output and cannot produce
+that capability.
+
+Two downstream policy decisions remain explicit rather than becoming a wire
+contract accidentally:
+
+- `CertifiedPolicy::RequireCertified` is the fail-closed default;
+  `AllowUncertified` deliberately admits a quarantined window and preserves its
+  `certified: false` receipt identity.
+- `LowerBoundPolicy::RequireWindowBoundary` is the fail-closed default when the
+  requested prologue bound falls inside the first window. `Clip` audits that
+  whole window but emits only records at or after the requested bound;
+  `ExpandToWindowStart` emits the whole first window and records the expanded
+  effective interval on the audited capability.
+
+The Replay owner must still choose which non-default behavior, if either, is
+appropriate before publishing a segment contract. The upper bound is always
+clipped at the requested exclusive end.
+
 ## Not in v1
 
-Replay and verify. They are retrofittable; **the property they verify is not.**
-The rule that makes them possible later — *`write_to` is the single source of the
-bytes: a store encodes once, hashes that buffer, and persists that same buffer* —
-has to hold from the first commit or no later work recovers it. So v1 encodes
-canonically and hash-binds every row, and the `replay`/`verify` commands land in
-iteration two.
+Venue normalization, Replay segments, books, strategies, and economics remain
+outside the finalizer. The rule that makes those later stages possible — encode
+once, hash those bytes, and persist those same bytes — has to hold here or no
+later work can recover it.
 
 Tags also stay out of the raw tape. Tagging is interpretation with today's logic;
 baking it in means replay can never re-tag with better logic, which defeats having

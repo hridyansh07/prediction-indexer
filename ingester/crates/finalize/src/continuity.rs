@@ -94,6 +94,7 @@ impl Committed<ContinuityFact> for ClassifiedLine {
 
 /// One connection's last delivered counter.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionCarry {
     /// The capture lane, so an entry can be superseded when *that* lane
     /// reconnects rather than when any lane of the same venue does.
@@ -105,6 +106,7 @@ pub struct ConnectionCarry {
 
 /// One stream-epoch's last venue-supplied ordering key.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EpochCarry {
     pub lane: String,
     pub venue: String,
@@ -118,6 +120,7 @@ pub struct EpochCarry {
 /// Sorted vectors rather than maps so the JSON is deterministic — the watermark
 /// is compared byte-for-byte after a rebuild.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OrderingState {
     pub connections: Vec<ConnectionCarry>,
     pub epochs: Vec<EpochCarry>,

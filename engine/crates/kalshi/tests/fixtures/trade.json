@@ -1,0 +1,1 @@
+{"type":"trade","sid":11,"seq":2,"msg":{"trade_id":"d91bc706-ee49-470d-82d8-11418bda6fed","market_ticker":"HIGHNY-22DEC23-B53.5","yes_price_dollars":"0.3600","no_price_dollars":"0.6400","count_fp":"136.00","taker_side":"no","taker_outcome_side":"no","taker_book_side":"ask","is_block_trade":false,"ts":1669149841,"ts_ms":1669149841000}}

@@ -20,6 +20,8 @@ data/
 
 # Rust ingester build output
 ingester/target/
+# Rust Replay Engine build output
+engine/target/
 # Standalone shared Rust codec build output
 encoder/rust/target/
 # Live capture output

@@ -10,40 +10,34 @@ sequence and where a dropped frame therefore leaves no trace at all.
 Note which assets re-anchor: the busy ones. The marginal value of polling is
 highest on quiet markets, which is the opposite of where attention naturally goes.
 
-## Why a poll can be positioned exactly, despite taking a second to arrive
+## Why a poll is useful despite taking a second to arrive
 
 The obvious objection is staleness. The round trip is ~955 ms, during which an
 active book moves, so comparing "our book at T" against "their book at T" seems
 to compare two different instants and prove nothing.
 
-It would, if the comparison were by time. It is not. **Every REST book carries the
-same `hash` the streaming `price_change` entries carry** — 24 of 24 polled hashes
-were found in the matching asset's websocket hash stream, exactly. So a snapshot
-is located in our sequence by hash equality:
+It would, if the comparison were by receive time. It is not. A later 600-second
+measurement over 24 assets showed that REST and WS use the same asset-scoped
+full-state SHA-1 space: all 216 post-startup REST `(asset_id, hash)` pairs appeared
+in WS and matched the REST levels. But a hash does **not** certify each delivery.
+Ten observations had two consecutive WS deliveries with the same hash where only
+the second delivery's reconstructed levels matched. The hash therefore identifies
+a full state while a run of same-hash deliveries supplies candidate boundaries;
+every delivery remains distinct evidence.
 
-    find the delivery whose hash equals this snapshot's hash
-    -> that is precisely where this book state sits in our stream
-
-No clock alignment, no timestamp comparison, no assumption about round-trip
-duration. The 955 ms stops mattering entirely.
-
-This also means the canonical-serialisation bootstrap is unnecessary. Two checks
-fall out, and neither requires us to reproduce Polymarket's hash function:
-
-1. **REST hash against streamed hash** — positions the snapshot. String equality.
-2. **Our reconstructed book against the snapshot's levels** — verifies our delta
-   application. Compares contents, not hashes.
+An auditor can compare each independently captured REST state with reconstructed
+WS candidates in that hash run. Capture itself neither chooses a candidate nor
+uses the REST book to reset current state.
 
 ## What it does and does not recover
 
 It does not recover the missed messages. How many orders were lost, and what they
 were, is gone the moment the frame is missed and nothing here brings it back.
 
-What it does is *bracket*. A snapshot matching at delivery N proves the book was
-correct through N; the next one failing at M places the loss inside `(N, M]`, and
-re-anchors the book so the damage stops there. Contamination is bounded by the
-poll interval instead of running to the end of the epoch. For deciding whether a
-window is trustworthy — which is the question — that is the whole answer.
+It supplies an independent audit anchor. A later two-pass auditor can use matched
+levels to certify a candidate state or expose divergence, but the snapshot poller
+does not establish delivery-level certification, rewind a current book, or recover
+missed messages.
 
 ## Cost
 
@@ -235,11 +229,12 @@ class PolymarketSnapshotSplice(BaseSplice):
         `snapshot` is the cursor class that says exactly that, and it is why this
         cannot report a false gap the way a dense-cursor reading would.
 
-        The load-bearing evidence is the `hash` inside the payload, which locates
-        the snapshot in the delta stream far more precisely than any timestamp.
-        It stays in the payload rather than being lifted into the cursor: the
-        cursor vocabulary is closed and shared across venues, and the ingester
-        deliberately does not interpret book contents.
+        The load-bearing evidence is the asset-scoped full-state SHA-1 inside the
+        payload. It narrows an auditor to same-hash candidate deliveries but does
+        not certify an individual delta or delivery. It stays in the payload
+        rather than being lifted into the cursor: the cursor vocabulary is closed
+        and shared across venues, and the ingester deliberately does not interpret
+        book contents.
         """
         try:
             stamped = json.loads(message).get("timestamp")
