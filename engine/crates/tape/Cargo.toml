@@ -1,5 +1,5 @@
 [package]
-name = "replay-materialize"
+name = "replay-tape"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,16 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-fs2 = { workspace = true }
+replay-domain = { workspace = true }
+replay-materialize = { workspace = true }
+
+[dev-dependencies]
+canonical-normalizer = { workspace = true }
 indexer-finalize = { workspace = true }
 indexer-types = { workspace = true }
 prediction-encoder = { workspace = true }
-replay-domain = { workspace = true }
-canonical-normalizer = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tempdir = "0.3"
+kalshi-normalizer = { path = "../kalshi" }
+polymarket-normalizer = { workspace = true }
+limitless-normalizer = { workspace = true }

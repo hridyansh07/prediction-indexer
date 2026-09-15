@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use indexer_types::EnvelopeView;
@@ -61,22 +61,26 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
     if !receipt_path.is_file() {
         return Err("derivative has no receipt commit marker".to_owned());
     }
-    let (receipt, receipt_bytes) = read_canonical_document::<DerivativeReceipt>(&receipt_path)?;
+    let receipt_bytes = super::reader::read_bounded(
+        &receipt_path,
+        super::ReadLimits::default().max_metadata_bytes,
+    )?;
+    let (receipt, receipt_bytes) = decode_receipt_document(&receipt_bytes, &receipt_path)?;
     verify_contents(directory, receipt, receipt_bytes, true)
 }
 
 pub(crate) fn verify_candidate(directory: &Path, receipt_bytes: &[u8]) -> Result<(), String> {
     let synthetic_path = directory.join(DERIVATIVE_RECEIPT_FILE);
-    let (receipt, canonical) =
-        decode_canonical_document::<DerivativeReceipt>(receipt_bytes, &synthetic_path)?;
+    let (receipt, canonical) = decode_receipt_document(receipt_bytes, &synthetic_path)?;
     verify_contents(directory, receipt, canonical, false).map(|_| ())
 }
 
-fn verify_contents(
+pub(crate) fn inspect_contents(
     directory: &Path,
     receipt: DerivativeReceipt,
     receipt_bytes: Vec<u8>,
     require_addressed_directory: bool,
+    manifest_bytes: &[u8],
 ) -> Result<VerifiedDerivative, String> {
     receipt.validate()?;
     if require_addressed_directory {
@@ -90,15 +94,13 @@ fn verify_contents(
     }
 
     let manifest_path = directory.join(DERIVATIVE_MANIFEST_FILE);
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .map_err(|error| format!("reading {}: {error}", manifest_path.display()))?;
     if manifest_bytes.len() as u64 != receipt.manifest.byte_length
-        || sha256(&manifest_bytes) != receipt.manifest.sha256
+        || sha256(manifest_bytes) != receipt.manifest.sha256
     {
         return Err("manifest identity disagrees with receipt".to_owned());
     }
     let (manifest, canonical_manifest_bytes) =
-        decode_canonical_document::<DerivativeManifest>(&manifest_bytes, &manifest_path)?;
+        decode_canonical_document::<DerivativeManifest>(manifest_bytes, &manifest_path)?;
     if canonical_manifest_bytes != manifest_bytes {
         return Err("manifest is not canonically encoded".to_owned());
     }
@@ -121,23 +123,16 @@ fn verify_contents(
         normalizer_config_sha256: manifest.normalizer_config_sha256,
         policy: manifest.policy.clone(),
     };
-    let expected_address = super::derivative_address(&manifest.source_receipt, &spec)
-        .map_err(|error| error.to_string())?;
+    let expected_address = super::derivative_address_versions(
+        &manifest.source_receipt,
+        &spec,
+        manifest.event_serialization_version,
+        manifest.reject_serialization_version,
+        manifest.materializer_version,
+    )
+    .map_err(|error| error.to_string())?;
     if expected_address != receipt.derivative_address {
         return Err("derivative address does not match its domain-separated inputs".to_owned());
-    }
-
-    let mut counts = verify_event_reject_pairing(directory, &manifest)?;
-    verify_source_dispositions(directory, &manifest, &mut counts)?;
-    if counts.input_records != manifest.counts.input_records
-        || counts.accepted_source_records != manifest.counts.accepted_source_records
-        || counts.event_lines != manifest.events.logical.line_count
-        || counts.reject_lines != manifest.rejects.logical.line_count
-        || counts.faults != manifest.counts.normalization_fault_events
-        || counts.parse_rejects != manifest.counts.rejected_source_records
-        || counts.ignored != manifest.counts.intentionally_ignored_records
-    {
-        return Err("verified derivative lines disagree with manifest counts".to_owned());
     }
 
     Ok(VerifiedDerivative {
@@ -152,14 +147,62 @@ fn verify_contents(
     })
 }
 
+fn verify_contents(
+    directory: &Path,
+    receipt: DerivativeReceipt,
+    receipt_bytes: Vec<u8>,
+    addressed: bool,
+) -> Result<VerifiedDerivative, String> {
+    let manifest_bytes = super::reader::read_bounded(
+        &directory.join(DERIVATIVE_MANIFEST_FILE),
+        super::ReadLimits::default().max_metadata_bytes,
+    )?;
+    let verified = inspect_contents(
+        directory,
+        receipt,
+        receipt_bytes,
+        addressed,
+        &manifest_bytes,
+    )?;
+    verify_data(directory, &verified.manifest, &super::ReadLimits::default())?;
+    Ok(verified)
+}
+
+pub(crate) fn verify_data(
+    directory: &Path,
+    manifest: &DerivativeManifest,
+    limits: &super::ReadLimits,
+) -> Result<(), String> {
+    let mut counts = verify_event_reject_pairing(directory, manifest, limits)?;
+    verify_source_dispositions(directory, manifest, &mut counts, limits)?;
+    if counts.input_records != manifest.counts.input_records
+        || counts.accepted_source_records != manifest.counts.accepted_source_records
+        || counts.event_lines != manifest.events.logical.line_count
+        || counts.reject_lines != manifest.rejects.logical.line_count
+        || counts.faults != manifest.counts.normalization_fault_events
+        || counts.parse_rejects != manifest.counts.rejected_source_records
+        || counts.ignored != manifest.counts.intentionally_ignored_records
+    {
+        return Err("verified derivative lines disagree with manifest counts".to_owned());
+    }
+    super::reader::verify_deliveries(directory, manifest, limits)
+}
+
 fn verify_event_reject_pairing(
     directory: &Path,
     manifest: &DerivativeManifest,
+    limits: &super::ReadLimits,
 ) -> Result<VerificationCounts, String> {
-    let mut events =
-        VerifiedLines::open(&directory.join(DERIVATIVE_EVENTS_FILE), &manifest.events)?;
-    let mut rejects =
-        VerifiedLines::open(&directory.join(DERIVATIVE_REJECTS_FILE), &manifest.rejects)?;
+    let mut events = VerifiedLines::open_limit(
+        &directory.join(DERIVATIVE_EVENTS_FILE),
+        &manifest.events,
+        limits.max_line_bytes,
+    )?;
+    let mut rejects = VerifiedLines::open_limit(
+        &directory.join(DERIVATIVE_REJECTS_FILE),
+        &manifest.rejects,
+        limits.max_line_bytes,
+    )?;
     let mut counts = VerificationCounts::default();
     let mut previous_event = None;
     let mut previous_reject_seq = None;
@@ -191,11 +234,18 @@ fn verify_source_dispositions(
     directory: &Path,
     manifest: &DerivativeManifest,
     counts: &mut VerificationCounts,
+    limits: &super::ReadLimits,
 ) -> Result<(), String> {
-    let mut events =
-        VerifiedLines::open(&directory.join(DERIVATIVE_EVENTS_FILE), &manifest.events)?;
-    let mut rejects =
-        VerifiedLines::open(&directory.join(DERIVATIVE_REJECTS_FILE), &manifest.rejects)?;
+    let mut events = VerifiedLines::open_limit(
+        &directory.join(DERIVATIVE_EVENTS_FILE),
+        &manifest.events,
+        limits.max_line_bytes,
+    )?;
+    let mut rejects = VerifiedLines::open_limit(
+        &directory.join(DERIVATIVE_REJECTS_FILE),
+        &manifest.rejects,
+        limits.max_line_bytes,
+    )?;
     let mut previous_event_seq = None;
     let mut accepted = next_accepted_source(&mut events, &mut previous_event_seq)?;
     let mut rejected = next_reject_source(&mut rejects)?;
@@ -374,14 +424,19 @@ fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
     Ok(())
 }
 
-struct VerifiedLines {
+pub(crate) struct VerifiedLines {
     path: PathBuf,
     reader: Option<BufReader<StreamingDecoder<File>>>,
     line: Vec<u8>,
+    max_line_bytes: u64,
 }
 
 impl VerifiedLines {
-    fn open(path: &Path, output: &super::CompressedOutput) -> Result<Self, String> {
+    pub(crate) fn open_limit(
+        path: &Path,
+        output: &super::CompressedOutput,
+        max_line_bytes: u64,
+    ) -> Result<Self, String> {
         let source =
             File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
         let logical = CodecLogicalIdentity {
@@ -400,17 +455,22 @@ impl VerifiedLines {
             path: path.to_path_buf(),
             reader: Some(BufReader::new(decoder)),
             line: Vec::new(),
+            max_line_bytes,
         })
     }
 
-    fn next_line(&mut self) -> Result<Option<&[u8]>, String> {
+    pub(crate) fn next_line(&mut self) -> Result<Option<&[u8]>, String> {
         self.line.clear();
         let read = self
             .reader
             .as_mut()
             .expect("reader is open")
+            .take(self.max_line_bytes.saturating_add(1))
             .read_until(b'\n', &mut self.line)
             .map_err(|error| format!("decoding {}: {error}", self.path.display()))?;
+        if read as u64 > self.max_line_bytes {
+            return Err("normalized line exceeds read limit".to_owned());
+        }
         if read == 0 {
             return Ok(None);
         }
@@ -423,7 +483,7 @@ impl VerifiedLines {
         Ok(Some(&self.line[..self.line.len() - 1]))
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
         self.reader
             .take()
             .expect("reader is open")
@@ -434,16 +494,34 @@ impl VerifiedLines {
     }
 }
 
-fn read_canonical_document<T>(path: &Path) -> Result<(T, Vec<u8>), String>
-where
-    T: DeserializeOwned + Serialize,
-{
-    let bytes =
-        std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
-    decode_canonical_document(&bytes, path)
+pub(crate) fn decode_receipt_document(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(DerivativeReceipt, Vec<u8>), String> {
+    // Select the frozen wire profile before interpreting its remaining fields.
+    // Unknown fields are ignored ONLY by this discriminator; the selected
+    // closed receipt decoder below rejects them and checks exact canonical bytes.
+    #[derive(serde::Deserialize)]
+    struct Profile {
+        receipt_version: u16,
+        normalized_schema_version: u16,
+        materializer_version: u16,
+    }
+    let profile: Profile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    match (
+        profile.receipt_version,
+        profile.normalized_schema_version,
+        profile.materializer_version,
+    ) {
+        (1, replay_domain::SEGMENT_SCHEMA_V3, 1) => decode_canonical_document(bytes, path),
+        _ => Err("unsupported derivative receipt/schema/materializer profile".into()),
+    }
 }
 
-fn decode_canonical_document<T>(bytes: &[u8], path: &Path) -> Result<(T, Vec<u8>), String>
+pub(crate) fn decode_canonical_document<T>(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(T, Vec<u8>), String>
 where
     T: DeserializeOwned + Serialize,
 {

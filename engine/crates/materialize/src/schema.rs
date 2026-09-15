@@ -9,6 +9,15 @@ pub const EVENT_SERIALIZATION_VERSION: u16 = 1;
 pub const REJECT_SERIALIZATION_VERSION: u16 = 1;
 pub const MATERIALIZER_VERSION: u16 = 1;
 
+/// Frozen first deployed-readable profile. New writers must add dispatch, not
+/// change this profile or reinterpret its existing wire types.
+fn validate_profile(schema: u16, materializer: u16) -> Result<(), String> {
+    match (schema, materializer) {
+        (replay_domain::SEGMENT_SCHEMA_V3, 1) => Ok(()),
+        _ => Err("unsupported derivative schema/materializer profile".to_owned()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizationPolicy {
@@ -151,28 +160,25 @@ pub struct DerivativeManifest {
 
 impl DerivativeManifest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.manifest_version != MANIFEST_VERSION {
+        if self.manifest_version != 1 {
             return Err(format!(
                 "unsupported derivative manifest version {}",
                 self.manifest_version
             ));
         }
-        if self.event_serialization_version != EVENT_SERIALIZATION_VERSION
-            || self.reject_serialization_version != REJECT_SERIALIZATION_VERSION
-            || self.materializer_version != MATERIALIZER_VERSION
-        {
+        if self.event_serialization_version != 1 || self.reject_serialization_version != 1 {
             return Err("unsupported derivative serialization version".to_owned());
         }
-        let spec = DerivativeSpec {
-            normalized_schema_version: self.normalized_schema_version,
-            normalizer_bundle_sha256: self.normalizer_bundle_sha256,
-            normalizer_config_sha256: self.normalizer_config_sha256,
-            policy: self.policy.clone(),
-        };
-        spec.validate_for(
-            self.source_receipt.window_start_ns,
-            self.source_receipt.window_end_ns,
-        )?;
+        validate_profile(self.normalized_schema_version, self.materializer_version)?;
+        if self.source_receipt.window_start_ns >= self.source_receipt.window_end_ns
+            || self.policy.effective_from_ns > self.source_receipt.window_start_ns
+            || self
+                .policy
+                .effective_until_ns
+                .is_some_and(|end| end < self.source_receipt.window_end_ns)
+        {
+            return Err("invalid derivative window or policy interval".to_owned());
+        }
         validate_address(&self.derivative_address, "derivative_address")?;
         validate_output(&self.events, "events.ndjson.zst")?;
         validate_output(&self.rejects, "rejects.ndjson.zst")?;
@@ -183,14 +189,22 @@ impl DerivativeManifest {
         {
             return Err("derivative interval is not the exact source window".to_owned());
         }
-        if self.counts.accepted_events + self.counts.normalization_fault_events
-            != self.events.logical.line_count
-            || self.counts.rejected_source_records + self.counts.intentionally_ignored_records
-                != self.rejects.logical.line_count
-            || self.counts.accepted_source_records
-                + self.counts.rejected_source_records
-                + self.counts.intentionally_ignored_records
-                != self.counts.input_records
+        if self
+            .counts
+            .accepted_events
+            .checked_add(self.counts.normalization_fault_events)
+            != Some(self.events.logical.line_count)
+            || self
+                .counts
+                .rejected_source_records
+                .checked_add(self.counts.intentionally_ignored_records)
+                != Some(self.rejects.logical.line_count)
+            || self
+                .counts
+                .accepted_source_records
+                .checked_add(self.counts.rejected_source_records)
+                .and_then(|n| n.checked_add(self.counts.intentionally_ignored_records))
+                != Some(self.counts.input_records)
         {
             return Err("derivative counts disagree with output identities".to_owned());
         }
@@ -216,18 +230,13 @@ pub struct DerivativeReceipt {
 
 impl DerivativeReceipt {
     pub fn validate(&self) -> Result<(), String> {
-        if self.receipt_version != RECEIPT_VERSION {
+        if self.receipt_version != 1 {
             return Err(format!(
                 "unsupported derivative receipt version {}",
                 self.receipt_version
             ));
         }
-        if self.normalized_schema_version != SEGMENT_SCHEMA_VERSION {
-            return Err("unsupported normalized schema version in receipt".to_owned());
-        }
-        if self.materializer_version != MATERIALIZER_VERSION {
-            return Err("unsupported materializer version in receipt".to_owned());
-        }
+        validate_profile(self.normalized_schema_version, self.materializer_version)?;
         validate_address(&self.derivative_address, "derivative_address")?;
         if self.manifest.file != "manifest.json" {
             return Err("receipt names an unsupported manifest file".to_owned());
@@ -331,7 +340,7 @@ impl RejectRecord {
     }
 
     fn from_wire(wire: RejectRecordWire) -> Result<Self, String> {
-        if wire.reject_version != REJECT_VERSION {
+        if wire.reject_version != 1 {
             return Err(format!(
                 "unsupported reject version {}",
                 wire.reject_version

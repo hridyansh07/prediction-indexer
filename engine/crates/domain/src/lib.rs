@@ -26,5 +26,8 @@ pub use numeric::{
     NumericError, PositiveQty, PriceUnit, Px, Qty, QuantityUnit,
 };
 
-/// Canonical persisted schema emitted and consumed by the Replay engine.
-pub const SEGMENT_SCHEMA_VERSION: u16 = 3;
+/// Frozen reader schema. Its types/serialization must remain available when a
+/// future writer schema is introduced; never retarget this constant.
+pub const SEGMENT_SCHEMA_V3: u16 = 3;
+/// Current writer selection, independent of historical reader dispatch.
+pub const SEGMENT_SCHEMA_VERSION: u16 = SEGMENT_SCHEMA_V3;

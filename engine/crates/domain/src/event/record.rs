@@ -86,7 +86,7 @@ impl SegmentRecord {
     }
 
     fn from_wire(wire: SegmentRecordWire) -> Result<Self, DomainError> {
-        if wire.schema_version != SEGMENT_SCHEMA_VERSION {
+        if wire.schema_version != crate::SEGMENT_SCHEMA_V3 {
             return Err(DomainError::UnsupportedSchemaVersion(wire.schema_version));
         }
         let header: EventHeader = serde_json::from_str(wire.header.get())

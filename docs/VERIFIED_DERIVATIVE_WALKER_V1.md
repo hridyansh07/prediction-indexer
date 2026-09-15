@@ -1,6 +1,7 @@
-# Verified derivative walker V1 — proposed
+# Verified derivative walker V1
 
-Status: independently reviewed design; implementation follows this contract.
+Status: independently reviewed design, implemented in `replay-materialize` and
+`replay-tape`. This document specifies the generic traversal boundary only.
 No production lower-bound policy is selected or approved by this document.
 
 ## Baseline and authority
@@ -20,16 +21,16 @@ No production lower-bound policy is selected or approved by this document.
   Clip versus ExpandToWindowStart. Minimal adapter lane attribution also remains
   unapproved, but generic caller-supplied filtering can avoid deciding it here.
 
-## What exists and what must change
+## Baseline gaps addressed by this implementation
 
-`replay-materialize::verify_derivative` verifies receipt/manifest bindings,
+At the base revision, `replay-materialize::verify_derivative` verified receipt/manifest bindings,
 canonical JSON, compressed identities, contiguous child indexes, source disposition
 counts, and reject/fault pairing. It returns metadata, not an open read capability.
 Its public metadata fields are mutable, and its compressed paths are reopened in
 successive verification passes. Calling it and then opening the original events
 path is not a verified-open lifecycle.
 
-The present verifier accepts only current format constants, and address
+The base verifier accepted only current format constants, and address
 recomputation uses current event/reject/materializer version constants. Its
 coexistence test changes bundle and source receipt identities, not schema or
 materializer versions. No walker, atomic-group reader, or projector exists.
@@ -39,7 +40,7 @@ materializer versions. No walker, atomic-group reader, or projector exists.
 rename it or add a competing key. FullBook, BookDelta, and AuditAnchor have
 `book_key()` accessors. Kalshi Outcome and Complement remain separate keys.
 
-## Ownership and proposed API
+## Ownership and API
 
 `replay-materialize` owns strict format dispatch, pinned open, source-disposition
 joining, immutable per-window verification, and opaque completion capabilities.
@@ -52,7 +53,8 @@ adjacent-window traversal, scope filtering, atomic groups, and traversal counter
 There is no dependency on venue adapters, book, strategies, or a new canonical
 reader. The existing transitive finalizer dependency stays in materialize.
 
-Proposed signatures (opaque types have private fields):
+Public signatures (opaque types have private fields; errors follow the existing
+`String` style rather than introducing wrapper error types):
 
 ```rust
 // replay-materialize
@@ -62,12 +64,12 @@ pub struct SourceDelivery { /* header, children, optional typed reject summary *
 pub struct FinishedWindow { /* exact pin, source receipt, counts, bounds */ }
 
 pub fn inspect_pinned(input: &PinnedDerivative, limits: &ReadLimits)
-    -> Result<DerivativeMetadata, ReadError>; // planning metadata, not event capability
+    -> Result<DerivativeMetadata, String>; // planning metadata, not event capability
 pub fn open_pinned(input: &PinnedDerivative, limits: &ReadLimits)
-    -> Result<VerifiedWindowReader, ReadError>;
+    -> Result<VerifiedWindowReader, String>;
 impl VerifiedWindowReader {
-    pub fn next_delivery(&mut self) -> Result<Option<SourceDelivery>, ReadError>;
-    pub fn finish(self) -> Result<FinishedWindow, ReadError>;
+    pub fn next_delivery(&mut self) -> Result<Option<SourceDelivery>, String>;
+    pub fn finish(self) -> Result<FinishedWindow, String>;
 }
 
 // replay-tape
@@ -80,13 +82,13 @@ pub struct WalkRequest {
 pub struct DerivativeWalker { /* no public constructor or mutable views */ }
 pub struct AtomicGroup { /* read-only deliveries and source span */ }
 pub struct FinishedWalk { /* requested/effective interval, exact pins, counters */ }
-pub enum WalkItem { WindowStatus(WindowStatus), Group(AtomicGroup) }
+pub enum WalkItem { WindowStatus(Box<WindowStatus>), Group(AtomicGroup) }
 
 impl DerivativeWalker {
     pub fn open(inputs: Vec<PinnedDerivative>, request: WalkRequest,
-                limits: ReadLimits) -> Result<Self, WalkError>;
-    pub fn next_item(&mut self) -> Result<Option<WalkItem>, WalkError>;
-    pub fn finish(self) -> Result<FinishedWalk, WalkError>;
+                limits: ReadLimits) -> Result<Self, String>;
+    pub fn next_item(&mut self) -> Result<Option<WalkItem>, String>;
+    pub fn finish(self) -> Result<FinishedWalk, String>;
 }
 ```
 
@@ -103,8 +105,9 @@ commit; writing such a bundle is not this task.
    directory name to agree. `inspect_pinned` verifies all manifest bindings and
    returns immutable planning metadata; open rechecks the same pin. The verified
    reader exposes immutable metadata getters.
-2. Copy the receipt-bound manifest, events, and rejects to an exclusively owned
-   private temporary snapshot using bounded copy buffers. Check per-file and
+2. Retain exact receipt/manifest bytes in bounded owned memory; copy events and
+   rejects to an exclusively owned private temporary snapshot using bounded copy
+   buffers. On Unix its directory mode is 0700 before content writes. Check per-file and
    total snapshot limits before copying and enforce them while copying. Never
    trust the original path's metadata as an identity or allocation size.
 3. Verify the private snapshot completely against the pinned receipt: strict
@@ -125,8 +128,8 @@ commit; writing such a bundle is not this task.
 Metadata for the selected run is bounded by `max_windows` and
 `max_metadata_bytes`. Only one complete stored window snapshot is retained at a
 time; disk is bounded by `max_snapshot_bytes`. RAM is bounded by metadata limits,
-scope limits, fixed codec/copy buffers, `max_line_bytes`, and
-`max_atomic_group_bytes`/`max_atomic_group_records`, plus one bounded lookahead.
+scope/lane limits, fixed codec/copy buffers, `max_line_bytes`, and
+`max_group_bytes`/`max_group_records`, plus one bounded lookahead.
 Use bounded reads, not `read_until` followed by a size check. Count unfiltered
 group data toward limits, so selecting one child cannot hide an oversized group.
 Limit overflow fails the attempt; it never splits a group, drops a record, or
@@ -174,6 +177,11 @@ Validate source-sequence density across the union, not just increasing event
 sequences. Ignored sources fill real sequence positions. The first sequence may
 be greater than one; it must be positive. Counts and the final union agree with
 the manifest; checked arithmetic rejects overflow.
+
+Per-lane source delivery indexes must strictly increase within and across
+windows, including empty intervening windows and filtered sources. A bounded
+`max_lanes` map remembers last indexes; it does not infer missing deliveries from
+index gaps or recompute canonical continuity classifications.
 
 A typed sidecar summary exposes reject ID, parser/error code, hint, impact, or
 ignored reason, and its original source header. Exact rejected bytes stay in the
