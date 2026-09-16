@@ -195,10 +195,7 @@ where
     let mut counts = DerivativeCounts::default();
     let mut reader = selection.open().map_err(BuildError::Audit)?;
 
-    loop {
-        let Some(source) = reader.next_record().map_err(BuildError::Audit)? else {
-            break;
-        };
+    while let Some(source) = reader.next_record().map_err(BuildError::Audit)? {
         counts.input_records = checked_add(counts.input_records, 1, "input_records")?;
         let normalized = catch_unwind(AssertUnwindSafe(|| normalizer.normalize(&source)))
             .map_err(|_| BuildError::NormalizerPanic)?

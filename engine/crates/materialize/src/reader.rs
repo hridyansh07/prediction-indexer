@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use replay_domain::{EventHeader, SegmentRecord};
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 use crate::verify::{VerifiedLines, decode_receipt_document, inspect_contents, verify_data};
 use crate::{
@@ -14,6 +14,9 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct ReadLimits {
+    /// Existing scratch directory on the intended data volume. None uses the
+    /// system temporary directory. Failure never falls back to another volume.
+    pub snapshot_root: Option<PathBuf>,
     pub max_metadata_bytes: u64,
     pub max_line_bytes: u64,
     pub max_snapshot_bytes: u64,
@@ -27,6 +30,7 @@ pub struct ReadLimits {
 impl Default for ReadLimits {
     fn default() -> Self {
         Self {
+            snapshot_root: None,
             max_metadata_bytes: 1024 * 1024,
             max_line_bytes: 16 * 1024 * 1024,
             max_snapshot_bytes: 8 * 1024 * 1024 * 1024,
@@ -448,7 +452,13 @@ pub(crate) fn open_pinned_with_checkpoint(
             limits.max_snapshot_bytes,
         )?;
     }
-    let snapshot = TempDir::new("replay-verified-window").map_err(|e| e.to_string())?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("replay-verified-window-");
+    let snapshot = match &limits.snapshot_root {
+        Some(root) => builder.tempdir_in(root),
+        None => builder.tempdir(),
+    }
+    .map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

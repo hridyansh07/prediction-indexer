@@ -36,6 +36,7 @@ enum FakeMode {
     Panic,
     FailFinish,
     UnpairedFault,
+    ControlLineBytes(usize),
 }
 
 struct FakeNormalizer {
@@ -141,6 +142,22 @@ impl Normalize for FakeNormalizer {
             FakeMode::FailRecord => return Err(NormalizerError::new("internal defect")),
             FakeMode::Panic => panic!("adapter panic"),
             FakeMode::Normal | FakeMode::Divergent | FakeMode::FailFinish => {}
+            FakeMode::ControlLineBytes(length) => {
+                let header = event_header(source, 0).unwrap();
+                let small =
+                    SegmentEvent::Control(ControlEvent::ConnectionClosed { epoch: "x".into() });
+                let overhead = replay_domain::SegmentRecord::new(header, small)
+                    .unwrap()
+                    .to_canonical_json()
+                    .len();
+                // One existing epoch byte is replaced by padding; the LF adds
+                // one byte, cancelling that removed byte.
+                return Ok(Normalization::Events(vec![SegmentEvent::Control(
+                    ControlEvent::ConnectionClosed {
+                        epoch: "x".repeat(length - overhead),
+                    },
+                )]));
+            }
             FakeMode::UnpairedFault => {
                 return Ok(Normalization::Events(vec![
                     SegmentEvent::NormalizationFault(
@@ -1235,5 +1252,95 @@ fn pinned_snapshot_races_and_post_verification_io_errors_fail_closed() {
         }
         assert_eq!(sources, 3);
         assert_eq!(retry.finish().unwrap().metadata().pin(), &input.pin);
+    }
+}
+
+#[test]
+fn snapshot_root_is_used_without_fallback_and_cleaned_on_drop_or_failure() {
+    use crate::reader::{ReadCheckpoint, open_pinned_with_checkpoint};
+    let canonical = TempDir::new("scratch-source").unwrap();
+    let output = TempDir::new("scratch-output").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    canonical_fixture(canonical.path());
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    let input = PinnedDerivative {
+        directory: built.derivative.directory,
+        pin: built.derivative.pin,
+    };
+    let mut limits = ReadLimits {
+        snapshot_root: Some(scratch.path().to_path_buf()),
+        ..ReadLimits::default()
+    };
+    let reader = open_pinned_with_checkpoint(&input, &limits, |stage, path| {
+        if stage == ReadCheckpoint::SnapshotCopied {
+            assert_eq!(path.parent(), Some(scratch.path()));
+            assert!(path.join("events.ndjson.zst").is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 1);
+    drop(reader);
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    assert!(
+        open_pinned_with_checkpoint(&input, &limits, |stage, path| {
+            if stage == ReadCheckpoint::SnapshotCopied {
+                fs::write(path.join("events.ndjson.zst"), []).unwrap();
+            }
+        })
+        .is_err()
+    );
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    limits.snapshot_root = Some(scratch.path().join("missing-volume"));
+    assert!(open_pinned(&input, &limits).is_err());
+    assert!(!limits.snapshot_root.as_ref().unwrap().exists());
+    limits.snapshot_root = Some(input.directory.join("receipt.json"));
+    assert!(open_pinned(&input, &limits).is_err());
+}
+
+#[test]
+fn default_build_line_limit_includes_lf_and_fails_before_commit() {
+    for extra in [0, 1] {
+        let canonical = TempDir::new("line-limit-source").unwrap();
+        let output = TempDir::new("line-limit-output").unwrap();
+        canonical_fixture_count(canonical.path(), 1, 10);
+        let result = build_window(
+            canonical.path(),
+            output.path(),
+            0,
+            10,
+            &spec(),
+            &mut FakeNormalizer::new(FakeMode::ControlLineBytes(
+                ReadLimits::default().max_line_bytes as usize + extra,
+            )),
+        );
+        if extra == 0 {
+            let built = result.unwrap();
+            assert_eq!(
+                built.derivative.manifest.events.logical.byte_length,
+                ReadLimits::default().max_line_bytes
+            );
+            verify_derivative(&built.derivative.directory).unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(BuildError::Verification(ref message)) if message == "normalized line exceeds read limit")
+            );
+            assert!(output_directories(output.path()).is_empty());
+        }
     }
 }
