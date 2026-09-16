@@ -230,6 +230,21 @@ defines the reviewed contract and acceptance cases.
 
 RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
 holds one bounded compressed window. Oversized groups fail rather than split.
+Set `ReadLimits { snapshot_root: Some(data_volume_scratch), ..Default::default() }`
+to place `tempfile` snapshots on the data volume. The root must already exist;
+failure never falls back to system temporary storage. `None` uses the system
+temporary directory. The 8 GiB per-reader cap does not reserve free space or
+budget concurrent readers. Ordinary drop/error removes the owned snapshot only.
+
+The default 16 MiB NDJSON-line limit (including LF), 1 MiB metadata-document
+limit, and group/lane limits also deliberately apply to build-candidate
+verification: oversized candidates fail before publication, rather than produce
+artifacts rejected by the default verifier. These are operational limits, not
+wire-format changes. Verification currently performs three full decode passes
+before traversal; a single-pass refactor and typed error categories are deferred.
+Do not infer retryability from error strings; an error invalidates the attempt,
+and any fresh retry must retain the explicit pins.
+
 Window status includes uncertified/empty evidence but reports detailed coverage
 as `NotRecordedInDerivativeV1`: missing/invalid lane details were not persisted.
 No production interval policy, scope resolver, projector, strategy, or audit

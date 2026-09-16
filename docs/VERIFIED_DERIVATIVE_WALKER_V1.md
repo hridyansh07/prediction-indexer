@@ -8,8 +8,12 @@ No production lower-bound policy is selected or approved by this document.
 
 - Requested `rework/replay-kalshi-final` was merged as PR #30 and deleted before
   this work started. GitHub reports its final head as
-  `17c38d7e50b8192c95ff94770519a7949c757a1e`; this is the exact implementation base,
+  `17c38d7e50b8192c95ff94770519a7949c757a1e`; this was the initial implementation base,
   not the older parent-thread reference `acd651b8e084ea3d678c391e8c0d214b29ab2e99`.
+- PR #30 was squash-merged into `master` as
+  `c4c09b99b786cb2bfab657e88c8cebaad92bf1ea`. The walker-only commits were
+  subsequently rebased onto that commit; `master` is the repository's default
+  branch (there is no `main`). Review against `master`, not the old PR ancestry.
 - The authoritative Replay design is `docs/REPLAY_ENGINE_V1.md` at
   `origin/rework/replay-pipeline`, commit
   `a3caab228a4a5f9d56694875be8c06a929d691d9`. Do not merge that branch to obtain it.
@@ -135,6 +139,31 @@ group data toward limits, so selecting one child cannot hide an oversized group.
 Limit overflow fails the attempt; it never splits a group, drops a record, or
 silently retries with another policy. Caller-retained output groups are caller
 memory, not walker-retained history.
+
+`ReadLimits::snapshot_root` selects an existing scratch directory; `None` uses
+the system temporary directory. Production callers should set `Some(path)` on
+the data volume, not rely on root-disk `$TMPDIR` capacity. `tempfile` creates a
+private per-window child there; missing/unwritable roots fail without fallback or
+automatic root creation. The reader deletes only its owned child on ordinary
+drop or error. The 8 GiB default snapshot cap is per reader, not a free-space
+reservation or process-wide quota; concurrent readers need an external budget.
+
+Build verification intentionally uses default verification limits too: 16 MiB
+per logical NDJSON line including LF, 1 MiB per metadata document, 64 MiB/100,000
+records per atomic group, and 1,024 lanes. Pinned inspection additionally limits
+combined receipt/manifest bytes to 1 MiB. These are operational limits, not new
+wire-schema restrictions. An oversized candidate fails before receipt publication;
+no truncation or partial commit is permitted. Changing these defaults therefore
+requires considering builders as well as walkers. Build verification does not
+create a private snapshot or impose the walker's selected-window/scope limits.
+
+The current implementation retains three complete verification passes (pairing,
+dispositions, source/tie semantics), then traversal. This is bounded-memory but
+costs repeated decompression, including excluded tails. Consolidating the shared
+verifier and delivery join is deferred as a separately tested refactor. Errors
+remain diagnostic strings; callers must not classify retryability by matching
+text. Every error invalidates the attempt. Any retry creates a fresh walker with
+the same pins; no automatic retry policy is provided.
 
 ## Minimum version-coexistence mechanism
 
