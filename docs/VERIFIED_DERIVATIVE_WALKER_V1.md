@@ -313,6 +313,10 @@ never an interpretation of lane names.
   groups, including ignored delivery summaries on relevant lanes. Continuity
   faults on relevant lanes cannot disappear just because their child instrument
   is filtered out: retain a typed source-only diagnostic in that case.
+  Profile-2 deliveries on explicitly selected lanes also retain source-only
+  headers and epochs when all children are excluded, even for healthy continuity.
+  A reconnect can first appear on another instrument. Excluded children remain
+  excluded; these source-only deliveries count as included sources, not events.
 - Duplicates stay visible and retain their payload/provenance. The future cursor
   must suppress duplicate mutation before processing events. Conflict, gap,
   backwards cursor, and broken counter remain distinct facts; the walker does
