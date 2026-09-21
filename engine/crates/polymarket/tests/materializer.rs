@@ -254,8 +254,7 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
     );
     let verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(verified.pin, first.derivative.pin);
-    // V2 parser/bundle output identities, independent of compression-library
-    // versions and local paths.
+    // Parser V2 with materializer profile 2. Local paths are not addressed.
     assert_eq!(
         format!(
             "{}:{}:{}",
@@ -263,7 +262,7 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
             verified.manifest.events.logical.sha256.as_hex(),
             verified.manifest.rejects.logical.sha256.as_hex()
         ),
-        "43a8e503bcf736e8e6883794a478317fe2feee1fad91c34a7da10720d71a2966:d2996e825487447bf3a85f6319e14e2d03354e5965ad3b9a09cbb01f1a57ab92:a5b1c5e2422c7b99da707330754313a464c22a5ba147e384e86ffd25e191cc97"
+        "f479b6409d1b4fb1959249334f066e51629b0ae4f5f095aee7d91a5b52fc4f83:d340a1e589588f5ca2973fa5cde5c09b60a62ab052fef4bf3739d7eee948d923:b5738391ca7853b6c1bea0c9fded63bacd03ed724a1946fdf4cf6bcf3125850b"
     );
     let records = read_events(&verified);
     let malformed_fault = records

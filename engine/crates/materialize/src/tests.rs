@@ -259,6 +259,245 @@ fn canonical_fixture(root: &Path) {
     canonical_fixture_count(root, 3, 10);
 }
 
+#[test]
+fn derivative_records_transport_and_receipt_evidence() {
+    let canonical = TempDir::new("source-evidence-input").unwrap();
+    let output = TempDir::new("source-evidence-output").unwrap();
+    canonical_fixture(canonical.path());
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+    )
+    .unwrap();
+    assert!(
+        built
+            .derivative
+            .directory
+            .join("sources.ndjson.zst")
+            .is_file(),
+        "accepted, rejected and ignored deliveries lose their connection identity"
+    );
+    let manifest = serde_json::to_value(&built.derivative.manifest).unwrap();
+    assert!(
+        manifest["source_receipt"]["document"].is_string(),
+        "the derivative loses receipt-bound lane and clock evidence"
+    );
+    let input = PinnedDerivative {
+        directory: built.derivative.directory,
+        pin: built.derivative.pin,
+    };
+    let mut reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+    assert!(reader.metadata().supports_source_evidence());
+    for count in [2, 0, 1] {
+        let delivery = reader.next_delivery().unwrap().unwrap();
+        assert_eq!(delivery.connection_epoch(), Some("epoch"));
+        assert_eq!(delivery.records().len(), count);
+    }
+    assert!(reader.next_delivery().unwrap().is_none());
+    assert!(
+        reader
+            .finish()
+            .unwrap()
+            .metadata()
+            .supports_source_evidence()
+    );
+}
+
+#[test]
+fn frozen_profile1_exact_pin_and_missing_capability() {
+    let root = TempDir::new("frozen-profile1").unwrap();
+    let address = "5b2a4358be376144d898f0c0671b25c23dc2f8de946d16cc049b3b9f92685ea4";
+    let directory = root.path().join(address);
+    fs::create_dir(&directory).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile1");
+    for name in [
+        "events.ndjson.zst",
+        "rejects.ndjson.zst",
+        "manifest.json",
+        "receipt.json",
+    ] {
+        fs::copy(fixture.join(name), directory.join(name)).unwrap();
+    }
+    let pin = DerivativePin {
+        derivative_address: address.into(),
+        receipt_sha256: Sha256::from_hex(
+            "4ecc6f2b25224e2988cb2879575fa4d8800a5c5d4dc7470dbbaba518d29fe5b8",
+        )
+        .unwrap(),
+    };
+    assert_eq!(verify_derivative(&directory).unwrap().pin, pin);
+    let old_receipt = fs::read_to_string(directory.join("receipt.json")).unwrap();
+    let extra = old_receipt.replacen(
+        "\"receipt_version\":1",
+        "\"receipt_version\":1,\"sources\":null",
+        1,
+    );
+    assert!(
+        verify::decode_receipt_document(extra.as_bytes(), &directory.join("receipt.json")).is_err()
+    );
+    let old_manifest = fs::read_to_string(directory.join("manifest.json")).unwrap();
+    let extra = old_manifest.replacen(
+        "\"certified\":true",
+        "\"certified\":true,\"document\":null",
+        1,
+    );
+    assert!(
+        verify::decode_canonical_document::<crate::profile1::Manifest>(
+            extra.as_bytes(),
+            &directory.join("manifest.json")
+        )
+        .is_err()
+    );
+    let mut reader = open_pinned(
+        &PinnedDerivative {
+            directory,
+            pin: pin.clone(),
+        },
+        &ReadLimits::default(),
+    )
+    .unwrap();
+    assert!(!reader.metadata().supports_source_evidence());
+    assert!(reader.metadata().coverage().is_none());
+    let mut positions = Vec::new();
+    while let Some(delivery) = reader.next_delivery().unwrap() {
+        assert_eq!(delivery.connection_epoch(), None);
+        positions.push((
+            delivery.header().address().canonical_seq(),
+            delivery.records().len(),
+        ));
+    }
+    assert_eq!(positions, [(1, 2), (2, 0), (3, 1)]);
+    assert_eq!(reader.finish().unwrap().metadata().pin(), &pin);
+}
+
+#[test]
+fn receipt_evidence_rejects_tampering_and_inconsistent_upstream_claims() {
+    let canonical = TempDir::new("coverage-validation").unwrap();
+    canonical_fixture(canonical.path());
+    let document =
+        fs::read_to_string(window_directory(canonical.path(), 0).join("receipt.json")).unwrap();
+    let baseline = SourceReceipt {
+        window_start_ns: 0,
+        window_end_ns: 10,
+        byte_length: document.len() as u64,
+        sha256: Sha256::digest(document.as_bytes()),
+        certified: true,
+        document: Some(document.clone()),
+    };
+    assert!(CoverageEvidence::from_source(&baseline).is_ok());
+    let mut changed = baseline.clone();
+    changed.document.as_mut().unwrap().push(' ');
+    assert_eq!(
+        CoverageEvidence::from_source(&changed).unwrap_err(),
+        "source receipt document identity mismatch"
+    );
+    for mutation in [
+        "expected",
+        "present",
+        "missing",
+        "invalid",
+        "clock",
+        "empty",
+        "count",
+        "sequence",
+        "unknown",
+        "unrecorded_clock",
+    ] {
+        let mut receipt: Value = serde_json::from_str(&document).unwrap();
+        match mutation {
+            "expected" => receipt["expected_lanes"] = json!(["polymarket", "absent"]),
+            "present" => receipt["present_lanes"] = json!([]),
+            "missing" => {
+                receipt["missing_lanes"] =
+                    json!([{"lane":"polymarket","reason":"lane_missing","detail":null}])
+            }
+            "invalid" => {
+                receipt["invalid_lanes"] =
+                    json!([{"lane":"other","reason":"guessed","detail":"broken"}])
+            }
+            "clock" => {
+                receipt["clock_faults"] = json!([{"lane":"polymarket","window_start_ns":1,"previous_visible_ns":3,"observed_visible_ns":5}])
+            }
+            "empty" => receipt["inputs"] = json!([]),
+            "count" => receipt["inputs"][0]["line_count"] = json!(2),
+            "sequence" => receipt["first_canonical_seq"] = json!(2),
+            "unknown" => receipt["invented"] = json!(true),
+            "unrecorded_clock" => {
+                receipt.as_object_mut().unwrap().remove("clock_faults");
+            }
+            _ => unreachable!(),
+        }
+        let mut source = baseline.clone();
+        let altered = serde_json::to_string(&receipt).unwrap();
+        source.sha256 = Sha256::digest(altered.as_bytes());
+        source.byte_length = altered.len() as u64;
+        source.document = Some(altered);
+        assert!(
+            CoverageEvidence::from_source(&source).is_err(),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+fn clock_quarantine_is_walkable_but_observation_must_match_delivery() {
+    for observed in [1, 2] {
+        let canonical = TempDir::new("clock-coverage").unwrap();
+        let output = TempDir::new("clock-output").unwrap();
+        canonical_fixture(canonical.path());
+        let path = window_directory(canonical.path(), 0).join("receipt.json");
+        let mut receipt: CanonicalReceipt =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        receipt.certified = false; // complete inventory, quarantined clock
+        receipt.clock_faults.push(indexer_finalize::ClockFault {
+            window_start_ns: 0,
+            lane: "polymarket".into(),
+            previous_visible_ns: 9,
+            observed_visible_ns: observed,
+        });
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+        )
+        .unwrap();
+        let result = build_window(
+            canonical.path(),
+            output.path(),
+            0,
+            10,
+            &spec(),
+            &mut FakeNormalizer::new(FakeMode::Normal),
+        );
+        if observed == 1 {
+            let built = result.unwrap();
+            let mut reader = open_pinned(
+                &PinnedDerivative {
+                    directory: built.derivative.directory,
+                    pin: built.derivative.pin,
+                },
+                &ReadLimits::default(),
+            )
+            .unwrap();
+            assert!(!reader.metadata().manifest().source_receipt.certified);
+            assert_eq!(reader.metadata().coverage().unwrap().faults().len(), 1);
+            while reader.next_delivery().unwrap().is_some() {}
+            reader.finish().unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                BuildError::Verification(
+                    "source clock diagnosis disagrees with first delivery".into()
+                )
+            );
+            assert!(output_directories(output.path()).is_empty());
+        }
+    }
+}
+
 fn canonical_fixture_count(root: &Path, count: i64, window_end_ns: u64) {
     let directory = window_directory(root, 0);
     fs::create_dir_all(&directory).unwrap();
@@ -673,9 +912,10 @@ fn address_binds_every_version_and_policy_input() {
         byte_length: 100,
         sha256: digest('a'),
         certified: true,
+        document: None,
     };
     let base = spec();
-    let base_address = derivative_address(&source, &base).unwrap();
+    let base_address = derivative_address_versions(&source, &base, 1, 1, 1).unwrap();
     assert_eq!(
         base_address,
         "71df204dafc347cee916dcf38a9ffcc4b765f2bd612e5cbc65300885f35268b0"

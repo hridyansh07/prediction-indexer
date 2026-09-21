@@ -7,6 +7,9 @@ use replay_domain::{
     BookEvent, BookKey, ContinuityVerdict, EventAddress, EventHeader, FaultImpact, InstrumentId,
     LaneId, SegmentEvent, SegmentRecord,
 };
+pub use replay_materialize::{
+    CoverageEvidence, LaneCoverage, LaneState, SourceFault, SourceFaultReason,
+};
 pub use replay_materialize::{DerivativeMetadata, DerivativePin, PinnedDerivative, ReadLimits};
 use replay_materialize::{
     RejectDisposition, SourceDelivery, VerifiedWindowReader, inspect_pinned, open_pinned,
@@ -77,10 +80,15 @@ pub struct WalkCounts {
 #[derive(Debug, PartialEq, Eq)]
 pub struct FilteredDelivery {
     header: EventHeader,
+    connection_epoch: Option<String>,
     records: Vec<SegmentRecord>,
     disposition: Option<RejectDisposition>,
 }
 impl FilteredDelivery {
+    /// Exact splice connection identity, or None for the frozen old profile.
+    pub fn connection_epoch(&self) -> Option<&str> {
+        self.connection_epoch.as_deref()
+    }
     pub fn header(&self) -> &EventHeader {
         &self.header
     }
@@ -138,6 +146,7 @@ impl AtomicGroup {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoverageDetails {
     NotRecordedInDerivativeV1,
+    ReceiptBoundV2,
 }
 
 #[derive(Debug)]
@@ -149,7 +158,14 @@ impl WindowStatus {
         &self.metadata
     }
     pub fn coverage_details(&self) -> CoverageDetails {
-        CoverageDetails::NotRecordedInDerivativeV1
+        if self.metadata.supports_source_evidence() {
+            CoverageDetails::ReceiptBoundV2
+        } else {
+            CoverageDetails::NotRecordedInDerivativeV1
+        }
+    }
+    pub fn coverage(&self) -> Option<&CoverageEvidence> {
+        self.metadata.coverage()
     }
 }
 
@@ -165,8 +181,13 @@ pub struct FinishedWalk {
     effective_start_ns: u64,
     pins: Vec<DerivativePin>,
     counts: WalkCounts,
+    source_evidence_complete: bool,
 }
 impl FinishedWalk {
+    /// True only when every pinned window, including empty ones, has profile-2 evidence.
+    pub fn supports_source_evidence(&self) -> bool {
+        self.source_evidence_complete
+    }
     pub fn request(&self) -> &WalkRequest {
         &self.request
     }
@@ -476,6 +497,7 @@ impl DerivativeWalker {
         add(&mut self.counts.included_sources, 1, u64::MAX)?;
         Ok(Some(FilteredDelivery {
             header: h.clone(),
+            connection_epoch: delivery.connection_epoch().map(str::to_owned),
             records,
             disposition,
         }))
@@ -486,6 +508,10 @@ impl DerivativeWalker {
             return Err("walker requires verified EOF before finish".into());
         }
         Ok(FinishedWalk {
+            source_evidence_complete: self
+                .windows
+                .iter()
+                .all(|(_, metadata)| metadata.supports_source_evidence()),
             request: self.request,
             effective_start_ns: self.effective_start_ns,
             pins: self

@@ -187,28 +187,28 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
             .intentionally_ignored_records,
         1
     );
-    // V4 changes parser/bundle identity and therefore the paired fault
-    // reference, reject sidecar, derivative address, and receipt. Accepted
+    // Materializer profile 2 changes the paired fault reference, reject
+    // sidecar, derivative address, and receipt. Accepted
     // non-fault event wire bytes remain covered by conformance tests.
     assert_eq!(
         first.derivative.manifest.events.logical.sha256.as_hex(),
-        "5aa1f34d50b28dd4527f7912714b98e4c054ef9195557c4afebad1f2908272b3"
+        "eb7cd9a9050635f923c5f7476e5a01a3fbeda414ae8f43a37404f4021acbe80a"
     );
     assert_eq!(first.derivative.manifest.events.logical.byte_length, 2304);
     assert_eq!(first.derivative.manifest.events.logical.line_count, 3);
     assert_eq!(
         first.derivative.manifest.rejects.logical.sha256.as_hex(),
-        "1995c4bd43c818b87f1bf62b7c7cabd3c2fed2dcfe67e6ea5826126bd6590a96"
+        "2a792ad161994c7e06e7b210dff25aa4edc9327746aca8397977dbbf61958cc1"
     );
     assert_eq!(first.derivative.manifest.rejects.logical.byte_length, 2113);
     assert_eq!(first.derivative.manifest.rejects.logical.line_count, 2);
     assert_eq!(
         first.derivative.pin.derivative_address,
-        "f1015f60cc79cd4345717ef5ee7d04233ce46f2b36401c4116b41b147d2d1481"
+        "0c16ee7392118e96650fc8b361934ffffa7250be29240194d7493073df6aedc4"
     );
     assert_eq!(
         first.derivative.pin.receipt_sha256.as_hex(),
-        "e86294dd94d2779858cddd7d215d0dffe16baacd451e8630122191c753eef726"
+        "a1be1bfd954bbe2dd6eef48891a90d8167e28d77bc014f7970ba5193ccef9d1a"
     );
     let independently_verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(independently_verified.pin, first.derivative.pin);

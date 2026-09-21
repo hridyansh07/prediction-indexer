@@ -331,13 +331,12 @@ after the whole private snapshot has verified. It returns a status even when the
 window has no admitted groups. Do not hide statuses in an unbounded history or
 provide a convenience group-only API that silently drops them.
 
-Current derivative metadata preserves only source `certified`, not the source
-receipt's missing/invalid lanes or clock-fault details. Report
-`coverage_details = NotRecordedInDerivativeV1`; do not invent those details,
-reopen canonical windows, or call uncertified data complete. This is sufficient
-for an evidence walker, not for the later projector's lane-availability contract.
-That later contract needs a separately versioned derivative metadata extension
-binding exact source coverage evidence. Do not silently add a field to V1 here.
+Frozen profile-1 metadata preserves only source `certified`. It reports
+`coverage_details = NotRecordedInDerivativeV1`, `coverage() = None`, and
+`connection_epoch() = None`; no details are invented or recovered from canonical
+windows. New builds use the profile-2 extension below. Uncertified windows with
+attributed upstream faults remain walkable; neither profile adds a certified-only
+gate.
 
 Count included/excluded sources and children, interval exclusions, rejects,
 ignored sources, and groups. Scope exclusion is not normalization failure. Empty
@@ -345,6 +344,84 @@ selected results still return statuses and require verified EOF/finish.
 A source is included when at least one child or required source diagnostic
 survives; excluded children are counted separately. A reject/fault pair is one
 source, not two.
+
+## Implemented source-evidence profile 2
+
+The normalized domain remains schema 3, with event and reject serialization 1.
+Receipt, manifest, and materializer versions are **2**. Profile 1 retains separate
+closed metadata wire readers (`materialize/src/profile1.rs`), exact canonical
+byte verification before runtime conversion, and its original address algorithm.
+No migration, readdressing, historical normalizer load, or changed venue adapter
+is required. Unknown profile tuples and extra fields fail closed.
+
+Profile 2 requires two additions:
+
+1. `SourceReceipt.document` is the **exact UTF-8 canonical receipt document**, not
+   a reserialization. Its bytes must match the existing source SHA-256/length and
+   its interval/certification must match the projection. `CanonicalSelection::
+   receipt_documents(maximum_bytes)` captures bounded bytes matching the selected
+   identity; publication still requires the matching finished canonical audit.
+   This does not alter canonical persisted formats or finalizer diagnoses.
+2. `sources.ndjson.zst` is a third level-3, checksummed single-frame stream. Every
+   source has exactly one closed record, in source-union order:
+   `{"source_version":1,"header":<schema-3 EventHeader at child 0>,"connection_epoch":"..."}`.
+   Both manifest and receipt bind its logical/stored identities. Its count equals
+   `input_records`. It follows the same staging, fsync, receipt-last, snapshot,
+   resource-limit, strict EOF, and poison rules as events/rejects.
+
+The existing address preimage uses the profile-2 source projection (including
+the exact document) and materializer version 2. That version fixes source
+serialization 1; changing it needs another supported profile. Reject IDs keep
+their existing algorithm but bind the new derivative address. Schema-3 accepted
+event bytes and normalizer bundle identities do not change.
+
+The sidecar header must match every child's source header, modulo child index,
+and any rejected/ignored envelope must also match its epoch. One source owns one
+epoch, so children cannot disagree. This is the splice's connection identity,
+not a venue cursor/version or a lane-global/venue-global reset. Reconnects are
+visible even without opening controls in the selection. No epoch inference,
+duplicate suppression, child removal, or book mutation occurs. As with normalized
+payloads, verification proves the pinned committed interpretation; it cannot
+detect consistently mis-authored accepted metadata under an entirely new pin
+without re-auditing canonical evidence.
+
+`CoverageEvidence` validates the receipt's expected/present/missing/invalid and
+unexpected inventories, input counts, sequence range, completeness/certification,
+and explicit clock diagnoses. Traversal independently reconciles actual per-lane
+counts and first clock-fault observations. A missing `clock_faults` field is not
+accepted as an explicit empty diagnosis in profile 2. It exposes:
+
+```rust
+SourceDelivery::connection_epoch(&self) -> Option<&str>
+FilteredDelivery::connection_epoch(&self) -> Option<&str>
+DerivativeMetadata::supports_source_evidence(&self) -> bool
+DerivativeMetadata::coverage(&self) -> Option<&CoverageEvidence>
+WindowStatus::coverage_details(&self) -> CoverageDetails
+WindowStatus::coverage(&self) -> Option<&CoverageEvidence>
+CoverageEvidence::lane(&self, lane: &LaneId) -> LaneCoverage
+CoverageEvidence::faults(&self) -> &[SourceFault]
+FinishedWalk::supports_source_evidence(&self) -> bool
+```
+
+`LaneCoverage { expected, state }` distinguishes `NotExpected`,
+`Present { records: 0 }`, nonempty `Present`, `Missing`, and `Invalid { detail }`.
+An unexpected observed lane retains its state with `expected: false`.
+`SourceFault { lane, start_ns, end_ns, reason }` preserves `LaneMissing`,
+`LaneInvalid { detail }`, and `VisibleClockRegression { previous_visible_ns,
+observed_visible_ns }`. Intervals are the upstream half-open storage window, not
+clipped request bounds. Status exposes all faults, including out-of-scope/audit
+lanes, before any group—even in empty windows. Consumers receive diagnoses, not
+invented tape events. Assigning a lane to books versus audit remains an explicit
+planner/risk responsibility; spelling supplies no role.
+
+The EOF capability reports source-evidence support only if **every** selected
+window has profile 2. Mixed-profile walks remain valid evidence walks but return
+false. Strong risk must require this capability and check planned lane coverage;
+`certified` alone is not a substitute. Source metadata survives scope filtering
+and both clipping bounds. The frozen profile-1 fixture under
+`materialize/tests/fixtures/profile1` was produced with the pre-extension writer
+at walker tip `5552d2fa3011c44258ce6fd65d53c0a6830a03a9`, not reconstructed by the
+new writer; tests pin its exact address and receipt hash.
 
 ## EOF, errors, and completion
 

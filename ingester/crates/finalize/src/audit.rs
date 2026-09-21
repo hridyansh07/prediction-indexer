@@ -101,6 +101,36 @@ impl CanonicalSelection {
         self.windows.iter().map(|window| &window.identity)
     }
 
+    /// Exact bounded commit-marker bytes, matched to the selected identities.
+    /// These are planning evidence; callers still need the finished audit.
+    pub fn receipt_documents(&self, maximum_bytes: u64) -> Result<Vec<Vec<u8>>, String> {
+        use std::io::Read;
+        let mut remaining = maximum_bytes;
+        self.windows
+            .iter()
+            .map(|window| {
+                let path = receipt_path(&self.canonical_root, window.identity.window_start_ns);
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .map_err(|e| e.to_string())?
+                    .take(remaining.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                remaining = remaining
+                    .checked_sub(bytes.len() as u64)
+                    .ok_or("receipt documents exceed byte limit")?;
+                if bytes.len() as u64 != window.identity.byte_length
+                    || Sha256::digest(&bytes) != window.identity.sha256
+                    || serde_json::from_slice::<Receipt>(&bytes).map_err(|e| e.to_string())?
+                        != window.receipt
+                {
+                    return Err("selected receipt changed before evidence capture".into());
+                }
+                Ok(bytes)
+            })
+            .collect()
+    }
+
     pub fn open(self) -> Result<AuditedCanonicalReader, String> {
         AuditedCanonicalReader::new(self)
     }

@@ -394,3 +394,21 @@ fn uncertified_windows_require_an_explicit_policy() {
     let (_, audited) = read_all(temp.path(), 0, 10, policy).unwrap();
     assert!(!audited.receipt_identities()[0].certified);
 }
+
+#[test]
+fn receipt_documents_are_exact_bounded_and_rechecked_against_selection() {
+    let temp = TempDir::new("receipt-documents").unwrap();
+    add_window(temp.path(), 0, 10, &[(1, 2)], true);
+    let path = window_directory(temp.path(), 0).join("receipt.json");
+    let bytes = fs::read(&path).unwrap();
+    let selection = select_canonical_windows(temp.path(), 0, 10, Default::default()).unwrap();
+    assert_eq!(
+        selection.receipt_documents(bytes.len() as u64).unwrap(),
+        [bytes.clone()]
+    );
+    assert!(selection.receipt_documents(bytes.len() as u64 - 1).is_err());
+    let mut changed = bytes;
+    changed.push(b' '); // Semantically identical is still a different commit marker.
+    fs::write(path, changed).unwrap();
+    assert!(selection.receipt_documents(1_000_000).is_err());
+}

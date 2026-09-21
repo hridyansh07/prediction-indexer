@@ -26,6 +26,7 @@ struct Row<'a> {
     time: u64,
     payload: &'a str,
     continuity: &'a str,
+    epoch: &'a str,
 }
 fn row<'a>(lane: &'a str, time: u64, payload: &'static str) -> Row<'a> {
     Row {
@@ -33,6 +34,7 @@ fn row<'a>(lane: &'a str, time: u64, payload: &'static str) -> Row<'a> {
         time,
         payload,
         continuity: "continuous",
+        epoch: "e",
     }
 }
 
@@ -88,7 +90,7 @@ fn canonical(root: &Path, start: u64, end: u64, first: i64, rows: &[Row<'_>], ce
             json!({"type":"unsequenced","counter":seq})
         };
         let envelope = json!({"envelope_version":2,"delivery_index":first as u64 + *local - 1,"record_id":id,"visible_ns":row.time,"monotonic_ns":row.time,
-            "venue":row.lane,"stream":"public_book","connection_epoch":"e","local_counter":local,"source_cursor":cursor,
+            "venue":row.lane,"stream":"public_book","connection_epoch":row.epoch,"local_counter":local,"source_cursor":cursor,
             "kind":"venue_frame","raw_payload":row.payload});
         evidence.extend_from_slice(format!("{envelope}\n").as_bytes());
         let tie = rows
@@ -118,10 +120,22 @@ fn canonical(root: &Path, start: u64, end: u64, first: i64, rows: &[Row<'_>], ce
         window_end_ns: end,
         completeness: if certified { "complete" } else { "incomplete" }.into(),
         certified,
-        expected_lanes: names.clone(),
+        expected_lanes: names
+            .iter()
+            .cloned()
+            .chain((!certified).then(|| "missing-lane".into()))
+            .collect(),
         present_lanes: names,
         unexpected_lanes: vec![],
-        missing_lanes: vec![],
+        missing_lanes: if certified {
+            vec![]
+        } else {
+            vec![indexer_finalize::LaneFault {
+                lane: "missing-lane".into(),
+                reason: "lane_missing".into(),
+                detail: None,
+            }]
+        },
         invalid_lanes: vec![],
         finalization_deadline_seconds: 300,
         deadline_expired: !certified,
@@ -351,7 +365,7 @@ fn multi_window_ties_orientation_ignored_rejected_and_empty_coverage() {
     assert!(!statuses[1].metadata().manifest().source_receipt.certified);
     assert_eq!(
         statuses[1].coverage_details(),
-        CoverageDetails::NotRecordedInDerivativeV1
+        CoverageDetails::ReceiptBoundV2
     );
     assert_eq!(finished.counts().source_deliveries, 6);
     assert_eq!(finished.counts().ignored_sources, 1);
@@ -636,6 +650,7 @@ fn actual_three_venue_derivatives_keep_native_books_and_exact_pins() {
                 time: start + 1,
                 payload,
                 continuity: "continuous",
+                epoch: "e",
             }],
             true,
         );
@@ -699,10 +714,11 @@ fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut St
         serde_json::from_slice(&fs::read(input.directory.join("receipt.json")).unwrap()).unwrap();
     let mut manifest: replay_materialize::DerivativeManifest =
         serde_json::from_slice(&fs::read(input.directory.join("manifest.json")).unwrap()).unwrap();
-    let object = if file == "events.ndjson.zst" {
-        &manifest.events
-    } else {
-        &manifest.rejects
+    let object = match file {
+        "events.ndjson.zst" => &manifest.events,
+        "rejects.ndjson.zst" => &manifest.rejects,
+        "sources.ndjson.zst" => manifest.sources.as_ref().unwrap(),
+        _ => panic!("unknown output"),
     };
     let logical = prediction_encoder::LogicalIdentity {
         sha256: object.logical.sha256.as_hex(),
@@ -730,10 +746,11 @@ fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut St
         3,
     )
     .unwrap();
-    let object = if file == "events.ndjson.zst" {
-        &mut manifest.events
-    } else {
-        &mut manifest.rejects
+    let object = match file {
+        "events.ndjson.zst" => &mut manifest.events,
+        "rejects.ndjson.zst" => &mut manifest.rejects,
+        "sources.ndjson.zst" => manifest.sources.as_mut().unwrap(),
+        _ => panic!("unknown output"),
     };
     object.logical = replay_materialize::LogicalIdentity {
         sha256: Sha256::from_hex(&result.logical.sha256).unwrap(),
@@ -746,6 +763,7 @@ fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut St
     };
     receipt.events = manifest.events.clone();
     receipt.rejects = manifest.rejects.clone();
+    receipt.sources = manifest.sources.clone();
     let bytes = format!("{}\n", serde_json::to_string(&manifest).unwrap()).into_bytes();
     receipt.manifest.sha256 = Sha256::digest(&bytes);
     receipt.manifest.byte_length = bytes.len() as u64;
@@ -954,7 +972,7 @@ fn distinct_bundle_versions_keep_old_pins_readable_and_unknown_profiles_fail() {
         let value = if field == "normalized_schema_version" {
             3
         } else {
-            1
+            2
         };
         let bytes = text
             .replacen(
@@ -1120,4 +1138,378 @@ fn memory_is_bounded_when_tape_grows_twentyfold() {
             "peak grew with tape: {peaks:?}"
         );
     }
+}
+
+#[test]
+fn epochs_without_open_controls_survive_dispositions_duplicates_filter_and_clipping() {
+    let source = TempDir::new("epochs").unwrap();
+    let out = TempDir::new("epochs-out").unwrap();
+    canonical(
+        source.path(),
+        0,
+        10,
+        1,
+        &[
+            row("kalshi", 1, "book"),
+            Row {
+                epoch: "second-connection",
+                ..row("kalshi", 2, "book")
+            },
+            Row {
+                epoch: "second-connection",
+                ..row("kalshi", 3, "reject")
+            },
+            Row {
+                epoch: "third-connection",
+                ..row("kalshi", 4, "ignore")
+            },
+            Row {
+                epoch: "third-connection",
+                continuity: "duplicate",
+                ..row("kalshi", 5, "book")
+            },
+            Row {
+                epoch: "fourth-connection",
+                ..row("kalshi", 6, "book")
+            },
+        ],
+        true,
+    );
+    let input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    let (groups, _, done) = drain(
+        DerivativeWalker::open(vec![input.clone()], request(2, 6), ReadLimits::default()).unwrap(),
+    );
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| (
+                g.first().canonical_seq(),
+                g.deliveries()[0].connection_epoch().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (2, "second-connection"),
+            (3, "second-connection"),
+            (4, "third-connection"),
+            (5, "third-connection")
+        ]
+    );
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| g.deliveries()[0].records().len())
+            .collect::<Vec<_>>(),
+        [2, 1, 0, 2]
+    );
+    assert_eq!(
+        groups[3].deliveries()[0].header().provenance().continuity(),
+        replay_domain::ContinuityVerdict::Duplicate
+    );
+    assert!(done.supports_source_evidence());
+    let mut req = request(2, 6);
+    req.scope.instruments.clear();
+    let (filtered, _, _) =
+        drain(DerivativeWalker::open(vec![input], req, ReadLimits::default()).unwrap());
+    assert_eq!(filtered.len(), 1); // relevant-lane ignore survives, venue fault does not
+    assert_eq!(
+        filtered[0].deliveries()[0].connection_epoch(),
+        Some("third-connection")
+    );
+}
+
+fn amend_receipt(root: &Path, change: impl FnOnce(&mut Receipt)) {
+    let path = window_directory(root, 0).join("receipt.json");
+    let mut receipt: Receipt = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    change(&mut receipt);
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn upstream_lane_and_clock_facts_precede_groups_even_when_empty_or_unrelated() {
+    for empty in [false, true] {
+        let source = TempDir::new("coverage").unwrap();
+        let out = TempDir::new("coverage-out").unwrap();
+        let rows = if empty {
+            vec![]
+        } else {
+            vec![row("kalshi", 3, "book")]
+        };
+        canonical(source.path(), 0, 10, 1, &rows, true);
+        amend_receipt(source.path(), |r| {
+            r.certified = false;
+            r.completeness = "incomplete".into();
+            r.expected_lanes
+                .extend(["book-feed".into(), "audit-feed".into(), "quiet".into()]);
+            r.present_lanes.push("quiet".into());
+            r.inputs.push(InputSegment {
+                lane: "quiet".into(),
+                data_file: "empty.ndjson".into(),
+                segment_index: 0,
+                line_count: 0,
+                sha256: Sha256::digest(b"").as_hex(),
+                first_delivery_index: None,
+                last_delivery_index: None,
+            });
+            r.missing_lanes = ["book-feed", "audit-feed"]
+                .map(|lane| indexer_finalize::LaneFault {
+                    lane: lane.into(),
+                    reason: "lane_missing".into(),
+                    detail: None,
+                })
+                .to_vec();
+            r.unexpected_lanes.push("unrelated".into());
+            r.invalid_lanes.push(indexer_finalize::LaneFault {
+                lane: "unrelated".into(),
+                reason: "lane_invalid".into(),
+                detail: Some("seal digest mismatch".into()),
+            });
+            r.deadline_expired = true;
+            if !empty {
+                r.clock_faults.push(indexer_finalize::ClockFault {
+                    window_start_ns: 0,
+                    lane: "kalshi".into(),
+                    previous_visible_ns: 8,
+                    observed_visible_ns: 3,
+                });
+            }
+        });
+        let input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        let mut walker =
+            DerivativeWalker::open(vec![input], request(1, 9), ReadLimits::default()).unwrap();
+        let Some(WalkItem::WindowStatus(status)) = walker.next_item().unwrap() else {
+            panic!("fault status must precede groups")
+        };
+        let coverage = status.coverage().unwrap();
+        assert_eq!(
+            coverage.lane(&LaneId::new("quiet").unwrap()).state,
+            LaneState::Present { records: 0 }
+        );
+        assert_eq!(
+            coverage.lane(&LaneId::new("disabled").unwrap()),
+            LaneCoverage {
+                expected: false,
+                state: LaneState::NotExpected
+            }
+        );
+        for lane in ["book-feed", "audit-feed"] {
+            assert_eq!(
+                coverage.lane(&LaneId::new(lane).unwrap()),
+                LaneCoverage {
+                    expected: true,
+                    state: LaneState::Missing
+                }
+            );
+        }
+        assert_eq!(
+            coverage.lane(&LaneId::new("unrelated").unwrap()),
+            LaneCoverage {
+                expected: false,
+                state: LaneState::Invalid {
+                    detail: Some("seal digest mismatch".into())
+                }
+            }
+        );
+        assert_eq!(coverage.faults().len(), if empty { 3 } else { 4 });
+        assert!(
+            coverage
+                .faults()
+                .iter()
+                .all(|f| (f.start_ns, f.end_ns) == (0, 10))
+        );
+        if !empty {
+            assert!(coverage.faults().iter().any(|f| f.reason
+                == SourceFaultReason::VisibleClockRegression {
+                    previous_visible_ns: 8,
+                    observed_visible_ns: 3
+                }));
+        }
+        assert_eq!(coverage.deadline_seconds(), 300);
+        assert!(coverage.deadline_expired());
+        let (groups, statuses, done) = drain(walker);
+        assert_eq!(groups.len(), usize::from(!empty));
+        assert!(statuses.is_empty());
+        assert!(done.supports_source_evidence());
+    }
+}
+
+#[test]
+fn rehashed_source_metadata_fails_before_status_and_poisons() {
+    for mutation in [
+        "epoch",
+        "empty_epoch",
+        "header",
+        "missing",
+        "extra",
+        "unknown",
+    ] {
+        let source = TempDir::new("source-corrupt").unwrap();
+        let out = TempDir::new("source-corrupt-out").unwrap();
+        canonical(
+            source.path(),
+            0,
+            10,
+            1,
+            &[
+                row("kalshi", 1, "book"),
+                row("kalshi", 2, "ignore"),
+                row("kalshi", 3, "reject"),
+            ],
+            true,
+        );
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "sources.ndjson.zst", |text| {
+            *text = match mutation {
+                "epoch" => text.replace(
+                    "\"connection_epoch\":\"e\"",
+                    "\"connection_epoch\":\"wrong\"",
+                ),
+                "empty_epoch" => {
+                    text.replace("\"connection_epoch\":\"e\"", "\"connection_epoch\":\"\"")
+                }
+                "header" => {
+                    text.replacen("\"record_id\":\"kalshi-1\"", "\"record_id\":\"wrong\"", 1)
+                }
+                "missing" => text.split_once('\n').unwrap().1.to_owned(),
+                "extra" => format!("{text}{}\n", text.lines().last().unwrap()),
+                "unknown" => text.replace(
+                    "\"source_version\":1",
+                    "\"source_version\":1,\"extra\":true",
+                ),
+                _ => unreachable!(),
+            };
+        });
+        let opened = DerivativeWalker::open(vec![input], request(8, 9), ReadLimits::default());
+        if let Ok(mut walker) = opened {
+            assert!(walker.next_item().is_err(), "{mutation}");
+            assert_eq!(
+                walker.next_item().unwrap_err(),
+                "derivative walker is poisoned"
+            );
+            assert!(walker.finish().is_err());
+        }
+    }
+}
+
+#[test]
+fn mixed_profiles_preserve_pins_but_cannot_mint_complete_source_capability() {
+    let source = TempDir::new("mixed-source").unwrap();
+    let out = TempDir::new("mixed-out").unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../materialize/tests/fixtures/profile1");
+    let address = "5b2a4358be376144d898f0c0671b25c23dc2f8de946d16cc049b3b9f92685ea4";
+    let directory = out.path().join(address);
+    fs::create_dir(&directory).unwrap();
+    for name in [
+        "receipt.json",
+        "manifest.json",
+        "events.ndjson.zst",
+        "rejects.ndjson.zst",
+    ] {
+        fs::copy(fixture.join(name), directory.join(name)).unwrap();
+    }
+    let old = PinnedDerivative {
+        directory,
+        pin: DerivativePin {
+            derivative_address: address.into(),
+            receipt_sha256: Sha256::from_hex(
+                "4ecc6f2b25224e2988cb2879575fa4d8800a5c5d4dc7470dbbaba518d29fe5b8",
+            )
+            .unwrap(),
+        },
+    };
+    canonical(source.path(), 10, 20, 4, &[row("kalshi", 12, "book")], true);
+    let new = build(source.path(), out.path(), 10, 20, &mut Fake::new());
+    let (groups, statuses, done) = drain(
+        DerivativeWalker::open(
+            vec![new.clone(), old.clone()],
+            request(0, 20),
+            ReadLimits::default(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        statuses[0].coverage_details(),
+        CoverageDetails::NotRecordedInDerivativeV1
+    );
+    assert!(statuses[0].coverage().is_none());
+    assert_eq!(groups[0].deliveries()[0].connection_epoch(), None);
+    assert_eq!(
+        groups.last().unwrap().deliveries()[0].connection_epoch(),
+        Some("e")
+    );
+    assert!(!done.supports_source_evidence());
+    assert_eq!(done.pins(), [old.pin, new.pin]);
+}
+
+#[test]
+fn source_sidecar_codec_corruption_cannot_hide_in_clipped_tail() {
+    for mutation in ["truncated", "trailing", "concatenated", "checksum"] {
+        let source = TempDir::new("codec-source").unwrap();
+        let out = TempDir::new("codec-out").unwrap();
+        canonical(source.path(), 0, 10, 1, &[row("kalshi", 8, "book")], true);
+        let input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        let path = input.directory.join("sources.ndjson.zst");
+        let mut bytes = fs::read(&path).unwrap();
+        match mutation {
+            "truncated" => {
+                bytes.pop();
+            }
+            "trailing" => bytes.push(0),
+            "concatenated" => bytes.extend(bytes.clone()),
+            "checksum" => {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        fs::write(path, bytes).unwrap();
+        let mut walker =
+            DerivativeWalker::open(vec![input], request(0, 1), ReadLimits::default()).unwrap();
+        assert!(walker.next_item().is_err(), "{mutation}");
+        assert_eq!(
+            walker.next_item().unwrap_err(),
+            "derivative walker is poisoned"
+        );
+        assert!(walker.finish().is_err());
+    }
+}
+
+#[test]
+fn certified_empty_lane_is_evidence_not_missing_coverage() {
+    let source = TempDir::new("quiet-source").unwrap();
+    let out = TempDir::new("quiet-output").unwrap();
+    canonical(source.path(), 0, 10, 1, &[], true);
+    amend_receipt(source.path(), |r| {
+        r.expected_lanes.push("quiet".into());
+        r.present_lanes.push("quiet".into());
+        r.inputs.push(InputSegment {
+            lane: "quiet".into(),
+            data_file: "empty.ndjson".into(),
+            segment_index: 0,
+            line_count: 0,
+            sha256: Sha256::digest(b"").as_hex(),
+            first_delivery_index: None,
+            last_delivery_index: None,
+        });
+    });
+    let input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    let (groups, statuses, done) =
+        drain(DerivativeWalker::open(vec![input], request(2, 8), ReadLimits::default()).unwrap());
+    assert!(groups.is_empty());
+    assert_eq!(statuses.len(), 1);
+    assert!(statuses[0].metadata().manifest().source_receipt.certified);
+    let coverage = statuses[0].coverage().unwrap();
+    assert_eq!(
+        coverage.lane(&LaneId::new("quiet").unwrap()),
+        LaneCoverage {
+            expected: true,
+            state: LaneState::Present { records: 0 }
+        }
+    );
+    assert!(coverage.faults().is_empty());
+    assert!(done.supports_source_evidence());
 }
