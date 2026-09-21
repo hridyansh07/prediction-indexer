@@ -490,7 +490,12 @@ impl DerivativeWalker {
             (delivery.records().len() - records.len()) as u64,
             u64::MAX,
         )?;
-        if records.is_empty() && disposition.is_none() && !lane_fault {
+        // Profile-2 source epochs are state-bearing even when every child is
+        // outside instrument scope. Keep source-only evidence on planned lanes;
+        // never restore excluded market events or sidecar payloads.
+        let source_epoch =
+            delivery.connection_epoch().is_some() && scope.lanes.contains(h.address().lane());
+        if records.is_empty() && disposition.is_none() && !lane_fault && !source_epoch {
             add(&mut self.counts.scope_excluded_sources, 1, u64::MAX)?;
             return Ok(None);
         }

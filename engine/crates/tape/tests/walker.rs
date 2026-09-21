@@ -450,6 +450,11 @@ fn scope_keeps_faults_controls_and_original_coordinates_without_collapsing_orien
     assert_eq!(groups[1].last().canonical_seq(), 3);
     assert_eq!(
         groups[1].deliveries()[0].header().address().canonical_seq(),
+        2
+    );
+    assert!(groups[1].deliveries()[0].records().is_empty());
+    assert_eq!(
+        groups[1].deliveries()[1].header().address().canonical_seq(),
         3
     );
     assert_eq!(groups[2].deliveries()[0].records().len(), 0);
@@ -457,7 +462,7 @@ fn scope_keeps_faults_controls_and_original_coordinates_without_collapsing_orien
         groups[2].deliveries()[0].header().provenance().continuity(),
         replay_domain::ContinuityVerdict::GapProven
     );
-    assert_eq!(done.counts().scope_excluded_sources, 1);
+    assert_eq!(done.counts().scope_excluded_sources, 0);
     assert_eq!(done.counts().excluded_events, 4);
 }
 
@@ -1210,10 +1215,22 @@ fn epochs_without_open_controls_survive_dispositions_duplicates_filter_and_clipp
     req.scope.instruments.clear();
     let (filtered, _, _) =
         drain(DerivativeWalker::open(vec![input], req, ReadLimits::default()).unwrap());
-    assert_eq!(filtered.len(), 1); // relevant-lane ignore survives, venue fault does not
+    assert_eq!(filtered.len(), 4); // source epochs survive even when all children are excluded
+    assert!(
+        filtered
+            .iter()
+            .all(|g| g.deliveries()[0].records().is_empty())
+    );
+    assert_eq!(
+        filtered[3].deliveries()[0]
+            .header()
+            .provenance()
+            .continuity(),
+        replay_domain::ContinuityVerdict::Duplicate
+    );
     assert_eq!(
         filtered[0].deliveries()[0].connection_epoch(),
-        Some("third-connection")
+        Some("second-connection")
     );
 }
 
