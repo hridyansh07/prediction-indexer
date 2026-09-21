@@ -2,18 +2,18 @@ use canonical_normalizer::validate_code;
 use replay_domain::{EventHeader, FaultImpact, InstrumentId, SEGMENT_SCHEMA_VERSION, Sha256};
 use serde::{Deserialize, Serialize};
 
-pub const MANIFEST_VERSION: u16 = 1;
-pub const RECEIPT_VERSION: u16 = 1;
+pub const MANIFEST_VERSION: u16 = 2;
+pub const RECEIPT_VERSION: u16 = 2;
 pub const REJECT_VERSION: u16 = 1;
 pub const EVENT_SERIALIZATION_VERSION: u16 = 1;
 pub const REJECT_SERIALIZATION_VERSION: u16 = 1;
-pub const MATERIALIZER_VERSION: u16 = 1;
+pub const MATERIALIZER_VERSION: u16 = 2;
 
 /// Frozen first deployed-readable profile. New writers must add dispatch, not
 /// change this profile or reinterpret its existing wire types.
 fn validate_profile(schema: u16, materializer: u16) -> Result<(), String> {
     match (schema, materializer) {
-        (replay_domain::SEGMENT_SCHEMA_V3, 1) => Ok(()),
+        (replay_domain::SEGMENT_SCHEMA_V3, 1 | 2) => Ok(()),
         _ => Err("unsupported derivative schema/materializer profile".to_owned()),
     }
 }
@@ -67,6 +67,9 @@ pub struct SourceReceipt {
     pub byte_length: u64,
     pub sha256: Sha256,
     pub certified: bool,
+    /// Profile 2 only: exact upstream commit marker, not reserialized JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
 }
 
 impl From<&indexer_finalize::ReceiptIdentity> for SourceReceipt {
@@ -77,6 +80,7 @@ impl From<&indexer_finalize::ReceiptIdentity> for SourceReceipt {
             byte_length: value.byte_length,
             sha256: value.sha256,
             certified: value.certified,
+            document: None,
         }
     }
 }
@@ -156,11 +160,22 @@ pub struct DerivativeManifest {
     pub counts: DerivativeCounts,
     pub events: CompressedOutput,
     pub rejects: CompressedOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<CompressedOutput>,
 }
 
 impl DerivativeManifest {
+    pub fn outputs(&self) -> impl Iterator<Item = &CompressedOutput> {
+        [&self.events, &self.rejects]
+            .into_iter()
+            .chain(self.sources.iter())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self.manifest_version != 1 {
+        if !matches!(
+            (self.manifest_version, self.materializer_version),
+            (1, 1) | (2, 2)
+        ) {
             return Err(format!(
                 "unsupported derivative manifest version {}",
                 self.manifest_version
@@ -182,6 +197,21 @@ impl DerivativeManifest {
         validate_address(&self.derivative_address, "derivative_address")?;
         validate_output(&self.events, "events.ndjson.zst")?;
         validate_output(&self.rejects, "rejects.ndjson.zst")?;
+        match (
+            self.materializer_version,
+            &self.sources,
+            &self.source_receipt.document,
+        ) {
+            (1, None, None) => {}
+            (2, Some(output), Some(_)) => {
+                validate_output(output, "sources.ndjson.zst")?;
+                if output.logical.line_count != self.counts.input_records {
+                    return Err("verified derivative lines disagree with manifest counts".into());
+                }
+                crate::evidence::CoverageEvidence::from_source(&self.source_receipt)?;
+            }
+            _ => return Err("source evidence disagrees with derivative profile".into()),
+        }
         if self.requested_start_ns != self.source_receipt.window_start_ns
             || self.requested_end_ns != self.source_receipt.window_end_ns
             || self.effective_start_ns != self.requested_start_ns
@@ -226,11 +256,16 @@ pub struct DerivativeReceipt {
     pub manifest: PlainOutput,
     pub events: CompressedOutput,
     pub rejects: CompressedOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<CompressedOutput>,
 }
 
 impl DerivativeReceipt {
     pub fn validate(&self) -> Result<(), String> {
-        if self.receipt_version != 1 {
+        if !matches!(
+            (self.receipt_version, self.materializer_version),
+            (1, 1) | (2, 2)
+        ) {
             return Err(format!(
                 "unsupported derivative receipt version {}",
                 self.receipt_version
@@ -242,7 +277,12 @@ impl DerivativeReceipt {
             return Err("receipt names an unsupported manifest file".to_owned());
         }
         validate_output(&self.events, "events.ndjson.zst")?;
-        validate_output(&self.rejects, "rejects.ndjson.zst")
+        validate_output(&self.rejects, "rejects.ndjson.zst")?;
+        match (self.materializer_version, &self.sources) {
+            (1, None) => Ok(()),
+            (2, Some(output)) => validate_output(output, "sources.ndjson.zst"),
+            _ => Err("source evidence disagrees with derivative profile".into()),
+        }
     }
 }
 

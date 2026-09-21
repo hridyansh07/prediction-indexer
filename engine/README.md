@@ -159,6 +159,7 @@ The immutable layout is:
 window=<window-start-ns>/<derivative-address>/
   events.ndjson.zst
   rejects.ndjson.zst
+  sources.ndjson.zst      # profile 2: one transport record per source delivery
   manifest.json
   receipt.json            # sole commit marker, written last
 ```
@@ -177,7 +178,18 @@ profile's wire types and exact serialization. Experimental schemas 1/2 and unkno
 profiles are unsupported; there is no migration or readdressing. Explicitly pinned
 bundle/config revisions can coexist without loading historical normalizers.
 
-Both NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
+New writers use profile 2: receipt/manifest/materializer 2, with schema 3 and
+event/reject serialization 1 unchanged. The source projection additionally binds
+the exact canonical receipt document; its independently checked coverage gives
+expected/present/missing/invalid lanes and clock faults without opening raw
+evidence. A third stream binds each delivery's child-zero header to the exact
+splice `connection_epoch`. The epoch belongs to the source delivery, shared by
+all accepted children and retained for rejects/ignores; it is not a venue version.
+Profile 1 has separate frozen metadata readers and never invents these fields.
+See the walker's [profile-2 contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#implemented-source-evidence-profile-2)
+for address inputs, independent validation, and compatibility limits.
+
+All NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
 and carry logical and stored identities. The strict verifier checks canonical
 JSON, closed versions and fields, frame EOF and both identities, event/child
 order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
@@ -245,8 +257,15 @@ before traversal; a single-pass refactor and typed error categories are deferred
 Do not infer retryability from error strings; an error invalidates the attempt,
 and any fresh retry must retain the explicit pins.
 
-Window status includes uncertified/empty evidence but reports detailed coverage
-as `NotRecordedInDerivativeV1`: missing/invalid lane details were not persisted.
+Window status includes uncertified/empty evidence. Profile 2 reports
+`ReceiptBoundV2` and `coverage() -> Option<&CoverageEvidence>` with typed lane
+states and interval-bearing upstream faults, before any groups. It retains
+out-of-scope faults without guessing lane roles. Delivery `connection_epoch()`
+survives clipping and filtering. Old profile 1 reports
+`NotRecordedInDerivativeV1`, with `None` for coverage and epoch.
+`FinishedWalk::supports_source_evidence()` is true only when every selected
+window has profile 2; future strong risk must require it, plus planned lane
+coverage, rather than gate on `certified` alone.
 No production interval policy, scope resolver, projector, strategy, or audit
 overlay is implemented or approved by this generic traversal boundary.
 

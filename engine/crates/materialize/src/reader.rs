@@ -76,6 +76,7 @@ pub struct DerivativeMetadata {
     receipt: DerivativeReceipt,
     receipt_bytes: Vec<u8>,
     manifest_bytes: Vec<u8>,
+    coverage: Option<crate::CoverageEvidence>,
 }
 
 impl DerivativeMetadata {
@@ -87,6 +88,12 @@ impl DerivativeMetadata {
     }
     pub fn metadata_bytes(&self) -> u64 {
         (self.receipt_bytes.len() + self.manifest_bytes.len()) as u64
+    }
+    pub fn coverage(&self) -> Option<&crate::CoverageEvidence> {
+        self.coverage.as_ref()
+    }
+    pub fn supports_source_evidence(&self) -> bool {
+        self.coverage.is_some()
     }
 }
 
@@ -133,8 +140,22 @@ pub fn inspect_pinned(
         true,
         &manifest_bytes,
     )?;
+    let coverage = verified
+        .manifest
+        .source_receipt
+        .document
+        .as_ref()
+        .map(|_| crate::CoverageEvidence::from_source(&verified.manifest.source_receipt))
+        .transpose()?;
+    if coverage
+        .as_ref()
+        .is_some_and(|c| c.lanes().len() > limits.max_lanes)
+    {
+        return Err("coverage lane count exceeds read limit".into());
+    }
     Ok(DerivativeMetadata {
         pin: input.pin.clone(),
+        coverage,
         manifest: verified.manifest,
         receipt,
         receipt_bytes,
@@ -146,6 +167,7 @@ pub fn inspect_pinned(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceDelivery {
     header: EventHeader,
+    connection_epoch: Option<String>,
     records: Vec<SegmentRecord>,
     disposition: Option<RejectDisposition>,
     logical_bytes: u64,
@@ -153,6 +175,10 @@ pub struct SourceDelivery {
 }
 
 impl SourceDelivery {
+    /// None is an explicit missing profile-1 capability, never an inferred epoch.
+    pub fn connection_epoch(&self) -> Option<&str> {
+        self.connection_epoch.as_deref()
+    }
     pub fn header(&self) -> &EventHeader {
         &self.header
     }
@@ -173,6 +199,7 @@ impl SourceDelivery {
 struct Deliveries {
     events: VerifiedLines,
     rejects: VerifiedLines,
+    sources: Option<VerifiedLines>,
     event: Option<(SegmentRecord, u64)>,
     reject: Option<(RejectRecord, u64)>,
     limits: ReadLimits,
@@ -196,6 +223,17 @@ impl Deliveries {
                 &manifest.rejects,
                 limits.max_line_bytes,
             )?,
+            sources: manifest
+                .sources
+                .as_ref()
+                .map(|output| {
+                    VerifiedLines::open_limit(
+                        &directory.join(&output.file),
+                        output,
+                        limits.max_line_bytes,
+                    )
+                })
+                .transpose()?,
             event: None,
             reject: None,
             limits: limits.clone(),
@@ -239,7 +277,14 @@ impl Deliveries {
         let seq = match (event_seq, reject_seq) {
             (Some(a), Some(b)) => a.min(b),
             (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => return Ok(None),
+            (None, None) => {
+                if let Some(sources) = &mut self.sources {
+                    if sources.next_line()?.is_some() {
+                        return Err("extra source evidence record".into());
+                    }
+                }
+                return Ok(None);
+            }
         };
         let header = if event_seq == Some(seq) {
             self.event.as_ref().unwrap().0.header().clone()
@@ -251,11 +296,27 @@ impl Deliveries {
         }
         let mut delivery = SourceDelivery {
             header,
+            connection_epoch: None,
             records: Vec::new(),
             disposition: None,
             logical_bytes: 0,
             record_count: 0,
         };
+        if let Some(sources) = &mut self.sources {
+            let bytes = sources
+                .next_line()?
+                .ok_or("missing source evidence record")?;
+            let source = crate::evidence::SourceEvidence::decode(bytes)?;
+            if source.header != delivery.header {
+                return Err("source evidence header disagrees with delivery".into());
+            }
+            add_size(
+                &mut delivery.logical_bytes,
+                bytes.len() as u64 + 1,
+                self.limits.max_group_bytes,
+            )?;
+            delivery.connection_epoch = Some(source.connection_epoch);
+        }
         while self
             .event
             .as_ref()
@@ -281,6 +342,14 @@ impl Deliveries {
             if reject.header() != &delivery.header {
                 return Err("reject source header disagrees with delivery".into());
             }
+            if let Some(epoch) = delivery.connection_epoch() {
+                let view =
+                    indexer_types::EnvelopeView::parse(reject.canonical_envelope().as_bytes())
+                        .map_err(|e| e.to_string())?;
+                if epoch != view.connection_epoch.as_str() {
+                    return Err("source connection epoch disagrees with reject envelope".into());
+                }
+            }
             add_size(
                 &mut delivery.logical_bytes,
                 bytes,
@@ -294,6 +363,9 @@ impl Deliveries {
     }
     fn finish(self) -> Result<(), String> {
         self.events.finish()?;
+        if let Some(sources) = self.sources {
+            sources.finish()?;
+        }
         self.rejects.finish()
     }
 }
@@ -322,19 +394,26 @@ pub(crate) fn verify_deliveries(
 ) -> Result<(), String> {
     let mut stream = Deliveries::open(directory, manifest, limits)?;
     let mut previous: Option<EventHeader> = None;
+    let mut first_seq = None;
     let mut run_first: Option<EventHeader> = None;
     let mut cross_lane = false;
     let mut run_bytes = 0;
     let mut run_records = 0;
     let mut lane_deliveries = BTreeMap::new();
+    let mut lane_counts = BTreeMap::new();
+    let mut first_visible = BTreeMap::new();
     let mut lane_bytes = 0;
     while let Some(delivery) = stream.next()? {
         let h = delivery.header();
+        first_seq.get_or_insert(h.address().canonical_seq());
         let lane = h.address().lane();
+        let count = lane_counts.entry(lane.clone()).or_insert(0u64);
+        *count = count.checked_add(1).ok_or("source lane count overflow")?;
         if !lane_deliveries.contains_key(lane) {
             if lane_deliveries.len() == limits.max_lanes {
                 return Err("lane count exceeds read limit".into());
             }
+            first_visible.insert(lane.clone(), h.visible_ns());
             add_size(
                 &mut lane_bytes,
                 lane.as_str().len() as u64,
@@ -395,6 +474,41 @@ pub(crate) fn verify_deliveries(
     if let Some(first) = &run_first {
         validate_tie(first, cross_lane)?;
     }
+    if manifest.source_receipt.document.is_some() {
+        let coverage = crate::CoverageEvidence::from_source(&manifest.source_receipt)?;
+        if coverage.sequence()
+            != (
+                first_seq,
+                previous.as_ref().map(|h| h.address().canonical_seq()),
+            )
+        {
+            return Err("source sequence disagrees with coverage".into());
+        }
+        if coverage.records() != manifest.counts.input_records {
+            return Err("source coverage count disagrees with derivative".into());
+        }
+        for (lane, status) in coverage.lanes() {
+            if let crate::LaneState::Present { records } = status.state {
+                if lane_counts.remove(lane).unwrap_or(0) != records {
+                    return Err("source lane count disagrees with coverage".into());
+                }
+            }
+        }
+        if !lane_counts.is_empty() {
+            return Err("source delivery from excluded lane".into());
+        }
+        for fault in coverage.faults() {
+            if let crate::SourceFaultReason::VisibleClockRegression {
+                observed_visible_ns,
+                ..
+            } = fault.reason
+            {
+                if first_visible.get(&fault.lane) != Some(&observed_visible_ns) {
+                    return Err("source clock diagnosis disagrees with first delivery".into());
+                }
+            }
+        }
+    }
     stream.finish()
 }
 
@@ -445,7 +559,7 @@ pub(crate) fn open_pinned_with_checkpoint(
     let metadata = inspect_pinned(input, limits)?;
     checkpoint(ReadCheckpoint::MetadataCaptured, &input.directory);
     let mut total = metadata.metadata_bytes();
-    for output in [&metadata.manifest.events, &metadata.manifest.rejects] {
+    for output in metadata.manifest.outputs() {
         add_size(
             &mut total,
             output.stored.byte_length,
@@ -465,7 +579,7 @@ pub(crate) fn open_pinned_with_checkpoint(
         std::fs::set_permissions(snapshot.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
-    for output in [&metadata.manifest.events, &metadata.manifest.rejects] {
+    for output in metadata.manifest.outputs() {
         let source = File::open(input.directory.join(&output.file)).map_err(|e| e.to_string())?;
         let mut sink =
             File::create(snapshot.path().join(&output.file)).map_err(|e| e.to_string())?;

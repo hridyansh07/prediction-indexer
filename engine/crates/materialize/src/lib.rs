@@ -4,6 +4,8 @@
 //! privately while Phase 0 is consumed, and cannot be published until verified
 //! EOF, normalizer `finish`, frame finish, and file fsync all succeed.
 
+mod evidence;
+mod profile1;
 mod reader;
 mod schema;
 mod verify;
@@ -32,6 +34,7 @@ use replay_domain::{NormalizationFault, SEGMENT_SCHEMA_VERSION, SegmentEvent, Se
 use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
+pub use evidence::{CoverageEvidence, LaneCoverage, LaneState, SourceFault, SourceFaultReason};
 pub use reader::{
     DerivativeMetadata, FinishedWindow, PinnedDerivative, ReadLimits, SourceDelivery,
     VerifiedWindowReader, inspect_pinned, open_pinned,
@@ -176,7 +179,17 @@ where
             "requested bounds do not match one canonical receipt".to_owned(),
         ));
     }
-    let source_receipt = SourceReceipt::from(selected);
+    let mut source_receipt = SourceReceipt::from(selected);
+    source_receipt.document = Some(
+        String::from_utf8(
+            selection
+                .receipt_documents(ReadLimits::default().max_metadata_bytes)
+                .map_err(BuildError::Audit)?
+                .remove(0),
+        )
+        .map_err(|e| BuildError::Audit(e.to_string()))?,
+    );
+    CoverageEvidence::from_source(&source_receipt).map_err(BuildError::Audit)?;
     let address = derivative_address(&source_receipt, spec)?;
     // Hold ownership before creating any stage, through cleanup and publication.
     // Declaring this before StageGuard also keeps the lock held during its Drop.
@@ -192,11 +205,30 @@ where
         .map_err(|error| BuildError::Io(error.to_string()))?;
     let mut rejects = StreamingEncoder::new(rejects_file, DEFAULT_ZSTD_LEVEL)
         .map_err(|error| BuildError::Io(error.to_string()))?;
+    let mut sources = StreamingEncoder::new(
+        create_file(&stage.join("sources.ndjson.zst.open"))?,
+        DEFAULT_ZSTD_LEVEL,
+    )
+    .map_err(|error| BuildError::Io(error.to_string()))?;
     let mut counts = DerivativeCounts::default();
     let mut reader = selection.open().map_err(BuildError::Audit)?;
 
     while let Some(source) = reader.next_record().map_err(BuildError::Audit)? {
         counts.input_records = checked_add(counts.input_records, 1, "input_records")?;
+        let transport = evidence::SourceEvidence {
+            source_version: 1,
+            header: event_header(&source, 0).map_err(|e| BuildError::Normalizer(e.to_string()))?,
+            connection_epoch: indexer_types::EnvelopeView::parse(&source.envelope)
+                .map_err(|e| BuildError::Audit(e.to_string()))?
+                .connection_epoch
+                .as_str()
+                .to_owned(),
+        };
+        write_line(
+            &mut sources,
+            &canonical_value(&transport)?,
+            "sources.ndjson.zst",
+        )?;
         let normalized = catch_unwind(AssertUnwindSafe(|| normalizer.normalize(&source)))
             .map_err(|_| BuildError::NormalizerPanic)?
             .map_err(|error| BuildError::Normalizer(error.to_string()))?;
@@ -334,6 +366,9 @@ where
     let (rejects_file, rejects_result) = rejects
         .finish()
         .map_err(|error| BuildError::Io(error.to_string()))?;
+    let (sources_file, sources_result) = sources
+        .finish()
+        .map_err(|error| BuildError::Io(error.to_string()))?;
     checkpoint(Checkpoint::FramesFinished)?;
     events_file
         .sync_all()
@@ -341,8 +376,12 @@ where
     rejects_file
         .sync_all()
         .map_err(io_error("fsyncing rejects"))?;
+    sources_file
+        .sync_all()
+        .map_err(io_error("fsyncing sources"))?;
     drop(events_file);
     drop(rejects_file);
+    drop(sources_file);
     rename_in_stage(
         &stage,
         &format!("{DERIVATIVE_EVENTS_FILE}.open"),
@@ -353,11 +392,13 @@ where
         &format!("{DERIVATIVE_REJECTS_FILE}.open"),
         DERIVATIVE_REJECTS_FILE,
     )?;
+    rename_in_stage(&stage, "sources.ndjson.zst.open", "sources.ndjson.zst")?;
     sync_directory(&stage)?;
     checkpoint(Checkpoint::FilesSynced)?;
 
     let events_output = compressed_output(DERIVATIVE_EVENTS_FILE, events_result)?;
     let rejects_output = compressed_output(DERIVATIVE_REJECTS_FILE, rejects_result)?;
+    let sources_output = compressed_output("sources.ndjson.zst", sources_result)?;
     checkpoint(Checkpoint::BeforeManifestSerialization)?;
     let manifest = DerivativeManifest {
         manifest_version: schema::MANIFEST_VERSION,
@@ -377,6 +418,7 @@ where
         counts,
         events: events_output.clone(),
         rejects: rejects_output.clone(),
+        sources: Some(sources_output.clone()),
     };
     manifest.validate().map_err(BuildError::Serialization)?;
     let manifest_bytes = canonical_document(&manifest)?;
@@ -401,6 +443,7 @@ where
         manifest: manifest_output,
         events: events_output,
         rejects: rejects_output,
+        sources: Some(sources_output),
     };
     receipt.validate().map_err(BuildError::Serialization)?;
     let receipt_bytes = canonical_document(&receipt)?;

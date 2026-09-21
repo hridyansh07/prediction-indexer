@@ -99,8 +99,13 @@ pub(crate) fn inspect_contents(
     {
         return Err("manifest identity disagrees with receipt".to_owned());
     }
-    let (manifest, canonical_manifest_bytes) =
-        decode_canonical_document::<DerivativeManifest>(manifest_bytes, &manifest_path)?;
+    let (manifest, canonical_manifest_bytes) = if receipt.materializer_version == 1 {
+        let (wire, bytes) =
+            decode_canonical_document::<crate::profile1::Manifest>(manifest_bytes, &manifest_path)?;
+        (DerivativeManifest::from(wire), bytes)
+    } else {
+        decode_canonical_document::<DerivativeManifest>(manifest_bytes, &manifest_path)?
+    };
     if canonical_manifest_bytes != manifest_bytes {
         return Err("manifest is not canonically encoded".to_owned());
     }
@@ -114,6 +119,7 @@ pub(crate) fn inspect_contents(
         || manifest.policy.policy_sha256 != receipt.policy_sha256
         || manifest.events != receipt.events
         || manifest.rejects != receipt.rejects
+        || manifest.sources != receipt.sources
     {
         return Err("manifest and receipt bindings disagree".to_owned());
     }
@@ -513,7 +519,11 @@ pub(crate) fn decode_receipt_document(
         profile.normalized_schema_version,
         profile.materializer_version,
     ) {
-        (1, replay_domain::SEGMENT_SCHEMA_V3, 1) => decode_canonical_document(bytes, path),
+        (1, replay_domain::SEGMENT_SCHEMA_V3, 1) => {
+            let (wire, bytes) = decode_canonical_document::<crate::profile1::Receipt>(bytes, path)?;
+            Ok((wire.into(), bytes))
+        }
+        (2, replay_domain::SEGMENT_SCHEMA_V3, 2) => decode_canonical_document(bytes, path),
         _ => Err("unsupported derivative receipt/schema/materializer profile".into()),
     }
 }
