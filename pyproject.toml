@@ -19,10 +19,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = []
+replay-redis = ["redis>=6.4,<7"]
 
 [tool.setuptools.packages.find]
 include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*"]
 
 [tool.setuptools.package-data]
 replay = ["policy.json"]
+"replay.streams" = ["*.lua"]
 universe = ["schema/*.sql", "schema/*.md"]
