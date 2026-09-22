@@ -15,7 +15,13 @@ dataset and rejects duplicate logical keys. Gate 1 can therefore consume raw
 segments and decoded `target_records_<venue>.ndjson` together without learning
 about S3, Zstandard, or either receipt protocol.
 
-No capture, ingester, targeter, or legacy-analysis module is imported.
+Replay reconstruction imports no capture, ingester, targeter, or legacy-analysis
+module. The optional pre-run `replay.preparation` boundary reuses Universe/Targeter
+historical evidence validators and archived streaming adapters; it freezes a
+hash-bound context before runtime. See
+[`STRATEGY_PREPARATION_V1.md`](../docs/STRATEGY_PREPARATION_V1.md) for its closed
+configuration, native book plans, explicit historical expectation scopes, and
+offline snapshot loader. No coverage strategy or shared cache is included.
 
 The package is included in the installed distribution, including the frozen
 terminal policy. Storage adapters provide bytes through `ByteStreamer`; none of
