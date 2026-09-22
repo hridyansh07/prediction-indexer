@@ -270,3 +270,26 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
         let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
     }
 }
+
+#[test]
+#[ignore = "requires explicitly supplied disposable Redis >=8.2 and Python SDK"]
+fn redis_supervisor_retries_entire_attempt() {
+    let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    let f = fixture();
+    let c = config(&f);
+    let scratch = tempdir::TempDir::new("replay-supervisor").unwrap();
+    let path = scratch.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    assert!(
+        std::process::Command::new(root.join(".venv/bin/python"))
+            .current_dir(&root)
+            .args(["-m", "replay.tests.test_supervisor", "--real-publisher"])
+            .arg(path)
+            .arg(env!("CARGO_BIN_EXE_replay-publish"))
+            .env("REPLAY_REDIS_URL", url)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
