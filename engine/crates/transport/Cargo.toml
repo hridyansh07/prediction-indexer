@@ -13,7 +13,7 @@ replay-risk = { path = "../risk" }
 replay-tape = { path = "../tape" }
 serde.workspace = true
 serde_json.workspace = true
-redis = { version = "0.29", default-features = false }
+redis = { version = "0.29", default-features = false, features = ["script"] }
 
 [dev-dependencies]
 canonical-normalizer.workspace = true

@@ -485,6 +485,25 @@ impl RiskEngine {
                         if let Some(reason) = self.blocked.get(lane) {
                             w.fail(reason.clone(), true);
                         }
+                        // Reject an oversized Full before allocating its atom maps.
+                        // Preserve scale-fault precedence and ignore latched inputs,
+                        // just as apply followed by the retained-level check does.
+                        if !w.latched {
+                            if let BookEvent::Full(full) = book {
+                                if full.bids().len().saturating_add(full.asks().len())
+                                    > self.limits.max_levels_per_book
+                                {
+                                    if full.bids().iter().chain(full.asks()).any(|level| {
+                                        level.price().scale() != plan.price_scale
+                                            || level.quantity().scale() != plan.quantity_scale
+                                    }) {
+                                        w.fail(Reason::ScaleMismatch, true);
+                                    } else {
+                                        return Err("risk level limit exceeded".into());
+                                    }
+                                }
+                            }
+                        }
                         if !w.latched {
                             match apply(&mut w.view, plan, book, &reference, epoch) {
                                 Ok(()) => match book {

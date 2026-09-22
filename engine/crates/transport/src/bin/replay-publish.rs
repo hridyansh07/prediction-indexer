@@ -7,7 +7,7 @@ fn main() {
         let retryable = matches!(
             error.downcast_ref::<Error>(),
             Some(Error::Transport | Error::Resource)
-        ) || error.downcast_ref::<std::io::Error>().is_some();
+        );
         std::process::exit(if retryable { 21 } else { 20 });
     }
 }
@@ -31,9 +31,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .write(true)
             .create_new(true)
             .open(path)?;
-        file.sync_all()?;
+        sync_ready(&file)?;
     }
     while publisher.step()? {}
     println!("terminal published; output remains provisional until all consumers complete");
     Ok(())
+}
+
+fn sync_ready(file: &std::fs::File) -> Result<(), Error> {
+    file.sync_all().map_err(|_| Error::Resource)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn ready_sync_failure_remains_a_resource_error() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(matches!(
+            super::sync_ready(&file),
+            Err(super::Error::Resource)
+        ));
+    }
 }
