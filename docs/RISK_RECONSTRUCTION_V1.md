@@ -34,7 +34,10 @@ evaluation cadence can skip inspecting a cut, never its application. Prefix drop
 read failure, integrity failure, or resource failure cannot mint completion.
 Further pulls after error stay poisoned. Previously returned cuts/views are
 provisional results of the failed attempt, not a completed result; any publisher
-must stage until `FinishedRisk`. Retry starts from the original pins with empty
+must keep strategy outputs provisional until `FinishedRisk`. This does not mean
+buffering the cut stream until EOF: the Redis delivery boundary streams each cut
+immediately, while success/finalization additionally waits for terminal validation
+and every registered strategy's processing completion. Retry starts from the original pins with empty
 books. `FinishedRisk` retains the finished walker, exact plan and cut count.
 
 ## State and recovery
