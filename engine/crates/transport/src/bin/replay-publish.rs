@@ -1,9 +1,14 @@
-use replay_transport::{Config, Publisher};
+use replay_transport::{Config, Error, Publisher};
 use std::io::Read;
 fn main() {
     if let Err(error) = run() {
         eprintln!("replay-publish: {error}");
-        std::process::exit(1);
+        // Closed exit contract: never classify risk diagnostics by their text.
+        let retryable = matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::Transport | Error::Resource)
+        ) || error.downcast_ref::<std::io::Error>().is_some();
+        std::process::exit(if retryable { 21 } else { 20 });
     }
 }
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,6 +25,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = serde_json::from_slice(&bytes)?;
     let url = std::env::var("REDIS_URL").map_err(|_| "REDIS_URL required")?;
     let mut publisher = Publisher::open(&url, config, replay_risk::RiskLimits::default())?;
+    // Optional supervisor handshake. No consumer joins before setup and initial.
+    if let Some(path) = std::env::args().nth(2) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.sync_all()?;
+    }
     while publisher.step()? {}
     println!("terminal published; output remains provisional until all consumers complete");
     Ok(())

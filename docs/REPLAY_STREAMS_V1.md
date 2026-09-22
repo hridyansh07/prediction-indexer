@@ -3,8 +3,9 @@
 Implemented by `engine/crates/transport` (`replay-transport`, `replay-publish`)
 and `replay.streams`. Risk remains the sole reconstruction authority. This is a
 rebuildable **derived** delivery boundary, not the capture filesystem protocol.
-No risk policy, fee policy, episode schema, receipt writer, retry supervisor,
-service deployment, or production lower-bound selection is introduced.
+No risk policy, fee policy, episode schema, service deployment, or production
+lower-bound selection is introduced. The optional whole-attempt runner is
+documented in [REPLAY_SUPERVISOR_V1.md](REPLAY_SUPERVISOR_V1.md).
 
 ## Attempt lifecycle and ownership
 
@@ -151,6 +152,9 @@ Identifiers are 1–128 ASCII alphanumeric/underscore/hyphen/dot. Groups are dis
 `replay:<scope>:<run>:<attempt>:stream` and `...:state`. Existing keys fail setup;
 never resume them. Supervisor owns deleting only its disposable keys after all
 participants stop. CLI exit 0 means terminal published, **not** strategy success.
+Exit 20 is nonretryable input/risk/protocol failure; 21 is transport/resource
+failure. An optional second argument names a new setup-ready file, created only
+after setup and initial publication; its contents are not a success marker.
 CLI uses default RiskLimits; library callers can supply tighter limits.
 
 Python optional install: `.venv/bin/pip install -e '.[replay-redis]'`.
