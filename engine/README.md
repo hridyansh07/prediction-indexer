@@ -3,8 +3,8 @@
 This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
 verified normalized derivative, the Kalshi, Polymarket, and Limitless normalizers,
-and a pull-based verified derivative walker. It
-contains no book, strategy, publisher, deployment, or scheduler.
+a pull-based verified derivative walker, and the `replay-risk` reconstruction
+engine. It contains no strategy, publisher, deployment, or scheduler.
 
 ## Representation contract
 
@@ -69,7 +69,7 @@ A full snapshot resets only that key, never every orientation of an instrument.
 
 The key distinguishes stored evidence; it does not assert cross-book economic
 independence. Any complementary-price view belongs in an explicit later consumer.
-No book store or implied-ask projection is implemented here yet.
+`replay-risk` reconstructs native books without an implied-ask projection.
 
 ## Closed event contract
 
@@ -237,8 +237,8 @@ defines the reviewed contract and acceptance cases.
   controls/faults, and every selected instrument orientation. `book_keys()` keeps
   Kalshi Outcome/Complement distinct; it performs no projection or mutation.
 - Both reader and walker require explicit clean EOF before consuming `finish()`
-  can mint a completion capability. Errors poison the attempt. A future cursor
-  must apply every complete group even when its strategy skips evaluation.
+  can mint a completion capability. Errors poison the attempt. `replay-risk`
+  applies every complete group even when its consumer skips evaluation.
 
 RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
 holds one bounded compressed window. Oversized groups fail rather than split.
@@ -264,10 +264,22 @@ out-of-scope faults without guessing lane roles. Delivery `connection_epoch()`
 survives clipping and filtering. Old profile 1 reports
 `NotRecordedInDerivativeV1`, with `None` for coverage and epoch.
 `FinishedWalk::supports_source_evidence()` is true only when every selected
-window has profile 2; future strong risk must require it, plus planned lane
+window has profile 2; `replay-risk` requires it, plus planned lane
 coverage, rather than gate on `certified` alone.
 No production interval policy, scope resolver, projector, strategy, or audit
 overlay is implemented or approved by this generic traversal boundary.
+
+## Reconstruction risk
+
+[`RISK_RECONSTRUCTION_V1.md`](../docs/RISK_RECONSTRUCTION_V1.md) specifies
+`RiskEngine::{open, next_cut, view, finish}`, explicit primary-lane `BookPlan`s,
+and the transport-independent immutable `RiskCut` boundary. It separates ordered
+original Book/Trade observations (including duplicate disposition) from scoped
+book decisions. Only affected books advance revision; failures latch per key,
+receipt faults block their entire intervals, and later valid Fulls recover.
+Views retain exact initialization/epoch dependencies and remain immutable after
+later cuts. Profile 1 cannot open a strong risk attempt. There is no transport,
+remote query, audit overlay, checkpoint, strategy, or fee change in this crate.
 
 ## Prepared mutation boundary
 
@@ -276,7 +288,8 @@ returns an opaque, owned, non-cloneable `PreparedMutation<T>`. `apply` first
 checks that the current revision equals `prepared_from`; a stale mutation writes
 nothing. After that check it performs only the complete replacement and revision
 advance. Future books can use this boundary without giving venue adapters or
-strategies mutation authority. No book implementation is included in this workspace.
+strategies mutation authority. The risk engine instead stages affected books
+privately under its exclusive writer and publishes the whole group together.
 
 ## Concepts adapted from Bitfrost
 

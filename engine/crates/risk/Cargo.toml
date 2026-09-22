@@ -1,0 +1,21 @@
+[package]
+name = "replay-risk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+replay-domain.workspace = true
+replay-materialize.workspace = true
+replay-tape = { path = "../tape" }
+
+[dev-dependencies]
+canonical-normalizer.workspace = true
+indexer-finalize.workspace = true
+indexer-types.workspace = true
+prediction-encoder.workspace = true
+serde_json.workspace = true
+tempdir = "0.3"

@@ -456,6 +456,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "replay-risk"
+version = "0.1.0"
+dependencies = [
+ "canonical-normalizer",
+ "indexer-finalize",
+ "indexer-types",
+ "prediction-encoder",
+ "replay-domain",
+ "replay-materialize",
+ "replay-tape",
+ "serde_json",
+ "tempdir",
+]
+
+[[package]]
 name = "replay-tape"
 version = "0.1.0"
 dependencies = [
