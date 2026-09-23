@@ -200,48 +200,75 @@ impl<A: VenueAdapter> Normalize for Normalizer<A> {
         &mut self,
         source: &JoinedCanonicalRecord,
     ) -> Result<Normalization, NormalizerError> {
-        let envelope = EnvelopeView::parse(&source.envelope).map_err(|error| {
-            NormalizerError::new(format!(
-                "audited canonical envelope became invalid: {error}"
-            ))
-        })?;
-        if envelope.venue != A::VENUE {
-            return Ok(Normalization::Ignored {
-                reason_code: "different_venue".to_owned(),
-            });
-        }
-        if contains_reserved_value_key(&envelope.raw_payload) {
-            return Ok(ParseReject::for_source(
-                A::PARSER_VERSION,
-                "reserved_json_value_key",
-                source,
-                None,
-            ));
-        }
-        let payload = match serde_json::from_str(&envelope.raw_payload) {
-            Ok(payload) => payload,
-            Err(_) => {
-                if let Some(normalized) = self.adapter.normalize_non_json(source, &envelope)? {
-                    return Ok(normalized);
-                }
-                return Ok(ParseReject::for_source(
-                    A::PARSER_VERSION,
-                    "invalid_json",
-                    source,
-                    None,
-                ));
-            }
-        };
-        self.adapter.normalize(CanonicalEnvelope {
-            source,
-            envelope,
-            payload,
-        })
+        normalize_adapter(&mut self.adapter, source, false)
     }
 
     fn finish(&mut self) -> Result<(), NormalizerError> {
         self.adapter.finish()
     }
+}
+
+/// Runs the generic canonical decode seam for one already-selected adapter.
+///
+/// Composite normalizers inspect only the closed envelope venue before calling
+/// this function. A routing defect is fatal rather than being mislabeled as an
+/// intentional `different_venue` ignore.
+pub fn normalize_with_adapter<A: VenueAdapter>(
+    adapter: &mut A,
+    source: &JoinedCanonicalRecord,
+) -> Result<Normalization, NormalizerError> {
+    normalize_adapter(adapter, source, true)
+}
+
+fn normalize_adapter<A: VenueAdapter>(
+    adapter: &mut A,
+    source: &JoinedCanonicalRecord,
+    strict_route: bool,
+) -> Result<Normalization, NormalizerError> {
+    let envelope = EnvelopeView::parse(&source.envelope).map_err(|error| {
+        NormalizerError::new(format!(
+            "audited canonical envelope became invalid: {error}"
+        ))
+    })?;
+    if envelope.venue != A::VENUE {
+        if !strict_route {
+            return Ok(Normalization::Ignored {
+                reason_code: "different_venue".to_owned(),
+            });
+        }
+        return Err(NormalizerError::new(format!(
+            "normalizer routing defect: {} record sent to {} adapter",
+            envelope.venue,
+            A::VENUE
+        )));
+    }
+    if contains_reserved_value_key(&envelope.raw_payload) {
+        return Ok(ParseReject::for_source(
+            A::PARSER_VERSION,
+            "reserved_json_value_key",
+            source,
+            None,
+        ));
+    }
+    let payload = match serde_json::from_str(&envelope.raw_payload) {
+        Ok(payload) => payload,
+        Err(_) => {
+            if let Some(normalized) = adapter.normalize_non_json(source, &envelope)? {
+                return Ok(normalized);
+            }
+            return Ok(ParseReject::for_source(
+                A::PARSER_VERSION,
+                "invalid_json",
+                source,
+                None,
+            ));
+        }
+    };
+    adapter.normalize(CanonicalEnvelope {
+        source,
+        envelope,
+        payload,
+    })
 }
 
 // With serde_json's `arbitrary_precision` and `raw_value` features, maps whose

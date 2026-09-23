@@ -18,6 +18,4 @@ indexer-types = { workspace = true }
 prediction-encoder = { workspace = true }
 serde_json = { workspace = true }
 tempdir = "0.3"
-kalshi-normalizer = { path = "../kalshi" }
-polymarket-normalizer = { workspace = true }
-limitless-normalizer = { workspace = true }
+replay-normalizers = { workspace = true }

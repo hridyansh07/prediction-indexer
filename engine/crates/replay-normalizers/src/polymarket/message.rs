@@ -5,7 +5,7 @@ use indexer_types::{EnvelopeView, RecordKind, SourceCursor, Stream};
 use replay_domain::{ControlEvent, SegmentEvent};
 use serde_json::{Map, Value};
 
-use crate::{
+use super::{
     Config,
     error::Reject,
     event::{AuditSnapshot, PriceChange, Snapshot, Trade, instrument, timestamp, validate_market},

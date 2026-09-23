@@ -6,7 +6,7 @@ use replay_domain::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::{
+use super::{
     Config,
     error::Reject,
     value::{CheckedKalshiValue, CheckedObject, numeric_code},
@@ -524,7 +524,7 @@ mod tests {
             }
         }
         let mut trade: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/trade.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/fixtures/kalshi/trade.json")).unwrap();
         trade["msg"]["taker_side"] = json!("yes");
         let wire: wire::Trade = serde_json::from_value(trade["msg"].clone()).unwrap();
         assert_eq!(
@@ -544,17 +544,17 @@ mod tests {
         type Parse = fn(&Value, Config) -> Result<Vec<SegmentEvent>, Reject>;
         for (fixture, parse, validate) in [
             (
-                include_str!("../tests/fixtures/orderbook_snapshot.json"),
+                include_str!("../../tests/fixtures/kalshi/orderbook_snapshot.json"),
                 (|v, c| Snapshot::parse(v, c).map(Into::into)) as Parse,
                 (|v, c| Snapshot::validate(v, c).map(Into::into)) as Parse,
             ),
             (
-                include_str!("../tests/fixtures/orderbook_delta.json"),
+                include_str!("../../tests/fixtures/kalshi/orderbook_delta.json"),
                 (|v, c| RelativeDelta::parse(v, c).map(Into::into)) as Parse,
                 (|v, c| RelativeDelta::validate(v, c).map(Into::into)) as Parse,
             ),
             (
-                include_str!("../tests/fixtures/trade.json"),
+                include_str!("../../tests/fixtures/kalshi/trade.json"),
                 (|v, c| Trade::parse(v, c).map(Into::into)) as Parse,
                 (|v, c| Trade::validate(v, c).map(Into::into)) as Parse,
             ),

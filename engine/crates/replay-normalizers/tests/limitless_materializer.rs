@@ -7,19 +7,19 @@ use indexer_finalize::{
     Receipt as CanonicalReceipt, StoredIdentity as CanonicalStored, window_directory,
 };
 use indexer_types::{ContentHash, EnvelopeView, Sha256};
-use limitless_normalizer::Limitless;
 use prediction_encoder::{DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version};
 use replay_domain::{BookEvent, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentRecord};
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
+use replay_normalizers::limitless::Limitless;
 use serde_json::{Value, json};
 use tempdir::TempDir;
 
 const SOURCE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const BOOK: &str = include_str!("fixtures/orderbook_update_live_2026_09_12.json");
-const CREATED: &str = include_str!("fixtures/market_created_documented.json");
-const SYSTEM: &str = include_str!("fixtures/system_live_2026_09_12.json");
+const BOOK: &str = include_str!("fixtures/limitless/orderbook_update_live_2026_09_12.json");
+const CREATED: &str = include_str!("fixtures/limitless/market_created_documented.json");
+const SYSTEM: &str = include_str!("fixtures/limitless/system_live_2026_09_12.json");
 
 fn envelope(seq: u64, payload: &str) -> Vec<u8> {
     let payload_value: Value = serde_json::from_str(payload).unwrap();

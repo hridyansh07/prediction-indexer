@@ -257,6 +257,13 @@ before traversal; a single-pass refactor and typed error categories are deferred
 Do not infer retryability from error strings; an error invalidates the attempt,
 and any fresh retry must retain the explicit pins.
 
+The private `replay-normalizers/examples/materialize_range.rs` operator helper
+selects the minimal adjacent locally committed canonical windows, builds one
+profile-2 composite derivative per exact window, and emits only verified ordered
+pins. It is an example target, not a stable CLI, archive restorer, or indexer.
+The existing 4096-window read limit is unchanged; with half-hour canonical
+windows, one initial materialization request can span at most 85 days 8 hours.
+
 Window status includes uncertified/empty evidence. Profile 2 reports
 `ReceiptBoundV2` and `coverage() -> Option<&CoverageEvidence>` with typed lane
 states and interval-bearing upstream faults, before any groups. It retains

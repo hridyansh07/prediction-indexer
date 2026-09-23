@@ -2,7 +2,7 @@ use canonical_normalizer::{CheckedDecimal, CheckedObject as _, CheckedValue as _
 use replay_domain::{ConditionalMarketPrice, DecimalScale, NumericError, PositiveQty, Qty};
 use serde_json::{Map, Value};
 
-use crate::error::Reject;
+use super::error::Reject;
 
 // Venue error taxonomy only; the shared normalizer owns all JSON and decimal
 // validation. These methods preserve the adapter's established reject codes.

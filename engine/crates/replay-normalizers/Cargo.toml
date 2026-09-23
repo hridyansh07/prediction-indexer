@@ -1,5 +1,5 @@
 [package]
-name = "polymarket-normalizer"
+name = "replay-normalizers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,17 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+canonical-normalizer = { workspace = true }
+chrono = { workspace = true }
 indexer-finalize = { workspace = true }
 indexer-types = { workspace = true }
 replay-domain = { workspace = true }
-canonical-normalizer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 prediction-encoder = { workspace = true }
 replay-materialize = { workspace = true }
+replay-risk = { path = "../risk" }
+replay-tape = { path = "../tape" }
 tempdir = "0.3"

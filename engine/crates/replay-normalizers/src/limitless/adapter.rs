@@ -3,7 +3,7 @@ use canonical_normalizer::{
 };
 use indexer_types::{RecordKind, Stream, Venue};
 
-use crate::{
+use super::{
     Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION,
     message::{MessageOutcome, ProcessOutcome, normalize_message, normalize_process},
 };

@@ -6,7 +6,7 @@ use replay_domain::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::{
+use super::{
     Config,
     error::Reject,
     value::{CheckedObject, CheckedValue},
@@ -561,8 +561,10 @@ mod tests {
 
     #[test]
     fn typed_delta_and_trade_constructors_enforce_semantics() {
-        let mut value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/price_change.json")).unwrap();
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/polymarket/price_change.json"
+        ))
+        .unwrap();
         let wire = wire::PriceChange::deserialize(&value).unwrap();
         let events: Vec<SegmentEvent> = PriceChange::try_from((wire, Config::default()))
             .unwrap()
@@ -588,8 +590,10 @@ mod tests {
             "invalid_quantity"
         );
 
-        let mut value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/last_trade_price.json")).unwrap();
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/polymarket/last_trade_price.json"
+        ))
+        .unwrap();
         let wire = wire::Trade::deserialize(&value).unwrap();
         let events: Vec<SegmentEvent> = Trade::try_from((wire, Config::default())).unwrap().into();
         assert!(
@@ -633,8 +637,10 @@ mod tests {
 
     #[test]
     fn rest_constructor_requires_independent_evidence_and_time_conversion() {
-        let rest: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/rest_book.json")).unwrap();
+        let rest: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/polymarket/rest_book.json"
+        ))
+        .unwrap();
         for field in [
             "hash",
             "tick_size",
