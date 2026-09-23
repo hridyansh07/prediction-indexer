@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 
 from .domain import (
     Asset,
@@ -317,14 +318,22 @@ class ResolvedScheduleSet(Closed):
     builder: Selection | UnknownSchedule
     account: Selection | UnknownSchedule
     next_boundary: int | None
+    reference_time: int | None = None
+    snapshot_identity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Resolver(Closed):
     catalog: Catalog
+    reference_time: int | None = None
+
+    def __post_init__(self):
+        Closed.__post_init__(self)
+        if self.reference_time is not None and self.reference_time < 0:
+            raise ValueError("nonnegative reference time required")
 
     def resolve(
-        self, context: Context, event_time: int, knowledge_cutoff: int | None
+        self, context: Context, event_time: int, knowledge_cutoff: int | None = None
     ) -> ResolvedScheduleSet:
         if (
             type(context) is not Context
@@ -338,6 +347,18 @@ class Resolver(Closed):
             raise ValueError(
                 "as-known cutoff must not exceed event time; None means retrospective"
             )
+        if self.reference_time is not None:
+            if knowledge_cutoff is not None:
+                raise ValueError("current snapshot does not accept a knowledge cutoff")
+            return replace(
+                self._select(context, self.reference_time, None), event_time=event_time
+            )
+        return self._select(context, event_time, knowledge_cutoff)
+
+    @lru_cache(maxsize=1024)
+    def _select(self, context, event_time, knowledge_cutoff):
+        # Bounded memoization reuses reference-time selections across fill times.
+        # Unknown-start evidence is caller-asserted current only in snapshot mode.
         candidates = tuple(
             s
             for s in self.catalog.schedules
@@ -356,12 +377,19 @@ class Resolver(Closed):
             active = tuple(
                 s
                 for s in pool
-                if s.effective_from is not None
-                and s.effective_from <= event_time
-                and (s.effective_to is None or event_time < s.effective_to)
+                if (s.effective_from is None and self.reference_time is not None)
+                or (
+                    s.effective_from is not None
+                    and s.effective_from <= event_time
+                    and (s.effective_to is None or event_time < s.effective_to)
+                )
             )
             # Unknown applicability cannot silently lose to a broad known default.
-            uncertain = tuple(s for s in pool if s.effective_from is None)
+            uncertain = tuple(
+                s
+                for s in pool
+                if s.effective_from is None and self.reference_time is None
+            )
             rank = max((s.scope.rank for s in active), default=-1)
             if any(s.scope.rank >= rank for s in uncertain):
                 return UnknownSchedule(
@@ -376,7 +404,7 @@ class Resolver(Closed):
                 return UnknownSchedule(
                     component,
                     UnknownReason.CONFLICT if active else UnknownReason.MISSING,
-                    tuple(sorted(s.identity for s in active)),
+                    tuple(sorted(s.identity for s in (active or pool))),
                 )
             s = active[0]
             return Selection(s, s.model, (s,))
@@ -423,4 +451,6 @@ class Resolver(Closed):
             choose(Component.BUILDER, candidates),
             choose(Component.ACCOUNT, candidates),
             min(boundaries, default=None),
+            self.reference_time,
+            self.identity if self.reference_time is not None else None,
         )
