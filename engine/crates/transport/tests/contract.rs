@@ -369,3 +369,100 @@ fn redis_supervisor_retries_entire_attempt() {
             .success()
     );
 }
+
+#[test]
+#[ignore = "requires explicitly supplied disposable Redis >=8.2 and Python SDK"]
+fn redis_bundle_coverage_acceptance() {
+    let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    let trade = || {
+        SegmentEvent::Trade(TradeEvent::new(
+            id("polymarket:123"),
+            ContractOrientation::Outcome,
+            ConditionalMarketPrice::from_atoms(37, scale(2)).unwrap(),
+            qty(5),
+            Some(Side::Ask),
+        ))
+    };
+    // Tiny canonical contracts, scripted normalization, REAL materialization.
+    // The pre-request Full must be clipped, not used as an implicit warm start.
+    let a = Fixture::new(
+        0,
+        40,
+        1,
+        vec![
+            row("primary", 5, vec![full("polymarket:987", &[(21, 6)], &[])]),
+            row(
+                "primary",
+                14,
+                vec![full("polymarket:123", &[(17, 3)], &[(83, 2)])],
+            ),
+            row("primary", 18, vec![trade()]),
+            Row {
+                continuity: "duplicate",
+                ..row("primary", 19, vec![trade()])
+            },
+            row("primary", 29, vec![full("polymarket:987", &[], &[])]),
+        ],
+        |_| {},
+    );
+    let b = Fixture::new(40, 50, 6, vec![], |r| {
+        r.certified = false;
+        r.completeness = "incomplete".into();
+        r.deadline_expired = true;
+        r.expected_lanes.push("primary".into());
+        r.missing_lanes.push(indexer_finalize::LaneFault {
+            lane: "primary".into(),
+            reason: "lane_missing".into(),
+            detail: None,
+        });
+    });
+    let c = Fixture::new(50, 60, 6, vec![ignored("primary", 55)], |_| {});
+    let d = Fixture::new(
+        60,
+        80,
+        7,
+        vec![
+            row("primary", 61, vec![full("polymarket:123", &[(31, 7)], &[])]),
+            row("primary", 67, vec![full("polymarket:987", &[], &[(81, 9)])]),
+        ],
+        |_| {},
+    );
+    let mut cfg = config(&a);
+    cfg.inputs = [&a, &b, &c, &d]
+        .into_iter()
+        .map(|f| Input {
+            directory: f.pin.directory.clone(),
+            derivative_address: f.pin.pin.derivative_address.clone(),
+            receipt_sha256: f.pin.pin.receipt_sha256,
+        })
+        .collect();
+    cfg.start_ns = "10".into();
+    cfg.end_ns = "80".into();
+    cfg.groups = vec!["coverage".into()];
+    cfg.plans = ["polymarket:123", "polymarket:987"]
+        .into_iter()
+        .map(|name| Plan {
+            instrument: id(name),
+            orientation: ContractOrientation::Outcome,
+            lane: LaneId::new("primary").unwrap(),
+            venue: "polymarket".into(),
+            price_scale: "2".into(),
+            quantity_scale: "0".into(),
+        })
+        .collect();
+    let scratch = tempdir::TempDir::new("coverage-acceptance").unwrap();
+    let path = scratch.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    assert!(
+        std::process::Command::new(root.join(".venv/bin/python"))
+            .current_dir(&root)
+            .args(["-m", "replay.tests.test_coverage_acceptance"])
+            .arg(path)
+            .arg(env!("CARGO_BIN_EXE_replay-publish"))
+            .env("REPLAY_REDIS_URL", url)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
