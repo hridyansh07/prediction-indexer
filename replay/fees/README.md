@@ -250,9 +250,12 @@ null fields independently clear to the **current** series model/multiplier; the 
 source schedules. Builder never replaces platform. `next_boundary` exposes the
 next matching effective boundary after the selection time (reference time for
 snapshots); crossing it in fill time never refreshes a snapshot. There is no
-mutable latest pointer or network resolver. A bounded 1,024-entry selection cache
-keys immutable resolver/context/selection-time inputs; eviction only recomputes
-the identical selection. Static type metadata also has a bounded cache.
+mutable latest pointer or network resolver. Each resolver keeps a bounded
+1,024-entry selection cache keyed by context/selection-time inputs, never by the
+catalog itself, so lookups do not rehash it; eviction only recomputes the
+identical selection. Catalog/snapshot identities and a venue/product index are
+derived once per resolver. This derived state is excluded from identity,
+equality, pickles and artifacts. Static type metadata also has a bounded cache.
 
 To import retained public evidence, read source bytes yourself, call
 `source_from_bytes(url, retrieved_at, data)`, construct reviewed `Schedule`
