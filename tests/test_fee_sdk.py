@@ -62,7 +62,10 @@ from replay.fees.schedules import (
 
 SOURCE_BYTES = b"hand-authored fee contract for offline tests; not venue evidence\n"
 SOURCE = source_from_bytes("https://example.invalid/offline-contract", 10, SOURCE_BYTES)
-EXACT = Policy("model-with-rebates-v1", include_rebates=True)
+EXACT = Policy(
+    "model-with-rebates-v1", include_account_rebates=True, include_rounding_refunds=True
+)
+DIRECT = replace(EXACT, kalshi_member_class=AccountClass.DIRECT)
 CONSERVATIVE = Policy()
 
 
@@ -87,8 +90,6 @@ def fill(venue=Venue.POLYMARKET, price="0.5", quantity="100", **changes):
         "yes",
         "account",
         "subaccount",
-        AccountClass.DIRECT,
-        Builder(BuilderStatus.ABSENT),
     )
     p, q = QuotePrice.parse(price), Quantity.parse(quantity)
     value = HypotheticalFill(
@@ -140,8 +141,8 @@ def assess(f, schedules=None, policy=CONSERVATIVE, state=None):
     resolver = Resolver(
         Catalog.build([schedule(f)] if schedules is None else schedules)
     )
-    return FeeEngine().assess(
-        f, resolver.resolve(f.context, f.event_time, None), policy, state
+    return FeeEngine(policy).assess(
+        f, resolver.resolve(f.context, f.event_time, None), state
     )
 
 
@@ -154,6 +155,152 @@ def total_fee(result):
     return sum((c.amount.amount.value for c in result.charges), Fraction(0)) - sum(
         (r.amount.amount.value for r in result.rebates), Fraction(0)
     )
+
+
+class ConfiguredEngineTests(unittest.TestCase):
+    def evaluate(self, engine, f, state=None):
+        resolved = Resolver(Catalog.build([schedule(f)])).resolve(
+            f.context, f.event_time, None
+        )
+        return engine.assess(f, resolved, order_state=state)
+
+    def test_default_limitless_native_and_dust_vectors(self):
+        engine = FeeEngine()
+        for side, price, quantity, fee, contracts, quote in (
+            (Side.BUY, "0.4", "100", "3", "97", "-40"),
+            (Side.SELL, "0.5", "100", "0.75", "-100", "49.25"),
+            (Side.BUY, "0.4", "0.00005", "0.000002", "0.000048", "-0.00002"),
+            (Side.SELL, "0.5", "0.0001", "0.000001", "-0.0001", "0.000049"),
+        ):
+            with self.subTest(side=side, quantity=quantity):
+                f = fill(Venue.LIMITLESS, price, quantity, side=side)
+                result, _ = self.evaluate(engine, f)
+                self.assertFalse(result.unknowns)
+                self.assertEqual(total_fee(result), Fraction(fee))
+                self.assertEqual(delta(result, f.economics.outcome), Fraction(contracts))
+                self.assertEqual(delta(result, f.economics.quote), Fraction(quote))
+
+    def test_independent_rates_and_identity(self):
+        buy = fill(Venue.LIMITLESS, "0.4", "100")
+        sell = fill(Venue.LIMITLESS, "0.5", "100", side=Side.SELL)
+        policies = (
+            Policy(),
+            Policy(limitless_buy_bps=350),
+            Policy(limitless_sell_bps=200),
+        )
+        identities = set()
+        for policy, buy_fee, sell_fee in zip(
+            policies, ("3", "3.5", "3"), ("0.75", "0.75", "1")
+        ):
+            engine = FeeEngine(policy)
+            result, _ = self.evaluate(engine, buy)
+            self.assertEqual(total_fee(result), Fraction(buy_fee))
+            self.assertEqual(result.policy, policy)
+            identities.add(result.identity)
+            self.assertEqual(
+                total_fee(self.evaluate(engine, sell)[0]), Fraction(sell_fee)
+            )
+        self.assertEqual(len(identities), 3)
+        self.assertEqual(len({p.identity for p in policies}), 3)
+
+    def test_member_config_is_only_authority_across_fills(self):
+        direct = FeeEngine(Policy(kalshi_member_class=AccountClass.DIRECT))
+        ordinary = FeeEngine()
+        for old_member in AccountClass:
+            f = fill(Venue.KALSHI, "0.01", "1")
+            f = replace(f, context=replace(f.context, account_class=old_member))
+            self.assertEqual(total_fee(self.evaluate(direct, f)[0]), Fraction("0.0007"))
+            self.assertEqual(total_fee(self.evaluate(ordinary, f)[0]), Fraction("0.01"))
+            self.assertNotEqual(
+                self.evaluate(direct, f)[0].identity,
+                self.evaluate(ordinary, f)[0].identity,
+            )
+        for side, expected in ((Side.BUY, "-0.06"), (Side.SELL, "0.05")):
+            f = fill(Venue.KALSHI, "0.055", "1", side=side)
+            result, _ = self.evaluate(ordinary, f)
+            self.assertEqual(total_fee(result), Fraction("0.005"))
+            self.assertEqual(delta(result, f.economics.quote), Fraction(expected))
+
+    def test_rounding_refunds_are_independent_and_configured_state_continues(self):
+        f = fill(Venue.KALSHI, "0.01", "1")
+        second = replace(f, fill_id="second", fill_index=1, new_order=False)
+        resolver = Resolver(Catalog.build([schedule(f)]))
+        for refunds in (False, True):
+            for account_rebates in (False, True):
+                engine = FeeEngine(
+                    Policy(
+                        include_rounding_refunds=refunds,
+                        include_account_rebates=account_rebates,
+                    )
+                )
+                results = engine.assess_many((f, second), resolver)
+                self.assertEqual(total_fee(results[0]), Fraction("0.01"))
+                self.assertEqual(
+                    total_fee(results[1]), Fraction(0) if refunds else Fraction("0.01")
+                )
+                self.assertEqual(
+                    tuple(r.amount.amount.value for r in results[1].rebates),
+                    (Fraction("0.01"),) if refunds else (),
+                )
+                self.assertTrue(all(r.policy == engine.policy for r in results))
+        engine = FeeEngine(
+            Policy(kalshi_member_class=AccountClass.DIRECT, include_rounding_refunds=True)
+        )
+        state = None
+        for index, old_member in enumerate(AccountClass):
+            current = replace(
+                f,
+                fill_id=str(index),
+                fill_index=index,
+                new_order=index == 0,
+                context=replace(f.context, account_class=old_member),
+            )
+            result, state = self.evaluate(engine, current, state)
+            self.assertFalse(result.unknowns)
+            self.assertEqual(total_fee(result), Fraction("0.0007"))
+            self.assertEqual(state.grid_scale, 4)
+            self.assertEqual(state.carry.value, Fraction(7 * (index + 1), 1000000))
+
+    def test_no_builder_and_unknown_role(self):
+        f = fill(role=Role.UNKNOWN)
+        f = replace(
+            f, context=replace(f.context, builder=Builder(BuilderStatus.UNKNOWN))
+        )
+        result, _ = self.evaluate(FeeEngine(), f)
+        self.assertFalse(result.unknowns)
+        self.assertEqual(total_fee(result), Fraction("1.75"))
+        self.assertEqual(result.fill, f)
+
+    def test_closed_immutable_config_and_arithmetic_identity(self):
+        policy = Policy()
+        for field in ("limitless_buy_bps", "limitless_sell_bps"):
+            for invalid in (True, 1.5, -1, 10001):
+                with (
+                    self.subTest(field=field, invalid=invalid),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    replace(policy, **{field: invalid})
+            for valid in (0, 10000):
+                self.assertEqual(getattr(replace(policy, **{field: valid}), field), valid)
+        with self.assertRaises(ValueError):
+            Policy(kalshi_member_class=AccountClass.UNKNOWN)
+        for field, value in (
+            ("kalshi_member_class", AccountClass.DIRECT),
+            ("include_rounding_refunds", True),
+            ("include_account_rebates", True),
+        ):
+            self.assertNotEqual(
+                policy.identity, replace(policy, **{field: value}).identity
+            )
+        engine = FeeEngine(policy)
+        with self.assertRaises(FrozenInstanceError):
+            engine.policy = Policy(limitless_buy_bps=350)
+        with self.assertRaises(TypeError):
+            FeeEngine(None)
+        f = fill()
+        resolved = Resolver(Catalog.build([schedule(f)])).resolve(f.context, 20, None)
+        with self.assertRaises(TypeError):
+            engine.assess(f, resolved, policy=Policy())
 
 
 class FeeDomainTests(unittest.TestCase):
@@ -175,7 +322,9 @@ class FeeDomainTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             Fixed(1.0, 2)
         with self.assertRaises(TypeError):
-            Policy(include_rebates=1)
+            Policy(include_account_rebates=1)
+        with self.assertRaises(TypeError):
+            Policy(include_rounding_refunds=1)
 
     def test_notional_mismatch_and_distinct_quantity(self):
         f = fill()
@@ -227,7 +376,7 @@ class VenueVectorTests(unittest.TestCase):
             result, _ = assess(f, [s], EXACT)
             self.assertEqual(result.charges[0].amount.amount.value, Fraction(expected))
         f = fill(Venue.KALSHI, "0.055", "0.1")
-        result, _ = assess(f, policy=EXACT)
+        result, _ = assess(f, policy=DIRECT)
         self.assertEqual(result.charges[0].amount.amount.value, Fraction("0.000364"))
         self.assertEqual(total_fee(result), Fraction("0.0004"))
         p, q = QuotePrice.parse("0.00001"), Quantity.parse("0.01")
@@ -277,7 +426,7 @@ class VenueVectorTests(unittest.TestCase):
         self.assertEqual(total_fee(single), Fraction("0.00003"))
         self.assertEqual(total_fee(split) * 2, Fraction("0.00004"))
 
-    def test_maker_zero_is_not_missing_and_builder_additive(self):
+    def test_maker_zero_is_not_missing_and_builder_metadata_is_ignored(self):
         f = fill(role=Role.MAKER)
         self.assertEqual(total_fee(assess(f)[0]), 0)
         self.assertIsNone(assess(f, [])[0].net_deltas)
@@ -293,16 +442,16 @@ class VenueVectorTests(unittest.TestCase):
         result, _ = assess(f, [schedule(f), s])
         self.assertEqual(
             [c.component for c in result.charges],
-            [Component.PLATFORM, Component.BUILDER],
+            [Component.PLATFORM],
         )
-        self.assertEqual(total_fee(result), Fraction("0.25"))
+        self.assertEqual(total_fee(result), 0)
         missing, _ = assess(f)
         self.assertEqual(len(missing.charges), 1)
-        self.assertIsNone(missing.net_deltas)
+        self.assertIsNotNone(missing.net_deltas)
         unknown_builder = replace(
             f, context=replace(c, builder=Builder(BuilderStatus.UNKNOWN))
         )
-        self.assertIsNone(assess(unknown_builder)[0].net_deltas)
+        self.assertIsNotNone(assess(unknown_builder)[0].net_deltas)
 
     def test_unknown_role_and_no_default_schedule(self):
         f = fill(role=Role.UNKNOWN)
@@ -315,7 +464,7 @@ class VenueVectorTests(unittest.TestCase):
 
     def test_kalshi_direct_non_direct_and_sell_signed_floor(self):
         f = fill(Venue.KALSHI, "0.01", "1")
-        result, _ = assess(f, policy=EXACT)
+        result, _ = assess(f, policy=DIRECT)
         self.assertEqual(result.charges[0].amount.amount.value, Fraction("0.000693"))
         self.assertEqual(total_fee(result), Fraction("0.0007"))
         self.assertEqual(result.evidence, Evidence.EXACT_MODEL)
@@ -335,7 +484,7 @@ class VenueVectorTests(unittest.TestCase):
     def test_kalshi_maker_quadratic_and_zero_balance_rounding(self):
         f = fill(Venue.KALSHI, role=Role.MAKER)
         result, _ = assess(
-            f, [schedule(f, Kalshi(KalshiKind.MAKER, Multiplier(1, 0)))], EXACT
+            f, [schedule(f, Kalshi(KalshiKind.MAKER, Multiplier(1, 0)))], DIRECT
         )
         self.assertEqual(total_fee(result), Fraction("0.4375"))
         f = fill(Venue.KALSHI, "0.055", "1", role=Role.MAKER)
@@ -400,25 +549,23 @@ class VenueVectorTests(unittest.TestCase):
     def test_unknown_member_and_unsupported_kalshi(self):
         f = fill(Venue.KALSHI)
         f = replace(f, context=replace(f.context, account_class=AccountClass.UNKNOWN))
-        self.assertIsNone(assess(f)[0].net_deltas)
-        result, _ = assess(f, policy=Policy(assume_unknown_member_non_direct=True))
-        self.assertEqual(result.evidence, Evidence.ESTIMATE)
+        result, _ = assess(f)
+        self.assertIsNotNone(result.net_deltas)
+        self.assertEqual(result.evidence, Evidence.CONDITIONAL_BOUND)
         for kind in (KalshiKind.FLAT, KalshiKind.COMBO):
             self.assertIsNone(
                 assess(f, [schedule(f, Kalshi(kind, Multiplier(1, 0)))])[0].net_deltas
             )
 
     def test_limitless_native_fee_and_payout_vectors(self):
-        policy = Policy(limitless_max_scenario=True)
         f = fill(Venue.LIMITLESS, "0.4", "100")
-        self.assertIsNone(assess(f)[0].net_deltas)
-        result, _ = assess(f, policy=policy)
+        result, _ = assess(f)
         self.assertEqual(result.evidence, Evidence.ESTIMATE)
         self.assertEqual(delta(result, f.economics.outcome), 97)
         self.assertEqual(delta(result, f.economics.quote), -40)
         self.assertEqual(result.contract_fee_payout_impact.amount.value, 3)
         f = fill(Venue.LIMITLESS, "0.5", "100", side=Side.SELL)
-        result, _ = assess(f, policy=policy)
+        result, _ = assess(f)
         self.assertEqual(total_fee(result), Fraction("0.75"))
         self.assertEqual(delta(result, f.economics.quote), Fraction("49.25"))
         self.assertEqual(delta(result, f.economics.outcome), -100)
@@ -452,7 +599,7 @@ class VenueVectorTests(unittest.TestCase):
         )
         actual = validate_actual(observed)
         self.assertEqual(actual.evidence, Evidence.ACTUAL_OBSERVED)
-        self.assertIsNone(assess(f)[0].net_deltas)
+        self.assertEqual(assess(f)[0].evidence, Evidence.ESTIMATE)
         with self.assertRaises(ValueError):
             validate_actual(
                 replace(
@@ -464,7 +611,6 @@ class VenueVectorTests(unittest.TestCase):
             FeeEngine().assess(
                 observed,
                 Resolver(Catalog.build([])).resolve(f.context, 20, None),
-                Policy(),
             )
 
 
@@ -545,7 +691,7 @@ class ResolutionTests(unittest.TestCase):
         r = resolver.resolve(f.context, 20, None)
         self.assertEqual(r.platform.schedule, new)
         with self.assertRaises(ValueError):
-            FeeEngine().assess(replace(f, event_time=21), r, Policy())
+            FeeEngine().assess(replace(f, event_time=21), r)
 
     def test_account_adjustment_explicit_only(self):
         f = fill()
@@ -567,6 +713,18 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(result.rebates[0].amount.amount.value, Fraction("0.315"))
         self.assertEqual(assess(f, [platform, account])[0].rebates, ())
         self.assertIsNone(assess(f, [platform], EXACT)[0].net_deltas)
+        for refunds in (False, True):
+            for account_rebates in (False, True):
+                policy = Policy(
+                    include_rounding_refunds=refunds,
+                    include_account_rebates=account_rebates,
+                )
+                result, _ = assess(f, [platform, account], policy)
+                self.assertFalse(result.unknowns)
+                self.assertEqual(
+                    total_fee(result),
+                    Fraction("1.435") if account_rebates else Fraction("1.75"),
+                )
 
     def test_instrument_discriminators_and_series_change_under_null(self):
         f = fill()
@@ -615,7 +773,7 @@ class PropertyTests(unittest.TestCase):
         sell = replace(buy, side=Side.SELL)
         s = schedule(buy, fee_asset=buy.economics.quote)
         for f, expected in ((buy, Fraction(3)), (sell, Fraction("0.6"))):
-            result, _ = assess(f, [s], Policy(limitless_max_scenario=True))
+            result, _ = assess(f, [s])
             self.assertIsNotNone(result.net_deltas)
             self.assertEqual(total_fee(result), expected)
 
@@ -669,7 +827,12 @@ class PropertyTests(unittest.TestCase):
                     min((carry + remainder) // grid, (trade + remainder) // grid) * grid
                 )
                 carry = carry + remainder - rebate
-                result, state = assess(f, [schedule(f, model)], EXACT, state)
+                result, state = assess(
+                    f,
+                    [schedule(f, model)],
+                    replace(EXACT, kalshi_member_class=member),
+                    state,
+                )
                 self.assertEqual(
                     total_fee(result), Fraction(trade + remainder - rebate, 10**6)
                 )
@@ -689,12 +852,12 @@ class PropertyTests(unittest.TestCase):
                 [schedule(f, effective_to=21), schedule(f, effective_from=22)]
             )
         )
-        results = FeeEngine().assess_many(fills, resolver, EXACT)
+        results = FeeEngine(EXACT).assess_many(fills, resolver)
         self.assertIsNotNone(results[0].net_deltas)
         self.assertIsNone(results[1].net_deltas)
         self.assertIsNone(results[2].net_deltas)
         with self.assertRaises(ValueError):
-            FeeEngine().assess_many((f, f), resolver, EXACT)
+            FeeEngine(EXACT).assess_many((f, f), resolver)
 
 
 class ArtifactTests(unittest.TestCase):

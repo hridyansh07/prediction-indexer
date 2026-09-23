@@ -227,8 +227,9 @@ class Context(Closed):
     orientation: str
     account: str
     subaccount: str
-    account_class: AccountClass
-    builder: Builder
+    # Optional source annotations, not configured hypothetical arithmetic inputs.
+    account_class: AccountClass = AccountClass.UNKNOWN
+    builder: Builder = Builder(BuilderStatus.ABSENT)
 
     def __post_init__(self):
         Closed.__post_init__(self)

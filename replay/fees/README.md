@@ -12,13 +12,33 @@ added. Old replay gates and research fee calculations are unchanged.
 ```python
 from replay.fees import Catalog, FeeEngine, Policy, Resolver
 from replay.fees.artifacts import load_catalog
+from replay.fees.domain import AccountClass
 
 catalog = load_catalog(catalog_directory)  # or Catalog.build(tuple_of_schedules)
 resolver = Resolver(catalog)
+engine = FeeEngine(Policy(
+    limitless_buy_bps=300,
+    limitless_sell_bps=150,
+    kalshi_member_class=AccountClass.NON_DIRECT,
+))  # identical to FeeEngine(); configure once per strategy instance
 resolved = resolver.resolve(fill.context, fill.event_time, knowledge_cutoff=None)
-assessment, next_state = FeeEngine().assess(fill, resolved, Policy(), order_state=None)
-assessments = FeeEngine().assess_many(ordered_fills, resolver, Policy())
+assessment, next_state = engine.assess(fill, resolved, order_state=None)
+assessments = engine.assess_many(ordered_fills, resolver)
 ```
+
+`FeeEngine` and its `Policy` are immutable. Neither assessment method accepts a
+per-fill policy override. Set `AccountClass.DIRECT` once for the .0001 Kalshi
+balance grid; the default `NON_DIRECT` uses .01. This is membership, not a
+loyalty/volume tier. `UNKNOWN` is rejected in configuration. Limitless rates
+are independently configurable integer basis points in 0–10000; booleans and
+floats are rejected. Changing rates, membership, refund/rebate switches, or any
+other policy field changes its identity and the assessment identity.
+
+The engine always estimates a **no-builder route**. Optional
+`Context.account_class` and `Context.builder` annotations are retained in the
+original fill for provenance, but do not override configuration or add builder
+charges—even when they conflict or are unknown. Callers need not supply either
+field. Builder schedules may remain in a catalog but are not assessed.
 
 Construct input types from `replay.fees.domain` and schedule types from
 `replay.fees.schedules`. All domain dataclasses are frozen, slotted, and validate
@@ -40,6 +60,8 @@ Times are nonnegative UTC Unix nanoseconds. `knowledge_cutoff=None` is explicitl
 **retrospective**. An integer cutoff means **as known**, filters by latest source
 retrieval time, and must not exceed event time. Effective claims still require
 their own evidence; retrieval time alone never supplies historical applicability.
+Schedule selection remains explicit and event-time-based here: configuring an
+engine does not yet freeze a current schedule for reuse across historical fills.
 
 `Fixed.parse("0.07")`, `Rate.parse(...)`, `Quantity.parse(...)`, etc. accept only
 bounded unsigned decimal strings. Values use integer atoms and scale 0–18;
@@ -72,14 +94,16 @@ deltas and payout impact to `None`**. `UnknownSchedule` retains a component,
 typed reason, and conflicting candidate identities when available. Exclusions
 and assumptions remain on the result. Consumers own admission/headline policy.
 
-Default `Policy()` excludes hypothetical rebates, explicitly assumes taker for
-unknown role, and does not assume Kalshi membership. Optional non-direct
-membership and Limitless maximum-rate scenarios are labelled assumptions, not
-established all-in bounds. `include_rebates=True` opts into complete Kalshi
-accumulator accounting and explicit PM account schedules; it never invents an
-account tier. Account rebate netting is model accounting, not proof of a daily
-cash payment or eligibility. Daily thresholds, account eligibility and payout
-timing must be established externally before treating it as cash available.
+Default `Policy()` omits Kalshi rounding refunds and hypothetical account rebates,
+explicitly assumes taker for unknown role, and configures non-direct Kalshi
+membership plus Limitless BUY 300 / SELL 150 bps. Configured estimates are not
+observations or established all-in bounds; evidence labels do not gate them.
+`include_rounding_refunds=True` opts into Kalshi accumulator refunds only.
+Independently, `include_account_rebates=True` enables explicit PM account
+schedules; it never invents an account tier. Account rebate netting is model
+accounting, not proof of a daily cash payment or eligibility. Daily thresholds,
+account eligibility and payout timing must be established externally before
+treating it as cash available.
 Maker rewards, bonuses, gas, bridge, deposits/withdrawals, and FCM costs are
 excluded.
 
@@ -91,8 +115,7 @@ excluded.
   **Estimate**, not a whole-execution bound. Official five-decimal precision does
   not settle ties/fragmentation. `CEIL`/`EXACT` require a separately evidenced
   rounding claim in the pinned schedule. There is no `.07` fallback. Builder
-  rates are additive `notional × bps / 10000`, with integer caps 100 taker/50
-  maker; builder asset/rounding must be pinned. Unknown builder is not absence.
+  fees are excluded because this SDK estimates no-builder routes.
   Explicit effective account rebate schedules may use a fraction of the base
   platform charge, but only the same evidenced native asset—USDC is not pUSD.
 * **Kalshi:** ordinary taker `.07MCP(1−P)`, enabled maker `.0175MCP(1−P)`.
@@ -100,15 +123,16 @@ excluded.
   rounding. Flat/combo variants return Unknown. Model fee is ceiled to six
   decimals. Signed revenue minus fee is floored to .0001 direct or .01
   non-direct grid. Rounding is its remainder. Revenue must be exactly supported
-  at six decimals. With rebates enabled, accumulated rounding is refunded in
-  whole grid units, capped by this fill's trade plus rounding fee; carry can
+  at six decimals. With rounding refunds enabled, accumulated rounding is refunded
+  in whole grid units, capped by this fill's trade plus rounding fee; carry can
   remain ≥ grid. Conservative omission is a **ConditionalBound** only for the
-  pinned supported model, known role/account, and declared fill partition; it
-  is not an execution-fragmentation or FCM-cost bound.
-* **Limitless CLOB:** Unknown for hypothetical takers by default. No table
-  interpolation. Optional BUY `ceil6(quantity × .03)` in the pinned outcome
-  token, SELL `ceil6(notional × .015)` in collateral are **Estimates**. One
-  schedule serves both sides: `fee_asset` pins collateral and economics pins
+  pinned supported model, known role, configured membership, and declared fill
+  partition; it is not an execution-fragmentation or FCM-cost bound.
+* **Limitless CLOB:** Configured BUY `ceil6(quantity × buy_bps / 10000)` in the
+  pinned outcome token and SELL `ceil6(notional × sell_bps / 10000)` in collateral
+  are **Estimates**. Defaults are 300 and 150 bps respectively. No public tier
+  inference or table interpolation. One schedule serves both sides:
+  `fee_asset` pins collateral and economics pins
   the BUY token. Known applicable maker-free schedules yield zero. AMM supports
   `.004` only with explicit contemporaneous ordinary schedule, quantity or
   quote-notional basis, fee asset, and rounding. Unknown basis/history remains
@@ -118,7 +142,7 @@ Kalshi `OrderState` binds account, subaccount, order, native asset, grid, last
 fill index/time and policy. Only an explicit new order at index zero seeds zero
 carry. Missing, duplicate, out-of-order, mismatched or uncertain fills cannot
 exact-continue. State survives taker→maker transitions. A missing schedule
-invalidates carry in `assess_many`; unknown role/membership cannot produce new
+invalidates carry in `assess_many`; unknown role cannot produce new
 exact state. No actual order ledger is persisted. Callers of individual
 `assess` calls must pass every intervening fill and replace state with the
 returned value, including `None`; retaining an old state is caller misuse.
