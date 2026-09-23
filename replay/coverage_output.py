@@ -128,8 +128,10 @@ def _row(row, snapshot, expected, pins):
                 and end <= uint(source["end_ns"]),
                 "evidence interval",
             )
+            # Window evidence persists even when a later group fault replaces
+            # the book's current reason. Both facts must remain visible.
             require(
-                row["state"] == "unusable" and row["reason"]["kind"] == row["evidence"],
+                row["state"] == "unusable",
                 "evidence/state mismatch",
             )
     else:

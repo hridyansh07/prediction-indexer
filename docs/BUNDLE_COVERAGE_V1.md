@@ -102,6 +102,11 @@ the whole verified coverage inventory. Consequently book `evidence` is only:
   `visible_clock_regression`: an authoritative window invalidation, using the
   existing Risk reason spelling and retaining the exact source window.
 
+Window evidence requires an unusable book, not an identical current book reason.
+A later group fault (for example, a connection close) may replace `reason` and
+`source` while `evidence` and `evidence_source` retain the window-level fault.
+Both facts remain visible; neither implies recovery.
+
 No inference of positive coverage from silence is made, and no second Python Risk
 verifier or expanded wire format is introduced. Entering a later clean window
 resets current evidence to `unknown` but does not clear a latched unusable book
@@ -244,8 +249,10 @@ at 14; token 987 at 29, including a valid empty ladder. A trade at 18 and duplic
 at 19 yield one nonduplicate observation. The first scope includes an uncaptured
 listed member. At 23 that member leaves the requested denominator; the incoming
 29-ns cut must not backdate its newly usable token to that quiet scope boundary.
-The primary lane is missing during `[40,50)`. Clean `[50,60)` has no Full and
-cannot recover either book. Fulls at 61 and 67 recover them separately.
+The primary lane has a clock-regression fault during `[40,50)`; a connection close
+at 45 replaces the book reason without clearing that window evidence. Clean
+`[50,60)` has no Full and cannot recover either book. Fulls at 61 and 67 recover
+them separately.
 
 Independently expected bundle durations:
 

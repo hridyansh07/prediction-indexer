@@ -405,22 +405,32 @@ fn redis_bundle_coverage_acceptance() {
         ],
         |_| {},
     );
-    let b = Fixture::new(40, 50, 6, vec![], |r| {
-        r.certified = false;
-        r.completeness = "incomplete".into();
-        r.deadline_expired = true;
-        r.expected_lanes.push("primary".into());
-        r.missing_lanes.push(indexer_finalize::LaneFault {
-            lane: "primary".into(),
-            reason: "lane_missing".into(),
-            detail: None,
-        });
-    });
-    let c = Fixture::new(50, 60, 6, vec![ignored("primary", 55)], |_| {});
+    let b = Fixture::new(
+        40,
+        50,
+        6,
+        vec![row(
+            "primary",
+            45,
+            vec![SegmentEvent::Control(ControlEvent::ConnectionClosed {
+                epoch: "e1".into(),
+            })],
+        )],
+        |r| {
+            r.certified = false;
+            r.clock_faults.push(indexer_finalize::ClockFault {
+                window_start_ns: 40,
+                lane: "primary".into(),
+                previous_visible_ns: 48,
+                observed_visible_ns: 45,
+            });
+        },
+    );
+    let c = Fixture::new(50, 60, 7, vec![ignored("primary", 55)], |_| {});
     let d = Fixture::new(
         60,
         80,
-        7,
+        8,
         vec![
             row("primary", 61, vec![full("polymarket:123", &[(31, 7)], &[])]),
             row("primary", 67, vec![full("polymarket:987", &[], &[(81, 9)])]),
