@@ -66,8 +66,9 @@ Do not spawn detached processes, close inherited lock descriptors, mutate the
 run directory, override signal handlers, or use exit codes to disguise hook
 exceptions. Factories/callbacks/finalizers that raise are **nonretryable**, even
 if they raise a transport exception. Strategies must not perform irreversible
-external side effects. No production strategy is supplied; the tiny test strategy
-is deliberately not an economic model.
+external side effects. The offline coverage-only factory is documented in
+[BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md); no economic strategy is supplied.
+The tiny supervisor test strategy is deliberately not an economic model.
 
 The run identity binds pins, configuration, groups, executable paths, and strategy
 revision/config assertions. Executables, installed packages, Python import path,
