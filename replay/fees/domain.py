@@ -286,6 +286,7 @@ class HypotheticalFill(Closed):
     fill_index: int
     new_order: bool
     decision_reference: str | None = None
+    counterfactual_revision: str | None = None
 
     def __post_init__(self):
         Closed.__post_init__(self)
@@ -297,6 +298,8 @@ class HypotheticalFill(Closed):
             or self.fill_index < 0
         ):
             raise ValueError("invalid fill identity, time, index or quantity")
+        if self.counterfactual_revision == "":
+            raise ValueError("counterfactual revision must be nonempty when supplied")
         if self.new_order and self.fill_index != 0:
             raise ValueError("new order must start at fill index zero")
         e = self.economics
