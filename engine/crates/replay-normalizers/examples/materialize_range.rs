@@ -37,14 +37,16 @@ struct Request {
     end_ns: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Response {
     version: u16,
     normalizer: CanonicalNormalizerIdentity,
     derivatives: Vec<OutputPin>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OutputPin {
     window_start_ns: u64,
     window_end_ns: u64,
@@ -52,13 +54,9 @@ struct OutputPin {
     receipt_sha256: Sha256,
 }
 
-fn run() -> Result<String, String> {
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|error| format!("reading stdin: {error}"))?;
+fn execute(input: &str) -> Result<String, String> {
     let request: Request =
-        serde_json::from_str(&input).map_err(|error| format!("invalid request: {error}"))?;
+        serde_json::from_str(input).map_err(|error| format!("invalid request: {error}"))?;
     if request.version != 1 {
         return Err("unsupported request version".to_owned());
     }
@@ -131,7 +129,12 @@ fn run() -> Result<String, String> {
 }
 
 fn main() {
-    match run() {
+    let mut input = String::new();
+    let result = io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| format!("reading stdin: {error}"))
+        .and_then(|_| execute(&input));
+    match result {
         Ok(output) => println!("{output}"),
         Err(error) => {
             let diagnostic = error.replace(['\n', '\r'], " ");
@@ -144,6 +147,103 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexer_finalize::{
+        CanonicalOutput, CompressionContract, DecodedIdentity, Receipt, StoredIdentity,
+        window_directory,
+    };
+    use prediction_encoder::{DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version};
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::Path;
+    use tempdir::TempDir;
+
+    fn output(directory: &Path, name: &str) -> CanonicalOutput {
+        let mut stored = Vec::new();
+        let encoded = encode_stream(Cursor::new([]), &mut stored, DEFAULT_ZSTD_LEVEL).unwrap();
+        fs::write(directory.join(name), stored).unwrap();
+        CanonicalOutput {
+            file: name.to_owned(),
+            content_encoding: "zstd".to_owned(),
+            decoded: DecodedIdentity {
+                byte_length: encoded.logical.byte_length,
+                line_count: encoded.logical.line_count,
+                sha256: encoded.logical.sha256,
+            },
+            stored: StoredIdentity {
+                byte_length: encoded.stored.byte_length,
+                sha256: encoded.stored.sha256,
+            },
+            compression: CompressionContract {
+                algorithm: "zstd".to_owned(),
+                level: DEFAULT_ZSTD_LEVEL,
+                frame_checksum: true,
+                dictionary: None,
+                frame_count: 1,
+                encoder: encoder_version(),
+            },
+        }
+    }
+
+    fn canonical_window(root: &Path, start: u64, end: u64) {
+        let directory = window_directory(root, start);
+        fs::create_dir_all(&directory).unwrap();
+        let receipt = Receipt {
+            receipt_version: 1,
+            window_start_ns: start,
+            window_end_ns: end,
+            completeness: "complete".to_owned(),
+            certified: true,
+            expected_lanes: vec![],
+            present_lanes: vec![],
+            unexpected_lanes: vec![],
+            missing_lanes: vec![],
+            invalid_lanes: vec![],
+            finalization_deadline_seconds: 300,
+            deadline_expired: false,
+            finalized_at_ns: end,
+            inputs: vec![],
+            evidence: output(&directory, "evidence.ndjson.zst"),
+            provenance: output(&directory, "provenance.ndjson.zst"),
+            first_canonical_seq: None,
+            last_canonical_seq: None,
+            carried: Default::default(),
+            clock_faults: vec![],
+            finalizer_version: 1,
+        };
+        fs::write(
+            directory.join("receipt.json"),
+            format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+        )
+        .unwrap();
+    }
+
+    fn request(canonical: &Path, output: &Path, start: u64, end: u64) -> String {
+        serde_json::json!({
+            "version":1,"canonical_root":canonical,"output_root":output,
+            "start_ns":start,"end_ns":end,
+        })
+        .to_string()
+    }
+
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push((
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(entry.path()).unwrap(),
+                    ));
+                }
+            }
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
 
     #[test]
     fn request_is_closed_and_window_limit_keeps_the_existing_boundary() {
@@ -162,5 +262,51 @@ mod tests {
             enforce_window_limit(4097).unwrap_err(),
             "selected 4097 canonical windows; maximum is 4096"
         );
+    }
+
+    #[test]
+    fn minimal_adjacent_selection_is_verified_ordered_noop_and_source_read_only() {
+        let canonical = TempDir::new("helper-canonical").unwrap();
+        let output = TempDir::new("helper-output").unwrap();
+        for (start, end) in [(0, 10), (10, 20), (20, 30)] {
+            canonical_window(canonical.path(), start, end);
+        }
+        let before = snapshot(canonical.path());
+        let input = request(canonical.path(), output.path(), 5, 25);
+        let first = execute(&input).unwrap();
+        let response: Response = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            response
+                .derivatives
+                .iter()
+                .map(|pin| (pin.window_start_ns, pin.window_end_ns))
+                .collect::<Vec<_>>(),
+            [(0, 10), (10, 20), (20, 30)]
+        );
+        assert_eq!(execute(&input).unwrap(), first);
+        assert_eq!(snapshot(canonical.path()), before);
+    }
+
+    #[test]
+    fn absence_gap_overlap_and_missing_local_object_fail_before_stdout_value() {
+        let output = TempDir::new("helper-output").unwrap();
+
+        let absent = TempDir::new("helper-absent").unwrap();
+        assert!(execute(&request(absent.path(), output.path(), 0, 10)).is_err());
+
+        let gap = TempDir::new("helper-gap").unwrap();
+        canonical_window(gap.path(), 0, 10);
+        canonical_window(gap.path(), 20, 30);
+        assert!(execute(&request(gap.path(), output.path(), 0, 30)).is_err());
+
+        let overlap = TempDir::new("helper-overlap").unwrap();
+        canonical_window(overlap.path(), 0, 15);
+        canonical_window(overlap.path(), 10, 20);
+        assert!(execute(&request(overlap.path(), output.path(), 0, 20)).is_err());
+
+        let missing = TempDir::new("helper-missing-object").unwrap();
+        canonical_window(missing.path(), 0, 10);
+        fs::remove_file(window_directory(missing.path(), 0).join("evidence.ndjson.zst")).unwrap();
+        assert!(execute(&request(missing.path(), output.path(), 0, 10)).is_err());
     }
 }
