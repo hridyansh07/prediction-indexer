@@ -14,8 +14,15 @@ from typing import get_args, get_origin, get_type_hints
 
 
 @lru_cache(maxsize=128)
+def persisted_fields(cls):
+    # Non-init fields are derived runtime state: never identity, equality or artifacts.
+    return tuple(f for f in fields(cls) if f.init)
+
+
+@lru_cache(maxsize=128)
 def _hints(cls):
-    return get_type_hints(cls)
+    names = {f.name for f in persisted_fields(cls)}
+    return {k: v for k, v in get_type_hints(cls).items() if k in names}
 
 
 def _matches(value, annotation):
@@ -52,7 +59,10 @@ def tree(value):
     if is_dataclass(value):
         return {
             "type": type(value).__name__,
-            **{f.name: tree(getattr(value, f.name)) for f in fields(value)},
+            **{
+                f.name: tree(getattr(value, f.name))
+                for f in persisted_fields(type(value))
+            },
         }
     if type(value) is tuple:
         return [tree(v) for v in value]
