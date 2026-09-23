@@ -1,7 +1,8 @@
 # Strategy scope preparation V1
 
-Implemented preparation only. No coverage algorithm, economic strategy, scheduler,
-query language, new reconstruction policy, or strategy output writer is included.
+This document specifies preparation only. The separately implemented coverage
+algorithm and output writer are documented in [BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md).
+No economic strategy, scheduler, query language, or new reconstruction policy is included.
 `replay.preparation` resolves one historical bundle or an explicit market subset
 before replay starts. Runtime consumes a saved immutable snapshot without network
 access. There is no shared cache, Redis cache, or cross-run response reuse.
