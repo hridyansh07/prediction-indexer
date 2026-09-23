@@ -160,6 +160,9 @@ excluded.
   are **Estimates**. Defaults are 300 and 150 bps respectively. No public tier
   inference or table interpolation. **No public curve or schedule is required
   for takers:** an empty catalog plus supplied CLOB instrument economics works.
+  A rounded fee greater than the received contracts (BUY) or collateral (SELL)
+  raises `ValueError`; fees are never clamped. Equality is valid and leaves zero
+  received balance. A configured zero rate remains zero even for tiny fills.
   If supplied, one schedule serves both sides: `fee_asset` pins collateral and
   economics pins the BUY token. Conflicting, malformed, wrong-asset, unsupported,
   or out-of-interval matching evidence is not replaced by configured defaults.
@@ -201,12 +204,17 @@ assert result.charges[0].amount == AssetAmount(outcome, Fixed(3_000_000, 6))
 assert result.net_deltas is not None  # -40 collateral, +97 contracts
 ```
 
-Kalshi `OrderState` binds account, subaccount, order, native asset, grid, last
-fill index/time and policy. Only an explicit new order at index zero seeds zero
-carry. Missing, duplicate, out-of-order, mismatched or uncertain fills cannot
-exact-continue. State survives taker→maker transitions. A missing schedule
-invalidates carry in `assess_many`; unknown role cannot produce new
-exact state. No actual order ledger is persisted. Callers of individual
+Kalshi `OrderState` binds account, subaccount, order, venue/product, market,
+instrument, outcome orientation/token, BUY/SELL side, native quote asset, grid,
+last fill index/time, policy and `counterfactual_revision`. Supply a distinct,
+nonempty revision ID when reusing order keys for independent hypothetical runs;
+omitting it puts fills in one shared revision. Each revision/order must explicitly
+start at fill index zero. Missing, duplicate, out-of-order, mismatched or uncertain
+fills cannot exact-continue. State survives taker→maker transitions and compatible
+schedule changes, but never crosses BUY/SELL or revision boundaries. A missing
+schedule or invalid continuation invalidates carry in `assess_many`; unknown role
+cannot produce new exact state. Stateless assessments require no carry.
+No actual order ledger is persisted. Callers of individual
 `assess` calls must pass every intervening fill and replace state with the
 returned value, including `None`; retaining an old state is caller misuse.
 
