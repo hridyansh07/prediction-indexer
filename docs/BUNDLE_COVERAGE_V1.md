@@ -4,8 +4,9 @@ Implemented: `replay.bundle_coverage:build` is a coverage-only supervisor factor
 It consumes the existing immutable `replay.streams.Cut` / `Book` interface and
 does not reconstruct Risk policy. No economics, fees, opportunities, episodes,
 fills, trading, timer/cadence, query language, discovery, cache, or UI is included.
-The Rust-materializer → Risk → Redis → coverage acceptance walkthrough is a
-separate stage; the tests here are offline contract tests, not that walkthrough.
+The opt-in Rust-materializer → Risk → Redis → supervisor → coverage acceptance
+below uses synthetic contracts. It does not establish retained-data acceptance
+or validate live venue normalizers.
 
 ## Factory and input binding
 
@@ -212,7 +213,7 @@ sort/index scratch additionally bounded by input limits. Resource failures abort
 without a content receipt. Scratch is removed normally, but hard process death may
 leave system temporary files; no broad cleanup service is introduced.
 
-## Verification and stage-3 fixture guidance
+## Offline contract verification
 
 ```bash
 .venv/bin/python -m unittest replay.tests.test_bundle_coverage \
@@ -227,13 +228,159 @@ changes during silence, mixed/all-uncaptured cases, prologue clipping, equal-tim
 transitions, missing terminal, byte determinism, bounds/retained memory, rehashed
 schema/reference/arithmetic tampering, incomplete files and receipt-last failures.
 
-For stage 3, materialize at least two adjacent windows with an explicit primary
-lane, two native required keys and an uncaptured listed member. Delay one Full;
-include a trade and a duplicate, a scoped interval fault, a later clean window
-without a Full, then a recovery Full. Put a scope boundary strictly before a later
-book update and request start inside the first raw window. Use these real pins in
-preparation and independent transport config. Run `replay.bundle_coverage:build`
-through the unchanged supervisor and inspect `read_completed`, checking exact
-state durations and NOT_PROVEN/history-incomplete qualifiers. A separate fresh
-attempt should have identical three semantic files/hash and a different attempt
-binding. Do not claim that these offline unit tests already prove that E2E path.
+## Synthetic cross-language acceptance
+
+`redis_bundle_coverage_acceptance` in `engine/crates/transport/tests/contract.rs`
+uses the existing hand-authored canonical fixture and scripted normalization seam,
+then real materialization, verified traversal, Risk, publisher CLI, Redis Streams,
+supervisor subprocesses, `replay.bundle_coverage:build`, and `read_completed`.
+`replay/tests/test_coverage_acceptance.py` is its Python assertion driver, **not a
+retained-data runner**: it deliberately corrupts a private copy of one synthetic
+input for the failure case. Invoke it only through the Rust test.
+
+Four adjacent raw windows cover `[0,80)`; reporting requests `[10,80)` with explicit
+`clip`. A pre-request Full at 5 must not initialize reporting. Token 123 initializes
+at 14; token 987 at 29, including a valid empty ladder. A trade at 18 and duplicate
+at 19 yield one nonduplicate observation. The first scope includes an uncaptured
+listed member. At 23 that member leaves the requested denominator; the incoming
+29-ns cut must not backdate its newly usable token to that quiet scope boundary.
+The primary lane is missing during `[40,50)`. Clean `[50,60)` has no Full and
+cannot recover either book. Fulls at 61 and 67 recover them separately.
+
+Independently expected bundle durations:
+
+| Scope | Interval | Unavailable | Partial | Available under policy |
+|---|---|---|---|---|
+| 0 | `[10,23)` | 4 ns | 9 ns | 0 ns |
+| 1 | `[23,80)` | 21 ns | 12 ns | 24 ns |
+
+The test checks every book/member/bundle duration, exact bundle intervals, the
+uncaptured denominator, unknown positive evidence, and incomplete-history/vendor
+qualifiers. It injects a crash after content completion but before `SUCCESS`:
+the completed reader rejects that attempt, restart uses a new attempt, and both
+retry and independent fresh run have identical three semantic files/hash. Finally,
+a truncated last derivative makes the real publisher fail without terminal,
+content receipt, or supervisor success. No Risk decisions are hand-authored in
+Python. No live API response or historical capture is used.
+
+Run only against **disposable dedicated Redis ≥8.2**, positive finite maxmemory,
+noeviction, no persistence, loopback-only. The wider test suite temporarily changes
+maxmemory and pauses Redis, so do not use a shared instance and run serially.
+In an Amp orb, use a supervised service (replace the executable path if needed):
+
+```bash
+# Install Redis 8.2 separately; do not use a distribution's older Redis.
+amp orb service start coverage-redis --command '/absolute/path/redis-server --bind 127.0.0.1 --port 6382 --save "" --appendonly no --maxmemory 128mb --maxmemory-policy noeviction'
+uv pip install --python .venv/bin/python 'redis>=6.4,<7'
+export REPLAY_REDIS_URL=redis://127.0.0.1:6382/0
+cargo test --manifest-path engine/Cargo.toml -p replay-transport \
+  --test contract redis_bundle_coverage_acceptance -- --ignored --exact --nocapture
+# Optional wider transport and supervisor acceptance, on the SAME disposable server:
+cargo test --manifest-path engine/Cargo.toml -p replay-transport \
+  --test contract -- --ignored --test-threads=1 --nocapture
+.venv/bin/python -m unittest replay.tests.test_streams_redis replay.tests.test_supervisor
+amp orb service stop coverage-redis
+```
+
+## Bounded retained-data walkthrough (requires actual pinned inputs)
+
+Use the **existing `replay.supervisor` runner**, not the synthetic test driver.
+No retained data was available for this implementation's acceptance. The recipe
+below is an operational entry point, not a claim that historical data passed.
+
+1. Choose one bundle or an explicit nonempty market subset and a finite requested
+   interval. Supply the minimal adjacent profile-2 derivative pins covering it,
+   exact absolute directories, explicit primary lanes/scales, and lower-bound
+   policy. Do not scan for newest derivatives. Missing derivatives or selection
+   occurrences are unavailable input, not permission to fabricate a fixture.
+2. Create the closed preparation JSON from `STRATEGY_PREPARATION_V1.md`. Pin every
+   caller-declared occurrence partitioning the requested interval and its source
+   hashes. Obtain actual IDs/hashes from your reviewed evidence; do not substitute
+   the synthetic IDs above. A union with no native plans is unsupported.
+3. Prepare into a new writable research directory outside retained data. Universe
+   is first, at a directly configurable URL. If archived fallback is desired,
+   explicitly supply matching production run receipts and existing archive backend
+   configuration; the existing S3/GCS ObjectStore and
+   `ArchivedTargeterRunByteStreamer` remain the only archive transport. For example:
+
+```bash
+.venv/bin/python - /research/prepare.json /research/context "$UNIVERSE_BASE_URL" \
+  /reviewed/receipt-one.json /reviewed/receipt-two.json <<'PY'
+import sys
+from pathlib import Path
+from replay.preparation import MAX_BYTES, UniverseHTTP, prepare
+from replay.preparation_sources import ArchivedSelections
+from replay.streams.protocol import decode
+from archive.storage.factory import build_store
+from targeter.v2.run_archive import read_run_archive_receipt
+
+config_path, output, url, *receipt_paths = sys.argv[1:]
+with open(config_path, 'rb') as stream:
+    config = decode(stream.read(MAX_BYTES + 1), MAX_BYTES)
+# Omit receipt arguments to fail closed on unavailable Universe without fallback.
+fallback = None
+if receipt_paths:
+    import os
+    if os.environ.get('ARCHIVE_BACKEND') not in ('s3', 'gcs'):
+        raise SystemExit('Select the existing S3 or GCS archive backend explicitly')
+    fallback = ArchivedSelections(
+        build_store(primary_roots=[Path('/retained/capture')]),
+        [read_run_archive_receipt(Path(p)) for p in receipt_paths],
+    )
+prepare(config, Path(output), universe=UniverseHTTP(url, timeout=10), fallback=fallback)
+PY
+```
+
+Replace paths explicitly; `/retained/capture` is the actual protected primary
+root passed to the existing store factory, not a scratch output. This preparation
+step only reads remote evidence. It does not publish targets, archive, delete,
+discover venues, or introduce a cache. Preserve `context.json` and `receipt.json`
+unchanged. Record the receipt's `snapshot_sha256` independently for run binding.
+
+4. Create `coverage-run.json` using the closed supervisor configuration in
+   `REPLAY_SUPERVISOR_V1.md`: absolute publisher/Python paths, `groups:["coverage"]`,
+   the exact inputs/bounds/policy and independently reviewed ordered native `plans`,
+   and the factory entry at the top of this document with the pinned snapshot.
+   Supply finite budgets; a small first run can use a 1 MiB entry cap, 64 MiB queue,
+   5000-ms command timeout, 3 attempts, 2 no-progress failures, progress margin 100,
+   30-s stall, 300-s attempt, 900-s overall, 0.1-s poll, and 2-s stop. These are
+   operational examples, not automatic defaults or permission to expand scope.
+   Risk's fixed bounds and coverage's output limits apply independently; exhaustions
+   fail closed. Provision temporary disk for the verified window and reader SQLite
+   scratch; this CLI uses system temporary storage and does not reserve space.
+5. Validate binding locally before starting processes, then run on a supplied
+   dedicated Redis. `REDIS_URL` is environment-only and must never be printed or
+   persisted in the JSON. Keep binaries/imports/configuration and pins unchanged
+   across restart. Do not use the destructive integration tests on this server.
+
+```bash
+cargo build --manifest-path engine/Cargo.toml -p replay-transport
+.venv/bin/python - /research/coverage-run.json <<'PY'
+import sys
+from replay.supervisor import read, validate, initial
+from replay.strategy_sdk import PreparedInput
+from replay.streams.protocol import freeze
+c = validate(read(sys.argv[1]))
+assert c['transport']['groups'] == ['coverage']
+assert c['strategies']['coverage']['factory'] == 'replay.bundle_coverage:build'
+PreparedInput(c['strategies']['coverage']['config']).bind(freeze(initial(c)))
+print('snapshot/transport binding verified; retained bytes not yet replayed')
+PY
+.venv/bin/python -m replay.supervisor /research/coverage-run.json /research/coverage-run
+.venv/bin/python - /research/coverage-run <<'PY'
+import json, sys
+from replay.coverage_output import read_completed
+result = read_completed(sys.argv[1], 'coverage')
+print(json.dumps(result, sort_keys=True, indent=2))
+PY
+```
+
+Only the final successful reader establishes a completed coverage result. Record
+its manifest semantic hash, snapshot pin, requested bounds, attempts and qualifiers
+alongside any retained-data acceptance report. Preserve failed attempts; restart
+the same run directory to preserve budgets, never patch receipts or advance a
+cursor. A deliberate fresh comparison uses a new directory with unchanged config
+and pins; compare `intervals.ndjson`, `summary.json`, and `manifest.json` bytewise,
+not the attempt-bound receipt. Missing `SUCCESS`, content receipt, or terminal is
+failure even if some interval rows look plausible. A successful result still says
+`NOT_PROVEN` and `history_complete:false`; it is not a trading/economic conclusion.
