@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn optional_flag_does_not_accept_null_or_coerce_other_primitives() {
         let fixture: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/trade.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/fixtures/kalshi/trade.json")).unwrap();
         for invalid in [Value::Null, json!(0), json!("false"), json!([])] {
             let mut value = fixture["msg"].clone();
             value["is_block_trade"] = invalid;

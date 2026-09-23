@@ -2,7 +2,7 @@ use canonical_normalizer::{CheckedDecimal, DecimalError};
 use replay_domain::{ConditionalMarketPrice, DecimalScale, NumericError, PositiveQty, Qty};
 use serde_json::{Map, Number, Value};
 
-use crate::error::Reject;
+use super::error::Reject;
 
 pub(crate) use canonical_normalizer::CheckedObject;
 

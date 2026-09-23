@@ -7,7 +7,6 @@ use indexer_finalize::{
     Receipt as CanonicalReceipt, StoredIdentity as CanonicalStored, window_directory,
 };
 use indexer_types::{ContentHash, EnvelopeView, Sha256};
-use polymarket_normalizer::Polymarket;
 use prediction_encoder::{
     DEFAULT_ZSTD_LEVEL, LogicalIdentity as CodecLogical, StoredIdentity as CodecStored,
     StreamingDecoder, encode_stream, encoder_version,
@@ -16,15 +15,16 @@ use replay_domain::{FaultImpact, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentRe
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
+use replay_normalizers::polymarket::Polymarket;
 use serde_json::{Value, json};
 use tempdir::TempDir;
 
 const PM_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SNAPSHOT_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const BOOK: &str = include_str!("fixtures/book.json");
-const PRICE_CHANGE: &str = include_str!("fixtures/price_change.json");
-const REST_BOOK: &str = include_str!("fixtures/rest_book.json");
-const TICK_SIZE: &str = include_str!("fixtures/tick_size_change.json");
+const BOOK: &str = include_str!("fixtures/polymarket/book.json");
+const PRICE_CHANGE: &str = include_str!("fixtures/polymarket/price_change.json");
+const REST_BOOK: &str = include_str!("fixtures/polymarket/rest_book.json");
+const TICK_SIZE: &str = include_str!("fixtures/polymarket/tick_size_change.json");
 
 fn envelope(seq: u64, delivery_index: u64, lane: &str, stream: &str, payload: &str) -> Vec<u8> {
     let cursor = if stream == "public_snapshot" {

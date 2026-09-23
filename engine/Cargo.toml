@@ -2,10 +2,8 @@
 members = [
     "crates/domain",
     "crates/normalize",
+    "crates/replay-normalizers",
     "crates/materialize",
-    "crates/kalshi",
-    "crates/polymarket",
-    "crates/limitless",
     "crates/tape",
     "crates/risk",
     "crates/transport",
@@ -28,9 +26,8 @@ indexer-finalize = { path = "../ingester/crates/finalize" }
 indexer-types = { path = "../ingester/crates/types" }
 replay-domain = { path = "crates/domain" }
 canonical-normalizer = { path = "crates/normalize" }
+replay-normalizers = { path = "crates/replay-normalizers" }
 replay-materialize = { path = "crates/materialize" }
-polymarket-normalizer = { path = "crates/polymarket" }
-limitless-normalizer = { path = "crates/limitless" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

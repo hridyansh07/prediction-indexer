@@ -5,7 +5,7 @@ use indexer_finalize::JoinedCanonicalRecord;
 use indexer_types::{EnvelopeView, RecordKind, Stream, Venue};
 use serde_json::Value;
 
-use crate::{
+use super::{
     Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION,
     message::{
         MessageOutcome, ProcessOutcome, normalize_message, normalize_process,
@@ -117,7 +117,7 @@ fn is_multi_change_batch(message: &Value) -> bool {
 
 fn outcome(
     input: &CanonicalEnvelope<'_>,
-    result: Result<MessageOutcome, crate::error::Reject>,
+    result: Result<MessageOutcome, super::error::Reject>,
     batched: bool,
 ) -> Normalization {
     match result {

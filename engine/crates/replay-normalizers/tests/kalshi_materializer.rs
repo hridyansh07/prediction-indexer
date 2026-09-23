@@ -7,17 +7,17 @@ use indexer_finalize::{
     Receipt as CanonicalReceipt, StoredIdentity as CanonicalStored, window_directory,
 };
 use indexer_types::{ContentHash, EnvelopeView, Sha256};
-use kalshi_normalizer::Kalshi;
 use prediction_encoder::{DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version};
 use replay_domain::SEGMENT_SCHEMA_VERSION;
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
+use replay_normalizers::{CanonicalNormalizer, kalshi::Kalshi};
 use serde_json::json;
 use tempdir::TempDir;
 
 const SOURCE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const SNAPSHOT: &str = include_str!("fixtures/orderbook_snapshot.json");
+const SNAPSHOT: &str = include_str!("fixtures/kalshi/orderbook_snapshot.json");
 
 fn envelope(seq: u64, payload: &str) -> Vec<u8> {
     let cursor = if payload == "[]" {
@@ -142,7 +142,7 @@ fn canonical_fixture(root: &std::path::Path) {
     fs::write(directory.join("receipt.json"), bytes).unwrap();
 }
 
-fn spec(normalizer: &Normalizer<Kalshi>) -> DerivativeSpec {
+fn spec(normalizer: &impl Normalize) -> DerivativeSpec {
     DerivativeSpec {
         normalized_schema_version: SEGMENT_SCHEMA_VERSION,
         normalizer_bundle_sha256: normalizer.descriptor().bundle_sha256,
@@ -245,7 +245,7 @@ fn production_normalization_makes_both_venues_usable_from_one_window() {
         ),
         (
             "polymarket",
-            json!({"event_type":"book","asset_id":"T","market":"C",
+            json!({"event_type":"book","asset_id":"1","market":format!("0x{}", "a".repeat(64)),
             "timestamp":"1","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bids":[{"price":"0.23","size":"5"}],
             "asks":[{"price":"0.79","size":"13"}]}),
@@ -319,7 +319,7 @@ fn production_normalization_makes_both_venues_usable_from_one_window() {
         format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
     )
     .unwrap();
-    let mut normalizer = Normalizer::new(Kalshi::default()).unwrap();
+    let mut normalizer = CanonicalNormalizer::default();
     let built = build_window(
         canonical.path(),
         output.path(),
@@ -330,8 +330,17 @@ fn production_normalization_makes_both_venues_usable_from_one_window() {
     )
     .unwrap();
     assert_eq!(built.derivative.manifest.counts.input_records, 2);
+    assert_eq!(built.derivative.manifest.counts.accepted_source_records, 2);
     assert_eq!(built.derivative.manifest.counts.rejected_source_records, 0);
-    let keys = ["kalshi:A", "polymarket:T"].map(|name| BookKey {
+    assert_eq!(
+        built
+            .derivative
+            .manifest
+            .counts
+            .intentionally_ignored_records,
+        0
+    );
+    let keys = ["kalshi:A", "polymarket:1"].map(|name| BookKey {
         instrument: InstrumentId::new(name).unwrap(),
         orientation: ContractOrientation::Outcome,
     });

@@ -9,7 +9,7 @@ use replay_domain::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{
+use super::{
     Config,
     error::Reject,
     value::{
@@ -773,7 +773,7 @@ mod tests {
         for fixture in [
             compact(),
             serde_json::from_str::<Value>(include_str!(
-                "../tests/fixtures/orderbook_update_live_2026_09_12.json"
+                "../../tests/fixtures/limitless/orderbook_update_live_2026_09_12.json"
             ))
             .unwrap()["data"]
                 .clone(),

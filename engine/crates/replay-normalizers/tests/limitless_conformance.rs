@@ -1,16 +1,17 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use limitless_normalizer::{Config, Limitless, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use replay_domain::{BookEvent, FaultImpact, SegmentEvent};
+use replay_normalizers::limitless::{Config, Limitless, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use serde_json::{Value, json};
 
-const CAPTURED_BOOK: &str = include_str!("fixtures/orderbook_update_live_2026_09_12.json");
-const DOCUMENTED_BOOK: &str = include_str!("fixtures/orderbook_update_documented.json");
-const PRICE_DATA: &str = include_str!("fixtures/new_price_data_documented.json");
-const CREATED: &str = include_str!("fixtures/market_created_documented.json");
-const RESOLVED: &str = include_str!("fixtures/market_resolved_documented.json");
-const SYSTEM: &str = include_str!("fixtures/system_live_2026_09_12.json");
+const CAPTURED_BOOK: &str =
+    include_str!("fixtures/limitless/orderbook_update_live_2026_09_12.json");
+const DOCUMENTED_BOOK: &str = include_str!("fixtures/limitless/orderbook_update_documented.json");
+const PRICE_DATA: &str = include_str!("fixtures/limitless/new_price_data_documented.json");
+const CREATED: &str = include_str!("fixtures/limitless/market_created_documented.json");
+const RESOLVED: &str = include_str!("fixtures/limitless/market_resolved_documented.json");
+const SYSTEM: &str = include_str!("fixtures/limitless/system_live_2026_09_12.json");
 
 #[test]
 fn frozen_baseline_canonical_bytes_and_reject_order() {

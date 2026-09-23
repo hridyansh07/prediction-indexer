@@ -3,7 +3,7 @@ use indexer_types::{EnvelopeView, SourceCursor, Stream};
 use replay_domain::SegmentEvent;
 use serde_json::{Map, Value};
 
-use crate::{
+use super::{
     Config,
     error::Reject,
     event::{RelativeDelta, Snapshot, Trade, instrument},

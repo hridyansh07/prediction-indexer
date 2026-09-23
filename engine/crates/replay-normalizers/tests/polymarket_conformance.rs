@@ -1,17 +1,17 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use polymarket_normalizer::{Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION, Polymarket};
 use replay_domain::{
     BookEvent, BookStateHash, ContractOrientation, FaultImpact, LevelChange, SegmentEvent, Side,
 };
+use replay_normalizers::polymarket::{Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION, Polymarket};
 use serde_json::{Value, json};
 
-const BOOK: &str = include_str!("fixtures/book.json");
-const PRICE_CHANGE: &str = include_str!("fixtures/price_change.json");
-const TRADE: &str = include_str!("fixtures/last_trade_price.json");
-const REST_BOOK: &str = include_str!("fixtures/rest_book.json");
-const TICK_SIZE: &str = include_str!("fixtures/tick_size_change.json");
+const BOOK: &str = include_str!("fixtures/polymarket/book.json");
+const PRICE_CHANGE: &str = include_str!("fixtures/polymarket/price_change.json");
+const TRADE: &str = include_str!("fixtures/polymarket/last_trade_price.json");
+const REST_BOOK: &str = include_str!("fixtures/polymarket/rest_book.json");
+const TICK_SIZE: &str = include_str!("fixtures/polymarket/tick_size_change.json");
 
 #[test]
 fn delivery_cursor_errors_preserve_prefix_and_level_precedence() {

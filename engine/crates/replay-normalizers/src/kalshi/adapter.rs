@@ -4,7 +4,7 @@ use canonical_normalizer::{
 use indexer_types::{RecordKind, SourceCursor, Stream, Venue};
 use serde_json::Value;
 
-use crate::{
+use super::{
     Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION,
     message::{MessageOutcome, normalize_message},
     process::{ProcessOutcome, normalize_process},

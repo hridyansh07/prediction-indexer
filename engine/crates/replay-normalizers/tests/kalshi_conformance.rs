@@ -1,14 +1,14 @@
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
-use kalshi_normalizer::{Config, Kalshi, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use replay_domain::{BookEvent, ContractOrientation, LevelChange, SegmentEvent, Side};
+use replay_normalizers::kalshi::{Config, Kalshi, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use serde_json::{Value, json};
 
-const SNAPSHOT: &str = include_str!("fixtures/orderbook_snapshot.json");
-const DELTA: &str = include_str!("fixtures/orderbook_delta.json");
-const TRADE: &str = include_str!("fixtures/trade.json");
-const TICKER: &str = include_str!("fixtures/ticker.json");
+const SNAPSHOT: &str = include_str!("fixtures/kalshi/orderbook_snapshot.json");
+const DELTA: &str = include_str!("fixtures/kalshi/orderbook_delta.json");
+const TRADE: &str = include_str!("fixtures/kalshi/trade.json");
+const TICKER: &str = include_str!("fixtures/kalshi/ticker.json");
 
 fn source(payload: &str, stream: &str, cursor: Value) -> JoinedCanonicalRecord {
     let envelope = format!(

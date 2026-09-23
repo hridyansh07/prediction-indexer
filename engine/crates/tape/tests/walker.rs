@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use canonical_normalizer::{
-    Normalization, Normalize, Normalizer, NormalizerDescriptor, NormalizerError, ParseReject,
+    Normalization, Normalize, NormalizerDescriptor, NormalizerError, ParseReject,
 };
 use indexer_finalize::{
     CanonicalOutput, CompressionContract, DecodedIdentity, InputSegment, Receipt, StoredIdentity,
@@ -616,57 +616,49 @@ fn all_empty_windows_are_visible_and_finish_normally() {
 }
 
 #[test]
-fn actual_three_venue_derivatives_keep_native_books_and_exact_pins() {
+fn one_composite_derivative_keeps_all_three_venues_and_native_books() {
     let fixtures = [
         (
             "kalshi",
-            include_str!("../../kalshi/tests/fixtures/orderbook_snapshot.json"),
+            include_str!("../../replay-normalizers/tests/fixtures/kalshi/orderbook_snapshot.json"),
         ),
         (
             "polymarket",
-            include_str!("../../polymarket/tests/fixtures/book.json"),
+            include_str!("../../replay-normalizers/tests/fixtures/polymarket/book.json"),
         ),
         (
             "limitless",
-            include_str!("../../limitless/tests/fixtures/orderbook_update_live_2026_09_12.json"),
+            include_str!(
+                "../../replay-normalizers/tests/fixtures/limitless/orderbook_update_live_2026_09_12.json"
+            ),
         ),
     ];
     let source = TempDir::new("source").unwrap();
     let out = TempDir::new("out").unwrap();
-    let mut normalizers: Vec<Box<dyn Normalize>> = vec![
-        Box::new(Normalizer::new(kalshi_normalizer::Kalshi::default()).unwrap()),
-        Box::new(Normalizer::new(polymarket_normalizer::Polymarket::default()).unwrap()),
-        Box::new(Normalizer::new(limitless_normalizer::Limitless::default()).unwrap()),
-    ];
-    let mut inputs = vec![];
+    let rows = fixtures.map(|(lane, payload)| Row {
+        lane,
+        time: match lane {
+            "kalshi" => 1,
+            "polymarket" => 2,
+            "limitless" => 3,
+            _ => unreachable!(),
+        },
+        payload,
+        continuity: "continuous",
+        epoch: "e",
+    });
+    canonical(source.path(), 0, 10, 1, &rows, true);
+    let input = build(
+        source.path(),
+        out.path(),
+        0,
+        10,
+        &mut replay_normalizers::CanonicalNormalizer::default(),
+    );
     let mut instruments = BTreeSet::new();
     let mut expected = vec![];
-    for (index, ((lane, payload), normalizer)) in
-        fixtures.into_iter().zip(normalizers.iter_mut()).enumerate()
-    {
-        let start = index as u64 * 10;
-        canonical(
-            source.path(),
-            start,
-            start + 10,
-            index as i64 + 1,
-            &[Row {
-                lane,
-                time: start + 1,
-                payload,
-                continuity: "continuous",
-                epoch: "e",
-            }],
-            true,
-        );
-        let input = build(
-            source.path(),
-            out.path(),
-            start,
-            start + 10,
-            normalizer.as_mut(),
-        );
-        let mut reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+    let mut reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+    for lane in ["kalshi", "polymarket", "limitless"] {
         let delivery = reader.next_delivery().unwrap().unwrap();
         assert!(
             delivery.disposition().is_none(),
@@ -679,15 +671,14 @@ fn actual_three_venue_derivatives_keep_native_books_and_exact_pins() {
             }
         }
         expected.extend(delivery.records().iter().cloned());
-        assert!(reader.next_delivery().unwrap().is_none());
-        reader.finish().unwrap();
-        inputs.push(input);
     }
-    let pins: Vec<_> = inputs.iter().map(|i| i.pin.clone()).collect();
-    let mut req = request(0, 30);
+    assert!(reader.next_delivery().unwrap().is_none());
+    reader.finish().unwrap();
+    let pin = input.pin.clone();
+    let mut req = request(0, 10);
     req.scope.instruments = instruments;
     let (groups, _, done) =
-        drain(DerivativeWalker::open(inputs, req, ReadLimits::default()).unwrap());
+        drain(DerivativeWalker::open(vec![input], req, ReadLimits::default()).unwrap());
     let actual: Vec<_> = groups
         .iter()
         .flat_map(|g| g.deliveries())
@@ -695,7 +686,8 @@ fn actual_three_venue_derivatives_keep_native_books_and_exact_pins() {
         .cloned()
         .collect();
     assert_eq!(actual, expected);
-    assert_eq!(done.pins(), pins);
+    assert_eq!(done.pins(), &[pin]);
+    assert_eq!(groups.len(), 3);
     assert_eq!(groups[0].book_keys().count(), 2);
     let books: Vec<_> = groups[0].deliveries()[0]
         .records()
