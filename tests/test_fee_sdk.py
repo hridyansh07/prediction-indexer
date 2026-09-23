@@ -159,6 +159,154 @@ def total_fee(result):
 
 
 class ConfiguredEngineTests(unittest.TestCase):
+    def test_limitless_fee_cannot_exceed_received(self):
+        base = fill(Venue.LIMITLESS, "0.4", "1")
+        tiny = replace(
+            base,
+            economics=replace(base.economics, quantity_scale=7, quote_scale=8),
+            quantity=Quantity(1, 7),
+            gross_notional=Notional(base.economics.quote, Fixed(4, 8)),
+        )
+        # BUY: 0.0000001 - 0.000001 = -0.0000009 contracts.
+        # SELL: 0.00000004 - 0.000001 = -0.00000096 collateral.
+        for side in Side:
+            f = replace(tiny, side=side)
+            for schedules in ((), (schedule(f),)):
+                engine = FeeEngine(
+                    resolver=Resolver(Catalog.build(schedules), reference_time=50)
+                )
+                with self.subTest(side=side, explicit=bool(schedules)):
+                    with self.assertRaisesRegex(
+                        ValueError, "Limitless fee exceeds received amount"
+                    ):
+                        engine.assess(f)
+                    zero = replace(
+                        engine, policy=Policy(limitless_buy_bps=0, limitless_sell_bps=0)
+                    )
+                    result, _ = zero.assess(f)
+                    self.assertEqual(total_fee(result), 0)
+                    self.assertEqual(
+                        delta(result, f.economics.outcome),
+                        Fraction(1 if side is Side.BUY else -1, 10**7),
+                    )
+                    self.assertEqual(
+                        delta(result, f.economics.quote),
+                        Fraction(-4 if side is Side.BUY else 4, 10**8),
+                    )
+        for side in Side:
+            f = fill(Venue.LIMITLESS, "1", "0.000001", side=side)
+            for schedules in ((), (schedule(f),)):
+                engine = FeeEngine(
+                    resolver=Resolver(Catalog.build(schedules), reference_time=50)
+                )
+                result, _ = engine.assess(f)
+                self.assertEqual(total_fee(result), Fraction(1, 10**6))
+                self.assertEqual(
+                    delta(
+                        result,
+                        f.economics.outcome if side is Side.BUY else f.economics.quote,
+                    ),
+                    0,
+                )
+
+    def test_kalshi_carry_binds_trading_identity(self):
+        first = fill(Venue.KALSHI, "0.01", "1")
+        _, state = assess(first, policy=EXACT)
+        self.assertEqual(state.carry.value, Fraction("0.009307"))
+        second = replace(first, fill_id="second", fill_index=1, new_order=False)
+        changed = [replace(second, side=Side.SELL)]
+        changed.extend(
+            replace(second, context=replace(second.context, **{field: value}))
+            for field, value in (
+                ("market", "other"),
+                ("instrument", "other"),
+                ("orientation", "no"),
+                ("account", "other"),
+                ("subaccount", "other"),
+            )
+        )
+        changed.append(
+            replace(
+                second,
+                economics=replace(
+                    second.economics,
+                    outcome=replace(second.economics.outcome, token="other"),
+                ),
+            )
+        )
+        for current in changed:
+            with self.subTest(
+                context=current.context,
+                side=current.side,
+                outcome=current.economics.outcome,
+            ):
+                result, next_state = assess(current, policy=EXACT, state=state)
+                self.assertIsNone(result.net_deltas)
+                self.assertIsNone(next_state)
+                self.assertEqual(result.rebates, ())
+                self.assertIn(UnknownReason.STATE, [u.reason for u in result.unknowns])
+        for current in (
+            replace(second, fill_index=0),
+            replace(second, fill_index=2),
+            replace(second, event_time=19),
+        ):
+            result, next_state = assess(current, policy=EXACT, state=state)
+            self.assertIsNone(result.net_deltas)
+            self.assertIsNone(next_state)
+
+    def test_kalshi_revisions_isolate_carry_and_require_order_start(self):
+        first = replace(fill(Venue.KALSHI, "0.01", "1"), counterfactual_revision="a")
+        _, state = assess(first, policy=EXACT)
+        second = replace(first, fill_id="second", fill_index=1, new_order=False)
+        other_revision = replace(second, counterfactual_revision="b")
+        result, next_state = assess(other_revision, policy=EXACT, state=state)
+        self.assertIsNone(result.net_deltas)
+        self.assertIsNone(next_state)
+        self.assertNotEqual(second.identity, other_revision.identity)
+        with self.assertRaises(ValueError):
+            replace(first, counterfactual_revision="")
+
+        engine = FeeEngine(
+            EXACT, Resolver(Catalog.build([schedule(first)]), reference_time=50)
+        )
+        missing_start = engine.assess_many((first, other_revision))
+        self.assertIsNone(missing_start[1].net_deltas)
+        new_revision = replace(first, fill_id="b-first", counterfactual_revision="b")
+        results = engine.assess_many((first, new_revision, second, other_revision))
+        self.assertEqual(
+            tuple(total_fee(r) for r in results),
+            (Fraction(".01"), Fraction(".01"), 0, 0),
+        )
+        changed_side = replace(second, side=Side.SELL)
+        after_bad = replace(second, fill_id="third", fill_index=2)
+        invalid = engine.assess_many((first, changed_side, after_bad))
+        self.assertIsNone(invalid[1].net_deltas)
+        self.assertIsNone(invalid[2].net_deltas)
+        # Stateless estimates never require a complete carry chain.
+        result, _ = replace(engine, policy=Policy()).assess(other_revision)
+        self.assertEqual(total_fee(result), Fraction(".01"))
+
+    def test_kalshi_carry_survives_supported_schedule_and_role_change(self):
+        first = fill(Venue.KALSHI, "0.01", "1")
+        second = replace(
+            first,
+            fill_id="second",
+            fill_index=1,
+            new_order=False,
+            event_time=21,
+            role=Role.MAKER,
+        )
+        old = schedule(first, effective_to=21)
+        new = schedule(
+            first, Kalshi(KalshiKind.MAKER, Multiplier(1, 0)), effective_from=21
+        )
+        results = FeeEngine(EXACT).assess_many(
+            (first, second), Resolver(Catalog.build([old, new]))
+        )
+        self.assertEqual(tuple(total_fee(r) for r in results), (Fraction(".01"), 0))
+        self.assertEqual(results[1].rebates[0].amount.amount.value, Fraction(".01"))
+        self.assertIsNotNone(results[1].net_deltas)
+
     def evaluate(self, engine, f, state=None):
         resolved = Resolver(Catalog.build([schedule(f)])).resolve(
             f.context, f.event_time, None
@@ -178,7 +326,9 @@ class ConfiguredEngineTests(unittest.TestCase):
                 result, _ = self.evaluate(engine, f)
                 self.assertFalse(result.unknowns)
                 self.assertEqual(total_fee(result), Fraction(fee))
-                self.assertEqual(delta(result, f.economics.outcome), Fraction(contracts))
+                self.assertEqual(
+                    delta(result, f.economics.outcome), Fraction(contracts)
+                )
                 self.assertEqual(delta(result, f.economics.quote), Fraction(quote))
 
     def test_independent_rates_and_identity(self):
@@ -245,7 +395,9 @@ class ConfiguredEngineTests(unittest.TestCase):
                 )
                 self.assertTrue(all(r.policy == engine.policy for r in results))
         engine = FeeEngine(
-            Policy(kalshi_member_class=AccountClass.DIRECT, include_rounding_refunds=True)
+            Policy(
+                kalshi_member_class=AccountClass.DIRECT, include_rounding_refunds=True
+            )
         )
         state = None
         for index, old_member in enumerate(AccountClass):
@@ -282,7 +434,9 @@ class ConfiguredEngineTests(unittest.TestCase):
                 ):
                     replace(policy, **{field: invalid})
             for valid in (0, 10000):
-                self.assertEqual(getattr(replace(policy, **{field: valid}), field), valid)
+                self.assertEqual(
+                    getattr(replace(policy, **{field: valid}), field), valid
+                )
         with self.assertRaises(ValueError):
             Policy(kalshi_member_class=AccountClass.UNKNOWN)
         for field, value in (
@@ -931,9 +1085,11 @@ class PropertyTests(unittest.TestCase):
 
     def test_random_kalshi_against_integer_reference(self):
         rng = random.Random(517)
-        for member, grid in (
-            (AccountClass.DIRECT, 100),
-            (AccountClass.NON_DIRECT, 10000),
+        for member, grid, side in (
+            (AccountClass.DIRECT, 100, Side.BUY),
+            (AccountClass.DIRECT, 100, Side.SELL),
+            (AccountClass.NON_DIRECT, 10000, Side.BUY),
+            (AccountClass.NON_DIRECT, 10000, Side.SELL),
         ):
             carry = 0
             state = None
@@ -941,7 +1097,6 @@ class PropertyTests(unittest.TestCase):
                 p = rng.randrange(1, 100)
                 q = rng.randrange(1, 300)
                 role = rng.choice((Role.TAKER, Role.MAKER))
-                side = rng.choice((Side.BUY, Side.SELL))
                 f = fill(
                     Venue.KALSHI,
                     f"0.{p:02}",

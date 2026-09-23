@@ -76,6 +76,14 @@ class OrderState(Closed):
     last_event_time: int
     carry: Fixed
     policy_identity: str
+    venue: Venue
+    product: Product
+    market: str
+    instrument: str
+    orientation: str
+    outcome: Asset
+    side: Side
+    counterfactual_revision: str | None
 
     def __post_init__(self):
         Closed.__post_init__(self)
@@ -193,7 +201,11 @@ class FeeEngine(Closed):
                 else notional * Fraction(policy.limitless_sell_bps, 10000)
             )
             assumptions.append("limitless_configured_rate_and_ceil6_declared_fill")
-            charge(Component.PLATFORM, asset, ceil_grid(raw, 6), Evidence.ESTIMATE)
+            amount = ceil_grid(raw, 6)
+            received = quantity if fill.side is Side.BUY else notional
+            if amount.value > received:
+                raise ValueError("Limitless fee exceeds received amount")
+            charge(Component.PLATFORM, asset, amount, Evidence.ESTIMATE)
 
         platform = resolved.platform
         if (
@@ -303,6 +315,14 @@ class FeeEngine(Closed):
                                 order_state.grid_scale,
                                 order_state.last_fill_index + 1,
                                 order_state.policy_identity,
+                                order_state.venue,
+                                order_state.product,
+                                order_state.market,
+                                order_state.instrument,
+                                order_state.orientation,
+                                order_state.outcome,
+                                order_state.side,
+                                order_state.counterfactual_revision,
                             )
                             == (
                                 fill.context.account,
@@ -312,6 +332,14 @@ class FeeEngine(Closed):
                                 grid_scale,
                                 fill.fill_index,
                                 policy.identity,
+                                fill.context.venue,
+                                fill.context.product,
+                                fill.context.market,
+                                fill.context.instrument,
+                                fill.context.orientation,
+                                e.outcome,
+                                fill.side,
+                                fill.counterfactual_revision,
                             )
                             and order_state.last_event_time <= fill.event_time
                         )
@@ -333,6 +361,14 @@ class FeeEngine(Closed):
                             fill.event_time,
                             fixed(accumulated - rebate, 6),
                             policy.identity,
+                            fill.context.venue,
+                            fill.context.product,
+                            fill.context.market,
+                            fill.context.instrument,
+                            fill.context.orientation,
+                            e.outcome,
+                            fill.side,
+                            fill.counterfactual_revision,
                         )
                         if policy.include_rounding_refunds:
                             rebates.append(
@@ -466,6 +502,7 @@ class FeeEngine(Closed):
                 fill.context.account,
                 fill.context.subaccount,
                 fill.order_key,
+                fill.counterfactual_revision,
             )
             if fill.event_time < last_time or fill.identity in seen:
                 raise ValueError("duplicate or out-of-order fills")
