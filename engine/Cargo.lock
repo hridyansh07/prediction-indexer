@@ -449,6 +449,8 @@ dependencies = [
  "prediction-encoder",
  "replay-domain",
  "replay-materialize",
+ "replay-risk",
+ "replay-tape",
  "serde",
  "serde_json",
  "tempdir",

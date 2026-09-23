@@ -225,3 +225,146 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
     assert_eq!(retry.disposition, BuildDisposition::VerifiedNoOp);
     assert_eq!(retry.derivative.pin, first.derivative.pin);
 }
+
+#[test]
+fn production_normalization_makes_both_venues_usable_from_one_window() {
+    use replay_domain::{BookKey, ContractOrientation, DecimalScale, InstrumentId, LaneId};
+    use replay_risk::{BookPlan, RiskEngine, RiskLimits, Validity};
+    use replay_tape::{LowerBoundPolicy, PinnedDerivative};
+
+    let canonical = TempDir::new("multi-venue-canonical").unwrap();
+    let output = TempDir::new("multi-venue-normalized").unwrap();
+    let directory = window_directory(canonical.path(), 0);
+    fs::create_dir_all(&directory).unwrap();
+    let rows = [
+        (
+            "kalshi",
+            json!({"type":"orderbook_snapshot","sid":1,"seq":1,
+            "msg":{"market_ticker":"A","yes_dollars_fp":[["0.37","11.00"]],
+            "no_dollars_fp":[["0.61","7.00"]]}}),
+        ),
+        (
+            "polymarket",
+            json!({"event_type":"book","asset_id":"T","market":"C",
+            "timestamp":"1","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bids":[{"price":"0.23","size":"5"}],
+            "asks":[{"price":"0.79","size":"13"}]}),
+        ),
+    ];
+    let mut evidence = Vec::new();
+    let mut provenance = Vec::new();
+    for (i, (venue, payload)) in rows.iter().enumerate() {
+        let seq = i + 1;
+        let payload = payload.to_string();
+        let id = format!("{venue}-1");
+        let cursor = if *venue == "kalshi" {
+            json!({"type":"update_range","first":1,"last":1,"previous_last":0})
+        } else {
+            json!({"type":"unsequenced","counter":1})
+        };
+        let envelope = json!({"envelope_version":2,"delivery_index":1,
+            "record_id":id,"visible_ns":seq,"monotonic_ns":seq,"venue":venue,
+            "stream":"public_book","connection_epoch":"e","local_counter":1,
+            "source_cursor":cursor,
+            "kind":"venue_frame","raw_payload":payload});
+        evidence.extend_from_slice(format!("{envelope}\n").as_bytes());
+        provenance.extend_from_slice(
+            format!(
+                "{}\n",
+                json!({"canonical_seq":seq,
+            "lane_id":venue,"source_segment_sha256":SOURCE_SHA,"source_line_number":1,
+            "record_id":id,"content_hash":ContentHash::hash(payload.as_bytes()).to_hex(),
+            "continuity_verdict":"unsequenced_venue","visible_tie_group":null})
+            )
+            .as_bytes(),
+        );
+    }
+    let lanes = vec!["kalshi".to_owned(), "polymarket".to_owned()];
+    let receipt = CanonicalReceipt {
+        receipt_version: 1,
+        window_start_ns: 0,
+        window_end_ns: 10,
+        completeness: "complete".into(),
+        certified: true,
+        expected_lanes: lanes.clone(),
+        present_lanes: lanes.clone(),
+        unexpected_lanes: vec![],
+        missing_lanes: vec![],
+        invalid_lanes: vec![],
+        finalization_deadline_seconds: 300,
+        deadline_expired: false,
+        finalized_at_ns: 10,
+        inputs: lanes
+            .iter()
+            .map(|lane| InputSegment {
+                lane: lane.clone(),
+                data_file: "source.ndjson".into(),
+                segment_index: 0,
+                line_count: 1,
+                sha256: SOURCE_SHA.into(),
+                first_delivery_index: Some(1),
+                last_delivery_index: Some(1),
+            })
+            .collect(),
+        evidence: encoded_output(&directory, "evidence.ndjson.zst", &evidence),
+        provenance: encoded_output(&directory, "provenance.ndjson.zst", &provenance),
+        first_canonical_seq: Some(1),
+        last_canonical_seq: Some(2),
+        carried: Default::default(),
+        clock_faults: vec![],
+        finalizer_version: 1,
+    };
+    fs::write(
+        directory.join("receipt.json"),
+        format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+    )
+    .unwrap();
+    let mut normalizer = Normalizer::new(Kalshi::default()).unwrap();
+    let built = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(&normalizer),
+        &mut normalizer,
+    )
+    .unwrap();
+    assert_eq!(built.derivative.manifest.counts.input_records, 2);
+    assert_eq!(built.derivative.manifest.counts.rejected_source_records, 0);
+    let keys = ["kalshi:A", "polymarket:T"].map(|name| BookKey {
+        instrument: InstrumentId::new(name).unwrap(),
+        orientation: ContractOrientation::Outcome,
+    });
+    let plans = keys
+        .iter()
+        .zip(lanes)
+        .map(|(key, venue)| BookPlan {
+            key: key.clone(),
+            lane: LaneId::new(venue.clone()).unwrap(),
+            price_scale: DecimalScale::new(4).unwrap(),
+            quantity_scale: DecimalScale::new(if venue == "kalshi" { 2 } else { 6 }).unwrap(),
+            venue,
+        })
+        .collect();
+    let mut risk = RiskEngine::open(
+        vec![PinnedDerivative {
+            directory: built.derivative.directory,
+            pin: built.derivative.pin,
+        }],
+        0,
+        10,
+        LowerBoundPolicy::Clip,
+        plans,
+        RiskLimits::default(),
+    )
+    .unwrap();
+    while risk.next_cut().unwrap().is_some() {}
+    for key in keys {
+        assert_eq!(
+            risk.view(&key).unwrap().validity(),
+            &Validity::Usable,
+            "production normalization must initialize {key:?}"
+        );
+    }
+    risk.finish().unwrap();
+}
