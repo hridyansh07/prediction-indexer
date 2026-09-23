@@ -57,6 +57,7 @@ from replay.fees.schedules import (
     Selection,
     TradeBasis,
     UnknownReason,
+    Unsupported,
     ZeroFee,
 )
 
@@ -301,6 +302,142 @@ class ConfiguredEngineTests(unittest.TestCase):
         resolved = Resolver(Catalog.build([schedule(f)])).resolve(f.context, 20, None)
         with self.assertRaises(TypeError):
             engine.assess(f, resolved, policy=Policy())
+
+
+class CurrentSnapshotTests(unittest.TestCase):
+    def engine(self, schedules=(), reference=50):
+        return FeeEngine(
+            resolver=Resolver(Catalog.build(schedules), reference_time=reference)
+        )
+
+    def test_current_pm_is_frozen_across_historical_boundaries(self):
+        f = fill(price="0.3", event_time=5)
+        old = schedule(f, effective_from=0, effective_to=40)
+        current = schedule(
+            f,
+            Polymarket(Rate.parse("0.05"), 1, True),
+            effective_from=40,
+            effective_to=60,
+        )
+        future = schedule(f, Polymarket(Rate.parse("0.09"), 1, True), effective_from=60)
+        engine = self.engine([old, current, future])
+        fills = tuple(
+            replace(f, fill_id=str(t), order_key=str(t), event_time=t)
+            for t in (5, 39, 40, 60, 101)
+        )
+        for result, original in zip(engine.assess_many(fills), fills):
+            self.assertEqual(total_fee(result), Fraction("1.05"))
+            self.assertEqual(result.fill, original)
+            self.assertEqual(result.resolved.event_time, original.event_time)
+            self.assertEqual(result.resolved.reference_time, 50)
+            self.assertEqual(
+                result.resolved.snapshot_identity, engine.resolver.identity
+            )
+            self.assertEqual(
+                result.resolved.catalog_identity, engine.resolver.catalog.identity
+            )
+            self.assertIn(
+                "current_snapshot_not_historical_fee_claim", result.assumptions
+            )
+            self.assertEqual(result.resolved.platform.schedule, current)
+        later = self.engine([old, current, future], 60)
+        self.assertEqual(total_fee(later.assess(f)[0]), Fraction("1.89"))
+        self.assertNotEqual(engine.identity, later.identity)
+        self.assertNotEqual(engine.assess(f)[0].identity, later.assess(f)[0].identity)
+        changed = self.engine([old, replace(current, model=old.model), future])
+        self.assertNotEqual(engine.identity, changed.identity)
+        self.assertEqual(total_fee(changed.assess(f)[0]), Fraction("1.47"))
+        with self.assertRaises(ValueError):
+            engine.assess(f, Resolver(Catalog.build([old])).resolve(f.context, 5, None))
+        with self.assertRaises(ValueError):
+            engine.assess_many((), Resolver(Catalog.build([])))
+        with self.assertRaises(ValueError):
+            engine.assess_many((), knowledge_cutoff=0)
+        with self.assertRaises(ValueError):
+            engine.resolver.resolve(f.context, f.event_time, 0)
+        with self.assertRaises(ValueError):
+            FeeEngine(resolver=Resolver(Catalog.build([])))
+        with self.assertRaises(FrozenInstanceError):
+            engine.resolver.reference_time = 60
+        for invalid in (-1, True, 0.5):
+            with self.assertRaises((ValueError, TypeError)):
+                self.engine(reference=invalid)
+
+    def test_current_unknown_start_and_context_conflicts(self):
+        f = fill(event_time=1)
+        s = schedule(f, effective_from=None, effective_to=None, effective_evidence=None)
+        other = replace(f, context=replace(f.context, market="other"))
+        second = schedule(other, Polymarket(Rate.parse("0.03"), 1, True))
+        engine = self.engine([s, second])
+        self.assertEqual(total_fee(engine.assess(f)[0]), Fraction("1.75"))
+        self.assertEqual(total_fee(engine.assess(other)[0]), Fraction("0.75"))
+        self.assertIsNone(assess(f, [s])[0].net_deltas)
+        conflict = self.engine([s, replace(s, model_version="conflict")]).assess(f)[0]
+        self.assertEqual(conflict.unknowns[0].reason, UnknownReason.CONFLICT)
+        self.assertIsNone(self.engine().assess(f)[0].net_deltas)
+        with tempfile.TemporaryDirectory() as temp:
+            catalog = Catalog.build([s])
+            path = build_catalog(Path(temp), catalog, {SOURCE.sha256: SOURCE_BYTES})
+            self.assertEqual(load_catalog(path), catalog)
+
+    def test_current_kalshi_null_inherits_current_series(self):
+        f = fill(Venue.KALSHI, event_time=5)
+        old = schedule(
+            f,
+            scope=Scope(Venue.KALSHI, Product.CLOB, series="series"),
+            effective_from=0,
+            effective_to=40,
+        )
+        current = replace(
+            old,
+            effective_from=40,
+            effective_to=100,
+            model=Kalshi(KalshiKind.QUADRATIC, Multiplier(2, 0)),
+        )
+        event = schedule(
+            f,
+            Kalshi(None, None),
+            scope=Scope(Venue.KALSHI, Product.CLOB, event="event"),
+            effective_from=40,
+        )
+        engine = self.engine([old, current, event])
+        for annotation in AccountClass:
+            result, _ = engine.assess(
+                replace(f, context=replace(f.context, account_class=annotation))
+            )
+            self.assertEqual(total_fee(result), Fraction("3.5"))
+            self.assertEqual(result.resolved.platform.dependencies, (event, current))
+
+    def test_limitless_without_curve_and_visible_bad_evidence(self):
+        f = fill(Venue.LIMITLESS, "0.4", "100")
+        for side, expected in ((Side.BUY, "3"), (Side.SELL, "0.6")):
+            result, _ = self.engine().assess(replace(f, side=side))
+            self.assertEqual(total_fee(result), Fraction(expected))
+            self.assertIsNotNone(result.net_deltas)
+        for unsupported in (
+            replace(f, role=Role.MAKER),
+            replace(f, context=replace(f.context, product=Product.AMM)),
+        ):
+            self.assertIsNone(self.engine().assess(unsupported)[0].net_deltas)
+        s = schedule(f)
+        for schedules in (
+            [s, replace(s, model_version="conflict")],
+            [replace(s, fee_asset=f.economics.outcome)],
+            [replace(s, fee_scale=5)],
+            [replace(s, model=Unsupported("unknown product variant"))],
+            [replace(s, effective_from=60)],
+        ):
+            self.assertIsNone(self.engine(schedules).assess(f)[0].net_deltas)
+            self.assertIsNone(
+                self.engine(schedules).assess(replace(f, role=Role.MAKER))[0].net_deltas
+            )
+        with self.assertRaisesRegex(ValueError, "economics identity"):
+            self.engine(
+                [replace(s, economics=replace(f.economics, quantity_scale=5))]
+            ).assess(f)
+        self.assertEqual(
+            total_fee(self.engine([s]).assess(replace(f, role=Role.MAKER))[0]), 0
+        )
 
 
 class FeeDomainTests(unittest.TestCase):
@@ -981,9 +1118,13 @@ import unittest.mock
 def blocked(*args, **kwargs):
     raise AssertionError("network attempted")
 socket.socket = blocked
-from replay.fees import FeeEngine
-from tests.test_fee_sdk import fill, assess
+from replay.fees import FeeEngine, Resolver, Catalog
+from tests.test_fee_sdk import fill, assess, schedule
 assess(fill())
+with unittest.mock.patch("time.time", blocked), unittest.mock.patch("time.time_ns", blocked):
+    fees = FeeEngine(resolver=Resolver(Catalog.build([schedule(fill())]), reference_time=50))
+    fees.assess(fill())
+    fees.assess_many((fill(),))
 for prefix in ("replay.books", "replay.economics", "targeter", "splices", "redis", "engine", "analysis", "archive"):
     assert not any(n == prefix or n.startswith(prefix + ".") for n in sys.modules), prefix
 """

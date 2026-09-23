@@ -18,6 +18,7 @@ from .domain import (
     FeeCharge,
     Fixed,
     HypotheticalFill,
+    Product,
     Rebate,
     Role,
     Side,
@@ -110,23 +111,35 @@ class FeeEngine(Closed):
     """One immutable configuration for no-builder hypothetical fills."""
 
     policy: Policy = Policy()
+    resolver: Resolver | None = None
+
+    def __post_init__(self):
+        Closed.__post_init__(self)
+        if self.resolver is not None and self.resolver.reference_time is None:
+            raise ValueError("constructor-bound resolver requires a reference time")
 
     def assess(
         self,
         fill: HypotheticalFill,
-        resolved: ResolvedScheduleSet,
+        resolved: ResolvedScheduleSet | None = None,
         order_state: OrderState | None = None,
     ) -> tuple[FeeAssessment, OrderState | None]:
         policy = self.policy
-        if (
-            type(fill) is not HypotheticalFill
-            or type(resolved) is not ResolvedScheduleSet
-            or (order_state is not None and type(order_state) is not OrderState)
+        if type(fill) is not HypotheticalFill:
+            raise TypeError("closed hypothetical inputs required")
+        if self.resolver is not None:
+            if resolved is not None:
+                raise ValueError("cannot override constructor-bound snapshot")
+            resolved = self.resolver.resolve(fill.context, fill.event_time)
+        if type(resolved) is not ResolvedScheduleSet or (
+            order_state is not None and type(order_state) is not OrderState
         ):
             raise TypeError("closed hypothetical inputs required")
         if resolved.context != fill.context or resolved.event_time != fill.event_time:
             raise ValueError("resolution belongs to a different fill context/time")
         charges, rebates, unknowns, assumptions = [], [], [], []
+        if resolved.reference_time is not None:
+            assumptions.append("current_snapshot_not_historical_fee_claim")
         exclusions = [
             "gas_bridge_deposit_withdrawal_fcm_costs",
             "maker_rewards_and_bonuses",
@@ -172,8 +185,27 @@ class FeeEngine(Closed):
                 raise ValueError("schedule economics identity mismatch")
             return True
 
+        def configured_limitless():
+            asset = e.outcome if fill.side is Side.BUY else e.quote
+            raw = (
+                quantity * Fraction(policy.limitless_buy_bps, 10000)
+                if fill.side is Side.BUY
+                else notional * Fraction(policy.limitless_sell_bps, 10000)
+            )
+            assumptions.append("limitless_configured_rate_and_ceil6_declared_fill")
+            charge(Component.PLATFORM, asset, ceil_grid(raw, 6), Evidence.ESTIMATE)
+
         platform = resolved.platform
-        if validate_selection(platform):
+        if (
+            fill.context.venue is Venue.LIMITLESS
+            and fill.context.product is Product.CLOB
+            and role is Role.TAKER
+            and isinstance(platform, UnknownSchedule)
+            and platform.reason is UnknownReason.MISSING
+            and not platform.candidates
+        ):
+            configured_limitless()
+        elif validate_selection(platform):
             s, model = platform.schedule, platform.model
             dimensional = True
             if isinstance(model, (Polymarket, Kalshi)):
@@ -315,29 +347,12 @@ class FeeEngine(Closed):
                     if not policy.include_rounding_refunds:
                         assumptions.append("kalshi_per_fill_rebates_omitted")
             elif isinstance(model, LimitlessClob):
-                if role is Role.MAKER and model.maker_free:
+                if s.fee_asset != e.quote or s.fee_scale != 6:
+                    unknown(Component.PLATFORM, UnknownReason.DIMENSIONS)
+                elif role is Role.MAKER and model.maker_free:
                     charge(Component.PLATFORM, s.fee_asset, Fixed(0, s.fee_scale))
                 elif role is Role.TAKER:
-                    asset = e.outcome if fill.side is Side.BUY else e.quote
-                    # CLOB collateral is pinned on the schedule; the BUY token
-                    # is independently pinned by its InstrumentEconomics.
-                    if s.fee_asset != e.quote or s.fee_scale != 6:
-                        unknown(Component.PLATFORM, UnknownReason.DIMENSIONS)
-                    else:
-                        raw = (
-                            quantity * Fraction(policy.limitless_buy_bps, 10000)
-                            if fill.side is Side.BUY
-                            else notional * Fraction(policy.limitless_sell_bps, 10000)
-                        )
-                        assumptions.append(
-                            "limitless_configured_rate_and_ceil6_declared_fill"
-                        )
-                        charge(
-                            Component.PLATFORM,
-                            asset,
-                            ceil_grid(raw, 6),
-                            Evidence.ESTIMATE,
-                        )
+                    configured_limitless()
                 else:
                     unknown(Component.PLATFORM, UnknownReason.UNSUPPORTED)
             elif isinstance(model, LimitlessAmm):
@@ -434,10 +449,15 @@ class FeeEngine(Closed):
     def assess_many(
         self,
         fills: tuple[HypotheticalFill, ...],
-        resolver: Resolver,
+        resolver: Resolver | None = None,
         knowledge_cutoff: int | None = None,
     ) -> tuple[FeeAssessment, ...]:
         """Input order is authoritative. Unknown/intervening fills invalidate carry."""
+        if self.resolver is not None:
+            if resolver is not None or knowledge_cutoff is not None:
+                raise ValueError("cannot override constructor-bound snapshot")
+        elif type(resolver) is not Resolver:
+            raise TypeError("resolver required for unbound engine")
         states, seen, results = {}, set(), []
         last_time = -1
         for fill in fills:
@@ -455,7 +475,9 @@ class FeeEngine(Closed):
             seen.add(fill.identity)
             result, state = self.assess(
                 fill,
-                resolver.resolve(fill.context, fill.event_time, knowledge_cutoff),
+                resolver.resolve(fill.context, fill.event_time, knowledge_cutoff)
+                if resolver is not None
+                else None,
                 states.get(key),
             )
             states[key] = state
