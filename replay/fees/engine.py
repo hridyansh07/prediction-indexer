@@ -12,7 +12,6 @@ from .domain import (
     AssetDelta,
     AssetKind,
     Basis,
-    BuilderStatus,
     Closed,
     Component,
     Evidence,
@@ -28,7 +27,6 @@ from .domain import (
 )
 from .schedules import (
     AccountRebate,
-    BuilderFee,
     Kalshi,
     KalshiKind,
     LimitlessAmm,
@@ -47,11 +45,23 @@ from .schedules import (
 @dataclass(frozen=True, slots=True)
 class Policy(Closed):
     name: str = "conservative-v1"
-    include_rebates: bool = False
+    include_account_rebates: bool = False
+    include_rounding_refunds: bool = False
     assume_unknown_role_taker: bool = True
-    assume_unknown_member_non_direct: bool = False
+    kalshi_member_class: AccountClass = AccountClass.NON_DIRECT
     pm_ceil5_scenario: bool = True
-    limitless_max_scenario: bool = False
+    limitless_buy_bps: int = 300
+    limitless_sell_bps: int = 150
+
+    def __post_init__(self):
+        Closed.__post_init__(self)
+        if self.kalshi_member_class is AccountClass.UNKNOWN:
+            raise ValueError("configured Kalshi member class must be known")
+        if any(
+            not 0 <= bps <= 10000
+            for bps in (self.limitless_buy_bps, self.limitless_sell_bps)
+        ):
+            raise ValueError("Limitless rates must be in 0..10000 bps")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,18 +105,22 @@ class FeeAssessment(Closed):
     engine_version: str = "fee-engine-v1"
 
 
-class FeeEngine:
+@dataclass(frozen=True, slots=True)
+class FeeEngine(Closed):
+    """One immutable configuration for no-builder hypothetical fills."""
+
+    policy: Policy = Policy()
+
     def assess(
         self,
         fill: HypotheticalFill,
         resolved: ResolvedScheduleSet,
-        policy: Policy,
         order_state: OrderState | None = None,
     ) -> tuple[FeeAssessment, OrderState | None]:
+        policy = self.policy
         if (
             type(fill) is not HypotheticalFill
             or type(resolved) is not ResolvedScheduleSet
-            or type(policy) is not Policy
             or (order_state is not None and type(order_state) is not OrderState)
         ):
             raise TypeError("closed hypothetical inputs required")
@@ -116,9 +130,10 @@ class FeeEngine:
         exclusions = [
             "gas_bridge_deposit_withdrawal_fcm_costs",
             "maker_rewards_and_bonuses",
+            "builder_fees_no_builder_route",
         ]
-        if not policy.include_rebates:
-            exclusions.append("hypothetical_rebates")
+        if not policy.include_account_rebates:
+            exclusions.append("hypothetical_account_rebates")
         role = fill.role
         if role is Role.UNKNOWN and policy.assume_unknown_role_taker:
             role = Role.TAKER
@@ -233,90 +248,76 @@ class FeeEngine:
                         rate * model.multiplier.value * quantity * p * (1 - p), 6
                     )
                     charge(Component.PLATFORM, e.quote, trade_fee)
-                    member = fill.context.account_class
-                    if (
-                        member is AccountClass.UNKNOWN
-                        and policy.assume_unknown_member_non_direct
-                    ):
-                        member = AccountClass.NON_DIRECT
-                        assumptions.append(
-                            "unknown_membership_assumed_non_direct_not_fcm_bound"
-                        )
-                    if member is AccountClass.UNKNOWN:
-                        unknown(Component.ROUNDING, UnknownReason.ACCOUNT)
+                    grid_scale = (
+                        4 if policy.kalshi_member_class is AccountClass.DIRECT else 2
+                    )
+                    grid = Fraction(1, 10**grid_scale)
+                    revenue = -notional if fill.side is Side.BUY else notional
+                    change = revenue - trade_fee.value
+                    rounding = change - (change // grid) * grid
+                    charge(Component.ROUNDING, e.quote, fixed(rounding, 6))
+                    state_ok = False
+                    previous = Fraction(0)
+                    if order_state is None:
+                        state_ok = fill.new_order
                     else:
-                        grid_scale = 4 if member is AccountClass.DIRECT else 2
-                        grid = Fraction(1, 10**grid_scale)
-                        revenue = -notional if fill.side is Side.BUY else notional
-                        change = revenue - trade_fee.value
-                        rounding = change - (change // grid) * grid
-                        charge(Component.ROUNDING, e.quote, fixed(rounding, 6))
-                        state_ok = False
-                        previous = Fraction(0)
-                        if order_state is None:
-                            state_ok = fill.new_order
-                        else:
-                            state_ok = (
-                                not fill.new_order
-                                and (
-                                    order_state.account,
-                                    order_state.subaccount,
-                                    order_state.order_key,
-                                    order_state.asset,
-                                    order_state.grid_scale,
-                                    order_state.last_fill_index + 1,
-                                    order_state.policy_identity,
-                                )
-                                == (
-                                    fill.context.account,
-                                    fill.context.subaccount,
-                                    fill.order_key,
-                                    e.quote,
-                                    grid_scale,
-                                    fill.fill_index,
-                                    policy.identity,
-                                )
-                                and order_state.last_event_time <= fill.event_time
-                            )
-                            previous = order_state.carry.value
                         state_ok = (
-                            state_ok
-                            and fill.role is not Role.UNKNOWN
-                            and fill.context.account_class is not AccountClass.UNKNOWN
-                        )
-                        if state_ok:
-                            accumulated = previous + rounding
-                            rebate = grid * min(
-                                accumulated // grid,
-                                (trade_fee.value + rounding) // grid,
+                            not fill.new_order
+                            and (
+                                order_state.account,
+                                order_state.subaccount,
+                                order_state.order_key,
+                                order_state.asset,
+                                order_state.grid_scale,
+                                order_state.last_fill_index + 1,
+                                order_state.policy_identity,
                             )
-                            next_state = OrderState(
+                            == (
                                 fill.context.account,
                                 fill.context.subaccount,
                                 fill.order_key,
                                 e.quote,
                                 grid_scale,
                                 fill.fill_index,
-                                fill.event_time,
-                                fixed(accumulated - rebate, 6),
                                 policy.identity,
                             )
-                            if policy.include_rebates:
-                                rebates.append(
-                                    Rebate(
-                                        Component.ROUNDING,
-                                        AssetAmount(e.quote, fixed(rebate, 6)),
-                                        Evidence.EXACT_MODEL,
-                                    )
+                            and order_state.last_event_time <= fill.event_time
+                        )
+                        previous = order_state.carry.value
+                    state_ok = state_ok and fill.role is not Role.UNKNOWN
+                    if state_ok:
+                        accumulated = previous + rounding
+                        rebate = grid * min(
+                            accumulated // grid,
+                            (trade_fee.value + rounding) // grid,
+                        )
+                        next_state = OrderState(
+                            fill.context.account,
+                            fill.context.subaccount,
+                            fill.order_key,
+                            e.quote,
+                            grid_scale,
+                            fill.fill_index,
+                            fill.event_time,
+                            fixed(accumulated - rebate, 6),
+                            policy.identity,
+                        )
+                        if policy.include_rounding_refunds:
+                            rebates.append(
+                                Rebate(
+                                    Component.ROUNDING,
+                                    AssetAmount(e.quote, fixed(rebate, 6)),
+                                    Evidence.EXACT_MODEL,
                                 )
-                        elif policy.include_rebates:
-                            unknown(Component.ROUNDING, UnknownReason.STATE)
-                        if not policy.include_rebates:
-                            assumptions.append("kalshi_per_fill_rebates_omitted")
+                            )
+                    elif policy.include_rounding_refunds:
+                        unknown(Component.ROUNDING, UnknownReason.STATE)
+                    if not policy.include_rounding_refunds:
+                        assumptions.append("kalshi_per_fill_rebates_omitted")
             elif isinstance(model, LimitlessClob):
                 if role is Role.MAKER and model.maker_free:
                     charge(Component.PLATFORM, s.fee_asset, Fixed(0, s.fee_scale))
-                elif policy.limitless_max_scenario and role is Role.TAKER:
+                elif role is Role.TAKER:
                     asset = e.outcome if fill.side is Side.BUY else e.quote
                     # CLOB collateral is pinned on the schedule; the BUY token
                     # is independently pinned by its InstrumentEconomics.
@@ -324,12 +325,12 @@ class FeeEngine:
                         unknown(Component.PLATFORM, UnknownReason.DIMENSIONS)
                     else:
                         raw = (
-                            quantity * Fraction(3, 100)
+                            quantity * Fraction(policy.limitless_buy_bps, 10000)
                             if fill.side is Side.BUY
-                            else notional * Fraction(15, 1000)
+                            else notional * Fraction(policy.limitless_sell_bps, 10000)
                         )
                         assumptions.append(
-                            "limitless_public_max_rate_and_ceil6_declared_fill_scenario"
+                            "limitless_configured_rate_and_ceil6_declared_fill"
                         )
                         charge(
                             Component.PLATFORM,
@@ -353,30 +354,8 @@ class FeeEngine:
             else:
                 unknown(Component.PLATFORM, UnknownReason.UNSUPPORTED)
 
-        builder = fill.context.builder
-        if builder.status is BuilderStatus.UNKNOWN:
-            unknown(Component.BUILDER, UnknownReason.BUILDER)
-        elif builder.status is BuilderStatus.KNOWN and validate_selection(
-            resolved.builder
-        ):
-            selection = resolved.builder
-            model = selection.model
-            if (
-                isinstance(model, BuilderFee)
-                and role is not Role.UNKNOWN
-                and selection.schedule.fee_asset == e.quote
-            ):
-                bps = model.maker_bps if role is Role.MAKER else model.taker_bps
-                amount = rounded(
-                    notional * Fraction(bps, 10000), selection, model.rounding
-                )
-                if amount is not None:
-                    charge(Component.BUILDER, e.quote, amount)
-            else:
-                unknown(Component.BUILDER, UnknownReason.UNSUPPORTED)
-
         if (
-            policy.include_rebates
+            policy.include_account_rebates
             and fill.context.venue is Venue.POLYMARKET
             and role is Role.TAKER
         ) and validate_selection(resolved.account):
@@ -456,7 +435,6 @@ class FeeEngine:
         self,
         fills: tuple[HypotheticalFill, ...],
         resolver: Resolver,
-        policy: Policy,
         knowledge_cutoff: int | None = None,
     ) -> tuple[FeeAssessment, ...]:
         """Input order is authoritative. Unknown/intervening fills invalidate carry."""
@@ -478,7 +456,6 @@ class FeeEngine:
             result, state = self.assess(
                 fill,
                 resolver.resolve(fill.context, fill.event_time, knowledge_cutoff),
-                policy,
                 states.get(key),
             )
             states[key] = state
