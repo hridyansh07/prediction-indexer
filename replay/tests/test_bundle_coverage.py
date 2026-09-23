@@ -329,6 +329,84 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(rows[0]["evidence_source"]["start_ns"], "0")
         self.assertEqual(rows[1]["reason"], {"kind": "lane_missing"})
 
+    def test_group_fault_preserves_distinct_window_evidence(self):
+        for window_reason in (
+            {"kind": "lane_invalid", "detail": "invalid source"},
+            {
+                "kind": "visible_clock_regression",
+                "previous_visible_ns": "8",
+                "observed_visible_ns": "3",
+            },
+        ):
+            for group_reason in (
+                {"kind": "connection_closed"},
+                {"kind": "epoch_changed"},
+                {"kind": "continuity", "verdict": "gap_proven"},
+                {"kind": "unsupported_state"},
+            ):
+                with (
+                    self.subTest(window=window_reason, group=group_reason),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    h = Harness(Path(tmp))
+                    self.addCleanup(h.strategy.writer.stream.close)
+                    h.window(0, 20, window_reason)
+                    h.group(15, h.initial["plans"], group_reason)
+                    h.window(20, 40)
+                    h.group(25, h.initial["plans"])
+                    h.finish()
+                    rows = h.rows(
+                        book_id(
+                            {
+                                "instrument": "polymarket:123",
+                                "orientation": "outcome",
+                            }
+                        )
+                    )
+                    self.assertEqual(
+                        [
+                            (
+                                r["start_ns"],
+                                r["end_ns"],
+                                r["state"],
+                                r["evidence"],
+                                r["reason"],
+                            )
+                            for r in rows
+                        ],
+                        [
+                            (
+                                "10",
+                                "15",
+                                "unusable",
+                                window_reason["kind"],
+                                window_reason,
+                            ),
+                            (
+                                "15",
+                                "20",
+                                "unusable",
+                                window_reason["kind"],
+                                group_reason,
+                            ),
+                            ("20", "25", "unusable", "unknown", group_reason),
+                            ("25", "40", "usable", "unknown", None),
+                        ],
+                    )
+                    self.assertEqual(
+                        rows[1]["evidence_source"], rows[0]["evidence_source"]
+                    )
+                    self.assertEqual(rows[1]["source"]["visible_ns"], "15")
+
+    def test_window_fault_still_rejects_usable_book(self):
+        h = self.harness()
+        h.window(0, 40, {"kind": "lane_invalid", "detail": None})
+        # Structurally valid wire, but impossible under Risk's blocked window.
+        h.group(15, h.initial["plans"])
+        with self.assertRaisesRegex(ProtocolError, "evidence/state mismatch"):
+            h.finish()
+        self.assertFalse((h.output / "content_receipt.json").exists())
+
     def test_same_time_transitions_have_no_positive_intermediate_interval(self):
         h = self.harness()
         h.window()

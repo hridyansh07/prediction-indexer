@@ -189,9 +189,17 @@ def acceptance(config_path, publisher):
         for r in rows:
             test.assertEqual(r["vendor_completeness"], "NOT_PROVEN")
             if r["kind"] == "book":
-                if r["start_ns"] == "40":
-                    test.assertEqual(r["end_ns"], "50")
-                    test.assertEqual(r["evidence"], "lane_missing")
+                if r["start_ns"] in ("40", "45"):
+                    test.assertEqual(
+                        r["end_ns"], "45" if r["start_ns"] == "40" else "50"
+                    )
+                    test.assertEqual(r["evidence"], "visible_clock_regression")
+                    test.assertEqual(
+                        r["reason"]["kind"],
+                        "visible_clock_regression"
+                        if r["start_ns"] == "40"
+                        else "connection_closed",
+                    )
                     test.assertEqual(
                         r["evidence_source"],
                         {
@@ -207,8 +215,11 @@ def acceptance(config_path, publisher):
             if r["entity"] == a and r["start_ns"] == "50":
                 test.assertEqual(
                     (r["state"], r["evidence"], r["reason"]),
-                    ("unusable", "unknown", {"kind": "lane_missing"}),
+                    ("unusable", "unknown", {"kind": "connection_closed"}),
                 )
+        test.assertEqual(
+            sum(r["kind"] == "book" and r["start_ns"] == "45" for r in rows), 2
+        )
         test.assertTrue(any(r["entity"] == a and r["start_ns"] == "50" for r in rows))
         fresh = root / "fresh"
         fresh_receipt = s.run(c, fresh, url)
