@@ -21,7 +21,11 @@ historical evidence validators and archived streaming adapters; it freezes a
 hash-bound context before runtime. See
 [`STRATEGY_PREPARATION_V1.md`](../docs/STRATEGY_PREPARATION_V1.md) for its closed
 configuration, native book plans, explicit historical expectation scopes, and
-offline snapshot loader. No coverage strategy or shared cache is included.
+offline snapshot loader. The offline `replay.bundle_coverage:build` strategy uses
+that context and immutable Risk cuts to report book/member/bundle intervals under
+policy, not vendor completeness or opportunities. Its strict completed reader
+requires both content identity and supervisor success; see
+[`BUNDLE_COVERAGE_V1.md`](../docs/BUNDLE_COVERAGE_V1.md). No shared cache is included.
 
 The package is included in the installed distribution, including the frozen
 terminal policy. Storage adapters provide bytes through `ByteStreamer`; none of
