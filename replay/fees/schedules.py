@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import lru_cache
 
 from .domain import (
     Asset,
@@ -322,10 +323,28 @@ class ResolvedScheduleSet(Closed):
     snapshot_identity: str | None = None
 
 
+class _ResolverMemo:
+    """Derived per-resolver state; excluded from identity, equality and pickles."""
+
+    __slots__ = ("lock", "identities", "index", "selections")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.identities = None
+        self.index = None
+        self.selections = OrderedDict()
+
+    def __reduce__(self):
+        return (_ResolverMemo, ())
+
+
 @dataclass(frozen=True, slots=True)
 class Resolver(Closed):
     catalog: Catalog
     reference_time: int | None = None
+    _memo: _ResolverMemo = field(
+        default_factory=_ResolverMemo, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self):
         Closed.__post_init__(self)
@@ -355,13 +374,43 @@ class Resolver(Closed):
             )
         return self._select(context, event_time, knowledge_cutoff)
 
-    @lru_cache(maxsize=1024)
     def _select(self, context, event_time, knowledge_cutoff):
         # Bounded memoization reuses reference-time selections across fill times.
+        # Keys hold only small selection inputs, never the catalog, so a lookup
+        # does not rehash it; eviction only recomputes the identical selection.
+        memo, key = self._memo, (context, event_time, knowledge_cutoff)
+        with memo.lock:
+            selected = memo.selections.get(key)
+            if selected is not None:
+                memo.selections.move_to_end(key)
+                return selected
+        selected = self._compute(context, event_time, knowledge_cutoff)
+        with memo.lock:
+            memo.selections[key] = selected
+            if len(memo.selections) > 1024:
+                memo.selections.popitem(last=False)
+        return selected
+
+    def _compute(self, context, event_time, knowledge_cutoff):
         # Unknown-start evidence is caller-asserted current only in snapshot mode.
+        # Identities and the venue/product index are idempotent, so a racing
+        # first computation is harmless; each is derived once per resolver.
+        memo = self._memo
+        if memo.identities is None:
+            memo.identities = (
+                self.catalog.identity,
+                self.identity if self.reference_time is not None else None,
+            )
+        if memo.index is None:
+            index = {}
+            for s in self.catalog.schedules:
+                index.setdefault((s.scope.venue, s.scope.product), []).append(s)
+            memo.index = {k: tuple(v) for k, v in index.items()}
+        catalog_identity, snapshot_identity = memo.identities
+        # Scope.matches requires venue/product first; the index keeps catalog order.
         candidates = tuple(
             s
-            for s in self.catalog.schedules
+            for s in memo.index.get((context.venue, context.product), ())
             if s.scope.matches(context)
             and (knowledge_cutoff is None or s.known_at <= knowledge_cutoff)
         )
@@ -446,11 +495,11 @@ class Resolver(Closed):
             context,
             event_time,
             knowledge_cutoff,
-            self.catalog.identity,
+            catalog_identity,
             platform,
             choose(Component.BUILDER, candidates),
             choose(Component.ACCOUNT, candidates),
             min(boundaries, default=None),
             self.reference_time,
-            self.identity if self.reference_time is not None else None,
+            snapshot_identity,
         )

@@ -1,5 +1,7 @@
 """Offline contract-shaped vectors; no live payload fixtures or historical claims."""
 
+import copy
+import pickle
 import random
 import subprocess
 import sys
@@ -1056,6 +1058,57 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(
             resolver.resolve(f.context, 21, None).platform.model, new.model
         )
+
+
+    def test_resolution_never_rehashes_or_reserializes_the_catalog(self):
+        # Per-fill cost must not grow with catalog size: the old method-level
+        # lru_cache hashed the whole Resolver/Catalog on every lookup and
+        # re-serialized the catalog identity on every miss.
+        f = fill()
+        catalog = Catalog.build([schedule(f)])
+        hashed = []
+
+        def counted_hash(value):
+            hashed.append(value)
+            return 0
+
+        for resolver in (Resolver(catalog), Resolver(catalog, reference_time=50)):
+            with (
+                patch.object(Catalog, "__hash__", counted_hash),
+                patch("replay.fees.domain.canonical", wraps=canonical) as serial,
+            ):
+                for offset in range(10):
+                    resolver.resolve(f.context, 20 + offset)
+            whole = [
+                c for c in serial.call_args_list if type(c.args[0]) in (Catalog, Resolver)
+            ]
+            self.assertEqual(hashed, [])
+            self.assertLessEqual(len(whole), 2)
+
+    def test_resolver_memo_is_invisible_and_bounded(self):
+        f = fill()
+        catalog = Catalog.build([schedule(f)])
+        used, fresh = (Resolver(catalog, reference_time=50) for _ in range(2))
+        first = used.resolve(f.context, 20)
+        self.assertEqual(first, fresh.resolve(f.context, 20))
+        self.assertEqual(used, fresh)
+        self.assertEqual(hash(used), hash(fresh))
+        self.assertEqual(repr(used), repr(fresh))
+        self.assertEqual(canonical(used), canonical(fresh))
+        self.assertNotIn(b"memo", canonical(used))
+        self.assertEqual(
+            FeeEngine(resolver=used).identity, FeeEngine(resolver=fresh).identity
+        )
+        for clone in (pickle.loads(pickle.dumps(used)), copy.deepcopy(used)):
+            self.assertEqual(clone, used)
+            self.assertEqual(clone.resolve(f.context, 20), first)
+        moved = replace(used, reference_time=60)
+        self.assertEqual(moved.resolve(f.context, 20).reference_time, 60)
+        self.assertEqual(used.resolve(f.context, 20), first)
+        historical = Resolver(catalog)
+        for offset in range(1100):
+            historical.resolve(f.context, offset)
+        self.assertLessEqual(len(historical._memo.selections), 1024)
 
 
 class PropertyTests(unittest.TestCase):
