@@ -15,20 +15,32 @@ from replay.fees.artifacts import load_catalog
 from replay.fees.domain import AccountClass
 
 catalog = load_catalog(catalog_directory)  # or Catalog.build(tuple_of_schedules)
-resolver = Resolver(catalog)
-engine = FeeEngine(Policy(
-    limitless_buy_bps=300,
-    limitless_sell_bps=150,
-    kalshi_member_class=AccountClass.NON_DIRECT,
-))  # identical to FeeEngine(); configure once per strategy instance
-resolved = resolver.resolve(fill.context, fill.event_time, knowledge_cutoff=None)
-assessment, next_state = engine.assess(fill, resolved, order_state=None)
-assessments = engine.assess_many(ordered_fills, resolver)
+fees = FeeEngine(
+    Policy(
+        limitless_buy_bps=300,
+        limitless_sell_bps=150,
+        kalshi_member_class=AccountClass.NON_DIRECT,
+    ),
+    resolver=Resolver(catalog, reference_time=reference_unix_ns),
+)
+assessment, next_state = fees.assess(fill, order_state=None)
+assessments = fees.assess_many(ordered_fills)
 ```
 
-`FeeEngine` and its `Policy` are immutable. Neither assessment method accepts a
-per-fill policy override. Set `AccountClass.DIRECT` once for the .0001 Kalshi
-balance grid; the default `NON_DIRECT` uses .01. This is membership, not a
+Supply the reference timestamp explicitly once per run; there is no clock read,
+network call, refresh, or per-fill catalog/reference override. The frozen resolver
+selects by **reference time**, not fill time, and reuses selections across fills.
+Original `fill.event_time` and `resolved.event_time` stay unchanged;
+`resolved.reference_time`, `catalog_identity`, and `snapshot_identity` record
+the separate pricing reference and frozen inputs. The snapshot identity is the
+resolver identity (catalog plus reference); the engine identity also pins policy.
+Changing reference or catalog changes identities even if the selected fee is equal.
+Current-snapshot results explicitly carry `current_snapshot_not_historical_fee_claim`
+and are estimates, not statements of fees actually applicable at execution time.
+
+`FeeEngine`, `Resolver`, `Catalog`, and `Policy` are immutable. Neither assessment
+method accepts a per-fill policy override. Set `AccountClass.DIRECT` once for the
+.0001 Kalshi balance grid; the default `NON_DIRECT` uses .01. This is membership, not a
 loyalty/volume tier. `UNKNOWN` is rejected in configuration. Limitless rates
 are independently configurable integer basis points in 0–10000; booleans and
 floats are rejected. Changing rates, membership, refund/rebate switches, or any
@@ -56,12 +68,27 @@ outcome); it is not BUY/SELL or bid/ask. No role is inferred from an order type.
 `price × quantity != gross_notional` raises `ValueError`, as do scale and asset
 mismatches. These are invalid inputs, not missing schedules.
 
-Times are nonnegative UTC Unix nanoseconds. `knowledge_cutoff=None` is explicitly
-**retrospective**. An integer cutoff means **as known**, filters by latest source
-retrieval time, and must not exceed event time. Effective claims still require
-their own evidence; retrieval time alone never supplies historical applicability.
-Schedule selection remains explicit and event-time-based here: configuring an
-engine does not yet freeze a current schedule for reuse across historical fills.
+Times are nonnegative UTC Unix nanoseconds. For a current snapshot, dated
+schedules must contain the **reference** in their half-open effective interval,
+not the historical fill. Future scheduled changes never activate early. A schedule
+with all three of `effective_from`, `effective_to`, and `effective_evidence` set
+to `None` is explicitly caller-asserted current evidence in this mode. This does
+not infer a historical start from retrieval time or mutate the source schedule.
+The caller must review that such evidence is current at the chosen reference;
+retrieval timestamps are provenance, not an automatic as-known filter. Scope,
+model, economics, fee asset/scale, sources, extractor/model versions remain
+required, and same-priority current conflicts still fail visibly. No invented
+effective history is needed. PM requires its explicit rate/exponent/rounding;
+Kalshi requires its supported kind/multiplier (or event nulls inheriting the series
+at reference time). Absence is never a zero PM/Kalshi rate.
+
+The unbound low-level API remains `FeeEngine(policy).assess(fill, resolved,
+order_state=None)` or `assess_many(fills, resolver, knowledge_cutoff=None)`.
+An unpinned `Resolver(catalog)` still resolves historical effective intervals:
+`None` cutoff means retrospective, while an integer cutoff filters retrieval time
+and must not exceed fill time. Unknown-start evidence remains unknown there.
+Constructor binding requires an explicit reference, and rejects resolved inputs,
+resolver overrides, and cutoffs on assessment calls.
 
 `Fixed.parse("0.07")`, `Rate.parse(...)`, `Quantity.parse(...)`, etc. accept only
 bounded unsigned decimal strings. Values use integer atoms and scale 0–18;
@@ -131,12 +158,48 @@ excluded.
 * **Limitless CLOB:** Configured BUY `ceil6(quantity × buy_bps / 10000)` in the
   pinned outcome token and SELL `ceil6(notional × sell_bps / 10000)` in collateral
   are **Estimates**. Defaults are 300 and 150 bps respectively. No public tier
-  inference or table interpolation. One schedule serves both sides:
-  `fee_asset` pins collateral and economics pins
-  the BUY token. Known applicable maker-free schedules yield zero. AMM supports
-  `.004` only with explicit contemporaneous ordinary schedule, quantity or
-  quote-notional basis, fee asset, and rounding. Unknown basis/history remains
-  Unknown; promotions are not inferred.
+  inference or table interpolation. **No public curve or schedule is required
+  for takers:** an empty catalog plus supplied CLOB instrument economics works.
+  If supplied, one schedule serves both sides: `fee_asset` pins collateral and
+  economics pins the BUY token. Conflicting, malformed, wrong-asset, unsupported,
+  or out-of-interval matching evidence is not replaced by configured defaults.
+  Known applicable maker-free schedules yield zero; missing maker evidence stays
+  unknown. AMM supports `.004` only with an explicit applicable ordinary schedule,
+  quantity or quote-notional basis, fee asset, and rounding. Unknown basis stays
+  Unknown; unknown historical applicability is accepted only through the explicit
+  current-snapshot assertion described above. Promotions are not inferred.
+
+Minimal standalone Limitless example (synthetic instrument, no public schedule):
+
+```python
+from replay.fees import Catalog, FeeEngine, HypotheticalFill, Resolver
+from replay.fees.domain import (
+    Asset, AssetAmount, AssetKind, Context, Fixed, InstrumentEconomics,
+    Notional, Probability, Product, Quantity, QuotePrice, Role, Side, Venue,
+)
+
+quote = Asset(AssetKind.USDC, "example-chain", "collateral")
+outcome = Asset(AssetKind.OUTCOME, "example-chain", "market-yes")
+economics = InstrumentEconomics(
+    quote, outcome, AssetAmount(quote, Fixed(1, 0)), 6, 6, 6,
+)
+context = Context(
+    Venue.LIMITLESS, Product.CLOB, "market", None, None, None,
+    "market-yes", "yes", "account", "subaccount",
+)
+fill = HypotheticalFill(
+    "fill-1", context, economics, Side.BUY, QuotePrice.parse("0.4"),
+    Probability.parse("0.4"), Quantity.parse("100"),
+    Notional(quote, Fixed(40, 0)), 1_700_000_000_000_000_000,
+    Role.TAKER, "order-1", 0, True,
+)
+fees = FeeEngine(resolver=Resolver(
+    Catalog.build(()), reference_time=1_790_000_000_000_000_000,
+))
+result, state = fees.assess(fill)
+assert result.charges[0].amount == AssetAmount(outcome, Fixed(3_000_000, 6))
+assert result.net_deltas is not None  # -40 collateral, +97 contracts
+```
 
 Kalshi `OrderState` binds account, subaccount, order, native asset, grid, last
 fill index/time and policy. Only an explicit new order at index zero seeds zero
@@ -172,13 +235,16 @@ instrument scope when a catalog contains multiple outcomes in the same market.
 
 Versioned precedence is market > event > series > category > venue/product,
 independently per component. Equal-priority conflicts fail closed unless an
-explicit supersession resolves them. Unknown applicability at equal/higher
-priority blocks a broad default. Kalshi event null fields independently clear
-to the **current** series model/multiplier; the resolved selection retains both
+explicit supersession resolves them. In unpinned historical resolution, unknown
+applicability at equal/higher priority blocks a broad default. In current snapshot
+mode, unknown-start inputs participate as current asserted evidence. Kalshi event
+null fields independently clear to the **current** series model/multiplier; the resolved selection retains both
 source schedules. Builder never replaces platform. `next_boundary` exposes the
-next matching effective boundary visible under the chosen knowledge cutoff.
-There is no mutable latest pointer, network resolver, or schedule-result cache.
-Only bounded static type metadata is cached.
+next matching effective boundary after the selection time (reference time for
+snapshots); crossing it in fill time never refreshes a snapshot. There is no
+mutable latest pointer or network resolver. A bounded 1,024-entry selection cache
+keys immutable resolver/context/selection-time inputs; eviction only recomputes
+the identical selection. Static type metadata also has a bounded cache.
 
 To import retained public evidence, read source bytes yourself, call
 `source_from_bytes(url, retrieved_at, data)`, construct reviewed `Schedule`
