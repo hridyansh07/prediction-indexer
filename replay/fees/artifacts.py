@@ -11,12 +11,12 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import fields, is_dataclass
+from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
 
 from . import domain, schedules
-from .domain import canonical
+from .domain import canonical, persisted_fields
 from .schedules import Catalog, Schedule, Source
 
 MAX_BYTES = 16 * 1024 * 1024
@@ -49,7 +49,7 @@ def _decode(value, depth=0):
         if (
             cls is None
             or not is_dataclass(cls)
-            or set(value) != {"type", *(f.name for f in fields(cls))}
+            or set(value) != {"type", *(f.name for f in persisted_fields(cls))}
         ):
             raise ValueError("unknown or missing artifact fields")
         return cls(
