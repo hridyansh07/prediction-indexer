@@ -136,10 +136,16 @@ excluded.
 
 ## Venue models and remaining evidence gaps
 
+Default estimates are deliberately **pessimistic**: where a venue's exact fee is
+curve-shaped or its rounding is ambiguous, the SDK chooses the higher fee. An
+overstated fee is acceptable; an understated fee is not.
+
 * **Polymarket:** `C × rate × [p(1−p)]^exponent`. Applicable taker-only schedules
   establish maker platform zero; `ZeroFee` establishes fee-free, never absence.
   Default `PM_CEIL5_SCENARIO` rounds each declared fill upward and returns
-  **Estimate**, not a whole-execution bound. Official five-decimal precision does
+  **Estimate**, not a whole-execution bound. Polymarket documents five-decimal
+  rounding in which sub-0.00001 fees become zero; rounding up instead is the
+  intentional pessimistic choice. Official five-decimal precision does
   not settle ties/fragmentation. `CEIL`/`EXACT` require a separately evidenced
   rounding claim in the pinned schedule. There is no `.07` fallback. Builder
   fees are excluded because this SDK estimates no-builder routes.
@@ -157,8 +163,11 @@ excluded.
   partition; it is not an execution-fragmentation or FCM-cost bound.
 * **Limitless CLOB:** Configured BUY `ceil6(quantity × buy_bps / 10000)` in the
   pinned outcome token and SELL `ceil6(notional × sell_bps / 10000)` in collateral
-  are **Estimates**. Defaults are 300 and 150 bps respectively. No public tier
-  inference or table interpolation. **No public curve or schedule is required
+  are **Estimates**. Defaults are 300 and 150 bps respectively: the maximum of
+  Limitless's published price-dependent CLOB curves (BUY 0.40–3.00%, SELL
+  0.42–1.50%). Using the peak rate instead of modelling the curve is intentional
+  and overstates fees away from the peak. No public tier inference or table
+  interpolation. **No public curve or schedule is required
   for takers:** an empty catalog plus supplied CLOB instrument economics works.
   A rounded fee greater than the received contracts (BUY) or collateral (SELL)
   raises `ValueError`; fees are never clamped. Equality is valid and leaves zero

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Stage-B narrow Replay runner over materialization, Risk transport, and supervisor.
+"""Narrow Replay runner over materialization, Risk transport, and supervisor.
 
-This baseline has no preparation, strategy SDK, bundle_coverage, or completed-result
-registry. The request therefore pins immutable book plans without scales, invokes
-one existing strategy factory, and returns validated supervisor completion only.
+This runner does not yet use replay.preparation, replay.strategy_sdk,
+replay.bundle_coverage, or the completed-result reader. The request therefore
+pins immutable book plans without scales, invokes one existing strategy factory,
+and returns validated supervisor completion only.
 """
 
 import ctypes
