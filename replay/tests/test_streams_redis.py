@@ -140,6 +140,19 @@ class RedisTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             c.poll(lambda _: None)
 
+    def test_script_flush_reloads_once_and_cached_calls_use_evalsha(self):
+        c = self.consumer()
+        self.redis.script_flush()
+        before = self.redis.info("commandstats")["cmdstat_eval"]["calls"]
+        self.assertEqual(c.progress()["published"], "-1")
+        self.assertEqual(
+            self.redis.info("commandstats")["cmdstat_eval"]["calls"], before + 1
+        )
+        self.assertEqual(c.progress()["published"], "-1")
+        self.assertEqual(
+            self.redis.info("commandstats")["cmdstat_eval"]["calls"], before + 1
+        )
+
     def test_url_cannot_override_finite_timeouts(self):
         with self.assertRaises(ProtocolError):
             Consumer(

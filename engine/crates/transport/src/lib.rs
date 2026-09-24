@@ -26,7 +26,9 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 fn redis_error(e: redis::RedisError) -> Error {
-    if e.code() == Some("REPLAY") {
+    if e.code() == Some("OOM") {
+        Error::Resource
+    } else if e.code() == Some("REPLAY") {
         if e.detail() == Some("resource_limit") {
             Error::Resource
         } else {
@@ -207,6 +209,7 @@ pub struct Publisher {
     config: Config,
     engine: Option<RiskEngine>,
     connection: redis::Connection,
+    script: redis::Script,
     sequence: u64,
     poisoned: bool,
     terminal: bool,
@@ -288,6 +291,7 @@ impl Publisher {
             config,
             engine: Some(engine),
             connection,
+            script: redis::Script::new(SCRIPT),
             sequence: 0,
             poisoned: false,
             terminal: false,
@@ -304,13 +308,25 @@ impl Publisher {
         Ok(p)
     }
     fn eval<T: redis::FromRedisValue>(&mut self, args: &[String]) -> Result<T> {
-        redis::cmd("EVAL")
-            .arg(SCRIPT)
+        let result = redis::cmd("EVALSHA")
+            .arg(self.script.get_hash())
             .arg(2)
             .arg(&self.config.keys())
             .arg(args)
-            .query(&mut self.connection)
-            .map_err(redis_error)
+            .query(&mut self.connection);
+        match result {
+            Err(e) if e.kind() == redis::ErrorKind::NoScriptError => {
+                // NOSCRIPT guarantees no execution. All ambiguous failures stay fatal.
+                redis::cmd("EVAL")
+                    .arg(SCRIPT)
+                    .arg(2)
+                    .arg(&self.config.keys())
+                    .arg(args)
+                    .query(&mut self.connection)
+                    .map_err(redis_error)
+            }
+            other => other.map_err(redis_error),
+        }
     }
     fn poison(&mut self) {
         self.poisoned = true;
@@ -394,5 +410,30 @@ impl Publisher {
             self.poison();
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_oom_is_resource_but_other_server_errors_are_not() {
+        assert!(matches!(
+            redis_error(
+                redis::parse_redis_value(b"-OOM memory exhausted\r\n")
+                    .unwrap()
+                    .extract_error()
+                    .unwrap_err()
+            ),
+            Error::Resource
+        ));
+        assert!(matches!(
+            redis_error(redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "ERR"
+            ))),
+            Error::Transport
+        ));
     }
 }

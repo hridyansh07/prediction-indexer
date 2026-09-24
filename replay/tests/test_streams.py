@@ -1,9 +1,11 @@
 import copy
+import importlib.util
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from replay.streams import Decoder, ProtocolError
+from replay.streams import Consumer, Decoder, ProtocolError
 
 FIXTURE = (
     Path(__file__).resolve().parents[2]
@@ -67,6 +69,60 @@ def assert_contract(test, cuts):
 
 
 class ProtocolTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("redis"), "optional redis SDK")
+    def test_consumer_rejects_initial_shape_before_creating_client(self):
+        initial = records()[0]["body"]
+        for bad in [
+            None,
+            [],
+            {},
+            {**initial, "max_entry_bytes": "065536"},
+            {**initial, "groups": "fast"},
+            {**initial, "extra": "x"},
+        ]:
+            with self.subTest(initial=bad), patch("redis.Redis.from_url") as connect:
+                with self.assertRaises(ProtocolError):
+                    Consumer(
+                        "redis://localhost",
+                        scope="test",
+                        run_id="contract",
+                        attempt_id="golden",
+                        group="fast",
+                        initial=bad,
+                    )
+                connect.assert_not_called()
+
+    @unittest.skipUnless(importlib.util.find_spec("redis"), "optional redis SDK")
+    def test_evalsha_falls_back_only_when_script_did_not_execute(self):
+        import redis
+        from unittest.mock import Mock
+
+        from replay.streams.consumer import SCRIPT, SCRIPT_SHA
+
+        c = Consumer.__new__(Consumer)
+        c._keys = ["stream", "state"]
+        c._redis = Mock()
+        c._redis.evalsha.return_value = "cached"
+        self.assertEqual(c._eval("check"), "cached")
+        c._redis.evalsha.assert_called_once_with(
+            SCRIPT_SHA, 2, "stream", "state", "check"
+        )
+        c._redis.eval.assert_not_called()
+        c._redis.evalsha.side_effect = redis.exceptions.NoScriptError()
+        c._redis.eval.return_value = "loaded"
+        self.assertEqual(c._eval("check"), "loaded")
+        c._redis.eval.assert_called_once_with(SCRIPT, 2, "stream", "state", "check")
+        for error in [
+            redis.TimeoutError(),
+            redis.ResponseError("REPLAY membership"),
+            redis.exceptions.OutOfMemoryError(),
+        ]:
+            c._redis.reset_mock()
+            c._redis.evalsha.side_effect = error
+            with self.assertRaises(type(error)):
+                c._eval("check")
+            c._redis.eval.assert_not_called()
+
     def test_rust_golden_exact_state_events_and_owned_cuts(self):
         values = records()
         d = decoder(values)

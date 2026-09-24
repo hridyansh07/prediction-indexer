@@ -247,6 +247,7 @@ impl DerivativeWalker {
                 &mut metadata_bytes,
                 id.as_str().len() as u64,
                 limits.max_metadata_bytes,
+                "scope metadata bytes",
             )?;
         }
         for id in &request.scope.lanes {
@@ -254,6 +255,7 @@ impl DerivativeWalker {
                 &mut metadata_bytes,
                 id.as_str().len() as u64,
                 limits.max_metadata_bytes,
+                "scope metadata bytes",
             )?;
         }
         for input in inputs {
@@ -261,12 +263,14 @@ impl DerivativeWalker {
                 &mut metadata_bytes,
                 input.directory.as_os_str().len() as u64,
                 limits.max_metadata_bytes,
+                "path metadata bytes",
             )?;
             let metadata = inspect_pinned(&input, &limits)?;
             add(
                 &mut metadata_bytes,
                 metadata.metadata_bytes(),
                 limits.max_metadata_bytes,
+                "window metadata bytes",
             )?;
             windows.push((input, metadata));
         }
@@ -337,6 +341,7 @@ impl DerivativeWalker {
                     &mut self.lane_bytes,
                     address.lane().as_str().len() as u64,
                     self.limits.max_metadata_bytes,
+                    "lane metadata bytes",
                 )?;
             }
             if self
@@ -401,11 +406,13 @@ impl DerivativeWalker {
                     &mut bytes,
                     current.logical_bytes(),
                     self.limits.max_group_bytes,
+                    "group bytes",
                 )?;
                 add(
                     &mut records,
                     current.record_count(),
                     self.limits.max_group_records,
+                    "group records",
                 )?;
                 group.last = current
                     .records()
@@ -429,30 +436,47 @@ impl DerivativeWalker {
                 }
             }
             if !group.deliveries.is_empty() {
-                add(&mut self.counts.groups, 1, u64::MAX)?;
+                add(&mut self.counts.groups, 1, u64::MAX, "groups")?;
                 return Ok(Some(WalkItem::Group(group)));
             }
         }
     }
 
     fn filter(&mut self, delivery: &SourceDelivery) -> Result<Option<FilteredDelivery>, String> {
-        add(&mut self.counts.source_deliveries, 1, u64::MAX)?;
+        add(
+            &mut self.counts.source_deliveries,
+            1,
+            u64::MAX,
+            "source deliveries",
+        )?;
         match delivery.disposition() {
-            Some(RejectDisposition::ParseReject { .. }) => {
-                add(&mut self.counts.rejected_sources, 1, u64::MAX)?
-            }
-            Some(RejectDisposition::IntentionallyIgnored { .. }) => {
-                add(&mut self.counts.ignored_sources, 1, u64::MAX)?
-            }
+            Some(RejectDisposition::ParseReject { .. }) => add(
+                &mut self.counts.rejected_sources,
+                1,
+                u64::MAX,
+                "rejected sources",
+            )?,
+            Some(RejectDisposition::IntentionallyIgnored { .. }) => add(
+                &mut self.counts.ignored_sources,
+                1,
+                u64::MAX,
+                "ignored sources",
+            )?,
             None => {}
         }
         let h = delivery.header();
         if h.visible_ns() < self.effective_start_ns || h.visible_ns() >= self.request.end_ns {
-            add(&mut self.counts.interval_excluded_sources, 1, u64::MAX)?;
+            add(
+                &mut self.counts.interval_excluded_sources,
+                1,
+                u64::MAX,
+                "interval excluded sources",
+            )?;
             add(
                 &mut self.counts.excluded_events,
                 delivery.records().len() as u64,
                 u64::MAX,
+                "excluded events",
             )?;
             return Ok(None);
         }
@@ -484,11 +508,13 @@ impl DerivativeWalker {
             &mut self.counts.included_events,
             records.len() as u64,
             u64::MAX,
+            "included events",
         )?;
         add(
             &mut self.counts.excluded_events,
             (delivery.records().len() - records.len()) as u64,
             u64::MAX,
+            "excluded events",
         )?;
         // Profile-2 source epochs are state-bearing even when every child is
         // outside instrument scope. Keep source-only evidence on planned lanes;
@@ -496,10 +522,20 @@ impl DerivativeWalker {
         let source_epoch =
             delivery.connection_epoch().is_some() && scope.lanes.contains(h.address().lane());
         if records.is_empty() && disposition.is_none() && !lane_fault && !source_epoch {
-            add(&mut self.counts.scope_excluded_sources, 1, u64::MAX)?;
+            add(
+                &mut self.counts.scope_excluded_sources,
+                1,
+                u64::MAX,
+                "scope excluded sources",
+            )?;
             return Ok(None);
         }
-        add(&mut self.counts.included_sources, 1, u64::MAX)?;
+        add(
+            &mut self.counts.included_sources,
+            1,
+            u64::MAX,
+            "included sources",
+        )?;
         Ok(Some(FilteredDelivery {
             header: h.clone(),
             connection_epoch: delivery.connection_epoch().map(str::to_owned),
@@ -529,10 +565,32 @@ impl DerivativeWalker {
     }
 }
 
-fn add(total: &mut u64, count: u64, maximum: u64) -> Result<(), String> {
+fn add(total: &mut u64, count: u64, maximum: u64, label: &'static str) -> Result<(), String> {
     *total = total
         .checked_add(count)
         .filter(|n| *n <= maximum)
-        .ok_or("walk resource limit exceeded")?;
+        .ok_or_else(|| format!("walk resource limit exceeded: {label}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn budget_errors_name_the_limit_and_preserve_the_counter() {
+        let mut total = 7;
+        add(&mut total, 2, 9, "group bytes").unwrap();
+        assert_eq!(
+            add(&mut total, 1, 9, "group bytes").unwrap_err(),
+            "walk resource limit exceeded: group bytes"
+        );
+        assert_eq!(total, 9);
+        total = u64::MAX;
+        assert_eq!(
+            add(&mut total, 1, u64::MAX, "included events").unwrap_err(),
+            "walk resource limit exceeded: included events"
+        );
+        assert_eq!(total, u64::MAX);
+    }
 }

@@ -1,11 +1,13 @@
 """Finite polling and hook-before-ACK. No reconnect, claim, retry or resume."""
 
+from hashlib import sha1
 from importlib.resources import files
 from urllib.parse import urlsplit
 
-from .protocol import Decoder, ProtocolError, TransportError, require
+from .protocol import Decoder, ProtocolError, TransportError, array, obj, require, uint
 
 SCRIPT = files(__package__).joinpath("attempt.lua").read_text()
+SCRIPT_SHA = sha1(SCRIPT.encode()).hexdigest()
 
 
 class Consumer:
@@ -29,9 +31,13 @@ class Consumer:
         # redis-py URL query parameters override keyword timeout/retry options.
         require(not urlsplit(url).query, "Redis URL options are not permitted")
         require(0 < timeout <= 60 and 0 < batch_entries <= 1024)
-        entry = int(initial["max_entry_bytes"])
+        obj(
+            initial,
+            "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes",
+        )
+        entry = uint(initial["max_entry_bytes"])
         require(0 < entry <= batch_bytes and batch_entries * entry <= batch_bytes)
-        require(group in initial["groups"])
+        require(group in array(initial["groups"]))
         self._redis = redis.Redis.from_url(
             url,
             socket_connect_timeout=timeout,
@@ -65,7 +71,13 @@ class Consumer:
         return self._decoder.terminal and not self._poisoned
 
     def _eval(self, *args):
-        return self._redis.eval(SCRIPT, 2, *self._keys, *args)
+        from redis.exceptions import NoScriptError
+
+        try:
+            return self._redis.evalsha(SCRIPT_SHA, 2, *self._keys, *args)
+        except NoScriptError:
+            # NOSCRIPT guarantees no execution; never retry an ambiguous failure.
+            return self._redis.eval(SCRIPT, 2, *self._keys, *args)
 
     def _fail(self, error):
         self._poisoned = True

@@ -9,6 +9,18 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use support::*;
 
+#[test]
+fn cli_config_io_is_nonretryable() {
+    let dir = tempdir::TempDir::new("publish-config").unwrap();
+    for path in [dir.path().join("absent.json"), dir.path().to_path_buf()] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_replay-publish"))
+            .arg(path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(20));
+    }
+}
+
 fn fixture() -> Fixture {
     let trade = |q| {
         SegmentEvent::Trade(TradeEvent::new(
@@ -285,6 +297,62 @@ fn redis_cli_python_end_to_end() {
 }
 
 #[test]
+#[ignore = "flushes script cache on explicitly disposable Redis; run serially"]
+fn redis_script_cache_fallback_and_ready_path_failure() {
+    use replay_transport::{Error, Publisher};
+    let url = std::env::var("REPLAY_REDIS_URL").unwrap();
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let calls = |admin: &mut redis::Connection| -> u64 {
+        let info: String = redis::cmd("INFO").arg("commandstats").query(admin).unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_eval:calls="))
+            .map(|s| s.split(',').next().unwrap().parse().unwrap())
+            .unwrap_or(0)
+    };
+    let f = fixture();
+    let mut c = config(&f);
+    c.attempt_id = format!("cache-{}", std::process::id());
+    let keys = c.keys();
+    let _: () = redis::cmd("SCRIPT").arg("FLUSH").query(&mut admin).unwrap();
+    let before = calls(&mut admin);
+    let mut publisher = Publisher::open(&url, c.clone(), RiskLimits::default()).unwrap();
+    assert_eq!(calls(&mut admin), before + 1); // setup loads; initial is cached
+    publisher.progress().unwrap();
+    assert_eq!(calls(&mut admin), before + 1);
+    let _: () = redis::cmd("SCRIPT").arg("FLUSH").query(&mut admin).unwrap();
+    publisher.progress().unwrap();
+    assert_eq!(calls(&mut admin), before + 2);
+    let _: i64 = redis::cmd("XGROUP")
+        .arg("DESTROY")
+        .arg(&keys[0])
+        .arg("slow")
+        .query(&mut admin)
+        .unwrap();
+    assert!(matches!(publisher.step(), Err(Error::Protocol(_))));
+    assert_eq!(calls(&mut admin), before + 2); // no fallback on an executed error
+    let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+
+    c.attempt_id = format!("ready-{}", std::process::id());
+    let tmp = tempdir::TempDir::new("ready-collision").unwrap();
+    let path = tmp.path().join("config.json");
+    let ready = tmp.path().join("ready");
+    std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+    std::fs::write(&ready, b"existing").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_replay-publish"))
+        .arg(path)
+        .arg(&ready)
+        .env("REDIS_URL", &url)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(20));
+    assert_eq!(std::fs::read(ready).unwrap(), b"existing");
+    let _: () = redis::cmd("DEL").arg(&c.keys()).query(&mut admin).unwrap();
+}
+
+#[test]
 #[ignore = "mutates maxmemory and pauses explicitly disposable Redis; run with --test-threads=1"]
 fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
     use replay_transport::{Error, Publisher};
@@ -347,7 +415,15 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
                 .query(&mut admin)
                 .unwrap();
         }
-        assert!(result.is_err(), "{failure}");
+        assert!(
+            match failure {
+                "oom" | "queue" => matches!(result, Err(Error::Resource)),
+                "timeout" => matches!(result, Err(Error::Transport)),
+                "risk" => matches!(result, Err(Error::Risk(_))),
+                _ => unreachable!(),
+            },
+            "{failure}: {result:?}"
+        );
         assert!(matches!(publisher.step(), Err(Error::Poisoned)));
         std::thread::sleep(std::time::Duration::from_millis(250));
         let terminal: String = redis::cmd("HGET")

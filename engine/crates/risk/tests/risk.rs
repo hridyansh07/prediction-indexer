@@ -770,6 +770,61 @@ fn scale_mismatch_missing_initialization_and_resource_poison() {
 }
 
 #[test]
+fn full_level_budget_combines_sides_and_preserves_fault_precedence() {
+    for (limit, mismatch, latched) in [
+        (3, false, false),
+        (2, false, false),
+        (2, true, false),
+        (2, false, true),
+    ] {
+        let mut events = vec![];
+        if latched {
+            events.push(SegmentEvent::Control(ControlEvent::ConnectionClosed {
+                epoch: "e1".into(),
+            }));
+        }
+        events.push(full("kalshi:A", &[(37, 11), (17, 3)], &[(83, 2)]));
+        let f = Fixture::new(0, 100, 1, vec![row("x", 1, events)], |_| {});
+        let mut p = plan("kalshi:A", "x");
+        if mismatch {
+            p.price_scale = scale(3);
+        }
+        let mut e = RiskEngine::open(
+            vec![f.pin.clone()],
+            0,
+            100,
+            LowerBoundPolicy::Clip,
+            vec![p],
+            RiskLimits {
+                max_levels_per_book: limit,
+                ..RiskLimits::default()
+            },
+        )
+        .unwrap();
+        e.next_cut().unwrap();
+        if limit == 2 && !mismatch && !latched {
+            assert_eq!(e.next_cut().unwrap_err(), "risk level limit exceeded");
+            assert_eq!(e.view(&key("kalshi:A")).unwrap().revision(), 0);
+            assert!(e.next_cut().unwrap_err().contains("poisoned"));
+        } else {
+            let cut = e.next_cut().unwrap().unwrap();
+            assert_eq!(
+                cut.book_transitions()[0].view.validity(),
+                &if mismatch {
+                    Validity::Unusable(Reason::ScaleMismatch)
+                } else if latched {
+                    Validity::Unusable(Reason::ConnectionClosed)
+                } else {
+                    Validity::Usable
+                }
+            );
+            assert!(e.next_cut().unwrap().is_none());
+            assert!(e.finish().is_ok());
+        }
+    }
+}
+
+#[test]
 fn prefix_and_later_corruption_cannot_finish_and_profile1_cannot_open() {
     let f = Fixture::new(
         0,
