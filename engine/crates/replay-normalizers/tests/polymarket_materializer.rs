@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor};
 
+use crate::polymarket::Polymarket;
 use canonical_normalizer::{Normalize, Normalizer};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract as CanonicalCompression, DecodedIdentity, InputSegment,
@@ -15,7 +16,6 @@ use replay_domain::{FaultImpact, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentRe
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
-use replay_normalizers::polymarket::Polymarket;
 use serde_json::{Value, json};
 use tempdir::TempDir;
 

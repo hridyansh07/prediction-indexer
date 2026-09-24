@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -172,7 +173,11 @@ def _validate_input_binding(pin, descriptor):
     require(
         manifest["manifest_version"] == 2
         and manifest["normalized_schema_version"] == 3
-        and manifest["materializer_version"] == 2,
+        and manifest["materializer_version"] == 2
+        and type(manifest["event_serialization_version"]) is int
+        and manifest["event_serialization_version"] == 1
+        and type(manifest["reject_serialization_version"]) is int
+        and manifest["reject_serialization_version"] == 1,
         "pinned derivative is not source-evidence profile 2",
     )
     require(
@@ -302,7 +307,45 @@ def validate(config):
             }
         ).encode()
     )
+    _strict_metadata_preflight(config)
     return config
+
+
+def _strict_metadata_preflight(config):
+    """Reuse the owning Rust reader, without Redis or participant side effects.
+
+    Python independently checks descriptor and scale binding above. Do not grow
+    a second, subtly different implementation of profile/address/coverage rules.
+    """
+    data = json.dumps({**config["transport"], "attempt_id": "validation"}).encode()
+    require(len(data) <= 1_048_576, "publisher config limit")
+    parent = os.getpid()
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def parent_death():
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+            os._exit(21)
+
+    children = {}
+    try:
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(data)
+            stdin.seek(0)
+            process = subprocess.Popen(
+                [config["publisher"], "--validate-only"], stdin=stdin,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, preexec_fn=parent_death,
+                env={key: value for key, value in os.environ.items() if key != "REDIS_URL"},
+            )
+            children["preflight"] = process
+            code = process.wait(timeout=config["limits"]["attempt_seconds"])
+            if code == 21 or code < 0:
+                raise OSError("metadata preflight resource failure")
+            require(code == 0, "strict derivative metadata preflight")
+    except subprocess.TimeoutExpired as error:
+        raise OSError("metadata preflight deadline") from error
+    finally:
+        stop(children, config["limits"]["stop_seconds"])
 
 
 def client(url, timeout):

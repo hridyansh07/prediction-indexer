@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 
+use crate::limitless::Limitless;
 use canonical_normalizer::{Normalize, Normalizer};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract as CanonicalCompression, DecodedIdentity, InputSegment,
@@ -12,7 +13,6 @@ use replay_domain::{BookEvent, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentReco
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
-use replay_normalizers::limitless::Limitless;
 use serde_json::{Value, json};
 use tempdir::TempDir;
 

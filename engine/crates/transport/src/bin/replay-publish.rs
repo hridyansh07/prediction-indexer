@@ -16,13 +16,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: replay-publish CONFIG.json (REDIS_URL environment required)")?;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(1_048_577)
-        .read_to_end(&mut bytes)?;
+    if path == "--validate-only" {
+        std::io::stdin().take(1_048_577).read_to_end(&mut bytes)?;
+    } else {
+        std::fs::File::open(&path)?
+            .take(1_048_577)
+            .read_to_end(&mut bytes)?;
+    }
     if bytes.len() > 1_048_576 {
         return Err("config limit".into());
     }
     let config: Config = serde_json::from_slice(&bytes)?;
+    if path == "--validate-only" {
+        config.validate()?;
+        return Ok(());
+    }
     let url = std::env::var("REDIS_URL").map_err(|_| "REDIS_URL required")?;
     let mut publisher = Publisher::open(&url, config, replay_risk::RiskLimits::default())?;
     // Optional supervisor handshake. No consumer joins before setup and initial.

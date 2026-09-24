@@ -1,8 +1,8 @@
+use crate::kalshi::{Config, Kalshi, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
 use replay_domain::{BookEvent, ContractOrientation, LevelChange, SegmentEvent, Side};
-use replay_normalizers::kalshi::{Config, Kalshi, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use serde_json::{Value, json};
 
 const SNAPSHOT: &str = include_str!("fixtures/kalshi/orderbook_snapshot.json");

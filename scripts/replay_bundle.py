@@ -6,13 +6,19 @@ registry. The request therefore pins immutable book plans without scales, invoke
 one existing strategy factory, and returns validated supervisor completion only.
 """
 
+import ctypes
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import selectors
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -53,7 +59,7 @@ def _absolute(value):
 
 def validate_request(value):
     obj(value, "version run_id interval capture plans strategy runtime")
-    require(value["version"] == 1)
+    require(type(value["version"]) is int and value["version"] == 1)
     require(
         type(value["run_id"]) is str
         and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value["run_id"])
@@ -139,7 +145,65 @@ def validate_request(value):
     return value
 
 
-def _materialize(request):
+def _helper_output(runtime, body, lock_fd):
+    """Own a single prebuilt helper; bound bytes before allocation, not afterward."""
+    parent = os.getpid()
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def parent_death():
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+            os._exit(21)
+
+    def interrupt(signum, frame):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)
+        raise StepError("materialize", retryable=True)
+
+    handlers, children = {}, {}
+    deadline = time.monotonic() + runtime["limits"]["run_seconds"]
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            handlers[sig] = signal.signal(sig, interrupt)
+        # A bounded anonymous input file avoids blocking on a helper that never
+        # reads stdin. Neither request nor diagnostics are command-line arguments.
+        with tempfile.TemporaryFile() as stdin, selectors.DefaultSelector() as selector:
+            stdin.write(_canonical(body))
+            stdin.seek(0)
+            process = subprocess.Popen(
+                [runtime["materializer"]], stdin=stdin,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=() if lock_fd is None else (lock_fd,),
+                preexec_fn=parent_death,
+                env={key: value for key, value in os.environ.items() if key != "REDIS_URL"},
+            )
+            children["materializer"] = process
+            with process.stdout as stdout:
+                selector.register(stdout, selectors.EVENT_READ)
+                output = bytearray()
+                limit = 4 * 1024 * 1024
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise StepError("materialize", retryable=True)
+                    chunk = os.read(stdout.fileno(), min(65536, limit + 1 - len(output)))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > limit:
+                        raise StepError("materialize")
+                if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                    raise StepError("materialize")
+                return bytes(output)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise StepError("materialize", retryable=True) from error
+    finally:
+        supervisor.stop(children, runtime["limits"]["stop_seconds"])
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def _materialize(request, lock_fd=None):
     interval, capture, runtime = (
         request["interval"],
         request["capture"],
@@ -152,23 +216,11 @@ def _materialize(request):
         "start_ns": int(interval["start_ns"]),
         "end_ns": int(interval["end_ns"]),
     }
+    output = _helper_output(runtime, body, lock_fd)
     try:
-        process = subprocess.run(
-            [runtime["materializer"]],
-            input=_canonical(body),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=runtime["limits"]["run_seconds"],
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise StepError("materialize", retryable=True) from error
-    if process.returncode != 0:
-        raise StepError("materialize")
-    try:
-        result = decode(process.stdout, 4 * 1024 * 1024)
+        result = decode(output, 4 * 1024 * 1024)
         obj(result, "version normalizer derivatives")
-        require(result["version"] == 1)
+        require(type(result["version"]) is int and result["version"] == 1)
         supervisor._normalizer_descriptor(result["normalizer"])
         require(type(result["derivatives"]) is list)
         require(0 < len(result["derivatives"]) <= 4096, "pin count")
@@ -253,15 +305,26 @@ def execute(request, workdir, redis_url):
     workdir = Path(workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     supervisor.fsync_directory(workdir.parent)
+    with (workdir / ".lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise StepError("workdir lock", retryable=True) from error
+        return _execute_locked(request, workdir, redis_url, lock.fileno())
+
+
+def _execute_locked(request, workdir, redis_url, lock_fd):
     request_bytes = _canonical(request)
+    require(len(request_bytes) <= 1_048_576, "request limit")
     request_path = workdir / "request.json"
     if request_path.exists():
-        require(request_path.read_bytes() == request_bytes, "immutable request")
+        with request_path.open("rb") as file:
+            require(file.read(1_048_577) == request_bytes, "immutable request")
     else:
         _write_bytes(request_path, request_bytes)
     request_sha256 = hashlib.sha256(request_bytes).hexdigest()
 
-    normalizer, pins = _materialize(request)
+    normalizer, pins = _materialize(request, lock_fd)
     config = _supervisor_config(request, normalizer, pins)
     try:
         completion = supervisor.run(config, workdir / "run", redis_url)
