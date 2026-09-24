@@ -19,6 +19,100 @@ from replay.tests.test_streams import records
 URL = os.environ.get("REPLAY_REDIS_URL")
 
 
+def normalizer():
+    def config(schema, *, additive=False):
+        variables = {
+            "price_scale": {"type": "unsigned", "value": 2},
+            "quantity_scale": {"type": "unsigned", "value": 0},
+        }
+        if additive:
+            variables = {
+                "accept_additive_fields": {"type": "boolean", "value": True},
+                **variables,
+            }
+        return {"schema_version": schema, "variables": variables}
+
+    return {
+        "identity_version": 1,
+        "venues": [
+            {
+                "venue": "kalshi",
+                "bundle_id": "risk-test-kalshi",
+                "parser_version": 1,
+                "config": config(2),
+            },
+            {
+                "venue": "limitless",
+                "bundle_id": "risk-test-limitless",
+                "parser_version": 1,
+                "config": config(1),
+            },
+            {
+                "venue": "polymarket",
+                "bundle_id": "risk-test-polymarket",
+                "parser_version": 1,
+                "config": config(1, additive=True),
+            },
+        ],
+    }
+
+
+_METADATA = tempfile.TemporaryDirectory()
+
+
+def metadata_pin():
+    directory = Path(_METADATA.name)
+    descriptor = s._normalizer_descriptor(normalizer())
+    address = "d" * 64
+    manifest = {
+        "manifest_version": 2,
+        "derivative_address": address,
+        "source_receipt": {},
+        "requested_start_ns": 0,
+        "requested_end_ns": 100,
+        "effective_start_ns": 0,
+        "effective_end_ns": 100,
+        "normalized_schema_version": 3,
+        "event_serialization_version": 1,
+        "reject_serialization_version": 1,
+        "materializer_version": 2,
+        "normalizer_bundle_sha256": descriptor["bundle_sha256"],
+        "normalizer_config_sha256": descriptor["config_sha256"],
+        "policy": {},
+        "counts": {},
+        "events": {},
+        "rejects": {},
+        "sources": {},
+    }
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    (directory / "manifest.json").write_bytes(manifest_bytes)
+    receipt = {
+        "receipt_version": 2,
+        "derivative_address": address,
+        "source_receipt_sha256": "a" * 64,
+        "normalized_schema_version": 3,
+        "materializer_version": 2,
+        "normalizer_bundle_sha256": descriptor["bundle_sha256"],
+        "normalizer_config_sha256": descriptor["config_sha256"],
+        "policy_sha256": "b" * 64,
+        "manifest": {
+            "file": "manifest.json",
+            "sha256": __import__("hashlib").sha256(manifest_bytes).hexdigest(),
+            "byte_length": len(manifest_bytes),
+        },
+        "events": {},
+        "rejects": {},
+        "sources": {},
+    }
+    receipt_bytes = (json.dumps(receipt, sort_keys=True) + "\n").encode()
+    (directory / "receipt.json").write_bytes(receipt_bytes)
+    return {
+        "directory": str(directory),
+        "derivative_address": address,
+        "receipt_sha256": __import__("hashlib").sha256(receipt_bytes).hexdigest(),
+    }
+
+
 def config(publisher="/unused"):
     body = records()[0]["body"]
     return {
@@ -28,7 +122,8 @@ def config(publisher="/unused"):
         "transport": {
             "run_id": "contract",
             "scope": "test",
-            "inputs": [{"directory": "/unused", **p} for p in body["pins"]],
+            "normalizer": normalizer(),
+            "inputs": [metadata_pin()],
             **{
                 k: body[k]
                 for k in ("start_ns", "end_ns", "lower_bound", "plans", "groups")
@@ -72,6 +167,50 @@ def state():
 
 
 class BudgetTests(unittest.TestCase):
+    def test_normalizer_hash_parity_and_closed_scale_binding(self):
+        value = normalizer()
+        value["venues"][0].update(
+            bundle_id="prediction-indexer/kalshi-normalizer/v4", parser_version=4
+        )
+        value["venues"][0]["config"]["variables"]["price_scale"]["value"] = 4
+        value["venues"][0]["config"]["variables"]["quantity_scale"]["value"] = 2
+        value["venues"][1].update(
+            bundle_id="prediction-indexer/limitless-normalizer/v2", parser_version=2
+        )
+        value["venues"][1]["config"]["variables"]["price_scale"]["value"] = 3
+        value["venues"][1]["config"]["variables"]["quantity_scale"]["value"] = 6
+        value["venues"][2].update(
+            bundle_id="prediction-indexer/polymarket-normalizer/v2", parser_version=2
+        )
+        value["venues"][2]["config"]["variables"]["price_scale"]["value"] = 4
+        value["venues"][2]["config"]["variables"]["quantity_scale"]["value"] = 6
+        descriptor = s._normalizer_descriptor(value)
+        self.assertEqual(
+            descriptor["bundle_sha256"],
+            "8076a1e1156470b053856c4100f9f38f83a675bdb625383cb42c1d4e5603fb92",
+        )
+        self.assertEqual(
+            descriptor["config_sha256"],
+            "5a70988d6be21716850f50eecdf393733ca8d6b551896cfda4299cabca547d7f",
+        )
+
+        valid = config()
+        s.validate(valid)
+        for mutate in (
+            lambda item: item["transport"]["normalizer"]["venues"][0].update(
+                bundle_id="changed"
+            ),
+            lambda item: item["transport"]["normalizer"]["venues"][2]["config"][
+                "variables"
+            ]["accept_additive_fields"].update(value=False),
+            lambda item: item["transport"]["plans"][0].update(venue="unknown"),
+            lambda item: item["transport"]["plans"][0].update(price_scale="3"),
+        ):
+            invalid = copy.deepcopy(valid)
+            mutate(invalid)
+            with self.assertRaises(ProtocolError):
+                s.validate(invalid)
+
     def test_high_water_not_previous_attempt_or_oscillation(self):
         x, limits = state(), config()["limits"]
         for progress, best, stagnant in [
@@ -196,8 +335,10 @@ class Strategy:
     def __init__(self, context):
         self.context = context
         self.path = Path(context["output_directory"]) / "sequences.txt"
+        self.books = None
 
     def __call__(self, cut):
+        self.books = cut.books
         with self.path.open("a") as f:
             f.write(f"{cut.sequence}\n")
         mode = self.context["config"].get("mode")
@@ -229,6 +370,22 @@ class Strategy:
     def finish(self):
         if self.context["config"].get("mode") == "finish_failure":
             raise RuntimeError("failed final local processing")
+        required = self.context["config"].get("required_usable_books", ())
+        if required:
+            (self.path.parent / "books.json").write_text(
+                json.dumps(
+                    {
+                        f"{instrument}|{orientation}": self.books[
+                            (instrument, orientation)
+                        ].validity
+                        for instrument, orientation in required
+                    },
+                    sort_keys=True,
+                )
+            )
+        for instrument, orientation in required:
+            if self.books[(instrument, orientation)].validity != "usable":
+                raise RuntimeError("required book is not usable")
 
 
 def strategy(context):
@@ -254,6 +411,23 @@ def fake_publisher(path, ready, mode):
         c["max_entry_bytes"],
     )
     values = records()
+    replacement = {
+        k: c["inputs"][0][k] for k in ("derivative_address", "receipt_sha256")
+    }
+
+    def replace_pin(value):
+        if type(value) is dict:
+            if set(value) == {"derivative_address", "receipt_sha256"}:
+                value.update(replacement)
+            else:
+                for child in value.values():
+                    replace_pin(child)
+        elif type(value) is list:
+            for child in value:
+                replace_pin(child)
+
+    for value in values:
+        replace_pin(value)
     if mode == "truncated":
         values = values[:-1]
     for value in values:

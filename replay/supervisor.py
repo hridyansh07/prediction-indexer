@@ -55,6 +55,143 @@ def identity(config):
     ).hexdigest()
 
 
+def _normalizer_descriptor(value):
+    """Validate identity V1 and reproduce replay-normalizers' exact hashes."""
+    obj(value, "identity_version venues")
+    require(type(value["identity_version"]) is int and value["identity_version"] == 1)
+    require(type(value["venues"]) is list)
+    expected = {
+        "kalshi": (2, ("price_scale", "quantity_scale")),
+        "limitless": (1, ("price_scale", "quantity_scale")),
+        "polymarket": (
+            1,
+            ("accept_additive_fields", "price_scale", "quantity_scale"),
+        ),
+    }
+    require(
+        [entry.get("venue") if type(entry) is dict else None for entry in value["venues"]]
+        == list(expected),
+        "normalizer venues",
+    )
+    normalized_venues = []
+    scales = {}
+    for entry in value["venues"]:
+        obj(entry, "venue bundle_id parser_version config")
+        venue = entry["venue"]
+        require(type(entry["bundle_id"]) is str and bool(entry["bundle_id"]))
+        require(type(entry["parser_version"]) is int and entry["parser_version"] > 0)
+        config = obj(entry["config"], "schema_version variables")
+        schema, variables = expected[venue]
+        require(type(config["schema_version"]) is int and config["schema_version"] == schema)
+        require(
+            type(config["variables"]) is dict
+            and set(config["variables"]) == set(variables)
+        )
+        normalized_variables = {}
+        for name in variables:
+            variable = obj(config["variables"][name], "type value")
+            if name == "accept_additive_fields":
+                require(variable["type"] == "boolean" and type(variable["value"]) is bool)
+            else:
+                require(
+                    variable["type"] == "unsigned"
+                    and type(variable["value"]) is int
+                    and 0 <= variable["value"] <= 18,
+                    "normalizer scale",
+                )
+            normalized_variables[name] = {
+                "type": variable["type"],
+                "value": variable["value"],
+            }
+        scales[venue] = (
+            normalized_variables["price_scale"]["value"],
+            normalized_variables["quantity_scale"]["value"],
+        )
+        normalized_venues.append(
+            {
+                "venue": venue,
+                "bundle_id": entry["bundle_id"],
+                "parser_version": entry["parser_version"],
+                "config": {
+                    "schema_version": config["schema_version"],
+                    "variables": normalized_variables,
+                },
+            }
+        )
+    canonical = {"identity_version": 1, "venues": normalized_venues}
+    encode = lambda item: json.dumps(
+        item, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode()
+    bundle = [
+        {k: entry[k] for k in ("venue", "bundle_id", "parser_version")}
+        for entry in normalized_venues
+    ]
+    return {
+        "bundle_sha256": hashlib.sha256(
+            b"prediction-indexer/replay-normalizers/bundle/v1\0" + encode(bundle)
+        ).hexdigest(),
+        "config_sha256": hashlib.sha256(
+            b"prediction-indexer/replay-normalizers/config/v1\0" + encode(canonical)
+        ).hexdigest(),
+        "scales": scales,
+    }
+
+
+def _metadata(path):
+    with Path(path).open("rb") as file:
+        data = file.read(1_048_577)
+    require(len(data) <= 1_048_576, "metadata limit")
+    return data, decode(data, 1_048_576)
+
+
+def _validate_input_binding(pin, descriptor):
+    directory = Path(pin["directory"])
+    receipt_bytes, receipt = _metadata(directory / "receipt.json")
+    require(
+        hashlib.sha256(receipt_bytes).hexdigest() == pin["receipt_sha256"],
+        "receipt does not match pin",
+    )
+    obj(
+        receipt,
+        "receipt_version derivative_address source_receipt_sha256 normalized_schema_version materializer_version normalizer_bundle_sha256 normalizer_config_sha256 policy_sha256 manifest events rejects sources",
+    )
+    require(
+        receipt["receipt_version"] == 2
+        and receipt["normalized_schema_version"] == 3
+        and receipt["materializer_version"] == 2,
+        "pinned derivative is not source-evidence profile 2",
+    )
+    require(receipt["derivative_address"] == pin["derivative_address"])
+    manifest_identity = obj(receipt["manifest"], "file sha256 byte_length")
+    require(manifest_identity["file"] == "manifest.json")
+    manifest_bytes, manifest = _metadata(directory / "manifest.json")
+    obj(
+        manifest,
+        "manifest_version derivative_address source_receipt requested_start_ns requested_end_ns effective_start_ns effective_end_ns normalized_schema_version event_serialization_version reject_serialization_version materializer_version normalizer_bundle_sha256 normalizer_config_sha256 policy counts events rejects sources",
+    )
+    require(
+        manifest["manifest_version"] == 2
+        and manifest["normalized_schema_version"] == 3
+        and manifest["materializer_version"] == 2,
+        "pinned derivative is not source-evidence profile 2",
+    )
+    require(
+        manifest["derivative_address"] == pin["derivative_address"]
+        and manifest_identity["sha256"] == hashlib.sha256(manifest_bytes).hexdigest()
+        and manifest_identity["byte_length"] == len(manifest_bytes),
+        "manifest binding",
+    )
+    for document in (receipt, manifest):
+        require(
+            document["normalizer_bundle_sha256"] == descriptor["bundle_sha256"],
+            "normalizer bundle mismatch",
+        )
+        require(
+            document["normalizer_config_sha256"] == descriptor["config_sha256"],
+            "normalizer config mismatch",
+        )
+
+
 def initial(config):
     t = config["transport"]
     return {
@@ -75,7 +212,7 @@ def validate(config):
         require(type(config[name]) is str and Path(config[name]).is_absolute())
     t = obj(
         config["transport"],
-        "run_id scope inputs start_ns end_ns lower_bound plans groups command_timeout_ms max_entry_bytes max_queue_bytes",
+        "run_id scope normalizer inputs start_ns end_ns lower_bound plans groups command_timeout_ms max_entry_bytes max_queue_bytes",
     )
     for s in [t["run_id"], t["scope"], *t["groups"]]:
         require(
@@ -95,9 +232,29 @@ def validate(config):
         },
         "reserved participant name",
     )
+    require(type(t["inputs"]) is list and 0 < len(t["inputs"]) <= 4096)
+    descriptor = _normalizer_descriptor(t["normalizer"])
     for p in t["inputs"]:
         obj(p, "directory derivative_address receipt_sha256")
         require(type(p["directory"]) is str and Path(p["directory"]).is_absolute())
+        require(
+            all(
+                type(p[name]) is str
+                and re.fullmatch(r"[0-9a-f]{64}", p[name]) is not None
+                for name in ("derivative_address", "receipt_sha256")
+            )
+        )
+        _validate_input_binding(p, descriptor)
+    require(type(t["plans"]) is list and bool(t["plans"]))
+    for plan in t["plans"]:
+        obj(plan, "instrument orientation lane venue price_scale quantity_scale")
+        require(plan["venue"] in descriptor["scales"], "plan venue missing from normalizer")
+        price_scale, quantity_scale = descriptor["scales"][plan["venue"]]
+        require(
+            plan["price_scale"] == str(price_scale)
+            and plan["quantity_scale"] == str(quantity_scale),
+            "plan scales disagree with normalizer",
+        )
     for k in ("command_timeout_ms", "max_entry_bytes", "max_queue_bytes"):
         require(type(t[k]) is int and t[k] > 0)
     require(

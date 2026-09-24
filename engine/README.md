@@ -263,6 +263,9 @@ profile-2 composite derivative per exact window, and emits only verified ordered
 pins. It is an example target, not a stable CLI, archive restorer, or indexer.
 The existing 4096-window read limit is unchanged; with half-hour canonical
 windows, one initial materialization request can span at most 85 days 8 hours.
+Transport and Python supervisor preflight bind every selected profile-2 manifest
+to the helper's typed composite identity and derive plan scales from it before any
+Redis command or child process. The initial Redis wire record remains V1.
 
 Window status includes uncertified/empty evidence. Profile 2 reports
 `ReceiptBoundV2` and `coverage() -> Option<&CoverageEvidence>` with typed lane
