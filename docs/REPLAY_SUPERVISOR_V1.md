@@ -142,10 +142,10 @@ CLI returns 0 only for whole-attempt success, 20 for fatal failure, 21 for exhau
 retry budget, interruption, or local resource/lock failure. Restarting with the
 same directory cannot reset persisted budgets or change immutable configuration.
 
-## Stage-B narrow bundle entry point
+## Narrow bundle entry point
 
-`scripts/replay_bundle.py REQUEST.json WORKDIR` is the single orchestration entry
-point available on the Stage-A ancestry. It durably binds the closed canonical
+`scripts/replay_bundle.py REQUEST.json WORKDIR` is the single automated
+materialize-and-supervise entry point. It durably binds the closed canonical
 request, invokes a request-pinned prebuilt `materialize_range` example binary,
 derives plan scales from the returned normalizer identity, validates this
 supervisor configuration, runs it, independently reads `SUCCESS.json`, and writes
@@ -165,15 +165,18 @@ derivative, and work directories without concurrent symlink/path mutation.
 Canonical catalogue discovery still scans retained receipt metadata before the
 4096 selected-window check; that limit is not a bound on total catalogue size.
 
-This baseline has no `replay.preparation`, `replay.strategy_sdk`,
-`replay.bundle_coverage`, or completed-result registry. The narrow request
-therefore carries immutable plan keys/lanes (never scales), one existing strategy
-factory/revision/config, capture roots, and runtime binary paths. Its result
-attests validated supervisor completion, not strategy semantics. Preparation can
-later replace the plan seam, and a completed-result reader can replace the generic
-completion payload, without changing materialization or transport binding.
+This entry point does not yet use `replay.preparation`, `replay.strategy_sdk`,
+`replay.bundle_coverage`, or `replay.coverage_output.read_completed`, although
+they exist in this tree. Preparation and bundle coverage currently run through
+the manual walkthrough in [BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md), with
+caller-supplied pins. The narrow request therefore carries immutable plan
+keys/lanes (never scales), one existing strategy factory/revision/config, capture
+roots, and runtime binary paths. Its result attests validated supervisor
+completion, not strategy semantics. Preparation can later replace the plan seam,
+and a completed-result reader can replace the generic completion payload, without
+changing materialization or transport binding.
 
-The closed Stage-B request is:
+The closed request is:
 
 ```json
 {
@@ -203,7 +206,11 @@ regenerable and is not a new commit marker.
 
 ## Verification
 
-Offline: `.venv/bin/python -m unittest replay.tests.test_supervisor`.
+Offline: `.venv/bin/python -m unittest replay.tests.test_supervisor`. The
+subprocess tests import `replay.tests` from a generated executable, so the
+repository must be installed in the virtual environment
+(`.venv/bin/pip install -e '.[replay-redis]'`). Process-containment tests require
+Linux (`prctl` parent-death signal); they fail rather than skip on macOS.
 For an explicitly disposable server only, set `REPLAY_REDIS_URL` and run that test
 plus `replay.tests.test_streams_redis`. The Rust contract test
 `redis_supervisor_retries_entire_attempt` materializes pinned profile-2 input,

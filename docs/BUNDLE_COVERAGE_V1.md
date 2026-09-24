@@ -273,12 +273,19 @@ Python. No live API response or historical capture is used.
 Run only against **disposable dedicated Redis ≥8.2**, positive finite maxmemory,
 noeviction, no persistence, loopback-only. The wider test suite temporarily changes
 maxmemory and pauses Redis, so do not use a shared instance and run serially.
-In an Amp orb, use a supervised service (replace the executable path if needed):
+Start the disposable server however your environment supervises processes
+(replace the executable path; do not use a distribution's older Redis):
 
 ```bash
-# Install Redis 8.2 separately; do not use a distribution's older Redis.
-amp orb service start coverage-redis --command '/absolute/path/redis-server --bind 127.0.0.1 --port 6382 --save "" --appendonly no --maxmemory 128mb --maxmemory-policy noeviction'
-uv pip install --python .venv/bin/python 'redis>=6.4,<7'
+/absolute/path/redis-server --bind 127.0.0.1 --port 6382 --save "" \
+  --appendonly no --maxmemory 128mb --maxmemory-policy noeviction
+```
+
+The Python tests import the repository package, so install it into the project
+virtual environment with the Redis extra before running them:
+
+```bash
+.venv/bin/pip install -e '.[replay-redis]'
 export REPLAY_REDIS_URL=redis://127.0.0.1:6382/0
 cargo test --manifest-path engine/Cargo.toml -p replay-transport \
   --test contract redis_bundle_coverage_acceptance -- --ignored --exact --nocapture
@@ -286,7 +293,7 @@ cargo test --manifest-path engine/Cargo.toml -p replay-transport \
 cargo test --manifest-path engine/Cargo.toml -p replay-transport \
   --test contract -- --ignored --test-threads=1 --nocapture
 .venv/bin/python -m unittest replay.tests.test_streams_redis replay.tests.test_supervisor
-amp orb service stop coverage-redis
+# Stop and discard the disposable server afterwards.
 ```
 
 ## Bounded retained-data walkthrough (requires actual pinned inputs)

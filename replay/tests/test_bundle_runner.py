@@ -419,7 +419,7 @@ class BundlePreflightTests(unittest.TestCase):
 
 @unittest.skipUnless(
     URL and MATERIALIZER.exists() and PUBLISHER.exists(),
-    "requires disposable REPLAY_REDIS_URL >=8.2 and prebuilt Stage-B binaries",
+    "requires disposable REPLAY_REDIS_URL >=8.2 and prebuilt Rust binaries",
 )
 class BundleRunnerRedisAcceptance(unittest.TestCase):
     def test_two_venue_materialize_supervise_complete_and_noop_rerun(self):
