@@ -18,7 +18,7 @@ from replay.preparation import encoded, prepare
 from replay.strategy_sdk import plain
 from replay.streams.protocol import Decoder, ProtocolError, freeze
 from replay.tests.test_preparation import G2, R1, R2, config, detail
-from replay.tests.test_supervisor import config as supervisor_config
+from replay.tests.test_supervisor import config as supervisor_config, metadata_pin
 
 
 class Harness:
@@ -33,10 +33,21 @@ class Harness:
         all_uncaptured=False,
         attempt="a" * 32,
         lower_bound="clip",
+        pin=None,
     ):
         self.root = root
         d = detail()
         c = config()
+        if pin is not None:
+            c["pins"] = [
+                {
+                    key: pin[key]
+                    for key in ("derivative_address", "receipt_sha256")
+                }
+            ]
+            for authority in c["authorities"]:
+                authority["price_scale"] = "2"
+                authority["quantity_scale"] = "0"
         c["lower_bound"] = lower_bound
         if not mixed:
             c["probe_markets"] = ["polymarket:series"]
@@ -681,7 +692,11 @@ class CoverageTests(unittest.TestCase):
             self.assertFalse((other.output / "content_receipt.json").exists())
 
     def test_real_success_reader_with_fake_supervisor_artifacts(self):
-        h = self.harness()
+        preflight = patch.object(supervisor, "_strict_metadata_preflight")
+        preflight.start()
+        self.addCleanup(preflight.stop)
+        input_pin = metadata_pin()
+        h = self.harness(pin=input_pin)
         c = supervisor_config()
         c["transport"].update(
             run_id="coverage-test",
@@ -689,7 +704,7 @@ class CoverageTests(unittest.TestCase):
             plans=h.initial["plans"],
             start_ns="10",
             end_ns="40",
-            inputs=[{"directory": "/unused", **h.pin}],
+            inputs=[input_pin],
         )
         c["strategies"] = {
             "coverage": {
