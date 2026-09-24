@@ -171,6 +171,12 @@ failure. An optional second argument names a new setup-ready file, created only
 after setup and initial publication; its contents are not a success marker.
 CLI uses default RiskLimits; library callers can supply tighter limits.
 
+The supervisor uses `replay-publish --validate-only` with the same bounded closed
+configuration on stdin. This read-only mode runs `Config::validate` (including
+strict pinned metadata inspection) and exits without requiring `REDIS_URL`,
+creating a Redis client, writing readiness, or publishing records. Exit 0 here
+attests metadata preflight only, not a completed replay.
+
 Python optional install: `.venv/bin/pip install -e '.[replay-redis]'`.
 
 ```python

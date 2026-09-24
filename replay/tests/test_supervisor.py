@@ -167,6 +167,31 @@ def state():
 
 
 class BudgetTests(unittest.TestCase):
+    def setUp(self):
+        # Budget/unit tests use intentionally incomplete metadata. The real Rust
+        # reader is exercised separately by BundlePreflightTests, without Redis.
+        preflight = patch.object(s, "_strict_metadata_preflight")
+        preflight.start()
+        self.addCleanup(preflight.stop)
+
+    def test_unsupported_profile_serialization_fails_preflight(self):
+        c = config()
+        pin = c["transport"]["inputs"][0]
+        directory = Path(pin["directory"])
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+        manifest["event_serialization_version"] = 999
+        data = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+        (directory / "manifest.json").write_bytes(data)
+        receipt = json.loads((directory / "receipt.json").read_bytes())
+        receipt["manifest"].update(
+            byte_length=len(data), sha256=__import__("hashlib").sha256(data).hexdigest()
+        )
+        data = (json.dumps(receipt, sort_keys=True) + "\n").encode()
+        (directory / "receipt.json").write_bytes(data)
+        pin["receipt_sha256"] = __import__("hashlib").sha256(data).hexdigest()
+        with self.assertRaises(ProtocolError):
+            s.validate(c)
+
     def test_normalizer_hash_parity_and_closed_scale_binding(self):
         value = normalizer()
         value["venues"][0].update(
@@ -469,7 +494,9 @@ class SubprocessTests(unittest.TestCase):
     def config(self, mode="normal"):
         exe = self.root / "publisher-executable"
         exe.write_text(
-            f"#!{sys.executable}\nfrom replay.tests.test_supervisor import fake_publisher\nimport sys\nsys.exit(fake_publisher(sys.argv[1], sys.argv[2], {mode!r}))\n"
+            f"#!{sys.executable}\nfrom replay.tests.test_supervisor import fake_publisher\nimport sys\n"
+            "if sys.argv[1] == '--validate-only': sys.exit(0)\n"
+            f"sys.exit(fake_publisher(sys.argv[1], sys.argv[2], {mode!r}))\n"
         )
         exe.chmod(0o700)
         return config(str(exe))

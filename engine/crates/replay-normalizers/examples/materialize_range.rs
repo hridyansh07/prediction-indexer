@@ -55,6 +55,9 @@ struct OutputPin {
 }
 
 fn execute(input: &str) -> Result<String, String> {
+    if input.len() > 1_048_576 {
+        return Err("request exceeds 1 MiB".into());
+    }
     let request: Request =
         serde_json::from_str(input).map_err(|error| format!("invalid request: {error}"))?;
     if request.version != 1 {
@@ -134,6 +137,7 @@ fn execute(input: &str) -> Result<String, String> {
 fn main() {
     let mut input = String::new();
     let result = io::stdin()
+        .take(1_048_577)
         .read_to_string(&mut input)
         .map_err(|error| format!("reading stdin: {error}"))
         .and_then(|_| execute(&input));
@@ -250,6 +254,10 @@ mod tests {
 
     #[test]
     fn request_is_closed_and_window_limit_keeps_the_existing_boundary() {
+        assert_eq!(
+            execute(&" ".repeat(1_048_577)).unwrap_err(),
+            "request exceeds 1 MiB"
+        );
         assert!(
             serde_json::from_str::<Request>(
                 r#"{"version":1,"canonical_root":"a","output_root":"b","start_ns":0,"end_ns":1}"#
@@ -294,6 +302,12 @@ mod tests {
             [(0, 10), (10, 20), (20, 30)]
         );
         assert_eq!(execute(&input).unwrap(), first);
+        let maximum = format!("{input}{}", " ".repeat(1_048_576 - input.len()));
+        assert_eq!(execute(&maximum).unwrap(), first);
+        assert_eq!(
+            execute(&(maximum + " ")).unwrap_err(),
+            "request exceeds 1 MiB"
+        );
         assert_eq!(snapshot(canonical.path()), before);
     }
 

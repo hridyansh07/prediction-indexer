@@ -42,6 +42,14 @@ Validation independently recomputes the typed composite normalizer descriptor,
 checks pinned profile-2 receipt/manifest metadata, and derives the only accepted
 price/quantity scales for each plan venue. Invalid identity, pin, profile, venue,
 or scale combinations fail before any participant is launched.
+After the Python binding checks, `validate` invokes the pinned publisher's
+read-only `--validate-only` mode with a bounded stdin configuration. This reuses
+the authoritative Rust `inspect_pinned` reader for closed nested schemas, source
+coverage, exact serialization, directory/address identity, and repeated bindings.
+It creates no Redis client, readiness marker, or output. Its output is discarded,
+its deadline is `attempt_seconds`, and it is killed if the supervisor dies.
+Independent success reading performs the same validation; the pinned executable
+must remain available even for read-only reruns.
 
 Each importable factory receives deeply immutable context with `run_id`,
 `attempt_id`, `group`, `identity`, strategy `config`, and `output_directory`.
@@ -143,6 +151,18 @@ supervisor configuration, runs it, independently reads `SUCCESS.json`, and write
 a regenerable `WORKDIR/result.json`. `REDIS_URL` remains environment-only and is
 never persisted or printed; the script never invokes Cargo. It accepts at most
 4096 adjacent pins, which is 85 days 8 hours at half-hour windows.
+
+A separate persistent `WORKDIR/.lock` serializes request binding through result
+publication. Contention fails retryably before writing `request.json`; the lock
+pathname is never removed. The helper inherits the lock, runs in an owned process
+group, and receives a Linux parent-death signal. Cancellation/timeouts stop and
+wait for it. Helper stdout is limited to 4 MiB while reading, stderr is discarded,
+and `REDIS_URL` is removed from the helper and metadata-check environments.
+These are trusted prebuilt binaries, not a sandbox for arbitrary executables;
+they must not spawn detached descendants. Use trusted, separately owned canonical,
+derivative, and work directories without concurrent symlink/path mutation.
+Canonical catalogue discovery still scans retained receipt metadata before the
+4096 selected-window check; that limit is not a bound on total catalogue size.
 
 This baseline has no `replay.preparation`, `replay.strategy_sdk`,
 `replay.bundle_coverage`, or completed-result registry. The narrow request

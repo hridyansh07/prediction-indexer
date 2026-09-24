@@ -4,7 +4,8 @@ This workspace contains the stable, venue-independent Replay domain, the
 generic boundary that turns one Phase 0 canonical window into one immutable,
 verified normalized derivative, the Kalshi, Polymarket, and Limitless normalizers,
 a pull-based verified derivative walker, and the `replay-risk` reconstruction
-engine. It contains no strategy, publisher, deployment, or scheduler.
+engine, plus the `replay-transport` Redis publisher. It contains no strategy,
+deployment, or scheduler.
 
 ## Representation contract
 
@@ -119,6 +120,16 @@ The Replay continuity enum intentionally has the same ten closed labels; the
 conversion uses an exhaustive match, not string fallback.
 
 ## Normalization and materialization
+
+Production builds use `replay-normalizers::CanonicalNormalizer::default()`:
+one derivative contains the decisions and source evidence of every Kalshi,
+Limitless, and Polymarket delivery in its canonical window. The three former
+venue crates are consolidated into private modules; their adapters cannot be
+wrapped in a public single-venue `Normalizer<A>`. Original adapter conformance
+tests remain crate-local. Bundle selection belongs to the walker, never the
+materializer. Internal deliveries remain explicit ignores; unknown envelope
+venues fail closed. All three finish hooks run in that order, returning the
+first error.
 
 `canonical-normalizer::Normalizer<A>` implements the normalization lifecycle once.
 It decodes each canonical envelope and raw JSON payload, routes by venue, hashes

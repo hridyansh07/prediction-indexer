@@ -1,8 +1,8 @@
+use crate::limitless::{Config, Limitless, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
 use replay_domain::{BookEvent, FaultImpact, SegmentEvent};
-use replay_normalizers::limitless::{Config, Limitless, NORMALIZER_BUNDLE_ID, PARSER_VERSION};
 use serde_json::{Value, json};
 
 const CAPTURED_BOOK: &str =

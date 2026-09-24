@@ -1,10 +1,10 @@
+use crate::polymarket::{Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION, Polymarket};
 use canonical_normalizer::{Normalization, Normalize, Normalizer, segment_record};
 use indexer_finalize::{ContinuityVerdict, EventAddress, JoinedCanonicalRecord};
 use indexer_types::{ContentHash, Sha256};
 use replay_domain::{
     BookEvent, BookStateHash, ContractOrientation, FaultImpact, LevelChange, SegmentEvent, Side,
 };
-use replay_normalizers::polymarket::{Config, NORMALIZER_BUNDLE_ID, PARSER_VERSION, Polymarket};
 use serde_json::{Value, json};
 
 const BOOK: &str = include_str!("fixtures/polymarket/book.json");

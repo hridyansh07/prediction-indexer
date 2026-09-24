@@ -1,4 +1,18 @@
 //! Production cross-venue normalization for one canonical window.
+//!
+//! Production venue adapters cannot be wrapped in a single-venue normalizer.
+//! ```compile_fail
+//! let _ = canonical_normalizer::Normalizer::new(
+//!     replay_normalizers::kalshi::Kalshi::default());
+//! ```
+//! ```compile_fail
+//! let _ = canonical_normalizer::Normalizer::new(
+//!     replay_normalizers::limitless::Limitless::default());
+//! ```
+//! ```compile_fail
+//! let _ = canonical_normalizer::Normalizer::new(
+//!     replay_normalizers::polymarket::Polymarket::default());
+//! ```
 
 use canonical_normalizer::{
     Normalization, Normalize, NormalizerConfigIdentity, NormalizerDescriptor, NormalizerError,
@@ -8,9 +22,30 @@ use indexer_finalize::JoinedCanonicalRecord;
 use indexer_types::{EnvelopeView, Sha256, Venue};
 use serde::{Deserialize, Serialize};
 
-pub mod kalshi;
-pub mod limitless;
-pub mod polymarket;
+mod kalshi;
+mod limitless;
+mod polymarket;
+
+// Keep the original single-adapter conformance assertions inside the crate;
+// external users can only construct the all-venue production normalizer.
+#[cfg(test)]
+#[path = "../tests/kalshi_conformance.rs"]
+mod kalshi_conformance;
+#[cfg(test)]
+#[path = "../tests/kalshi_materializer.rs"]
+mod kalshi_materializer;
+#[cfg(test)]
+#[path = "../tests/limitless_conformance.rs"]
+mod limitless_conformance;
+#[cfg(test)]
+#[path = "../tests/limitless_materializer.rs"]
+mod limitless_materializer;
+#[cfg(test)]
+#[path = "../tests/polymarket_conformance.rs"]
+mod polymarket_conformance;
+#[cfg(test)]
+#[path = "../tests/polymarket_materializer.rs"]
+mod polymarket_materializer;
 
 const BUNDLE_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/bundle/v1\0";
 const CONFIG_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/config/v1\0";

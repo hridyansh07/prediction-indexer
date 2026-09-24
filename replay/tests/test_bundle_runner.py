@@ -1,15 +1,18 @@
 import copy
+import fcntl
 import hashlib
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from encoder import DEFAULT_ZSTD_LEVEL, encode_stream, encoder_version
 from replay.streams import ProtocolError
@@ -150,6 +153,9 @@ def write_two_venue_canonical(root):
 
 class BundleRunnerTests(unittest.TestCase):
     def setUp(self):
+        preflight = patch.object(replay_bundle.supervisor, "_strict_metadata_preflight")
+        preflight.start()
+        self.addCleanup(preflight.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.canonical = self.root / "canonical"
@@ -228,12 +234,79 @@ class BundleRunnerTests(unittest.TestCase):
             ],
         }
 
-    def test_closed_request_derives_scales_binds_and_reruns(self):
-        process = Mock(
-            returncode=0,
-            stdout=replay_bundle._canonical(self.helper_result()),
-            stderr=b"",
+    def test_busy_workdir_cannot_bind_a_second_request(self):
+        work = self.root / "busy"
+        work.mkdir()
+        with (work / ".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(replay_bundle, "_materialize") as materialize:
+                with self.assertRaises(replay_bundle.StepError) as failure:
+                    replay_bundle.execute(self.request, work, "redis://unused")
+                self.assertTrue(failure.exception.retryable)
+                materialize.assert_not_called()
+        self.assertFalse((work / "request.json").exists())
+
+    def test_materializer_output_limit_stops_before_timeout(self):
+        helper = self.root / "verbose-helper"
+        helper.write_text(
+            f"#!{sys.executable}\nimport os, time\n"
+            "os.write(1, b'x' * (4 * 1024 * 1024 + 1))\ntime.sleep(30)\n"
         )
+        helper.chmod(0o755)
+        self.request["runtime"]["materializer"] = str(helper)
+        self.request["runtime"]["limits"]["run_seconds"] = 1
+        with self.assertRaises(replay_bundle.StepError) as failure:
+            replay_bundle._materialize(self.request)
+        self.assertFalse(failure.exception.retryable, "size overflow, not timeout")
+
+    def test_materializer_dies_with_runner(self):
+        helper = self.root / "sleeping-helper"
+        ready = self.root / "pid"
+        helper.write_text(
+            f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\n"
+            f"Path({str(ready)!r}).write_text(str(os.getpid()))\ntime.sleep(60)\n"
+        )
+        helper.chmod(0o755)
+        self.request["runtime"]["materializer"] = str(helper)
+        request = self.root / "input.json"
+        request.write_bytes(replay_bundle._canonical(self.request))
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=sig):
+                ready.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    [sys.executable, "scripts/replay_bundle.py", str(request),
+                     str(self.root / f"signal-{sig}")],
+                    cwd=ROOT, env={**os.environ, "REDIS_URL": "redis://unused"},
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                pid = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists())
+                    pid = int(ready.read_text())
+                    process.send_signal(sig)
+                    process.wait(timeout=5)
+                    def running():
+                        stat = Path(f"/proc/{pid}/stat")
+                        return stat.exists() and stat.read_text().split()[2] != "Z"
+                    deadline = time.monotonic() + 2
+                    while running() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(running(), "orphaned materializer")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                    if pid is not None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_closed_request_derives_scales_binds_and_reruns(self):
+        output = replay_bundle._canonical(self.helper_result())
         completion = {
             "version": 1,
             "identity": "a" * 64,
@@ -243,7 +316,7 @@ class BundleRunnerTests(unittest.TestCase):
         }
         workdir = self.root / "work"
         with (
-            patch.object(replay_bundle.subprocess, "run", return_value=process),
+            patch.object(replay_bundle, "_helper_output", return_value=output),
             patch.object(replay_bundle.supervisor, "run", return_value=completion) as run,
             patch.object(replay_bundle.supervisor, "read_success", return_value=completion),
         ):
@@ -264,6 +337,11 @@ class BundleRunnerTests(unittest.TestCase):
             replay_bundle.execute(changed, workdir, "redis://secret@unused")
 
     def test_request_rejects_caller_scales_and_error_redacts_redis_url(self):
+        for version in (True, 1.0):
+            invalid = copy.deepcopy(self.request)
+            invalid["version"] = version
+            with self.assertRaises(ProtocolError):
+                replay_bundle.validate_request(invalid)
         invalid = copy.deepcopy(self.request)
         invalid["plans"][0]["price_scale"] = "2"
         with self.assertRaises(ProtocolError):
@@ -275,15 +353,68 @@ class BundleRunnerTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"REDIS_URL": "redis://user:top-secret@unused"}),
             patch.object(
-                replay_bundle.subprocess,
-                "run",
-                return_value=Mock(returncode=20, stdout=b"", stderr=b"top-secret"),
+                replay_bundle,
+                "_helper_output",
+                side_effect=replay_bundle.StepError("materialize"),
             ),
             redirect_stderr(stderr),
         ):
             self.assertEqual(replay_bundle.main([str(path), str(self.root / "failed")]), 20)
         self.assertNotIn("top-secret", stderr.getvalue())
         self.assertFalse((self.root / "failed/result.json").exists())
+
+
+@unittest.skipUnless(MATERIALIZER.exists() and PUBLISHER.exists(), "prebuilt Rust binaries")
+class BundlePreflightTests(unittest.TestCase):
+    def test_real_metadata_and_rehashed_corruptions_fail_before_redis(self):
+        from replay.tests.test_supervisor import config
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_two_venue_canonical(root / "canonical")
+            job = {
+                "version": 1, "canonical_root": str(root / "canonical"),
+                "output_root": str(root / "derived"), "start_ns": 0, "end_ns": 100,
+            }
+            helper = subprocess.run(
+                [str(MATERIALIZER)], input=json.dumps(job).encode(),
+                capture_output=True, timeout=20, check=True,
+            )
+            result = json.loads(helper.stdout)
+            item = result["derivatives"][0]
+            directory = root / "derived" / "window=0" / item["derivative_address"]
+            c = config(str(PUBLISHER))
+            c["transport"].update(
+                normalizer=result["normalizer"],
+                inputs=[{"directory": str(directory), **{
+                    key: item[key] for key in ("derivative_address", "receipt_sha256")
+                }}],
+            )
+            for plan in c["transport"]["plans"]:
+                scales = replay_bundle.supervisor._normalizer_descriptor(result["normalizer"])["scales"][plan["venue"]]
+                plan.update(price_scale=str(scales[0]), quantity_scale=str(scales[1]))
+            with patch.object(replay_bundle.supervisor, "client") as redis:
+                replay_bundle.supervisor.validate(c)
+                original_manifest = (directory / "manifest.json").read_bytes()
+                original_receipt = (directory / "receipt.json").read_bytes()
+                for field, invalid in (
+                    ("source_receipt", {}), ("sources", {}), ("policy", {}),
+                    ("event_serialization_version", 999),
+                    ("effective_start_ns", 1),
+                ):
+                    with self.subTest(field=field):
+                        manifest = json.loads(original_manifest)
+                        manifest[field] = invalid
+                        data = (json.dumps(manifest, separators=(",", ":")) + "\n").encode()
+                        (directory / "manifest.json").write_bytes(data)
+                        receipt = json.loads(original_receipt)
+                        receipt["manifest"].update(byte_length=len(data), sha256=hashlib.sha256(data).hexdigest())
+                        data = (json.dumps(receipt, separators=(",", ":")) + "\n").encode()
+                        (directory / "receipt.json").write_bytes(data)
+                        c["transport"]["inputs"][0]["receipt_sha256"] = hashlib.sha256(data).hexdigest()
+                        with self.assertRaises(ProtocolError):
+                            replay_bundle.supervisor.validate(c)
+                redis.assert_not_called()
 
 
 @unittest.skipUnless(

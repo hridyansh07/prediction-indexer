@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Cursor;
 
+use crate::{CanonicalNormalizer, kalshi::Kalshi};
 use canonical_normalizer::{Normalize, Normalizer};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract as CanonicalCompression, DecodedIdentity, InputSegment,
@@ -12,7 +13,6 @@ use replay_domain::SEGMENT_SCHEMA_VERSION;
 use replay_materialize::{
     BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
 };
-use replay_normalizers::{CanonicalNormalizer, kalshi::Kalshi};
 use serde_json::json;
 use tempdir::TempDir;
 
