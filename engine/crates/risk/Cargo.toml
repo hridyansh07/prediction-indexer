@@ -17,5 +17,6 @@ canonical-normalizer.workspace = true
 indexer-finalize.workspace = true
 indexer-types.workspace = true
 prediction-encoder.workspace = true
+replay-normalizers.workspace = true
 serde_json.workspace = true
 tempdir = "0.3"

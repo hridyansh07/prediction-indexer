@@ -83,6 +83,7 @@ fn config(f: &Fixture) -> Config {
         run_id: "contract".into(),
         attempt_id: "golden".into(),
         scope: "test".into(),
+        normalizer: test_normalizer_identity(),
         inputs: vec![Input {
             directory: f.pin.directory.clone(),
             derivative_address: f.pin.pin.derivative_address.clone(),
@@ -135,6 +136,69 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
     ));
     output
 }
+
+fn invalid_preflight_configs(f: &Fixture) -> (Vec<(&'static str, Config)>, tempdir::TempDir) {
+    let mut cases = Vec::new();
+
+    let mut descriptor = config(f);
+    descriptor.normalizer.venues[0]
+        .bundle_id
+        .push_str("-changed");
+    cases.push(("bundle", descriptor));
+
+    let mut config_hash = config(f);
+    config_hash.normalizer.venues[2].config.variables.insert(
+        "accept_additive_fields".into(),
+        canonical_normalizer::ConfigValue::Boolean(false),
+    );
+    cases.push(("config", config_hash));
+
+    let mut missing = config(f);
+    missing.plans[0].venue = "unknown".into();
+    cases.push(("venue", missing));
+
+    let mut scale = config(f);
+    scale.plans[0].price_scale = "3".into();
+    cases.push(("scale", scale));
+
+    let mut profile = config(f);
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../materialize/tests/fixtures/profile1");
+    let profile_root = tempdir::TempDir::new("transport-profile1").unwrap();
+    let directory = profile_root
+        .path()
+        .join("5b2a4358be376144d898f0c0671b25c23dc2f8de946d16cc049b3b9f92685ea4");
+    std::fs::create_dir(&directory).unwrap();
+    for name in [
+        "receipt.json",
+        "manifest.json",
+        "events.ndjson.zst",
+        "rejects.ndjson.zst",
+    ] {
+        std::fs::copy(source.join(name), directory.join(name)).unwrap();
+    }
+    let receipt = std::fs::read(directory.join("receipt.json")).unwrap();
+    profile.inputs = vec![Input {
+        directory,
+        derivative_address: "5b2a4358be376144d898f0c0671b25c23dc2f8de946d16cc049b3b9f92685ea4"
+            .into(),
+        receipt_sha256: indexer_types::Sha256::digest(&receipt),
+    }];
+    cases.push(("profile", profile));
+    (cases, profile_root)
+}
+
+#[test]
+fn publisher_preflight_binds_descriptor_config_venues_scales_and_profile() {
+    let f = fixture();
+    config(&f).validate().unwrap();
+    let (cases, _profile_root) = invalid_preflight_configs(&f);
+    for (name, invalid) in cases {
+        let error = invalid.validate().unwrap_err().to_string();
+        assert!(error.contains(name), "{name}: {error}");
+    }
+}
+
 #[test]
 fn golden_wire_from_real_materializer_walker_and_risk() {
     let f = fixture();
@@ -159,6 +223,31 @@ fn golden_wire_from_real_materializer_walker_and_risk() {
         values[3]["body"]["market_events"].as_array().unwrap().len(),
         5
     );
+}
+
+#[test]
+#[ignore = "requires explicitly supplied disposable Redis >=8.2"]
+fn invalid_preflight_never_creates_redis_keys() {
+    use replay_transport::Publisher;
+
+    let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    let f = fixture();
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let (cases, _profile_root) = invalid_preflight_configs(&f);
+    for (index, (name, mut invalid)) in cases.into_iter().enumerate() {
+        invalid.attempt_id = format!("preflight-{index}-{}", std::process::id());
+        let keys = invalid.keys();
+        let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+        assert!(
+            Publisher::open(&url, invalid, RiskLimits::default()).is_err(),
+            "{name}"
+        );
+        let count: u64 = redis::cmd("EXISTS").arg(&keys).query(&mut admin).unwrap();
+        assert_eq!(count, 0, "{name}");
+    }
 }
 
 #[test]

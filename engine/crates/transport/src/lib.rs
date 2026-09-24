@@ -1,6 +1,8 @@
 //! One single-producer, fixed-membership Redis attempt. No retry or resumption.
 pub mod wire;
 use replay_domain::*;
+use replay_materialize::{ReadLimits, inspect_pinned};
+use replay_normalizers::CanonicalNormalizerIdentity;
 use replay_risk::{BookPlan, RiskEngine, RiskLimits};
 use replay_tape::{DerivativePin, LowerBoundPolicy, PinnedDerivative};
 use serde::{Deserialize, Serialize};
@@ -80,6 +82,7 @@ pub struct Config {
     pub run_id: String,
     pub attempt_id: String,
     pub scope: String,
+    pub normalizer: CanonicalNormalizerIdentity,
     pub inputs: Vec<Input>,
     pub start_ns: String,
     pub end_ns: String,
@@ -99,7 +102,9 @@ pub fn integer(s: &str) -> Result<u64> {
         .map_err(|_| Error::Protocol("integer range".into()))
 }
 impl Config {
-    fn validate(&self) -> Result<()> {
+    /// Completes all caller-controlled derivative/normalizer/plan checks before
+    /// a Redis client is constructed or any Redis command can be issued.
+    pub fn validate(&self) -> Result<()> {
         let valid = |s: &str| {
             !s.is_empty()
                 && s.len() <= 128
@@ -125,6 +130,54 @@ impl Config {
             || self.max_queue_bytes > 1_000_000_000
         {
             return Err(Error::Protocol("configuration".into()));
+        }
+        if self.inputs.is_empty() || self.inputs.len() > ReadLimits::default().max_windows {
+            return Err(Error::Protocol("input count".into()));
+        }
+        let descriptor = self
+            .normalizer
+            .descriptor()
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+        for input in &self.inputs {
+            let pinned = PinnedDerivative {
+                directory: input.directory.clone(),
+                pin: DerivativePin {
+                    derivative_address: input.derivative_address.clone(),
+                    receipt_sha256: input.receipt_sha256,
+                },
+            };
+            let metadata = inspect_pinned(&pinned, &ReadLimits::default())
+                .map_err(|error| Error::Protocol(format!("pinned derivative: {error}")))?;
+            if !metadata.supports_source_evidence() || metadata.manifest().materializer_version != 2
+            {
+                return Err(Error::Protocol(
+                    "pinned derivative is not source-evidence profile 2".into(),
+                ));
+            }
+            if metadata.manifest().normalizer_bundle_sha256 != descriptor.bundle_sha256 {
+                return Err(Error::Protocol(
+                    "pinned derivative normalizer bundle mismatch".into(),
+                ));
+            }
+            if metadata.manifest().normalizer_config_sha256 != descriptor.config_sha256 {
+                return Err(Error::Protocol(
+                    "pinned derivative normalizer config mismatch".into(),
+                ));
+            }
+        }
+        for plan in &self.plans {
+            let (price_scale, quantity_scale) = self
+                .normalizer
+                .scales(&plan.venue)
+                .map_err(|error| Error::Protocol(error.to_string()))?;
+            if plan.price_scale != price_scale.to_string()
+                || plan.quantity_scale != quantity_scale.to_string()
+            {
+                return Err(Error::Protocol(format!(
+                    "plan scales do not match normalizer identity for {}",
+                    plan.venue
+                )));
+            }
         }
         Ok(())
     }

@@ -70,7 +70,27 @@ impl CanonicalNormalizer {
                 venue_identity(&polymarket),
             ],
         };
-        let bundle_identity = identity
+        let descriptor = identity.descriptor()?;
+        Ok(Self {
+            kalshi,
+            limitless,
+            polymarket,
+            descriptor,
+            identity,
+        })
+    }
+
+    pub const fn identity(&self) -> &CanonicalNormalizerIdentity {
+        &self.identity
+    }
+}
+
+impl CanonicalNormalizerIdentity {
+    /// Recomputes the addressed descriptor from the typed identity. Consumers
+    /// use this rather than trusting caller-supplied digest strings.
+    pub fn descriptor(&self) -> Result<NormalizerDescriptor, NormalizerError> {
+        self.validate()?;
+        let bundle_identity = self
             .venues
             .iter()
             .map(|venue| VenueBundleIdentity {
@@ -84,25 +104,101 @@ impl CanonicalNormalizer {
                 "composite bundle identity is not serializable: {error}"
             ))
         })?;
-        let config_bytes = serde_json::to_vec(&identity).map_err(|error| {
+        let config_bytes = serde_json::to_vec(self).map_err(|error| {
             NormalizerError::new(format!(
                 "composite config identity is not serializable: {error}"
             ))
         })?;
-        Ok(Self {
-            kalshi,
-            limitless,
-            polymarket,
-            descriptor: NormalizerDescriptor {
-                bundle_sha256: domain_digest(BUNDLE_DOMAIN, &bundle_bytes),
-                config_sha256: domain_digest(CONFIG_DOMAIN, &config_bytes),
-            },
-            identity,
+        Ok(NormalizerDescriptor {
+            bundle_sha256: domain_digest(BUNDLE_DOMAIN, &bundle_bytes),
+            config_sha256: domain_digest(CONFIG_DOMAIN, &config_bytes),
         })
     }
 
-    pub const fn identity(&self) -> &CanonicalNormalizerIdentity {
-        &self.identity
+    /// Returns the exact scales bound for one venue. Identity V1 is closed over
+    /// the three production adapters and every semantic adapter variable.
+    pub fn scales(&self, venue: &str) -> Result<(u8, u8), NormalizerError> {
+        self.validate()?;
+        let identity = self
+            .venues
+            .iter()
+            .find(|candidate| candidate.venue == venue)
+            .ok_or_else(|| {
+                NormalizerError::new(format!("normalizer does not contain venue {venue}"))
+            })?;
+        Ok((
+            unsigned_scale(identity, "price_scale")?,
+            unsigned_scale(identity, "quantity_scale")?,
+        ))
+    }
+
+    fn validate(&self) -> Result<(), NormalizerError> {
+        if self.identity_version != 1 {
+            return Err(NormalizerError::new(
+                "unsupported normalizer identity version",
+            ));
+        }
+        let expected = ["kalshi", "limitless", "polymarket"];
+        if self.venues.len() != expected.len()
+            || self
+                .venues
+                .iter()
+                .map(|venue| venue.venue.as_str())
+                .ne(expected)
+        {
+            return Err(NormalizerError::new(
+                "normalizer identity must contain ordered kalshi, limitless, polymarket venues",
+            ));
+        }
+        for venue in &self.venues {
+            if venue.bundle_id.is_empty() || venue.parser_version == 0 {
+                return Err(NormalizerError::new("invalid venue normalizer identity"));
+            }
+            let expected_variables = match venue.venue.as_str() {
+                "kalshi" if venue.config.schema_version == 2 => {
+                    ["price_scale", "quantity_scale"].as_slice()
+                }
+                "limitless" if venue.config.schema_version == 1 => {
+                    ["price_scale", "quantity_scale"].as_slice()
+                }
+                "polymarket" if venue.config.schema_version == 1 => {
+                    ["accept_additive_fields", "price_scale", "quantity_scale"].as_slice()
+                }
+                _ => return Err(NormalizerError::new("unsupported venue config identity")),
+            };
+            if venue
+                .config
+                .variables
+                .keys()
+                .map(String::as_str)
+                .ne(expected_variables.iter().copied())
+            {
+                return Err(NormalizerError::new("invalid venue config variables"));
+            }
+            if venue.venue == "polymarket"
+                && !matches!(
+                    venue.config.variables.get("accept_additive_fields"),
+                    Some(canonical_normalizer::ConfigValue::Boolean(_))
+                )
+            {
+                return Err(NormalizerError::new(
+                    "invalid polymarket additive-field identity",
+                ));
+            }
+            unsigned_scale(venue, "price_scale")?;
+            unsigned_scale(venue, "quantity_scale")?;
+        }
+        Ok(())
+    }
+}
+
+fn unsigned_scale(venue: &VenueNormalizerIdentity, name: &str) -> Result<u8, NormalizerError> {
+    match venue.config.variables.get(name) {
+        Some(canonical_normalizer::ConfigValue::Unsigned(value)) => u8::try_from(*value)
+            .ok()
+            .filter(|value| *value <= 18)
+            .ok_or_else(|| NormalizerError::new(format!("invalid {name}"))),
+        _ => Err(NormalizerError::new(format!("invalid {name}"))),
     }
 }
 

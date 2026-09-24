@@ -38,6 +38,10 @@ Groups must match strategy keys exactly; `.`, `..`, `publisher`, `ready`,
 `publisher.json`, `result.json`, and `interrupted.json` are reserved.
 The config is limited to 1 MiB, validated before launching, copied durably as
 `run.json`, and SHA-256 bound to every checkpoint and completion marker.
+Validation independently recomputes the typed composite normalizer descriptor,
+checks pinned profile-2 receipt/manifest metadata, and derives the only accepted
+price/quantity scales for each plan venue. Invalid identity, pin, profile, venue,
+or scale combinations fail before any participant is launched.
 
 Each importable factory receives deeply immutable context with `run_id`,
 `attempt_id`, `group`, `identity`, strategy `config`, and `output_directory`.
@@ -128,6 +132,53 @@ Strategy-specific readers/receipts remain responsible for episode validation.
 CLI returns 0 only for whole-attempt success, 20 for fatal failure, 21 for exhausted
 retry budget, interruption, or local resource/lock failure. Restarting with the
 same directory cannot reset persisted budgets or change immutable configuration.
+
+## Stage-B narrow bundle entry point
+
+`scripts/replay_bundle.py REQUEST.json WORKDIR` is the single orchestration entry
+point available on the Stage-A ancestry. It durably binds the closed canonical
+request, invokes a request-pinned prebuilt `materialize_range` example binary,
+derives plan scales from the returned normalizer identity, validates this
+supervisor configuration, runs it, independently reads `SUCCESS.json`, and writes
+a regenerable `WORKDIR/result.json`. `REDIS_URL` remains environment-only and is
+never persisted or printed; the script never invokes Cargo. It accepts at most
+4096 adjacent pins, which is 85 days 8 hours at half-hour windows.
+
+This baseline has no `replay.preparation`, `replay.strategy_sdk`,
+`replay.bundle_coverage`, or completed-result registry. The narrow request
+therefore carries immutable plan keys/lanes (never scales), one existing strategy
+factory/revision/config, capture roots, and runtime binary paths. Its result
+attests validated supervisor completion, not strategy semantics. Preparation can
+later replace the plan seam, and a completed-result reader can replace the generic
+completion payload, without changing materialization or transport binding.
+
+The closed Stage-B request is:
+
+```json
+{
+  "version": 1,
+  "run_id": "bundle-run-1",
+  "interval": {"start_ns": "0", "end_ns": "100", "lower_bound": "clip"},
+  "capture": {"canonical_root": "/absolute/canonical", "derivative_root": "/absolute/derived"},
+  "plans": [{"instrument": "kalshi:TICKER", "orientation": "outcome", "lane": "kalshi", "venue": "kalshi"}],
+  "strategy": {"group": "test", "factory": "package.module:build", "revision": "immutable-revision", "config": {}},
+  "runtime": {
+    "materializer": "/absolute/materialize_range",
+    "publisher": "/absolute/replay-publish",
+    "python": "/absolute/python",
+    "scope": "research",
+    "max_entry_bytes": "1048576",
+    "max_queue_bytes": "67108864",
+    "command_timeout_ms": 5000,
+    "limits": {"attempts": 3, "no_progress": 2, "progress_margin": 100, "stall_seconds": 30, "attempt_seconds": 300, "run_seconds": 900, "poll_seconds": 0.1, "stop_seconds": 2}
+  }
+}
+```
+
+The caller cannot supply pins, normalizer descriptors, or scales. `result.json`
+contains the canonical request digest, helper-returned typed identity and pins,
+and the independently validated supervisor completion receipt. It is
+regenerable and is not a new commit marker.
 
 ## Verification
 

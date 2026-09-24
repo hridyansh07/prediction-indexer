@@ -1,4 +1,7 @@
-use canonical_normalizer::{Normalization, Normalize, NormalizerDescriptor, NormalizerError};
+use canonical_normalizer::{
+    ConfigValue, Normalization, Normalize, NormalizerConfigIdentity, NormalizerDescriptor,
+    NormalizerError,
+};
 use indexer_finalize::{
     CanonicalOutput, CompressionContract, DecodedIdentity, InputSegment, Receipt, StoredIdentity,
     window_directory,
@@ -7,6 +10,7 @@ use indexer_types::{ContentHash, Sha256};
 use prediction_encoder::{encode_stream, encoder_version};
 use replay_domain::*;
 use replay_materialize::{DerivativeSpec, NormalizationPolicy, build_window};
+use replay_normalizers::{CanonicalNormalizerIdentity, VenueNormalizerIdentity};
 use replay_tape::PinnedDerivative;
 use serde_json::json;
 use std::{collections::BTreeMap, fs, io::Cursor, path::Path};
@@ -113,10 +117,7 @@ impl Fixture {
         )
         .unwrap();
         let mut normalizer = Script {
-            descriptor: NormalizerDescriptor {
-                bundle_sha256: Sha256::digest(b"risk-tests"),
-                config_sha256: Sha256::digest(b"config"),
-            },
+            descriptor: test_normalizer_identity().descriptor().unwrap(),
             rows: rows.into_iter().map(|r| Some(r.result)).collect(),
         };
         let spec = DerivativeSpec {
@@ -147,6 +148,54 @@ impl Fixture {
             _out: out,
             pin,
         }
+    }
+}
+
+pub fn test_normalizer_identity() -> CanonicalNormalizerIdentity {
+    let scales = || {
+        BTreeMap::from([
+            ("price_scale".to_owned(), ConfigValue::Unsigned(2)),
+            ("quantity_scale".to_owned(), ConfigValue::Unsigned(0)),
+        ])
+    };
+    CanonicalNormalizerIdentity {
+        identity_version: 1,
+        venues: vec![
+            VenueNormalizerIdentity {
+                venue: "kalshi".into(),
+                bundle_id: "risk-test-kalshi".into(),
+                parser_version: 1,
+                config: NormalizerConfigIdentity {
+                    schema_version: 2,
+                    variables: scales(),
+                },
+            },
+            VenueNormalizerIdentity {
+                venue: "limitless".into(),
+                bundle_id: "risk-test-limitless".into(),
+                parser_version: 1,
+                config: NormalizerConfigIdentity {
+                    schema_version: 1,
+                    variables: scales(),
+                },
+            },
+            VenueNormalizerIdentity {
+                venue: "polymarket".into(),
+                bundle_id: "risk-test-polymarket".into(),
+                parser_version: 1,
+                config: NormalizerConfigIdentity {
+                    schema_version: 1,
+                    variables: BTreeMap::from([
+                        (
+                            "accept_additive_fields".to_owned(),
+                            ConfigValue::Boolean(true),
+                        ),
+                        ("price_scale".to_owned(), ConfigValue::Unsigned(2)),
+                        ("quantity_scale".to_owned(), ConfigValue::Unsigned(0)),
+                    ]),
+                },
+            },
+        ],
     }
 }
 struct Script {

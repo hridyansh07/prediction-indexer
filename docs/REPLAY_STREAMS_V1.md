@@ -10,7 +10,7 @@ documented in [REPLAY_SUPERVISOR_V1.md](REPLAY_SUPERVISOR_V1.md).
 ## Attempt lifecycle and ownership
 
 One immutable run/attempt ID, explicit pins, requested interval, lower-bound
-policy, book plans and required strategy groups define an attempt. The publisher
+policy, typed composite normalizer identity, book plans and required strategy groups define an attempt. The publisher
 opens its own fresh RiskEngine. `step()` publishes one cut, or a terminal only
 after `next_cut() == None` and `finish()` return the EOF capability. Cuts stream
 immediately; only downstream strategy outputs are staged/provisional. The initial
@@ -138,13 +138,27 @@ Strict config is ≤1 MiB, with fields:
 ```json
 {
   "run_id":"run-1", "attempt_id":"attempt-1", "scope":"research",
+  "normalizer":{"identity_version":1,"venues":[
+    {"venue":"kalshi","bundle_id":"prediction-indexer/kalshi-normalizer/v4","parser_version":4,"config":{"schema_version":2,"variables":{"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":2}}}},
+    {"venue":"limitless","bundle_id":"prediction-indexer/limitless-normalizer/v2","parser_version":2,"config":{"schema_version":1,"variables":{"price_scale":{"type":"unsigned","value":3},"quantity_scale":{"type":"unsigned","value":6}}}},
+    {"venue":"polymarket","bundle_id":"prediction-indexer/polymarket-normalizer/v2","parser_version":2,"config":{"schema_version":1,"variables":{"accept_additive_fields":{"type":"boolean","value":true},"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":6}}}}
+  ]},
   "inputs":[{"directory":"/pinned/derivative-address","derivative_address":"<64 lowercase hex>","receipt_sha256":"<64 lowercase hex>"}],
   "start_ns":"0", "end_ns":"100", "lower_bound":"clip",
-  "plans":[{"instrument":"kalshi:A","orientation":"outcome","lane":"x","venue":"kalshi","price_scale":"2","quantity_scale":"0"}],
+  "plans":[{"instrument":"kalshi:A","orientation":"outcome","lane":"x","venue":"kalshi","price_scale":"4","quantity_scale":"2"}],
   "groups":["strategy-a","strategy-b"], "command_timeout_ms":5000,
   "max_entry_bytes":1048576, "max_queue_bytes":67108864
 }
 ```
+
+Before constructing a Redis client, the publisher recomputes the composite
+bundle/config descriptor from `normalizer`, verifies every pin through the strict
+metadata reader, requires profile 2, and matches both manifest normalizer digests.
+Every plan venue must be present and its price/quantity scales must equal the
+typed identity. These are exit-20 input failures and cannot create Redis keys.
+`normalizer` is intentionally not added to the V1 initial stream record: the
+existing wire remains byte-compatible, while supervisor identity binds the full
+transport configuration.
 
 Operational config limits above are JSON numbers; **wire** integers are strings.
 Identifiers are 1–128 ASCII alphanumeric/underscore/hyphen/dot. Groups are distinct,

@@ -60,6 +60,9 @@ fn execute(input: &str) -> Result<String, String> {
     if request.version != 1 {
         return Err("unsupported request version".to_owned());
     }
+    if request.start_ns >= request.end_ns {
+        return Err("start_ns must be less than end_ns".to_owned());
+    }
     let selection = select_canonical_windows(
         &request.canonical_root,
         request.start_ns,
@@ -261,6 +264,13 @@ mod tests {
         assert_eq!(
             enforce_window_limit(4097).unwrap_err(),
             "selected 4097 canonical windows; maximum is 4096"
+        );
+        assert_eq!(
+            execute(
+                r#"{"version":1,"canonical_root":"a","output_root":"b","start_ns":1,"end_ns":1}"#
+            )
+            .unwrap_err(),
+            "start_ns must be less than end_ns"
         );
     }
 
