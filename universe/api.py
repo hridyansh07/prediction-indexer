@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
+from universe.auth import AuthError, AuthStore
 from universe.store import (
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     DetailTooLarge,
@@ -19,12 +20,20 @@ from universe.store import (
 
 
 class UniverseApplication:
-    def __init__(self, database: UniverseStore) -> None:
+    def __init__(self, database: UniverseStore, auth: AuthStore | None = None) -> None:
         self.database = database
+        self.auth = auth
 
-    def get(self, target: str) -> tuple[int, dict[str, Any]]:
+    def get(self, target: str, headers: Any = None) -> tuple[int, dict[str, Any]]:
         parsed = urlsplit(target)
         query = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.path == "/v1/auth/nonce" and self.auth is not None:
+            _only(query, set())
+            return HTTPStatus.OK, self.auth.create_nonce()
+        if parsed.path == "/v1/admin/allowlist" and self.auth is not None:
+            _only(query, set())
+            self.auth.require_admin(headers)
+            return HTTPStatus.OK, {"members": self.auth.list_members()}
         if parsed.path == "/healthz":
             _only(query, set())
             return HTTPStatus.OK, self.database.status()
@@ -132,6 +141,47 @@ class UniverseApplication:
                 if detail is None:
                     return HTTPStatus.NOT_FOUND, {"error": "selection not found"}
                 return HTTPStatus.OK, detail
+        return HTTPStatus.NOT_FOUND, {"error": "not found"}
+
+    def post(
+        self, target: str, headers: Any, document: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parsed = urlsplit(target)
+        _only(parse_qs(parsed.query, keep_blank_values=True), set())
+        if self.auth is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if parsed.path == "/v1/auth/siwe":
+            _exact_body(document, {"message", "signature"})
+            if not isinstance(document["message"], str) or not isinstance(document["signature"], str):
+                raise ValueError("message and signature must be strings")
+            return HTTPStatus.OK, self.auth.verify_siwe(
+                document["message"], document["signature"]
+            )
+        if parsed.path == "/v1/auth/logout":
+            _exact_body(document, set())
+            self.auth.logout(headers)
+            return HTTPStatus.OK, {"ok": True}
+        if parsed.path == "/v1/admin/allowlist":
+            _exact_body(document, {"address", "note"})
+            principal = self.auth.require_admin(headers)
+            return HTTPStatus.OK, self.auth.add_member(
+                document["address"], document["note"], principal.address
+            )
+        return HTTPStatus.NOT_FOUND, {"error": "not found"}
+
+    def delete(
+        self, target: str, headers: Any, document: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parsed = urlsplit(target)
+        _only(parse_qs(parsed.query, keep_blank_values=True), set())
+        if self.auth is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        prefix = "/v1/admin/allowlist/"
+        if parsed.path.startswith(prefix):
+            _exact_body(document, set())
+            principal = self.auth.require_admin(headers)
+            address = _path_value(parsed.path.removeprefix(prefix), "address")
+            return HTTPStatus.OK, self.auth.remove_member(address, principal.address)
         return HTTPStatus.NOT_FOUND, {"error": "not found"}
 
     def _runs(self, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -266,24 +316,94 @@ class UniverseApplication:
         return {"events": events, "next_cursor": next_cursor}
 
 
-def serve(database: UniverseStore, host: str, port: int) -> None:
-    application = UniverseApplication(database)
+def build_server(
+    database: UniverseStore,
+    auth: AuthStore,
+    host: str,
+    port: int,
+) -> ThreadingHTTPServer:
+    application = UniverseApplication(database, auth)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            self._dispatch(lambda: application.get(self.path, self.headers))
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            self._dispatch_with_body(application.post)
+
+        def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            self._dispatch_with_body(application.delete)
+
+        def _dispatch_with_body(self, dispatch) -> None:
             try:
-                status, document = application.get(self.path)
+                document = self._read_json_body()
+                status, response = dispatch(self.path, self.headers, document)
+            except _FramingError as error:
+                self.close_connection = True
+                self._framing_rejected = True
+                self._send_json(error.status, {"error": error.message})
+                return
+            except AuthError as error:
+                self._send_json(error.status, {"error": str(error)})
+                return
+            except (ValueError, TypeError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+                return
+            except Exception:  # noqa: BLE001 - secrets and internals must not be logged
+                self.log_error("request failed")
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "internal server error"},
+                )
+                return
+            self._send_json(status, response)
+
+        def _dispatch(self, dispatch) -> None:
+            try:
+                status, document = dispatch()
             except DetailTooLarge as error:
                 status, document = HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
                     "error": str(error)
                 }
+            except AuthError as error:
+                status, document = error.status, {"error": str(error)}
             except (ValueError, TypeError) as error:
                 status, document = HTTPStatus.BAD_REQUEST, {"error": str(error)}
-            except Exception as error:  # noqa: BLE001 - do not expose internals
-                self.log_error("request failed: %s", error)
+            except Exception:  # noqa: BLE001 - do not expose or log secrets
+                self.log_error("request failed")
                 status, document = HTTPStatus.INTERNAL_SERVER_ERROR, {
                     "error": "internal server error"
                 }
+            self._send_json(status, document)
+
+        def _read_json_body(self) -> dict[str, Any]:
+            if self.headers.get_all("Transfer-Encoding", []):
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "invalid request framing")
+            lengths = self.headers.get_all("Content-Length", [])
+            if not lengths:
+                raise _FramingError(HTTPStatus.LENGTH_REQUIRED, "content length required")
+            if len(lengths) != 1 or not lengths[0].isdigit():
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "invalid content length")
+            length = int(lengths[0])
+            if length > 65_536:
+                raise _FramingError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
+            content_types = self.headers.get_all("Content-Type", [])
+            if len(content_types) != 1 or not _json_content_type(content_types[0]):
+                raise _FramingError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "application/json required")
+            payload = self.rfile.read(length)
+            if len(payload) != length:
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "incomplete request body")
+            try:
+                document = json.loads(
+                    payload.decode("utf-8"), object_pairs_hook=_unique_object
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise ValueError("invalid JSON") from error
+            if not isinstance(document, dict):
+                raise ValueError("JSON body must be an object")
+            return document
+
+        def _send_json(self, status: int, document: dict[str, Any]) -> None:
             payload = (
                 json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
                 + "\n"
@@ -295,14 +415,50 @@ def serve(database: UniverseStore, host: str, port: int) -> None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            if getattr(self, "_framing_rejected", False):
+                self.send_header("Connection", "close")
+            if int(status) == HTTPStatus.UNAUTHORIZED:
+                self.send_header("WWW-Authenticate", "Bearer")
             self.end_headers()
             self.wfile.write(payload)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def serve(database: UniverseStore, auth: AuthStore, host: str, port: int) -> None:
+    server = build_server(database, auth, host, port)
     try:
         server.serve_forever()
     finally:
         server.server_close()
+
+
+class _FramingError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _json_content_type(value: str) -> bool:
+    parts = [part.strip().lower() for part in value.split(";")]
+    return parts[0] == "application/json" and (
+        len(parts) == 1 or (len(parts) == 2 and parts[1] == "charset=utf-8")
+    )
+
+
+def _exact_body(document: dict[str, Any], fields: set[str]) -> None:
+    if set(document) != fields:
+        raise ValueError("request body fields are invalid")
 
 
 def _only(query: dict[str, list[str]], expected: set[str]) -> None:

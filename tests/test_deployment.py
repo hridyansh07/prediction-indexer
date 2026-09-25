@@ -168,7 +168,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
                 self.assertIn("load_config()", source)
                 self.assertNotIn("argparse", source)
         config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
-        self.assertIn('"event_universe_config_version": 1', config)
+        self.assertIn('"event_universe_config_version": 2', config)
         self.assertIn('"generated_start": null', config)
         self.assertIn('"generated_end": null', config)
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
@@ -194,8 +194,11 @@ class EventUniverseDeploymentTests(unittest.TestCase):
     def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
         schema_directory = ROOT / "universe" / "schema"
         sql_files = list(schema_directory.glob("*.sql"))
-        self.assertEqual([path.name for path in sql_files], ["schema.sql"])
-        schema = sql_files[0].read_text(
+        self.assertEqual(
+            sorted(path.name for path in sql_files),
+            ["replay_auth.sql", "schema.sql"],
+        )
+        schema = (schema_directory / "schema.sql").read_text(
             encoding="utf-8"
         )
         self.assertIn("CREATE TABLE selection_occurrences", schema)
