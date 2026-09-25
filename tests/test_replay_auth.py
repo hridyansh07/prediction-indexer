@@ -23,6 +23,7 @@ UTC = timezone.utc
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 ADMIN = Account.from_key("0x" + "11" * 32)
 MEMBER = Account.from_key("0x" + "22" * 32)
+OTHER = Account.from_key("0x" + "33" * 32)
 
 
 def auth_config(*, admin_address: str = ADMIN.address) -> AuthConfig:
@@ -105,6 +106,44 @@ class ReplayAuthTests(unittest.TestCase):
         source.write_text(json.dumps({"event_universe_config_version": 1}), encoding="utf-8")
         with self.assertRaisesRegex(UniverseConfigError, "version 2"):
             load_config(source)
+
+    def test_config_rejects_invalid_security_values(self) -> None:
+        source = Path(self.temporary.name) / "config.json"
+        base = {
+            "event_universe_config_version": 2,
+            "database_path": "universe.sqlite3",
+            "api": {"host": "127.0.0.1", "port": 8080},
+            "backfill": {"temporary_directory": "tmp", "generated_start": None, "generated_end": None},
+            "backup": {"directory": "backups", "object_prefix": "universe/backups"},
+            "replay": {
+                "database_path": "jobs.sqlite3",
+                "auth": {
+                    "siwe_domain": "universe.example",
+                    "siwe_uri": "https://universe.example/login",
+                    "chain_id": 1,
+                    "admin_address": ADMIN.address,
+                    "nonce_ttl_seconds": 300,
+                    "session_ttl_seconds": 43200,
+                },
+            },
+        }
+        cases = (
+            ("siwe_domain", "https://universe.example"),
+            ("siwe_uri", "https://user@universe.example/login"),
+            ("siwe_uri", "https://universe.example/login?token=x"),
+            ("chain_id", True),
+            ("chain_id", 0),
+            ("admin_address", ADMIN.address.lower()),
+            ("nonce_ttl_seconds", 0),
+            ("session_ttl_seconds", 604_801),
+        )
+        for field, value in cases:
+            document = json.loads(json.dumps(base))
+            document["replay"]["auth"][field] = value
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(UniverseConfigError):
+                    load_config(source)
 
     def test_schema_is_idempotent_and_rejects_tampering(self) -> None:
         self.store.initialize()
@@ -272,10 +311,16 @@ class ReplayAuthTests(unittest.TestCase):
     def test_allowlist_idempotency_audit_immutability_order_and_pruning(self) -> None:
         first = self.store.add_member(MEMBER.address, "hello", ADMIN.address)
         second = self.store.add_member(MEMBER.address, "hello", ADMIN.address)
+        self.store.add_member(OTHER.address, "other", ADMIN.address)
+        self.store.create_nonce()
+        self.login()
         self.assertEqual(first, second)
-        self.assertEqual([row["address"] for row in self.store.list_members()], [MEMBER.address])
+        self.assertEqual(
+            [row["address"].lower() for row in self.store.list_members()],
+            sorted([MEMBER.address.lower(), OTHER.address.lower()]),
+        )
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 2)
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("DELETE FROM allowlist_events")
             with self.assertRaises(sqlite3.IntegrityError):
@@ -283,7 +328,14 @@ class ReplayAuthTests(unittest.TestCase):
         self.now += timedelta(days=2)
         self.store.prune()
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT count(*) FROM nonces").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 0)
+
+    def test_configured_admin_cannot_be_removed(self) -> None:
+        with self.assertRaises(AuthError) as raised:
+            self.store.remove_member(ADMIN.address, ADMIN.address)
+        self.assertEqual(raised.exception.status, 403)
 
     def test_restart_preserves_membership_and_session(self) -> None:
         self.store.add_member(MEMBER.address, "member", ADMIN.address)

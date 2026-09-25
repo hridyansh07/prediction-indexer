@@ -142,6 +142,15 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn("EVENT_UNIVERSE_DATA_ROOT", compose)
         self.assertNotIn("CAPTURE_DATA_ROOT", compose)
         self.assertIn('CMD ["python", "-u", "universe/run_server.py"]', dockerfile)
+        self.assertIn('"eth-account>=0.13,<0.14"', dockerfile)
+        config = (ROOT / "configs" / "event_universe.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '"database_path": "/var/lib/event-universe/jobs.sqlite3"', config
+        )
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"eth-account>=0.13,<0.14"', pyproject)
         self.assertNotIn("COPY universe/", shared)
         server = compose.split("  event-universe:", 1)[1].split(
             "  event-universe-sync:", 1

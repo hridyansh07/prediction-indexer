@@ -735,8 +735,25 @@ default command:
 docker compose -f compose.universe.yaml up -d event-universe
 ```
 
-The JSON config holds the database path, API listener, temporary directory, and
-backup destination. Object-store selection is environment-owned and uses the
+The version-2 JSON config holds the rebuildable Universe database path, API
+listener, temporary directory, backup destination, and a separate durable
+`replay.database_path` for authentication and Replay state. The server initializes
+the additive authentication schema in `jobs.sqlite3`; rebuilding
+`event-universe.sqlite3` must never remove or replace that file. Roll out the
+version-2 config and Universe image together because older configs are rejected
+actionably. Before exposing the authentication routes, replace the shipped zero
+admin placeholder with the operator wallet's EIP-55 address and set
+`siwe_domain`/`siwe_uri` to the exact public origin users sign.
+
+SIWE verification is offline EIP-191 recovery and makes no wallet RPC or provider
+request. Sessions persist only a SHA-256 token digest. The six W1 routes are
+`GET /v1/auth/nonce`, `POST /v1/auth/siwe`, `POST /v1/auth/logout`,
+`GET /v1/admin/allowlist`, `POST /v1/admin/allowlist`, and
+`DELETE /v1/admin/allowlist/<address>`. All responses are `no-store`; expose them
+only through the same private interface or authenticated reverse proxy described
+below.
+
+Object-store selection is environment-owned and uses the
 same provider-neutral `ARCHIVE_BACKEND` factory as Targeter and the archivers.
 For local operation, `EVENT_UNIVERSE_ARCHIVE_ROOT` is mounted at
 `/var/lib/archive`. For S3 set all three `ARCHIVE_S3_*` values; for GCS set
