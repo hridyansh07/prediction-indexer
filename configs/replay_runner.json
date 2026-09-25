@@ -29,5 +29,10 @@
       "poll_seconds": 0.1,
       "stop_seconds": 2
     }
+  },
+  "orchestration": {
+    "max_stage_attempts": 20,
+    "max_job_seconds": 86400,
+    "retry_backoff_seconds": 60
   }
 }

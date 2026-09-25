@@ -56,8 +56,11 @@ def identity(config):
     ).hexdigest()
 
 
-def _normalizer_descriptor(value):
-    """Validate identity V1 and reproduce replay-normalizers' exact hashes."""
+def normalizer_descriptor(value):
+    """Validate identity V1 and reproduce replay-normalizers' exact hashes.
+
+    Public owning API for the composite normalizer identity; Replay jobs reuse it.
+    """
     obj(value, "identity_version venues")
     require(type(value["identity_version"]) is int and value["identity_version"] == 1)
     require(type(value["venues"]) is list)
@@ -136,6 +139,10 @@ def _normalizer_descriptor(value):
         ).hexdigest(),
         "scales": scales,
     }
+
+
+# Retained for existing internal callers.
+_normalizer_descriptor = normalizer_descriptor
 
 
 def _metadata(path):
@@ -238,7 +245,7 @@ def validate(config):
         "reserved participant name",
     )
     require(type(t["inputs"]) is list and 0 < len(t["inputs"]) <= 4096)
-    descriptor = _normalizer_descriptor(t["normalizer"])
+    descriptor = normalizer_descriptor(t["normalizer"])
     for p in t["inputs"]:
         obj(p, "directory derivative_address receipt_sha256")
         require(type(p["directory"]) is str and Path(p["directory"]).is_absolute())

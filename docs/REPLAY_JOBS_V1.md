@@ -18,10 +18,10 @@ Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 
 An allowlisted wallet registers a JSON replay request with the Event Universe
 server. A cron-driven runner on the same EC2 host — not the splice host, so
-replay I/O never contends with capture — takes the oldest pending job and runs
+replay I/O never contends with capture — takes the oldest eligible job and runs
 it end to end: resolve the bundle, reuse or build its derivatives, prepare the
-snapshot, run the supervisor, read the result, archive the job. Status is
-recorded in a jobs database.
+snapshot, run the supervisor, read the result, archive the job. Every accepted
+job ends with an archived job receipt; status is recorded in a jobs database.
 
 ```
 Universe EC2
@@ -31,9 +31,27 @@ Universe EC2
 └─ replay-runner    host cron each minute; flock-skip if busy
 ```
 
-Non-goals: parallel or multi-host jobs, automatic retry of `not_ready`,
-a local job-directory reaper, request-supplied strategy code, bundle-filtered
-derivatives, and any change to the rebuildable Universe query index.
+Non-goals: parallel or multi-host jobs, automatic resubmission of `not_ready`
+jobs, cancelling a job after it starts, a local job-directory reaper,
+request-supplied strategy code, bundle-filtered derivatives, API idempotency
+keys, and any change to the rebuildable Universe query index.
+
+### 1.1 Deliberate V1 semantics
+
+- **Submission is at least once.** Each accepted `POST` creates a distinct job,
+  even for byte-identical requests. There is no idempotency key.
+- **`bundle_id` identifies reusable derivatives, not a job.** Two jobs for one
+  bundle share its cached derivatives but run and archive independently.
+- **The archived job receipt and the files it lists are the deliverable.** The
+  API reports status, reason, and the receipt key; it does not serve strategy
+  results.
+- **Local state lives on one persistent volume.** `jobs.sqlite3` and every job
+  directory share one persistent EC2 volume. A process or instance restart
+  resumes from that volume. Restoring the database without its job
+  directories does not support resumption: such jobs fail as
+  `local_state_lost` (§3.8). Active job directories are not backed up.
+- **Fees are outside `bundle_coverage`.** A future economic strategy must bind
+  its fee schedule identities through its own new strategy config schema.
 
 ## 2. Workstreams and merge order
 
@@ -62,16 +80,24 @@ contract locally.
 ## 3. W0 — Shared contracts
 
 `replay/jobs/contracts.py` is pure: no filesystem, network, clock, or
-randomness. It depends only on the standard library and the existing strict
-helpers in `replay.streams.protocol`, `replay.preparation` (`encoded`,
-`digest`), and `replay.supervisor` (`_normalizer_descriptor`). The Universe
-image already ships all of `replay/`. Every error is `ContractError`
-(a `ValueError`) with a message safe to return in a `400`.
+randomness; callers pass time and random suffixes in. It reuses the existing
+strict JSON decoder (`replay.streams.protocol`), preparation's canonical
+encoding (`replay.preparation.encoded`), the supervisor's public
+`normalizer_descriptor`, and `archive.storage.base.normalize_key`. The Universe
+image already ships `replay/` and `archive/`. Every error is `ContractError`
+(a `ValueError`) whose message is safe to return in a `400`; where a failure
+maps to a job outcome, `ContractError.code` carries its reason code.
+
+Every persisted document below is closed, versioned JSON with preparation's
+canonical serialization (sorted keys, compact separators, UTF-8, no trailing
+LF). Each has a strict parser that rejects unknown fields, duplicate keys,
+non-canonical bytes, and out-of-bounds sizes, and a writer that re-validates
+before serializing. Frozen dataclasses validate on construction, so an invalid
+value cannot be built directly either.
 
 ### 3.1 Request (`replay_request_version: 1`)
 
-Closed object, at most 64 KiB, strict JSON (duplicate keys, `NaN`, and unknown
-fields rejected).
+At most 64 KiB.
 
 ```json
 {
@@ -88,56 +114,81 @@ fields rejected).
   component).
 - `probe_markets`: `null` (every listed market) or a sorted unique list of
   1–4096 `venue:native-id` strings. Preparation applies its stricter checks later.
-- `interval`: `null` (the whole bundle interval) or
-  `{"start_ns", "end_ns"}` as canonical unsigned decimal strings, start < end.
+- `interval`: `null` (the whole bundle interval) or `{"start_ns", "end_ns"}` as
+  canonical unsigned decimal strings, start < end.
 - `strategy.name`: a key of the runner registry; never a module or factory.
   `strategy.config` is checked against the entry's `config_schema` in
-  `STRATEGY_CONFIG_SCHEMAS`: request keys are allowed, runner-owned keys and
-  unknown keys are rejected. `bundle_coverage_v1` allows no request keys; the
-  runner supplies `version`, `snapshot_directory`, and `snapshot_sha256`.
+  `STRATEGY_CONFIG_SCHEMAS`: request keys are allowed, runner-owned and unknown
+  keys are rejected. `bundle_coverage_v1` allows no request keys; the runner
+  supplies `version`, `snapshot_directory`, and `snapshot_sha256`.
 - `limits`: a preset name in the runner config.
 
-API: `parse_request(raw: bytes, config: RunnerConfig) -> Request` (deeply
-immutable); `request_sha256(request)` is SHA-256 of preparation's canonical
-encoding (sorted keys, compact, UTF-8), so whitespace and key order do not
-change it.
+`parse_request(raw, config) -> Request` (deeply immutable);
+`request_sha256(request)` hashes the canonical encoding, so whitespace and key
+order do not change it.
 
-### 3.2 Status and stage
-
-```
-queued ─▶ running ─▶ archiving ─▶ succeeded
-  │          ├──────▶ archiving ─▶ failed | exhausted
-  │          ├─▶ not_ready            (terminal)
-  │          └─▶ stale_bundle_cache   (terminal)
-  └─▶ cancelled
-```
-
-`STATUSES`, `TERMINAL`, `RESUMABLE = {running, archiving}`,
-`ARCHIVED_OUTCOMES = {succeeded, failed, exhausted}`, `ALLOWED_TRANSITIONS`,
-`check_transition(current, new)`, `STAGES = (resolve, bundle, prepare, run,
-read, archive)`, and `check_stage`. Any other transition is a bug and raises.
-`not_ready` and `stale_bundle_cache` are terminal so that a blocked job never
-holds the head of the queue.
-
-### 3.3 Jobs table
-
-`JOBS_SCHEMA_SQL` creates the `STRICT` `jobs` table and its `jobs_queue` index
-idempotently, with `CHECK` constraints on status and stage:
+### 3.2 Statuses and stages
 
 ```
-job_id PK, created_at_ns, submitted_by (lowercase 0x address),
-request_json (exact submitted bytes), request_sha256,
-status, stage, reason, started_at_ns, updated_at_ns, finished_at_ns,
-archive_receipt_key
+queued ──▶ running ──▶ archiving ──▶ succeeded | failed | exhausted
+   │                      │  ▲         | not_ready | stale_bundle_cache | cancelled
+   │                      ▼  │ (manual resume)
+   └──(cancel)──▶ archiving  archive_blocked
 ```
 
-The file is `REPLAY_DATA_ROOT/jobs.sqlite3`, WAL, `busy_timeout = 30000`. It is
+Every accepted job reaches its terminal status through `archiving`, and every
+terminal row has an archived job receipt. While `archiving` or
+`archive_blocked`, `pending_outcome` records the terminal status the job will
+take once its receipt is durable.
+
+| Status | Meaning |
+|---|---|
+| `queued` | accepted, not started |
+| `running` | in a work stage (`resolve`…`read`) |
+| `archiving` | work ended; uploading the job's objects and receipt |
+| `archive_blocked` | archival spent its attempts; excluded from automatic claims, resumed only manually |
+| terminal | `succeeded`, `failed`, `exhausted`, `not_ready`, `stale_bundle_cache`, `cancelled` |
+
+`STAGES = (resolve, bundle, prepare, run, read, archive)`. Running rows are in a
+work stage; `archiving`, `archive_blocked`, and terminal rows are in `archive`.
+Only a `queued` job can be cancelled; it goes to `archiving` with pending
+`cancelled` and the runner archives it like any other job.
+
+### 3.3 Job row and table
+
+`JobRow` is one row minus `request_json`; its construction enforces the same
+rules as the table:
+
+```
+job_id PK                  <yyyymmddTHHMMSSZ>-<16 hex>; a valid supervisor run_id
+created_at_ns
+submitted_by               lowercase 0x address
+request_json               exact submitted bytes
+request_sha256
+status, stage
+stage_attempts             starts of the current stage (§3.8)
+next_attempt_at_ns         earliest reclaim time; only for running/archiving
+started_at_ns              first claim
+updated_at_ns
+finished_at_ns             terminal only
+pending_outcome            archiving/archive_blocked only
+reason_code, reason_detail §3.7
+blocked_reason_code, blocked_at_ns   archive_blocked only
+archive_receipt_key        terminal only; always replay/jobs/<job_id>/job_receipt.json
+```
+
+`JOBS_SCHEMA_SQL` creates the `STRICT` table and its queue index idempotently
+and enforces the relational rules with `CHECK` constraints: identifier, hash,
+and address shapes; `pending_outcome` exactly while archiving or blocked;
+blocked fields exactly while blocked; `finished_at_ns` and
+`archive_receipt_key` exactly for terminal rows; no schedule on terminal rows;
+queued rows without stage or start; `succeeded` without a reason code and every
+other terminal status with one. `JobRow` additionally checks that a code
+matches its outcome.
+
+The file is `REPLAY_DATA_ROOT/jobs.sqlite3` (WAL, `busy_timeout = 30000`),
 **separate from** `event-universe.sqlite3`, which is a rebuildable index whose
 rebuild procedure deletes it. W1's auth tables live in the same file.
-
-`job_id(now_ns, suffix_hex)` returns `<yyyymmddTHHMMSSZ>-<16 hex>` from
-caller-supplied time and 64 random bits; `check_job_id` validates it. The form
-is a valid supervisor `run_id`.
 
 ### 3.4 Object keys
 
@@ -148,18 +199,38 @@ is a valid supervisor `run_id`.
 | `replay/bundles/<bundle_id>/bundle_receipt.json` | W3 | the object |
 | `replay/jobs/<job_id>/…`, `job_receipt.json` | W4 | `job_receipt.json` |
 
-Helpers: `date_partition` (the UTC date of a window start, identical to the
-finalizer's), `canonical_window_keys`, `derivative_key`, `bundle_receipt_key`,
-`job_object_key` (rejects traversal and the reserved `job_receipt.json`),
-`job_receipt_key`, and `window_bounds(start, end, window_seconds)`, which
-returns the aligned `[first, last)` and every window start.
+Helpers: `date_partition` (identical to the finalizer's), `canonical_window_keys`
+(identical to the archiver's `canonical_object_keys`), `derivative_key`,
+`bundle_receipt_key`, `job_object_key` (normalized with the object store's own
+`normalize_key`, so traversal, empty components, backslash, and NUL are
+rejected; `job_receipt.json` is reserved), `job_receipt_key`, and
+`window_bounds(start, end, window_seconds)`.
 
-All writes use `put_immutable`: identical bytes are a no-op, and different bytes
-raise `IntegrityConflict`, which is fatal and never repaired by writing. Nothing
-in this system deletes objects. An operator deletes
-`replay/bundles/<bundle_id>/` by hand to force a rebuild.
+All writes use `put_immutable`: identical bytes are a no-op, and different
+bytes raise `IntegrityConflict`, which is never repaired by writing. The
+application never deletes objects.
 
-### 3.5 Bundle receipt (`replay_bundle_receipt_version: 1`)
+### 3.5 Producer descriptor and bundle receipt
+
+The **producer** is everything besides canonical input that determines
+derivative bytes:
+
+```json
+{
+  "producer_identity_version": 1,
+  "normalizer": {"identity_version": 1, "venues": ["…composite identity…"]},
+  "normalized_schema_version": 3,
+  "materializer_version": 2,
+  "materialization_policy_sha256": "<sha256>"
+}
+```
+
+`materialize_range --describe` prints exactly this canonical object;
+`parse_producer` reads it. The normalizer must pass the supervisor's identity
+validation. The cache compares the **whole** descriptor, so a change to the
+normalizer, schema, materializer, or policy each independently invalidates it.
+
+The bundle receipt (`replay_bundle_receipt_version: 1`):
 
 ```json
 {
@@ -167,25 +238,135 @@ in this system deletes objects. An operator deletes
   "bundle_id": "…",
   "interval": {"start_ns": "…", "end_ns": "…"},
   "canonical_window_seconds": 1800,
-  "normalizer": {"identity_version": 1, "venues": ["…composite identity…"]},
+  "producer": {"…": "§3.5 descriptor"},
   "windows": [{"window_start_ns": "…", "window_end_ns": "…",
                "canonical_receipt_sha256": "…",
-               "derivative_address": "…", "receipt_sha256": "…"}],
-  "built_by_job": "<job_id>"
+               "derivative_address": "…", "receipt_sha256": "…"}]
 }
 ```
 
-`parse_bundle_receipt(raw)` is closed and strict. The normalizer must pass the
-supervisor's identity validation. The interval must be aligned to the window
-period, and windows must be ordered, adjacent, exactly cover the interval, and
-use distinct derivative addresses. The input bytes must equal
-`bundle_receipt_bytes(receipt)`, the canonical serialization (preparation's
-encoding, no trailing LF) that is uploaded and hashed.
+The interval is aligned to the window period; windows are ordered, adjacent,
+exactly cover it, and have distinct addresses. The receipt contains nothing
+job-specific, so two jobs that build the same bundle with the same producer
+publish identical bytes and the second `put_immutable` is a no-op. The job's
+`bundle.json` is the byte-exact receipt, parsed with `parse_bundle_receipt`;
+there is no separate bundle-stage schema.
 
-The normalizer identity lives only here. The runner compares it with the
-current materializer's identity; a mismatch is `stale_bundle_cache`.
+**Manual rebuild (operator procedure, audited):** after every job that used the
+old receipt has archived its `bundle.json`, an operator deletes only
+`replay/bundles/<bundle_id>/bundle_receipt.json` with provider tooling and
+records who, when, and why in the operations log. Derivative objects are never
+deleted. The next job rebuilds; an unchanged producer reproduces the same
+addresses, and a changed producer adds new ones beside the old. This does not
+add a delete operation to the `ObjectStore` protocol.
 
-### 3.6 Runner configuration
+### 3.6 Stage and job documents
+
+**`resolved.json`** (`replay_resolved_job_version: 1`): `job_id`,
+`request_sha256`, `bundle_id`, `canonical_window_seconds`, `bundle_interval`,
+`window_interval` (derived: the aligned bundle interval), `job_interval`, and
+`occurrences` partitioning the job interval in order, each `{run_id, start_ns,
+end_ns, source: {manifest_key, manifest_sha256, report_key, report_sha256}}` —
+the same occurrence shape preparation consumes. At most 128 occurrences, no
+repeated run.
+
+**`bundle.json`**: the bundle receipt bytes (§3.5).
+
+**`result.json`** (`replay_job_result_version: 1`): `job_id`, `strategy`,
+`strategy_semantic_sha256`, `snapshot_sha256`, `bundle_receipt_sha256`,
+`supervisor_identity`, `attempt_id`, `attempts_started`. Strategy outputs and
+their qualifiers stay in the archived run directory; this document only binds
+their identities.
+
+**`job_receipt.json`** (`replay_job_receipt_version: 1`), uploaded last:
+
+```
+job_id, request_sha256, submitted_by, image_revision
+final_outcome, reason_code, reason_detail
+resolved_sha256            nullable
+bundle_receipt_sha256      nullable
+snapshot_sha256            nullable
+supervisor_identity        nullable
+strategy_semantic_sha256   nullable
+objects[] {key, sha256, byte_length}   sorted, unique, this job's keys only, ≤ 4096
+created_at_ns, finished_at_ns          decimal strings
+```
+
+The identities are recorded in stage order: a later one requires every earlier
+one, so an early outcome records `null`s and never invents identities.
+`succeeded` requires all five and no reason code; every other outcome requires
+the reason code that maps to it. The receipt is at most 4 MiB.
+
+### 3.7 Reason codes
+
+Behavior depends only on codes; `reason_detail` is human-readable, printable,
+at most 1024 characters, has URL userinfo redacted (`reason_detail()`), and is
+never parsed.
+
+| Code | Outcome | Retryable in stage |
+|---|---|---|
+| `cancelled` | `cancelled` | — |
+| `bundle_not_retired`, `canonical_not_archived` | `not_ready` | — |
+| `stale_bundle_cache` | `stale_bundle_cache` | — |
+| `supervisor_exhausted` | `exhausted` | — |
+| `universe_unavailable`, `resource_exhausted` | `failed` once attempts are spent | yes |
+| `bundle_history_invalid`, `interval_out_of_range`, `local_state_lost`, `integrity_failure`, `tool_failure`, `supervisor_failed`, `result_invalid`, `stage_attempts_exhausted`, `job_deadline_exceeded`, `internal_failure` | `failed` | — |
+| `archive_unavailable` | — (blocks archival; `archive_blocked` once spent) | yes |
+| `archive_conflict` | — (blocks archival immediately) | — |
+
+A running row may record its last retryable code while it waits. An
+`archive_blocked` row records its cause in `blocked_reason_code`
+(`archive_unavailable`, `archive_conflict`, or `stage_attempts_exhausted`) and
+keeps the pending outcome's code in `reason_code`.
+
+### 3.8 Scheduling and transitions
+
+Transitions are pure functions over `JobRow`; W2 persists their results and W4
+calls them. `select_next(rows, now_ns)` is the reference claim order that W2's
+SQL must match:
+
+1. the oldest (`created_at_ns`, `job_id`) row in `running` or `archiving` whose
+   `next_attempt_at_ns` is null or has passed;
+2. otherwise the oldest `queued` row.
+
+So a job waiting on backoff, and every `archive_blocked` job, never prevents
+queued work from starting.
+
+- `claim(row, orchestration, now)` counts the attempt **before** any work runs,
+  so a process that dies mid-stage still spends budget, and sets
+  `next_attempt_at_ns = now + retry_backoff_seconds`. A queued job becomes
+  `running` in `resolve`. For a running job, reaching `max_job_seconds` since
+  `started_at_ns` ends it as `job_deadline_exceeded`, and a stage already
+  started `max_stage_attempts` times ends it as `stage_attempts_exhausted`,
+  both through `archiving`. For an archiving job, spent attempts make it
+  `archive_blocked`.
+- `advance(row, stage, now)` commits the current stage and starts the next;
+  `stage_attempts` resets to 1 (the running attempt) and a retry reason clears.
+- `retry_later(row, code, detail, orchestration, now)` accepts only retryable
+  codes and schedules backoff.
+- `succeed` (after `read`), `fail(code)`, and `cancel` (queued only) enter
+  `archiving` with the mapped pending outcome.
+- `lose_local_state(row, detail, now)` applies when a running or archiving job's
+  directory is missing or its committed markers are invalid: the pending
+  outcome becomes `failed` with `local_state_lost`. The runner then archives
+  whatever objects exist. It **never recreates** a missing supervisor directory
+  under the same job ID, because that would reset the supervisor's persisted
+  retry budgets.
+- `block_archive`, `resume_blocked` (manual operator action), and `finish`
+  (after the job receipt is durable).
+
+### 3.9 Bundle history resolution
+
+`resolve_occurrences(history, retired_at_ns, job_interval)` orders Universe's
+occurrences by `(generated_at_ns, run_id)`. Occurrence *i* covers
+`[generated_at_i, generated_at_{i+1})` and the last ends at the retiring run's
+`generated_at_ns`; the bundle interval spans them. Equal timestamps would
+create a zero-length occurrence, so they fail closed with
+`bundle_history_invalid`, as do an empty history and a retirement that does not
+follow the last occurrence. A job interval outside the bundle interval fails
+with `interval_out_of_range`. Occurrences are clipped to the job interval.
+
+### 3.10 Runner configuration
 
 `configs/replay_runner.json`, parsed by `parse_runner_config(raw)`:
 
@@ -206,32 +387,41 @@ current materializer's identity; a mismatch is `stale_bundle_cache`.
   "limits": {"small": {"max_entry_bytes": 1048576, "max_queue_bytes": 67108864,
     "command_timeout_ms": 5000, "attempts": 3, "no_progress": 2, "progress_margin": 100,
     "stall_seconds": 30, "attempt_seconds": 300, "run_seconds": 900,
-    "poll_seconds": 0.1, "stop_seconds": 2}}
+    "poll_seconds": 0.1, "stop_seconds": 2}},
+  "orchestration": {"max_stage_attempts": 20, "max_job_seconds": 86400,
+                    "retry_backoff_seconds": 60}
 }
 ```
 
 - `universe_base_url`: http(s), with no credentials, query, or fragment.
 - `scope`: the supervisor transport scope used for Redis key names.
-- `canonical_window_seconds`: must be a positive divisor of 86400 and equal the
+- `canonical_window_seconds`: a positive divisor of 86400 that must equal the
   finalizer's `--window-seconds`.
-- `authorities`: the primary lane for each venue's books. The values are the
-  splice lane IDs from `replay/lanes.py`; Polymarket's authority is its market
-  channel `polymarket`, not the snapshot, sports, or RTDS lanes.
-- `limits` presets are checked early against the supervisor's rules. The
-  supervisor's own `validate` remains authoritative at run time.
+- `authorities`: each venue's primary book lane, from `replay/lanes.py`.
+  Polymarket's authority is its market channel `polymarket`.
+- `limits` presets are checked early against the supervisor's rules; the
+  supervisor's own `validate` stays authoritative. Every preset's `run_seconds`
+  must be below `max_job_seconds`.
+- `orchestration` is server-owned; no request can change it. The numbers may be
+  tuned, but the semantics in §3.8 are fixed.
 
 Adding a strategy means changing the image and this registry, never a request.
 
-### 3.7 Tests
+### 3.11 Tests
 
-`replay/tests/test_jobs_contracts.py` covers request strictness (unknown,
-missing, and duplicate fields; bad versions, strings, and intervals;
-runner-owned and unknown config keys; size), whitespace-independent request
-hashing, every allowed and disallowed transition, table constraints,
-`job_id` formatting, date partitions against the finalizer's vectors, canonical
-keys against the archiver's `canonical_object_keys`, window alignment, a
-byte-exact bundle receipt round trip, receipt tampering, and runner config
-strictness.
+`replay/tests/test_jobs_contracts.py` covers request strictness and hashing;
+every path through `archiving` and every illegal bypass; archive receipts on
+every terminal row; `pending_outcome` and the SQL constraints (valid rows insert,
+each invalid update is rejected); claim counting, backoff, attempt reset,
+exhaustion, deadlines, manual resume, and queued jobs not starved by waiting or
+blocked jobs; `local_state_lost` for running and archiving jobs without
+restarting work; producer fields changing identity independently; invalid
+direct construction and bypassed fields failing serialization; unnormalized,
+backslash, and NUL keys; canonical round trips and single-field tampering for
+the bundle receipt, resolved job, result, and job receipt; partial receipts for
+cancelled, not-ready, stale, failed, and exhausted jobs; deterministic
+equal-timestamp failures; and the shipped runner config with its orchestration
+section.
 
 ## 4. W1 — Auth (Universe)
 
@@ -289,28 +479,33 @@ content type; existing GET routes unchanged.
 runner reuses.
 
 **Store module** `universe/replay_jobs.py` (standard library plus
-`replay.jobs.contracts`): `insert_job(conn, request_bytes, principal, now_ns,
-suffix) -> job_id`, `get_job`, `list_jobs(conn, status, limit, after)`,
-`cancel_job(conn, job_id, principal)`, `claim_next(conn, now_ns)` (the oldest
-resumable job first, then the oldest `queued` marked `running`, in one
-`BEGIN IMMEDIATE` transaction), `set_stage`, and
-`finish(conn, job_id, status, reason, archive_key)`. Every change passes
-`check_transition`.
+`replay.jobs.contracts`). It persists `JobRow`s and never writes a row that
+`JobRow` would reject; every state change is one of §3.8's transition functions:
+`insert_job(conn, request_bytes, principal, now_ns, suffix) -> job_id`,
+`get_job`, `list_jobs(conn, status, limit, after)`,
+`cancel_job(conn, job_id, principal, now_ns)`,
+`claim_next(conn, orchestration, now_ns)` (selects exactly as `select_next`
+and applies `claim`, in one `BEGIN IMMEDIATE` transaction), and
+`save(conn, before, after)`, a compare-and-set on `(job_id, status, stage,
+stage_attempts, updated_at_ns)` so a stale writer cannot overwrite a newer row.
 
 | Method and path | Auth | Behaviour |
 |---|---|---|
 | `POST /v1/replay/jobs` | member or admin | `parse_request`; the bundle must exist in the Universe store (in-process, not HTTP); inserts `queued`; returns `201 {job_id, status}` or `400 {"error"}` |
 | `GET /v1/replay/jobs?status=&limit=&after=` | public | newest first, `limit` ≤ 100, within the existing response budget |
-| `GET /v1/replay/jobs/<job_id>` | public | the row, with the parsed request in place of `request_json` bytes |
-| `POST /v1/replay/jobs/<job_id>/cancel` | submitter or admin | only while `queued`; otherwise 409 |
+| `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the parsed request in place of `request_json` bytes |
+| `POST /v1/replay/jobs/<job_id>/cancel` | submitter or admin | only while `queued`, applying `cancel`; otherwise 409 |
 
 Universe loads `configs/replay_runner.json` to validate strategy and preset
-names; W5 mounts it into both containers.
+names; W5 mounts it into both containers. `resume_blocked` is an operator
+command, not an HTTP route in V1.
 
 **Tests:** a valid submit and every 400 class; an unknown bundle; 401 when
-unauthenticated; ordering and pagination; cancel rules (403 for a non-submitter,
-409 while running); `claim_next` precedence and age ordering; illegal
-transitions raise; concurrent `claim_next` from two connections claims once.
+unauthenticated; duplicate submissions create distinct jobs; ordering and
+pagination; cancel rules (403 for a non-submitter, 409 once started);
+`claim_next` agreeing with `select_next` on randomized row sets; stale
+compare-and-set rejected; concurrent `claim_next` from two connections claims
+once.
 
 ## 6. W3 — Bundle cache (library)
 
@@ -318,24 +513,26 @@ transitions raise; concurrent `claim_next` from two connections claims once.
 bundle, building and publishing them if absent.
 
 ```python
-ensure_bundle(bundle_id, interval, *, store, work_root, derivatives_root,
-              materializer, window_seconds, job_id)
-  -> BundleReady(receipt, pins: [(directory, address, receipt_sha256)])
-   | NotReady(reason)
-   | StaleCache(cached_identity, current_identity)
+ensure_bundle(bundle_id, window_interval, *, store, work_root, derivatives_root,
+              materializer, window_seconds)
+  -> BundleReady(receipt, receipt_bytes, pins: [(directory, address, receipt_sha256)])
+   | NotReady(code, detail)                 # canonical_not_archived
+   | StaleCache(cached: Producer, current: Producer)
 ```
 
-`interval` is the whole bundle interval; W4 slices the pins to the job
-interval. The call raises only on integrity, verification, or tooling failures.
+`window_interval` is `ResolvedJob.window_interval`; W4 slices the pins to the
+job interval. Retryable object-store failures raise with `archive_unavailable`;
+integrity and verification failures raise with `integrity_failure`; tool
+failures with `tool_failure`.
 
 **Cache hit.**
 
 1. Bounded read (1 MiB) of `bundle_receipt_key(bundle_id)`; `parse_bundle_receipt`.
-2. Compare its normalizer with `materialize_range --describe`; if they differ,
-   return `StaleCache`.
+2. `parse_producer(materialize_range --describe)`; if it differs from the
+   receipt's producer, return `StaleCache`.
 3. For each window, download `replay/derivatives/<address>/*` through
    `open_verified` into `derivatives_root/<address>/`, receipt last, skipping
-   directories that are already present and verified.
+   directories already present and verified.
 4. Strict `inspect_pinned` check of each (the publisher's `--validate-only`
    path), then return `BundleReady`.
 
@@ -343,20 +540,22 @@ interval. The call raises only on integrity, verification, or tooling failures.
 
 1. **Restore.** For each window from `window_bounds`, `head` its
    `canonical_window_keys` receipt. If any is absent, return
-   `NotReady("window <start> not yet archived")` before downloading anything.
+   `NotReady("canonical_not_archived", ...)` before downloading anything.
    Otherwise use the new generic `archive/canonical_restore.py`: bounded-read
    and strictly parse the archive `receipt.json`, stream evidence and provenance
-   through `open_verified` against the receipt's stored identities, decode-verify
-   their logical identities, and write them into
+   through `open_verified` against the receipt's stored identities,
+   decode-verify their logical identities, and write them into
    `work_root/canonical/date=…/window=…/` with fsync, receipt last. The trust
    anchor is the archive's receipt-last `receipt.json`; local tombstones are not
    needed. The module must not import `replay` or `targeter`.
 2. **Materialize.** Run `materialize_range` with `{canonical_root:
    work_root/canonical, output_root: derivatives_root, start_ns, end_ns}`. Its
-   existing receipt scan sees only the restored windows. It returns the identity
-   and ordered pins.
+   existing receipt scan sees only the restored windows. It returns the
+   normalizer identity and ordered pins; the producer comes from `--describe`.
 3. **Upload** each derivative's files with `put_immutable`, `receipt.json` last.
-4. **Publish** `bundle_receipt_bytes(...)` with `put_immutable`.
+4. **Publish** `bundle_receipt_bytes(...)` with `put_immutable`. An existing
+   identical receipt (another job built it) is a no-op; a different one is an
+   `IntegrityConflict` → `integrity_failure`.
 5. Delete `work_root/canonical/`. It is runner-owned scratch, not evidence.
 
 Every period has a committed canonical receipt: the finalizer's
@@ -365,63 +564,62 @@ expected lane for any hole. So a missing key means only "not yet finalized or
 archived". Empty and incomplete windows restore and replay normally; finding
 where books are usable is the coverage strategy's job.
 
-**Engine change:** `materialize_range --describe` prints the composite
-normalizer identity and exits, with no I/O beyond stdout.
+**Engine change:** `materialize_range --describe` prints the §3.5 producer
+descriptor and exits, with no I/O beyond stdout.
 
 **Tests** (disposable in-memory `ObjectStore` with real compressed bytes; the
 existing synthetic canonical fixture): a cold build publishes derivatives
-before the receipt, and a warm call downloads without materializing; `NotReady`
-when any key is missing, with nothing uploaded; `StaleCache` on an identity
-mismatch; an empty tiled window builds; a crash after each upload is resumed
-idempotently; different bytes at an existing key raise `IntegrityConflict`; a
-tampered stored object fails verification; an import test proving
-`canonical_restore` never imports `replay` or `targeter`.
+before the receipt, and a warm call downloads without materializing; two builds
+of one bundle publish identical receipt bytes; `NotReady` when any key is
+missing, with nothing uploaded; `StaleCache` on each producer field change; an
+empty tiled window builds; a crash after each upload is resumed idempotently;
+different bytes at an existing key raise `integrity_failure`; a tampered stored
+object fails verification; an import test proving `canonical_restore` never
+imports `replay` or `targeter`.
 
 ## 7. W4 — Runner
 
 **Delivers** `python -m replay.jobs tick`, the container entry point.
 
 ```
-flock(REPLAY_DATA_ROOT/runner.lock, EX|NB)   busy → exit 0
-job ← claim_next()                            none → exit 0
-run stages in REPLAY_DATA_ROOT/jobs/<job_id>/, skipping committed ones; set_stage before each
-finish(status, reason, archive_key); exit 0
+flock(REPLAY_DATA_ROOT/runner.lock, EX|NB)      busy → exit 0
+row ← claim_next(orchestration, now)            none → exit 0
+if row is running/archiving and its directory is missing or its markers are
+   invalid: row ← lose_local_state(row)         (never recreate the directory)
+run the row's stage and every following one in jobs/<job_id>/,
+   skipping stages whose markers are committed, persisting each transition
+exit 0 after the job finishes, fails into archiving, or schedules a retry
 ```
 
 The lock file is on the shared bind mount, so separate `docker compose run`
-containers exclude each other. A process killed mid-stage leaves the row
-resumable; the next tick holds the lock, claims it again, and resumes from the
-first uncommitted stage. The supervisor itself refuses to reset its persisted
-budgets in the same run directory.
-
-Every stage writes, fsyncs, renames, fsyncs its directory, and writes its
+containers exclude each other. The runner handles at most one claimed job per
+tick. Every stage writes, fsyncs, renames, fsyncs its directory, and writes its
 marker last.
 
 | Stage | Marker | Work |
 |---|---|---|
-| resolve | `resolved.json` | Via Universe HTTP (paged `/v1/bundles/<id>/history`, `/v1/runs/<run_id>`). A bundle that is not `retired` → `not_ready`. Bundle interval = `[first occurrence generated_at_ns, retiring run generated_at_ns)`; occurrence *i* = `[gen_i, gen_{i+1})`, the last ending at retirement; source pins from the run rows. Job interval = request interval or bundle interval, contained in it. |
-| bundle | `bundle.json` | `ensure_bundle(...)`: `NotReady` → `not_ready`; `StaleCache` → `stale_bundle_cache` with both identities in `reason`. |
-| prepare | `context/receipt.json` | Preparation config: pins sliced to the job interval, `lower_bound: "clip"`, `market_namespace: "targeter_target_id"`, occurrences clipped to the job interval, authorities with lanes from config and scales from the normalizer identity. `prepare(..., universe=UniverseHTTP(base_url, timeout=10), fallback=None)`. |
-| run | `run/SUCCESS.json` | Supervisor config: in-image `publisher` and `python`; transport with `run_id = job_id`, config `scope`, the bundle receipt's `normalizer`, pinned inputs, snapshot plans, `groups: [name]`, and the preset's byte caps and timeout; the registry factory, `revision = $REPLAY_IMAGE_REVISION`, config merged with the runner-owned snapshot keys; the preset's limits. `validate(...)`, then `python -m replay.supervisor`, with `REDIS_URL` in the environment only. Exit 20 → `failed` and 21 → `exhausted`, both archived. |
-| read | `result.json` | Registry reader (e.g. `read_completed`): summary, semantic hash, snapshot pin, bundle receipt hash, attempts, and qualifiers (`NOT_PROVEN`, `history_complete: false`). A reader failure → `failed`. |
-| archive | `job_receipt.json` in the store | Status `archiving`; `put_immutable` of the request, `resolved.json`, `bundle.json`, `context/`, `run/`, and `result.json` (whichever exist), then `job_receipt.json` last, listing keys, identities, final status, and reason. For `ARCHIVED_OUTCOMES` only. The local job directory is kept. |
+| resolve | `resolved.json` | Universe HTTP: paged `/v1/bundles/<id>/history` and `/v1/runs/<run_id>`. Not `retired` → `fail("bundle_not_retired")`. `resolve_occurrences(...)` with the request interval; its `ContractError.code` becomes the failure code. Write `resolved_job_bytes`. |
+| bundle | `bundle.json` | `ensure_bundle(...)`: `NotReady` → `fail(code)`; `StaleCache` → `fail("stale_bundle_cache")` with both producers in the detail. Write the receipt bytes. |
+| prepare | `context/receipt.json` | Preparation config: pins sliced to the job interval, `lower_bound: "clip"`, `market_namespace: "targeter_target_id"`, resolved occurrences, authorities with lanes from config and scales from the producer's normalizer. `prepare(..., universe=UniverseHTTP(base_url, timeout=10), fallback=None)`. |
+| run | `run/SUCCESS.json` | Supervisor config: in-image `publisher` and `python`; transport with `run_id = job_id`, config `scope`, the producer's `normalizer`, pinned inputs, snapshot plans, `groups: [name]`, and the preset's byte caps and timeout; the registry factory, `revision = $REPLAY_IMAGE_REVISION`, config merged with the runner-owned snapshot keys; the preset's limits. `validate(...)`, then `python -m replay.supervisor`, with `REDIS_URL` in the environment only. Exit 20 → `supervisor_failed`, 21 → `supervisor_exhausted`. |
+| read | `result.json` | The registry reader (e.g. `read_completed`), then `job_result_bytes`. A reader failure → `result_invalid`. Then `succeed`. |
+| archive | `job_receipt.json` in the store | `put_immutable` of `request.json`, `resolved.json`, `bundle.json`, `context/`, `run/`, and `result.json` — whichever exist — then `job_receipt_bytes` last, listing exactly the uploaded objects. Then `finish`. Runs for every outcome, including `cancelled` (request only) and early failures. |
 
-| Case | Outcome |
-|---|---|
-| Universe unreachable | `failed` |
-| Redis down or OOM | `exhausted` after the supervisor budgets |
-| Killed at any point | resumed next tick from the first uncommitted stage |
-| Overlapping ticks | the second exits 0 |
-| Empty probe union | preparation fails closed → `failed` |
+Failure handling uses only codes: retryable codes go to `retry_later`, others to
+`fail`; unexpected exceptions are `internal_failure`. During archiving,
+`archive_unavailable` goes to `retry_later` until `claim` blocks the job, and
+`archive_conflict` blocks it at once. The local job directory is kept.
 
 **Tests:** each stage against fakes for `ensure_bundle`, Universe (a small HTTP
 stub), and the supervisor (the existing fake-artifact pattern), with real
 preparation and readers; a kill after each marker gives identical semantic
-outputs on resume; lock contention; exit-code mapping; slicing and clipping at
-window and occurrence boundaries. Opt-in acceptance with W3: the synthetic
-fixture uploaded to a disposable store → a full tick with disposable Redis →
-`read_completed` → `job_receipt.json`, run cold then warm, with byte-identical
-semantic files.
+outputs on resume; a missing or corrupted job directory → `local_state_lost`
+without a new supervisor directory; lock contention; exit-code mapping; the
+receipt listing exactly the uploaded objects for each outcome; slicing and
+clipping at window and occurrence boundaries. Opt-in acceptance with W3: the
+synthetic fixture uploaded to a disposable store → a full tick with disposable
+Redis → `read_completed` → `job_receipt.json`, run cold then warm, with
+byte-identical semantic files.
 
 ## 8. W5 — Deployment
 
@@ -435,15 +633,17 @@ semantic files.
   `.[replay-redis]`, release builds of `replay-publish` and `materialize_range`,
   `configs/replay_runner.json`, and `REPLAY_IMAGE_REVISION` set to the git SHA
   at build time. No restart policy.
-- Volumes: `REPLAY_DATA_ROOT` (read-write for the runner; `event-universe`
-  mounts `jobs.sqlite3` and the runner config), plus the existing archive
-  backend variables, referenced by name only.
+- Volumes: `REPLAY_DATA_ROOT` on one persistent volume holding `jobs.sqlite3`
+  and every job directory (§1.1) — read-write for the runner; `event-universe`
+  mounts `jobs.sqlite3` and the runner config. The existing archive backend
+  variables, referenced by name only.
 - Host cron: `* * * * * docker compose -f compose.universe.yaml --profile replay
   run --rm replay-runner`.
-- The Universe backup job includes `jobs.sqlite3` under its own object prefix.
-- `docs/DEPLOYMENT.md` documents the profile, cron, and the manual "delete the
-  bundle prefix to rebuild" step. `AGENTS.md` gains a routing row for this
-  document.
+- The Universe backup job includes `jobs.sqlite3` under its own object prefix;
+  §1.1 describes what a restore of it alone can and cannot do.
+- `docs/DEPLOYMENT.md` documents the profile, cron, `resume_blocked`, and the
+  manual bundle-receipt rebuild procedure (§3.5). `AGENTS.md` gains a routing
+  row for this document.
 
 **Checks:** `docker compose -f compose.universe.yaml --profile replay config
 --quiet`; a runner image build; inside the image `replay-publish`,
@@ -460,10 +660,12 @@ policy. Do not start services against production data in this workstream.
   response-schema checks move into the client's existing validators.
 - Wallet sign-in: EIP-1193 plus a SIWE message built from `GET /v1/auth/nonce`.
   The token is held in memory only.
-- Replay pages: job list; job detail (status, stage, reason, archive receipt
-  key; the summary for `bundle_coverage`); a "Replay this bundle" action in the
-  History bundle drawer that submits `{bundle_id, interval: null, strategy:
-  bundle_coverage}`; admin-only allowlist management.
+- Replay pages: a job list and a job detail showing status, stage, pending
+  outcome, reason code and detail, attempts, and the archive receipt key. There
+  is no result summary in V1: the archived receipt is the deliverable. A
+  "Replay this bundle" action in the History bundle drawer submits
+  `{bundle_id, interval: null, strategy: bundle_coverage}`. Admin-only allowlist
+  management.
 
 **Tests:** view models against the W1/W2 response shapes; sign-in state with a
 mocked provider; lint, typecheck, and build.
@@ -471,15 +673,18 @@ mocked provider; lint, typecheck, and build.
 ## 10. Resolved decisions
 
 - The canonical trust anchor is the archive's receipt-last `receipt.json`.
-- Every period has a committed canonical receipt, empty ones included. A
-  missing key means "not yet archived", and the job is `not_ready`.
+- Every period has a committed canonical receipt, empty ones included. A missing
+  key means "not yet archived" (`canonical_not_archived`).
 - Empty and incomplete windows replay normally; usability is the coverage
   strategy's finding.
 - The bundle interval starts at the first selection's `generated_at_ns`. Time
   before capture shows up honestly as not initialized.
-- Failed and exhausted jobs are archived.
-- The normalizer identity lives only on the bundle receipt. A mismatch is
-  `stale_bundle_cache`; rebuilding is a manual delete.
+- Every terminal job, including cancelled, not-ready, and stale ones, is
+  archived with a receipt.
+- The producer descriptor lives only on the bundle receipt and is compared
+  whole. A mismatch is `stale_bundle_cache`; rebuilding is the manual §3.5
+  procedure.
+- Only queued jobs can be cancelled in V1.
 - The Vercel proxy is removed. Caddy on the Universe host provides TLS, limits,
   and same-origin UI serving. The 1.75 MB response budget is Universe's own
   constant and can be revisited separately.
