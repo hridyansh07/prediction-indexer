@@ -117,6 +117,27 @@ class ReplayAuthTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid replay auth schema"):
             self.store.initialize()
 
+    def test_schema_constraints_reject_invalid_auth_rows(self) -> None:
+        with sqlite3.connect(self.path) as connection:
+            invalid_statements = (
+                (
+                    "INSERT INTO nonces VALUES (?,?,?,NULL)",
+                    ("A" * 32, 1, 2),
+                ),
+                (
+                    "INSERT INTO sessions VALUES (?,?,?,?,?,NULL)",
+                    ("0" * 64, "0x" + "g" * 40, "member", 1, 2),
+                ),
+                (
+                    "INSERT INTO allowlist VALUES (?,?,?,?)",
+                    (MEMBER.address.lower(), "bad\nnote", 1, ADMIN.address.lower()),
+                ),
+            )
+            for statement, values in invalid_statements:
+                with self.subTest(statement=statement):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        connection.execute(statement, values)
+
     def test_offline_login_hashes_token_and_returns_lowercase_principal(self) -> None:
         self.store.add_member(MEMBER.address, "member", ADMIN.address)
         result = self.login()
@@ -129,6 +150,8 @@ class ReplayAuthTests(unittest.TestCase):
             dump = "\n".join(connection.iterdump())
         self.assertEqual(row[0], hashlib.sha256(token.encode("ascii")).hexdigest())
         self.assertNotIn(token, dump)
+        self.assertNotIn("Sign in to Event Universe.", dump)
+        self.assertNotIn("signature", dump)
 
     def test_bad_signature_does_not_consume_nonce(self) -> None:
         self.store.add_member(MEMBER.address, "member", ADMIN.address)
