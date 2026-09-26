@@ -562,7 +562,7 @@ deadline or attempts are persisted and returned in their resulting state.
 |---|---|---|
 | `POST /v1/replay/jobs` | member or admin | exactly one valid `Idempotency-Key`; parse the exact received bytes; the bundle must exist in the Universe store for a new key; returns `201/200 {job_id,status,replayed}`; conflicting key/hash is 409, per-user quota is 429, and global quota is 503 |
 | `GET /v1/replay/jobs?status=&limit=&after=` | public | newest first, `limit` ≤ 100, within the existing response budget |
-| `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the parsed request in place of `request_json` bytes |
+| `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the stored request, decoded, in place of `request_json` bytes; it is not re-validated against the current runner registry, so renaming a preset or strategy never hides earlier jobs |
 | `POST /v1/replay/jobs/<job_id>/cancel` | submitter or admin | only while `queued`, applying `cancel`; otherwise 409 |
 | `GET /v1/replay/jobs/<job_id>/events?limit=&cursor=` | public | global event IDs in ascending order, with a strict opaque job-bound `replay_job_events` cursor |
 

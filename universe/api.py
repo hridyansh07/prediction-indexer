@@ -67,9 +67,9 @@ class UniverseApplication:
             if stored is None:
                 return HTTPStatus.NOT_FOUND, {"error": "job not found"}
             row, request_bytes = stored
-            if self.runner_config is None:
-                raise ValueError("Replay jobs are not configured")
-            parse_request(request_bytes, self.runner_config)
+            # The request was validated against the registry when it was
+            # submitted. Re-validating history against today's registry would
+            # hide every job whose preset or strategy was later renamed.
             record = self.replay_jobs.job_record(row, request_bytes)
             record["submitted_by"] = checksum_address(row.submitted_by)
             return HTTPStatus.OK, record

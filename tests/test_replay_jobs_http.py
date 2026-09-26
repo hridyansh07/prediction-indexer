@@ -16,7 +16,7 @@ from eth_account.messages import encode_defunct
 from replay.jobs import contracts as c
 from tests.test_event_universe_store import G1, R1, _publish_run, _selection_report
 from tests.test_replay_auth import ADMIN, MEMBER, auth_config, siwe_message
-from tests.test_replay_jobs import Limits, request_bytes, runner_config
+from tests.test_replay_jobs import ROOT, Limits, request_bytes, runner_config
 from universe.api import build_server
 from universe.auth import AuthStore, Principal
 from universe.replay_jobs import ReplayJobStore
@@ -194,6 +194,47 @@ class ReplayJobsHTTPAcceptanceTests(unittest.TestCase):
             self.assertEqual(
                 connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
             )
+
+    def restart_with_runner(self, runner: c.RunnerConfig) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.server = build_server(
+            self.universe, self.auth, "127.0.0.1", 0, self.jobs, runner
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def test_job_detail_survives_runner_registry_changes(self) -> None:
+        """A request accepted under one registry stays readable after the registry
+        drops its preset or strategy; detail must not re-validate history."""
+        raw = request_bytes()
+        headers = {
+            "Authorization": f"Bearer {self.token()}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "registry-change",
+        }
+        status, submitted, _ = self.request("POST", "/v1/replay/jobs", raw, headers)
+        self.assertEqual(status, 201)
+        job_id = submitted["job_id"]
+        shipped = json.loads((ROOT / "configs/replay_runner.json").read_bytes())
+        renamed_preset = {**shipped, "limits": {"standard": shipped["limits"]["small"]}}
+        renamed_strategy = {
+            **shipped,
+            "strategies": {"coverage_v2": shipped["strategies"]["bundle_coverage"]},
+        }
+        for name, document in (
+            ("preset removed", renamed_preset),
+            ("strategy removed", renamed_strategy),
+        ):
+            with self.subTest(name):
+                self.restart_with_runner(
+                    c.parse_runner_config(json.dumps(document).encode())
+                )
+                status, detail, _ = self.request("GET", f"/v1/replay/jobs/{job_id}")
+                self.assertEqual(status, 200, detail)
+                self.assertEqual(detail["request"], json.loads(raw))
 
 
 if __name__ == "__main__":
