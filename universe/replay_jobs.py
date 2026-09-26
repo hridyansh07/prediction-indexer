@@ -448,22 +448,71 @@ class ReplayJobStore:
             raise ReplayJobError(409, "invalid job transition")
         if before.status == jobs.RUNNING and after.status == jobs.RUNNING:
             if before.stage != after.stage:
-                return "stage_advanced"
+                try:
+                    expected = jobs.advance(before, after.stage, after.updated_at_ns)
+                except jobs.ContractError as error:
+                    raise ReplayJobError(409, "invalid job transition") from error
+                if after == expected:
+                    return "stage_advanced"
             if before.stage_attempts == after.stage_attempts:
-                return "retry_scheduled"
+                changed = {
+                    name
+                    for name in before.as_record()
+                    if getattr(before, name) != getattr(after, name)
+                }
+                if changed <= {
+                    "reason_code",
+                    "reason_detail",
+                    "next_attempt_at_ns",
+                    "updated_at_ns",
+                }:
+                    return "retry_scheduled"
         if before.status == jobs.RUNNING and after.status == jobs.ARCHIVING:
-            return "outcome_pending"
+            if after.pending_outcome == jobs.SUCCEEDED:
+                expected = jobs.succeed(before, after.updated_at_ns)
+            elif after.reason_code in jobs.OUTCOME_OF_CODE:
+                try:
+                    expected = jobs.fail(
+                        before,
+                        after.reason_code,
+                        after.reason_detail,
+                        after.updated_at_ns,
+                    )
+                except jobs.ContractError as error:
+                    raise ReplayJobError(409, "invalid job transition") from error
+            else:
+                expected = None
+            if after == expected:
+                return "outcome_pending"
         if before.status == jobs.ARCHIVING and after.status == jobs.ARCHIVING:
-            if before.pending_outcome != after.pending_outcome:
-                return "outcome_replaced"
+            if (
+                before.pending_outcome != after.pending_outcome
+                or before.reason_code != after.reason_code
+            ):
+                expected = jobs.lose_local_state(
+                    before, after.reason_detail, after.updated_at_ns
+                )
+                if after == expected:
+                    return "outcome_replaced"
             if before.stage_attempts == after.stage_attempts:
-                return "retry_scheduled"
+                changed = {
+                    name
+                    for name in before.as_record()
+                    if getattr(before, name) != getattr(after, name)
+                }
+                if changed <= {"reason_detail", "next_attempt_at_ns", "updated_at_ns"}:
+                    return "retry_scheduled"
         if before.status == jobs.ARCHIVING and after.status == jobs.ARCHIVE_BLOCKED:
-            return "archive_blocked"
+            if after.blocked_reason_code is not None and after == jobs.block_archive(
+                before, after.blocked_reason_code, after.updated_at_ns
+            ):
+                return "archive_blocked"
         if before.status == jobs.ARCHIVE_BLOCKED and after.status == jobs.ARCHIVING:
-            return "archive_resumed"
+            if after == jobs.resume_blocked(before, after.updated_at_ns):
+                return "archive_resumed"
         if before.status == jobs.ARCHIVING and after.status in jobs.TERMINAL:
-            return "finished"
+            if after == jobs.finish(before, after.updated_at_ns):
+                return "finished"
         raise ReplayJobError(409, "invalid job transition")
 
     @staticmethod
