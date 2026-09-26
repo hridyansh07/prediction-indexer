@@ -14,13 +14,14 @@ from pathlib import Path
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from universe.auth import AuthError, AuthStore, Principal, checksum_address
+from universe.auth import AuthError, AuthStore, NonceStore, Principal, checksum_address
 from universe.api import build_server
 from universe.config import AuthConfig, UniverseConfigError, load_config
 
 
 UTC = timezone.utc
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+STATEMENT = "Sign in to Prediction Indexer."
 ADMIN = Account.from_key("0x" + "11" * 32)
 MEMBER = Account.from_key("0x" + "22" * 32)
 OTHER = Account.from_key("0x" + "33" * 32)
@@ -30,6 +31,7 @@ def auth_config(*, admin_address: str = ADMIN.address) -> AuthConfig:
     return AuthConfig(
         siwe_domain="universe.example",
         siwe_uri="https://universe.example/login",
+        siwe_statement=STATEMENT,
         chain_id=1,
         admin_address=admin_address,
         nonce_ttl_seconds=300,
@@ -37,18 +39,25 @@ def auth_config(*, admin_address: str = ADMIN.address) -> AuthConfig:
     )
 
 
-def siwe_message(address: str, nonce: str, *, expiration: datetime | None = None) -> str:
+def siwe_message(
+    address: str,
+    nonce: str,
+    *,
+    expiration: datetime | None = None,
+    issued_at: datetime = NOW,
+    statement: str = STATEMENT,
+) -> str:
     lines = [
         "universe.example wants you to sign in with your Ethereum account:",
         address,
         "",
-        "Sign in to Event Universe.",
+        statement,
         "",
         "URI: https://universe.example/login",
         "Version: 1",
         "Chain ID: 1",
         f"Nonce: {nonce}",
-        f"Issued At: {NOW.isoformat().replace('+00:00', 'Z')}",
+        f"Issued At: {issued_at.isoformat().replace('+00:00', 'Z')}",
     ]
     if expiration is not None:
         lines.append(f"Expiration Time: {expiration.isoformat().replace('+00:00', 'Z')}")
@@ -85,6 +94,7 @@ class ReplayAuthTests(unittest.TestCase):
                 "auth": {
                     "siwe_domain": "universe.example",
                     "siwe_uri": "https://universe.example/login",
+                    "siwe_statement": STATEMENT,
                     "chain_id": 1,
                     "admin_address": ADMIN.address,
                     "nonce_ttl_seconds": 300,
@@ -94,7 +104,10 @@ class ReplayAuthTests(unittest.TestCase):
         }
         source.write_text(json.dumps(document), encoding="utf-8")
         config = load_config(source)
-        self.assertEqual(config.replay.database_path, source.parent / "jobs.sqlite3")
+        self.assertEqual(
+            config.replay.database_path.resolve(), (source.parent / "jobs.sqlite3").resolve()
+        )
+        self.assertEqual(config.replay.auth.siwe_statement, STATEMENT)
         self.assertEqual(config.replay.auth.admin_address, ADMIN.address)
         document["replay"]["auth"]["extra"] = True
         source.write_text(json.dumps(document), encoding="utf-8")
@@ -120,6 +133,7 @@ class ReplayAuthTests(unittest.TestCase):
                 "auth": {
                     "siwe_domain": "universe.example",
                     "siwe_uri": "https://universe.example/login",
+                    "siwe_statement": STATEMENT,
                     "chain_id": 1,
                     "admin_address": ADMIN.address,
                     "nonce_ttl_seconds": 300,
@@ -131,6 +145,9 @@ class ReplayAuthTests(unittest.TestCase):
             ("siwe_domain", "https://universe.example"),
             ("siwe_uri", "https://user@universe.example/login"),
             ("siwe_uri", "https://universe.example/login?token=x"),
+            ("siwe_statement", ""),
+            ("siwe_statement", "two\nlines"),
+            ("siwe_statement", "x" * 257),
             ("chain_id", True),
             ("chain_id", 0),
             ("admin_address", ADMIN.address.lower()),
@@ -160,10 +177,6 @@ class ReplayAuthTests(unittest.TestCase):
         with sqlite3.connect(self.path) as connection:
             invalid_statements = (
                 (
-                    "INSERT INTO nonces VALUES (?,?,?,NULL)",
-                    ("A" * 32, 1, 2),
-                ),
-                (
                     "INSERT INTO sessions VALUES (?,?,?,?,?,NULL)",
                     ("0" * 64, "0x" + "g" * 40, "member", 1, 2),
                 ),
@@ -189,7 +202,7 @@ class ReplayAuthTests(unittest.TestCase):
             dump = "\n".join(connection.iterdump())
         self.assertEqual(row[0], hashlib.sha256(token.encode("ascii")).hexdigest())
         self.assertNotIn(token, dump)
-        self.assertNotIn("Sign in to Event Universe.", dump)
+        self.assertNotIn(STATEMENT, dump)
         self.assertNotIn("signature", dump)
 
     def test_bad_signature_does_not_consume_nonce(self) -> None:
@@ -209,7 +222,9 @@ class ReplayAuthTests(unittest.TestCase):
             lambda value: value.replace("URI: https://universe.example/login", "URI: https://evil.example/login"),
             lambda value: value.replace("Version: 1", "Version: 2"),
             lambda value: value.replace("Chain ID: 1", "Chain ID: 2"),
-            lambda value: value.replace("Issued At: 2026-01-02T03:04:05Z", "Issued At: 2026-01-02T03:04:06Z"),
+            lambda value: value.replace(STATEMENT, "Sign in to something else."),
+            lambda value: value.replace(f"\n{STATEMENT}\n", "\n"),
+            lambda value: value.replace("Issued At: 2026-01-02T03:04:05Z", "Issued At: 2026-01-02 03:04:05"),
             lambda value: value + "\nNot Before: 2026-01-02T03:04:06Z",
             lambda value: value + "\nExpiration Time: 2026-01-02T03:04:05Z",
         )
@@ -321,6 +336,8 @@ class ReplayAuthTests(unittest.TestCase):
         )
         with sqlite3.connect(self.path) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 2)
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            self.assertNotIn("nonces", tables)
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("DELETE FROM allowlist_events")
             with self.assertRaises(sqlite3.IntegrityError):
@@ -329,8 +346,73 @@ class ReplayAuthTests(unittest.TestCase):
         self.store.prune()
         with sqlite3.connect(self.path) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM allowlist_events").fetchone()[0], 2)
-            self.assertEqual(connection.execute("SELECT count(*) FROM nonces").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT count(*) FROM sessions").fetchone()[0], 0)
+
+    def test_client_clock_drift_does_not_matter(self) -> None:
+        """Freshness is the server-side nonce TTL, not the browser's Issued At."""
+        self.store.add_member(MEMBER.address, "member", ADMIN.address)
+        for drift in (timedelta(hours=-3), timedelta(seconds=-2), timedelta(seconds=2), timedelta(hours=3)):
+            with self.subTest(drift=drift):
+                nonce = self.store.create_nonce()["nonce"]
+                message = siwe_message(MEMBER.address, nonce, issued_at=NOW + drift)
+                signature = Account.sign_message(encode_defunct(text=message), MEMBER.key).signature.hex()
+                self.assertIn("token", self.store.verify_siwe(message, signature))
+
+    def test_nonce_expires_by_server_ttl(self) -> None:
+        self.store.add_member(MEMBER.address, "member", ADMIN.address)
+        nonce = self.store.create_nonce()["nonce"]
+        message = siwe_message(MEMBER.address, nonce)
+        signature = Account.sign_message(encode_defunct(text=message), MEMBER.key).signature.hex()
+        self.now = NOW + timedelta(seconds=300)
+        with self.assertRaisesRegex(AuthError, "authentication failed"):
+            self.store.verify_siwe(message, signature)
+
+    def test_unknown_nonce_is_rejected(self) -> None:
+        self.store.add_member(MEMBER.address, "member", ADMIN.address)
+        message = siwe_message(MEMBER.address, "0" * 32)
+        signature = Account.sign_message(encode_defunct(text=message), MEMBER.key).signature.hex()
+        with self.assertRaisesRegex(AuthError, "authentication failed"):
+            self.store.verify_siwe(message, signature)
+
+    def test_restart_drops_outstanding_nonces(self) -> None:
+        self.store.add_member(MEMBER.address, "member", ADMIN.address)
+        nonce = self.store.create_nonce()["nonce"]
+        message = siwe_message(MEMBER.address, nonce)
+        signature = Account.sign_message(encode_defunct(text=message), MEMBER.key).signature.hex()
+        restarted = AuthStore(self.path, auth_config(), now=lambda: self.now)
+        restarted.initialize()
+        with self.assertRaisesRegex(AuthError, "authentication failed"):
+            restarted.verify_siwe(message, signature)
+        with sqlite3.connect(self.path) as connection:
+            self.assertNotIn(nonce, "\n".join(connection.iterdump()))
+
+    def test_nonce_store_is_capped_and_prunes_expired(self) -> None:
+        store = NonceStore(ttl_seconds=10, capacity=3)
+        for _ in range(3):
+            store.issue(100)
+        with self.assertRaises(AuthError) as raised:
+            store.issue(105)
+        self.assertEqual(raised.exception.status, 503)
+        store.issue(110)  # all three expired at 110 and were pruned
+        self.assertEqual(len(store), 1)
+
+    def test_nonce_consume_is_single_use_and_bounded_by_expiry(self) -> None:
+        store = NonceStore(ttl_seconds=10)
+        nonce, expires = store.issue(100)
+        self.assertEqual(expires, 110)
+        self.assertTrue(store.consume(nonce, 109))
+        self.assertFalse(store.consume(nonce, 109))
+        late, _ = store.issue(100)
+        self.assertFalse(store.consume(late, 110))
+
+    def test_placeholder_admin_disables_sign_in(self) -> None:
+        store = AuthStore(self.path, auth_config(admin_address="0x" + "0" * 40), now=lambda: self.now)
+        store.initialize()
+        self.assertFalse(store.configured)
+        for call in (store.create_nonce, lambda: store.verify_siwe("x", "y")):
+            with self.assertRaises(AuthError) as raised:
+                call()
+            self.assertEqual(raised.exception.status, 503)
 
     def test_configured_admin_cannot_be_removed(self) -> None:
         with self.assertRaises(AuthError) as raised:

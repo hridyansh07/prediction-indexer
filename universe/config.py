@@ -49,6 +49,7 @@ class BackfillConfig:
 class AuthConfig:
     siwe_domain: str
     siwe_uri: str
+    siwe_statement: str
     chain_id: int
     admin_address: str
     nonce_ttl_seconds: int
@@ -119,6 +120,7 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         {
             "siwe_domain",
             "siwe_uri",
+            "siwe_statement",
             "chain_id",
             "admin_address",
             "nonce_ttl_seconds",
@@ -170,6 +172,11 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         or not uri_port_valid
     ):
         raise UniverseConfigError("replay.auth.siwe_uri must be a canonical absolute HTTP(S) URI")
+    statement = _text(auth, "siwe_statement", "replay.auth")
+    if len(statement) > 256 or any(not 32 <= ord(character) <= 126 for character in statement):
+        raise UniverseConfigError(
+            "replay.auth.siwe_statement must be at most 256 printable ASCII characters"
+        )
     chain_id = _positive_integer(auth, "chain_id", "replay.auth")
     nonce_ttl = _bounded_ttl(auth, "nonce_ttl_seconds")
     session_ttl = _bounded_ttl(auth, "session_ttl_seconds")
@@ -213,6 +220,7 @@ def load_config(path: Path | None = None) -> UniverseConfig:
             auth=AuthConfig(
                 siwe_domain=domain,
                 siwe_uri=uri,
+                siwe_statement=statement,
                 chain_id=chain_id,
                 admin_address=admin_address,
                 nonce_ttl_seconds=nonce_ttl,

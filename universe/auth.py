@@ -6,6 +6,7 @@ import hashlib
 import re
 import secrets
 import sqlite3
+import threading
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,10 @@ NONCE_RE = re.compile(r"[0-9a-f]{32}\Z")
 TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z"
 )
+#: Upper bound on outstanding nonces. The nonce route is public, so the store is
+#: capped rather than grown on demand; Caddy rate limiting is the first defence.
+MAX_LIVE_NONCES = 10_000
+ZERO_ADDRESS = "0x" + "0" * 40
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,47 @@ class AuthError(Exception):
         self.status = status
 
 
+class NonceStore:
+    """Single-use SIWE nonces held in process memory.
+
+    Freshness is the server's own issue time plus the configured TTL; a
+    client's ``Issued At`` is never trusted for it. Nonces are lost on restart,
+    which only means the user signs in again. This requires one Universe server
+    process: a second worker or replica would need shared storage instead.
+    """
+
+    def __init__(self, ttl_seconds: int, capacity: int = MAX_LIVE_NONCES) -> None:
+        self._ttl = ttl_seconds
+        self._capacity = capacity
+        self._expiry: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def issue(self, now: int) -> tuple[str, int]:
+        with self._lock:
+            self._prune(now)
+            if len(self._expiry) >= self._capacity:
+                raise AuthError(503, "too many pending sign-ins; retry shortly")
+            nonce = secrets.token_hex(16)
+            expires = now + self._ttl
+            self._expiry[nonce] = expires
+            return nonce, expires
+
+    def consume(self, nonce: str, now: int) -> bool:
+        """Atomically remove ``nonce``; true only if it was live."""
+        with self._lock:
+            expires = self._expiry.pop(nonce, None)
+            return expires is not None and now < expires
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._expiry)
+
+    def _prune(self, now: int) -> None:
+        expired = [nonce for nonce, expires in self._expiry.items() if expires <= now]
+        for nonce in expired:
+            del self._expiry[nonce]
+
+
 class AuthStore:
     def __init__(
         self,
@@ -52,6 +98,16 @@ class AuthStore:
         self.path = Path(path)
         self.config = config
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.nonces = NonceStore(config.nonce_ttl_seconds)
+
+    @property
+    def configured(self) -> bool:
+        """False while the shipped zero-address admin placeholder is in place."""
+        return self.config.admin_address.lower() != ZERO_ADDRESS
+
+    def _require_configured(self) -> None:
+        if not self.configured:
+            raise AuthError(503, "replay authentication is not configured")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -106,18 +162,12 @@ class AuthStore:
             connection.close()
 
     def create_nonce(self) -> dict[str, str]:
-        now = self._timestamp()
-        nonce = secrets.token_hex(16)
-        expires = now + self.config.nonce_ttl_seconds
-        with self._write() as connection:
-            self._prune(connection, now)
-            connection.execute(
-                "INSERT INTO nonces(nonce, created_at, expires_at) VALUES (?, ?, ?)",
-                (nonce, now, expires),
-            )
+        self._require_configured()
+        nonce, expires = self.nonces.issue(self._timestamp())
         return {"nonce": nonce, "expires_at": _format_timestamp(expires)}
 
     def verify_siwe(self, message: str, signature: str) -> dict[str, str]:
+        self._require_configured()
         try:
             parsed = self._parse_siwe(message)
             recovered = Account.recover_message(
@@ -129,31 +179,15 @@ class AuthStore:
             raise AuthError(401, "authentication failed")
 
         now = self._timestamp()
+        # Only a correctly signed message spends its nonce.
+        if not self.nonces.consume(parsed["nonce"], now):
+            raise AuthError(401, "authentication failed")
         token = secrets.token_hex(32)
         digest = token_digest(token)
         address = parsed["address"].lower()
         with self._write() as connection:
-            nonce = connection.execute(
-                "SELECT created_at, expires_at, used_at FROM nonces WHERE nonce = ?",
-                (parsed["nonce"],),
-            ).fetchone()
-            if (
-                nonce is None
-                or nonce["used_at"] is not None
-                or now >= nonce["expires_at"]
-                or parsed["issued_at"] < nonce["created_at"]
-                or parsed["issued_at"] > now
-            ):
-                raise AuthError(401, "authentication failed")
             role = self._current_role(connection, address)
             if role is None:
-                raise AuthError(401, "authentication failed")
-            consumed = connection.execute(
-                "UPDATE nonces SET used_at = ? "
-                "WHERE nonce = ? AND used_at IS NULL AND expires_at > ?",
-                (now, parsed["nonce"], now),
-            ).rowcount
-            if consumed != 1:
                 raise AuthError(401, "authentication failed")
             expires = now + self.config.session_ttl_seconds
             if parsed["expiration"] is not None:
@@ -278,7 +312,6 @@ class AuthStore:
 
     @staticmethod
     def _prune(connection: sqlite3.Connection, now: int) -> None:
-        connection.execute("DELETE FROM nonces WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
 
     def _current_role(self, connection: sqlite3.Connection, address: str) -> str | None:
@@ -298,12 +331,10 @@ class AuthStore:
         address = lines[1]
         if not ADDRESS_RE.fullmatch(address) or not is_checksum_address(address) or lines[2] != "":
             raise ValueError("invalid address")
-        try:
-            uri_index = next(i for i in range(3, len(lines)) if lines[i].startswith("URI: "))
-        except StopIteration as error:
-            raise ValueError("missing uri") from error
-        if uri_index > 3 and (uri_index != 5 or lines[4] != "" or not lines[3]):
+        # EIP-4361 with-statement layout; the statement is the configured one.
+        if lines[3] != self.config.siwe_statement or lines[4] != "":
             raise ValueError("invalid statement")
+        uri_index = 5
         fields: dict[str, str] = {}
         resources = False
         resource_count = 0
@@ -343,6 +374,8 @@ class AuthStore:
             raise ValueError("invalid network")
         if not NONCE_RE.fullmatch(fields["Nonce"]):
             raise ValueError("invalid nonce")
+        # Issued At must be well formed but is not compared with the server clock:
+        # freshness is the server-side nonce TTL, so browser clock drift is harmless.
         issued = _parse_timestamp(fields["Issued At"])
         expiration = (
             _parse_timestamp(fields["Expiration Time"])
@@ -359,7 +392,6 @@ class AuthStore:
         return {
             "address": address,
             "nonce": fields["Nonce"],
-            "issued_at": issued,
             "expiration": expiration,
         }
 

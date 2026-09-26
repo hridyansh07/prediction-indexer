@@ -743,10 +743,18 @@ the additive authentication schema in `jobs.sqlite3`; rebuilding
 version-2 config and Universe image together because older configs are rejected
 actionably. Before exposing the authentication routes, replace the shipped zero
 admin placeholder with the operator wallet's EIP-55 address and set
-`siwe_domain`/`siwe_uri` to the exact public origin users sign.
+`siwe_domain`/`siwe_uri` to the exact public origin users sign. While the zero
+placeholder remains, the sign-in routes return `503` and every other route is
+unaffected. `siwe_statement` is the exact statement line every sign-in message
+must carry; the UI must use the same text.
 
 SIWE verification is offline EIP-191 recovery and makes no wallet RPC or provider
-request. Sessions persist only a SHA-256 token digest. The six W1 routes are
+request, so the admin must be an externally owned account, not a contract wallet.
+Nonces are single use and held only in the server process's memory, capped at
+10,000 outstanding, and expire `nonce_ttl_seconds` after the server issued them;
+the client's `Issued At` is not compared with the server clock. A restart drops
+outstanding nonces and users simply sign in again. This requires exactly one
+`event-universe` process. Sessions persist only a SHA-256 token digest. The six W1 routes are
 `GET /v1/auth/nonce`, `POST /v1/auth/siwe`, `POST /v1/auth/logout`,
 `GET /v1/admin/allowlist`, `POST /v1/admin/allowlist`, and
 `DELETE /v1/admin/allowlist/<address>`. All responses are `no-store`; expose them

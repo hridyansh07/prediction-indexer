@@ -7,8 +7,9 @@ candidate decisions, selected-market occurrences, and market claims.
 
 Replay authentication is intentionally separate. [`replay_auth.sql`](replay_auth.sql)
 is initialized additively in the durable `replay.database_path`; it contains only
-SIWE nonces, bearer-session digests, the member allowlist, and append-only
-allowlist events. It does not use `PRAGMA user_version`, because Replay job tables
+bearer-session digests, the member allowlist, and append-only allowlist events.
+SIWE nonces are deliberately not persisted: they live in the server process's
+memory with a TTL and are lost on restart. It does not use `PRAGMA user_version`, because Replay job tables
 share that database in the next delivery wave. Never place these durable records
 in the rebuildable Event Universe projection database.
 

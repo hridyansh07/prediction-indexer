@@ -1,12 +1,3 @@
-CREATE TABLE IF NOT EXISTS nonces (
-    nonce TEXT PRIMARY KEY CHECK(typeof(nonce) = 'text' AND length(nonce) = 32 AND nonce = lower(nonce) AND nonce NOT GLOB '*[^0-9a-f]*'),
-    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
-    expires_at INTEGER NOT NULL CHECK(typeof(expires_at) = 'integer' AND expires_at > created_at),
-    used_at INTEGER CHECK(used_at IS NULL OR (typeof(used_at) = 'integer' AND used_at >= created_at AND used_at < expires_at))
-) WITHOUT ROWID;
-
-CREATE INDEX IF NOT EXISTS nonces_expiry ON nonces(expires_at);
-
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY CHECK(typeof(token_hash) = 'text' AND length(token_hash) = 64 AND token_hash = lower(token_hash) AND token_hash NOT GLOB '*[^0-9a-f]*'),
     address TEXT NOT NULL CHECK(typeof(address) = 'text' AND length(address) = 42 AND address = lower(address) AND substr(address, 1, 2) = '0x' AND substr(address, 3) NOT GLOB '*[^0-9a-f]*'),

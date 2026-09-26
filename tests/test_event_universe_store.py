@@ -2025,6 +2025,7 @@ class EventUniverseTests(unittest.TestCase):
                         "auth": {
                             "siwe_domain": "universe.example",
                             "siwe_uri": "https://universe.example/login",
+                            "siwe_statement": "Sign in to Prediction Indexer.",
                             "chain_id": 1,
                             "admin_address": "0x0000000000000000000000000000000000000000",
                             "nonce_ttl_seconds": 300,
