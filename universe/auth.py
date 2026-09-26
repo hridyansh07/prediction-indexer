@@ -28,7 +28,7 @@ TIMESTAMP_RE = re.compile(
 )
 #: Upper bound on outstanding nonces. The nonce route is public, so the store is
 #: capped rather than grown on demand; Caddy rate limiting is the first defence.
-MAX_LIVE_NONCES = 10_000
+MAX_LIVE_NONCES = 500
 ZERO_ADDRESS = "0x" + "0" * 40
 
 

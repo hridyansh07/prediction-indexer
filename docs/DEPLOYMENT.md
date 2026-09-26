@@ -751,7 +751,7 @@ must carry; the UI must use the same text.
 SIWE verification is offline EIP-191 recovery and makes no wallet RPC or provider
 request, so the admin must be an externally owned account, not a contract wallet.
 Nonces are single use and held only in the server process's memory, capped at
-10,000 outstanding, and expire `nonce_ttl_seconds` after the server issued them;
+500 outstanding, and expire `nonce_ttl_seconds` after the server issued them;
 the client's `Issued At` is not compared with the server clock. A restart drops
 outstanding nonces and users simply sign in again. This requires exactly one
 `event-universe` process. Sessions persist only a SHA-256 token digest. The six W1 routes are

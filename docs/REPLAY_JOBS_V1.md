@@ -446,7 +446,7 @@ return 503 and every other route is unaffected.
 **Nonces are held in memory, not in SQLite.** A process-local store maps each
 nonce to the server time it expires (`nonce_ttl_seconds` after the server
 issued it). It is locked, so consuming a nonce is atomic across the server's
-threads, and capped at 10,000 outstanding nonces: expired ones are pruned on
+threads, and capped at 500 outstanding nonces: expired ones are pruned on
 each issue, and a full store returns 503. Caddy rate limiting on the nonce
 route (W5) is the first defence. A restart drops outstanding nonces and users
 simply sign in again. This requires exactly one `event-universe` process; a
