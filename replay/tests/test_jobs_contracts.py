@@ -460,7 +460,7 @@ class IdentifierTest(unittest.TestCase):
         for call in (
             lambda: c.derivative_key("A" * 64, "receipt.json"),
             lambda: c.derivative_key("a" * 64, "other.json"),
-            lambda: c.bundle_receipt_key("a/b"),
+            lambda: c.bundle_receipt_key("a/b", "0" * 64),
         ):
             with self.assertRaises(c.ContractError):
                 call()
@@ -519,6 +519,24 @@ class BundleReceiptTest(unittest.TestCase):
     def test_independent_builds_publish_identical_bytes(self):
         self.assertEqual(c.bundle_receipt_bytes(bundle_receipt()), c.bundle_receipt_bytes(bundle_receipt()))
         self.assertNotIn(b"built_by_job", c.bundle_receipt_bytes(bundle_receipt()))
+
+    def test_generation_identity_binds_interval_sources_producer_and_pins(self):
+        base = bundle_receipt()
+        identity = c.bundle_generation_sha256(base)
+        variants = (
+            bundle_receipt(bundle_id="bundle_y"),
+            bundle_receipt(start_ns=3 * HALF, windows=windows((3 * HALF, 4 * HALF, 5 * HALF))),
+            bundle_receipt(producer=producer(materializer_version=3)),
+            bundle_receipt(windows=(replace(base.windows[0], canonical_receipt_sha256="f" * 64), base.windows[1])),
+            bundle_receipt(windows=(replace(base.windows[0], receipt_sha256="f" * 64), base.windows[1])),
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(c.bundle_generation_sha256(variant), identity)
+        self.assertEqual(
+            c.bundle_receipt_key(base.bundle_id, identity),
+            f"replay/bundles/{base.bundle_id}/generations/{identity}/bundle_receipt.json",
+        )
 
     def test_direct_construction_of_invalid_receipt_fails(self):
         """Review item 7."""

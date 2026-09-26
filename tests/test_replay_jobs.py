@@ -89,6 +89,12 @@ class ReplayJobStoreTests(unittest.TestCase):
         self.assertIn("scoped to\n  the authenticated lowercase submitter", spec)
         self.assertNotIn("Submission is at least once", spec)
         self.assertNotIn("There is no idempotency key", spec)
+        self.assertNotIn("duplicate submissions create distinct jobs", spec)
+        self.assertNotIn("replay/bundles/<bundle_id>/bundle_receipt.json", spec)
+        self.assertIn(
+            "Canonical restore and the immutable bundle cache (§6) are the\ncurrent stage",
+            spec,
+        )
 
     def test_initialize_coexists_with_auth_and_rejects_owned_tampering(self) -> None:
         from tests.test_replay_auth import auth_config
