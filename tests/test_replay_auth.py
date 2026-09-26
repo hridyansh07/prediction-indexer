@@ -81,10 +81,10 @@ class ReplayAuthTests(unittest.TestCase):
         signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
         return self.store.verify_siwe(message, signature)
 
-    def test_config_v2_is_closed_and_resolves_replay_database(self) -> None:
+    def test_config_v3_is_closed_and_resolves_replay_database(self) -> None:
         source = Path(self.temporary.name) / "config.json"
         document = {
-            "event_universe_config_version": 2,
+            "event_universe_config_version": 3,
             "database_path": "universe.sqlite3",
             "api": {"host": "127.0.0.1", "port": 8080},
             "backfill": {"temporary_directory": "tmp", "generated_start": None, "generated_end": None},
@@ -100,6 +100,12 @@ class ReplayAuthTests(unittest.TestCase):
                     "nonce_ttl_seconds": 300,
                     "session_ttl_seconds": 43200,
                 },
+                "jobs": {
+                    "runner_config_path": "replay_runner.json",
+                    "max_active_jobs_total": 100,
+                    "max_active_jobs_per_submitter": 4,
+                    "max_queued_jobs_total": 64,
+                },
             },
         }
         source.write_text(json.dumps(document), encoding="utf-8")
@@ -109,6 +115,10 @@ class ReplayAuthTests(unittest.TestCase):
         )
         self.assertEqual(config.replay.auth.siwe_statement, STATEMENT)
         self.assertEqual(config.replay.auth.admin_address, ADMIN.address)
+        self.assertEqual(
+            config.replay.jobs.runner_config_path,
+            (source.parent / "replay_runner.json").resolve(),
+        )
         document["replay"]["auth"]["extra"] = True
         source.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(UniverseConfigError, "replay.auth fields"):
@@ -117,13 +127,13 @@ class ReplayAuthTests(unittest.TestCase):
     def test_old_config_fails_actionably(self) -> None:
         source = Path(self.temporary.name) / "old.json"
         source.write_text(json.dumps({"event_universe_config_version": 1}), encoding="utf-8")
-        with self.assertRaisesRegex(UniverseConfigError, "version 2"):
+        with self.assertRaisesRegex(UniverseConfigError, "version 3"):
             load_config(source)
 
     def test_config_rejects_invalid_security_values(self) -> None:
         source = Path(self.temporary.name) / "config.json"
         base = {
-            "event_universe_config_version": 2,
+            "event_universe_config_version": 3,
             "database_path": "universe.sqlite3",
             "api": {"host": "127.0.0.1", "port": 8080},
             "backfill": {"temporary_directory": "tmp", "generated_start": None, "generated_end": None},
@@ -138,6 +148,12 @@ class ReplayAuthTests(unittest.TestCase):
                     "admin_address": ADMIN.address,
                     "nonce_ttl_seconds": 300,
                     "session_ttl_seconds": 43200,
+                },
+                "jobs": {
+                    "runner_config_path": "replay_runner.json",
+                    "max_active_jobs_total": 100,
+                    "max_active_jobs_per_submitter": 4,
+                    "max_queued_jobs_total": 64,
                 },
             },
         }

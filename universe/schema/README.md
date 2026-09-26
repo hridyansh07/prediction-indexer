@@ -5,13 +5,18 @@ package resource. It contains both the historical run/bundle API tables and the
 event/market view: umbrella and venue events, canonical and venue markets,
 candidate decisions, selected-market occurrences, and market claims.
 
-Replay authentication is intentionally separate. [`replay_auth.sql`](replay_auth.sql)
-is initialized additively in the durable `replay.database_path`; it contains only
-bearer-session digests, the member allowlist, and append-only allowlist events.
+Replay authentication and jobs are intentionally separate component schemas.
+[`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql) are
+initialized additively in the durable `replay.database_path` (`jobs.sqlite3`).
+They contain bearer-session digests, the member allowlist, append-only allowlist
+events, W0 job rows, durable idempotency mappings, component metadata, and
+append-only job transition events.
 SIWE nonces are deliberately not persisted: they live in the server process's
-memory with a TTL and are lost on restart. It does not use `PRAGMA user_version`, because Replay job tables
-share that database in the next delivery wave. Never place these durable records
-in the rebuildable Event Universe projection database.
+memory with a TTL and are lost on restart. The durable Replay database does not
+use `PRAGMA user_version`; each component validates only the objects it owns so
+the auth and jobs schemas coexist. Never place these durable records in the
+rebuildable Event Universe projection database or remove them during a Universe
+projection rebuild.
 
 The database is a rebuildable query index, not another evidence archive:
 
