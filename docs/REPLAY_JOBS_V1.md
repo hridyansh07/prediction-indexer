@@ -34,13 +34,21 @@ Universe EC2
 
 Non-goals: parallel or multi-host jobs, automatic resubmission of `not_ready`
 jobs, cancelling a job after it starts, a local job-directory reaper,
-request-supplied strategy code, bundle-filtered derivatives, API idempotency
-keys, and any change to the rebuildable Universe query index.
+request-supplied strategy code, bundle-filtered derivatives, and any change to
+the rebuildable Universe query index.
 
 ### 1.1 Deliberate V1 semantics
 
-- **Submission is at least once.** Each accepted `POST` creates a distinct job,
-  even for byte-identical requests. There is no idempotency key.
+- **Submission is durably idempotent.** `POST /v1/replay/jobs` requires exactly
+  one `Idempotency-Key` matching `[A-Za-z0-9._~-]{1,128}`. The key is scoped to
+  the authenticated lowercase submitter, not to `bundle_id`. The first request
+  returns `201 {job_id,status,replayed:false}`. The same submitter and key with
+  the same canonical request hash returns the original job as
+  `200 {job_id,status,replayed:true}` without a new row, event, or quota check;
+  a different hash returns `409`. Different keys may create distinct jobs for
+  identical requests. Mappings are durable with no TTL and keys cannot be
+  recycled. The key is HTTP metadata: it is never part of request v1, exposed,
+  or archived.
 - **`bundle_id` identifies reusable derivatives, not a job.** Two jobs for one
   bundle share its cached derivatives but run and archive independently.
 - **The archived job receipt and the files it lists are the deliverable.** The
@@ -510,22 +518,66 @@ unchanged.
 runner reuses.
 
 **Store module** `universe/replay_jobs.py` (standard library plus
-`replay.jobs.contracts`). It persists `JobRow`s and never writes a row that
-`JobRow` would reject; every state change is one of §3.8's transition functions:
-`insert_job(conn, request_bytes, principal, now_ns, suffix) -> job_id`,
-`get_job`, `list_jobs(conn, status, limit, after)`,
-`cancel_job(conn, job_id, principal, now_ns)`,
-`claim_next(conn, orchestration, now_ns)` (selects exactly as `select_next`
-and applies `claim`, in one `BEGIN IMMEDIATE` transaction), and
-`save(conn, before, after)`, a compare-and-set on `(job_id, status, stage,
-stage_attempts, updated_at_ns)` so a stale writer cannot overwrite a newer row.
+`replay.jobs.contracts` and W1's `Principal`; it does not import auth internals).
+It persists `JobRow`s and never writes a row that `JobRow` would reject; every
+state change is one of §3.8's transition functions. Its immutable results are
+`SubmissionResult(row, created: bool)` and
+`ClaimResult(row, request_bytes: bytes, mode: Literal['initialize','resume'])`.
+Methods are `initialize`, `lookup_submission`, `submit`, `get_job`, `list_jobs`,
+`list_events`, `cancel_job`, `claim_next`, and `save(before, after)`. `save` is a
+compare-and-set on `(job_id,status,stage,stage_attempts,updated_at_ns)` with an
+exact-before row check, so stale or corrupt writers cannot overwrite a newer
+row. Failed writes append no event.
+
+The component first initializes W0's `JOBS_SCHEMA_SQL`, then its owned schema.
+Its metadata binds a SHA-256 over the deterministically ordered, whitespace-
+normalized `sqlite_master` definitions for only those owned objects; unrelated
+auth objects may coexist and formatting-only changes to the SQL source do not
+change the schema identity.
+`job_submissions` stores `(submitted_by,idempotency_key,request_sha256,job_id,
+created_at_ns)`, with submitter/key as its primary key and a unique job foreign
+key. `job_events` has one global monotonic sequence, closed transition fields,
+and permits only `submitted`, `cancelled`, `claimed_initialize`,
+`claimed_resume`, `stage_advanced`, `retry_scheduled`, `outcome_pending`,
+`outcome_replaced`, `archive_blocked`, `archive_resumed`, and `finished`.
+Triggers reject event updates and deletes. Every job mutation and its event are
+one `BEGIN IMMEDIATE` transaction. A nonempty W0 jobs table without matching
+component metadata and event history is an unsupported migration and fails
+initialization rather than fabricating history.
+
+Admission is atomic for a new key. Active means every nonterminal status,
+including `archive_blocked`. Limits are `max_active_jobs_total`,
+`max_active_jobs_per_submitter`, and `max_queued_jobs_total`; administrators are
+not exempt. Per-submitter exhaustion is `429`, and either global exhaustion is
+`503`. An idempotent replay bypasses current quota. Existing mapping lookup
+precedes current bundle visibility and quota checks; a new mapping requires at
+least one historical bundle occurrence from the current Universe projection,
+without requiring active or retired state.
+
+`claim_next` uses one `BEGIN IMMEDIATE` and exactly §3.8's priority and
+`next_attempt_at_ns <= now_ns` boundary. `ClaimResult.mode` is `initialize` only
+for a pre-claim queued row or pristine queued-cancellation archival state
+(`archiving`, pending `cancelled`, no started time, zero attempts); every other
+running or archiving claim is `resume`. A post-claim crash therefore resumes;
+missing local state must later fail closed. Claim transitions that exhaust a
+deadline or attempts are persisted and returned in their resulting state.
 
 | Method and path | Auth | Behaviour |
 |---|---|---|
-| `POST /v1/replay/jobs` | member or admin | `parse_request`; the bundle must exist in the Universe store (in-process, not HTTP); inserts `queued`; returns `201 {job_id, status}` or `400 {"error"}` |
+| `POST /v1/replay/jobs` | member or admin | exactly one valid `Idempotency-Key`; parse the exact received bytes; the bundle must exist in the Universe store for a new key; returns `201/200 {job_id,status,replayed}`; conflicting key/hash is 409, per-user quota is 429, and global quota is 503 |
 | `GET /v1/replay/jobs?status=&limit=&after=` | public | newest first, `limit` ≤ 100, within the existing response budget |
-| `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the parsed request in place of `request_json` bytes |
+| `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the stored request, decoded, in place of `request_json` bytes; it is not re-validated against the current runner registry, so renaming a preset or strategy never hides earlier jobs |
 | `POST /v1/replay/jobs/<job_id>/cancel` | submitter or admin | only while `queued`, applying `cancel`; otherwise 409 |
+| `GET /v1/replay/jobs/<job_id>/events?limit=&cursor=` | public | global event IDs in ascending order, with a strict opaque job-bound `replay_job_events` cursor |
+
+The job list cursor is strict opaque base64url tagged `replay_jobs` and binds
+the newest-first `(created_at_ns,job_id)` position. Both list limits default to
+and are capped at 100. API u64 nanosecond values are decimal strings;
+`submitted_by` is checksummed for display while storage remains lowercase. Job
+detail never returns raw request bytes or an idempotency key. Safe request
+validation failures return their actionable contract message in `error`
+(including malformed JSON location, duplicate keys, missing/unexpected fields,
+and request-v1 field errors) rather than the undiagnostic `invalid request`.
 
 Universe loads `configs/replay_runner.json` to validate strategy and preset
 names; W5 mounts it into both containers. `resume_blocked` is an operator

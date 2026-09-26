@@ -2011,7 +2011,7 @@ class EventUniverseTests(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "event_universe_config_version": 2,
+                    "event_universe_config_version": 3,
                     "database_path": "database.sqlite3",
                     "api": {"host": "127.0.0.1", "port": 8080},
                     "backfill": {
@@ -2030,6 +2030,12 @@ class EventUniverseTests(unittest.TestCase):
                             "admin_address": "0x0000000000000000000000000000000000000000",
                             "nonce_ttl_seconds": 300,
                             "session_ttl_seconds": 43200,
+                        },
+                        "jobs": {
+                            "runner_config_path": "replay_runner.json",
+                            "max_active_jobs_total": 100,
+                            "max_active_jobs_per_submitter": 4,
+                            "max_queued_jobs_total": 64,
                         },
                     },
                 }

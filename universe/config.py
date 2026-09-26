@@ -17,7 +17,7 @@ from archive.storage.base import ObjectStore, normalize_key
 from archive.storage.factory import build_store
 from targeter.v2.models import isoformat, parse_timestamp
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 CONFIG_ENVIRONMENT_VARIABLE = "EVENT_UNIVERSE_CONFIG"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/event_universe.json"
 
@@ -57,9 +57,18 @@ class AuthConfig:
 
 
 @dataclass(frozen=True)
+class ReplayJobsConfig:
+    runner_config_path: Path
+    max_active_jobs_total: int
+    max_active_jobs_per_submitter: int
+    max_queued_jobs_total: int
+
+
+@dataclass(frozen=True)
 class ReplayConfig:
     database_path: Path
     auth: AuthConfig
+    jobs: ReplayJobsConfig
 
 
 @dataclass(frozen=True)
@@ -93,7 +102,7 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         raise UniverseConfigError(f"invalid Event Universe config {source}: {error}") from error
     document = _expand_environment(document)
     if not isinstance(document, dict) or document.get("event_universe_config_version") != CONFIG_VERSION:
-        raise UniverseConfigError("unsupported Event Universe config version; version 2 is required")
+        raise UniverseConfigError("unsupported Event Universe config version; version 3 is required")
     _exact(
         document,
         {
@@ -113,7 +122,7 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         {"temporary_directory", "generated_start", "generated_end"},
     )
     backup = _section(document, "backup", {"directory", "object_prefix"})
-    replay = _section(document, "replay", {"database_path", "auth"})
+    replay = _section(document, "replay", {"database_path", "auth", "jobs"})
     auth = replay.get("auth")
     _exact(
         auth,
@@ -129,6 +138,18 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         "replay.auth",
     )
     assert isinstance(auth, dict)
+    jobs = replay.get("jobs")
+    _exact(
+        jobs,
+        {
+            "runner_config_path",
+            "max_active_jobs_total",
+            "max_active_jobs_per_submitter",
+            "max_queued_jobs_total",
+        },
+        "replay.jobs",
+    )
+    assert isinstance(jobs, dict)
     port = api["port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise UniverseConfigError("api.port must be an integer between 1 and 65535")
@@ -180,6 +201,15 @@ def load_config(path: Path | None = None) -> UniverseConfig:
     chain_id = _positive_integer(auth, "chain_id", "replay.auth")
     nonce_ttl = _bounded_ttl(auth, "nonce_ttl_seconds")
     session_ttl = _bounded_ttl(auth, "session_ttl_seconds")
+    max_active_total = _positive_integer(jobs, "max_active_jobs_total", "replay.jobs")
+    max_active_submitter = _positive_integer(
+        jobs, "max_active_jobs_per_submitter", "replay.jobs"
+    )
+    max_queued_total = _positive_integer(jobs, "max_queued_jobs_total", "replay.jobs")
+    if max_queued_total > max_active_total:
+        raise UniverseConfigError(
+            "replay.jobs.max_queued_jobs_total must not exceed max_active_jobs_total"
+        )
     admin_address = _text(auth, "admin_address", "replay.auth")
     if not is_checksum_address(admin_address):
         raise UniverseConfigError("replay.auth.admin_address must be a valid EIP-55 address")
@@ -225,6 +255,14 @@ def load_config(path: Path | None = None) -> UniverseConfig:
                 admin_address=admin_address,
                 nonce_ttl_seconds=nonce_ttl,
                 session_ttl_seconds=session_ttl,
+            ),
+            jobs=ReplayJobsConfig(
+                runner_config_path=_path(
+                    jobs, "runner_config_path", base, "replay.jobs"
+                ),
+                max_active_jobs_total=max_active_total,
+                max_active_jobs_per_submitter=max_active_submitter,
+                max_queued_jobs_total=max_queued_total,
             ),
         ),
     )
