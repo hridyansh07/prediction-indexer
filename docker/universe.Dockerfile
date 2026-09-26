@@ -35,6 +35,7 @@ COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
 COPY configs/event_universe.json /etc/prediction-indexer/event_universe.json
+COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json
 
 USER universe:universe
 

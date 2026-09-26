@@ -149,6 +149,10 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn(
             '"database_path": "/var/lib/event-universe/jobs.sqlite3"', config
         )
+        self.assertIn(
+            "COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json",
+            dockerfile,
+        )
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"eth-account>=0.13,<0.14"', pyproject)
         self.assertNotIn("COPY universe/", shared)
@@ -177,7 +181,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
                 self.assertIn("load_config()", source)
                 self.assertNotIn("argparse", source)
         config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
-        self.assertIn('"event_universe_config_version": 2', config)
+        self.assertIn('"event_universe_config_version": 3', config)
         self.assertIn('"generated_start": null', config)
         self.assertIn('"generated_end": null', config)
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
@@ -205,7 +209,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         sql_files = list(schema_directory.glob("*.sql"))
         self.assertEqual(
             sorted(path.name for path in sql_files),
-            ["replay_auth.sql", "schema.sql"],
+            ["replay_auth.sql", "replay_jobs.sql", "schema.sql"],
         )
         schema = (schema_directory / "schema.sql").read_text(
             encoding="utf-8"
