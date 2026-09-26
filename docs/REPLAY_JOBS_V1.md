@@ -1,9 +1,8 @@
 # Replay jobs V1
 
-Status: **proposed**. W0 (§3) is implemented in `replay/jobs/contracts.py`,
-`configs/replay_runner.json`, and `replay/tests/test_jobs_contracts.py`. W1 (§4)
-is implemented in `universe/auth.py`, `universe/schema/replay_auth.sql`, and
-`tests/test_replay_auth.py`. W2–W6 are not implemented.
+Status: **in progress**. The shared contracts and durable control plane (§§3–5)
+are implemented. Canonical restore and the immutable bundle cache (§6) are the
+current stage. Runner, deployment, and UI work (§§7–9) are not implemented.
 
 Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md),
@@ -49,8 +48,10 @@ the rebuildable Universe query index.
   identical requests. Mappings are durable with no TTL and keys cannot be
   recycled. The key is HTTP metadata: it is never part of request v1, exposed,
   or archived.
-- **`bundle_id` identifies reusable derivatives, not a job.** Two jobs for one
-  bundle share its cached derivatives but run and archive independently.
+- **`bundle_id` is one cache coordinate, not the cache identity.** Two jobs may
+  reuse a generation only when the complete aligned interval, canonical window
+  period, ordered source receipt identities, full Producer, and ordered
+  derivative pins match. Jobs still run and archive independently.
 - **The archived job receipt and the files it lists are the deliverable.** The
   API reports status, reason, and the receipt key; it does not serve strategy
   results.
@@ -67,21 +68,21 @@ the rebuildable Universe query index.
 ```
 W0 Contracts ──┬─▶ W1 Auth ────────┐
   (landed)     ├─▶ W2 Job API ─────┤
-               ├─▶ W3 Bundle cache ┼─▶ W4 Runner ─▶ W5 Deployment ─▶ live acceptance
+               ├─▶ Bundle cache ───┼─▶ W4 Runner ─▶ W5 Deployment ─▶ live acceptance
                └─▶ W6 UI ◀── W1/W2 API shapes only
 ```
 
-W1, W2, W3, and W6 proceed in parallel from W0. W2 uses a stub auth hook until
-W1 merges. W4 may start in parallel against W3's interface and fakes. W5 comes
-last. A change to a §3 contract is a W0 amendment PR; no workstream edits a
-contract locally.
+The durable W1/W2 control plane has landed. Canonical restore and bundle-cache
+work now proceeds against its contracts. W4 may start in parallel against the
+bundle interface and fakes. W5 comes last. A change to a §3 contract is a
+contract amendment, not an unreviewed local override.
 
 | Workstream | Owns (writes) | Must not touch |
 |---|---|---|
 | W0 | `replay/jobs/contracts.py`, `configs/replay_runner.json`, this document | everything else |
 | W1 | `universe/auth.py`, auth tables, `do_POST`/`do_DELETE` plumbing and body cap in `universe/api.py`, the `replay.auth` config section | job tables, runner, `replay/` |
 | W2 | `universe/replay_jobs.py`, job routes in `universe/api.py` | auth internals, runner stages |
-| W3 | `replay/jobs/bundle.py`, `archive/canonical_restore.py`, `materialize_range --describe` | job DB, Universe, supervisor |
+| Bundle cache | `replay/jobs/bundle.py`, `archive/canonical_restore.py`, `materialize_range --describe`, strict derivative pin inspection | job DB, Universe, supervisor |
 | W4 | `replay/jobs/runner.py`, `replay/jobs/stages.py`, `python -m replay.jobs` | Universe, bundle internals, `archive/` |
 | W5 | `compose.universe.yaml` `replay` profile, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `docs/DEPLOYMENT.md`, AGENTS routing | application code |
 | W6 | `targeter-ui/`, removal of `api/event-universe-proxy.ts` and the `vercel.json` rewrites | Universe, runner |
@@ -205,7 +206,7 @@ rebuild procedure deletes it. W1's auth tables live in the same file.
 |---|---|---|
 | `canonical/date=<YYYY-MM-DD>/window=<start_ns>/{evidence,provenance}.ndjson.zst`, `receipt.json` | existing archiver (read-only here) | `receipt.json` |
 | `replay/derivatives/<address>/{events,rejects,sources}.ndjson.zst`, `manifest.json`, `receipt.json` | W3 | `receipt.json` |
-| `replay/bundles/<bundle_id>/bundle_receipt.json` | W3 | the object |
+| `replay/bundles/<bundle_id>/generations/<generation_sha256>/bundle_receipt.json` | bundle cache | the object |
 | `replay/jobs/<job_id>/…`, `job_receipt.json` | W4 | `job_receipt.json` |
 
 Helpers: `date_partition` (identical to the finalizer's), `canonical_window_keys`
@@ -261,13 +262,14 @@ publish identical bytes and the second `put_immutable` is a no-op. The job's
 `bundle.json` is the byte-exact receipt, parsed with `parse_bundle_receipt`;
 there is no separate bundle-stage schema.
 
-**Manual rebuild (operator procedure, audited):** after every job that used the
-old receipt has archived its `bundle.json`, an operator deletes only
-`replay/bundles/<bundle_id>/bundle_receipt.json` with provider tooling and
-records who, when, and why in the operations log. Derivative objects are never
-deleted. The next job rebuilds; an unchanged producer reproduces the same
-addresses, and a changed producer adds new ones beside the old. This does not
-add a delete operation to the `ObjectStore` protocol.
+`generation_sha256` is the SHA-256 of a domain-separated canonical document
+binding `bundle_id`, the complete aligned interval, canonical window seconds,
+the ordered canonical receipt SHA-256 values, the full Producer, and ordered
+`(derivative_address, receipt_sha256)` pairs. It is not derived from
+`bundle_id` alone and there is no mutable current/latest/singleton object. A
+changed interval, source receipt, producer field, derivative address, or
+derivative receipt creates a distinct immutable generation. Old generations
+and derivatives remain readable and are never overwritten or deleted.
 
 ### 3.6 Stage and job documents
 
@@ -584,13 +586,14 @@ names; W5 mounts it into both containers. `resume_blocked` is an operator
 command, not an HTTP route in V1.
 
 **Tests:** a valid submit and every 400 class; an unknown bundle; 401 when
-unauthenticated; duplicate submissions create distinct jobs; ordering and
+unauthenticated; the same durable `Idempotency-Key` and request replay the
+original job while a different key may create another job; ordering and
 pagination; cancel rules (403 for a non-submitter, 409 once started);
 `claim_next` agreeing with `select_next` on randomized row sets; stale
 compare-and-set rejected; concurrent `claim_next` from two connections claims
 once.
 
-## 6. W3 — Bundle cache (library)
+## 6. Canonical restore and immutable bundle cache (library)
 
 **Delivers** one call that returns local, verified, pinned derivatives for a
 bundle, building and publishing them if absent.
@@ -600,7 +603,7 @@ ensure_bundle(bundle_id, window_interval, *, store, work_root, derivatives_root,
               materializer, window_seconds)
   -> BundleReady(receipt, receipt_bytes, pins: [(directory, address, receipt_sha256)])
    | NotReady(code, detail)                 # canonical_not_archived
-   | StaleCache(cached: Producer, current: Producer)
+   | StaleCache(cached_producer: Producer, current_producer: Producer)
 ```
 
 `window_interval` is `ResolvedJob.window_interval`; W4 slices the pins to the
@@ -608,38 +611,72 @@ job interval. Retryable object-store failures raise with `archive_unavailable`;
 integrity and verification failures raise with `integrity_failure`; tool
 failures with `tool_failure`.
 
-**Cache hit.**
+### 6.1 Trust anchors and strict readers
 
-1. Bounded read (1 MiB) of `bundle_receipt_key(bundle_id)`; `parse_bundle_receipt`.
-2. `parse_producer(materialize_range --describe)`; if it differs from the
-   receipt's producer, return `StaleCache`.
+The remote canonical `receipt.json` is the commit marker and trust anchor. Its
+presence is necessary but not sufficient: the reader bootstraps an
+`ObjectExpectation` from a bounded `head`, requires provider checksum metadata,
+streams the receipt through `open_verified`, and only then strictly parses it.
+The parser rejects duplicate/unknown fields, non-canonical serialization,
+invalid compression declarations, wrong window/path bindings, impossible
+sequence/line counts, and every numeric/hash/schema violation. The evidence and
+provenance expectations are then formed from that trusted receipt plus fresh
+provider metadata; key existence alone never establishes trust.
+
+The restored local `receipt.json` is **not** an archive authority or a second
+trust anchor. It is an exact verified copy written after both verified frames,
+with file and directory fsyncs, solely so existing canonical readers see the
+same receipt-last committed layout. Restore streams through `open_verified`,
+strictly decodes exactly one checksummed Zstandard frame to EOF, verifies stored
+and logical identities and line bounds, and persists the original compressed
+bytes. Empty and incomplete committed windows are valid; an absent remote
+receipt is not an empty window.
+
+Derivative validation uses a dedicated strict Rust pin-inspection interface
+backed by `replay-materialize`'s existing independent verifier. It accepts only
+an addressed directory and exact `(address, receipt_sha256)` pin and verifies
+the receipt, manifest, source binding, domain-separated address, every compressed
+data identity, strict line schemas, single-frame EOF, and clean end of input.
+`replay-publish --validate-only` validates publisher configuration and is not
+the bundle cache's pin-inspection API.
+
+### 6.2 Cache hit
+
+1. Obtain the current Producer from exact bounded
+   `materialize_range --describe` output. This mode performs no canonical,
+   derivative, or configuration-file I/O.
+2. Preflight every required remote canonical receipt before any frame download
+   or upload. If any receipt is absent, return
+   `NotReady("canonical_not_archived", detail)` with no publication.
+3. Compute the source-and-interval generation coordinates. Inspect matching
+   immutable generations under the bundle prefix. A generation with the same
+   interval/source coordinates and another Producer returns `StaleCache`; a
+   byte/schema/hash conflict is `integrity_failure`.
+4. Bounded-read the exact generation receipt and parse it strictly.
 3. For each window, download `replay/derivatives/<address>/*` through
    `open_verified` into `derivatives_root/<address>/`, receipt last, skipping
    directories already present and verified.
-4. Strict `inspect_pinned` check of each (the publisher's `--validate-only`
-   path), then return `BundleReady`.
+4. Run the strict Rust pin inspector on every ordered pin, then return
+   `BundleReady`. A warm hit never invokes materialization.
 
-**Cache miss (build).**
+### 6.3 Cache miss (build)
 
-1. **Restore.** For each window from `window_bounds`, `head` its
-   `canonical_window_keys` receipt. If any is absent, return
-   `NotReady("canonical_not_archived", ...)` before downloading anything.
-   Otherwise use the new generic `archive/canonical_restore.py`: bounded-read
-   and strictly parse the archive `receipt.json`, stream evidence and provenance
-   through `open_verified` against the receipt's stored identities,
-   decode-verify their logical identities, and write them into
-   `work_root/canonical/date=…/window=…/` with fsync, receipt last. The trust
-   anchor is the archive's receipt-last `receipt.json`; local tombstones are not
-   needed. The module must not import `replay` or `targeter`.
+1. **Restore.** Use provider-neutral `archive/canonical_restore.py` after the
+   all-receipts preflight. It implements §6.1 and writes only beneath an owned
+   per-generation scratch directory. It must not import `replay` or `targeter`.
 2. **Materialize.** Run `materialize_range` with `{canonical_root:
    work_root/canonical, output_root: derivatives_root, start_ns, end_ns}`. Its
    existing receipt scan sees only the restored windows. It returns the
    normalizer identity and ordered pins; the producer comes from `--describe`.
-3. **Upload** each derivative's files with `put_immutable`, `receipt.json` last.
-4. **Publish** `bundle_receipt_bytes(...)` with `put_immutable`. An existing
+3. **Inspect and upload** each derivative only after strict Rust pin inspection;
+   upload the fixed data/manifest allowlist with `put_immutable`, then
+   `receipt.json` last.
+4. **Publish** `bundle_receipt_bytes(...)` at its content-addressed generation
+   key with `put_immutable`. An existing
    identical receipt (another job built it) is a no-op; a different one is an
    `IntegrityConflict` → `integrity_failure`.
-5. Delete `work_root/canonical/`. It is runner-owned scratch, not evidence.
+5. Remove only the owned generation scratch. Never delete a derivative or any
+   other generation.
 
 Every period has a committed canonical receipt: the finalizer's
 `tile_absent_windows` commits an empty, incomplete receipt naming every
@@ -647,18 +684,51 @@ expected lane for any hole. So a missing key means only "not yet finalized or
 archived". Empty and incomplete windows restore and replay normally; finding
 where books are usable is the coverage strategy's job.
 
-**Engine change:** `materialize_range --describe` prints the §3.5 producer
-descriptor and exits, with no I/O beyond stdout.
+**Engine change:** `materialize_range --describe` prints the exact canonical
+§3.5 Producer and exits, with no materialization or data/configuration I/O. A
+separate strict `--inspect-pin` mode is the cache's derivative verification
+interface.
 
-**Tests** (disposable in-memory `ObjectStore` with real compressed bytes; the
-existing synthetic canonical fixture): a cold build publishes derivatives
-before the receipt, and a warm call downloads without materializing; two builds
-of one bundle publish identical receipt bytes; `NotReady` when any key is
-missing, with nothing uploaded; `StaleCache` on each producer field change; an
-empty tiled window builds; a crash after each upload is resumed idempotently;
-different bytes at an existing key raise `integrity_failure`; a tampered stored
-object fails verification; an import test proving `canonical_restore` never
-imports `replay` or `targeter`.
+### 6.4 Frozen limits, concurrency, and crash recovery
+
+Limits are fixed for V1: at most 4096 windows; 1 MiB per receipt/manifest and
+4 MiB total subprocess stdout; 1 MiB captured stderr; 16 MiB per NDJSON line;
+8 GiB stored and 32 GiB decoded per canonical frame; 1 TiB aggregate canonical
+scratch, 1 TiB aggregate derivative publication input, and 16 GiB verifier
+temporary space per call; exactly the five derivative files in §3.4 and no
+other object; and a 3600-second materializer/inspector timeout. Reads and copies
+are streaming. Subprocesses use a fixed argv, minimal allowlisted environment,
+no shell, bounded output, and process-group timeout termination.
+
+All roots and children are checked for containment. Symlinks, traversal,
+non-regular files, unexpected entries, over-budget output, and address/directory
+mismatch fail closed. Publication order is data, manifest, derivative receipt,
+then bundle receipt. Pins are ordered by window and independently verified.
+
+Concurrent callers may build the same generation independently. Immutable
+addressing and receipt-last publication make the result deterministic; a local
+per-generation `flock` is only an optimization and never the correctness
+mechanism. Before the bundle receipt exists, partial local scratch and remote
+objects are untrusted: owned scratch is discarded and rebuilt, while immutable
+uploads resume only by exact verification/no-op. Once the bundle receipt is
+published, the generation is committed. A conflict or tamper at any boundary
+fails closed and is never repaired in place.
+
+Error mapping is closed: retryable store availability faults are
+`archive_unavailable`; receipt/object/hash/schema/immutability violations are
+`integrity_failure`; materializer or inspector launch, timeout, output, exit, or
+protocol failures are `tool_failure`.
+
+**Tests** use disposable stores, generated compressed canonical fixtures, and
+temporary directories only. They cover strict receipt bootstrap and restore;
+missing/oversized/malformed/non-canonical/wrong-store/tampered/identity-mismatched
+inputs; empty and incomplete windows; exact `--describe`; every Producer field;
+strict pin rejection for receipt/manifest/data/address/source/Zstandard/hash
+tampering; cold ordering; warm no-materializer equality; interval/source-aware
+generation identity; deterministic concurrent builders; crash injection at each
+local/upload/receipt boundary and deterministic retry; immutable conflicts and
+partial state; every window/file/object/disk/subprocess/output/path limit; and an
+import test proving `canonical_restore` never imports `replay` or `targeter`.
 
 ## 7. W4 — Runner
 
@@ -765,9 +835,9 @@ mocked provider; lint, typecheck, and build.
   before capture shows up honestly as not initialized.
 - Every terminal job, including cancelled, not-ready, and stale ones, is
   archived with a receipt.
-- The producer descriptor lives only on the bundle receipt and is compared
-  whole. A mismatch is `stale_bundle_cache`; rebuilding is the manual §3.5
-  procedure.
+- The Producer is compared whole. A matching source/interval generation with a
+  different Producer is `stale_bundle_cache`; immutable generations coexist and
+  there is no delete/rebuild procedure or mutable bundle singleton.
 - Only queued jobs can be cancelled in V1.
 - SIWE nonces live in the single Universe process's memory with a server-side
   TTL; the client's `Issued At` is not a freshness check. Every sign-in message
