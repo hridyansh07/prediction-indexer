@@ -1,5 +1,5 @@
 {
-  "event_universe_config_version": 1,
+  "event_universe_config_version": 2,
   "database_path": "/var/lib/event-universe/event-universe.sqlite3",
   "api": {
     "host": "0.0.0.0",
@@ -13,5 +13,17 @@
   "backup": {
     "directory": "/var/lib/event-universe/backups",
     "object_prefix": "event-universe/backups"
+  },
+  "replay": {
+    "database_path": "/var/lib/event-universe/jobs.sqlite3",
+    "auth": {
+      "siwe_domain": "universe.example",
+      "siwe_uri": "https://universe.example/login",
+      "siwe_statement": "Sign in to Prediction Indexer.",
+      "chain_id": 1,
+      "admin_address": "0x0000000000000000000000000000000000000000",
+      "nonce_ttl_seconds": 300,
+      "session_ttl_seconds": 43200
+    }
   }
 }

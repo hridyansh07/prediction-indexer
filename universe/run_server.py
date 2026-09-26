@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from universe.api import serve  # noqa: E402
+from universe.auth import AuthStore  # noqa: E402
 from universe.config import load_config  # noqa: E402
 from universe.store import UniverseStore  # noqa: E402
 
@@ -17,7 +18,9 @@ def main() -> None:
     config = load_config()
     database = UniverseStore(config.database_path)
     database.initialize()
-    serve(database, config.api.host, config.api.port)
+    auth = AuthStore(config.replay.database_path, config.replay.auth)
+    auth.initialize()
+    serve(database, auth, config.api.host, config.api.port)
 
 
 if __name__ == "__main__":

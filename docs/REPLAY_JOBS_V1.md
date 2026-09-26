@@ -1,8 +1,9 @@
 # Replay jobs V1
 
 Status: **proposed**. W0 (§3) is implemented in `replay/jobs/contracts.py`,
-`configs/replay_runner.json`, and `replay/tests/test_jobs_contracts.py`. W1–W6
-are not implemented.
+`configs/replay_runner.json`, and `replay/tests/test_jobs_contracts.py`. W1 (§4)
+is implemented in `universe/auth.py`, `universe/schema/replay_auth.sql`, and
+`tests/test_replay_auth.py`. W2–W6 are not implemented.
 
 Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md),
@@ -433,14 +434,28 @@ write plumbing.
 The write plumbing: `do_POST`/`do_DELETE` dispatch with a 64 KiB body cap and
 `Content-Type: application/json` required, returning 413/415 otherwise.
 
-**Config** (`replay.auth` section of `event_universe.json`; all fields required,
-closed): `siwe_domain`, `siwe_uri`, `chain_id`, `admin_address` (EIP-55),
-`nonce_ttl_seconds` (300), `session_ttl_seconds` (43200).
+**Config** (`replay` section of `event_universe.json` version 2; all fields
+required, closed): `replay.database_path` (the durable `jobs.sqlite3`) and
+`replay.auth` with `siwe_domain`, `siwe_uri`, `siwe_statement`, `chain_id`,
+`admin_address` (EIP-55), `nonce_ttl_seconds` (300), and `session_ttl_seconds`
+(43200). `siwe_statement` is the exact statement line every sign-in message
+carries, e.g. `Sign in to Prediction Indexer.`; the UI uses the same text.
+While the shipped zero-address admin placeholder remains, the sign-in routes
+return 503 and every other route is unaffected.
 
-**Tables** (in `jobs.sqlite3`): `nonces(nonce, expires_at_ns, used_at_ns)`,
-`sessions(token_sha256, address, role, expires_at_ns, revoked_at_ns)`,
-`allowlist(address, note, added_by, added_at_ns)`, and the append-only
-`allowlist_events(seq, actor, action, address, note, at_ns)`.
+**Nonces are held in memory, not in SQLite.** A process-local store maps each
+nonce to the server time it expires (`nonce_ttl_seconds` after the server
+issued it). It is locked, so consuming a nonce is atomic across the server's
+threads, and capped at 500 outstanding nonces: expired ones are pruned on
+each issue, and a full store returns 503. Caddy rate limiting on the nonce
+route (W5) is the first defence. A restart drops outstanding nonces and users
+simply sign in again. This requires exactly one `event-universe` process; a
+second worker or replica would need shared nonce storage.
+
+**Tables** (in `jobs.sqlite3`): `sessions(token_hash, address, role,
+created_at, expires_at, revoked_at)`, `allowlist(address, note, created_at,
+created_by)`, and the append-only `allowlist_events(event_id, action, address,
+note, actor_address, created_at)`, whose immutability triggers enforce.
 
 | Method and path | Auth | Behaviour |
 |---|---|---|
@@ -451,27 +466,43 @@ closed): `siwe_domain`, `siwe_uri`, `chain_id`, `admin_address` (EIP-55),
 | `POST /v1/admin/allowlist` | admin | `{address, note}`; idempotent |
 | `DELETE /v1/admin/allowlist/<address>` | admin | removes the address and revokes its live sessions |
 
-SIWE verification order (the first failure wins):
+SIWE verification (every failure is the same 401):
 
-1. strict EIP-4361 parse;
-2. domain, URI, and chain ID equal config;
-3. version `1`;
-4. nonce known, unexpired, unused, and **consumed atomically**;
-5. `issued-at` within the nonce lifetime and `expiration-time`, if present, in
-   the future;
-6. the recovered EIP-191 signer equals the message address;
-7. the address is `admin_address` or on the allowlist.
+1. strict EIP-4361 parse of the with-statement layout: the configured domain
+   header, a checksummed address, the configured statement, then the fields in
+   order;
+2. URI, version `1`, and chain ID equal config; `Issued At` is a well-formed
+   UTC timestamp;
+3. `Not Before`, if present, has passed and `Expiration Time`, if present, has
+   not;
+4. the recovered EIP-191 signer equals the message address;
+5. the nonce is live and is **consumed atomically**. Only a correctly signed
+   message spends its nonce;
+6. the address is `admin_address` or on the allowlist.
+
+**Freshness is the server's.** The nonce's server-side TTL and single use are
+the replay protection. The client-written `Issued At` is never compared with
+the server clock, so browser clock drift cannot break sign-in. `Expiration
+Time` can only shorten the session, never extend it past
+`session_ttl_seconds`.
 
 Tokens are 256 random bits; only their SHA-256 is stored. Addresses are stored
 lowercase and returned checksummed. The admin comes from config and cannot be
-removed through the API. Dependency: `siwe` or `eth-account`, pinned in the
+removed through the API; changing it invalidates the old admin's sessions
+because the role is re-checked on every request. Verification is offline
+`ecrecover`, so the admin must be an externally owned account, not an EIP-1271
+contract wallet. Dependency: `eth-account`, pinned in `pyproject.toml` and the
 Universe image.
 
 **Tests** (offline, keys generated in the test): a valid login; wrong domain,
-URI, or chain; a replayed or expired nonce; a bad signature; a signer that
-differs from the message address; a non-allowlisted address; a member calling
-admin routes; revocation on removal; the admin cannot be removed; body cap and
-content type; existing GET routes unchanged.
+URI, chain, statement, or a missing statement; malformed `Issued At`; client
+clocks hours ahead or behind still signing in; a nonce expired by the server
+TTL, unknown, replayed, or raced by two logins; a bad signature not spending
+the nonce; a restart dropping outstanding nonces; the capped store returning
+503 and pruning expired nonces; the placeholder admin disabling sign-in; a
+non-allowlisted address; a member calling admin routes; revocation on removal;
+the admin cannot be removed; body cap and content type; existing GET routes
+unchanged.
 
 ## 5. W2 — Job API and store (Universe)
 
@@ -626,7 +657,8 @@ byte-identical semantic files.
 **Delivers** the `replay` profile in `compose.universe.yaml`:
 
 - `caddy`: automatic TLS for `REPLAY_PUBLIC_HOST`, request-body and time limits,
-  static `targeter-ui/dist`, and `/v1/*` → `event-universe:8080`.
+  a rate limit on `GET /v1/auth/nonce`, static `targeter-ui/dist`, and `/v1/*` →
+  `event-universe:8080`. `event-universe` stays a single process (§4).
 - `replay-redis`: `redis:8.2` with `--maxmemory <finite>
   --maxmemory-policy noeviction --save "" --appendonly no`; no published port.
 - `replay-runner`: `docker/replay-runner.Dockerfile` with the venv including
@@ -685,6 +717,9 @@ mocked provider; lint, typecheck, and build.
   whole. A mismatch is `stale_bundle_cache`; rebuilding is the manual §3.5
   procedure.
 - Only queued jobs can be cancelled in V1.
+- SIWE nonces live in the single Universe process's memory with a server-side
+  TTL; the client's `Issued At` is not a freshness check. Every sign-in message
+  carries one configured statement.
 - The Vercel proxy is removed. Caddy on the Universe host provides TLS, limits,
   and same-origin UI serving. The 1.75 MB response budget is Universe's own
   constant and can be revisited separately.
