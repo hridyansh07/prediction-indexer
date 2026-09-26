@@ -665,7 +665,7 @@ the bundle cache's pin-inspection API.
    all-receipts preflight. It implements §6.1 and writes only beneath an owned
    per-generation scratch directory. It must not import `replay` or `targeter`.
 2. **Materialize.** Run `materialize_range` with `{canonical_root:
-   work_root/canonical, output_root: derivatives_root, start_ns, end_ns}`. Its
+   scratch/canonical, output_root: scratch/materialized, start_ns, end_ns}`. Its
    existing receipt scan sees only the restored windows. It returns the
    normalizer identity and ordered pins; the producer comes from `--describe`.
 3. **Inspect and upload** each derivative only after strict Rust pin inspection;
@@ -694,11 +694,11 @@ interface.
 Limits are fixed for V1: at most 4096 windows; 1 MiB per receipt/manifest and
 4 MiB total subprocess stdout; 1 MiB captured stderr; 16 MiB per NDJSON line;
 8 GiB stored and 32 GiB decoded per canonical frame; 1 TiB aggregate canonical
-scratch, 1 TiB aggregate derivative publication input, and 16 GiB verifier
-temporary space per call; exactly the five derivative files in §3.4 and no
-other object; and a 3600-second materializer/inspector timeout. Reads and copies
-are streaming. Subprocesses use a fixed argv, minimal allowlisted environment,
-no shell, bounded output, and process-group timeout termination.
+input, 1 TiB aggregate derivative input, and 2 TiB aggregate owned generation
+scratch per call; exactly the five derivative files in §3.4 and no other
+object; and a 3600-second materializer/inspector timeout. Reads and copies are
+streaming. Subprocesses use a fixed argv, minimal allowlisted environment, no
+shell, bounded output, and process-group timeout termination.
 
 All roots and children are checked for containment. Symlinks, traversal,
 non-regular files, unexpected entries, over-budget output, and address/directory

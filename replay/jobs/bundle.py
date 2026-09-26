@@ -6,12 +6,12 @@ import fcntl
 import hashlib
 import os
 import re
-import resource
 import shutil
 import signal
 import stat
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -58,6 +58,7 @@ MAX_SUBPROCESS_STDERR = 1024 * 1024
 MAX_SUBPROCESS_SECONDS = 3600
 MAX_CANONICAL_SCRATCH_BYTES = 1024 * 1024 * 1024 * 1024
 MAX_DERIVATIVE_BYTES = 1024 * 1024 * 1024 * 1024
+MAX_GENERATION_SCRATCH_BYTES = MAX_CANONICAL_SCRATCH_BYTES + MAX_DERIVATIVE_BYTES
 MAX_GENERATION_OBJECTS = MAX_BUNDLE_WINDOWS
 
 
@@ -149,56 +150,94 @@ def _read_verified(store, key: str, maximum: int, *, content_type: str, content_
     return b"".join(chunks)
 
 
-def _child_setup(stdout_limit: int, stderr_limit: int):
-    def setup():
-        os.setsid()
-        resource.setrlimit(resource.RLIMIT_FSIZE, (max(stdout_limit, stderr_limit) + 1, max(stdout_limit, stderr_limit) + 1))
-
-    return setup
-
-
 def _run_tool(executable: Path, arguments: tuple[str, ...], stdin: bytes, scratch: Path) -> bytes:
     executable = Path(executable)
     if not executable.is_absolute() or executable.is_symlink() or not executable.is_file():
         raise BundleFailure("tool_failure", "materializer must be an absolute regular executable")
     if len(stdin) > 1024 * 1024:
         raise BundleFailure("tool_failure", "materializer stdin exceeds 1 MiB")
-    scratch.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryFile(dir=scratch) as stdout, tempfile.TemporaryFile(dir=scratch) as stderr:
+    _owned_root(scratch, "tool scratch")
+    try:
+        process = subprocess.Popen(
+            [str(executable), *arguments],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            cwd=scratch,
+            env={"LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise _failure("tool_failure", error) from error
+
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
+    overrun = threading.Event()
+    pipe_errors: list[OSError] = []
+
+    def terminate() -> None:
         try:
-            process = subprocess.Popen(
-                [str(executable), *arguments],
-                stdin=subprocess.PIPE,
-                stdout=stdout,
-                stderr=stderr,
-                shell=False,
-                cwd=scratch,
-                env={"LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
-                start_new_session=False,
-                preexec_fn=_child_setup(MAX_SUBPROCESS_STDOUT, MAX_SUBPROCESS_STDERR),
-            )
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def read_pipe(name: str, limit: int) -> None:
+        pipe = getattr(process, name)
+        try:
             try:
-                process.communicate(stdin, timeout=MAX_SUBPROCESS_SECONDS)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                raise BundleFailure("tool_failure", "materializer timed out") from None
-        except BundleFailure:
-            raise
+                while chunk := pipe.read(64 * 1024):
+                    if len(outputs[name]) + len(chunk) > limit:
+                        overrun.set()
+                        terminate()
+                        return
+                    outputs[name].extend(chunk)
+            except OSError as error:
+                pipe_errors.append(error)
+                terminate()
+        finally:
+            pipe.close()
+
+    def write_stdin() -> None:
+        try:
+            process.stdin.write(stdin)
+            process.stdin.flush()
         except OSError as error:
-            raise _failure("tool_failure", error) from error
-        stdout.seek(0, os.SEEK_END)
-        stdout_length = stdout.tell()
-        stderr.seek(0, os.SEEK_END)
-        stderr_length = stderr.tell()
-        if stdout_length > MAX_SUBPROCESS_STDOUT or stderr_length > MAX_SUBPROCESS_STDERR:
-            raise BundleFailure("tool_failure", "materializer output exceeds its byte budget")
-        stderr.seek(0)
-        diagnostic = stderr.read().decode("utf-8", "replace").replace("\n", " ")[:1024]
-        if process.returncode != 0:
-            raise BundleFailure("tool_failure", f"materializer exited {process.returncode}: {diagnostic}")
-        stdout.seek(0)
-        output = stdout.read()
+            if not isinstance(error, BrokenPipeError):
+                pipe_errors.append(error)
+                terminate()
+        finally:
+            process.stdin.close()
+
+    threads = (
+        threading.Thread(target=read_pipe, args=("stdout", MAX_SUBPROCESS_STDOUT)),
+        threading.Thread(target=read_pipe, args=("stderr", MAX_SUBPROCESS_STDERR)),
+        threading.Thread(target=write_stdin),
+    )
+    for thread in threads:
+        thread.start()
+    try:
+        try:
+            process.wait(timeout=MAX_SUBPROCESS_SECONDS)
+        except subprocess.TimeoutExpired:
+            terminate()
+            process.wait()
+            raise BundleFailure("tool_failure", "materializer timed out") from None
+    except BaseException:
+        terminate()
+        process.wait()
+        raise
+    finally:
+        for thread in threads:
+            thread.join()
+
+    if overrun.is_set():
+        raise BundleFailure("tool_failure", "materializer output exceeds its byte budget")
+    if pipe_errors:
+        raise _failure("tool_failure", pipe_errors[0])
+    output = bytes(outputs["stdout"])
+    diagnostic = bytes(outputs["stderr"]).decode("utf-8", "replace").replace("\n", " ")[:1024]
+    if process.returncode != 0:
+        raise BundleFailure("tool_failure", f"materializer exited {process.returncode}: {diagnostic}")
     if not output.endswith(b"\n") or output.count(b"\n") != 1:
         raise BundleFailure("tool_failure", "materializer stdout is not one JSON line")
     return output[:-1]
@@ -321,6 +360,50 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _directory_names(path: Path) -> set[str]:
+    try:
+        entries = tuple(os.scandir(path))
+    except OSError as error:
+        raise _failure("tool_failure", error) from error
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            raise BundleFailure("tool_failure", f"unexpected non-directory entry beneath {path}")
+    return {entry.name for entry in entries}
+
+
+def _validate_materialized_window(path: Path, address: str) -> None:
+    try:
+        entries = {entry.name: entry for entry in os.scandir(path)}
+    except OSError as error:
+        raise _failure("tool_failure", error) from error
+    lock = f".{address}.lock"
+    if set(entries) != {address, lock}:
+        raise BundleFailure("tool_failure", "materializer output has unexpected derivative entries")
+    if not entries[address].is_dir(follow_symlinks=False) or not entries[lock].is_file(follow_symlinks=False):
+        raise BundleFailure("tool_failure", "materializer output contains a non-regular derivative entry")
+
+
+def _tree_bytes(root: Path, maximum: int) -> int:
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as error:
+            raise _failure("tool_failure", error) from error
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+                if total > maximum:
+                    raise BundleFailure("tool_failure", "generation scratch exceeds aggregate byte budget")
+            else:
+                raise BundleFailure("tool_failure", "generation scratch contains a non-regular entry")
+    return total
+
+
 def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, materializer: Path, scratch: Path) -> BundlePin:
     _pin_values(address, receipt_sha256)
     _owned_root(root, "derivatives_root")
@@ -357,16 +440,23 @@ def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, 
         shutil.rmtree(stage_root, ignore_errors=True)
 
 
-def _download_derivative(store, address, receipt_sha256, root, materializer, scratch) -> BundlePin:
+def _add_derivative_bytes(paths, budget: list[int]) -> None:
+    for path in paths:
+        budget[0] += _file_identity(path).byte_length
+        if budget[0] > MAX_DERIVATIVE_BYTES:
+            raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
+
+
+def _download_derivative(store, address, receipt_sha256, root, materializer, scratch, budget) -> BundlePin:
     target = root / address
     if target.exists() and (target / "receipt.json").is_file():
         pin = BundlePin(target, address, receipt_sha256)
         _inspect(materializer, pin, scratch)
+        _add_derivative_bytes((target / name for name in DERIVATIVE_FILES), budget)
         return pin
     stage_source = Path(tempfile.mkdtemp(prefix=".bundle-download-", dir=scratch)) / address
     stage_source.mkdir()
     try:
-        total = 0
         for name in DERIVATIVE_FILES:
             key = derivative_key(address, name)
             metadata = store.head(key)
@@ -375,8 +465,8 @@ def _download_derivative(store, address, receipt_sha256, root, materializer, scr
             content_type, content_encoding = _attributes(name)
             if (metadata.content_type, metadata.content_encoding) != (content_type, content_encoding):
                 raise BundleFailure("integrity_failure", f"{key} has invalid provider metadata")
-            total += metadata.byte_length
-            if total > MAX_DERIVATIVE_BYTES:
+            budget[0] += metadata.byte_length
+            if budget[0] > MAX_DERIVATIVE_BYTES:
                 raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
             with store.open_verified(_expectation(metadata)) as reader, open(stage_source / name, "xb") as writer:
                 while chunk := reader.read(1024 * 1024):
@@ -389,23 +479,23 @@ def _download_derivative(store, address, receipt_sha256, root, materializer, scr
 
 
 def _ready(store, receipt, raw, derivatives_root, materializer, scratch) -> BundleReady:
+    budget = [0]
     pins = tuple(
         _download_derivative(
             store, window.derivative_address, window.receipt_sha256,
-            derivatives_root, materializer, scratch,
+            derivatives_root, materializer, scratch, budget,
         )
         for window in receipt.windows
     )
     return BundleReady(receipt, raw, pins)
 
 
-def _upload_derivative(store, pin: BundlePin) -> None:
-    total = 0
+def _upload_derivative(store, pin: BundlePin, budget: list[int]) -> None:
     for name in DERIVATIVE_FILES:
         path = pin.directory / name
         identity = _file_identity(path)
-        total += identity.byte_length
-        if total > MAX_DERIVATIVE_BYTES:
+        budget[0] += identity.byte_length
+        if budget[0] > MAX_DERIVATIVE_BYTES:
             raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
         content_type, content_encoding = _attributes(name)
         with path.open("rb") as source:
@@ -415,14 +505,18 @@ def _upload_derivative(store, pin: BundlePin) -> None:
             )
 
 
-def _build(bundle_id, interval, store, work_root, derivatives_root, materializer, window_seconds, remotes, producer, scratch):
+def _build(bundle_id, interval, store, derivatives_root, materializer, window_seconds, remotes, producer, scratch):
     canonical_root = scratch / "canonical"
     output_root = scratch / "materialized"
-    canonical_bytes = sum(
+    canonical_stored_bytes = sum(
         remote.evidence.expected.stored.byte_length + remote.provenance.expected.stored.byte_length
         for remote in remotes
     )
-    if canonical_bytes > MAX_CANONICAL_SCRATCH_BYTES:
+    canonical_decoded_bytes = sum(
+        remote.evidence.logical.byte_length + remote.provenance.logical.byte_length
+        for remote in remotes
+    )
+    if max(canonical_stored_bytes, canonical_decoded_bytes) > MAX_CANONICAL_SCRATCH_BYTES:
         raise BundleFailure("integrity_failure", "aggregate canonical scratch exceeds budget")
     for remote in remotes:
         restore_canonical_window(store, remote, canonical_root)
@@ -435,11 +529,15 @@ def _build(bundle_id, interval, store, work_root, derivatives_root, materializer
             "version": 1,
         }
     )
-    response = _strict_response(_run_tool(materializer, (), request, scratch))
+    tool_output = _run_tool(materializer, (), request, scratch)
+    _tree_bytes(scratch, MAX_GENERATION_SCRATCH_BYTES)
+    response = _strict_response(tool_output)
     if response["normalizer"] != producer.document()["normalizer"]:
         raise BundleFailure("tool_failure", "materializer response normalizer disagrees with --describe")
     if len(response["derivatives"]) != len(remotes):
         raise BundleFailure("tool_failure", "materializer returned the wrong derivative count")
+    if _directory_names(output_root) != {f"window={remote.window_start_ns}" for remote in remotes}:
+        raise BundleFailure("tool_failure", "materializer output has unexpected window entries")
     windows = []
     pins = []
     for remote, value in zip(remotes, response["derivatives"], strict=True):
@@ -450,7 +548,9 @@ def _build(bundle_id, interval, store, work_root, derivatives_root, materializer
         if value["window_start_ns"] != remote.window_start_ns or value["window_end_ns"] != remote.window_end_ns:
             raise BundleFailure("tool_failure", "materializer pins are not ordered by requested window")
         address, receipt_sha256 = _pin_values(value["derivative_address"], value["receipt_sha256"])
-        source = output_root / f"window={remote.window_start_ns}" / address
+        window_root = output_root / f"window={remote.window_start_ns}"
+        _validate_materialized_window(window_root, address)
+        source = window_root / address
         built_pin = BundlePin(source, address, receipt_sha256)
         _inspect(materializer, built_pin, scratch)
         pin = _install_local(source, address, receipt_sha256, derivatives_root, materializer, scratch)
@@ -458,8 +558,9 @@ def _build(bundle_id, interval, store, work_root, derivatives_root, materializer
         windows.append(BundleWindow(remote.window_start_ns, remote.window_end_ns, remote.receipt_sha256, address, receipt_sha256))
     receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, tuple(windows))
     raw = bundle_receipt_bytes(receipt)
+    derivative_budget = [0]
     for pin in pins:
-        _upload_derivative(store, pin)
+        _upload_derivative(store, pin, derivative_budget)
     generation = bundle_generation_sha256(receipt)
     identity = StoredIdentity(hashlib.sha256(raw).hexdigest(), len(raw))
     with tempfile.SpooledTemporaryFile(max_size=MAX_BUNDLE_RECEIPT_BYTES) as source:
@@ -530,7 +631,7 @@ def ensure_bundle(
             scratch = Path(tempfile.mkdtemp(prefix=f"generation-{coordinate}-", dir=work_root))
             try:
                 return _build(
-                    bundle_id, (first, last), store, work_root, derivatives_root,
+                    bundle_id, (first, last), store, derivatives_root,
                     materializer, window_seconds, remotes, producer, scratch,
                 )
             finally:

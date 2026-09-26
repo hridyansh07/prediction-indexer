@@ -4,10 +4,12 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 from archive.archiver.canonical import CanonicalArchiver
 from archive.storage import LocalObjectStore, ObjectStoreError
 from encoder import StoredIdentity
+from replay.jobs import bundle
 from replay.jobs.bundle import BundleFailure, BundleReady, NotReady, StaleCache, ensure_bundle
 from tests.archive_fixtures import BASE_NS, WINDOW_SECONDS, write_canonical_receipt
 
@@ -66,6 +68,25 @@ class BundleCacheTest(unittest.TestCase):
             materializer=materializer,
             window_seconds=WINDOW_SECONDS,
         )
+
+    def helper(self, body):
+        path = self.root / f"helper-{len(tuple(self.root.glob('helper-*')))}"
+        path.write_text(f"#!/usr/bin/env python3\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_subprocess_stdout_stderr_and_timeout_are_hard_bounded(self):
+        cases = (
+            ("import sys; sys.stdout.write('x' * 17)", "MAX_SUBPROCESS_STDOUT", 16, "byte budget"),
+            ("import sys; sys.stderr.write('x' * 17)", "MAX_SUBPROCESS_STDERR", 16, "byte budget"),
+            ("import time; time.sleep(2)", "MAX_SUBPROCESS_SECONDS", 0.01, "timed out"),
+        )
+        for body, setting, limit, detail in cases:
+            with self.subTest(setting=setting), mock.patch.object(bundle, setting, limit):
+                with self.assertRaises(BundleFailure) as caught:
+                    bundle._run_tool(self.helper(body), (), b"", self.work)
+                self.assertEqual(caught.exception.code, "tool_failure")
+                self.assertIn(detail, caught.exception.detail)
 
     def test_missing_receipt_is_not_ready_without_publication(self):
         result = self.ensure()

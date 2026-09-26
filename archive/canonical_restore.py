@@ -90,15 +90,21 @@ def _strict_json(raw: bytes) -> dict[str, Any]:
             value[key] = item
         return value
 
+    def invalid_constant(value):
+        raise CanonicalRestoreError(f"canonical receipt contains invalid JSON constant {value}")
+
     try:
-        document = json.loads(raw, object_pairs_hook=pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        document = json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise CanonicalRestoreError(f"canonical receipt is not strict JSON: {error}") from error
     if not isinstance(document, dict):
         raise CanonicalRestoreError("canonical receipt is not an object")
     # The finalizer's durable serializer is two-space pretty JSON plus LF. Key
     # order is schema-owned by Rust and is therefore retained during this check.
-    canonical = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+    try:
+        canonical = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+    except UnicodeError as error:
+        raise CanonicalRestoreError(f"canonical receipt contains invalid Unicode: {error}") from error
     if raw != canonical:
         raise CanonicalRestoreError("canonical receipt is not in finalizer serialization")
     return document
@@ -135,9 +141,11 @@ def _parse_output(value: Any, name: str, key: str, metadata: ObjectMetadata) -> 
     )
     if (
         compression["algorithm"] != "zstd"
+        or type(compression["level"]) is not int
         or compression["level"] != 3
         or compression["frame_checksum"] is not True
         or compression["dictionary"] is not None
+        or type(compression["frame_count"]) is not int
         or compression["frame_count"] != 1
         or not isinstance(compression["encoder"], str)
         or not compression["encoder"]
@@ -270,7 +278,12 @@ def preflight_canonical_window(
     _closed(document, fields, "canonical receipt", {"carried", "clock_faults"})
     start = _u64(document["window_start_ns"], "window_start_ns")
     end = _u64(document["window_end_ns"], "window_end_ns")
-    if document["receipt_version"] != 1 or document["finalizer_version"] != 1:
+    if (
+        type(document["receipt_version"]) is not int
+        or document["receipt_version"] != 1
+        or type(document["finalizer_version"]) is not int
+        or document["finalizer_version"] != 1
+    ):
         raise CanonicalRestoreError("canonical receipt version is unsupported")
     if start != window_start_ns or end != start + window_seconds * 1_000_000_000:
         raise CanonicalRestoreError("canonical receipt names another window")
@@ -291,7 +304,12 @@ def preflight_canonical_window(
     if first is None and last is None:
         if evidence.logical.line_count != 0:
             raise CanonicalRestoreError("nonempty canonical receipt has no sequence range")
-    elif type(first) is not int or type(last) is not int or first < 1 or last < first or last - first + 1 != evidence.logical.line_count:
+    elif (
+        type(first) is not int
+        or type(last) is not int
+        or not 1 <= first <= last < 2**63
+        or last - first + 1 != evidence.logical.line_count
+    ):
         raise CanonicalRestoreError("canonical sequence range is invalid")
     return RemoteCanonicalWindow(start, end, raw, receipt_metadata.sha256, receipt_expectation, evidence, provenance)
 
@@ -360,7 +378,11 @@ def restore_canonical_window(
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not stat.S_ISDIR(root.stat(follow_symlinks=False).st_mode):
         raise CanonicalRestoreError("canonical restore root is not an owned regular directory")
-    directory = root / f"date={_date_partition(remote.window_start_ns)}" / f"window={remote.window_start_ns}"
+    partition = root / f"date={_date_partition(remote.window_start_ns)}"
+    partition.mkdir(exist_ok=True)
+    if partition.is_symlink() or not stat.S_ISDIR(partition.stat(follow_symlinks=False).st_mode):
+        raise CanonicalRestoreError("canonical restore date partition is not a regular directory")
+    directory = partition / f"window={remote.window_start_ns}"
     if directory.exists():
         if directory.is_symlink() or not directory.is_dir():
             raise CanonicalRestoreError("canonical restore destination is not a directory")

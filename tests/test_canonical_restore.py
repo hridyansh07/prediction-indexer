@@ -38,6 +38,17 @@ class CanonicalRestoreTest(unittest.TestCase):
         self.assertEqual(parsed.evidence.decoded.line_count, 2)
         self.assertEqual(restored.read_bytes(), self.source.read_bytes())
 
+    def test_restore_rejects_symlinked_partition_without_writing_outside(self):
+        remote = preflight_canonical_window(self.store, BASE_NS, WINDOW_SECONDS)
+        destination = self.root / "restored"
+        destination.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (destination / self.source.parent.parent.name).symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(CanonicalRestoreError):
+            restore_canonical_window(self.store, remote, destination)
+        self.assertEqual(tuple(outside.iterdir()), ())
+
     def test_missing_oversized_malformed_noncanonical_and_tampered_fail(self):
         absent = LocalObjectStore(self.root / "absent")
         self.assertIsNone(preflight_canonical_window(absent, BASE_NS, WINDOW_SECONDS))
