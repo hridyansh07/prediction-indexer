@@ -178,6 +178,31 @@ class ReplayAuthTests(unittest.TestCase):
                 with self.assertRaises(UniverseConfigError):
                     load_config(source)
 
+    def test_replay_jobs_config_is_closed_positive_and_bounded(self) -> None:
+        source = Path(self.temporary.name) / "config.json"
+        document = json.loads(
+            (Path(__file__).resolve().parents[1] / "configs/event_universe.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        cases = (
+            ("max_active_jobs_total", 0),
+            ("max_active_jobs_per_submitter", True),
+            ("max_queued_jobs_total", -1),
+        )
+        for field, value in cases:
+            candidate = json.loads(json.dumps(document))
+            candidate["replay"]["jobs"][field] = value
+            source.write_text(json.dumps(candidate), encoding="utf-8")
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(UniverseConfigError, "positive integer"):
+                    load_config(source)
+        document["replay"]["jobs"]["max_active_jobs_total"] = 10
+        document["replay"]["jobs"]["max_queued_jobs_total"] = 11
+        source.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(UniverseConfigError, "must not exceed"):
+            load_config(source)
+
     def test_schema_is_idempotent_and_rejects_tampering(self) -> None:
         self.store.initialize()
         with sqlite3.connect(self.path) as connection:
