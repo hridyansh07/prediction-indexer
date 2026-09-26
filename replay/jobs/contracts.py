@@ -710,8 +710,10 @@ def derivative_key(derivative_address, file):
     return f"replay/derivatives/{derivative_address}/{file}"
 
 
-def bundle_receipt_key(bundle_id):
-    return f"replay/bundles/{_identifier(bundle_id, 'bundle id')}/bundle_receipt.json"
+def bundle_receipt_key(bundle_id, generation_sha256):
+    bundle = _identifier(bundle_id, "bundle id")
+    generation = _hex64(generation_sha256, "bundle generation sha256")
+    return f"replay/bundles/{bundle}/generations/{generation}/bundle_receipt.json"
 
 
 def job_object_key(job_id_value, relative):
@@ -1049,6 +1051,15 @@ def bundle_receipt_bytes(receipt):
     # Re-run construction checks in case a caller bypassed them.
     rebuilt = replace(receipt, windows=tuple(replace(w) for w in receipt.windows))
     return encoded(_bundle_receipt_document(rebuilt))
+
+
+def bundle_generation_sha256(receipt):
+    """Complete immutable generation identity for one bundle receipt."""
+    body = bundle_receipt_bytes(receipt)
+    digest = hashlib.sha256()
+    digest.update(b"prediction-indexer/replay-bundle-generation/v1\0")
+    digest.update(body)
+    return digest.hexdigest()
 
 
 # --- Bundle history resolution (§3.9) ---------------------------------------
