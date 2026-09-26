@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import sqlite3
@@ -102,6 +103,19 @@ class ReplayJobStoreTests(unittest.TestCase):
             connection.execute("DROP TRIGGER job_events_no_delete")
         with self.assertRaisesRegex(ValueError, "invalid replay jobs schema"):
             self.store.initialize()
+
+    def test_metadata_hashes_normalized_owned_schema_not_sql_file_bytes(self) -> None:
+        with sqlite3.connect(self.path) as connection:
+            stored = connection.execute(
+                "SELECT schema_sha256 FROM replay_job_components "
+                "WHERE component='replay_jobs'"
+            ).fetchone()[0]
+            actual = self.store._schema_digest(connection)
+        raw = hashlib.sha256(
+            (ROOT / "universe/schema/replay_jobs.sql").read_bytes()
+        ).hexdigest()
+        self.assertEqual(stored, actual)
+        self.assertNotEqual(stored, raw)
 
     def test_nonempty_w0_table_requires_migration(self) -> None:
         other = Path(self.temp.name) / "legacy.sqlite3"

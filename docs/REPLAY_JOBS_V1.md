@@ -530,6 +530,10 @@ exact-before row check, so stale or corrupt writers cannot overwrite a newer
 row. Failed writes append no event.
 
 The component first initializes W0's `JOBS_SCHEMA_SQL`, then its owned schema.
+Its metadata binds a SHA-256 over the deterministically ordered, whitespace-
+normalized `sqlite_master` definitions for only those owned objects; unrelated
+auth objects may coexist and formatting-only changes to the SQL source do not
+change the schema identity.
 `job_submissions` stores `(submitted_by,idempotency_key,request_sha256,job_id,
 created_at_ns)`, with submitter/key as its primary key and a unique job foreign
 key. `job_events` has one global monotonic sequence, closed transition fields,
@@ -570,7 +574,10 @@ The job list cursor is strict opaque base64url tagged `replay_jobs` and binds
 the newest-first `(created_at_ns,job_id)` position. Both list limits default to
 and are capped at 100. API u64 nanosecond values are decimal strings;
 `submitted_by` is checksummed for display while storage remains lowercase. Job
-detail never returns raw request bytes or an idempotency key.
+detail never returns raw request bytes or an idempotency key. Safe request
+validation failures return their actionable contract message in `error`
+(including malformed JSON location, duplicate keys, missing/unexpected fields,
+and request-v1 field errors) rather than the undiagnostic `invalid request`.
 
 Universe loads `configs/replay_runner.json` to validate strategy and preset
 names; W5 mounts it into both containers. `resume_blocked` is an operator

@@ -13,7 +13,12 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
-from replay.jobs.contracts import RunnerConfig, parse_request, request_sha256
+from replay.jobs.contracts import (
+    ContractError,
+    RunnerConfig,
+    parse_request,
+    request_sha256,
+)
 from universe.auth import AuthError, AuthStore, checksum_address
 from universe.replay_jobs import ReplayJobError, ReplayJobStore
 from universe.store import (
@@ -490,6 +495,9 @@ def build_server(
             except ReplayJobError as error:
                 self._send_json(error.status, {"error": str(error)})
                 return
+            except (ContractError, _RequestError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
             except (ValueError, TypeError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
                 return
@@ -540,13 +548,17 @@ def build_server(
             if len(payload) != length:
                 raise _FramingError(HTTPStatus.BAD_REQUEST, "incomplete request body")
             try:
-                document = json.loads(
-                    payload.decode("utf-8"), object_pairs_hook=_unique_object
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-                raise ValueError("invalid JSON") from error
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise _RequestError("request body must be UTF-8 JSON") from error
+            try:
+                document = json.loads(text, object_pairs_hook=_unique_object)
+            except json.JSONDecodeError as error:
+                raise _RequestError(
+                    f"invalid JSON at line {error.lineno} column {error.colno}"
+                ) from error
             if not isinstance(document, dict):
-                raise ValueError("JSON body must be an object")
+                raise _RequestError("JSON body must be an object")
             return document, payload
 
         def _send_json(self, status: int, document: dict[str, Any]) -> None:
@@ -595,11 +607,15 @@ class _FramingError(Exception):
         self.message = message
 
 
+class _RequestError(ValueError):
+    """A validation failure whose message is safe to return to the client."""
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("duplicate JSON key")
+            raise _RequestError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
 
@@ -622,7 +638,14 @@ def _single_header(headers: Any, field: str) -> str:
 
 def _exact_body(document: dict[str, Any], fields: set[str]) -> None:
     if set(document) != fields:
-        raise ValueError("request body fields are invalid")
+        missing = sorted(fields - set(document))
+        unexpected = sorted(set(document) - fields)
+        details = []
+        if missing:
+            details.append(f"missing fields: {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected fields: {', '.join(unexpected)}")
+        raise _RequestError("request body fields are invalid; " + "; ".join(details))
 
 
 def _only(query: dict[str, list[str]], expected: set[str]) -> None:

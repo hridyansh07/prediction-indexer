@@ -14,7 +14,9 @@ append-only job transition events.
 SIWE nonces are deliberately not persisted: they live in the server process's
 memory with a TTL and are lost on restart. The durable Replay database does not
 use `PRAGMA user_version`; each component validates only the objects it owns so
-the auth and jobs schemas coexist. Never place these durable records in the
+the auth and jobs schemas coexist. Replay jobs records a SHA-256 over its
+ordered, whitespace-normalized owned `sqlite_master` definitions rather than
+the formatting of the source SQL file. Never place these durable records in the
 rebuildable Event Universe projection database or remove them during a Universe
 projection rebuild.
 

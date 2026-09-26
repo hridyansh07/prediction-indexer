@@ -116,6 +116,33 @@ class ReplayJobsHTTPAcceptanceTests(unittest.TestCase):
         response.read()
         connection.close()
 
+    def test_bad_requests_return_actionable_safe_errors(self) -> None:
+        headers = {
+            "Authorization": f"Bearer {self.token()}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "diagnostic-errors",
+        }
+        malformed_cases = (
+            (b"{", "invalid JSON at line 1 column 2"),
+            (b'{"x":1,"x":2}', "duplicate JSON key: x"),
+            (b"[]", "JSON body must be an object"),
+        )
+        for body, message in malformed_cases:
+            with self.subTest(message=message):
+                status, payload, _ = self.request(
+                    "POST", "/v1/replay/jobs", body, headers
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload, {"error": message})
+
+        document = json.loads(request_bytes())
+        document["unexpected"] = True
+        status, payload, _ = self.request(
+            "POST", "/v1/replay/jobs", json.dumps(document).encode(), headers
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("request must have exactly the fields", payload["error"])
+
     def test_sign_in_submit_replay_read_cancel_claim_and_restart(self) -> None:
         token = self.token()
         raw = request_bytes(pretty=True)

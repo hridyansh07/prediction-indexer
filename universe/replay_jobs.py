@@ -67,7 +67,7 @@ class ReplayJobStore:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         schema_bytes = SCHEMA_PATH.read_bytes()
-        digest = hashlib.sha256(schema_bytes).hexdigest()
+        digest = self._expected_schema_digest()
         with closing(self.connect()) as connection:
             try:
                 has_metadata = connection.execute(
@@ -129,10 +129,31 @@ class ReplayJobStore:
             return cls._schema_objects(connection)
 
     @classmethod
-    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
+    def _expected_schema_digest(cls) -> str:
+        expected = cls._expected_objects()
+        return cls._objects_digest(expected, expected)
+
+    @classmethod
+    def _schema_digest(cls, connection: sqlite3.Connection) -> str:
         expected = cls._expected_objects()
         actual = cls._schema_objects(connection)
-        if any(actual.get(key) != value for key, value in expected.items()):
+        return cls._objects_digest(actual, expected)
+
+    @staticmethod
+    def _objects_digest(
+        objects: dict[tuple[str, str], str],
+        owned: dict[tuple[str, str], str],
+    ) -> str:
+        normalized = [
+            [kind, name, objects.get((kind, name))]
+            for kind, name in sorted(owned)
+        ]
+        payload = json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
+        if cls._schema_digest(connection) != cls._expected_schema_digest():
             raise ValueError("database contains an invalid replay jobs schema")
 
     @contextmanager
