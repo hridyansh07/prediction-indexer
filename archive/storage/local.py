@@ -309,6 +309,26 @@ class LocalObjectStore:
                 # winner's content decides whether this is a retry or a
                 # conflict; either way we never overwrite it.
                 published = self.head(normalized)
+                if (
+                    published is not None
+                    and published.matches(expected_identity)
+                    and (published.content_type, published.content_encoding)
+                    == (None, None)
+                    and (content_type, content_encoding) != (None, None)
+                ):
+                    # The winning writer may still be between its durable data
+                    # link and its local metadata sidecar. Re-entering the
+                    # existing-object path applies the same narrowly scoped
+                    # crash recovery used on an ordinary retry: identical bytes
+                    # plus wholly absent attributes may establish the requested
+                    # attributes; present-but-different attributes conflict.
+                    return self.put_immutable(
+                        normalized,
+                        reader,
+                        expected_identity,
+                        content_type=content_type,
+                        content_encoding=content_encoding,
+                    )
                 if published is not None and published.matches_request(
                     expected_identity, content_type, content_encoding
                 ):

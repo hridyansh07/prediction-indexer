@@ -653,10 +653,10 @@ the bundle cache's pin-inspection API.
    interval/source coordinates and another Producer returns `StaleCache`; a
    byte/schema/hash conflict is `integrity_failure`.
 4. Bounded-read the exact generation receipt and parse it strictly.
-3. For each window, download `replay/derivatives/<address>/*` through
+5. For each window, download `replay/derivatives/<address>/*` through
    `open_verified` into `derivatives_root/<address>/`, receipt last, skipping
    directories already present and verified.
-4. Run the strict Rust pin inspector on every ordered pin, then return
+6. Run the strict Rust pin inspector on every ordered pin, then return
    `BundleReady`. A warm hit never invokes materialization.
 
 ### 6.3 Cache miss (build)
