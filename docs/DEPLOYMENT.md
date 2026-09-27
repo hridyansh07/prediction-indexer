@@ -933,6 +933,14 @@ docker build -f docker/replay-runner.Dockerfile \
 # REPLAY_RUNNER_IMAGE=registry.example/prediction-indexer-replay-runner@sha256:...
 ```
 
+Both `event-universe` and `replay-runner` read the host checkout's
+`configs/replay_runner.json`. When a release changes
+`replay_runner_config_version`, re-pin `REPLAY_RUNNER_IMAGE` to a runner built
+from that same revision before the checkout is updated on the host: an older
+runner rejects the newer config and every tick fails before claiming. Retire a
+strategy by setting its `status` to `retired` and restarting `event-universe`;
+never delete its entry (see `docs/REPLAY_JOBS_V1.md` §3.10).
+
 Caddy and Redis are pinned by multi-platform OCI digest in Compose, and
 the runner is pulled by the digest set above rather than rebuilt. Validate
 configuration before touching services:

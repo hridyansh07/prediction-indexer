@@ -5,6 +5,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 from archive.archiver.canonical import canonical_object_keys
 from replay.jobs import contracts as c
@@ -30,6 +31,17 @@ def canonical(value):
 
 def runner_config():
     return c.parse_runner_config(CONFIG_PATH.read_bytes())
+
+
+def retired_config():
+    config = runner_config()
+    entry = config.strategies["bundle_coverage"]
+    return replace(
+        config,
+        strategies=MappingProxyType(
+            {"bundle_coverage": replace(entry, status=c.STRATEGY_RETIRED)}
+        ),
+    )
 
 
 def request(**changes):
@@ -215,6 +227,32 @@ class RequestTest(unittest.TestCase):
         for name, body in cases.items():
             with self.subTest(name), self.assertRaises(c.ContractError):
                 c.parse_request(body, config)
+
+    def test_retired_strategy_refuses_new_requests_but_parses_accepted_ones(self):
+        config = retired_config()
+        with self.assertRaisesRegex(c.ContractError, "retired and accepts no new jobs"):
+            c.parse_request(raw(request()), config)
+        parsed = c.parse_request(raw(request()), config, accept_retired=True)
+        self.assertEqual(parsed.strategy, "bundle_coverage")
+        self.assertEqual(
+            parsed.sha256, c.parse_request(raw(request()), runner_config()).sha256
+        )
+
+    def test_unknown_strategy_error_lists_only_active_strategies(self):
+        config = runner_config()
+        coverage = config.strategies["bundle_coverage"]
+        config = replace(
+            config,
+            strategies=MappingProxyType(
+                {
+                    "bundle_coverage": coverage,
+                    "old_coverage": replace(coverage, status=c.STRATEGY_RETIRED),
+                }
+            ),
+        )
+        with self.assertRaises(c.ContractError) as caught:
+            c.parse_request(raw(request(strategy={"name": "x", "config": {}})), config)
+        self.assertEqual(str(caught.exception), "strategy.name must be one of: bundle_coverage")
 
     def test_parsed_request_is_immutable(self):
         parsed = c.parse_request(raw(request()), runner_config())
@@ -715,14 +753,32 @@ class RunnerConfigTest(unittest.TestCase):
         self.assertEqual(set(config.authorities), {"kalshi", "limitless", "polymarket"})
         self.assertEqual(config.orchestration, c.Orchestration(20, 86400, 60))
         self.assertIn("small", config.limits)
+        self.assertEqual(
+            config.strategies["bundle_coverage"],
+            c.StrategyEntry(
+                factory="replay.bundle_coverage:build",
+                reader="replay.coverage_output:read_completed",
+                config_schema="bundle_coverage_v1",
+                label="Bundle coverage",
+                description="Evaluates historical coverage for the selected bundle.",
+                status=c.STRATEGY_ACTIVE,
+            ),
+        )
 
     def test_rejections(self):
         base = json.loads(CONFIG_PATH.read_bytes())
         small = base["limits"]["small"]
         orchestration = base["orchestration"]
+        coverage = base["strategies"]["bundle_coverage"]
 
         def with_(**changes):
             return raw({**base, **changes})
+
+        def entry(**changes):
+            return with_(strategies={"x": {**coverage, **changes}})
+
+        def without(field):
+            return with_(strategies={"x": {k: v for k, v in coverage.items() if k != field}})
 
         cases = {
             "unknown field": with_(extra=1),
@@ -734,8 +790,21 @@ class RunnerConfigTest(unittest.TestCase):
             "relative url": with_(universe_base_url="event-universe:8080"),
             "window seconds": with_(canonical_window_seconds=7),
             "missing venue": with_(authorities={"kalshi": "kalshi", "limitless": "limitless"}),
-            "bad factory": with_(strategies={"x": {"factory": "nope", "reader": "a:b", "config_schema": "bundle_coverage_v1"}}),
-            "unknown schema": with_(strategies={"x": {"factory": "a:b", "reader": "a:b", "config_schema": "nope"}}),
+            "version 1": with_(replay_runner_config_version=1),
+            "no strategies": with_(strategies={}),
+            "bad factory": entry(factory="nope"),
+            "unknown schema": entry(config_schema="nope"),
+            "missing label": without("label"),
+            "missing description": without("description"),
+            "missing status": without("status"),
+            "unknown entry field": entry(module="x"),
+            "empty label": entry(label=""),
+            "long label": entry(label="x" * (c.MAX_STRATEGY_LABEL + 1)),
+            "control label": entry(label="a\nb"),
+            "numeric label": entry(label=1),
+            "long description": entry(description="x" * (c.MAX_STRATEGY_DESCRIPTION + 1)),
+            "unknown status": entry(status="removed"),
+            "status case": entry(status="Active"),
             "limits order": with_(limits={"small": {**small, "stall_seconds": 1000}}),
             "float attempts": with_(limits={"small": {**small, "attempts": 3.0}}),
         }

@@ -127,13 +127,18 @@ At most 64 KiB.
 - `interval`: `null` (the whole bundle interval) or `{"start_ns", "end_ns"}` as
   canonical unsigned decimal strings, start < end.
 - `strategy.name`: a key of the runner registry; never a module or factory.
+  A new request must name an `active` entry; a `retired` one is rejected with
+  `strategy '<name>' is retired and accepts no new jobs` (§3.10).
   `strategy.config` is checked against the entry's `config_schema` in
   `STRATEGY_CONFIG_SCHEMAS`: request keys are allowed, runner-owned and unknown
   keys are rejected. `bundle_coverage_v1` allows no request keys; the runner
   supplies `version`, `snapshot_directory`, and `snapshot_sha256`.
 - `limits`: a preset name in the runner config.
 
-`parse_request(raw, config) -> Request` (deeply immutable);
+`parse_request(raw, config, *, accept_retired=False) -> Request` (deeply
+immutable). Only work accepted while its strategy was active passes
+`accept_retired=True`: the runner's re-parse of a claimed job and the lookup of
+an idempotent resubmission.
 `request_sha256(request)` hashes the canonical encoding, so whitespace and key
 order do not change it.
 
@@ -388,7 +393,7 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
 
 ```json
 {
-  "replay_runner_config_version": 1,
+  "replay_runner_config_version": 2,
   "universe_base_url": "http://event-universe:8080",
   "scope": "jobs",
   "canonical_window_seconds": 1800,
@@ -397,7 +402,10 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
     "bundle_coverage": {
       "factory": "replay.bundle_coverage:build",
       "reader": "replay.coverage_output:read_completed",
-      "config_schema": "bundle_coverage_v1"
+      "config_schema": "bundle_coverage_v1",
+      "label": "Bundle coverage",
+      "description": "Evaluates historical coverage for the selected bundle.",
+      "status": "active"
     }
   },
   "limits": {"small": {"max_entry_bytes": 1048576, "max_queue_bytes": 67108864,
@@ -421,7 +429,28 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
 - `orchestration` is server-owned; no request can change it. The numbers may be
   tuned, but the semantics in §3.8 are fixed.
 
+- `strategies`: a nonempty object keyed by `[A-Za-z0-9_.-]{1,128}`. Each entry
+  is closed: `factory` and `reader` (`module:function`), `config_schema` (a key
+  of `STRATEGY_CONFIG_SCHEMAS`), `label` (1–64 printable characters),
+  `description` (1–512 printable characters), and `status` (`active` or
+  `retired`). Version 1 entries, which had no display fields or status, are
+  rejected.
+
 Adding a strategy means changing the image and this registry, never a request.
+
+A strategy is never removed from the registry; it is retired. Retiring sets
+`status: retired` and keeps `factory`, `reader`, and `config_schema` working in
+the image, so:
+
+- new submissions naming it are rejected;
+- an idempotent resubmission of a job accepted before retirement still returns
+  that job;
+- queued, running, archiving, and blocked jobs that name it run and archive to
+  completion, because the runner re-parses them with `accept_retired=True`;
+- job detail, list, and the strategy catalogue (§5) keep its name and label.
+
+Deleting an entry would leave every such job to fail as `internal_failure` when
+it is next claimed, so the registry's entry set only grows.
 
 ### 3.11 Tests
 
@@ -436,8 +465,12 @@ direct construction and bypassed fields failing serialization; unnormalized,
 backslash, and NUL keys; canonical round trips and single-field tampering for
 the bundle receipt, resolved job, result, and job receipt; partial receipts for
 cancelled, not-ready, stale, failed, and exhausted jobs; deterministic
-equal-timestamp failures; and the shipped runner config with its orchestration
-section.
+equal-timestamp failures; the shipped runner config with its orchestration
+section; strict strategy entries (display fields, status, version 1 rejected);
+and retired strategies refusing new requests while `accept_retired` still parses
+accepted ones. `replay/tests/test_job_runner.py` proves a job accepted before
+retirement keeps running, and `tests/test_replay_jobs_http.py` covers the
+catalogue and retired submission, including idempotent replay.
 
 ## 4. W1 — Auth (Universe)
 
@@ -588,6 +621,32 @@ deadline or attempts are persisted and returned in their resulting state.
 | `GET /v1/replay/jobs/<job_id>` | public | the row (status, stage, pending outcome, reason code and detail, attempts, times, archive receipt key) with the stored request, decoded, in place of `request_json` bytes; it is not re-validated against the current runner registry, so renaming a preset or strategy never hides earlier jobs |
 | `POST /v1/replay/jobs/<job_id>/cancel` | submitter or admin | only while `queued`, applying `cancel`; otherwise 409 |
 | `GET /v1/replay/jobs/<job_id>/events?limit=&cursor=` | public | global event IDs in ascending order, with a strict opaque job-bound `replay_job_events` cursor |
+| `GET /v1/replay/strategies` | public | the strategy catalogue below; no query parameters |
+
+The strategy catalogue is generated from the runner config Universe loaded at
+start, so it lists exactly what submission validates against:
+
+```json
+{
+  "version": 1,
+  "strategies": [
+    {
+      "name": "bundle_coverage",
+      "label": "Bundle coverage",
+      "description": "Evaluates historical coverage for the selected bundle.",
+      "status": "active",
+      "config_keys": []
+    }
+  ],
+  "limits": ["small"]
+}
+```
+
+Strategies are sorted by name and include retired entries so earlier jobs keep
+their labels; only `active` entries accept new jobs. `config_keys` is the sorted
+`request_keys` of the entry's config schema. `limits` is the sorted preset
+names. Factory and reader module paths are not exposed. A registry change takes
+effect when Universe restarts.
 
 The job list cursor is strict opaque base64url tagged `replay_jobs` and binds
 the newest-first `(created_at_ns,job_id)` position. Both list limits default to
@@ -599,7 +658,9 @@ validation failures return their actionable contract message in `error`
 and request-v1 field errors) rather than the undiagnostic `invalid request`.
 
 Universe loads `configs/replay_runner.json` to validate strategy and preset
-names; production deployment mounts it into both containers. `resume_blocked` is an operator
+names; production deployment mounts the same host file into both containers,
+so a runner-config version change must ship with a runner image built from the
+same revision. `resume_blocked` is an operator
 command, not an HTTP route in V1.
 
 **Tests:** a valid submit and every 400 class; an unknown bundle; 401 when
@@ -930,8 +991,10 @@ authorized job. Never delete derivative objects or mutate a marker/receipt.
 - Replay pages: a job list and a job detail showing status, stage, pending
   outcome, reason code and detail, attempts, and the archive receipt key. There
   is no result summary in V1: the archived receipt is the deliverable. A
-  "Replay this bundle" action in the History bundle drawer submits
-  `{bundle_id, interval: null, strategy: bundle_coverage}`. Admin-only allowlist
+  "Replay this bundle" action in the History bundle drawer offers the `active`
+  strategies and the presets from `GET /v1/replay/strategies` and submits
+  `{bundle_id, interval: null, strategy, limits}`; job views label strategies
+  from the same catalogue, retired ones included. Admin-only allowlist
   management.
 
 **Tests:** view models against the W1/W2 response shapes; sign-in state with a

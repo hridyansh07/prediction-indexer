@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
 from replay.jobs.contracts import (
+    STRATEGY_CONFIG_SCHEMAS,
     ContractError,
     RunnerConfig,
     parse_request,
@@ -54,6 +55,9 @@ class UniverseApplication:
             return HTTPStatus.OK, {"members": self.auth.list_members()}
         if parsed.path == "/v1/replay/jobs" and self.replay_jobs is not None:
             return HTTPStatus.OK, self._replay_jobs(query)
+        if parsed.path == "/v1/replay/strategies" and self.runner_config is not None:
+            _only(query, set())
+            return HTTPStatus.OK, _replay_strategies(self.runner_config)
         if (
             parsed.path.startswith("/v1/replay/jobs/")
             and parsed.path.endswith("/events")
@@ -221,7 +225,11 @@ class UniverseApplication:
             key = _single_header(headers, "Idempotency-Key")
             if raw_body is None or self.runner_config is None:
                 raise ValueError("invalid request")
-            request = parse_request(raw_body, self.runner_config)
+            # A retired strategy still names jobs accepted before retirement,
+            # so an idempotent replay of one returns it; only new jobs are refused.
+            request = parse_request(
+                raw_body, self.runner_config, accept_retired=True
+            )
             existing = self.replay_jobs.lookup_submission(
                 principal.address, key, request_sha256(request)
             )
@@ -231,6 +239,7 @@ class UniverseApplication:
                     "status": existing.row.status,
                     "replayed": True,
                 }
+            request = parse_request(raw_body, self.runner_config)
             occurrences, _more = self.database.list_selections(
                 bundle_id=request.bundle_id, limit=1
             )
@@ -772,6 +781,33 @@ def _decode_cursor(value: str) -> list[Any]:
     if not isinstance(decoded, list):
         raise ValueError("cursor is invalid")
     return decoded
+
+
+REPLAY_STRATEGIES_VERSION = 1
+
+
+def _replay_strategies(config: RunnerConfig) -> dict[str, Any]:
+    """The runner registry as the UI needs it; module paths are not exposed.
+
+    Retired strategies stay listed so earlier jobs keep their labels; only
+    ``status: active`` entries accept new jobs.
+    """
+    return {
+        "version": REPLAY_STRATEGIES_VERSION,
+        "strategies": [
+            {
+                "name": name,
+                "label": entry.label,
+                "description": entry.description,
+                "status": entry.status,
+                "config_keys": sorted(
+                    STRATEGY_CONFIG_SCHEMAS[entry.config_schema].request_keys
+                ),
+            }
+            for name, entry in sorted(config.strategies.items())
+        ],
+        "limits": sorted(config.limits),
+    }
 
 
 def _replay_jobs_cursor(value: str | None) -> tuple[int, str] | None:
