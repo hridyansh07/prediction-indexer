@@ -354,7 +354,9 @@ queued work from starting.
 - `advance(row, stage, now)` commits the current stage and starts the next;
   `stage_attempts` resets to 1 (the running attempt) and a retry reason clears.
 - `retry_later(row, code, detail, orchestration, now)` accepts only retryable
-  codes and schedules backoff.
+  codes and schedules backoff. While archiving it preserves the pending
+  outcome's `reason_code` and `reason_detail` exactly; archive diagnostics live
+  only in the runner's durable local reconciliation state.
 - `succeed` (after `read`), `fail(code)`, and `cancel` (queued only) enter
   `archiving` with the mapped pending outcome.
 - `lose_local_state(row, detail, now)` applies when a running or archiving job's
@@ -363,8 +365,11 @@ queued work from starting.
   whatever objects exist. It **never recreates** a missing supervisor directory
   under the same job ID, because that would reset the supervisor's persisted
   retry budgets.
-- `block_archive`, `resume_blocked` (manual operator action), and `finish`
-  (after the job receipt is durable).
+- `block_archive`, `resume_blocked` (manual operator action), and
+  `finish(row, finished_at_ns, now_ns)` (after the job receipt is durable).
+  `finished_at_ns` is frozen with the receipt before publication and remains
+  byte-identical across a publication-to-SQLite crash; `now_ns` is the later
+  reconciliation time used for the row update and event.
 
 ### 3.9 Bundle history resolution
 

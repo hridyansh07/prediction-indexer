@@ -229,7 +229,7 @@ class TransitionTest(unittest.TestCase):
         row = running("read")
         row = c.succeed(row, 20 * SECOND)
         self.assertEqual((row.status, row.pending_outcome, row.stage), ("archiving", "succeeded", "archive"))
-        row = c.finish(row, 30 * SECOND)
+        row = c.finish(row, 30 * SECOND, 30 * SECOND)
         self.assertEqual(row.status, "succeeded")
         self.assertEqual(row.archive_receipt_key, c.job_receipt_key(JOB))
 
@@ -240,12 +240,12 @@ class TransitionTest(unittest.TestCase):
             with self.subTest(code):
                 row = c.fail(running("bundle"), code, "detail", 20 * SECOND)
                 self.assertEqual((row.status, row.pending_outcome, row.reason_code), ("archiving", outcome, code))
-                self.assertEqual(c.finish(row, 30 * SECOND).status, outcome)
+                self.assertEqual(c.finish(row, 30 * SECOND, 30 * SECOND).status, outcome)
 
     def test_cancel_goes_through_archiving(self):
         row = c.cancel(queued(), 20 * SECOND)
         self.assertEqual((row.status, row.pending_outcome, row.stage_attempts), ("archiving", "cancelled", 0))
-        self.assertEqual(c.finish(c.claim(row, ORCH, 20 * SECOND), 30 * SECOND).status, "cancelled")
+        self.assertEqual(c.finish(c.claim(row, ORCH, 20 * SECOND), 30 * SECOND, 30 * SECOND).status, "cancelled")
         with self.assertRaises(c.ContractError):
             c.cancel(running(), 20 * SECOND)
 
@@ -254,7 +254,7 @@ class TransitionTest(unittest.TestCase):
             with self.subTest(status), self.assertRaises(c.ContractError):
                 replace(running(), status=status)
         with self.assertRaises(c.ContractError):
-            c.finish(running("read"), 1)
+            c.finish(running("read"), 1, 1)
         with self.assertRaises(c.ContractError):
             c.fail(queued(), "tool_failure", None, 1)
         with self.assertRaises(c.ContractError):
@@ -263,12 +263,24 @@ class TransitionTest(unittest.TestCase):
             c.succeed(running("run"), 1)
 
     def test_every_terminal_row_requires_archive_receipt(self):
-        done = c.finish(c.succeed(running("read"), 20 * SECOND), 30 * SECOND)
+        done = c.finish(c.succeed(running("read"), 20 * SECOND), 30 * SECOND, 30 * SECOND)
         for field, value in (("archive_receipt_key", None), ("finished_at_ns", None)):
             with self.subTest(field), self.assertRaises(c.ContractError):
                 replace(done, **{field: value})
         with self.assertRaises(c.ContractError):
             replace(done, archive_receipt_key="replay/jobs/other/job_receipt.json")
+
+    def test_finish_preserves_frozen_receipt_time_during_later_reconciliation(self):
+        row = c.fail(running("run"), "supervisor_failed", "exit 20", 20 * SECOND)
+        done = c.finish(row, 25 * SECOND, 40 * SECOND)
+        self.assertEqual(done.finished_at_ns, 25 * SECOND)
+        self.assertEqual(done.updated_at_ns, 40 * SECOND)
+        for finished, reconciled in (
+            (9 * SECOND, 40 * SECOND),
+            (41 * SECOND, 40 * SECOND),
+        ):
+            with self.subTest(finished=finished), self.assertRaises(c.ContractError):
+                c.finish(row, finished, reconciled)
 
     def test_pending_outcome_only_while_archiving(self):
         with self.assertRaises(c.ContractError):
@@ -310,6 +322,15 @@ class SchedulingTest(unittest.TestCase):
         for code in ("tool_failure", "integrity_failure", "cancelled"):
             with self.subTest(code), self.assertRaises(c.ContractError):
                 c.retry_later(running(), code, None, ORCH, 20 * SECOND)
+
+    def test_archival_retry_preserves_pending_outcome_detail(self):
+        row = c.fail(running("run"), "supervisor_failed", "original detail", 20 * SECOND)
+        retried = c.retry_later(
+            row, "archive_unavailable", "provider diagnostic", ORCH, 30 * SECOND
+        )
+        self.assertEqual(retried.reason_code, "supervisor_failed")
+        self.assertEqual(retried.reason_detail, "original detail")
+        self.assertEqual(retried.next_attempt_at_ns, 90 * SECOND)
 
     def test_work_stage_exhaustion_moves_to_archived_failure(self):
         row = running()
@@ -393,9 +414,9 @@ class JobsTableTest(unittest.TestCase):
             "retrying": c.retry_later(running(), "archive_unavailable", "s3", ORCH, 20 * SECOND),
             "archiving": archiving,
             "blocked": c.block_archive(archiving, "archive_conflict", 30 * SECOND),
-            "succeeded": c.finish(archiving, 40 * SECOND),
-            "failed": c.finish(c.fail(base, "tool_failure", "x", 20 * SECOND), 40 * SECOND),
-            "cancelled": c.finish(c.cancel(queued(), 20 * SECOND), 40 * SECOND),
+            "succeeded": c.finish(archiving, 40 * SECOND, 40 * SECOND),
+            "failed": c.finish(c.fail(base, "tool_failure", "x", 20 * SECOND), 40 * SECOND, 40 * SECOND),
+            "cancelled": c.finish(c.cancel(queued(), 20 * SECOND), 40 * SECOND, 40 * SECOND),
         }
 
     def test_every_valid_row_inserts(self):

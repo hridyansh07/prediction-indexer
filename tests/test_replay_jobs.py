@@ -260,7 +260,7 @@ class ReplayJobStoreTests(unittest.TestCase):
             row = store.save(row, after)
         archiving = c.succeed(row, 80 * SECOND)
         row = store.save(row, archiving)
-        terminal = c.finish(row, 90 * SECOND)
+        terminal = c.finish(row, 90 * SECOND, 90 * SECOND)
         store.save(row, terminal)
         replacement = store.submit(
             request_bytes(), c.parse_request(request_bytes(), self.config),
@@ -432,7 +432,7 @@ class ReplayJobStoreTests(unittest.TestCase):
         row = self.store.save(row, after)
         after = c.resume_blocked(row, 180 * SECOND)
         row = self.store.save(row, after)
-        after = c.finish(row, 190 * SECOND)
+        after = c.finish(row, 190 * SECOND, 190 * SECOND)
         self.store.save(row, after)
         events, _ = self.store.list_events(after.job_id, limit=100)
         event_types = [event["event_type"] for event in events]
@@ -446,6 +446,17 @@ class ReplayJobStoreTests(unittest.TestCase):
             "finished",
         ):
             self.assertIn(expected, event_types)
+
+    def test_store_accepts_frozen_finish_time_with_later_reconciliation(self) -> None:
+        self.submit()
+        row = self.store.claim_next(self.config.orchestration, 20 * SECOND).row
+        row = self.store.save(
+            row, c.fail(row, "tool_failure", "failed", 30 * SECOND)
+        )
+        terminal = c.finish(row, 35 * SECOND, 50 * SECOND)
+        saved = self.store.save(row, terminal)
+        self.assertEqual(saved.finished_at_ns, 35 * SECOND)
+        self.assertEqual(saved.updated_at_ns, 50 * SECOND)
 
     def test_events_are_append_only(self) -> None:
         self.submit()
