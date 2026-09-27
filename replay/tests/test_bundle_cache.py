@@ -98,8 +98,8 @@ class BundleCacheTest(unittest.TestCase):
         first = self.ensure()
         self.assertIsInstance(first, BundleReady)
         self.assertEqual(len(first.pins), 1)
-        generation_keys = tuple(self.store.list_keys("replay/bundles/bundle-1/"))
-        self.assertEqual(len(generation_keys), 1)
+        bundle_keys = tuple(self.store.list_keys("replay/bundles/bundle-1/"))
+        self.assertEqual(bundle_keys, ("replay/bundles/bundle-1/bundle_receipt.json",))
 
         shutil.rmtree(self.derivatives)
         log = self.root / "arguments.log"
@@ -145,7 +145,7 @@ class BundleCacheTest(unittest.TestCase):
                 receipt_index = max(i for i, key in enumerate(replay_puts) if key.endswith("/receipt.json"))
                 self.assertTrue(all(not key.endswith("/receipt.json") for key in replay_puts[receipt_index + 1 : -1]))
 
-    def test_independent_concurrent_builders_publish_one_semantic_generation(self):
+    def test_independent_concurrent_builders_publish_one_receipt_safely(self):
         self.archive_window(
             completeness="incomplete",
             certified=False,
@@ -165,7 +165,10 @@ class BundleCacheTest(unittest.TestCase):
             results = tuple(pool.map(build, (1, 2)))
         self.assertTrue(all(isinstance(result, BundleReady) for result in results))
         self.assertEqual(results[0].receipt_bytes, results[1].receipt_bytes)
-        self.assertEqual(len(tuple(self.store.list_keys("replay/bundles/bundle-1/"))), 1)
+        self.assertEqual(
+            tuple(self.store.list_keys("replay/bundles/bundle-1/")),
+            ("replay/bundles/bundle-1/bundle_receipt.json",),
+        )
 
     def test_all_receipts_are_checked_before_any_download(self):
         self.archive_window()
@@ -220,21 +223,69 @@ class BundleCacheTest(unittest.TestCase):
         wrapper = self.root / "changed-materializer"
         wrapper.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, os, subprocess, sys\n"
+            "import json, subprocess, sys\n"
             f"real={str(MATERIALIZER)!r}\n"
             "if sys.argv[1:] == ['--describe']:\n"
             " p=json.loads(subprocess.check_output([real,'--describe']))\n"
             " p['materializer_version'] += 1\n"
             " print(json.dumps(p,sort_keys=True,separators=(',',':')))\n"
             "else:\n"
-            " os.execv(real,[real,*sys.argv[1:]])\n",
+            " sys.exit(99)\n",
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
-        stale = self.ensure(wrapper)
+        store = RecordingStore(self.store)
+        stale = ensure_bundle(
+            "bundle-1", (BASE_NS, BASE_NS + WINDOW_SECONDS * 1_000_000_000),
+            store=store, work_root=self.work, derivatives_root=self.derivatives,
+            materializer=wrapper, window_seconds=WINDOW_SECONDS,
+        )
         self.assertIsInstance(stale, StaleCache)
         self.assertEqual(stale.cached_producer, first.receipt.producer)
         self.assertNotEqual(stale.current_producer, first.receipt.producer)
+        self.assertEqual(store.puts, [])
+
+    def test_source_interval_mismatch_is_stale_without_writes(self):
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        second_start = BASE_NS + WINDOW_SECONDS * 1_000_000_000
+        self.archive_window(
+            window_start_ns=second_start,
+            window_end_ns=second_start + WINDOW_SECONDS * 1_000_000_000,
+        )
+        store = RecordingStore(self.store)
+        stale = ensure_bundle(
+            "bundle-1", (BASE_NS, second_start + WINDOW_SECONDS * 1_000_000_000),
+            store=store, work_root=self.work, derivatives_root=self.derivatives,
+            materializer=MATERIALIZER, window_seconds=WINDOW_SECONDS,
+        )
+        self.assertIsInstance(stale, StaleCache)
+        self.assertEqual(store.puts, [])
+
+    def test_operator_deleting_only_bundle_receipt_permits_rebuild(self):
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        receipt_key = "replay/bundles/bundle-1/bundle_receipt.json"
+        derivative_keys = tuple(self.store.list_keys("replay/derivatives/"))
+        derivative_metadata = {key: self.store.head(key) for key in derivative_keys}
+
+        # Simulate audited provider tooling. ObjectStore intentionally has no delete API.
+        (self.store.root / receipt_key).unlink()
+        self.store._metadata_path(receipt_key).unlink()
+
+        store = RecordingStore(self.store)
+        rebuilt = ensure_bundle(
+            "bundle-1", (BASE_NS, BASE_NS + WINDOW_SECONDS * 1_000_000_000),
+            store=store, work_root=self.work, derivatives_root=self.derivatives,
+            materializer=MATERIALIZER, window_seconds=WINDOW_SECONDS,
+        )
+        self.assertIsInstance(rebuilt, BundleReady)
+        self.assertEqual(rebuilt.receipt_bytes, first.receipt_bytes)
+        self.assertEqual(tuple(self.store.list_keys("replay/derivatives/")), derivative_keys)
+        self.assertEqual({key: self.store.head(key) for key in derivative_keys}, derivative_metadata)
+        self.assertEqual(store.puts[-1], receipt_key)
 
 
 if __name__ == "__main__":

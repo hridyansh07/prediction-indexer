@@ -90,7 +90,8 @@ class ReplayJobStoreTests(unittest.TestCase):
         self.assertNotIn("Submission is at least once", spec)
         self.assertNotIn("There is no idempotency key", spec)
         self.assertNotIn("duplicate submissions create distinct jobs", spec)
-        self.assertNotIn("replay/bundles/<bundle_id>/bundle_receipt.json", spec)
+        self.assertIn("replay/bundles/<bundle_id>/bundle_receipt.json", spec)
+        self.assertNotIn("generations/<generation_sha256>", spec)
         self.assertIn(
             "Canonical restore and the immutable bundle cache (§6) are the\ncurrent stage",
             spec,

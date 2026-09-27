@@ -1,8 +1,7 @@
-"""Immutable Replay derivative generations restored from archived canonical evidence."""
+"""Immutable Replay derivatives cached behind one operator-managed bundle receipt."""
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import re
@@ -41,7 +40,6 @@ from replay.jobs.contracts import (
     BundleWindow,
     ContractError,
     Producer,
-    bundle_generation_sha256,
     bundle_receipt_bytes,
     bundle_receipt_key,
     canonical_window_keys,
@@ -58,8 +56,7 @@ MAX_SUBPROCESS_STDERR = 1024 * 1024
 MAX_SUBPROCESS_SECONDS = 3600
 MAX_CANONICAL_SCRATCH_BYTES = 1024 * 1024 * 1024 * 1024
 MAX_DERIVATIVE_BYTES = 1024 * 1024 * 1024 * 1024
-MAX_GENERATION_SCRATCH_BYTES = MAX_CANONICAL_SCRATCH_BYTES + MAX_DERIVATIVE_BYTES
-MAX_GENERATION_OBJECTS = MAX_BUNDLE_WINDOWS
+MAX_BUILD_SCRATCH_BYTES = MAX_CANONICAL_SCRATCH_BYTES + MAX_DERIVATIVE_BYTES
 
 
 class BundlePin(NamedTuple):
@@ -293,37 +290,28 @@ def _source_matches(receipt: BundleReceipt, bundle_id: str, interval, window_sec
     )
 
 
-def _cached_receipts(store, bundle_id: str) -> tuple[tuple[BundleReceipt, bytes], ...]:
-    prefix = f"replay/bundles/{bundle_id}/generations/"
-    keys = tuple(store.list_keys(prefix))
-    if len(keys) > MAX_GENERATION_OBJECTS:
-        raise BundleFailure("integrity_failure", "bundle generation object count exceeds limit")
-    receipts = []
-    for key in keys:
-        parts = key.split("/")
-        if len(parts) != 6 or parts[:3] != ["replay", "bundles", bundle_id] or parts[3] != "generations" or parts[5] != "bundle_receipt.json":
-            raise BundleFailure("integrity_failure", f"unexpected object below bundle prefix: {key}")
-        raw = _read_verified(store, key, MAX_BUNDLE_RECEIPT_BYTES, content_type=JSON_CONTENT_TYPE)
-        try:
-            receipt = parse_bundle_receipt(raw)
-        except ContractError as error:
-            raise _failure("integrity_failure", error) from error
-        generation = bundle_generation_sha256(receipt)
-        if key != bundle_receipt_key(receipt.bundle_id, generation):
-            raise BundleFailure("integrity_failure", "bundle receipt is stored under the wrong generation key")
-        receipts.append((receipt, raw))
-    return tuple(receipts)
+def _cached_receipt(store, bundle_id: str) -> tuple[BundleReceipt, bytes] | None:
+    key = bundle_receipt_key(bundle_id)
+    if store.head(key) is None:
+        return None
+    raw = _read_verified(store, key, MAX_BUNDLE_RECEIPT_BYTES, content_type=JSON_CONTENT_TYPE)
+    try:
+        receipt = parse_bundle_receipt(raw)
+    except ContractError as error:
+        raise _failure("integrity_failure", error) from error
+    if receipt.bundle_id != bundle_id:
+        raise BundleFailure("integrity_failure", "bundle receipt names another bundle")
+    return receipt, raw
 
 
 def _cache_decision(store, bundle_id, interval, window_seconds, remotes, producer):
-    stale = None
-    for receipt, raw in _cached_receipts(store, bundle_id):
-        if not _source_matches(receipt, bundle_id, interval, window_seconds, remotes):
-            continue
-        if receipt.producer == producer:
-            return receipt, raw
-        stale = receipt.producer
-    return StaleCache(stale, producer) if stale is not None else None
+    cached = _cached_receipt(store, bundle_id)
+    if cached is None:
+        return None
+    receipt, raw = cached
+    if _source_matches(receipt, bundle_id, interval, window_seconds, remotes) and receipt.producer == producer:
+        return receipt, raw
+    return StaleCache(receipt.producer, producer)
 
 
 def _file_identity(path: Path) -> StoredIdentity:
@@ -398,9 +386,9 @@ def _tree_bytes(root: Path, maximum: int) -> int:
             elif entry.is_file(follow_symlinks=False):
                 total += entry.stat(follow_symlinks=False).st_size
                 if total > maximum:
-                    raise BundleFailure("tool_failure", "generation scratch exceeds aggregate byte budget")
+                    raise BundleFailure("tool_failure", "build scratch exceeds aggregate byte budget")
             else:
-                raise BundleFailure("tool_failure", "generation scratch contains a non-regular entry")
+                raise BundleFailure("tool_failure", "build scratch contains a non-regular entry")
     return total
 
 
@@ -530,7 +518,7 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
         }
     )
     tool_output = _run_tool(materializer, (), request, scratch)
-    _tree_bytes(scratch, MAX_GENERATION_SCRATCH_BYTES)
+    _tree_bytes(scratch, MAX_BUILD_SCRATCH_BYTES)
     response = _strict_response(tool_output)
     if response["normalizer"] != producer.document()["normalizer"]:
         raise BundleFailure("tool_failure", "materializer response normalizer disagrees with --describe")
@@ -561,12 +549,11 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
     derivative_budget = [0]
     for pin in pins:
         _upload_derivative(store, pin, derivative_budget)
-    generation = bundle_generation_sha256(receipt)
     identity = StoredIdentity(hashlib.sha256(raw).hexdigest(), len(raw))
     with tempfile.SpooledTemporaryFile(max_size=MAX_BUNDLE_RECEIPT_BYTES) as source:
         source.write(raw)
         source.seek(0)
-        store.put_immutable(bundle_receipt_key(bundle_id, generation), source, identity, content_type=JSON_CONTENT_TYPE)
+        store.put_immutable(bundle_receipt_key(bundle_id), source, identity, content_type=JSON_CONTENT_TYPE)
     return BundleReady(receipt, raw, tuple(pins))
 
 
@@ -580,7 +567,7 @@ def ensure_bundle(
     materializer,
     window_seconds,
 ):
-    """Return verified local pins for one immutable source-and-producer generation."""
+    """Return verified local pins behind one immutable receipt per bundle."""
     work_root = Path(work_root)
     derivatives_root = Path(derivatives_root)
     materializer = Path(materializer)
@@ -590,8 +577,8 @@ def ensure_bundle(
         first, last, starts = window_bounds(window_interval[0], window_interval[1], window_seconds)
         if (first, last) != tuple(window_interval) or len(starts) > MAX_BUNDLE_WINDOWS:
             raise BundleFailure("integrity_failure", "window interval is not aligned or exceeds the window limit")
-        # Validate the bundle key component before it reaches list prefixes or paths.
-        bundle_receipt_key(bundle_id, "0" * 64)
+        # Validate the bundle key component before it reaches object or scratch paths.
+        bundle_receipt_key(bundle_id)
         producer = _describe(materializer, tool_scratch)
         for start in starts:
             if store.head(canonical_window_keys(start)[2]) is None:
@@ -608,34 +595,14 @@ def ensure_bundle(
             return decision
         if decision is not None:
             return _ready(store, *decision, derivatives_root, materializer, tool_scratch)
-
-        coordinate = hashlib.sha256(
-            encoded(
-                {
-                    "bundle_id": bundle_id,
-                    "canonical_receipts": [remote.receipt_sha256 for remote in remotes],
-                    "canonical_window_seconds": window_seconds,
-                    "interval": {"end_ns": str(last), "start_ns": str(first)},
-                    "producer": producer.document(),
-                }
+        scratch = Path(tempfile.mkdtemp(prefix=f"bundle-{bundle_id}-", dir=work_root))
+        try:
+            return _build(
+                bundle_id, (first, last), store, derivatives_root,
+                materializer, window_seconds, remotes, producer, scratch,
             )
-        ).hexdigest()
-        lock_path = work_root / f"generation-{coordinate}.lock"
-        with lock_path.open("a+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            decision = _cache_decision(store, bundle_id, (first, last), window_seconds, remotes, producer)
-            if isinstance(decision, StaleCache):
-                return decision
-            if decision is not None:
-                return _ready(store, *decision, derivatives_root, materializer, tool_scratch)
-            scratch = Path(tempfile.mkdtemp(prefix=f"generation-{coordinate}-", dir=work_root))
-            try:
-                return _build(
-                    bundle_id, (first, last), store, derivatives_root,
-                    materializer, window_seconds, remotes, producer, scratch,
-                )
-            finally:
-                shutil.rmtree(scratch, ignore_errors=True)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
     except BundleFailure:
         raise
     except (IntegrityConflict, VerificationFailure, CanonicalRestoreError, ContractError) as error:
