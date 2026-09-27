@@ -583,6 +583,8 @@ def build_server(
                 raise _RequestError("request body must be UTF-8 JSON") from error
             try:
                 document = json.loads(text, object_pairs_hook=_unique_object)
+            except RecursionError as error:
+                raise _RequestError("request JSON is too deeply nested") from error
             except json.JSONDecodeError as error:
                 raise _RequestError(
                     f"invalid JSON at line {error.lineno} column {error.colno}"
@@ -599,7 +601,7 @@ def build_server(
             retry_after: int | None = None,
         ) -> None:
             payload = (
-                json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
                 + "\n"
             ).encode("utf-8")
             if len(payload) > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:

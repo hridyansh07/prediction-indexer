@@ -4,6 +4,7 @@ WORKDIR /build
 COPY encoder/rust/ encoder/rust/
 COPY ingester/ ingester/
 COPY engine/ engine/
+COPY replay/streams/attempt.lua replay/streams/attempt.lua
 RUN cargo build --locked --release --manifest-path engine/Cargo.toml \
       -p replay-transport --bin replay-publish \
     && cargo build --locked --release --manifest-path engine/Cargo.toml \
@@ -25,11 +26,7 @@ ENV PYTHONUNBUFFERED=1 \
     REPLAY_DATA_ROOT=/var/lib/replay \
     EVENT_UNIVERSE_CONFIG=/etc/prediction-indexer/event_universe.json
 
-RUN case "${REPLAY_IMAGE_REVISION}" in \
-      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; \
-      *) echo "REPLAY_IMAGE_REVISION must be a full Git SHA" >&2; exit 1 ;; \
-    esac \
-    && groupadd --gid "${APP_GID}" replay \
+RUN groupadd --gid "${APP_GID}" replay \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin replay \
     && install -d -m 0700 -o replay -g replay /var/lib/replay \
     && printf '%s\n' "${REPLAY_IMAGE_REVISION}" > /etc/prediction-indexer-replay-image-revision

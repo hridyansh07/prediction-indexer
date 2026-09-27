@@ -1,6 +1,6 @@
 {
 	servers {
-		max_header_size 32KB
+		max_header_size 32KiB
 		timeouts {
 			read_body 15s
 			read_header 10s
@@ -24,7 +24,7 @@
 
 {$REPLAY_PUBLIC_HOST} {
 	request_body {
-		max_size 64KB
+		max_size 64KiB
 	}
 
 	header {

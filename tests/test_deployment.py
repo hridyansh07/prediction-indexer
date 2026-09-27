@@ -300,6 +300,8 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("replay-publish", self.runner)
         self.assertIn(".[replay-redis]", self.runner)
         self.assertIn("ARG REPLAY_IMAGE_REVISION", self.runner)
+        self.assertIn("COPY replay/streams/attempt.lua replay/streams/attempt.lua", self.runner)
+        self.assertNotIn("must be a full Git SHA", self.runner)
         self.assertIn("USER replay:replay", self.runner)
         self.assertIn("materialize_range --describe", self.runner)
 
@@ -311,6 +313,8 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("Strict-Transport-Security", self.caddy)
         self.assertIn("X-Content-Type-Options", self.caddy)
         self.assertIn("Referrer-Policy", self.caddy)
+        self.assertIn("max_size 64KiB", self.caddy)
+        self.assertIn("max_header_size 32KiB", self.caddy)
         auth = self.caddy.split("@auth path", 1)[1].split("@api path", 1)[0]
         self.assertNotIn("encode", auth)
         self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
@@ -349,13 +353,20 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
         replay = deployment.split("## Replay jobs production runtime", 1)[1]
         self.assertIn("--profile replay run --rm replay-preflight", replay)
-        self.assertIn("--profile replay run --rm replay-runner", replay)
+        self.assertIn("--profile replay run --rm --no-deps replay-runner", replay)
+        self.assertIn("disable the Replay scheduler", replay)
         self.assertIn("systemd", replay)
         self.assertIn("local_state_lost", replay)
         self.assertIn("resume-blocked", replay)
         self.assertIn("receipt-only", replay)
         self.assertIn("full-volume snapshot", replay)
         self.assertIn("in-process rate limiter", replay)
+
+    def test_local_runner_build_revision_default_is_stable_identifier(self) -> None:
+        self.assertIn(
+            'REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-local}"',
+            self.compose,
+        )
 
 
 if __name__ == "__main__":

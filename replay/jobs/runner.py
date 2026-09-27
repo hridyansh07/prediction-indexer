@@ -80,11 +80,9 @@ class Runner:
             return
         row = claim.row
         root = self.jobs_root / row.job_id
-        if claim.mode == "resume" and row.status == c.ARCHIVING:
+        if row.status == c.ARCHIVING:
             try:
-                frozen = adopt_published_for_row(
-                    self.archive, row, self.runtime.image_revision
-                )
+                frozen = adopt_published_for_row(self.archive, row)
                 if frozen is not None:
                     self._save(row, c.finish(row, frozen, self.clock()))
                     return
@@ -95,11 +93,29 @@ class Runner:
                 # Availability is handled by the ordinary local resume path;
                 # if local state is gone, archival retry remains retryable.
         try:
-            if claim.mode == "initialize":
+            retrying_initialization = (
+                row.status == c.RUNNING
+                and row.stage == "resolve"
+                and row.reason_code == "resource_exhausted"
+                and not root.exists()
+            )
+            if claim.mode == "initialize" or retrying_initialization:
                 root = initialize_job_root(self.jobs_root, row.job_id, claim.request_bytes)
             else:
                 validate_job_root(root, claim.request_bytes, row.request_sha256)
             validate_committed_markers(root, row.stage)
+        except OSError as error:
+            self._save(
+                row,
+                c.retry_later(
+                    row,
+                    "resource_exhausted",
+                    str(error),
+                    self.config.orchestration,
+                    self.clock(),
+                ),
+            )
+            return
         except LocalStateError as error:
             row = self._save(row, c.lose_local_state(row, error.detail, self.clock()))
             return self._archive(row, None)
@@ -136,6 +152,18 @@ class Runner:
                     )
                     return
                 row = self._save(row, c.fail(row, error.code, error.detail, self.clock()))
+            except OSError as error:
+                row = self._save(
+                    row,
+                    c.retry_later(
+                        row,
+                        "resource_exhausted",
+                        str(error),
+                        self.config.orchestration,
+                        self.clock(),
+                    ),
+                )
+                return
             except Exception as error:
                 row = self._save(
                     row,
@@ -217,9 +245,12 @@ class Runner:
         except StageFailure as error:
             if error.code == "archive_unavailable":
                 if root is not None and (root / "archive_state.json").exists():
-                    record_archive_diagnostic(
-                        root, f"archive_unavailable: {error.detail or ''}"
-                    )
+                    try:
+                        record_archive_diagnostic(
+                            root, f"archive_unavailable: {error.detail or ''}"
+                        )
+                    except OSError:
+                        pass
                 self._save(
                     row,
                     c.retry_later(

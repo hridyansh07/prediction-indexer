@@ -138,6 +138,32 @@ class ReplayJobsBackupTests(unittest.TestCase):
         with self.assertRaisesRegex(BackupError, "independently durable"):
             verify_backup(store, "replay/jobs-db-backups/missing.receipt.json")
 
+    def test_backup_requires_independent_durability_before_staging(self) -> None:
+        store = LocalObjectStore(self.root / "default-store")
+        staging = self.root / "must-not-exist"
+        with self.assertRaisesRegex(BackupError, "independently durable"):
+            backup_jobs_database(
+                self.database,
+                staging,
+                store,
+                prefix="replay/jobs-db-backups",
+                created_at_ns=1,
+            )
+        self.assertFalse(staging.exists())
+
+    def test_restore_refuses_stale_rollback_journal_sidecar(self) -> None:
+        receipt = backup_jobs_database(
+            self.database,
+            self.root / "staging",
+            self.store,
+            prefix="replay/jobs-db-backups",
+            created_at_ns=1_800_000_000_000_000_000,
+        )
+        destination = self.root / "restore-journal.sqlite3"
+        destination.with_name(destination.name + "-journal").write_bytes(b"stale")
+        with self.assertRaisesRegex(BackupError, "sidecars"):
+            restore_jobs_database(self.store, receipt.receipt_key, destination)
+
     def test_backup_prefix_must_not_overlap_replay_artifacts(self) -> None:
         for prefix in ("replay", "replay/jobs", "replay/jobs/nested"):
             with self.subTest(prefix), self.assertRaises(BackupError):
@@ -151,6 +177,14 @@ class ReplayJobsBackupTests(unittest.TestCase):
 
 
 class ReplayPreflightTests(unittest.TestCase):
+    def test_image_revision_accepts_stable_safe_identifiers_only(self) -> None:
+        for revision in ("local", "release-2026.09+hotfix:1", "a" * 40):
+            with self.subTest(revision=revision):
+                self.assertIsNotNone(preflight._REVISION.fullmatch(revision))
+        for revision in ("", "has space", "slash/name", "x" * 129, "line\nbreak"):
+            with self.subTest(revision=revision):
+                self.assertIsNone(preflight._REVISION.fullmatch(revision))
+
     def test_private_root_rejects_group_or_world_access(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -209,7 +209,7 @@ services:
       context: .
       dockerfile: docker/replay-runner.Dockerfile
       args:
-        REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-0000000000000000000000000000000000000000}"
+        REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-local}"
     profiles: [replay]
     restart: "no"
     init: true

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -32,11 +34,13 @@ def config():
 
 
 def request():
-    import json
-
     return c.parse_request(
         json.dumps(request_document(), separators=(",", ":")).encode(), config()
     )
+
+
+def json_bytes(value):
+    return json.dumps(value, separators=(",", ":")).encode()
 
 
 class BundleStageTests(unittest.TestCase):
@@ -122,6 +126,24 @@ class BundleStageTests(unittest.TestCase):
                     config(),
                 )
         self.assertEqual(caught.exception.code, "resource_exhausted")
+
+    def test_resolved_marker_enospc_is_resource_exhausted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_request = json_bytes(request_document())
+            parsed_request = c.parse_request(raw_request, config())
+            job_id = "20260924T120000Z-0123456789abcdef"
+            job = stages.initialize_job_root(root / "jobs", job_id, raw_request)
+            resolved_job = resolved()
+            history = mock.Mock()
+            history.resolve.return_value = resolved_job
+            with mock.patch.object(
+                stages,
+                "write_marker",
+                side_effect=OSError(errno.ENOSPC, "disk full"),
+            ), self.assertRaises(StageFailure) as caught:
+                stages.resolve_stage(job, job_id, parsed_request, config(), history)
+            self.assertEqual(caught.exception.code, "resource_exhausted")
 
 
 class SupervisorStageTests(unittest.TestCase):
