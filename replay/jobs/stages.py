@@ -1071,6 +1071,30 @@ def adopt_published_for_row(store, row, image_revision: str) -> int | None:
         raise StageFailure("archive_conflict", str(error)) from error
 
 
+def verify_published_receipt(store, job_id: str) -> JobReceipt:
+    """Strictly read a committed job receipt and every object it names."""
+    try:
+        raw = _read_remote(
+            store,
+            job_receipt_key(job_id),
+            MAX_JOB_RECEIPT_BYTES,
+            content_type=JSON_CONTENT_TYPE,
+        )
+        if raw is None:
+            raise StageFailure("archive_conflict", "job receipt is absent")
+        receipt = parse_job_receipt(raw)
+        if receipt.job_id != job_id:
+            raise StageFailure("archive_conflict", "job receipt has the wrong job ID")
+        _verify_remote_objects(store, receipt)
+        return receipt
+    except StageFailure:
+        raise
+    except (ObjectStoreError, OSError) as error:
+        raise StageFailure("archive_unavailable", str(error)) from error
+    except (ContractError, VerificationFailure) as error:
+        raise StageFailure("archive_conflict", str(error)) from error
+
+
 def _expectation(metadata):
     if not metadata.provider_checksum or not metadata.provider_checksum_algorithm:
         raise StageFailure("archive_conflict", f"remote object {metadata.key} lacks provider checksum metadata")
