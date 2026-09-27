@@ -53,6 +53,17 @@ def renamed_runner_config():
     )
 
 
+def retired_runner_config():
+    original = runner_config()
+    entry = original.strategies["bundle_coverage"]
+    return replace(
+        original,
+        strategies=MappingProxyType(
+            {"bundle_coverage": replace(entry, status=c.STRATEGY_RETIRED)}
+        ),
+    )
+
+
 def request_bytes():
     return json.dumps(
         {
@@ -593,6 +604,40 @@ class CancelledRunnerAcceptanceTests(unittest.TestCase):
                 ["request.json"],
             )
             self.assertEqual((job / "request.json").read_bytes(), raw)
+
+    def test_job_accepted_before_strategy_retirement_keeps_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, runner_config()),
+                Principal(ADDRESS, "member"),
+                "accepted-before-retirement",
+                10,
+                bundle_exists=True,
+            )
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            with mock.patch.object(
+                Runner,
+                "_work_stage",
+                side_effect=StageFailure("universe_unavailable", "injected"),
+            ) as work:
+                Runner(
+                    jobs,
+                    LocalObjectStore(root / "objects"),
+                    retired_runner_config(),
+                    runtime,
+                    clock=lambda: 100_000_000_000,
+                ).tick()
+            self.assertEqual(work.call_args.args[2].strategy, "bundle_coverage")
+            row, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(
+                (row.status, row.stage, row.reason_code),
+                (c.RUNNING, "resolve", "universe_unavailable"),
+            )
 
     def test_archive_contract_error_blocks_instead_of_escaping(self):
         with tempfile.TemporaryDirectory() as temporary:

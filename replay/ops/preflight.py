@@ -13,7 +13,11 @@ from contextlib import closing
 from pathlib import Path
 
 from archive.storage.factory import build_store
-from replay.jobs.contracts import parse_producer, parse_runner_config
+from replay.jobs.contracts import (
+    RUNNER_CONFIG_VERSION,
+    parse_producer,
+    parse_runner_config,
+)
 from universe.auth import AuthStore
 from universe.config import load_config
 from universe.replay_jobs import ReplayJobStore
@@ -313,7 +317,7 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "volume_id": required["REPLAY_VOLUME_ID"],
         "mount_type": mount_type,
         "materialization_policy_sha256": policy,
-        "runner_config_version": 1,
+        "runner_config_version": RUNNER_CONFIG_VERSION,
         "archive_provider": store.provider,
         "archive_store_id": store.store_id,
         "redis": redis_report,

@@ -1,5 +1,5 @@
 {
-  "replay_runner_config_version": 1,
+  "replay_runner_config_version": 2,
   "universe_base_url": "http://event-universe:8080",
   "scope": "jobs",
   "canonical_window_seconds": 1800,
@@ -12,7 +12,10 @@
     "bundle_coverage": {
       "factory": "replay.bundle_coverage:build",
       "reader": "replay.coverage_output:read_completed",
-      "config_schema": "bundle_coverage_v1"
+      "config_schema": "bundle_coverage_v1",
+      "label": "Bundle coverage",
+      "description": "Evaluates historical coverage for the selected bundle.",
+      "status": "active"
     }
   },
   "limits": {

@@ -263,6 +263,90 @@ class ReplayJobsHTTPAcceptanceTests(unittest.TestCase):
                 self.assertEqual(status, 200, detail)
                 self.assertEqual(detail["request"], json.loads(raw))
 
+    def retired_runner(self) -> c.RunnerConfig:
+        shipped = json.loads((ROOT / "configs/replay_runner.json").read_bytes())
+        coverage = shipped["strategies"]["bundle_coverage"]
+        document = {
+            **shipped,
+            "strategies": {
+                "bundle_coverage": {**coverage, "status": "retired"},
+                "coverage_next": {
+                    **coverage,
+                    "label": "Coverage next",
+                    "description": "A successor coverage strategy.",
+                },
+            },
+        }
+        return c.parse_runner_config(json.dumps(document).encode())
+
+    def test_strategy_catalogue_is_public_and_mirrors_the_registry(self) -> None:
+        status, catalogue, headers = self.request("GET", "/v1/replay/strategies")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(
+            catalogue,
+            {
+                "version": 1,
+                "strategies": [
+                    {
+                        "name": "bundle_coverage",
+                        "label": "Bundle coverage",
+                        "description": "Evaluates historical coverage for the selected bundle.",
+                        "status": "active",
+                        "config_keys": [],
+                    }
+                ],
+                "limits": ["small"],
+            },
+        )
+        status, payload, _ = self.request("GET", "/v1/replay/strategies?x=1")
+        self.assertEqual(status, 400, payload)
+
+        self.restart_with_runner(self.retired_runner())
+        status, catalogue, _ = self.request("GET", "/v1/replay/strategies")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(item["name"], item["status"]) for item in catalogue["strategies"]],
+            [("bundle_coverage", "retired"), ("coverage_next", "active")],
+        )
+
+    def test_retired_strategy_refuses_new_jobs_but_replays_accepted_ones(self) -> None:
+        token = self.token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "before-retirement",
+        }
+        status, submitted, _ = self.request(
+            "POST", "/v1/replay/jobs", request_bytes(), headers
+        )
+        self.assertEqual(status, 201, submitted)
+
+        self.restart_with_runner(self.retired_runner())
+        status, replayed, _ = self.request(
+            "POST", "/v1/replay/jobs", request_bytes(), headers
+        )
+        self.assertEqual(
+            (status, replayed["job_id"], replayed["replayed"]),
+            (200, submitted["job_id"], True),
+        )
+        status, refused, _ = self.request(
+            "POST",
+            "/v1/replay/jobs",
+            request_bytes(),
+            {**headers, "Idempotency-Key": "after-retirement"},
+        )
+        self.assertEqual(
+            (status, refused),
+            (400, {"error": "strategy 'bundle_coverage' is retired and accepts no new jobs"}),
+        )
+        status, detail, _ = self.request(
+            "GET", f"/v1/replay/jobs/{submitted['job_id']}"
+        )
+        self.assertEqual((status, detail["status"]), (200, "queued"))
+        listing = self.jobs.list_jobs(status=None, limit=100, after=None)[0]
+        self.assertEqual([row.job_id for row in listing], [submitted["job_id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

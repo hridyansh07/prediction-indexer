@@ -108,7 +108,9 @@ class Runner:
             return self._archive(row, root)
 
         try:
-            request = c.parse_request(claim.request_bytes, self.config)
+            request = c.parse_request(
+                claim.request_bytes, self.config, accept_retired=True
+            )
         except Exception as error:
             row = self._save(
                 row, c.fail(row, "internal_failure", str(error), self.clock())

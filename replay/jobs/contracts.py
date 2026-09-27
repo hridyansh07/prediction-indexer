@@ -24,7 +24,7 @@ PRODUCER_IDENTITY_VERSION = 1
 RESOLVED_JOB_VERSION = 1
 JOB_RESULT_VERSION = 1
 JOB_RECEIPT_VERSION = 1
-RUNNER_CONFIG_VERSION = 1
+RUNNER_CONFIG_VERSION = 2
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_BUNDLE_RECEIPT_BYTES = 1024 * 1024
@@ -38,6 +38,8 @@ MAX_OCCURRENCES = 128
 MAX_JOB_OBJECTS = 4096
 MAX_REASON_DETAIL = 1024
 MAX_TEXT = 1024
+MAX_STRATEGY_LABEL = 64
+MAX_STRATEGY_DESCRIPTION = 512
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -773,8 +775,12 @@ class Request:
         return request_sha256(self)
 
 
-def parse_request(raw, config):
-    """Strictly parse submitted request bytes against a parsed runner config."""
+def parse_request(raw, config, *, accept_retired=False):
+    """Strictly parse submitted request bytes against a parsed runner config.
+
+    A retired strategy is rejected unless ``accept_retired``: only work that was
+    accepted while the strategy was active may name it (§3.10).
+    """
     value = _decode(raw, MAX_REQUEST_BYTES, "request")
     _closed(
         value,
@@ -809,9 +815,14 @@ def parse_request(raw, config):
 
     strategy = _closed(value["strategy"], "name config", "strategy")
     name = strategy["name"]
+    active = sorted(n for n, e in config.strategies.items() if e.status == STRATEGY_ACTIVE)
     _require(
         type(name) is str and name in config.strategies,
-        f"strategy.name must be one of: {', '.join(sorted(config.strategies))}",
+        f"strategy.name must be one of: {', '.join(active)}",
+    )
+    _require(
+        accept_retired or config.strategies[name].status == STRATEGY_ACTIVE,
+        f"strategy {name!r} is retired and accepts no new jobs",
     )
     strategy_config = _check_strategy_config(
         config.strategies[name].config_schema, strategy["config"]
@@ -1491,11 +1502,22 @@ _LIMIT_FIELDS = (
 )
 
 
+STRATEGY_ACTIVE = "active"
+STRATEGY_RETIRED = "retired"
+STRATEGY_STATUSES = frozenset({STRATEGY_ACTIVE, STRATEGY_RETIRED})
+
+
 @dataclass(frozen=True)
 class StrategyEntry:
+    """One registry entry. A retired entry keeps its factory and reader so jobs
+    accepted before retirement still run; it only refuses new submissions."""
+
     factory: str
     reader: str
     config_schema: str
+    label: str
+    description: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -1552,7 +1574,11 @@ def parse_runner_config(raw):
     entries = {}
     for name, entry in strategies.items():
         _identifier(name, "strategy name")
-        _closed(entry, "factory reader config_schema", f"strategies.{name}")
+        _closed(
+            entry,
+            "factory reader config_schema label description status",
+            f"strategies.{name}",
+        )
         for field in ("factory", "reader"):
             _require(
                 type(entry[field]) is str and _FACTORY.fullmatch(entry[field]) is not None,
@@ -1561,6 +1587,17 @@ def parse_runner_config(raw):
         _require(
             entry["config_schema"] in STRATEGY_CONFIG_SCHEMAS,
             f"strategies.{name}.config_schema is unknown",
+        )
+        _text(entry["label"], f"strategies.{name}.label", MAX_STRATEGY_LABEL)
+        _text(
+            entry["description"],
+            f"strategies.{name}.description",
+            MAX_STRATEGY_DESCRIPTION,
+        )
+        _require(
+            entry["status"] in STRATEGY_STATUSES,
+            f"strategies.{name}.status must be one of: "
+            f"{', '.join(sorted(STRATEGY_STATUSES))}",
         )
         entries[name] = StrategyEntry(**entry)
 
