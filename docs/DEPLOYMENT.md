@@ -933,12 +933,13 @@ docker build -f docker/replay-runner.Dockerfile \
 # REPLAY_RUNNER_IMAGE=registry.example/prediction-indexer-replay-runner@sha256:...
 ```
 
-Caddy and Redis are pinned by multi-platform OCI digest in Compose. Validate
+Caddy and Redis are pinned by multi-platform OCI digest in Compose, and
+the runner is pulled by the digest set above rather than rebuilt. Validate
 configuration before touching services:
 
 ```bash
 docker compose -f compose.universe.yaml --profile replay config --quiet
-docker compose -f compose.universe.yaml --profile replay build replay-runner
+docker compose -f compose.universe.yaml --profile replay pull replay-runner
 docker compose -f compose.universe.yaml --profile replay run --rm --no-deps \
   --entrypoint sh replay-runner -c \
   'test "$(id -u)" != 0 && test -x "$REPLAY_PUBLISHER" && materialize_range --describe && python -c "import replay.jobs,replay.ops"'
