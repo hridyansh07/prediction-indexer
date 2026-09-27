@@ -1,8 +1,8 @@
 # Replay jobs V1
 
-Status: **in progress**. The shared contracts, durable control plane, canonical
-restore, immutable bundle cache, and durable runner (§§3–7) are implemented.
-Deployment and UI work (§§8–9) are not implemented.
+Status: **runtime implemented**. The shared contracts, durable control plane,
+canonical restore, immutable bundle cache, and durable runner (§§3–7) are implemented.
+The production runtime (§8) is also implemented. UI work (§9) is not implemented.
 
 Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md),
@@ -68,13 +68,13 @@ the rebuildable Universe query index.
 ```
 W0 Contracts ──┬─▶ W1 Auth ────────┐
   (landed)     ├─▶ W2 Job API ─────┤
-               ├─▶ Bundle cache ───┼─▶ W4 Runner ─▶ W5 Deployment ─▶ live acceptance
+               ├─▶ Bundle cache ───┼─▶ Runner ─▶ Production deployment ─▶ acceptance
                └─▶ W6 UI ◀── W1/W2 API shapes only
 ```
 
 The durable W1/W2 control plane has landed. Canonical restore and bundle-cache
 work now proceeds against its contracts. W4 may start in parallel against the
-bundle interface and fakes. W5 comes last. A change to a §3 contract is a
+bundle interface and fakes. Production deployment comes last. A change to a §3 contract is a
 contract amendment, not an unreviewed local override.
 
 | Workstream | Owns (writes) | Must not touch |
@@ -84,7 +84,7 @@ contract amendment, not an unreviewed local override.
 | W2 | `universe/replay_jobs.py`, job routes in `universe/api.py` | auth internals, runner stages |
 | Bundle cache | `replay/jobs/bundle.py`, `archive/canonical_restore.py`, `materialize_range --describe`, strict derivative pin inspection | job DB, Universe, supervisor |
 | W4 | `replay/jobs/runner.py`, `replay/jobs/stages.py`, `python -m replay.jobs` | Universe, bundle internals, `archive/` |
-| W5 | `compose.universe.yaml` `replay` profile, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `docs/DEPLOYMENT.md`, AGENTS routing | application code |
+| Production deployment | `compose.universe.yaml` `replay` profile, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `replay/ops/`, `docs/DEPLOYMENT.md`, AGENTS routing | request, auth, API, cache, runner, receipt, and strategy semantics |
 | W6 | `targeter-ui/`, removal of `api/event-universe-proxy.ts` and the `vercel.json` rewrites | Universe, runner |
 
 ## 3. W0 — Shared contracts
@@ -449,12 +449,15 @@ write plumbing.
 The write plumbing: `do_POST`/`do_DELETE` dispatch with a 64 KiB body cap and
 `Content-Type: application/json` required, returning 413/415 otherwise.
 
-**Config** (`replay` section of `event_universe.json` version 2; all fields
+**Config** (`replay` section of `event_universe.json` version 4; all fields
 required, closed): `replay.database_path` (the durable `jobs.sqlite3`) and
 `replay.auth` with `siwe_domain`, `siwe_uri`, `siwe_statement`, `chain_id`,
 `admin_address` (EIP-55), `nonce_ttl_seconds` (300), and `session_ttl_seconds`
-(43200). `siwe_statement` is the exact statement line every sign-in message
-carries, e.g. `Sign in to Prediction Indexer.`; the UI uses the same text.
+(43200). `replay.rate_limit` contains exact `trusted_proxy_addresses`, positive
+authenticated and unauthenticated request/window limits, and a bounded
+`max_buckets`. `siwe_statement` is the exact statement line every sign-in
+message carries, e.g. `Sign in to Prediction Indexer.`; the UI uses the same
+text.
 While the shipped zero-address admin placeholder remains, the sign-in routes
 return 503 and every other route is unaffected.
 
@@ -462,10 +465,19 @@ return 503 and every other route is unaffected.
 nonce to the server time it expires (`nonce_ttl_seconds` after the server
 issued it). It is locked, so consuming a nonce is atomic across the server's
 threads, and capped at 500 outstanding nonces: expired ones are pruned on
-each issue, and a full store returns 503. Caddy rate limiting on the nonce
-route (W5) is the first defence. A restart drops outstanding nonces and users
-simply sign in again. This requires exactly one `event-universe` process; a
-second worker or replica would need shared nonce storage.
+each issue, and a full store returns 503. The same singleton process owns a
+thread-safe, bounded in-memory token-bucket map. Rate limiting applies only when
+the direct peer is one of `trusted_proxy_addresses`, proving that the request
+arrived through Caddy. For that trusted peer only, Universe uses the final
+address in `X-Forwarded-For`, which is the address Caddy appended; earlier
+client-supplied entries are never trusted. Authenticated requests are bucketed
+by the validated session token hash, while unauthenticated requests—including
+nonce and SIWE—are bucketed by that final client IP. Exhaustion returns 429 with
+`Retry-After`; least-recently-used buckets are evicted at `max_buckets`.
+Private, direct callers such as the runner and preparation path are exempt. A
+restart drops limiter state and outstanding nonces, and users simply sign in
+again. This requires exactly one `event-universe` process; a second worker or
+replica would need shared nonce and limiter storage.
 
 **Tables** (in `jobs.sqlite3`): `sessions(token_hash, address, role,
 created_at, expires_at, revoked_at)`, `allowlist(address, note, created_at,
@@ -587,7 +599,7 @@ validation failures return their actionable contract message in `error`
 and request-v1 field errors) rather than the undiagnostic `invalid request`.
 
 Universe loads `configs/replay_runner.json` to validate strategy and preset
-names; W5 mounts it into both containers. `resume_blocked` is an operator
+names; production deployment mounts it into both containers. `resume_blocked` is an operator
 command, not an HTTP route in V1.
 
 **Tests:** a valid submit and every 400 class; an unknown bundle; 401 when
@@ -803,27 +815,39 @@ synthetic fixture uploaded to a disposable store → a full tick with disposable
 Redis → `read_completed` → `job_receipt.json`, run cold then warm, with
 byte-identical semantic files.
 
-## 8. W5 — Deployment
+## 8. Production runtime and operations
 
 **Delivers** the `replay` profile in `compose.universe.yaml`:
 
-- `caddy`: automatic TLS for `REPLAY_PUBLIC_HOST`, request-body and time limits,
-  a rate limit on `GET /v1/auth/nonce`, static `targeter-ui/dist`, and `/v1/*` →
-  `event-universe:8080`. `event-universe` stays a single process (§4).
+- `caddy`: digest-pinned stock Caddy 2.10.2, automatic TLS for
+  `REPLAY_PUBLIC_HOST`, bounded request bodies/headers and connection/upstream
+  times, security headers, secret-safe JSON access logs, and `/v1/*` plus
+  `/healthz` to private `event-universe:8080`. Authentication responses are not
+  compressed. There is no UI in this implementation. Stock Caddy does not
+  enforce request rate limits; the singleton Universe in-process limiter from
+  §4 does, based on Caddy's statically assigned trusted peer address.
 - `replay-redis`: `redis:8.2` with `--maxmemory <finite>
   --maxmemory-policy noeviction --save "" --appendonly no`; no published port.
 - `replay-runner`: `docker/replay-runner.Dockerfile` with the venv including
   `.[replay-redis]`, release builds of `replay-publish` and `materialize_range`,
   `configs/replay_runner.json`, and `REPLAY_IMAGE_REVISION` set to the git SHA
   at build time. No restart policy.
-- Volumes: `REPLAY_DATA_ROOT` on one persistent volume holding `jobs.sqlite3`
-  and every job directory (§1.1) — read-write for the runner; `event-universe`
-  mounts `jobs.sqlite3` and the runner config. The existing archive backend
-  variables, referenced by name only.
+- Volumes: one private, quota-governed `REPLAY_DATA_ROOT` bind holds
+  `jobs.sqlite3`, `jobs/`, `runner.lock`, `bundle-work/`, `derivatives/`, and
+  `.runner/`. Universe and runner mount it; only runner-owned runtime paths are
+  writable. Configs are read-only. Capture, splice, repository, and Docker
+  socket mounts are forbidden. The archive is independently durable and normal
+  identity has create/get/list only; deletion is separate operator authority.
 - Host cron: `* * * * * docker compose -f compose.universe.yaml --profile replay
   run --rm replay-runner`.
-- The Universe backup job includes `jobs.sqlite3` under its own object prefix;
-  §1.1 describes what a restore of it alone can and cannot do.
+- `python -m replay.ops backup` uses SQLite's online backup API, runs
+  `integrity_check`, uploads immutable bytes below the separate
+  `REPLAY_BACKUP_PREFIX`, streams them back against provider metadata, and
+  publishes a canonical receipt recording source, type, time, SHA-256, length,
+  key, provider/store identity, verification identity, and integrity result.
+  Active directories are excluded. `verify-backup` and `restore-backup` require
+  that receipt and complete verified reads; restore refuses to replace an
+  existing database or sidecar.
 - `docs/DEPLOYMENT.md` documents the profile, cron, `resume_blocked`, and the
   manual bundle-receipt rebuild procedure (§3.5). `AGENTS.md` gains a routing
   row for this document.
@@ -833,6 +857,66 @@ byte-identical semantic files.
 `materialize_range --describe`, and `python -c "import replay.jobs"` succeed; a
 deployment test asserts Redis publishes no port and the runner has no restart
 policy. Do not start services against production data in this workstream.
+
+### 8.1 Preflight and scheduling gate
+
+`python -m replay.ops preflight /etc/prediction-indexer/replay_runner.json` is a
+bounded, secret-safe readiness transaction. It rejects a non-SHA image revision
+or digest; malformed runner or Universe config; missing/non-executable release
+binaries; invalid `materialize_range --describe`; non-private, non-owned,
+non-durable, or unwritable Replay root; insufficient free bytes, inodes, or
+declared enforced quota; schema/migration/integrity failure; Redis older than
+8.2, unbounded memory, policy other than `noeviction`, persistence, or prior
+evictions; non-independent archive configuration (including a local same-device
+claim); inability to read a configured known archive receipt using normal
+runner authority; private Universe health failure; or public TLS/proxy failure.
+It prints only identities and bounded status, never URLs with credentials or
+environment values. Limiter behavior is a release/config contract tested at the
+Universe boundary, not a preflight 429 probe that consumes public auth budget.
+
+The capacity floor must cover configured worst-case local work plus safety; the
+operator must set `REPLAY_REQUIRED_CAPACITY_BYTES` explicitly; the shipped
+one-million-free-inode floor remains. `REPLAY_QUOTA_BYTES` is an operator
+declaration of an actually enforced filesystem/project quota, not a Compose
+limit. Scheduling remains disabled until preflight exits zero. The only
+recurring invocation is one `docker compose --profile replay run --rm
+replay-runner` per minute. Lock contention exits zero and claims no second job.
+There is no persistent runner, restart loop, parallel claim, or Redis recovery
+policy.
+
+### 8.2 Backup, restore, and rollback semantics
+
+A recurring database backup preserves auth, jobs, events, and submissions, but
+not active job directories. After a DB-only restore, nonterminal jobs whose
+local state is absent follow the existing resume path to `local_state_lost`; no
+directory is recreated and no row is reset. Sessions must be revoked or the
+authentication authority rotated after restore. This is intentionally not a
+rollback mechanism for active work.
+
+A full active-state rollback requires a stopped, coordinated full-volume
+snapshot: disable public ingress and scheduler, drain the runner and verify no
+lock holder, checkpoint/stop Universe, snapshot the complete Replay volume plus
+the exact configs and image revision/digest, then restore those as one unit.
+Only a schema-compatible image may start it. Never delete job artifacts, markers,
+or receipts to make an older image start, and never restore only `jobs.sqlite3`
+as a full-state rollback.
+
+### 8.3 Audit and break-glass boundary
+
+`python -m replay.ops audit` reports database integrity, status counts, bounded
+active rows with stage/reason/attempt/age, and runner-lock presence.
+`verify-job-receipt JOB_ID` strictly re-reads the receipt and every listed object
+before reporting success. An `archive_blocked` job is inspected and repaired at
+the archive/provider boundary, strictly verified, and only then changed with
+`resume-blocked JOB_ID`. The command performs the existing transition; it does
+not edit a row directly.
+
+Rebuilding a stale singleton bundle cache remains receipt-only deletion under a
+separate, short-lived, audited operator identity. Normal server and runner roles
+have no delete permission. Verify the exact receipt and bundle identity, record
+the authorization/change ticket, delete only
+`replay/bundles/<bundle_id>/bundle_receipt.json`, then submit a new synthetic or
+authorized job. Never delete derivative objects or mutate a marker/receipt.
 
 ## 9. W6 — UI
 

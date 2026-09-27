@@ -548,7 +548,9 @@ def prepare_stage(root: Path, request: Request, resolved: ResolvedJob, receipt: 
         )
     except SourceUnavailable as error:
         raise StageFailure("universe_unavailable", str(error)) from error
-    except (ProtocolError, ValueError, OSError) as error:
+    except OSError as error:
+        raise StageFailure("resource_exhausted", str(error)) from error
+    except (ProtocolError, ValueError) as error:
         raise StageFailure("integrity_failure", str(error)) from error
 
 
@@ -1063,6 +1065,30 @@ def adopt_published_for_row(store, row, image_revision: str) -> int | None:
         return receipt.finished_at_ns
     except LocalStateError as error:
         raise StageFailure("archive_conflict", error.detail) from error
+    except StageFailure:
+        raise
+    except (ObjectStoreError, OSError) as error:
+        raise StageFailure("archive_unavailable", str(error)) from error
+    except (ContractError, VerificationFailure) as error:
+        raise StageFailure("archive_conflict", str(error)) from error
+
+
+def verify_published_receipt(store, job_id: str) -> JobReceipt:
+    """Strictly read a committed job receipt and every object it names."""
+    try:
+        raw = _read_remote(
+            store,
+            job_receipt_key(job_id),
+            MAX_JOB_RECEIPT_BYTES,
+            content_type=JSON_CONTENT_TYPE,
+        )
+        if raw is None:
+            raise StageFailure("archive_conflict", "job receipt is absent")
+        receipt = parse_job_receipt(raw)
+        if receipt.job_id != job_id:
+            raise StageFailure("archive_conflict", "job receipt has the wrong job ID")
+        _verify_remote_objects(store, receipt)
+        return receipt
     except StageFailure:
         raise
     except (ObjectStoreError, OSError) as error:

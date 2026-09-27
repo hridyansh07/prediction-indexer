@@ -27,7 +27,7 @@ TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z"
 )
 #: Upper bound on outstanding nonces. The nonce route is public, so the store is
-#: capped rather than grown on demand; Caddy rate limiting is the first defence.
+#: capped rather than grown on demand; the process limiter is the first defence.
 MAX_LIVE_NONCES = 500
 ZERO_ADDRESS = "0x" + "0" * 40
 
@@ -224,6 +224,13 @@ class AuthStore:
             if role is None or role != row["role"]:
                 return None
             return Principal(str(row["address"]), role)
+
+    def authenticated_session_key(self, headers: Any) -> str | None:
+        """Return a non-secret key only for a currently valid bearer session."""
+        token = _bearer_token(headers)
+        if token is None or self.authenticate(headers) is None:
+            return None
+        return token_digest(token)
 
     def require_member(self, headers: Any) -> Principal:
         principal = self.authenticate(headers)

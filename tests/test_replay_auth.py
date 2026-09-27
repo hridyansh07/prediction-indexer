@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from pathlib import Path
 
 from eth_account import Account
@@ -16,7 +17,13 @@ from eth_account.messages import encode_defunct
 
 from universe.auth import AuthError, AuthStore, NonceStore, Principal, checksum_address
 from universe.api import build_server
-from universe.config import AuthConfig, UniverseConfigError, load_config
+from universe.config import (
+    AuthConfig,
+    RateLimitConfig,
+    UniverseConfigError,
+    load_config,
+)
+from universe.rate_limit import RateLimiter
 
 
 UTC = timezone.utc
@@ -37,6 +44,34 @@ def auth_config(*, admin_address: str = ADMIN.address) -> AuthConfig:
         nonce_ttl_seconds=300,
         session_ttl_seconds=43_200,
     )
+
+
+def rate_limit_config(
+    *,
+    trusted_proxy_addresses: tuple[str, ...] = ("127.0.0.1",),
+    authenticated_requests: int = 60,
+    unauthenticated_requests: int = 3,
+    max_buckets: int = 500,
+) -> RateLimitConfig:
+    return RateLimitConfig(
+        trusted_proxy_addresses=trusted_proxy_addresses,
+        authenticated_requests=authenticated_requests,
+        authenticated_window_seconds=60,
+        unauthenticated_requests=unauthenticated_requests,
+        unauthenticated_window_seconds=10,
+        max_buckets=max_buckets,
+    )
+
+
+def rate_limit_document() -> dict[str, object]:
+    return {
+        "trusted_proxy_addresses": ["172.30.0.2"],
+        "authenticated_requests": 60,
+        "authenticated_window_seconds": 60,
+        "unauthenticated_requests": 3,
+        "unauthenticated_window_seconds": 10,
+        "max_buckets": 10000,
+    }
 
 
 def siwe_message(
@@ -81,10 +116,10 @@ class ReplayAuthTests(unittest.TestCase):
         signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
         return self.store.verify_siwe(message, signature)
 
-    def test_config_v3_is_closed_and_resolves_replay_database(self) -> None:
+    def test_config_v4_is_closed_and_resolves_replay_database(self) -> None:
         source = Path(self.temporary.name) / "config.json"
         document = {
-            "event_universe_config_version": 3,
+            "event_universe_config_version": 4,
             "database_path": "universe.sqlite3",
             "api": {"host": "127.0.0.1", "port": 8080},
             "backfill": {"temporary_directory": "tmp", "generated_start": None, "generated_end": None},
@@ -106,6 +141,7 @@ class ReplayAuthTests(unittest.TestCase):
                     "max_active_jobs_per_submitter": 4,
                     "max_queued_jobs_total": 64,
                 },
+                "rate_limit": rate_limit_document(),
             },
         }
         source.write_text(json.dumps(document), encoding="utf-8")
@@ -115,6 +151,9 @@ class ReplayAuthTests(unittest.TestCase):
         )
         self.assertEqual(config.replay.auth.siwe_statement, STATEMENT)
         self.assertEqual(config.replay.auth.admin_address, ADMIN.address)
+        self.assertEqual(
+            config.replay.rate_limit.trusted_proxy_addresses, ("172.30.0.2",)
+        )
         self.assertEqual(
             config.replay.jobs.runner_config_path,
             (source.parent / "replay_runner.json").resolve(),
@@ -127,13 +166,13 @@ class ReplayAuthTests(unittest.TestCase):
     def test_old_config_fails_actionably(self) -> None:
         source = Path(self.temporary.name) / "old.json"
         source.write_text(json.dumps({"event_universe_config_version": 1}), encoding="utf-8")
-        with self.assertRaisesRegex(UniverseConfigError, "version 3"):
+        with self.assertRaisesRegex(UniverseConfigError, "version 4"):
             load_config(source)
 
     def test_config_rejects_invalid_security_values(self) -> None:
         source = Path(self.temporary.name) / "config.json"
         base = {
-            "event_universe_config_version": 3,
+            "event_universe_config_version": 4,
             "database_path": "universe.sqlite3",
             "api": {"host": "127.0.0.1", "port": 8080},
             "backfill": {"temporary_directory": "tmp", "generated_start": None, "generated_end": None},
@@ -155,6 +194,7 @@ class ReplayAuthTests(unittest.TestCase):
                     "max_active_jobs_per_submitter": 4,
                     "max_queued_jobs_total": 64,
                 },
+                "rate_limit": rate_limit_document(),
             },
         }
         cases = (
@@ -202,6 +242,29 @@ class ReplayAuthTests(unittest.TestCase):
         source.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(UniverseConfigError, "must not exceed"):
             load_config(source)
+
+    def test_rate_limit_config_is_closed_and_validates_proxy_ips(self) -> None:
+        source = Path(self.temporary.name) / "config.json"
+        document = json.loads(
+            (Path(__file__).resolve().parents[1] / "configs/event_universe.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for field, value in (
+            ("trusted_proxy_addresses", []),
+            ("trusted_proxy_addresses", ["not-an-ip"]),
+            ("trusted_proxy_addresses", ["127.0.0.1", "127.0.0.1"]),
+            ("authenticated_requests", 0),
+            ("unauthenticated_window_seconds", True),
+            ("max_buckets", -1),
+        ):
+            candidate = json.loads(json.dumps(document))
+            candidate["replay"]["rate_limit"][field] = value
+            source.write_text(json.dumps(candidate), encoding="utf-8")
+            with self.subTest(field=field, value=value), self.assertRaises(
+                UniverseConfigError
+            ):
+                load_config(source)
 
     def test_schema_is_idempotent_and_rejects_tampering(self) -> None:
         self.store.initialize()
@@ -487,6 +550,121 @@ class ReplayAuthTests(unittest.TestCase):
 class _Database:
     def status(self) -> dict[str, bool]:
         return {"ok": True}
+
+
+class ReplayRateLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.now = NOW
+        self.auth = AuthStore(
+            Path(self.temporary.name) / "jobs.sqlite3",
+            auth_config(),
+            now=lambda: self.now,
+        )
+        self.auth.initialize()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_untrusted_internal_callers_are_exempt_and_proxy_uses_last_xff(self) -> None:
+        limiter = RateLimiter(rate_limit_config(), self.auth, clock=lambda: 0.0)
+        headers = {"X-Forwarded-For": "198.51.100.1, 203.0.113.9"}
+        for _ in range(3):
+            self.assertIsNone(limiter.retry_after("127.0.0.1", headers))
+        self.assertEqual(
+            limiter.retry_after(
+                "127.0.0.1",
+                {"X-Forwarded-For": "192.0.2.44, 203.0.113.9"},
+            ),
+            4,
+        )
+        for _ in range(20):
+            self.assertIsNone(limiter.retry_after("127.0.0.2", headers))
+
+    def test_proxy_uses_last_address_across_repeated_xff_fields(self) -> None:
+        limiter = RateLimiter(rate_limit_config(), self.auth, clock=lambda: 0.0)
+        first = Message()
+        first.add_header("X-Forwarded-For", "198.51.100.1")
+        first.add_header("X-Forwarded-For", "203.0.113.9")
+        second = Message()
+        second.add_header("X-Forwarded-For", "192.0.2.44")
+        second.add_header("X-Forwarded-For", "203.0.113.9")
+        for _ in range(3):
+            self.assertIsNone(limiter.retry_after("127.0.0.1", first))
+        self.assertEqual(limiter.retry_after("127.0.0.1", second), 4)
+
+    def test_authenticated_sessions_have_independent_buckets(self) -> None:
+        self.auth.add_member(MEMBER.address, "member", ADMIN.address)
+
+        def token(account) -> str:
+            nonce = self.auth.create_nonce()["nonce"]
+            message = siwe_message(account.address, nonce)
+            signature = Account.sign_message(
+                encode_defunct(text=message), account.key
+            ).signature.hex()
+            return self.auth.verify_siwe(message, signature)["token"]
+
+        first = token(MEMBER)
+        second = token(MEMBER)
+        limiter = RateLimiter(
+            rate_limit_config(authenticated_requests=2),
+            self.auth,
+            clock=lambda: 0.0,
+        )
+        headers = {"Authorization": f"Bearer {first}"}
+        self.assertIsNone(limiter.retry_after("127.0.0.1", headers))
+        self.assertIsNone(limiter.retry_after("127.0.0.1", headers))
+        self.assertEqual(limiter.retry_after("127.0.0.1", headers), 30)
+        self.assertIsNone(
+            limiter.retry_after(
+                "127.0.0.1", {"Authorization": f"Bearer {second}"}
+            )
+        )
+
+    def test_bucket_map_is_capped_by_oldest_eviction(self) -> None:
+        limiter = RateLimiter(
+            rate_limit_config(max_buckets=2), self.auth, clock=lambda: 0.0
+        )
+        for address in ("192.0.2.1", "192.0.2.2", "192.0.2.3"):
+            limiter.retry_after(
+                "127.0.0.1", {"X-Forwarded-For": address}
+            )
+        self.assertEqual(len(limiter), 2)
+
+    def test_http_429_has_retry_after(self) -> None:
+        limiter = RateLimiter(
+            rate_limit_config(unauthenticated_requests=1),
+            self.auth,
+            clock=lambda: 0.0,
+        )
+        server = build_server(
+            _Database(), self.auth, "127.0.0.1", 0, rate_limiter=limiter
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "GET", "/v1/auth/nonce", headers={"X-Forwarded-For": "192.0.2.1"}
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            connection.close()
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "GET", "/v1/auth/nonce", headers={"X-Forwarded-For": "192.0.2.1"}
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 429)
+            self.assertEqual(response.getheader("Retry-After"), "10")
+            self.assertEqual(json.loads(response.read()), {"error": "rate limit exceeded"})
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 class ReplayAuthHTTPTests(unittest.TestCase):

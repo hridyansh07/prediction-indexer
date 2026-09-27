@@ -886,6 +886,241 @@ and references. Event, market, and relationship detail is available from
 proxy enforce a 1.75 MB serialized response budget; list limits are capped at
 100.
 
+## Replay jobs production runtime
+
+Replay jobs run on the Universe EC2 host, never the splice/capture host. The
+topology is Internet → digest-pinned stock Caddy TLS → private
+`event-universe:8080`; one-shot runner containers share only the private network
+with disposable Redis. A separate runner-only egress network reaches the
+independently durable ObjectStore and workload-identity endpoint.
+Universe remains the parser and response-budget authority. Caddy has no archive
+credentials, and Universe has no archive-write credentials.
+
+### Install and storage preflight
+
+Provision a private persistent filesystem at `REPLAY_DATA_ROOT`, owned by the
+runtime uid/gid with mode 0700. Put `jobs.sqlite3`, `jobs/`, `runner.lock`,
+`bundle-work/`, `derivatives/`, and `.runner/` on that same filesystem. Enforce
+an XFS/ext4 project quota or equivalent no lower than `REPLAY_QUOTA_BYTES`.
+Explicitly set `REPLAY_REQUIRED_CAPACITY_BYTES` to the configured worst-case
+durable state, work, and scratch demand plus operating safety; there is no
+production byte default. Keep scratch/work paths quota-governed. Never mount a
+capture root, splice root, repository, credential file, or Docker socket.
+
+Use an S3/GCS instance workload identity scoped to create/get/list for the exact
+canonical, derivative, bundle, Replay job, and Replay database-backup prefixes.
+It must not update or delete objects. A local backend is production-eligible
+only when explicitly `independent` and on a different filesystem/device;
+preflight and the store factory reject same-device independence. Receipt-only
+bundle deletion uses a separate, audited, short-lived operator identity.
+Set `REPLAY_ARCHIVE_PROBE_KEY` to a known immutable canonical receipt that the
+normal runner identity must be able to read; preflight performs a provider HEAD
+and requires checksum metadata. On EC2, the instance metadata options must
+require IMDSv2 and use a hop limit of at least 2 so the container can obtain the
+role credentials.
+
+Build the runner with the exact source SHA, push it, and pin the deployed image
+by provider digest:
+
+```bash
+export REPLAY_IMAGE_REVISION="$(git rev-parse HEAD)"
+export REPLAY_RUNNER_BUILD_TAG="registry.example/prediction-indexer-replay-runner:$REPLAY_IMAGE_REVISION"
+docker build -f docker/replay-runner.Dockerfile \
+  --build-arg REPLAY_IMAGE_REVISION="$REPLAY_IMAGE_REVISION" \
+  -t "$REPLAY_RUNNER_BUILD_TAG" .
+# Push through the approved registry workflow, resolve its digest, then set both:
+# REPLAY_IMAGE_DIGEST=sha256:...
+# REPLAY_RUNNER_IMAGE=registry.example/prediction-indexer-replay-runner@sha256:...
+```
+
+Caddy and Redis are pinned by multi-platform OCI digest in Compose, and
+the runner is pulled by the digest set above rather than rebuilt. Validate
+configuration before touching services:
+
+```bash
+docker compose -f compose.universe.yaml --profile replay config --quiet
+docker compose -f compose.universe.yaml --profile replay pull replay-runner
+docker compose -f compose.universe.yaml --profile replay run --rm --no-deps \
+  --entrypoint sh replay-runner -c \
+  'test "$(id -u)" != 0 && test -x "$REPLAY_PUBLISHER" && materialize_range --describe && python -c "import replay.jobs,replay.ops"'
+```
+
+Stock Caddy enforces TLS, 64 KiB request bodies, 32 KiB headers, connection and
+upstream timeouts, security headers, and secret-safe JSON access logging. It
+does **not** enforce request rate limits. The singleton Universe process owns
+the in-process rate limiter configured in `event_universe.json`: requests whose
+direct peer is the statically assigned Caddy address are limited by validated
+session hash when authenticated and by the final Caddy-appended
+`X-Forwarded-For` address otherwise. Direct private runner/preparation requests
+are exempt. Keep the `replay-edge` subnet and Caddy address aligned with
+`trusted_proxy_addresses`, and do not add another ingress peer without adding
+its exact address. Caddy's `/data` volume persists ACME state; auth responses
+are not compressed, and there is no static UI in this rollout.
+
+The existing unauthenticated Vercel proxy is not a supported production ingress
+after this cutover: its users share a small egress-IP pool and therefore share
+the unauthenticated bucket. Retire that proxy or move its UI to authenticated
+session traffic before enabling public ingress. The localhost-only Universe
+port remains available for SSH tunnels and existing host operations.
+
+Start private services and Caddy, but leave the scheduler disabled:
+
+```bash
+docker compose -f compose.universe.yaml --profile replay up -d \
+  event-universe replay-redis caddy
+docker compose -f compose.universe.yaml --profile replay run --rm replay-preflight
+```
+
+Preflight is the scheduling gate. It validates immutable image identity and
+release descriptor, both configs, binaries, root ownership/privacy/durability,
+free bytes/inodes/quota, additive jobs/auth schema and SQLite integrity, Redis
+≥8.2 with finite maxmemory/noeviction/no RDB/AOF/no evictions, independent
+archive identity, private Universe health, public Caddy TLS/proxy health, and an
+archive HEAD of `REPLAY_ARCHIVE_PROBE_KEY`. Its output is bounded and
+secret-safe. A failure keeps the scheduler disabled. The in-process rate limiter
+is validated by release tests rather than a public 429 preflight probe. Daemon
+health, public DNS/certificates, cloud IAM, and filesystem quota enforcement are
+environment gates, not properties a repository test can certify.
+
+### Scheduler and resource controls
+
+The runner is never started with `up`, a restart policy, or a persistent loop.
+Use exactly one host cron or systemd timer invocation per minute:
+
+```cron
+* * * * * cd /opt/prediction-indexer && docker compose -f compose.universe.yaml --profile replay run --rm replay-runner >> /var/log/prediction-replay-runner.log 2>&1
+```
+
+Prefer a systemd oneshot service plus a one-minute timer with
+`Persistent=false`; use `flock` only inside the application as shipped. The
+durable `runner.lock` makes overlap a clean exit zero, and each successful lock
+holder claims at most one job. Alert on timer failures and last-success age;
+rotate host logs and Compose JSON logs. Never add parallel runners.
+
+Compose supplies CPU, memory reservation/limit, PID, read-only-rootfs, dropped
+capabilities, no-new-privileges, and bounded tmpfs controls. Redis uses the exact
+declared finite `REPLAY_REDIS_MAXMEMORY_BYTES`, no eviction, no persistence, no
+host port, and no volume. It is only transport; restart loses attempts visibly
+under existing typed retry/budget rules. Do not use container restart or
+eviction to mask `resource_exhausted`,
+`supervisor_exhausted`, or transport failures. Application entry/queue/output,
+attempt, deadline, and archive limits remain authoritative.
+
+### Monitoring and audit
+
+Probe and alert on:
+
+- public TLS, `/healthz`, `/v1/*` proxy limits, oversized body/header rejection,
+  security headers, absent auth-route compression, and 429 plus `Retry-After`
+  from controlled authenticated-session and unauthenticated-client-IP probes;
+- Universe health, schema identity/integrity, auth configuration, and one-process
+  singleton status;
+- Redis version, maxmemory, policy, persistence config drift, used memory,
+  `evicted_keys` (must remain zero), OOM/transport failures, and absence of a
+  published host port;
+- scheduler last start/exit, lock contention rate, last completed tick, and
+  stale runner containers;
+- counts and age by job `status`, `stage`, `reason_code`, `stage_attempts`,
+  `archive_blocked`, and `local_state_lost`;
+- archive availability/conflicts, receipt verification failures, disk/inodes,
+  actual project quota, and backup age/verification/restore-drill age.
+
+The bounded local audit is:
+
+```bash
+docker compose -f compose.universe.yaml --profile replay run --rm replay-audit
+docker compose -f compose.universe.yaml --profile replay run --rm \
+  --entrypoint python replay-runner -m replay.ops verify-job-receipt JOB_ID
+```
+
+For an `archive_blocked` job, first inspect its pending outcome, reason, attempts,
+age, local frozen `job_receipt.json`/`archive_state.json`, provider state, and
+logs. Remedy availability or IAM without modifying those files. If the remote
+job receipt exists, strictly verify it and every listed immutable object. If the
+block happened before receipt-last publication and verification reports `job
+receipt is absent`, compare the local frozen receipt/archive state to every
+already-uploaded immutable object and confirm that the remote receipt is truly
+absent; that absence is expected and must not be "repaired" manually. Then
+explicitly run:
+
+```bash
+docker compose -f compose.universe.yaml --profile replay run --rm \
+  --entrypoint python replay-runner -m replay.ops resume-blocked JOB_ID
+```
+
+Never edit SQLite rows, stage markers, archive state, or receipts. The command
+uses the existing compare-and-set transition and normal archive-first path.
+
+### Backup, restore, and drills
+
+Schedule a recurring jobs database backup separately from Universe's rebuildable
+database backup:
+
+```bash
+docker compose -f compose.universe.yaml --profile replay run --rm replay-backup
+```
+
+It uses SQLite's online backup API, so copying `jobs.sqlite3`, WAL, or SHM is
+forbidden. It checks the consistent snapshot, uploads immutable bytes under
+`REPLAY_BACKUP_PREFIX`, verifies the provider stream, and publishes a receipt
+with source/type/time/hash/length/key/provider identity and `integrity_check`.
+It never includes `jobs/`, bundle work, derivatives, `.runner`, or other active
+directories. Regularly run `verify-backup RECEIPT_KEY` and restore to an empty
+drill path with `restore-backup RECEIPT_KEY DESTINATION`; independently open the
+result and require `PRAGMA integrity_check = ok`.
+
+A DB-only restore recovers auth, sessions, jobs, events, and submissions. Before
+cutover, disable ingress and scheduler, stop Universe, preserve the current
+volume, restore to a new path, verify, then atomically install while stopped.
+Revoke all restored sessions or rotate authentication authority before reopening
+ingress. Active rows whose job directories are absent resume only to
+`local_state_lost`; never recreate/reset them. The archive-first receipt path
+still runs and remains auditable.
+
+A full active-state rollback requires a stopped coordinated full-volume snapshot:
+
+1. Obtain change authorization; disable edge ingress and scheduler.
+2. Drain the runner and prove no `runner.lock` holder exists.
+3. Stop Universe, checkpoint SQLite, and snapshot the entire Replay volume.
+4. Record config hashes, image revision/digest, volume ID, archive identity, and
+   snapshot identity together.
+5. Restore volume/config/revision metadata as one unit while services remain
+   stopped; verify SQLite and local markers, then run preflight and synthetic
+   acceptance before reopening ingress/scheduling.
+
+Do not call a DB-only restore a full-state rollback. Never roll back to an image
+that cannot read current state, delete artifacts to force compatibility, or
+mutate committed evidence.
+
+### Break-glass bundle rebuild
+
+The bundle cache remains one singleton receipt. After proving
+`stale_bundle_cache`, use separate delete-capable operator authority, record the
+ticket/operator/time/bundle key/current receipt identity, strictly verify the
+receipt, and delete **only**
+`replay/bundles/<bundle_id>/bundle_receipt.json`. Remove the authority, verify no
+derivative changed, and allow an explicitly authorized new job to rebuild. This
+is receipt-only deletion: never delete or rewrite derivative objects, job
+receipts, or canonical objects.
+
+### Rollout and rollback
+
+Rollout order is: build/pin images; provision private volume, quotas, independent
+archive, networks, workload identity, Caddy state, and logging;
+deploy additive Universe config/schema; drill migration plus online
+backup/verify/DB-only restore and stopped full-volume restore with synthetic
+data; start private services; pass preflight; validate TLS/proxy/body/header/time
+limits, security headers, and controlled in-process limiter 429s; install the
+scheduler disabled; run synthetic cold and warm acceptance through canonical
+materialize → prepare → supervisor → strict reader → receipt-last archive →
+strict job reader, including crash boundaries; then enable and monitor. No
+retained or live-provider acceptance is authorized by this procedure.
+
+Rollback disables scheduler and ingress, drains the runner, and preserves the
+whole volume. Roll back only to a config/image proven compatible with current
+schema and markers. For state rollback use only the stopped full-volume snapshot
+procedure above. Rerun preflight and synthetic acceptance before re-enabling.
+
 ## Clock and liveness semantics
 
 Linux containers share the host kernel's `CLOCK_MONOTONIC` and boot ID. Each

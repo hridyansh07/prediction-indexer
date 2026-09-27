@@ -21,6 +21,7 @@ from replay.jobs.contracts import (
 )
 from universe.auth import AuthError, AuthStore, checksum_address
 from universe.replay_jobs import ReplayJobError, ReplayJobStore
+from universe.rate_limit import RateLimiter
 from universe.store import (
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     DetailTooLarge,
@@ -465,18 +466,38 @@ def build_server(
     port: int,
     replay_jobs: ReplayJobStore | None = None,
     runner_config: RunnerConfig | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> ThreadingHTTPServer:
     application = UniverseApplication(database, auth, replay_jobs, runner_config)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
             self._dispatch(lambda: application.get(self.path, self.headers))
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
             self._dispatch_with_body(application.post)
 
         def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
             self._dispatch_with_body(application.delete)
+
+        def _rate_limited(self) -> bool:
+            if rate_limiter is None:
+                return False
+            retry_after = rate_limiter.retry_after(self.client_address[0], self.headers)
+            if retry_after is None:
+                return False
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "rate limit exceeded"},
+                retry_after=retry_after,
+            )
+            return True
 
         def _dispatch_with_body(self, dispatch) -> None:
             try:
@@ -561,7 +582,13 @@ def build_server(
                 raise _RequestError("JSON body must be an object")
             return document, payload
 
-        def _send_json(self, status: int, document: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            status: int,
+            document: dict[str, Any],
+            *,
+            retry_after: int | None = None,
+        ) -> None:
             payload = (
                 json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
                 + "\n"
@@ -577,6 +604,8 @@ def build_server(
                 self.send_header("Connection", "close")
             if int(status) == HTTPStatus.UNAUTHORIZED:
                 self.send_header("WWW-Authenticate", "Bearer")
+            if retry_after is not None:
+                self.send_header("Retry-After", str(retry_after))
             self.end_headers()
             self.wfile.write(payload)
 
@@ -590,9 +619,10 @@ def serve(
     port: int,
     replay_jobs: ReplayJobStore | None = None,
     runner_config: RunnerConfig | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> None:
     server = build_server(
-        database, auth, host, port, replay_jobs, runner_config
+        database, auth, host, port, replay_jobs, runner_config, rate_limiter
     )
     try:
         server.serve_forever()
