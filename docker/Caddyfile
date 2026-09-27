@@ -1,0 +1,57 @@
+{
+	servers {
+		max_header_size 32KiB
+		timeouts {
+			read_body 15s
+			read_header 10s
+			write 60s
+			idle 2m
+		}
+	}
+}
+
+(universe_proxy) {
+	reverse_proxy event-universe:8080 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+			read_timeout 60s
+			write_timeout 30s
+			keepalive 30s
+		}
+	}
+}
+
+{$REPLAY_PUBLIC_HOST} {
+	request_body {
+		max_size 64KiB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# Authentication responses carry nonces or tokens and are never compressed.
+	@auth path /v1/auth/*
+	handle @auth {
+		import universe_proxy
+	}
+
+	@api path /v1/* /healthz
+	handle @api {
+		encode zstd gzip
+		import universe_proxy
+	}
+
+	# Reserved for an eventual same-origin static UI. No UI is shipped here.
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

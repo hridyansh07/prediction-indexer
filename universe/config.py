@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -9,12 +10,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+from eth_utils import is_checksum_address
 
 from archive.storage.base import ObjectStore, normalize_key
 from archive.storage.factory import build_store
 from targeter.v2.models import isoformat, parse_timestamp
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 4
 CONFIG_ENVIRONMENT_VARIABLE = "EVENT_UNIVERSE_CONFIG"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/event_universe.json"
 
@@ -43,12 +47,50 @@ class BackfillConfig:
 
 
 @dataclass(frozen=True)
+class AuthConfig:
+    siwe_domain: str
+    siwe_uri: str
+    siwe_statement: str
+    chain_id: int
+    admin_address: str
+    nonce_ttl_seconds: int
+    session_ttl_seconds: int
+
+
+@dataclass(frozen=True)
+class ReplayJobsConfig:
+    runner_config_path: Path
+    max_active_jobs_total: int
+    max_active_jobs_per_submitter: int
+    max_queued_jobs_total: int
+
+
+@dataclass(frozen=True)
+class RateLimitConfig:
+    trusted_proxy_addresses: tuple[str, ...]
+    authenticated_requests: int
+    authenticated_window_seconds: int
+    unauthenticated_requests: int
+    unauthenticated_window_seconds: int
+    max_buckets: int
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    database_path: Path
+    auth: AuthConfig
+    jobs: ReplayJobsConfig
+    rate_limit: RateLimitConfig
+
+
+@dataclass(frozen=True)
 class UniverseConfig:
     path: Path
     database_path: Path
     api: ApiConfig
     backfill: BackfillConfig
     backup: BackupConfig
+    replay: ReplayConfig
 
     @property
     def temporary_directory(self) -> Path:
@@ -71,6 +113,8 @@ def load_config(path: Path | None = None) -> UniverseConfig:
     except json.JSONDecodeError as error:
         raise UniverseConfigError(f"invalid Event Universe config {source}: {error}") from error
     document = _expand_environment(document)
+    if not isinstance(document, dict) or document.get("event_universe_config_version") != CONFIG_VERSION:
+        raise UniverseConfigError("unsupported Event Universe config version; version 4 is required")
     _exact(
         document,
         {
@@ -79,12 +123,10 @@ def load_config(path: Path | None = None) -> UniverseConfig:
             "api",
             "backfill",
             "backup",
+            "replay",
         },
         "config",
     )
-    if document["event_universe_config_version"] != CONFIG_VERSION:
-        raise UniverseConfigError("unsupported Event Universe config version")
-
     api = _section(document, "api", {"host", "port"})
     backfill = _section(
         document,
@@ -92,11 +134,134 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         {"temporary_directory", "generated_start", "generated_end"},
     )
     backup = _section(document, "backup", {"directory", "object_prefix"})
+    replay = _section(
+        document, "replay", {"database_path", "auth", "jobs", "rate_limit"}
+    )
+    auth = replay.get("auth")
+    _exact(
+        auth,
+        {
+            "siwe_domain",
+            "siwe_uri",
+            "siwe_statement",
+            "chain_id",
+            "admin_address",
+            "nonce_ttl_seconds",
+            "session_ttl_seconds",
+        },
+        "replay.auth",
+    )
+    assert isinstance(auth, dict)
+    jobs = replay.get("jobs")
+    _exact(
+        jobs,
+        {
+            "runner_config_path",
+            "max_active_jobs_total",
+            "max_active_jobs_per_submitter",
+            "max_queued_jobs_total",
+        },
+        "replay.jobs",
+    )
+    assert isinstance(jobs, dict)
+    rate_limit = replay.get("rate_limit")
+    _exact(
+        rate_limit,
+        {
+            "trusted_proxy_addresses",
+            "authenticated_requests",
+            "authenticated_window_seconds",
+            "unauthenticated_requests",
+            "unauthenticated_window_seconds",
+            "max_buckets",
+        },
+        "replay.rate_limit",
+    )
+    assert isinstance(rate_limit, dict)
     port = api["port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise UniverseConfigError("api.port must be an integer between 1 and 65535")
     object_prefix = normalize_key(_text(backup, "object_prefix", "backup").rstrip("/"))
     base = source.resolve().parent
+    domain = _text(auth, "siwe_domain", "replay.auth")
+    try:
+        parsed_domain = urlsplit(f"//{domain}")
+        domain_port_valid = parsed_domain.port is None or parsed_domain.port > 0
+    except ValueError:
+        domain_port_valid = False
+        parsed_domain = urlsplit("//invalid")
+    if (
+        "://" in domain
+        or any(character.isspace() or ord(character) < 32 for character in domain)
+        or not parsed_domain.netloc
+        or parsed_domain.hostname is None
+        or parsed_domain.path
+        or parsed_domain.query
+        or parsed_domain.fragment
+        or parsed_domain.username is not None
+        or not domain_port_valid
+    ):
+        raise UniverseConfigError("replay.auth.siwe_domain must be an authority without scheme or path")
+    uri = _text(auth, "siwe_uri", "replay.auth")
+    try:
+        parsed_uri = urlsplit(uri)
+        uri_port_valid = parsed_uri.port is None or parsed_uri.port > 0
+    except ValueError:
+        uri_port_valid = False
+        parsed_uri = urlsplit("invalid:")
+    if (
+        parsed_uri.scheme not in {"http", "https"}
+        or not parsed_uri.netloc
+        or parsed_uri.hostname is None
+        or parsed_uri.username is not None
+        or parsed_uri.query
+        or parsed_uri.fragment
+        or parsed_uri.geturl() != uri
+        or any(character.isspace() or ord(character) < 32 for character in uri)
+        or not uri_port_valid
+    ):
+        raise UniverseConfigError("replay.auth.siwe_uri must be a canonical absolute HTTP(S) URI")
+    statement = _text(auth, "siwe_statement", "replay.auth")
+    if len(statement) > 256 or any(not 32 <= ord(character) <= 126 for character in statement):
+        raise UniverseConfigError(
+            "replay.auth.siwe_statement must be at most 256 printable ASCII characters"
+        )
+    chain_id = _positive_integer(auth, "chain_id", "replay.auth")
+    nonce_ttl = _bounded_ttl(auth, "nonce_ttl_seconds")
+    session_ttl = _bounded_ttl(auth, "session_ttl_seconds")
+    max_active_total = _positive_integer(jobs, "max_active_jobs_total", "replay.jobs")
+    max_active_submitter = _positive_integer(
+        jobs, "max_active_jobs_per_submitter", "replay.jobs"
+    )
+    max_queued_total = _positive_integer(jobs, "max_queued_jobs_total", "replay.jobs")
+    trusted_proxy_addresses = rate_limit.get("trusted_proxy_addresses")
+    if (
+        not isinstance(trusted_proxy_addresses, list)
+        or not trusted_proxy_addresses
+        or len(trusted_proxy_addresses) > 16
+    ):
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must contain 1 to 16 IP addresses"
+        )
+    try:
+        trusted_proxies = tuple(
+            str(ipaddress.ip_address(address)) for address in trusted_proxy_addresses
+        )
+    except ValueError as error:
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must contain IP addresses"
+        ) from error
+    if len(set(trusted_proxies)) != len(trusted_proxies):
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must be unique"
+        )
+    if max_queued_total > max_active_total:
+        raise UniverseConfigError(
+            "replay.jobs.max_queued_jobs_total must not exceed max_active_jobs_total"
+        )
+    admin_address = _text(auth, "admin_address", "replay.auth")
+    if not is_checksum_address(admin_address):
+        raise UniverseConfigError("replay.auth.admin_address must be a valid EIP-55 address")
     generated_start = _optional_timestamp(
         backfill.get("generated_start"), "backfill.generated_start"
     )
@@ -128,6 +293,48 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         backup=BackupConfig(
             directory=_path(backup, "directory", base, "backup"),
             object_prefix=object_prefix,
+        ),
+        replay=ReplayConfig(
+            database_path=_path(replay, "database_path", base, "replay"),
+            auth=AuthConfig(
+                siwe_domain=domain,
+                siwe_uri=uri,
+                siwe_statement=statement,
+                chain_id=chain_id,
+                admin_address=admin_address,
+                nonce_ttl_seconds=nonce_ttl,
+                session_ttl_seconds=session_ttl,
+            ),
+            jobs=ReplayJobsConfig(
+                runner_config_path=_path(
+                    jobs, "runner_config_path", base, "replay.jobs"
+                ),
+                max_active_jobs_total=max_active_total,
+                max_active_jobs_per_submitter=max_active_submitter,
+                max_queued_jobs_total=max_queued_total,
+            ),
+            rate_limit=RateLimitConfig(
+                trusted_proxy_addresses=trusted_proxies,
+                authenticated_requests=_positive_integer(
+                    rate_limit, "authenticated_requests", "replay.rate_limit"
+                ),
+                authenticated_window_seconds=_positive_integer(
+                    rate_limit,
+                    "authenticated_window_seconds",
+                    "replay.rate_limit",
+                ),
+                unauthenticated_requests=_positive_integer(
+                    rate_limit, "unauthenticated_requests", "replay.rate_limit"
+                ),
+                unauthenticated_window_seconds=_positive_integer(
+                    rate_limit,
+                    "unauthenticated_window_seconds",
+                    "replay.rate_limit",
+                ),
+                max_buckets=_positive_integer(
+                    rate_limit, "max_buckets", "replay.rate_limit"
+                ),
+            ),
         ),
     )
 
@@ -181,3 +388,17 @@ def _optional_timestamp(value: Any, label: str) -> datetime | None:
     if parsed is None or value != isoformat(parsed):
         raise UniverseConfigError(f"{label} must be null or a canonical UTC timestamp")
     return parsed
+
+
+def _positive_integer(document: dict[str, Any], field: str, label: str) -> int:
+    value = document.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise UniverseConfigError(f"{label}.{field} must be a positive integer")
+    return value
+
+
+def _bounded_ttl(document: dict[str, Any], field: str) -> int:
+    value = _positive_integer(document, field, "replay.auth")
+    if value > 604_800:
+        raise UniverseConfigError(f"replay.auth.{field} must not exceed 604800")
+    return value

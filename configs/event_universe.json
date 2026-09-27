@@ -1,5 +1,5 @@
 {
-  "event_universe_config_version": 1,
+  "event_universe_config_version": 4,
   "database_path": "/var/lib/event-universe/event-universe.sqlite3",
   "api": {
     "host": "0.0.0.0",
@@ -13,5 +13,31 @@
   "backup": {
     "directory": "/var/lib/event-universe/backups",
     "object_prefix": "event-universe/backups"
+  },
+  "replay": {
+    "database_path": "/var/lib/replay/jobs.sqlite3",
+    "auth": {
+      "siwe_domain": "universe.example",
+      "siwe_uri": "https://universe.example/login",
+      "siwe_statement": "Sign in to Prediction Indexer.",
+      "chain_id": 1,
+      "admin_address": "0x0000000000000000000000000000000000000000",
+      "nonce_ttl_seconds": 300,
+      "session_ttl_seconds": 43200
+    },
+    "jobs": {
+      "runner_config_path": "/etc/prediction-indexer/replay_runner.json",
+      "max_active_jobs_total": 100,
+      "max_active_jobs_per_submitter": 4,
+      "max_queued_jobs_total": 64
+    },
+    "rate_limit": {
+      "trusted_proxy_addresses": ["172.30.0.2"],
+      "authenticated_requests": 60,
+      "authenticated_window_seconds": 60,
+      "unauthenticated_requests": 3,
+      "unauthenticated_window_seconds": 10,
+      "max_buckets": 10000
+    }
   }
 }

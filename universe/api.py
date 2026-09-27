@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +13,16 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from targeter.v2.models import isoformat, parse_timestamp
+from replay.jobs.contracts import (
+    STRATEGY_CONFIG_SCHEMAS,
+    ContractError,
+    RunnerConfig,
+    parse_request,
+    request_sha256,
+)
+from universe.auth import AuthError, AuthStore, checksum_address
+from universe.replay_jobs import ReplayJobError, ReplayJobStore
+from universe.rate_limit import RateLimiter
 from universe.store import (
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     DetailTooLarge,
@@ -19,12 +31,58 @@ from universe.store import (
 
 
 class UniverseApplication:
-    def __init__(self, database: UniverseStore) -> None:
+    def __init__(
+        self,
+        database: UniverseStore,
+        auth: AuthStore | None = None,
+        replay_jobs: ReplayJobStore | None = None,
+        runner_config: RunnerConfig | None = None,
+    ) -> None:
         self.database = database
+        self.auth = auth
+        self.replay_jobs = replay_jobs
+        self.runner_config = runner_config
 
-    def get(self, target: str) -> tuple[int, dict[str, Any]]:
+    def get(self, target: str, headers: Any = None) -> tuple[int, dict[str, Any]]:
         parsed = urlsplit(target)
         query = parse_qs(parsed.query, keep_blank_values=True)
+        if parsed.path == "/v1/auth/nonce" and self.auth is not None:
+            _only(query, set())
+            return HTTPStatus.OK, self.auth.create_nonce()
+        if parsed.path == "/v1/admin/allowlist" and self.auth is not None:
+            _only(query, set())
+            self.auth.require_admin(headers)
+            return HTTPStatus.OK, {"members": self.auth.list_members()}
+        if parsed.path == "/v1/replay/jobs" and self.replay_jobs is not None:
+            return HTTPStatus.OK, self._replay_jobs(query)
+        if parsed.path == "/v1/replay/strategies" and self.runner_config is not None:
+            _only(query, set())
+            return HTTPStatus.OK, _replay_strategies(self.runner_config)
+        if (
+            parsed.path.startswith("/v1/replay/jobs/")
+            and parsed.path.endswith("/events")
+            and self.replay_jobs is not None
+        ):
+            job_id = _path_value(
+                parsed.path.removeprefix("/v1/replay/jobs/").removesuffix("/events"),
+                "job id",
+            )
+            return HTTPStatus.OK, self._replay_job_events(job_id, query)
+        if parsed.path.startswith("/v1/replay/jobs/") and self.replay_jobs is not None:
+            _only(query, set())
+            job_id = _path_value(
+                parsed.path.removeprefix("/v1/replay/jobs/"), "job id"
+            )
+            stored = self.replay_jobs.get_job(job_id)
+            if stored is None:
+                return HTTPStatus.NOT_FOUND, {"error": "job not found"}
+            row, request_bytes = stored
+            # The request was validated against the registry when it was
+            # submitted. Re-validating history against today's registry would
+            # hide every job whose preset or strategy was later renamed.
+            record = self.replay_jobs.job_record(row, request_bytes)
+            record["submitted_by"] = checksum_address(row.submitted_by)
+            return HTTPStatus.OK, record
         if parsed.path == "/healthz":
             _only(query, set())
             return HTTPStatus.OK, self.database.status()
@@ -132,6 +190,110 @@ class UniverseApplication:
                 if detail is None:
                     return HTTPStatus.NOT_FOUND, {"error": "selection not found"}
                 return HTTPStatus.OK, detail
+        return HTTPStatus.NOT_FOUND, {"error": "not found"}
+
+    def post(
+        self,
+        target: str,
+        headers: Any,
+        document: dict[str, Any],
+        raw_body: bytes | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        parsed = urlsplit(target)
+        _only(parse_qs(parsed.query, keep_blank_values=True), set())
+        if self.auth is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if parsed.path == "/v1/auth/siwe":
+            _exact_body(document, {"message", "signature"})
+            if not isinstance(document["message"], str) or not isinstance(document["signature"], str):
+                raise ValueError("message and signature must be strings")
+            return HTTPStatus.OK, self.auth.verify_siwe(
+                document["message"], document["signature"]
+            )
+        if parsed.path == "/v1/auth/logout":
+            _exact_body(document, set())
+            self.auth.logout(headers)
+            return HTTPStatus.OK, {"ok": True}
+        if parsed.path == "/v1/admin/allowlist":
+            _exact_body(document, {"address", "note"})
+            principal = self.auth.require_admin(headers)
+            return HTTPStatus.OK, self.auth.add_member(
+                document["address"], document["note"], principal.address
+            )
+        if parsed.path == "/v1/replay/jobs" and self.replay_jobs is not None:
+            principal = self.auth.require_member(headers)
+            key = _single_header(headers, "Idempotency-Key")
+            if raw_body is None or self.runner_config is None:
+                raise ValueError("invalid request")
+            # A retired strategy still names jobs accepted before retirement,
+            # so an idempotent replay of one returns it; only new jobs are refused.
+            request = parse_request(
+                raw_body, self.runner_config, accept_retired=True
+            )
+            existing = self.replay_jobs.lookup_submission(
+                principal.address, key, request_sha256(request)
+            )
+            if existing is not None:
+                return HTTPStatus.OK, {
+                    "job_id": existing.row.job_id,
+                    "status": existing.row.status,
+                    "replayed": True,
+                }
+            request = parse_request(raw_body, self.runner_config)
+            occurrences, _more = self.database.list_selections(
+                bundle_id=request.bundle_id, limit=1
+            )
+            result = self.replay_jobs.submit(
+                raw_body,
+                request,
+                principal,
+                key,
+                time.time_ns(),
+                bundle_exists=bool(occurrences),
+            )
+            return (
+                HTTPStatus.CREATED if result.created else HTTPStatus.OK,
+                {
+                    "job_id": result.row.job_id,
+                    "status": result.row.status,
+                    "replayed": not result.created,
+                },
+            )
+        cancel_prefix = "/v1/replay/jobs/"
+        if (
+            parsed.path.startswith(cancel_prefix)
+            and parsed.path.endswith("/cancel")
+            and self.replay_jobs is not None
+        ):
+            _exact_body(document, set())
+            principal = self.auth.require_member(headers)
+            job_id = _path_value(
+                parsed.path.removeprefix(cancel_prefix).removesuffix("/cancel"),
+                "job id",
+            )
+            row = self.replay_jobs.cancel_job(job_id, principal, time.time_ns())
+            record = self.replay_jobs.job_record(row)
+            record["submitted_by"] = checksum_address(row.submitted_by)
+            return HTTPStatus.OK, record
+        return HTTPStatus.NOT_FOUND, {"error": "not found"}
+
+    def delete(
+        self,
+        target: str,
+        headers: Any,
+        document: dict[str, Any],
+        raw_body: bytes | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        parsed = urlsplit(target)
+        _only(parse_qs(parsed.query, keep_blank_values=True), set())
+        if self.auth is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        prefix = "/v1/admin/allowlist/"
+        if parsed.path.startswith(prefix):
+            _exact_body(document, set())
+            principal = self.auth.require_admin(headers)
+            address = _path_value(parsed.path.removeprefix(prefix), "address")
+            return HTTPStatus.OK, self.auth.remove_member(address, principal.address)
         return HTTPStatus.NOT_FOUND, {"error": "not found"}
 
     def _runs(self, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -265,27 +427,181 @@ class UniverseApplication:
             )
         return {"events": events, "next_cursor": next_cursor}
 
+    def _replay_jobs(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        assert self.replay_jobs is not None
+        _only(query, {"status", "limit", "cursor"})
+        limit = _integer(query, "limit", default=100)
+        after = _replay_jobs_cursor(_optional(query, "cursor"))
+        rows, has_more = self.replay_jobs.list_jobs(
+            status=_optional(query, "status"), limit=limit, after=after
+        )
+        records = []
+        for row in rows:
+            record = self.replay_jobs.job_record(row)
+            record["submitted_by"] = checksum_address(row.submitted_by)
+            records.append(record)
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = _encode_cursor(
+                ["replay_jobs", str(last.created_at_ns), last.job_id]
+            )
+        return {"jobs": records, "next_cursor": next_cursor}
 
-def serve(database: UniverseStore, host: str, port: int) -> None:
-    application = UniverseApplication(database)
+    def _replay_job_events(
+        self, job_id: str, query: dict[str, list[str]]
+    ) -> dict[str, Any]:
+        assert self.replay_jobs is not None
+        _only(query, {"limit", "cursor"})
+        if self.replay_jobs.get_job(job_id) is None:
+            raise ReplayJobError(404, "job not found")
+        limit = _integer(query, "limit", default=100)
+        after = _replay_job_events_cursor(_optional(query, "cursor"), job_id)
+        events, has_more = self.replay_jobs.list_events(
+            job_id, limit=limit, after_event_id=after
+        )
+        next_cursor = None
+        if has_more and events:
+            next_cursor = _encode_cursor(
+                ["replay_job_events", job_id, events[-1]["event_id"]]
+            )
+        return {"events": events, "next_cursor": next_cursor}
+
+
+def build_server(
+    database: UniverseStore,
+    auth: AuthStore,
+    host: str,
+    port: int,
+    replay_jobs: ReplayJobStore | None = None,
+    runner_config: RunnerConfig | None = None,
+    rate_limiter: RateLimiter | None = None,
+) -> ThreadingHTTPServer:
+    application = UniverseApplication(database, auth, replay_jobs, runner_config)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
+            self._dispatch(lambda: application.get(self.path, self.headers))
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
+            self._dispatch_with_body(application.post)
+
+        def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            if self._rate_limited():
+                return
+            self._dispatch_with_body(application.delete)
+
+        def _rate_limited(self) -> bool:
+            if rate_limiter is None:
+                return False
+            retry_after = rate_limiter.retry_after(self.client_address[0], self.headers)
+            if retry_after is None:
+                return False
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "rate limit exceeded"},
+                retry_after=retry_after,
+            )
+            return True
+
+        def _dispatch_with_body(self, dispatch) -> None:
             try:
-                status, document = application.get(self.path)
+                document, raw_body = self._read_json_body()
+                status, response = dispatch(
+                    self.path, self.headers, document, raw_body
+                )
+            except _FramingError as error:
+                self.close_connection = True
+                self._framing_rejected = True
+                self._send_json(error.status, {"error": error.message})
+                return
+            except AuthError as error:
+                self._send_json(error.status, {"error": str(error)})
+                return
+            except ReplayJobError as error:
+                self._send_json(error.status, {"error": str(error)})
+                return
+            except (ContractError, _RequestError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            except (ValueError, TypeError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+                return
+            except Exception:  # noqa: BLE001 - secrets and internals must not be logged
+                self.log_error("request failed")
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "internal server error"},
+                )
+                return
+            self._send_json(status, response)
+
+        def _dispatch(self, dispatch) -> None:
+            try:
+                status, document = dispatch()
             except DetailTooLarge as error:
                 status, document = HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
                     "error": str(error)
                 }
+            except AuthError as error:
+                status, document = error.status, {"error": str(error)}
+            except ReplayJobError as error:
+                status, document = error.status, {"error": str(error)}
             except (ValueError, TypeError) as error:
                 status, document = HTTPStatus.BAD_REQUEST, {"error": str(error)}
-            except Exception as error:  # noqa: BLE001 - do not expose internals
-                self.log_error("request failed: %s", error)
+            except Exception:  # noqa: BLE001 - do not expose or log secrets
+                self.log_error("request failed")
                 status, document = HTTPStatus.INTERNAL_SERVER_ERROR, {
                     "error": "internal server error"
                 }
+            self._send_json(status, document)
+
+        def _read_json_body(self) -> tuple[dict[str, Any], bytes]:
+            if self.headers.get_all("Transfer-Encoding", []):
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "invalid request framing")
+            lengths = self.headers.get_all("Content-Length", [])
+            if not lengths:
+                raise _FramingError(HTTPStatus.LENGTH_REQUIRED, "content length required")
+            if len(lengths) != 1 or not lengths[0].isdigit():
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "invalid content length")
+            length = int(lengths[0])
+            if length > 65_536:
+                raise _FramingError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
+            content_types = self.headers.get_all("Content-Type", [])
+            if len(content_types) != 1 or not _json_content_type(content_types[0]):
+                raise _FramingError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "application/json required")
+            payload = self.rfile.read(length)
+            if len(payload) != length:
+                raise _FramingError(HTTPStatus.BAD_REQUEST, "incomplete request body")
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise _RequestError("request body must be UTF-8 JSON") from error
+            try:
+                document = json.loads(text, object_pairs_hook=_unique_object)
+            except RecursionError as error:
+                raise _RequestError("request JSON is too deeply nested") from error
+            except json.JSONDecodeError as error:
+                raise _RequestError(
+                    f"invalid JSON at line {error.lineno} column {error.colno}"
+                ) from error
+            if not isinstance(document, dict):
+                raise _RequestError("JSON body must be an object")
+            return document, payload
+
+        def _send_json(
+            self,
+            status: int,
+            document: dict[str, Any],
+            *,
+            retry_after: int | None = None,
+        ) -> None:
             payload = (
-                json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
                 + "\n"
             ).encode("utf-8")
             if len(payload) > EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:
@@ -295,14 +611,82 @@ def serve(database: UniverseStore, host: str, port: int) -> None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            if getattr(self, "_framing_rejected", False):
+                self.send_header("Connection", "close")
+            if int(status) == HTTPStatus.UNAUTHORIZED:
+                self.send_header("WWW-Authenticate", "Bearer")
+            if retry_after is not None:
+                self.send_header("Retry-After", str(retry_after))
             self.end_headers()
             self.wfile.write(payload)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def serve(
+    database: UniverseStore,
+    auth: AuthStore,
+    host: str,
+    port: int,
+    replay_jobs: ReplayJobStore | None = None,
+    runner_config: RunnerConfig | None = None,
+    rate_limiter: RateLimiter | None = None,
+) -> None:
+    server = build_server(
+        database, auth, host, port, replay_jobs, runner_config, rate_limiter
+    )
     try:
         server.serve_forever()
     finally:
         server.server_close()
+
+
+class _FramingError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class _RequestError(ValueError):
+    """A validation failure whose message is safe to return to the client."""
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _RequestError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _json_content_type(value: str) -> bool:
+    parts = [part.strip().lower() for part in value.split(";")]
+    return parts[0] == "application/json" and (
+        len(parts) == 1 or (len(parts) == 2 and parts[1] == "charset=utf-8")
+    )
+
+
+def _single_header(headers: Any, field: str) -> str:
+    values = headers.get_all(field, []) if hasattr(headers, "get_all") else []
+    if not values and isinstance(headers, dict) and field in headers:
+        values = [headers[field]]
+    if len(values) != 1 or not isinstance(values[0], str):
+        raise ReplayJobError(400, f"exactly one {field} header is required")
+    return values[0]
+
+
+def _exact_body(document: dict[str, Any], fields: set[str]) -> None:
+    if set(document) != fields:
+        missing = sorted(fields - set(document))
+        unexpected = sorted(set(document) - fields)
+        details = []
+        if missing:
+            details.append(f"missing fields: {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected fields: {', '.join(unexpected)}")
+        raise _RequestError("request body fields are invalid; " + "; ".join(details))
 
 
 def _only(query: dict[str, list[str]], expected: set[str]) -> None:
@@ -386,14 +770,78 @@ def _encode_cursor(value: list[Any]) -> str:
 
 
 def _decode_cursor(value: str) -> list[Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("cursor is invalid")
     try:
         padded = value + "=" * (-len(value) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(padded))
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != value:
+            raise ValueError("noncanonical cursor")
+        decoded = json.loads(raw)
     except (ValueError, json.JSONDecodeError) as error:
         raise ValueError("cursor is invalid") from error
     if not isinstance(decoded, list):
         raise ValueError("cursor is invalid")
     return decoded
+
+
+REPLAY_STRATEGIES_VERSION = 1
+
+
+def _replay_strategies(config: RunnerConfig) -> dict[str, Any]:
+    """The runner registry as the UI needs it; module paths are not exposed.
+
+    Retired strategies stay listed so earlier jobs keep their labels; only
+    ``status: active`` entries accept new jobs.
+    """
+    return {
+        "version": REPLAY_STRATEGIES_VERSION,
+        "strategies": [
+            {
+                "name": name,
+                "label": entry.label,
+                "description": entry.description,
+                "status": entry.status,
+                "config_keys": sorted(
+                    STRATEGY_CONFIG_SCHEMAS[entry.config_schema].request_keys
+                ),
+            }
+            for name, entry in sorted(config.strategies.items())
+        ],
+        "limits": sorted(config.limits),
+    }
+
+
+def _replay_jobs_cursor(value: str | None) -> tuple[int, str] | None:
+    if value is None:
+        return None
+    decoded = _decode_cursor(value)
+    if (
+        len(decoded) != 3
+        or decoded[0] != "replay_jobs"
+        or not isinstance(decoded[1], str)
+        or not re.fullmatch(r"0|[1-9][0-9]*", decoded[1])
+        or not isinstance(decoded[2], str)
+    ):
+        raise ValueError("cursor does not belong to replay jobs")
+    return int(decoded[1]), decoded[2]
+
+
+def _replay_job_events_cursor(
+    value: str | None, job_id: str
+) -> int | None:
+    if value is None:
+        return None
+    decoded = _decode_cursor(value)
+    if (
+        len(decoded) != 3
+        or decoded[0] != "replay_job_events"
+        or decoded[1] != job_id
+        or not isinstance(decoded[2], str)
+        or not re.fullmatch(r"[1-9][0-9]*", decoded[2])
+    ):
+        raise ValueError("cursor does not belong to this replay job")
+    return int(decoded[2])
 
 
 def _claim_market_cursor(value: str | None) -> tuple[str, str, str] | None:

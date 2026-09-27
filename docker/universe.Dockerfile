@@ -13,7 +13,7 @@ RUN groupadd --gid "${APP_GID}" universe \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" \
         --create-home --shell /usr/sbin/nologin universe \
     && install -d -o universe -g universe /var/lib/event-universe \
-    && python -m pip install "boto3>=1.43,<2" "google-cloud-storage>=3.4,<4" "zstandard>=0.23"
+    && python -m pip install "boto3>=1.43,<2" "google-cloud-storage>=3.4,<4" "zstandard>=0.23" "eth-account>=0.13,<0.14"
 
 WORKDIR /app
 
@@ -35,6 +35,7 @@ COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
 COPY configs/event_universe.json /etc/prediction-indexer/event_universe.json
+COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json
 
 USER universe:universe
 

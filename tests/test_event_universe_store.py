@@ -2011,7 +2011,7 @@ class EventUniverseTests(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "event_universe_config_version": 1,
+                    "event_universe_config_version": 4,
                     "database_path": "database.sqlite3",
                     "api": {"host": "127.0.0.1", "port": 8080},
                     "backfill": {
@@ -2020,6 +2020,32 @@ class EventUniverseTests(unittest.TestCase):
                         "generated_end": G2,
                     },
                     "backup": {"directory": "backup", "object_prefix": "universe"},
+                    "replay": {
+                        "database_path": "jobs.sqlite3",
+                        "auth": {
+                            "siwe_domain": "universe.example",
+                            "siwe_uri": "https://universe.example/login",
+                            "siwe_statement": "Sign in to Prediction Indexer.",
+                            "chain_id": 1,
+                            "admin_address": "0x0000000000000000000000000000000000000000",
+                            "nonce_ttl_seconds": 300,
+                            "session_ttl_seconds": 43200,
+                        },
+                        "jobs": {
+                            "runner_config_path": "replay_runner.json",
+                            "max_active_jobs_total": 100,
+                            "max_active_jobs_per_submitter": 4,
+                            "max_queued_jobs_total": 64,
+                        },
+                        "rate_limit": {
+                            "trusted_proxy_addresses": ["172.30.0.2"],
+                            "authenticated_requests": 60,
+                            "authenticated_window_seconds": 60,
+                            "unauthenticated_requests": 3,
+                            "unauthenticated_window_seconds": 10,
+                            "max_buckets": 10000,
+                        },
+                    },
                 }
             )
         )

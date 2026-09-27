@@ -16,4 +16,5 @@ htmlcov
 data
 ingester/target
 encoder/rust/target
+engine/target
 secrets

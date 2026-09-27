@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -142,6 +143,19 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn("EVENT_UNIVERSE_DATA_ROOT", compose)
         self.assertNotIn("CAPTURE_DATA_ROOT", compose)
         self.assertIn('CMD ["python", "-u", "universe/run_server.py"]', dockerfile)
+        self.assertIn('"eth-account>=0.13,<0.14"', dockerfile)
+        config = (ROOT / "configs" / "event_universe.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '"database_path": "/var/lib/replay/jobs.sqlite3"', config
+        )
+        self.assertIn(
+            "COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json",
+            dockerfile,
+        )
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"eth-account>=0.13,<0.14"', pyproject)
         self.assertNotIn("COPY universe/", shared)
         server = compose.split("  event-universe:", 1)[1].split(
             "  event-universe-sync:", 1
@@ -168,7 +182,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
                 self.assertIn("load_config()", source)
                 self.assertNotIn("argparse", source)
         config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
-        self.assertIn('"event_universe_config_version": 1', config)
+        self.assertIn('"event_universe_config_version": 4', config)
         self.assertIn('"generated_start": null', config)
         self.assertIn('"generated_end": null', config)
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
@@ -194,8 +208,11 @@ class EventUniverseDeploymentTests(unittest.TestCase):
     def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:
         schema_directory = ROOT / "universe" / "schema"
         sql_files = list(schema_directory.glob("*.sql"))
-        self.assertEqual([path.name for path in sql_files], ["schema.sql"])
-        schema = sql_files[0].read_text(
+        self.assertEqual(
+            sorted(path.name for path in sql_files),
+            ["replay_auth.sql", "replay_jobs.sql", "schema.sql"],
+        )
+        schema = (schema_directory / "schema.sql").read_text(
             encoding="utf-8"
         )
         self.assertIn("CREATE TABLE selection_occurrences", schema)
@@ -232,6 +249,124 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")
         self.assertIn('python3 -m venv "$REPO_ROOT/.venv"', setup)
         self.assertIn('"$REPO_ROOT/.venv/bin/python" -m pip install -e', setup)
+
+
+class ReplayProductionDeploymentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.compose = (ROOT / "compose.universe.yaml").read_text(encoding="utf-8")
+        self.runner = (ROOT / "docker" / "replay-runner.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.caddy = (ROOT / "docker" / "Caddyfile").read_text(encoding="utf-8")
+
+    def service(self, name: str) -> str:
+        marker = f"\n  {name}:\n"
+        start = self.compose.index(marker) + len(marker)
+        following = re.search(r"\n  [a-z][a-z0-9-]*:\n", self.compose[start:])
+        return self.compose[start : start + following.start()] if following else self.compose[start:]
+
+    def test_replay_services_are_private_hardened_and_one_shot(self) -> None:
+        redis = self.service("replay-redis")
+        runner = self.service("replay-runner")
+        universe = self.service("event-universe")
+        self.assertIn("redis:8.2", redis)
+        self.assertIn("--maxmemory-policy", redis)
+        self.assertIn("noeviction", redis)
+        self.assertIn('--save', redis)
+        self.assertIn('--appendonly', redis)
+        self.assertIn('--protected-mode\n      - "no"', redis)
+        self.assertIn('user: "${PUID:-1000}:${PGID:-1000}"', redis)
+        self.assertNotIn("ports:", redis)
+        self.assertNotIn("volumes:", redis)
+        self.assertIn("REPLAY_REDIS_MAXMEMORY_BYTES", redis)
+        self.assertIn('restart: "no"', runner)
+        self.assertIn("python", runner)
+        self.assertIn("replay.jobs", runner)
+        self.assertIn("REPLAY_IMAGE_REVISION", runner)
+        self.assertIn("REPLAY_RUNNER_IMAGE:-", runner)
+        self.assertIn("*replay-volume", runner)
+        self.assertIn("*universe-runtime", universe)
+        self.assertIn("- *replay-volume", self.compose)
+        self.assertIn("networks: [replay-private, replay-egress]", runner)
+        for service in (runner, redis):
+            self.assertIn("pids_limit:", service)
+            self.assertIn("mem_limit:", service)
+        self.assertNotIn("CAPTURE_DATA_ROOT", self.compose)
+        self.assertNotIn("/var/run/docker.sock", self.compose)
+
+    def test_runner_image_contains_release_tools_dependency_and_nonroot_runtime(self) -> None:
+        self.assertIn("--release", self.runner)
+        self.assertIn("--example materialize_range", self.runner)
+        self.assertIn("replay-publish", self.runner)
+        self.assertIn(".[replay-redis]", self.runner)
+        self.assertIn("ARG REPLAY_IMAGE_REVISION", self.runner)
+        self.assertIn("COPY replay/streams/attempt.lua replay/streams/attempt.lua", self.runner)
+        self.assertNotIn("must be a full Git SHA", self.runner)
+        self.assertIn("USER replay:replay", self.runner)
+        self.assertIn("materialize_range --describe", self.runner)
+
+    def test_caddy_limits_transport_but_universe_owns_rate_limiting(self) -> None:
+        self.assertIn("REPLAY_PUBLIC_HOST", self.caddy)
+        self.assertIn("reverse_proxy", self.caddy)
+        self.assertIn("request_body", self.caddy)
+        self.assertNotIn("rate_limit", self.caddy)
+        self.assertIn("Strict-Transport-Security", self.caddy)
+        self.assertIn("X-Content-Type-Options", self.caddy)
+        self.assertIn("Referrer-Policy", self.caddy)
+        self.assertIn("max_size 64KiB", self.caddy)
+        self.assertIn("max_header_size 32KiB", self.caddy)
+        auth = self.caddy.split("@auth path", 1)[1].split("@api path", 1)[0]
+        self.assertNotIn("encode", auth)
+        self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
+
+    def test_non_replay_compose_renders_with_example_environment(self) -> None:
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                ".env.example",
+                "-f",
+                "compose.universe.yaml",
+                "config",
+                "--quiet",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_replay_networks_keep_redis_private_and_localhost_universe_access(self) -> None:
+        redis = self.service("replay-redis")
+        universe = self.service("event-universe")
+        caddy = self.service("caddy")
+        self.assertIn("networks: [replay-private]", redis)
+        self.assertNotIn("replay-edge", redis)
+        self.assertIn("127.0.0.1", universe)
+        self.assertIn("replay-private: {}", universe)
+        self.assertIn("ipv4_address: 172.30.0.3", universe)
+        self.assertNotIn("replay-private", caddy)
+        self.assertIn("ipv4_address: 172.30.0.2", caddy)
+
+    def test_scheduler_and_operations_are_documented_as_gated_one_shots(self) -> None:
+        deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        replay = deployment.split("## Replay jobs production runtime", 1)[1]
+        self.assertIn("--profile replay run --rm replay-preflight", replay)
+        self.assertIn("--profile replay run --rm --no-deps replay-runner", replay)
+        self.assertIn("disable the Replay scheduler", replay)
+        self.assertIn("systemd", replay)
+        self.assertIn("local_state_lost", replay)
+        self.assertIn("resume-blocked", replay)
+        self.assertIn("receipt-only", replay)
+        self.assertIn("full-volume snapshot", replay)
+        self.assertIn("in-process rate limiter", replay)
+
+    def test_local_runner_build_revision_default_is_stable_identifier(self) -> None:
+        self.assertIn(
+            'REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-local}"',
+            self.compose,
+        )
 
 
 if __name__ == "__main__":

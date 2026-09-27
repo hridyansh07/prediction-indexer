@@ -1,0 +1,41 @@
+{
+  "replay_runner_config_version": 2,
+  "universe_base_url": "http://event-universe:8080",
+  "scope": "jobs",
+  "canonical_window_seconds": 1800,
+  "authorities": {
+    "kalshi": "kalshi",
+    "limitless": "limitless",
+    "polymarket": "polymarket"
+  },
+  "strategies": {
+    "bundle_coverage": {
+      "factory": "replay.bundle_coverage:build",
+      "reader": "replay.coverage_output:read_completed",
+      "config_schema": "bundle_coverage_v1",
+      "label": "Bundle coverage",
+      "description": "Evaluates historical coverage for the selected bundle.",
+      "status": "active"
+    }
+  },
+  "limits": {
+    "small": {
+      "max_entry_bytes": 1048576,
+      "max_queue_bytes": 67108864,
+      "command_timeout_ms": 5000,
+      "attempts": 3,
+      "no_progress": 2,
+      "progress_margin": 100,
+      "stall_seconds": 30,
+      "attempt_seconds": 300,
+      "run_seconds": 900,
+      "poll_seconds": 0.1,
+      "stop_seconds": 2
+    }
+  },
+  "orchestration": {
+    "max_stage_attempts": 20,
+    "max_job_seconds": 86400,
+    "retry_backoff_seconds": 60
+  }
+}
