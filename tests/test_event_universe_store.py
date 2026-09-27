@@ -2011,7 +2011,7 @@ class EventUniverseTests(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "event_universe_config_version": 3,
+                    "event_universe_config_version": 4,
                     "database_path": "database.sqlite3",
                     "api": {"host": "127.0.0.1", "port": 8080},
                     "backfill": {
@@ -2036,6 +2036,14 @@ class EventUniverseTests(unittest.TestCase):
                             "max_active_jobs_total": 100,
                             "max_active_jobs_per_submitter": 4,
                             "max_queued_jobs_total": 64,
+                        },
+                        "rate_limit": {
+                            "trusted_proxy_addresses": ["172.30.0.2"],
+                            "authenticated_requests": 60,
+                            "authenticated_window_seconds": 60,
+                            "unauthenticated_requests": 3,
+                            "unauthenticated_window_seconds": 10,
+                            "max_buckets": 10000,
                         },
                     },
                 }
