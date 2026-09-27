@@ -610,4 +610,4 @@ def ensure_bundle(
     except ObjectStoreError as error:
         raise _failure("archive_unavailable", error) from error
     except OSError as error:
-        raise _failure("integrity_failure", error) from error
+        raise _failure("resource_exhausted", error) from error

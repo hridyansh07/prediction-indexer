@@ -1,4 +1,6 @@
+import errno
 import io
+import os
 import shutil
 import tempfile
 import unittest
@@ -15,7 +17,38 @@ from tests.archive_fixtures import BASE_NS, WINDOW_SECONDS, write_canonical_rece
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MATERIALIZER = ROOT / "engine/target/debug/examples/materialize_range"
+
+
+def materializer_path(target_dir=None):
+    target = target_dir if target_dir is not None else os.environ.get("CARGO_TARGET_DIR")
+    target_root = Path(target) if target else ROOT / "engine/target"
+    if not target_root.is_absolute():
+        target_root = Path.cwd() / target_root
+    return target_root / "debug/examples/materialize_range"
+
+
+MATERIALIZER = materializer_path()
+
+
+class BundleCacheBoundaryTest(unittest.TestCase):
+    def test_materializer_path_honors_absolute_and_relative_cargo_target_dir(self):
+        for target in ("relative-target", "/tmp/absolute-target"):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    materializer_path(target),
+                    (Path(target) if Path(target).is_absolute() else Path.cwd() / target)
+                    / "debug/examples/materialize_range",
+                )
+
+    def test_local_filesystem_error_is_retryable_resource_exhaustion(self):
+        with mock.patch.object(bundle, "_owned_root", side_effect=OSError(errno.ENOSPC, "disk full")):
+            with self.assertRaises(BundleFailure) as caught:
+                ensure_bundle(
+                    "bundle-1", (0, 1), store=None, work_root="work",
+                    derivatives_root="derivatives", materializer="materializer",
+                    window_seconds=1,
+                )
+        self.assertEqual(caught.exception.code, "resource_exhausted")
 
 
 class RecordingStore:
