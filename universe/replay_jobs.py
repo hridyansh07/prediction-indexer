@@ -532,7 +532,9 @@ class ReplayJobStore:
             if after == jobs.resume_blocked(before, after.updated_at_ns):
                 return "archive_resumed"
         if before.status == jobs.ARCHIVING and after.status in jobs.TERMINAL:
-            if after == jobs.finish(before, after.updated_at_ns):
+            if after == jobs.finish(
+                before, after.finished_at_ns, after.updated_at_ns
+            ):
                 return "finished"
         raise ReplayJobError(409, "invalid job transition")
 
