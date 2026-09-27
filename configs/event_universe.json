@@ -15,7 +15,7 @@
     "object_prefix": "event-universe/backups"
   },
   "replay": {
-    "database_path": "/var/lib/event-universe/jobs.sqlite3",
+    "database_path": "/var/lib/replay/jobs.sqlite3",
     "auth": {
       "siwe_domain": "universe.example",
       "siwe_uri": "https://universe.example/login",

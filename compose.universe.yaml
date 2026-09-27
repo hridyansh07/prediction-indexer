@@ -42,6 +42,51 @@ x-universe-config: &universe-config
   bind:
     create_host_path: false
 
+x-replay-volume: &replay-volume
+  type: bind
+  source: ${REPLAY_DATA_ROOT:-./data/replay}
+  target: /var/lib/replay
+  bind:
+    create_host_path: false
+
+x-replay-config: &replay-config
+  type: bind
+  source: ./configs/replay_runner.json
+  target: /etc/prediction-indexer/replay_runner.json
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-replay-archive-environment: &replay-archive-environment
+  ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"
+  ARCHIVE_ROOT: /var/lib/archive
+  ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-}"
+  ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
+  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
+  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
+  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
+  ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
+
+x-replay-environment: &replay-environment
+  <<: *replay-archive-environment
+  REPLAY_DATA_ROOT: /var/lib/replay
+  REPLAY_MATERIALIZER: /usr/local/bin/materialize_range
+  REPLAY_PUBLISHER: /usr/local/bin/replay-publish
+  REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:?set REPLAY_IMAGE_REVISION to the full release Git SHA}"
+  REPLAY_IMAGE_DIGEST: "${REPLAY_IMAGE_DIGEST:?set REPLAY_IMAGE_DIGEST to the pulled runner image digest}"
+  REPLAY_RUNNER_IMAGE: "${REPLAY_RUNNER_IMAGE:?set REPLAY_RUNNER_IMAGE to the immutable runner image reference}"
+  REPLAY_VOLUME_ID: "${REPLAY_VOLUME_ID:?set REPLAY_VOLUME_ID to the provisioned volume identity}"
+  REDIS_URL: redis://replay-redis:6379/0
+  REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:?set REPLAY_PUBLIC_HOST}"
+  REPLAY_INTERNAL_URL: http://event-universe:8080
+  REPLAY_REQUIRED_CAPACITY_BYTES: "${REPLAY_REQUIRED_CAPACITY_BYTES:-3298534883328}"
+  REPLAY_REQUIRED_INODES: "${REPLAY_REQUIRED_INODES:-1000000}"
+  REPLAY_QUOTA_BYTES: "${REPLAY_QUOTA_BYTES:?set the enforced filesystem/project quota in bytes}"
+  REPLAY_RATE_LIMIT_PROBE_REQUESTS: "${REPLAY_RATE_LIMIT_PROBE_REQUESTS:-20}"
+  REPLAY_REDIS_MAXMEMORY_BYTES: "${REPLAY_REDIS_MAXMEMORY_BYTES:-536870912}"
+  REPLAY_BACKUP_PREFIX: "${REPLAY_BACKUP_PREFIX:-replay/jobs-db-backups}"
+  EVENT_UNIVERSE_CONFIG: /etc/prediction-indexer/event_universe.json
+
 x-universe-job-volumes: &universe-job-volumes
   - *universe-volume
   - *universe-archive-volume
@@ -62,6 +107,17 @@ x-universe-runtime: &universe-runtime
   volumes:
     - *universe-volume
     - *universe-config
+    - *replay-volume
+    - *replay-config
+  pids_limit: ${UNIVERSE_PIDS_LIMIT:-256}
+  mem_limit: ${UNIVERSE_MEMORY_LIMIT:-2g}
+  mem_reservation: ${UNIVERSE_MEMORY_RESERVATION:-512m}
+  cpus: ${UNIVERSE_CPU_LIMIT:-2.0}
+  logging:
+    driver: json-file
+    options:
+      max-size: "${LOG_MAX_SIZE:-25m}"
+      max-file: "${LOG_MAX_FILES:-5}"
 
 services:
   event-universe:
@@ -79,6 +135,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - replay-private
 
   event-universe-sync:
     <<: *universe-runtime
@@ -103,3 +161,151 @@ services:
     environment: *universe-job-environment
     volumes: *universe-job-volumes
     command: ["python", "-u", "universe/run_backup.py"]
+
+  replay-redis:
+    image: redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
+    profiles: [replay]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${REPLAY_REDIS_PIDS_LIMIT:-128}
+    mem_limit: ${REPLAY_REDIS_MEMORY_LIMIT:-768m}
+    mem_reservation: ${REPLAY_REDIS_MEMORY_RESERVATION:-256m}
+    cpus: ${REPLAY_REDIS_CPU_LIMIT:-1.0}
+    command:
+      - redis-server
+      - --maxmemory
+      - "${REPLAY_REDIS_MAXMEMORY_BYTES:-536870912}"
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --protected-mode
+      - "yes"
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks: [replay-private]
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-25m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+
+  replay-runner:
+    image: "${REPLAY_RUNNER_IMAGE:?set REPLAY_RUNNER_IMAGE to an immutable registry reference ending in @sha256:<digest>}"
+    build:
+      context: .
+      dockerfile: docker/replay-runner.Dockerfile
+      args:
+        REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:?set REPLAY_IMAGE_REVISION to the full release Git SHA}"
+    profiles: [replay]
+    restart: "no"
+    init: true
+    read_only: true
+    user: "${PUID:-10001}:${PGID:-10001}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${REPLAY_RUNNER_PIDS_LIMIT:-512}
+    mem_limit: ${REPLAY_RUNNER_MEMORY_LIMIT:-8g}
+    mem_reservation: ${REPLAY_RUNNER_MEMORY_RESERVATION:-1g}
+    cpus: ${REPLAY_RUNNER_CPU_LIMIT:-4.0}
+    tmpfs:
+      - /tmp:size=${REPLAY_RUNNER_TMPFS_SIZE:-256m},mode=1777
+    environment: *replay-environment
+    volumes:
+      - *replay-volume
+      - *replay-config
+      - *universe-config
+      - *universe-archive-volume
+    depends_on:
+      event-universe:
+        condition: service_healthy
+      replay-redis:
+        condition: service_healthy
+    networks: [replay-private, replay-egress]
+    entrypoint: ["python", "-m", "replay.jobs"]
+    command: ["tick", "/etc/prediction-indexer/replay_runner.json"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-25m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+
+  replay-preflight:
+    extends: replay-runner
+    profiles: [replay]
+    command: ["-m", "replay.ops", "preflight", "/etc/prediction-indexer/replay_runner.json"]
+    entrypoint: ["python"]
+
+  replay-backup:
+    extends: replay-runner
+    profiles: [replay]
+    command: ["-m", "replay.ops", "backup"]
+    entrypoint: ["python"]
+    depends_on: !override []
+
+  replay-audit:
+    extends: replay-runner
+    profiles: [replay]
+    command: ["-m", "replay.ops", "audit"]
+    entrypoint: ["python"]
+    depends_on: !override []
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    profiles: [replay]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${REPLAY_CADDY_PIDS_LIMIT:-128}
+    mem_limit: ${REPLAY_CADDY_MEMORY_LIMIT:-256m}
+    mem_reservation: ${REPLAY_CADDY_MEMORY_RESERVATION:-64m}
+    cpus: ${REPLAY_CADDY_CPU_LIMIT:-1.0}
+    tmpfs:
+      - /config:size=16m,mode=0700
+      - /tmp:size=16m,mode=1777
+    environment:
+      REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:?set REPLAY_PUBLIC_HOST}"
+    volumes:
+      - type: bind
+        source: ./docker/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy-data:/data
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    depends_on:
+      event-universe:
+        condition: service_healthy
+    networks:
+      - replay-edge
+      - replay-private
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-25m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+
+networks:
+  replay-private:
+    internal: true
+  replay-edge: {}
+  replay-egress: {}
+
+volumes:
+  caddy-data: {}

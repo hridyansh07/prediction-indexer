@@ -1,0 +1,45 @@
+{
+	# Stock Caddy deliberately has no rate-limit module. The required nonce
+	# rate limit is enforced by the external edge/WAF and actively checked by
+	# replay-preflight before the scheduler may be enabled.
+	servers {
+		max_header_size 32KB
+		timeouts {
+			read_body 15s
+			read_header 10s
+			write 60s
+			idle 2m
+		}
+	}
+}
+
+{$REPLAY_PUBLIC_HOST} {
+	encode zstd gzip
+
+	request_body {
+		max_size 64KB
+	}
+
+	@api path /v1/* /healthz
+	handle @api {
+		reverse_proxy event-universe:8080 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+				read_timeout 60s
+				write_timeout 30s
+				keepalive 30s
+			}
+		}
+	}
+
+	# Reserved for an eventual same-origin static UI. No UI is shipped here.
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
