@@ -79,13 +79,6 @@ class Runner:
         if claim is None or claim.row.status == c.ARCHIVE_BLOCKED:
             return
         row = claim.row
-        try:
-            request = c.parse_request(claim.request_bytes, self.config)
-        except Exception as error:
-            if row.status == c.RUNNING:
-                row = self._save(row, c.fail(row, "internal_failure", str(error), self.clock()))
-            return self._archive(row, None)
-
         root = self.jobs_root / row.job_id
         if claim.mode == "resume" and row.status == c.ARCHIVING:
             try:
@@ -110,6 +103,17 @@ class Runner:
         except LocalStateError as error:
             row = self._save(row, c.lose_local_state(row, error.detail, self.clock()))
             return self._archive(row, None)
+
+        if row.status == c.ARCHIVING:
+            return self._archive(row, root)
+
+        try:
+            request = c.parse_request(claim.request_bytes, self.config)
+        except Exception as error:
+            row = self._save(
+                row, c.fail(row, "internal_failure", str(error), self.clock())
+            )
+            return self._archive(row, root)
 
         while row.status == c.RUNNING:
             try:
@@ -226,6 +230,8 @@ class Runner:
                 )
             else:
                 self._block(row, "archive_conflict")
+        except c.ContractError:
+            self._block(row, "archive_conflict")
 
     def _block(self, row, code):
         self._save(row, c.block_archive(row, code, self.clock()))

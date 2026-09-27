@@ -5,7 +5,10 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
+from unittest import mock
 
 from archive.storage import LocalObjectStore
 from archive.storage.base import ObjectStoreError
@@ -39,6 +42,14 @@ class Limits:
 
 def runner_config():
     return c.parse_runner_config((ROOT / "configs/replay_runner.json").read_bytes())
+
+
+def renamed_runner_config():
+    original = runner_config()
+    return replace(
+        original,
+        limits=MappingProxyType({"standard": original.limits["small"]}),
+    )
 
 
 def request_bytes():
@@ -456,6 +467,162 @@ class CancelledRunnerAcceptanceTests(unittest.TestCase):
             )
             self.assertIn("archive_unavailable", state.diagnostic)
             self.assertFalse(any(key.endswith("archive_state.json") for key in unavailable.inner.list_keys("replay/")))
+
+    def test_archiving_uses_frozen_local_receipt_after_current_preset_is_renamed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            original_config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, original_config),
+                Principal(ADDRESS, "member"),
+                "renamed-after-freeze",
+                10,
+                bundle_exists=True,
+            )
+            jobs.cancel_job(submitted.row.job_id, Principal(ADDRESS, "member"), 20)
+            archive = RecordingStore(LocalObjectStore(root / "objects"), fail_at=1)
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            Runner(
+                jobs,
+                archive,
+                original_config,
+                runtime,
+                clock=iter(range(30, 100)).__next__,
+            ).tick()
+            job = root / "jobs" / submitted.row.job_id
+            frozen_receipt = (job / "job_receipt.json").read_bytes()
+            frozen = c.parse_job_receipt(frozen_receipt)
+            self.assertEqual(frozen.finished_at_ns, 31)
+            self.assertEqual(
+                [item.key.rsplit("/", 1)[-1] for item in frozen.objects],
+                ["request.json"],
+            )
+
+            archive.fail_at = None
+            Runner(
+                jobs,
+                archive,
+                renamed_runner_config(),
+                runtime,
+                clock=lambda: 1_001_000_000_000,
+            ).tick()
+            finished, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(finished.status, c.CANCELLED)
+            self.assertEqual(finished.finished_at_ns, frozen.finished_at_ns)
+            self.assertEqual((job / "job_receipt.json").read_bytes(), frozen_receipt)
+            with archive.inner.open(
+                c.job_receipt_key(finished.job_id), max_bytes=c.MAX_JOB_RECEIPT_BYTES
+            ) as source:
+                self.assertEqual(source.read(), frozen_receipt)
+
+    def test_archiving_success_skips_current_request_validation_and_keeps_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            original_config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, original_config),
+                Principal(ADDRESS, "member"),
+                "succeeded-before-rename",
+                10,
+                bundle_exists=True,
+            )
+            row = jobs.claim_next(original_config.orchestration, 20).row
+            job = initialize_job_root(root / "jobs", row.job_id, raw)
+            for stage, now in zip(c.WORK_STAGES[1:], range(21, 25)):
+                row = jobs.save(row, c.advance(row, stage, now))
+            row = jobs.save(row, c.succeed(row, 25))
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            with mock.patch("replay.jobs.runner.archive_stage", return_value=31) as archive:
+                Runner(
+                    jobs,
+                    LocalObjectStore(root / "objects"),
+                    renamed_runner_config(),
+                    runtime,
+                    clock=lambda: 100_000_000_000,
+                ).tick()
+            self.assertEqual(archive.call_args.args[0], job)
+            finished, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual((finished.status, finished.finished_at_ns), (c.SUCCEEDED, 31))
+
+    def test_running_request_revalidation_failure_archives_existing_request_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            original_config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, original_config),
+                Principal(ADDRESS, "member"),
+                "running-before-rename",
+                10,
+                bundle_exists=True,
+            )
+            claimed = jobs.claim_next(original_config.orchestration, 20)
+            job = initialize_job_root(root / "jobs", claimed.row.job_id, raw)
+            archive = LocalObjectStore(root / "objects")
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            Runner(
+                jobs,
+                archive,
+                renamed_runner_config(),
+                runtime,
+                clock=lambda: 100_000_000_000,
+            ).tick()
+            finished, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual((finished.status, finished.reason_code), (c.FAILED, "internal_failure"))
+            with archive.open(
+                c.job_receipt_key(finished.job_id), max_bytes=c.MAX_JOB_RECEIPT_BYTES
+            ) as source:
+                receipt = c.parse_job_receipt(source.read())
+            self.assertEqual(
+                [item.key.rsplit("/", 1)[-1] for item in receipt.objects],
+                ["request.json"],
+            )
+            self.assertEqual((job / "request.json").read_bytes(), raw)
+
+    def test_archive_contract_error_blocks_instead_of_escaping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, config),
+                Principal(ADDRESS, "member"),
+                "contract-error",
+                10,
+                bundle_exists=True,
+            )
+            jobs.cancel_job(submitted.row.job_id, Principal(ADDRESS, "member"), 20)
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            with mock.patch(
+                "replay.jobs.runner.archive_stage",
+                side_effect=c.ContractError("invalid receipt"),
+            ):
+                Runner(
+                    jobs,
+                    LocalObjectStore(root / "objects"),
+                    config,
+                    runtime,
+                    clock=iter(range(30, 100)).__next__,
+                ).tick()
+            blocked, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(
+                (blocked.status, blocked.blocked_reason_code),
+                (c.ARCHIVE_BLOCKED, "archive_conflict"),
+            )
 
     def test_global_lock_contention_skips_without_running_tick(self):
         with tempfile.TemporaryDirectory() as temporary:
