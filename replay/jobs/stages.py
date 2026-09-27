@@ -548,7 +548,9 @@ def prepare_stage(root: Path, request: Request, resolved: ResolvedJob, receipt: 
         )
     except SourceUnavailable as error:
         raise StageFailure("universe_unavailable", str(error)) from error
-    except (ProtocolError, ValueError, OSError) as error:
+    except OSError as error:
+        raise StageFailure("resource_exhausted", str(error)) from error
+    except (ProtocolError, ValueError) as error:
         raise StageFailure("integrity_failure", str(error)) from error
 
 

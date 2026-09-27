@@ -449,12 +449,15 @@ write plumbing.
 The write plumbing: `do_POST`/`do_DELETE` dispatch with a 64 KiB body cap and
 `Content-Type: application/json` required, returning 413/415 otherwise.
 
-**Config** (`replay` section of `event_universe.json` version 2; all fields
+**Config** (`replay` section of `event_universe.json` version 4; all fields
 required, closed): `replay.database_path` (the durable `jobs.sqlite3`) and
 `replay.auth` with `siwe_domain`, `siwe_uri`, `siwe_statement`, `chain_id`,
 `admin_address` (EIP-55), `nonce_ttl_seconds` (300), and `session_ttl_seconds`
-(43200). `siwe_statement` is the exact statement line every sign-in message
-carries, e.g. `Sign in to Prediction Indexer.`; the UI uses the same text.
+(43200). `replay.rate_limit` contains exact `trusted_proxy_addresses`, positive
+authenticated and unauthenticated request/window limits, and a bounded
+`max_buckets`. `siwe_statement` is the exact statement line every sign-in
+message carries, e.g. `Sign in to Prediction Indexer.`; the UI uses the same
+text.
 While the shipped zero-address admin placeholder remains, the sign-in routes
 return 503 and every other route is unaffected.
 
@@ -462,10 +465,19 @@ return 503 and every other route is unaffected.
 nonce to the server time it expires (`nonce_ttl_seconds` after the server
 issued it). It is locked, so consuming a nonce is atomic across the server's
 threads, and capped at 500 outstanding nonces: expired ones are pruned on
-each issue, and a full store returns 503. Caddy rate limiting on the nonce
-route (the external edge/WAF) is the first defence. A restart drops outstanding nonces and users
-simply sign in again. This requires exactly one `event-universe` process; a
-second worker or replica would need shared nonce storage.
+each issue, and a full store returns 503. The same singleton process owns a
+thread-safe, bounded in-memory token-bucket map. Rate limiting applies only when
+the direct peer is one of `trusted_proxy_addresses`, proving that the request
+arrived through Caddy. For that trusted peer only, Universe uses the final
+address in `X-Forwarded-For`, which is the address Caddy appended; earlier
+client-supplied entries are never trusted. Authenticated requests are bucketed
+by the validated session token hash, while unauthenticated requests—including
+nonce and SIWE—are bucketed by that final client IP. Exhaustion returns 429 with
+`Retry-After`; least-recently-used buckets are evicted at `max_buckets`.
+Private, direct callers such as the runner and preparation path are exempt. A
+restart drops limiter state and outstanding nonces, and users simply sign in
+again. This requires exactly one `event-universe` process; a second worker or
+replica would need shared nonce and limiter storage.
 
 **Tables** (in `jobs.sqlite3`): `sessions(token_hash, address, role,
 created_at, expires_at, revoked_at)`, `allowlist(address, note, created_at,
@@ -809,13 +821,11 @@ byte-identical semantic files.
 
 - `caddy`: digest-pinned stock Caddy 2.10.2, automatic TLS for
   `REPLAY_PUBLIC_HOST`, bounded request bodies/headers and connection/upstream
-  times, secret-safe JSON access logs, and `/v1/*` plus `/healthz` to private
-  `event-universe:8080`. There is no UI in this implementation. Stock Caddy has
-  no rate-limit handler; the actual enforcement point is a separately managed
-  external edge/WAF in front of Caddy. It must rate-limit at least
-  `GET /v1/auth/nonce`, and preflight makes bounded public requests and requires
-  an observed `429` before scheduling. The runtime never claims Caddy enforces
-  this policy. `event-universe` stays one process (§4).
+  times, security headers, secret-safe JSON access logs, and `/v1/*` plus
+  `/healthz` to private `event-universe:8080`. Authentication responses are not
+  compressed. There is no UI in this implementation. Stock Caddy does not
+  enforce request rate limits; the singleton Universe in-process limiter from
+  §4 does, based on Caddy's statically assigned trusted peer address.
 - `replay-redis`: `redis:8.2` with `--maxmemory <finite>
   --maxmemory-policy noeviction --save "" --appendonly no`; no published port.
 - `replay-runner`: `docker/replay-runner.Dockerfile` with the venv including
@@ -858,14 +868,17 @@ non-durable, or unwritable Replay root; insufficient free bytes, inodes, or
 declared enforced quota; schema/migration/integrity failure; Redis older than
 8.2, unbounded memory, policy other than `noeviction`, persistence, or prior
 evictions; non-independent archive configuration (including a local same-device
-claim); private Universe health failure; public TLS/proxy failure; and missing
-external edge rate-limit enforcement. It prints only identities and bounded
-status, never URLs with credentials or environment values.
+claim); inability to read a configured known archive receipt using normal
+runner authority; private Universe health failure; or public TLS/proxy failure.
+It prints only identities and bounded status, never URLs with credentials or
+environment values. Limiter behavior is a release/config contract tested at the
+Universe boundary, not a preflight 429 probe that consumes public auth budget.
 
 The capacity floor must cover configured worst-case local work plus safety; the
-shipped default is 3 TiB and one million free inodes. `REPLAY_QUOTA_BYTES` is an
-operator declaration of an actually enforced filesystem/project quota, not a
-Compose limit. Scheduling remains disabled until preflight exits zero. The only
+operator must set `REPLAY_REQUIRED_CAPACITY_BYTES` explicitly; the shipped
+one-million-free-inode floor remains. `REPLAY_QUOTA_BYTES` is an operator
+declaration of an actually enforced filesystem/project quota, not a Compose
+limit. Scheduling remains disabled until preflight exits zero. The only
 recurring invocation is one `docker compose --profile replay run --rm
 replay-runner` per minute. Lock contention exits zero and claims no second job.
 There is no persistent runner, restart loop, parallel claim, or Redis recovery

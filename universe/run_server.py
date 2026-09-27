@@ -12,6 +12,7 @@ from universe.api import serve  # noqa: E402
 from universe.auth import AuthStore  # noqa: E402
 from universe.config import load_config  # noqa: E402
 from universe.replay_jobs import ReplayJobStore  # noqa: E402
+from universe.rate_limit import RateLimiter  # noqa: E402
 from universe.store import UniverseStore  # noqa: E402
 from replay.jobs.contracts import parse_runner_config  # noqa: E402
 
@@ -27,6 +28,7 @@ def main() -> None:
     )
     replay_jobs = ReplayJobStore(config.replay.database_path, config.replay.jobs)
     replay_jobs.initialize()
+    rate_limiter = RateLimiter(config.replay.rate_limit, auth)
     serve(
         database,
         auth,
@@ -34,6 +36,7 @@ def main() -> None:
         config.api.port,
         replay_jobs,
         runner_config,
+        rate_limiter,
     )
 
 

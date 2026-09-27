@@ -1,5 +1,5 @@
 {
-  "event_universe_config_version": 3,
+  "event_universe_config_version": 4,
   "database_path": "/var/lib/event-universe/event-universe.sqlite3",
   "api": {
     "host": "0.0.0.0",
@@ -30,6 +30,14 @@
       "max_active_jobs_total": 100,
       "max_active_jobs_per_submitter": 4,
       "max_queued_jobs_total": 64
+    },
+    "rate_limit": {
+      "trusted_proxy_addresses": ["172.30.0.2"],
+      "authenticated_requests": 60,
+      "authenticated_window_seconds": 60,
+      "unauthenticated_requests": 3,
+      "unauthenticated_window_seconds": 10,
+      "max_buckets": 10000
     }
   }
 }

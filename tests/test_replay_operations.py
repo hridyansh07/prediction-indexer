@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import fcntl
 import hashlib
+import io
 import json
 import sqlite3
 import tempfile
@@ -10,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from archive.storage import INDEPENDENT, LocalObjectStore
+from archive.storage import CONFORMANCE, INDEPENDENT, LocalObjectStore
 from replay.ops.backup import (
     BackupError,
     backup_jobs_database,
@@ -20,6 +23,8 @@ from replay.ops.backup import (
 from replay.ops.preflight import PreflightError, check_capacity, check_private_root
 from replay.ops import preflight
 from replay.ops import __main__ as operations
+from tests.test_replay_jobs import Limits
+from universe.replay_jobs import ReplayJobStore
 
 
 class ReplayJobsBackupTests(unittest.TestCase):
@@ -40,6 +45,7 @@ class ReplayJobsBackupTests(unittest.TestCase):
 
     def test_online_backup_during_writes_uploads_and_restores_verified_snapshot(self) -> None:
         stop = threading.Event()
+        writing = threading.Event()
 
         def writer() -> None:
             value = 0
@@ -49,11 +55,13 @@ class ReplayJobsBackupTests(unittest.TestCase):
                         "INSERT OR IGNORE INTO values_table VALUES (?)", (value,)
                     )
                     connection.commit()
+                writing.set()
                 value += 1
 
         thread = threading.Thread(target=writer)
         thread.start()
         try:
+            self.assertTrue(writing.wait(timeout=5))
             receipt = backup_jobs_database(
                 self.database,
                 self.root / "staging",
@@ -77,9 +85,16 @@ class ReplayJobsBackupTests(unittest.TestCase):
         restore_jobs_database(self.store, receipt.receipt_key, restored)
         with sqlite3.connect(restored) as connection:
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-            self.assertGreaterEqual(
-                connection.execute("SELECT count(*) FROM values_table").fetchone()[0], 0
-            )
+            count, minimum, maximum = connection.execute(
+                "SELECT count(*),min(value),max(value) FROM values_table"
+            ).fetchone()
+            self.assertGreater(count, 0)
+            self.assertEqual(minimum, 0)
+            self.assertEqual(maximum, count - 1)
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(restored.with_name(restored.name + "-wal").exists())
+        self.assertFalse(restored.with_name(restored.name + "-shm").exists())
 
     def test_backup_is_immutable_and_corruption_is_rejected(self) -> None:
         receipt = backup_jobs_database(
@@ -116,6 +131,13 @@ class ReplayJobsBackupTests(unittest.TestCase):
         with self.assertRaises(BackupError):
             restore_jobs_database(self.store, receipt.object_key, self.root / "bad.sqlite3")
 
+    def test_verification_requires_independent_durability(self) -> None:
+        store = LocalObjectStore(
+            self.root / "conformance", durability=CONFORMANCE
+        )
+        with self.assertRaisesRegex(BackupError, "independently durable"):
+            verify_backup(store, "replay/jobs-db-backups/missing.receipt.json")
+
     def test_backup_prefix_must_not_overlap_replay_artifacts(self) -> None:
         for prefix in ("replay", "replay/jobs", "replay/jobs/nested"):
             with self.subTest(prefix), self.assertRaises(BackupError):
@@ -150,12 +172,23 @@ class ReplayPreflightTests(unittest.TestCase):
             with self.subTest(arguments), self.assertRaises(PreflightError):
                 check_capacity(stat, **arguments)
 
-    def test_public_rate_limit_probe_requires_observed_429(self) -> None:
-        with mock.patch.object(preflight, "_request", side_effect=[200, 200, 200, 429]):
-            preflight._http_checks("http://event-universe:8080", "replay.example", 2)
-        with mock.patch.object(preflight, "_request", side_effect=[200, 200, 200, 200]):
+    def test_http_preflight_checks_private_and_public_health_without_nonce_probe(self) -> None:
+        with mock.patch.object(preflight, "_request", side_effect=[200, 200]) as request:
+            preflight._http_checks("http://event-universe:8080", "replay.example")
+        self.assertEqual(request.call_count, 2)
+        with mock.patch.object(preflight, "_request", side_effect=[200, 503]):
             with self.assertRaises(PreflightError):
-                preflight._http_checks("http://event-universe:8080", "replay.example", 2)
+                preflight._http_checks("http://event-universe:8080", "replay.example")
+
+    def test_publisher_contract_probe_executes_expected_binary_protocol(self) -> None:
+        result = SimpleNamespace(
+            returncode=20,
+            stdout=b"",
+            stderr=b"replay-publish: usage: replay-publish CONFIG.json\n",
+        )
+        with mock.patch.object(preflight.subprocess, "run", return_value=result) as run:
+            preflight._publisher_contract(Path("/usr/local/bin/replay-publish"))
+        self.assertEqual(run.call_args.args[0], ["/usr/local/bin/replay-publish"])
 
     def test_required_environment_diagnostic_names_only(self) -> None:
         secret = "do-not-print-this-value"
@@ -172,6 +205,19 @@ class ReplayPreflightTests(unittest.TestCase):
         }
         with mock.patch.object(preflight, "_required", return_value=environment):
             with self.assertRaisesRegex(PreflightError, "must end with"):
+                preflight.run_preflight(Path("unused"), environment)
+
+    def test_missing_image_revision_file_fails_preflight(self) -> None:
+        environment = {
+            "REPLAY_IMAGE_REVISION": "a" * 40,
+            "REPLAY_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "REPLAY_RUNNER_IMAGE": "registry.example/replay@sha256:" + "b" * 64,
+            "REPLAY_PUBLIC_HOST": "replay.example",
+        }
+        with mock.patch.object(
+            preflight, "_required", return_value=environment
+        ), mock.patch.object(Path, "is_file", return_value=False):
+            with self.assertRaisesRegex(PreflightError, "revision file is missing"):
                 preflight.run_preflight(Path("unused"), environment)
 
     def test_backup_receipt_contains_no_environment_or_secret_values(self) -> None:
@@ -211,6 +257,68 @@ class ReplayPreflightTests(unittest.TestCase):
 
 
 class ReplayAuditTests(unittest.TestCase):
+    def test_audit_reports_integrity_and_actual_lock_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ReplayJobStore(root / "jobs.sqlite3", Limits()).initialize()
+            self.assertEqual(operations._audit(root)["status"], "ok")
+            self.assertFalse(operations._audit(root)["runner_lock_held"])
+            output = io.StringIO()
+            with mock.patch.object(operations, "_root", return_value=root), redirect_stdout(
+                output
+            ):
+                self.assertEqual(operations.main(["audit"]), 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "ok")
+            lock = root / "runner.lock"
+            descriptor = open(lock, "w")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(operations._audit(root)["runner_lock_held"])
+            finally:
+                descriptor.close()
+
+    def test_corrupt_database_fails_audit_and_cli_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "jobs.sqlite3").write_bytes(b"not sqlite")
+            report = operations._audit(root)
+            self.assertEqual(report["status"], "failed")
+            output = io.StringIO()
+            with mock.patch.object(operations, "_root", return_value=root), redirect_stdout(
+                output
+            ):
+                self.assertEqual(operations.main(["audit"]), 1)
+            self.assertEqual(json.loads(output.getvalue())["status"], "failed")
+
+    def test_existing_job_store_modes_never_create_a_missing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = SimpleNamespace(
+                replay=SimpleNamespace(
+                    database_path=root / "jobs.sqlite3", jobs=Limits()
+                )
+            )
+            with mock.patch.object(operations, "_config", return_value=config):
+                for read_only in (True, False):
+                    with self.subTest(read_only=read_only), self.assertRaises(ValueError):
+                        operations._jobs(root, read_only=read_only)
+            self.assertFalse((root / "jobs.sqlite3").exists())
+
+    def test_resume_blocked_cli_uses_existing_compare_and_set_store(self) -> None:
+        before = SimpleNamespace(job_id="job", status="archive_blocked")
+        after = SimpleNamespace(job_id="job", status="archiving", stage="archive")
+        store = mock.Mock()
+        store.get_job.return_value = (before, b"request")
+        store.save.return_value = after
+        with mock.patch.object(operations, "_root", return_value=Path("/unused")), mock.patch.object(
+            operations, "_jobs", return_value=store
+        ), mock.patch.object(operations.jobs, "resume_blocked", return_value=after):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(operations.main(["resume-blocked", "job"]), 0)
+        store.save.assert_called_once_with(before, after)
+        self.assertEqual(json.loads(output.getvalue())["status"], "archiving")
+
     def test_terminal_receipt_verification_uses_terminal_row_binding(self) -> None:
         row = SimpleNamespace(
             status="failed",

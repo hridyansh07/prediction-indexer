@@ -889,10 +889,10 @@ proxy enforce a 1.75 MB serialized response budget; list limits are capped at
 ## Replay jobs production runtime
 
 Replay jobs run on the Universe EC2 host, never the splice/capture host. The
-topology is Internet → external edge/WAF → digest-pinned stock Caddy TLS →
-private `event-universe:8080`; one-shot runner containers share only the private
-network with disposable Redis. A separate runner-only egress network reaches
-the independently durable ObjectStore and workload-identity endpoint.
+topology is Internet → digest-pinned stock Caddy TLS → private
+`event-universe:8080`; one-shot runner containers share only the private network
+with disposable Redis. A separate runner-only egress network reaches the
+independently durable ObjectStore and workload-identity endpoint.
 Universe remains the parser and response-budget authority. Caddy has no archive
 credentials, and Universe has no archive-write credentials.
 
@@ -901,10 +901,11 @@ credentials, and Universe has no archive-write credentials.
 Provision a private persistent filesystem at `REPLAY_DATA_ROOT`, owned by the
 runtime uid/gid with mode 0700. Put `jobs.sqlite3`, `jobs/`, `runner.lock`,
 `bundle-work/`, `derivatives/`, and `.runner/` on that same filesystem. Enforce
-an XFS/ext4 project quota or equivalent no lower than `REPLAY_QUOTA_BYTES`; the
-default 3 TiB free-space floor covers the runner's 2 TiB owned-build contract
-plus safety. Keep scratch/work paths quota-governed. Never mount a capture root,
-splice root, repository, credential file, or Docker socket.
+an XFS/ext4 project quota or equivalent no lower than `REPLAY_QUOTA_BYTES`.
+Explicitly set `REPLAY_REQUIRED_CAPACITY_BYTES` to the configured worst-case
+durable state, work, and scratch demand plus operating safety; there is no
+production byte default. Keep scratch/work paths quota-governed. Never mount a
+capture root, splice root, repository, credential file, or Docker socket.
 
 Use an S3/GCS instance workload identity scoped to create/get/list for the exact
 canonical, derivative, bundle, Replay job, and Replay database-backup prefixes.
@@ -912,6 +913,11 @@ It must not update or delete objects. A local backend is production-eligible
 only when explicitly `independent` and on a different filesystem/device;
 preflight and the store factory reject same-device independence. Receipt-only
 bundle deletion uses a separate, audited, short-lived operator identity.
+Set `REPLAY_ARCHIVE_PROBE_KEY` to a known immutable canonical receipt that the
+normal runner identity must be able to read; preflight performs a provider HEAD
+and requires checksum metadata. On EC2, the instance metadata options must
+require IMDSv2 and use a hop limit of at least 2 so the container can obtain the
+role credentials.
 
 Build the runner with the exact source SHA, push it, and pin the deployed image
 by provider digest:
@@ -938,13 +944,23 @@ docker compose -f compose.universe.yaml --profile replay run --rm --no-deps \
   'test "$(id -u)" != 0 && test -x "$REPLAY_PUBLISHER" && materialize_range --describe && python -c "import replay.jobs,replay.ops"'
 ```
 
-Configure the external edge/WAF as the actual rate-limit enforcement point for
-at least `GET /v1/auth/nonce`; a threshold below
-`REPLAY_RATE_LIMIT_PROBE_REQUESTS` must return 429. Stock Caddy does **not**
-enforce this. It enforces TLS, 64 KiB request bodies, 32 KiB headers, connection
-and upstream timeouts, and secret-safe JSON access logging. Restrict origin
-ingress so clients cannot bypass the edge. Caddy's `/data` volume persists ACME
-state; there is no static UI in this rollout.
+Stock Caddy enforces TLS, 64 KiB request bodies, 32 KiB headers, connection and
+upstream timeouts, security headers, and secret-safe JSON access logging. It
+does **not** enforce request rate limits. The singleton Universe process owns
+the in-process rate limiter configured in `event_universe.json`: requests whose
+direct peer is the statically assigned Caddy address are limited by validated
+session hash when authenticated and by the final Caddy-appended
+`X-Forwarded-For` address otherwise. Direct private runner/preparation requests
+are exempt. Keep the `replay-edge` subnet and Caddy address aligned with
+`trusted_proxy_addresses`, and do not add another ingress peer without adding
+its exact address. Caddy's `/data` volume persists ACME state; auth responses
+are not compressed, and there is no static UI in this rollout.
+
+The existing unauthenticated Vercel proxy is not a supported production ingress
+after this cutover: its users share a small egress-IP pool and therefore share
+the unauthenticated bucket. Retire that proxy or move its UI to authenticated
+session traffic before enabling public ingress. The localhost-only Universe
+port remains available for SSH tunnels and existing host operations.
 
 Start private services and Caddy, but leave the scheduler disabled:
 
@@ -959,10 +975,11 @@ release descriptor, both configs, binaries, root ownership/privacy/durability,
 free bytes/inodes/quota, additive jobs/auth schema and SQLite integrity, Redis
 ≥8.2 with finite maxmemory/noeviction/no RDB/AOF/no evictions, independent
 archive identity, private Universe health, public Caddy TLS/proxy health, and an
-observed nonce-route 429. Its output is bounded and secret-safe. A failure keeps
-the scheduler disabled. Daemon health, public DNS/certificates, cloud IAM,
-filesystem quota enforcement, and the external WAF are environment gates, not
-properties a repository test can certify.
+archive HEAD of `REPLAY_ARCHIVE_PROBE_KEY`. Its output is bounded and
+secret-safe. A failure keeps the scheduler disabled. The in-process rate limiter
+is validated by release tests rather than a public 429 preflight probe. Daemon
+health, public DNS/certificates, cloud IAM, and filesystem quota enforcement are
+environment gates, not properties a repository test can certify.
 
 ### Scheduler and resource controls
 
@@ -993,7 +1010,8 @@ attempt, deadline, and archive limits remain authoritative.
 Probe and alert on:
 
 - public TLS, `/healthz`, `/v1/*` proxy limits, oversized body/header rejection,
-  and an external-edge 429 on bounded nonce probes;
+  security headers, absent auth-route compression, and 429 plus `Retry-After`
+  from controlled authenticated-session and unauthenticated-client-IP probes;
 - Universe health, schema identity/integrity, auth configuration, and one-process
   singleton status;
 - Redis version, maxmemory, policy, persistence config drift, used memory,
@@ -1016,8 +1034,13 @@ docker compose -f compose.universe.yaml --profile replay run --rm \
 
 For an `archive_blocked` job, first inspect its pending outcome, reason, attempts,
 age, local frozen `job_receipt.json`/`archive_state.json`, provider state, and
-logs. Remedy availability or IAM without modifying those files. Strictly verify
-the receipt and every listed immutable object, then explicitly run:
+logs. Remedy availability or IAM without modifying those files. If the remote
+job receipt exists, strictly verify it and every listed immutable object. If the
+block happened before receipt-last publication and verification reports `job
+receipt is absent`, compare the local frozen receipt/archive state to every
+already-uploaded immutable object and confirm that the remote receipt is truly
+absent; that absence is expected and must not be "repaired" manually. Then
+explicitly run:
 
 ```bash
 docker compose -f compose.universe.yaml --profile replay run --rm \
@@ -1082,15 +1105,15 @@ receipts, or canonical objects.
 ### Rollout and rollback
 
 Rollout order is: build/pin images; provision private volume, quotas, independent
-archive, networks, workload identity, external edge, Caddy state, and logging;
+archive, networks, workload identity, Caddy state, and logging;
 deploy additive Universe config/schema; drill migration plus online
 backup/verify/DB-only restore and stopped full-volume restore with synthetic
 data; start private services; pass preflight; validate TLS/proxy/body/header/time
-limits and external 429; install the scheduler disabled; run synthetic cold and
-warm acceptance through canonical materialize → prepare → supervisor → strict
-reader → receipt-last archive → strict job reader, including crash boundaries;
-then enable and monitor. No retained or live-provider acceptance is authorized
-by this procedure.
+limits, security headers, and controlled in-process limiter 429s; install the
+scheduler disabled; run synthetic cold and warm acceptance through canonical
+materialize → prepare → supervisor → strict reader → receipt-last archive →
+strict job reader, including crash boundaries; then enable and monitor. No
+retained or live-provider acceptance is authorized by this procedure.
 
 Rollback disables scheduler and ingress, drains the runner, and preserves the
 whole volume. Roll back only to a config/image proven compatible with current

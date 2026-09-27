@@ -11,8 +11,8 @@ RUN cargo build --locked --release --manifest-path engine/Cargo.toml \
 
 FROM python:3.13-slim-bookworm
 
-ARG APP_UID=10001
-ARG APP_GID=10001
+ARG APP_UID=1000
+ARG APP_GID=1000
 ARG REPLAY_IMAGE_REVISION
 
 ENV PYTHONUNBUFFERED=1 \

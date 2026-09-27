@@ -1,7 +1,4 @@
 {
-	# Stock Caddy deliberately has no rate-limit module. The required nonce
-	# rate limit is enforced by the external edge/WAF and actively checked by
-	# replay-preflight before the scheduler may be enabled.
 	servers {
 		max_header_size 32KB
 		timeouts {
@@ -13,24 +10,39 @@
 	}
 }
 
-{$REPLAY_PUBLIC_HOST} {
-	encode zstd gzip
+(universe_proxy) {
+	reverse_proxy event-universe:8080 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+			read_timeout 60s
+			write_timeout 30s
+			keepalive 30s
+		}
+	}
+}
 
+{$REPLAY_PUBLIC_HOST} {
 	request_body {
 		max_size 64KB
 	}
 
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# Authentication responses carry nonces or tokens and are never compressed.
+	@auth path /v1/auth/*
+	handle @auth {
+		import universe_proxy
+	}
+
 	@api path /v1/* /healthz
 	handle @api {
-		reverse_proxy event-universe:8080 {
-			transport http {
-				dial_timeout 5s
-				response_header_timeout 30s
-				read_timeout 60s
-				write_timeout 30s
-				keepalive 30s
-			}
-		}
+		encode zstd gzip
+		import universe_proxy
 	}
 
 	# Reserved for an eventual same-origin static UI. No UI is shipped here.

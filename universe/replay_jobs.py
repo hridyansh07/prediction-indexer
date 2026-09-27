@@ -50,19 +50,47 @@ class ReplayJobStore:
         limits: Any,
         *,
         suffix: Callable[[], str] | None = None,
+        open_mode: Literal["create", "readwrite", "readonly"] = "create",
     ) -> None:
         self.path = Path(path)
         self.limits = limits
         self._suffix = suffix or (lambda: secrets.token_hex(8))
+        self._open_mode = open_mode
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
+        if self._open_mode == "create":
+            target: str | Path = self.path
+            uri = False
+        else:
+            mode = "rw" if self._open_mode == "readwrite" else "ro"
+            target = self.path.resolve().as_uri() + f"?mode={mode}"
+            uri = True
+        connection = sqlite3.connect(target, timeout=30.0, uri=uri)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
+        if self._open_mode != "readonly":
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+        else:
+            connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
+
+    def validate_existing(self) -> None:
+        if not self.path.is_file() or self.path.is_symlink():
+            raise ValueError("Replay jobs database must already be a regular file")
+        digest = self._expected_schema_digest()
+        with closing(self.connect()) as connection:
+            self._validate_schema(connection)
+            metadata = connection.execute(
+                "SELECT schema_version,schema_sha256 FROM replay_job_components "
+                "WHERE component='replay_jobs'"
+            ).fetchone()
+            if metadata is None or (int(metadata[0]), str(metadata[1])) != (
+                SCHEMA_VERSION,
+                digest,
+            ):
+                raise ValueError("database contains an invalid replay jobs schema")
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

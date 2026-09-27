@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -181,7 +182,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
                 self.assertIn("load_config()", source)
                 self.assertNotIn("argparse", source)
         config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
-        self.assertIn('"event_universe_config_version": 3', config)
+        self.assertIn('"event_universe_config_version": 4', config)
         self.assertIn('"generated_start": null', config)
         self.assertIn('"generated_end": null', config)
         self.assertFalse((ROOT / "archive" / "run_receipt_mirror.py").exists())
@@ -273,6 +274,8 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("noeviction", redis)
         self.assertIn('--save', redis)
         self.assertIn('--appendonly', redis)
+        self.assertIn('--protected-mode\n      - "no"', redis)
+        self.assertIn('user: "${PUID:-1000}:${PGID:-1000}"', redis)
         self.assertNotIn("ports:", redis)
         self.assertNotIn("volumes:", redis)
         self.assertIn("REPLAY_REDIS_MAXMEMORY_BYTES", redis)
@@ -280,7 +283,7 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("python", runner)
         self.assertIn("replay.jobs", runner)
         self.assertIn("REPLAY_IMAGE_REVISION", runner)
-        self.assertIn("REPLAY_RUNNER_IMAGE:?", runner)
+        self.assertIn("REPLAY_RUNNER_IMAGE:-", runner)
         self.assertIn("*replay-volume", runner)
         self.assertIn("*universe-runtime", universe)
         self.assertIn("- *replay-volume", self.compose)
@@ -300,13 +303,47 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("USER replay:replay", self.runner)
         self.assertIn("materialize_range --describe", self.runner)
 
-    def test_stock_caddy_does_not_claim_rate_limiting(self) -> None:
+    def test_caddy_limits_transport_but_universe_owns_rate_limiting(self) -> None:
         self.assertIn("REPLAY_PUBLIC_HOST", self.caddy)
         self.assertIn("reverse_proxy", self.caddy)
         self.assertIn("request_body", self.caddy)
         self.assertNotIn("rate_limit", self.caddy)
-        self.assertIn("external edge", self.caddy)
+        self.assertIn("Strict-Transport-Security", self.caddy)
+        self.assertIn("X-Content-Type-Options", self.caddy)
+        self.assertIn("Referrer-Policy", self.caddy)
+        auth = self.caddy.split("@auth path", 1)[1].split("@api path", 1)[0]
+        self.assertNotIn("encode", auth)
         self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
+
+    def test_non_replay_compose_renders_with_example_environment(self) -> None:
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                ".env.example",
+                "-f",
+                "compose.universe.yaml",
+                "config",
+                "--quiet",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_replay_networks_keep_redis_private_and_localhost_universe_access(self) -> None:
+        redis = self.service("replay-redis")
+        universe = self.service("event-universe")
+        caddy = self.service("caddy")
+        self.assertIn("networks: [replay-private]", redis)
+        self.assertNotIn("replay-edge", redis)
+        self.assertIn("127.0.0.1", universe)
+        self.assertIn("replay-private: {}", universe)
+        self.assertIn("ipv4_address: 172.30.0.3", universe)
+        self.assertNotIn("replay-private", caddy)
+        self.assertIn("ipv4_address: 172.30.0.2", caddy)
 
     def test_scheduler_and_operations_are_documented_as_gated_one_shots(self) -> None:
         deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
@@ -318,7 +355,7 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("resume-blocked", replay)
         self.assertIn("receipt-only", replay)
         self.assertIn("full-volume snapshot", replay)
-        self.assertIn("external edge/WAF", replay)
+        self.assertIn("in-process rate limiter", replay)
 
 
 if __name__ == "__main__":

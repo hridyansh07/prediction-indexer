@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,11 @@ def _integrity(path: Path) -> None:
         raise BackupError("backup failed SQLite integrity_check")
 
 
+def _remove_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        path.with_name(path.name + suffix).unlink(missing_ok=True)
+
+
 def _online_copy(source: Path, destination: Path) -> None:
     source = Path(source)
     if not source.is_file() or source.is_symlink():
@@ -110,9 +116,13 @@ def _online_copy(source: Path, destination: Path) -> None:
         with closing(
             sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
         ) as reader, closing(sqlite3.connect(temporary)) as writer:
+            os.chmod(temporary, 0o600)
             reader.backup(writer)
             writer.commit()
+            if writer.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
+                raise BackupError("SQLite backup could not leave WAL mode")
         _integrity(temporary)
+        _remove_sidecars(temporary)
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
@@ -279,6 +289,8 @@ def verify_backup(store, receipt_key: str) -> BackupReceipt:
     receipt_key = normalize_key(receipt_key)
     if not receipt_key.endswith(".receipt.json"):
         raise BackupError("backup verification requires a receipt key")
+    if not store.durability.independent:
+        raise BackupError("backup verification requires an independently durable store")
     try:
         metadata = store.head(receipt_key)
         if metadata is None or metadata.byte_length > MAX_RECEIPT_BYTES:
@@ -286,6 +298,9 @@ def verify_backup(store, receipt_key: str) -> BackupReceipt:
         buffer = io.BytesIO()
         _consume_verified(store, metadata, buffer)
         receipt = _parse_receipt(buffer.getvalue(), receipt_key)
+        expected_object_key = receipt_key.removesuffix(".receipt.json") + ".sqlite3"
+        if receipt.object_key != expected_object_key:
+            raise BackupError("backup object key does not belong to its receipt")
         if receipt.store_id != store.store_id or receipt.provider != store.provider:
             raise BackupError("backup receipt belongs to another object store")
         data = store.head(receipt.object_key)
@@ -299,7 +314,12 @@ def verify_backup(store, receipt_key: str) -> BackupReceipt:
             or data.provider_checksum_algorithm != receipt.provider_checksum_algorithm
         ):
             raise BackupError("backup object metadata disagrees with its receipt")
-        _consume_verified(store, data)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            downloaded = Path(temporary_directory) / "jobs.sqlite3"
+            with downloaded.open("xb") as target:
+                _consume_verified(store, data, target)
+            _integrity(downloaded)
+            _remove_sidecars(downloaded)
         return receipt
     except BackupError:
         raise
@@ -316,7 +336,8 @@ def restore_jobs_database(store, receipt_key: str, destination: Path) -> Path:
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.open")
     metadata = store.head(receipt.object_key)
-    assert metadata is not None
+    if metadata is None:
+        raise BackupError("verified backup object disappeared before restore")
     try:
         with temporary.open("xb") as writer:
             _consume_verified(store, metadata, writer)
@@ -325,8 +346,10 @@ def restore_jobs_database(store, receipt_key: str, destination: Path) -> Path:
         if _identity(temporary) != StoredIdentity(receipt.sha256, receipt.byte_length):
             raise BackupError("restored bytes disagree with receipt")
         _integrity(temporary)
+        _remove_sidecars(temporary)
         os.chmod(temporary, 0o600)
-        os.replace(temporary, destination)
+        os.link(temporary, destination)
+        temporary.unlink()
         _fsync_directory(destination.parent)
         return destination
     except BackupError:

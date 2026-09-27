@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -17,7 +18,7 @@ from archive.storage.base import ObjectStore, normalize_key
 from archive.storage.factory import build_store
 from targeter.v2.models import isoformat, parse_timestamp
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 CONFIG_ENVIRONMENT_VARIABLE = "EVENT_UNIVERSE_CONFIG"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/event_universe.json"
 
@@ -65,10 +66,21 @@ class ReplayJobsConfig:
 
 
 @dataclass(frozen=True)
+class RateLimitConfig:
+    trusted_proxy_addresses: tuple[str, ...]
+    authenticated_requests: int
+    authenticated_window_seconds: int
+    unauthenticated_requests: int
+    unauthenticated_window_seconds: int
+    max_buckets: int
+
+
+@dataclass(frozen=True)
 class ReplayConfig:
     database_path: Path
     auth: AuthConfig
     jobs: ReplayJobsConfig
+    rate_limit: RateLimitConfig
 
 
 @dataclass(frozen=True)
@@ -102,7 +114,7 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         raise UniverseConfigError(f"invalid Event Universe config {source}: {error}") from error
     document = _expand_environment(document)
     if not isinstance(document, dict) or document.get("event_universe_config_version") != CONFIG_VERSION:
-        raise UniverseConfigError("unsupported Event Universe config version; version 3 is required")
+        raise UniverseConfigError("unsupported Event Universe config version; version 4 is required")
     _exact(
         document,
         {
@@ -122,7 +134,9 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         {"temporary_directory", "generated_start", "generated_end"},
     )
     backup = _section(document, "backup", {"directory", "object_prefix"})
-    replay = _section(document, "replay", {"database_path", "auth", "jobs"})
+    replay = _section(
+        document, "replay", {"database_path", "auth", "jobs", "rate_limit"}
+    )
     auth = replay.get("auth")
     _exact(
         auth,
@@ -150,6 +164,20 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         "replay.jobs",
     )
     assert isinstance(jobs, dict)
+    rate_limit = replay.get("rate_limit")
+    _exact(
+        rate_limit,
+        {
+            "trusted_proxy_addresses",
+            "authenticated_requests",
+            "authenticated_window_seconds",
+            "unauthenticated_requests",
+            "unauthenticated_window_seconds",
+            "max_buckets",
+        },
+        "replay.rate_limit",
+    )
+    assert isinstance(rate_limit, dict)
     port = api["port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise UniverseConfigError("api.port must be an integer between 1 and 65535")
@@ -206,6 +234,27 @@ def load_config(path: Path | None = None) -> UniverseConfig:
         jobs, "max_active_jobs_per_submitter", "replay.jobs"
     )
     max_queued_total = _positive_integer(jobs, "max_queued_jobs_total", "replay.jobs")
+    trusted_proxy_addresses = rate_limit.get("trusted_proxy_addresses")
+    if (
+        not isinstance(trusted_proxy_addresses, list)
+        or not trusted_proxy_addresses
+        or len(trusted_proxy_addresses) > 16
+    ):
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must contain 1 to 16 IP addresses"
+        )
+    try:
+        trusted_proxies = tuple(
+            str(ipaddress.ip_address(address)) for address in trusted_proxy_addresses
+        )
+    except ValueError as error:
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must contain IP addresses"
+        ) from error
+    if len(set(trusted_proxies)) != len(trusted_proxies):
+        raise UniverseConfigError(
+            "replay.rate_limit.trusted_proxy_addresses must be unique"
+        )
     if max_queued_total > max_active_total:
         raise UniverseConfigError(
             "replay.jobs.max_queued_jobs_total must not exceed max_active_jobs_total"
@@ -263,6 +312,28 @@ def load_config(path: Path | None = None) -> UniverseConfig:
                 max_active_jobs_total=max_active_total,
                 max_active_jobs_per_submitter=max_active_submitter,
                 max_queued_jobs_total=max_queued_total,
+            ),
+            rate_limit=RateLimitConfig(
+                trusted_proxy_addresses=trusted_proxies,
+                authenticated_requests=_positive_integer(
+                    rate_limit, "authenticated_requests", "replay.rate_limit"
+                ),
+                authenticated_window_seconds=_positive_integer(
+                    rate_limit,
+                    "authenticated_window_seconds",
+                    "replay.rate_limit",
+                ),
+                unauthenticated_requests=_positive_integer(
+                    rate_limit, "unauthenticated_requests", "replay.rate_limit"
+                ),
+                unauthenticated_window_seconds=_positive_integer(
+                    rate_limit,
+                    "unauthenticated_window_seconds",
+                    "replay.rate_limit",
+                ),
+                max_buckets=_positive_integer(
+                    rate_limit, "max_buckets", "replay.rate_limit"
+                ),
             ),
         ),
     )

@@ -87,6 +87,42 @@ class BundleStageTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "integrity_failure")
 
+    def test_prepare_oserror_is_resource_exhausted(self):
+        window = c.BundleWindow(
+            window_start_ns=0,
+            window_end_ns=1_800_000_000_000,
+            canonical_receipt_sha256="0" * 64,
+            derivative_address="2" * 64,
+            receipt_sha256="4" * 64,
+        )
+        receipt = c.BundleReceipt(
+            bundle_id=self.receipt.bundle_id,
+            start_ns=window.window_start_ns,
+            end_ns=window.window_end_ns,
+            canonical_window_seconds=self.receipt.canonical_window_seconds,
+            producer=self.receipt.producer,
+            windows=(window,),
+        )
+        pins = tuple(
+            BundlePin(
+                self.root / f"derivative-{index}",
+                window.derivative_address,
+                window.receipt_sha256,
+            )
+            for index, window in enumerate(receipt.windows)
+        )
+        with mock.patch.object(stages, "prepare", side_effect=OSError("disk full")):
+            with self.assertRaises(StageFailure) as caught:
+                stages.prepare_stage(
+                    self.root,
+                    request(),
+                    resolved(),
+                    receipt,
+                    pins,
+                    config(),
+                )
+        self.assertEqual(caught.exception.code, "resource_exhausted")
+
 
 class SupervisorStageTests(unittest.TestCase):
     def test_fixed_argv_minimal_environment_and_closed_exit_mapping(self):

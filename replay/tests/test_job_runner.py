@@ -24,6 +24,7 @@ from replay.jobs.stages import (
     parse_archive_state,
     validate_committed_markers,
     validate_job_root,
+    verify_published_receipt,
 )
 from targeter.v2.models import isoformat, parse_timestamp
 from universe.auth import Principal
@@ -281,6 +282,9 @@ class ArchiveTests(unittest.TestCase):
         before = tuple(store.puts)
         self.assertEqual(archive_stage(self.job, self.row, store, "revision", 999), 30)
         self.assertEqual(tuple(store.puts), before)
+        verified = verify_published_receipt(inner, self.row.job_id)
+        self.assertEqual(verified.job_id, self.row.job_id)
+        self.assertEqual(verified.final_outcome, "cancelled")
 
     def test_crash_before_each_upload_resumes_with_same_frozen_receipt(self):
         for fail_at in (1, 2):

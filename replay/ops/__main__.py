@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -36,49 +37,89 @@ def _store(root: Path):
     return build_store((root,))
 
 
-def _jobs(root: Path):
+def _jobs(root: Path, *, read_only: bool):
     config = _config()
     if config.replay.database_path != root / "jobs.sqlite3":
         raise RuntimeError("configured Replay database is outside REPLAY_DATA_ROOT")
-    store = ReplayJobStore(config.replay.database_path, config.replay.jobs)
-    store.initialize()
+    store = ReplayJobStore(
+        config.replay.database_path,
+        config.replay.jobs,
+        open_mode="readonly" if read_only else "readwrite",
+    )
+    store.validate_existing()
     return store
+
+
+def _runner_lock_held(path: Path) -> bool:
+    try:
+        descriptor = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _audit(root: Path) -> dict[str, object]:
     database = root / "jobs.sqlite3"
-    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
-        connection.row_factory = sqlite3.Row
-        integrity = connection.execute("PRAGMA integrity_check").fetchall()
-        statuses = {
-            str(row["status"]): int(row["count"])
-            for row in connection.execute(
-                "SELECT status,count(*) AS count FROM jobs GROUP BY status ORDER BY status"
+    try:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            integrity = [
+                tuple(row)
+                for row in connection.execute("PRAGMA integrity_check").fetchall()
+            ]
+            healthy = integrity == [("ok",)]
+            statuses = (
+                {
+                    str(row["status"]): int(row["count"])
+                    for row in connection.execute(
+                        "SELECT status,count(*) AS count FROM jobs "
+                        "GROUP BY status ORDER BY status"
+                    )
+                }
+                if healthy
+                else {}
             )
-        }
-        oldest = [
-            dict(row)
-            for row in connection.execute(
-                "SELECT job_id,status,stage,reason_code,blocked_reason_code,stage_attempts,"
-                "created_at_ns,updated_at_ns FROM jobs WHERE status NOT IN "
-                "('succeeded','failed','exhausted','not_ready','stale_bundle_cache','cancelled') "
-                "ORDER BY created_at_ns LIMIT 100"
+            oldest = (
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT job_id,status,stage,reason_code,blocked_reason_code,"
+                        "stage_attempts,created_at_ns,updated_at_ns FROM jobs "
+                        "WHERE status NOT IN ('succeeded','failed','exhausted',"
+                        "'not_ready','stale_bundle_cache','cancelled') "
+                        "ORDER BY created_at_ns LIMIT 100"
+                    )
+                ]
+                if healthy
+                else []
             )
-        ]
+    except sqlite3.DatabaseError:
+        integrity = [("database unreadable",)]
+        healthy = False
+        statuses = {}
+        oldest = []
     now = time.time_ns()
     for row in oldest:
         row["age_seconds"] = max(0, (now - int(row["created_at_ns"])) // 1_000_000_000)
     return {
-        "status": "ok" if integrity == [("ok",)] else "failed",
+        "status": "ok" if healthy else "failed",
         "integrity_check": [row[0] for row in integrity],
         "statuses": statuses,
         "active_jobs": oldest,
-        "runner_lock_present": (root / "runner.lock").exists(),
+        "runner_lock_held": _runner_lock_held(root / "runner.lock"),
     }
 
 
 def _verify_job(root: Path, job_id: str) -> dict[str, object]:
-    job_store = _jobs(root)
+    job_store = _jobs(root, read_only=True)
     found = job_store.get_job(job_id)
     if found is None:
         raise RuntimeError("job not found")
@@ -136,7 +177,7 @@ def main(argv=None) -> int:
     elif command == "audit" and not parameters:
         result = _audit(root)
     elif command == "resume-blocked" and len(parameters) == 1:
-        job_store = _jobs(root)
+        job_store = _jobs(root, read_only=False)
         found = job_store.get_job(parameters[0])
         if found is None:
             raise RuntimeError("job not found")
@@ -148,7 +189,7 @@ def main(argv=None) -> int:
     else:
         raise SystemExit("invalid replay operations command or arguments")
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
+    return 1 if command == "audit" and result["status"] != "ok" else 0
 
 
 if __name__ == "__main__":

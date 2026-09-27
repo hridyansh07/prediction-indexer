@@ -131,6 +131,28 @@ def _descriptor(materializer: Path) -> str:
     return producer.materialization_policy_sha256
 
 
+def _publisher_contract(publisher: Path) -> None:
+    try:
+        result = subprocess.run(
+            [str(publisher)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+            env={"LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PreflightError("replay-publish contract probe failed") from error
+    if (
+        result.returncode != 20
+        or result.stdout
+        or len(result.stderr) > 4096
+        or not result.stderr.startswith(b"replay-publish: usage:")
+    ):
+        raise PreflightError("replay-publish is not the expected release binary")
+
+
 def _mount_type(path: Path) -> str:
     resolved = str(path.resolve())
     selected = ("", "")
@@ -207,15 +229,12 @@ def _request(url: str, timeout: int = 10) -> int:
         raise PreflightError("HTTP/TLS connectivity check failed") from error
 
 
-def _http_checks(internal_url: str, public_host: str, probes: int) -> None:
+def _http_checks(internal_url: str, public_host: str) -> None:
     if _request(internal_url.rstrip("/") + "/healthz") != 200:
         raise PreflightError("private Event Universe health check failed")
     public = f"https://{public_host}"
     if _request(public + "/healthz") != 200:
         raise PreflightError("public Caddy TLS/proxy health check failed")
-    statuses = [_request(public + "/v1/auth/nonce") for _ in range(probes)]
-    if 429 not in statuses:
-        raise PreflightError("external edge/WAF nonce rate limit did not return 429")
 
 
 def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
@@ -232,6 +251,7 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "REDIS_URL",
         "REPLAY_PUBLIC_HOST",
         "REPLAY_INTERNAL_URL",
+        "REPLAY_ARCHIVE_PROBE_KEY",
     )
     if _REVISION.fullmatch(required["REPLAY_IMAGE_REVISION"]) is None:
         raise PreflightError("REPLAY_IMAGE_REVISION must be a full immutable Git SHA")
@@ -244,7 +264,9 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
     if _PUBLIC_HOST.fullmatch(required["REPLAY_PUBLIC_HOST"]) is None:
         raise PreflightError("REPLAY_PUBLIC_HOST must be a DNS hostname")
     revision_file = Path("/etc/prediction-indexer-replay-image-revision")
-    if revision_file.exists() and revision_file.read_text(encoding="ascii").strip() != required["REPLAY_IMAGE_REVISION"]:
+    if not revision_file.is_file() or revision_file.is_symlink():
+        raise PreflightError("runner image revision file is missing")
+    if revision_file.read_text(encoding="ascii").strip() != required["REPLAY_IMAGE_REVISION"]:
         raise PreflightError("REPLAY_IMAGE_REVISION disagrees with the image build identity")
     root = Path(required["REPLAY_DATA_ROOT"])
     check_private_root(root)
@@ -255,13 +277,14 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
     check_capacity(filesystem, required_bytes=capacity, required_inodes=inodes, quota_bytes=quota)
     mount_type = _mount_type(root)
     materializer = _executable(required["REPLAY_MATERIALIZER"], "REPLAY_MATERIALIZER")
-    _executable(required["REPLAY_PUBLISHER"], "REPLAY_PUBLISHER")
+    publisher = _executable(required["REPLAY_PUBLISHER"], "REPLAY_PUBLISHER")
     runner_config = parse_runner_config(Path(config_path).read_bytes())
     if runner_config.universe_base_url.rstrip("/") != required[
         "REPLAY_INTERNAL_URL"
     ].rstrip("/"):
         raise PreflightError("runner config and REPLAY_INTERNAL_URL disagree")
     policy = _descriptor(materializer)
+    _publisher_contract(publisher)
     universe_config = load_config(Path(environment.get("EVENT_UNIVERSE_CONFIG", "/etc/prediction-indexer/event_universe.json")))
     _database(universe_config, root)
     try:
@@ -270,12 +293,19 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         raise PreflightError("archive configuration or independence check failed") from error
     if not store.durability.independent:
         raise PreflightError("Replay production ObjectStore must be independently durable")
+    try:
+        archive_probe = store.head(required["REPLAY_ARCHIVE_PROBE_KEY"])
+    except Exception as error:
+        raise PreflightError("archive receipt/IAM probe failed") from error
+    if (
+        archive_probe is None
+        or not archive_probe.provider_checksum
+        or not archive_probe.provider_checksum_algorithm
+    ):
+        raise PreflightError("archive receipt/IAM probe is absent or unverifiable")
     redis_maxmemory = _positive_environment(environment, "REPLAY_REDIS_MAXMEMORY_BYTES")
     redis_report = _redis(required["REDIS_URL"], redis_maxmemory)
-    probes = _positive_environment(environment, "REPLAY_RATE_LIMIT_PROBE_REQUESTS")
-    if probes > 100:
-        raise PreflightError("REPLAY_RATE_LIMIT_PROBE_REQUESTS must not exceed 100")
-    _http_checks(required["REPLAY_INTERNAL_URL"], required["REPLAY_PUBLIC_HOST"], probes)
+    _http_checks(required["REPLAY_INTERNAL_URL"], required["REPLAY_PUBLIC_HOST"])
     return {
         "status": "ready",
         "image_revision": required["REPLAY_IMAGE_REVISION"],
@@ -287,5 +317,5 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "archive_provider": store.provider,
         "archive_store_id": store.store_id,
         "redis": redis_report,
-        "rate_limit_enforcement": "external_edge_verified",
+        "rate_limit_enforcement": "event_universe_process",
     }

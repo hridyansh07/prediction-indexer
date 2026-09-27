@@ -47,7 +47,7 @@ x-replay-volume: &replay-volume
   source: ${REPLAY_DATA_ROOT:-./data/replay}
   target: /var/lib/replay
   bind:
-    create_host_path: false
+    create_host_path: true
 
 x-replay-config: &replay-config
   type: bind
@@ -72,19 +72,19 @@ x-replay-environment: &replay-environment
   REPLAY_DATA_ROOT: /var/lib/replay
   REPLAY_MATERIALIZER: /usr/local/bin/materialize_range
   REPLAY_PUBLISHER: /usr/local/bin/replay-publish
-  REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:?set REPLAY_IMAGE_REVISION to the full release Git SHA}"
-  REPLAY_IMAGE_DIGEST: "${REPLAY_IMAGE_DIGEST:?set REPLAY_IMAGE_DIGEST to the pulled runner image digest}"
-  REPLAY_RUNNER_IMAGE: "${REPLAY_RUNNER_IMAGE:?set REPLAY_RUNNER_IMAGE to the immutable runner image reference}"
-  REPLAY_VOLUME_ID: "${REPLAY_VOLUME_ID:?set REPLAY_VOLUME_ID to the provisioned volume identity}"
+  REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-}"
+  REPLAY_IMAGE_DIGEST: "${REPLAY_IMAGE_DIGEST:-}"
+  REPLAY_RUNNER_IMAGE: "${REPLAY_RUNNER_IMAGE:-}"
+  REPLAY_VOLUME_ID: "${REPLAY_VOLUME_ID:-}"
   REDIS_URL: redis://replay-redis:6379/0
-  REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:?set REPLAY_PUBLIC_HOST}"
+  REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:-}"
   REPLAY_INTERNAL_URL: http://event-universe:8080
-  REPLAY_REQUIRED_CAPACITY_BYTES: "${REPLAY_REQUIRED_CAPACITY_BYTES:-3298534883328}"
+  REPLAY_REQUIRED_CAPACITY_BYTES: "${REPLAY_REQUIRED_CAPACITY_BYTES:-}"
   REPLAY_REQUIRED_INODES: "${REPLAY_REQUIRED_INODES:-1000000}"
-  REPLAY_QUOTA_BYTES: "${REPLAY_QUOTA_BYTES:?set the enforced filesystem/project quota in bytes}"
-  REPLAY_RATE_LIMIT_PROBE_REQUESTS: "${REPLAY_RATE_LIMIT_PROBE_REQUESTS:-20}"
+  REPLAY_QUOTA_BYTES: "${REPLAY_QUOTA_BYTES:-}"
   REPLAY_REDIS_MAXMEMORY_BYTES: "${REPLAY_REDIS_MAXMEMORY_BYTES:-536870912}"
   REPLAY_BACKUP_PREFIX: "${REPLAY_BACKUP_PREFIX:-replay/jobs-db-backups}"
+  REPLAY_ARCHIVE_PROBE_KEY: "${REPLAY_ARCHIVE_PROBE_KEY:-}"
   EVENT_UNIVERSE_CONFIG: /etc/prediction-indexer/event_universe.json
 
 x-universe-job-volumes: &universe-job-volumes
@@ -136,7 +136,9 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - replay-private
+      replay-private: {}
+      replay-edge:
+        ipv4_address: 172.30.0.3
 
   event-universe-sync:
     <<: *universe-runtime
@@ -167,6 +169,7 @@ services:
     profiles: [replay]
     restart: unless-stopped
     init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -187,7 +190,7 @@ services:
       - --appendonly
       - "no"
       - --protected-mode
-      - "yes"
+      - "no"
     healthcheck:
       test: [CMD, redis-cli, ping]
       interval: 10s
@@ -201,17 +204,17 @@ services:
         max-file: "${LOG_MAX_FILES:-5}"
 
   replay-runner:
-    image: "${REPLAY_RUNNER_IMAGE:?set REPLAY_RUNNER_IMAGE to an immutable registry reference ending in @sha256:<digest>}"
+    image: "${REPLAY_RUNNER_IMAGE:-prediction-indexer-replay-runner:local}"
     build:
       context: .
       dockerfile: docker/replay-runner.Dockerfile
       args:
-        REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:?set REPLAY_IMAGE_REVISION to the full release Git SHA}"
+        REPLAY_IMAGE_REVISION: "${REPLAY_IMAGE_REVISION:-0000000000000000000000000000000000000000}"
     profiles: [replay]
     restart: "no"
     init: true
     read_only: true
-    user: "${PUID:-10001}:${PGID:-10001}"
+    user: "${PUID:-1000}:${PGID:-1000}"
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     pids_limit: ${REPLAY_RUNNER_PIDS_LIMIT:-512}
@@ -276,7 +279,7 @@ services:
       - /config:size=16m,mode=0700
       - /tmp:size=16m,mode=1777
     environment:
-      REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:?set REPLAY_PUBLIC_HOST}"
+      REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:-replay.invalid}"
     volumes:
       - type: bind
         source: ./docker/Caddyfile
@@ -293,8 +296,8 @@ services:
       event-universe:
         condition: service_healthy
     networks:
-      - replay-edge
-      - replay-private
+      replay-edge:
+        ipv4_address: 172.30.0.2
     logging:
       driver: json-file
       options:
@@ -304,7 +307,10 @@ services:
 networks:
   replay-private:
     internal: true
-  replay-edge: {}
+  replay-edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
   replay-egress: {}
 
 volumes:
