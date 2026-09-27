@@ -891,8 +891,9 @@ byte-identical semantic files.
   --maxmemory-policy noeviction --save "" --appendonly no`; no published port.
 - `replay-runner`: `docker/replay-runner.Dockerfile` with the venv including
   `.[replay-redis]`, release builds of `replay-publish` and `materialize_range`,
-  `configs/replay_runner.json`, and `REPLAY_IMAGE_REVISION` set to the git SHA
-  at build time. No restart policy.
+  `configs/replay_runner.json`, and `REPLAY_IMAGE_REVISION` set at build time.
+  A full Git SHA is recommended, but any stable identifier matching
+  `[A-Za-z0-9._:+-]{1,128}` is permitted. No restart policy.
 - Volumes: one private, quota-governed `REPLAY_DATA_ROOT` bind holds
   `jobs.sqlite3`, `jobs/`, `runner.lock`, `bundle-work/`, `derivatives/`, and
   `.runner/`. Universe and runner mount it; only runner-owned runtime paths are
@@ -900,7 +901,7 @@ byte-identical semantic files.
   socket mounts are forbidden. The archive is independently durable and normal
   identity has create/get/list only; deletion is separate operator authority.
 - Host cron: `* * * * * docker compose -f compose.universe.yaml --profile replay
-  run --rm replay-runner`.
+  run --rm --no-deps replay-runner`.
 - `python -m replay.ops backup` uses SQLite's online backup API, runs
   `integrity_check`, uploads immutable bytes below the separate
   `REPLAY_BACKUP_PREFIX`, streams them back against provider metadata, and
@@ -922,9 +923,9 @@ policy. Do not start services against production data in this workstream.
 ### 8.1 Preflight and scheduling gate
 
 `python -m replay.ops preflight /etc/prediction-indexer/replay_runner.json` is a
-bounded, secret-safe readiness transaction. It rejects a non-SHA image revision
-or digest; malformed runner or Universe config; missing/non-executable release
-binaries; invalid `materialize_range --describe`; non-private, non-owned,
+bounded, secret-safe readiness transaction. It rejects an empty or unsafe image
+revision identifier or a non-SHA digest; malformed runner or Universe config;
+missing/non-executable release binaries; invalid `materialize_range --describe`; non-private, non-owned,
 non-durable, or unwritable Replay root; insufficient free bytes, inodes, or
 declared enforced quota; schema/migration/integrity failure; Redis older than
 8.2, unbounded memory, policy other than `noeviction`, persistence, or prior

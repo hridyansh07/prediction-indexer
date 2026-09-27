@@ -24,7 +24,7 @@ from universe.replay_jobs import ReplayJobStore
 
 MAX_DESCRIPTOR_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_REVISION = re.compile(r"[0-9a-f]{40}\Z")
+_REVISION = re.compile(r"[A-Za-z0-9._:+-]{1,128}\Z")
 _PUBLIC_HOST = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
 )
@@ -258,7 +258,7 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "REPLAY_ARCHIVE_PROBE_KEY",
     )
     if _REVISION.fullmatch(required["REPLAY_IMAGE_REVISION"]) is None:
-        raise PreflightError("REPLAY_IMAGE_REVISION must be a full immutable Git SHA")
+        raise PreflightError("REPLAY_IMAGE_REVISION must be a safe stable identifier")
     if _SHA256.fullmatch(required["REPLAY_IMAGE_DIGEST"]) is None:
         raise PreflightError("REPLAY_IMAGE_DIGEST must be an immutable sha256 digest")
     if not required["REPLAY_RUNNER_IMAGE"].endswith(

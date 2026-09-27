@@ -806,6 +806,29 @@ class ReplayAuthHTTPTests(unittest.TestCase):
         self.assertEqual((status, document["address"], document["role"]), (200, MEMBER.address, "member"))
         self.assertEqual(headers["Cache-Control"], "no-store")
 
+    def test_siwe_lone_surrogate_key_returns_json_400(self) -> None:
+        status, _, payload = self.request(
+            "POST",
+            "/v1/auth/siwe",
+            b'{"\\udfff":1}',
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(json.loads(payload)["error"], str)
+
+    def test_deep_json_returns_bounded_400(self) -> None:
+        payload = b"[" * 60_000
+        status, _, body = self.request(
+            "POST",
+            "/v1/auth/siwe",
+            payload,
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            json.loads(body), {"error": "request JSON is too deeply nested"}
+        )
+
     def test_internal_error_is_redacted(self) -> None:
         original = self.auth.create_nonce
 

@@ -171,6 +171,7 @@ def write_marker(path: Path, raw: bytes, *, mode: int = 0o600) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.open")
     descriptor = None
     try:
+        temporary.unlink(missing_ok=True)
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(descriptor, "wb", closefd=True) as target:
             descriptor = None
@@ -191,10 +192,22 @@ def initialize_job_root(jobs_root: Path, job_id: str, request_bytes: bytes) -> P
     _directory(jobs_root, "jobs root")
     root = jobs_root / job_id
     if root.exists() or root.is_symlink():
-        raise LocalStateError("initialize requires an absent job directory")
+        _directory(root, "initialized job root")
+        _remove_open_temps(root)
+        if read_regular(root / "request.json", MAX_REQUEST_BYTES) != request_bytes:
+            raise LocalStateError("existing initialized request.json disagrees with submitted bytes")
+        return root
     root.mkdir(mode=0o700)
     fsync_directory(jobs_root)
-    write_marker(root / "request.json", request_bytes)
+    try:
+        write_marker(root / "request.json", request_bytes)
+    except OSError:
+        try:
+            root.rmdir()
+            fsync_directory(jobs_root)
+        except OSError:
+            pass
+        raise
     return root
 
 
@@ -205,6 +218,7 @@ def validate_job_root(root: Path, request_bytes: bytes, request_sha256: str) -> 
         raise LocalStateError("resumed job directory is missing") from error
     if root.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
         raise LocalStateError("resumed job root is not a regular directory")
+    _remove_open_temps(root)
     actual = read_regular(root / "request.json", MAX_REQUEST_BYTES)
     if actual != request_bytes or hashlib.sha256(encoded(plain(parse_request_document(actual)))).hexdigest() != request_sha256:
         raise LocalStateError("request.json identity disagrees with the submitted request")
@@ -216,6 +230,24 @@ def parse_request_document(raw: bytes):
         return decode(raw, MAX_REQUEST_BYTES)
     except ProtocolError as error:
         raise LocalStateError("request.json is not strict JSON") from error
+
+
+def _remove_open_temps(root: Path) -> None:
+    try:
+        with os.scandir(root) as entries:
+            stale = [
+                Path(entry.path)
+                for entry in entries
+                if entry.name.startswith(".")
+                and entry.name.endswith(".open")
+                and not entry.is_dir(follow_symlinks=False)
+            ]
+        for path in stale:
+            path.unlink(missing_ok=True)
+        if stale:
+            fsync_directory(root)
+    except OSError as error:
+        raise LocalStateError(f"cannot remove stale job temporary: {error}") from error
 
 
 def _timestamp_ns(value: object) -> int:
@@ -445,7 +477,10 @@ def resolve_stage(root: Path, job_id: str, request: Request, config: RunnerConfi
         resolved = parse_resolved_job(read_regular(path, MAX_RESOLVED_JOB_BYTES))
     else:
         resolved = history.resolve(job_id, request, config)
-        write_marker(path, resolved_job_bytes(resolved))
+        try:
+            write_marker(path, resolved_job_bytes(resolved))
+        except OSError as error:
+            raise StageFailure("resource_exhausted", str(error)) from error
     if resolved.job_id != job_id or resolved.request_sha256 != request.sha256:
         raise LocalStateError("resolved.json identity mismatch")
     return resolved
@@ -481,7 +516,10 @@ def bundle_stage(root: Path, request: Request, resolved: ResolvedJob, ensure, **
         raise StageFailure("internal_failure", "ensure_bundle returned an unknown outcome")
     if outcome.receipt_bytes != bundle_receipt_bytes(outcome.receipt):
         raise StageFailure("integrity_failure", "bundle receipt bytes are not exact")
-    write_marker(path, outcome.receipt_bytes)
+    try:
+        write_marker(path, outcome.receipt_bytes)
+    except OSError as error:
+        raise StageFailure("resource_exhausted", str(error)) from error
     return outcome.receipt, outcome.receipt_bytes, outcome.pins
 
 
@@ -711,15 +749,18 @@ def run_stage(root: Path, document, *, python: Path, redis_url: str, scratch_roo
     run_root = root / "run"
     if (run_root / "SUCCESS.json").exists():
         return read_success(run_root)
-    scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb", prefix="supervisor-", suffix=".json", dir=scratch_root, delete=False
-    ) as temporary:
-        temporary.write(encoded(document))
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        config_path = Path(temporary.name)
-    os.chmod(config_path, 0o600)
+    try:
+        scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix="supervisor-", suffix=".json", dir=scratch_root, delete=False
+        ) as temporary:
+            temporary.write(encoded(document))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            config_path = Path(temporary.name)
+        os.chmod(config_path, 0o600)
+    except OSError as error:
+        raise StageFailure("resource_exhausted", str(error)) from error
     try:
         code = _run_bounded(
             [str(Path(python).resolve()), "-m", "replay.supervisor", str(config_path), str(run_root)],
@@ -839,6 +880,7 @@ def record_archive_diagnostic(root: Path, diagnostic: str) -> None:
     )
     temporary = path.with_name(f".{path.name}.{os.getpid()}.open")
     try:
+        temporary.unlink(missing_ok=True)
         with temporary.open("xb") as target:
             target.write(updated.bytes())
             target.flush()
@@ -851,6 +893,7 @@ def record_archive_diagnostic(root: Path, diagnostic: str) -> None:
 
 
 def _archive_files(root: Path):
+    _remove_open_temps(root)
     try:
         entries = tuple(os.scandir(root))
     except OSError as error:
@@ -1015,7 +1058,7 @@ def freeze_job_receipt(root: Path | None, row, image_revision: str, now_ns: int)
         if receipt_path.exists():
             raw = read_regular(receipt_path, MAX_JOB_RECEIPT_BYTES)
             receipt = parse_job_receipt(raw)
-            _validate_receipt_row(receipt, row, image_revision)
+            _validate_receipt_row(receipt, row)
             if state_path.exists():
                 state = parse_archive_state(read_regular(state_path, MAX_JOB_RECEIPT_BYTES))
                 if (
@@ -1034,12 +1077,11 @@ def freeze_job_receipt(root: Path | None, row, image_revision: str, now_ns: int)
     return receipt, raw, state, files
 
 
-def _validate_receipt_row(receipt: JobReceipt, row, image_revision: str) -> None:
+def _validate_receipt_row(receipt: JobReceipt, row) -> None:
     if (
         receipt.job_id != row.job_id
         or receipt.request_sha256 != row.request_sha256
         or receipt.submitted_by != row.submitted_by
-        or receipt.image_revision != image_revision
         or receipt.final_outcome != row.pending_outcome
         or receipt.reason_code != row.reason_code
         or receipt.reason_detail != row.reason_detail
@@ -1048,7 +1090,7 @@ def _validate_receipt_row(receipt: JobReceipt, row, image_revision: str) -> None
         raise LocalStateError("frozen job receipt disagrees with the job row")
 
 
-def adopt_published_for_row(store, row, image_revision: str) -> int | None:
+def adopt_published_for_row(store, row) -> int | None:
     """Bridge only a valid receipt-publication/SQLite-finalization crash."""
     try:
         raw = _read_remote(
@@ -1060,7 +1102,7 @@ def adopt_published_for_row(store, row, image_revision: str) -> int | None:
         if raw is None:
             return None
         receipt = parse_job_receipt(raw)
-        _validate_receipt_row(receipt, row, image_revision)
+        _validate_receipt_row(receipt, row)
         _verify_remote_objects(store, receipt)
         return receipt.finished_at_ns
     except LocalStateError as error:

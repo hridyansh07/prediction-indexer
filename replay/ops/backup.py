@@ -168,6 +168,8 @@ def backup_jobs_database(
     created_at_ns: int,
 ) -> BackupReceipt:
     """Use SQLite's online backup API, publish immutable bytes, then a receipt."""
+    if not store.durability.independent:
+        raise BackupError("backup requires an independently durable store")
     if type(created_at_ns) is not int or created_at_ns < 0:
         raise BackupError("created_at_ns must be a nonnegative integer")
     prefix = normalize_key(prefix.rstrip("/"))
@@ -331,7 +333,11 @@ def restore_jobs_database(store, receipt_key: str, destination: Path) -> Path:
     """Restore to a new path only; stopping ingress/runner is an operator gate."""
     receipt = verify_backup(store, receipt_key)
     destination = Path(destination)
-    if destination.exists() or destination.with_name(destination.name + "-wal").exists() or destination.with_name(destination.name + "-shm").exists():
+    sidecars = tuple(
+        destination.with_name(destination.name + suffix)
+        for suffix in ("-wal", "-shm", "-journal")
+    )
+    if destination.exists() or any(path.exists() for path in sidecars):
         raise BackupError("restore destination and SQLite sidecars must not exist")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.open")

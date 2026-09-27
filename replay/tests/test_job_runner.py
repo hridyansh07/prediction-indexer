@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -25,6 +26,7 @@ from replay.jobs.stages import (
     validate_committed_markers,
     validate_job_root,
     verify_published_receipt,
+    write_marker,
 )
 from targeter.v2.models import isoformat, parse_timestamp
 from universe.auth import Principal
@@ -174,8 +176,26 @@ class LocalStateTests(unittest.TestCase):
         self.assertEqual(stat_mode(job), 0o700)
         self.assertEqual(stat_mode(job / "request.json"), 0o600)
         validate_job_root(job, self.raw, self.request.sha256)
+        self.assertEqual(
+            initialize_job_root(self.root / "jobs", self.job_id, self.raw), job
+        )
         with self.assertRaises(LocalStateError):
-            initialize_job_root(self.root / "jobs", self.job_id, self.raw)
+            initialize_job_root(self.root / "jobs", self.job_id, b"{}")
+
+    def test_fixed_marker_temp_from_crash_is_removed_before_create(self):
+        path = self.root / "bundle.json"
+        stale = path.with_name(f".{path.name}.{os.getpid()}.open")
+        stale.write_bytes(b"partial")
+        write_marker(path, b"committed")
+        self.assertEqual(path.read_bytes(), b"committed")
+        self.assertFalse(stale.exists())
+
+    def test_resume_removes_only_top_level_open_temps(self):
+        job = initialize_job_root(self.root / "jobs", self.job_id, self.raw)
+        stale = job / ".bundle.json.4242.open"
+        stale.write_bytes(b"partial")
+        validate_job_root(job, self.raw, self.request.sha256)
+        self.assertFalse(stale.exists())
 
     def test_resume_rejects_missing_tampered_symlink_and_nonregular_request(self):
         cases = ("missing", "tampered", "symlink", "fifo")
@@ -309,8 +329,20 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "archive_unavailable")
                 frozen = (job / "job_receipt.json").read_bytes()
                 store.fail_at = None
-                self.assertEqual(archive_stage(job, self.row, store, "revision", 999), 30)
+                self.assertEqual(archive_stage(job, self.row, store, "revision-b", 999), 30)
                 self.assertEqual((job / "job_receipt.json").read_bytes(), frozen)
+                self.assertEqual(c.parse_job_receipt(frozen).image_revision, "revision")
+
+    def test_archive_removes_top_level_open_temp_before_traversal(self):
+        (self.job / ".bundle.json.4242.open").write_bytes(b"partial")
+        archive_stage(
+            self.job,
+            self.row,
+            LocalObjectStore(self.root / "objects-open"),
+            "revision",
+            30,
+        )
+        self.assertFalse((self.job / ".bundle.json.4242.open").exists())
 
     def test_every_multi_object_upload_boundary_is_idempotent(self):
         from dataclasses import replace
@@ -420,11 +452,95 @@ class CancelledRunnerAcceptanceTests(unittest.TestCase):
                 path.unlink() if path.is_file() else path.rmdir()
             job.rmdir()
 
-            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision-b")
             Runner(jobs, archive, config, runtime, clock=lambda: 100_000_000_000).tick()
             finished, _ = jobs.get_job(row.job_id)
             self.assertEqual(finished.status, c.CANCELLED)
             self.assertEqual(finished.finished_at_ns, 40)
+
+    def test_cancelled_archive_blocked_resume_reuses_identical_initialized_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            config = replace(
+                runner_config(),
+                orchestration=replace(runner_config().orchestration, max_stage_attempts=1),
+            )
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, config),
+                Principal(ADDRESS, "member"),
+                "cancelled-blocked",
+                10,
+                bundle_exists=True,
+            )
+            jobs.cancel_job(submitted.row.job_id, Principal(ADDRESS, "member"), 20)
+            archive = RecordingStore(LocalObjectStore(root / "objects"), fail_at=1)
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            Runner(jobs, archive, config, runtime, clock=iter((30, 31, 32, 33)).__next__).tick()
+            Runner(jobs, archive, config, runtime, clock=lambda: 100_000_000_000).tick()
+            blocked, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(blocked.status, c.ARCHIVE_BLOCKED)
+            jobs.save(blocked, c.resume_blocked(blocked, 100_000_000_001))
+            archive.fail_at = None
+            Runner(jobs, archive, config, runtime, clock=lambda: 200_000_000_000).tick()
+            finished, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(finished.status, c.CANCELLED)
+
+    def test_request_initialization_enospc_is_retryable_and_does_not_escape_tick(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, config),
+                Principal(ADDRESS, "member"),
+                "request-enospc",
+                10,
+                bundle_exists=True,
+            )
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            with mock.patch(
+                "replay.jobs.stages.write_marker",
+                side_effect=OSError(errno.ENOSPC, "disk full"),
+            ):
+                Runner(
+                    jobs,
+                    LocalObjectStore(root / "objects"),
+                    config,
+                    runtime,
+                    clock=iter((20, 21)).__next__,
+                ).tick()
+            waiting, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(
+                (waiting.status, waiting.stage, waiting.reason_code),
+                (c.RUNNING, "resolve", "resource_exhausted"),
+            )
+            with mock.patch.object(
+                Runner,
+                "_work_stage",
+                side_effect=StageFailure("universe_unavailable", "still waiting"),
+            ):
+                Runner(
+                    jobs,
+                    LocalObjectStore(root / "objects"),
+                    config,
+                    runtime,
+                    clock=iter((100_000_000_000, 100_000_000_001)).__next__,
+                ).tick()
+            retried, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual(
+                (retried.status, retried.reason_code),
+                (c.RUNNING, "universe_unavailable"),
+            )
+            self.assertEqual(
+                (root / "jobs" / retried.job_id / "request.json").read_bytes(), raw
+            )
 
     def test_crash_after_initialize_claim_before_root_fails_local_state_lost_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:

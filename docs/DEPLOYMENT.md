@@ -919,8 +919,9 @@ and requires checksum metadata. On EC2, the instance metadata options must
 require IMDSv2 and use a hop limit of at least 2 so the container can obtain the
 role credentials.
 
-Build the runner with the exact source SHA, push it, and pin the deployed image
-by provider digest:
+Build the runner with a stable source identifier, push it, and pin the deployed
+image by provider digest. The full source SHA is recommended as shown, but any
+stable identifier matching `[A-Za-z0-9._:+-]{1,128}` is permitted:
 
 ```bash
 export REPLAY_IMAGE_REVISION="$(git rev-parse HEAD)"
@@ -996,7 +997,7 @@ The runner is never started with `up`, a restart policy, or a persistent loop.
 Use exactly one host cron or systemd timer invocation per minute:
 
 ```cron
-* * * * * cd /opt/prediction-indexer && docker compose -f compose.universe.yaml --profile replay run --rm replay-runner >> /var/log/prediction-replay-runner.log 2>&1
+* * * * * cd /opt/prediction-indexer && docker compose -f compose.universe.yaml --profile replay run --rm --no-deps replay-runner >> /var/log/prediction-replay-runner.log 2>&1
 ```
 
 Prefer a systemd oneshot service plus a one-minute timer with
@@ -1078,7 +1079,7 @@ drill path with `restore-backup RECEIPT_KEY DESTINATION`; independently open the
 result and require `PRAGMA integrity_check = ok`.
 
 A DB-only restore recovers auth, sessions, jobs, events, and submissions. Before
-cutover, disable ingress and scheduler, stop Universe, preserve the current
+cutover, disable ingress and the Replay scheduler, stop Universe, preserve the current
 volume, restore to a new path, verify, then atomically install while stopped.
 Revoke all restored sessions or rotate authentication authority before reopening
 ingress. Active rows whose job directories are absent resume only to
@@ -1099,6 +1100,10 @@ A full active-state rollback requires a stopped coordinated full-volume snapshot
 Do not call a DB-only restore a full-state rollback. Never roll back to an image
 that cannot read current state, delete artifacts to force compatibility, or
 mutate committed evidence.
+
+For every rebuild or maintenance operation that stops `event-universe`, disable the Replay scheduler
+first and drain any lock holder. Otherwise cron may start a runner against a
+deliberately unavailable control plane.
 
 ### Break-glass bundle rebuild
 
