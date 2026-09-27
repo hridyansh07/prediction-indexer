@@ -45,6 +45,7 @@ from replay.jobs.contracts import (
     JobObject,
     JobReceipt,
     JobResult,
+    Occurrence,
     Request,
     ResolvedJob,
     RunnerConfig,
@@ -70,7 +71,7 @@ from replay.preparation import (
     prepare,
 )
 from replay.strategy_sdk import plain
-from replay.streams.protocol import ProtocolError, decode, obj, require
+from replay.streams.protocol import ProtocolError, choice, decode, obj, require
 from replay.supervisor import read as read_supervisor_json
 from replay.supervisor import read_success, validate as validate_supervisor
 
@@ -151,6 +152,15 @@ def read_regular(path: Path, maximum: int) -> bytes:
     return raw
 
 
+def _directory(path: Path, where: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise LocalStateError(f"cannot inspect {where}: {error}") from error
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise LocalStateError(f"{where} is not a regular directory")
+
+
 def write_marker(path: Path, raw: bytes, *, mode: int = 0o600) -> None:
     """Create one exact durable marker; an existing marker must be byte-identical."""
     if path.exists() or path.is_symlink():
@@ -178,6 +188,7 @@ def write_marker(path: Path, raw: bytes, *, mode: int = 0o600) -> None:
 
 def initialize_job_root(jobs_root: Path, job_id: str, request_bytes: bytes) -> Path:
     jobs_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _directory(jobs_root, "jobs root")
     root = jobs_root / job_id
     if root.exists() or root.is_symlink():
         raise LocalStateError("initialize requires an absent job directory")
@@ -273,7 +284,7 @@ class HistoryClient:
         if retirement is None:
             raise StageFailure("bundle_not_retired", "bundle is not retired")
         try:
-            bundle, job, occurrences = resolve_occurrences(history, retirement, request.interval)
+            bundle, job, occurrences = resolve_occurrences(history, retirement[0], request.interval)
             return ResolvedJob(
                 job_id,
                 request.sha256,
@@ -314,7 +325,23 @@ class HistoryClient:
             "retirement source origin",
         )
         require(value["bundle_id"] == bundle_id and type(value["run_id"]) is str)
+        choice(value["occurrence_kind"], "complete retained")
+        require(type(value["continuity_selected"]) is bool)
+        if value["continuity_disposition"] is not None:
+            choice(value["continuity_disposition"], "held_current_candidate retained")
+        for field in ("sport", "game", "topology", "activation_at", "capture_start_at"):
+            require(type(value[field]) is str and bool(value[field]))
         source = obj(value["source"], "manifest_key manifest_sha256 report_key report_sha256")
+        HistoryClient._source(value["run_id"], source)
+        origin = obj(
+            value["origin"],
+            "run_id generated_at manifest_key manifest_sha256 report_key report_sha256",
+        )
+        HistoryClient._source(
+            origin["run_id"],
+            {name: origin[name] for name in source},
+        )
+        _timestamp_ns(origin["generated_at"])
         entry = HistoryEntry(
             value["run_id"],
             _timestamp_ns(value["generated_at"]),
@@ -331,7 +358,33 @@ class HistoryClient:
             retirement["source"],
             "run_id manifest_key manifest_sha256 report_key report_sha256",
         )
-        return entry, _timestamp_ns(retirement["retired_at"])
+        choice(retirement["disposition"], "all_markets_terminal terminal_clamp_elapsed")
+        require(
+            retirement["terminal_observed_at"]
+            == (
+                retirement["retired_at"]
+                if retirement["disposition"] == "all_markets_terminal"
+                else None
+            )
+        )
+        retirement_source = retirement["source"]
+        HistoryClient._source(
+            retirement_source["run_id"],
+            {name: retirement_source[name] for name in source},
+        )
+        return entry, (_timestamp_ns(retirement["retired_at"]), encoded(retirement))
+
+    @staticmethod
+    def _source(run_id, source):
+        Occurrence(run_id, 0, 1, **source)
+        prefix = source["manifest_key"].rsplit("/", 1)[0]
+        require(
+            source["report_key"]
+            in {
+                prefix + "/selection_report.json",
+                prefix + "/selection_report.json.zst",
+            }
+        )
 
 
 def validate_committed_markers(root: Path, stage: str) -> None:
@@ -351,6 +404,21 @@ def validate_committed_markers(root: Path, stage: str) -> None:
         "run": lambda: read_success(root / "run"),
     }
     try:
+        context = root / "context"
+        if context.exists() or context.is_symlink():
+            _directory(context, "preparation directory")
+        run = root / "run"
+        if run.exists() or run.is_symlink():
+            _directory(run, "supervisor directory")
+        if context.exists() and not (context / "receipt.json").exists():
+            try:
+                names = {path.name for path in context.iterdir()}
+                if names - {".lock"}:
+                    raise LocalStateError("preparation directory has no commit marker")
+                if ".lock" in names:
+                    _regular(context / ".lock")
+            except OSError as error:
+                raise LocalStateError(f"cannot inspect preparation directory: {error}") from error
         for name in required:
             validators[name]()
         # Existing later markers are immutable evidence even if SQLite did not
@@ -838,8 +906,9 @@ def _identity(path: Path) -> StoredIdentity:
     return StoredIdentity(digest.hexdigest(), length)
 
 
-def _stage_identities(root: Path):
+def _stage_identities(root: Path, row):
     identities = []
+    resolved = bundle = result = success = None
     for path, maximum, parser, accessor in (
         (root / "resolved.json", MAX_RESOLVED_JOB_BYTES, parse_resolved_job, None),
         (root / "bundle.json", MAX_BUNDLE_RECEIPT_BYTES, parse_bundle_receipt, None),
@@ -852,20 +921,58 @@ def _stage_identities(root: Path):
             continue
         if parser is parse_resolved_job or parser is parse_bundle_receipt:
             raw = read_regular(path, maximum)
-            parser(raw)
+            parsed = parser(raw)
+            if parser is parse_resolved_job:
+                resolved = parsed
+                if parsed.job_id != row.job_id or parsed.request_sha256 != row.request_sha256:
+                    raise LocalStateError("resolved marker disagrees with the job row")
+            else:
+                bundle = parsed
+                if resolved is None or parsed.bundle_id != resolved.bundle_id:
+                    raise LocalStateError("bundle marker disagrees with resolved job")
             identities.append(hashlib.sha256(raw).hexdigest())
         elif path.name == "receipt.json":
+            snapshot = load_snapshot(root / "context")
+            if (
+                resolved is None
+                or bundle is None
+                or plain(snapshot["config"])["bundle_id"] != resolved.bundle_id
+                or plain(snapshot["config"])["start_ns"] != str(resolved.job_interval[0])
+                or plain(snapshot["config"])["end_ns"] != str(resolved.job_interval[1])
+            ):
+                raise LocalStateError("preparation marker disagrees with resolved job")
+            available = {
+                (window.derivative_address, window.receipt_sha256)
+                for window in bundle.windows
+            }
+            if not all(
+                (pin["derivative_address"], pin["receipt_sha256"]) in available
+                for pin in snapshot["config"]["pins"]
+            ):
+                raise LocalStateError("preparation pins disagree with bundle receipt")
             identities.append(snapshot_sha256(root / "context"))
         elif path.name == "SUCCESS.json":
-            identities.append(read_success(root / "run")[accessor])
+            success = read_success(root / "run")
+            identities.append(success[accessor])
         else:
-            identities.append(parser(read_regular(path, maximum)).__getattribute__(accessor))
+            result = parser(read_regular(path, maximum))
+            if result.job_id != row.job_id:
+                raise LocalStateError("result marker disagrees with the job row")
+            identities.append(result.__getattribute__(accessor))
     absent = False
     for value in identities:
         if value is None:
             absent = True
         elif absent:
             raise LocalStateError("stage identity chain has a gap")
+    if result is not None and (
+        result.bundle_receipt_sha256 != identities[1]
+        or result.snapshot_sha256 != identities[2]
+        or result.supervisor_identity != identities[3]
+        or success is None
+        or result.attempt_id != success["attempt"]
+    ):
+        raise LocalStateError("result marker disagrees with prior stage identities")
     return identities
 
 
@@ -875,7 +982,7 @@ def freeze_job_receipt(root: Path | None, row, image_revision: str, now_ns: int)
         identities = [None] * 5
     else:
         files = _archive_files(root)
-        identities = _stage_identities(root)
+        identities = _stage_identities(root, row)
     objects = tuple(
         JobObject(
             job_object_key(row.job_id, path.relative_to(root).as_posix()),
@@ -947,13 +1054,7 @@ def adopt_published_for_row(store, row, image_revision: str) -> int | None:
             return None
         receipt = parse_job_receipt(raw)
         _validate_receipt_row(receipt, row, image_revision)
-        for item in receipt.objects:
-            metadata = store.head(item.key)
-            if metadata is None or not metadata.matches(StoredIdentity(item.sha256, item.byte_length)):
-                raise StageFailure("archive_conflict", f"remote object {item.key} disagrees with receipt")
-            with store.open_verified(_expectation(metadata)) as source:
-                while source.read(1024 * 1024):
-                    pass
+        _verify_remote_objects(store, receipt)
         return receipt.finished_at_ns
     except LocalStateError as error:
         raise StageFailure("archive_conflict", error.detail) from error
@@ -966,6 +1067,8 @@ def adopt_published_for_row(store, row, image_revision: str) -> int | None:
 
 
 def _expectation(metadata):
+    if not metadata.provider_checksum or not metadata.provider_checksum_algorithm:
+        raise StageFailure("archive_conflict", f"remote object {metadata.key} lacks provider checksum metadata")
     return ObjectExpectation(
         metadata.key,
         metadata.stored,
@@ -989,6 +1092,74 @@ def _read_remote(store, key, maximum):
     return b"".join(chunks)
 
 
+def _verify_remote_objects(store, receipt: JobReceipt) -> None:
+    prefix = f"replay/jobs/{receipt.job_id}/"
+    objects = {item.key.removeprefix(prefix): item for item in receipt.objects}
+    selected = {}
+    bounds = {
+        "resolved.json": MAX_RESOLVED_JOB_BYTES,
+        "bundle.json": MAX_BUNDLE_RECEIPT_BYTES,
+        "context/receipt.json": 4096,
+        "run/SUCCESS.json": 1024 * 1024,
+        "result.json": MAX_JOB_RESULT_BYTES,
+    }
+    for item in receipt.objects:
+        metadata = store.head(item.key)
+        if metadata is None or not metadata.matches(StoredIdentity(item.sha256, item.byte_length)):
+            raise StageFailure("archive_conflict", f"remote object {item.key} disagrees with receipt")
+        relative = item.key.removeprefix(prefix)
+        maximum = bounds.get(relative)
+        if maximum is None:
+            with store.open_verified(_expectation(metadata)) as source:
+                while source.read(1024 * 1024):
+                    pass
+        else:
+            selected[relative] = _read_remote(store, item.key, maximum)
+
+    direct = (
+        ("resolved.json", receipt.resolved_sha256),
+        ("bundle.json", receipt.bundle_receipt_sha256),
+    )
+    for relative, expected in direct:
+        item = objects.get(relative)
+        if (item is None) != (expected is None) or (
+            item is not None and item.sha256 != expected
+        ):
+            raise StageFailure("archive_conflict", f"remote {relative} identity chain mismatch")
+    if receipt.snapshot_sha256 is not None:
+        try:
+            preparation = decode(selected["context/receipt.json"], 4096)
+            obj(preparation, "version snapshot_sha256 snapshot_byte_length config_sha256")
+            require(preparation["snapshot_sha256"] == receipt.snapshot_sha256)
+            context = objects["context/context.json"]
+            require(
+                context.sha256 == receipt.snapshot_sha256
+                and context.byte_length == preparation["snapshot_byte_length"]
+            )
+        except (KeyError, ProtocolError) as error:
+            raise StageFailure("archive_conflict", "remote snapshot identity chain mismatch") from error
+    if receipt.supervisor_identity is not None:
+        try:
+            success = decode(selected["run/SUCCESS.json"], 1024 * 1024)
+            obj(success, "version identity attempt terminal outputs")
+            require(success["identity"] == receipt.supervisor_identity)
+        except (KeyError, ProtocolError) as error:
+            raise StageFailure("archive_conflict", "remote supervisor identity chain mismatch") from error
+    if receipt.strategy_semantic_sha256 is not None:
+        try:
+            result = parse_job_result(selected["result.json"])
+        except (KeyError, ContractError) as error:
+            raise StageFailure("archive_conflict", "remote result identity chain mismatch") from error
+        if (
+            result.job_id != receipt.job_id
+            or result.strategy_semantic_sha256 != receipt.strategy_semantic_sha256
+            or result.snapshot_sha256 != receipt.snapshot_sha256
+            or result.bundle_receipt_sha256 != receipt.bundle_receipt_sha256
+            or result.supervisor_identity != receipt.supervisor_identity
+        ):
+            raise StageFailure("archive_conflict", "remote result identity chain mismatch")
+
+
 def adopt_remote_receipt(store, expected: JobReceipt, expected_raw: bytes) -> bool:
     key = job_receipt_key(expected.job_id)
     try:
@@ -998,13 +1169,7 @@ def adopt_remote_receipt(store, expected: JobReceipt, expected_raw: bytes) -> bo
         receipt = parse_job_receipt(remote)
         if remote != expected_raw or receipt != expected:
             raise StageFailure("archive_conflict", "remote job receipt disagrees with frozen receipt")
-        for item in receipt.objects:
-            metadata = store.head(item.key)
-            if metadata is None or not metadata.matches(StoredIdentity(item.sha256, item.byte_length)):
-                raise StageFailure("archive_conflict", f"remote object {item.key} disagrees with receipt")
-            with store.open_verified(_expectation(metadata)) as source:
-                while source.read(1024 * 1024):
-                    pass
+        _verify_remote_objects(store, receipt)
         return True
     except StageFailure:
         raise

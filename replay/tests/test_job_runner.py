@@ -19,6 +19,7 @@ from replay.jobs.stages import (
     archive_stage,
     initialize_job_root,
     parse_archive_state,
+    validate_committed_markers,
     validate_job_root,
 )
 from targeter.v2.models import isoformat, parse_timestamp
@@ -172,6 +173,14 @@ class LocalStateTests(unittest.TestCase):
                 with self.assertRaises(LocalStateError):
                     validate_job_root(job, self.raw, self.request.sha256)
 
+    def test_uncommitted_preparation_directory_is_local_state_lost(self):
+        job = initialize_job_root(self.root / "jobs", self.job_id, self.raw)
+        context = job / "context"
+        context.mkdir()
+        (context / "context.json").write_bytes(b"{}")
+        with self.assertRaises(LocalStateError):
+            validate_committed_markers(job, "prepare")
+
 
 class HistoryTests(unittest.TestCase):
     def test_paginates_selected_history_and_closes_interval_at_coherent_retirement(self):
@@ -277,6 +286,43 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(archive_stage(job, self.row, store, "revision", 999), 30)
                 self.assertEqual((job / "job_receipt.json").read_bytes(), frozen)
 
+    def test_every_multi_object_upload_boundary_is_idempotent(self):
+        from dataclasses import replace
+
+        from replay.tests.test_jobs_contracts import bundle_receipt, resolved
+
+        failed = c.fail(
+            c.claim(
+                c.new_job(
+                    self.row.job_id,
+                    submitted_by=ADDRESS,
+                    request_sha256=c.parse_request(self.raw, runner_config()).sha256,
+                    now_ns=10,
+                ),
+                runner_config().orchestration,
+                20,
+            ),
+            "tool_failure",
+            "failed after bundle",
+            21,
+        )
+        for fail_at in range(1, 5):
+            with self.subTest(fail_at=fail_at):
+                case = self.root / f"multi-{fail_at}"
+                job = initialize_job_root(case / "jobs", failed.job_id, self.raw)
+                (job / "resolved.json").write_bytes(
+                    c.resolved_job_bytes(replace(resolved(), request_sha256=failed.request_sha256))
+                )
+                (job / "bundle.json").write_bytes(c.bundle_receipt_bytes(bundle_receipt()))
+                inner = LocalObjectStore(case / "objects")
+                store = RecordingStore(inner, fail_at=fail_at)
+                with self.assertRaises(StageFailure):
+                    archive_stage(job, failed, store, "revision", 30)
+                frozen = (job / "job_receipt.json").read_bytes()
+                store.fail_at = None
+                self.assertEqual(archive_stage(job, failed, store, "revision", 99), 30)
+                self.assertEqual((job / "job_receipt.json").read_bytes(), frozen)
+
     def test_archive_rejects_symlink_hardlink_fifo_unexpected_and_limits(self):
         context = self.job / "context"
         context.mkdir()
@@ -353,6 +399,35 @@ class CancelledRunnerAcceptanceTests(unittest.TestCase):
             finished, _ = jobs.get_job(row.job_id)
             self.assertEqual(finished.status, c.CANCELLED)
             self.assertEqual(finished.finished_at_ns, 40)
+
+    def test_crash_after_initialize_claim_before_root_fails_local_state_lost_on_resume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, config),
+                Principal(ADDRESS, "member"),
+                "claimed-no-root",
+                10,
+                bundle_exists=True,
+            )
+            claimed = jobs.claim_next(config.orchestration, 20)
+            self.assertEqual(claimed.mode, "initialize")
+            archive = LocalObjectStore(root / "objects")
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            Runner(jobs, archive, config, runtime, clock=lambda: 100_000_000_000).tick()
+            finished, _ = jobs.get_job(submitted.row.job_id)
+            self.assertEqual((finished.status, finished.reason_code), (c.FAILED, "local_state_lost"))
+            with archive.open(
+                c.job_receipt_key(finished.job_id),
+                max_bytes=c.MAX_JOB_RECEIPT_BYTES,
+            ) as source:
+                receipt = c.parse_job_receipt(source.read())
+            self.assertEqual(receipt.objects, ())
 
     def test_archive_retry_diagnostic_is_local_and_pending_detail_is_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
