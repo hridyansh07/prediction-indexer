@@ -2,36 +2,12 @@ import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import {
-  createEventUniverseRouter,
-  EventUniverseClient,
-} from './event-universe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = positive(process.env.PORT, 3000, 'PORT');
-const universeUrl = process.env.UNIVERSE_API_BASE_URL;
-const universe = universeUrl
-  ? new EventUniverseClient({
-      baseUrl: universeUrl,
-      authorization: process.env.UNIVERSE_API_AUTHORIZATION,
-      timeoutMs: positive(
-        process.env.UNIVERSE_API_TIMEOUT_MS,
-        5000,
-        'UNIVERSE_API_TIMEOUT_MS',
-      ),
-      maxResponseBytes: positive(
-        process.env.UNIVERSE_API_MAX_RESPONSE_BYTES,
-        1_750_000,
-        'UNIVERSE_API_MAX_RESPONSE_BYTES',
-      ),
-    })
-  : null;
 const app = express();
 app.disable('x-powered-by');
-app.get('/healthz', (_q, r) =>
-  r.json({ ready: true, universeConfigured: universe !== null }),
-);
-app.use('/api/event-universe', createEventUniverseRouter(universe));
+app.get('/healthz', (_q, r) => r.json({ ready: true }));
 const web = path.resolve(here, '../../dist');
 if (fs.existsSync(web)) {
   app.use(express.static(web));

@@ -4,28 +4,29 @@ Read-only React/Vite UI for current Targeter selections, historical Event
 Universe bundles, and recent Targeter decision evidence. The current targets
 explorer is the landing page; detailed views are desktop-first.
 
-The browser hydrates every view exclusively through the same-origin
-`/api/event-universe/...` proxy. The UI does not list an archive, download
+The browser hydrates every view directly from the public Universe HTTPS API.
+The UI does not list an archive, download
 Targeter reports, decode Zstandard, stage private files, or hold cloud-storage
 credentials. Event Universe owns report verification and lifecycle projection.
 
-## Server configuration
+## Public build configuration
 
 [`targeter-ui/.env.example`](.env.example) contains the non-secret examples:
 
 ```text
-UNIVERSE_API_BASE_URL=https://universe.example.com
-UNIVERSE_API_AUTHORIZATION=Bearer replace-with-server-side-token  # optional
-UNIVERSE_API_TIMEOUT_MS=5000                                     # optional
-UNIVERSE_API_MAX_RESPONSE_BYTES=1750000                          # optional
-PORT=3000                                                        # Express only
+VITE_UNIVERSE_API_BASE_URL=https://34-182-18-247.sslip.io
+VITE_REPLAY_SIWE_DOMAIN=<the exact domain in Universe replay.auth.siwe_domain>
+VITE_REPLAY_SIWE_URI=<the exact URI in Universe replay.auth.siwe_uri>
+VITE_REPLAY_SIWE_STATEMENT=Sign in to Prediction Indexer.
+VITE_REPLAY_SIWE_CHAIN_ID=1
+PORT=3000 # optional local static server
 ```
 
-All Universe variables are server-only. Do not prefix them with `VITE_`; doing
-so would expose them to browser JavaScript. The proxy accepts only documented
-paths and query fields, validates closed response schemas, applies bounded
-timeouts and response sizes, and returns generic failures without upstream
-bodies or credentials.
+These values are public and embedded at build time. They must contain no token,
+wallet key, signature, or other secret. The browser client validates closed
+response schemas, bounds response sizes and polling, handles `Retry-After`, and
+sends bearer sessions with `credentials: omit`. Sessions remain in memory and
+are lost on refresh; they are never written to local or session storage.
 
 The targets and decisions views resolve the newest complete run through:
 
@@ -67,18 +68,16 @@ their drawer closes.
 - `/targets` — compatibility redirect to `/`
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
-- `/replay` — fixture-driven Replay jobs workspace
-- `/replay/jobs/:jobId` — Replay progress, events, request, and audit detail
-- `/replay/new` — desktop Replay request workflow
-- `/replay/admin` — admin-only allowlist design
+- `/replay` — public Replay jobs workspace
+- `/replay/jobs/:jobId` — public Replay progress, events, request, and audit detail
+- `/replay/new` — authenticated desktop Replay request workflow
+- `/replay/admin` — admin-only allowlist management
 - `/replay/jobs/:jobId/output` — reserved Coming soon route
-- `/api/event-universe/...` — narrow same-origin Universe proxy
 
-Replay routes currently use local fixtures and mocked wallet/session states.
-They do not submit requests, mutate the allowlist, cancel jobs, or integrate
-SIWE. URL fixture controls expose design states for review: `?auth=entry`,
-`?auth=expired`, list `?view=loading|empty|error`, detail `?state=<job-status>`,
-and admin `?state=loading|error|forbidden`.
+Replay production paths use Universe directly. URL fixture controls remain for
+design regression coverage: `?auth=entry`, `?auth=expired`, list
+`?view=loading|empty|error`, detail `?state=<job-status>`, new replay
+`?fixture=true`, and admin `?state=loading|error|forbidden|ready`.
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.
@@ -86,9 +85,9 @@ routes.
 ## Vercel
 
 Create the Vercel project from the repository root. [`vercel.json`](../vercel.json)
-builds only the Vite client, serves `targeter-ui/dist`, forwards the same-origin
-Universe routes through the Vercel function, and supplies the SPA fallback.
-Configure the same `UNIVERSE_API_*` server-side variables in Vercel. No AWS,
+builds only the Vite client, serves `targeter-ui/dist`, and supplies the SPA
+fallback. It has no API rewrite or function. Configure the same public
+`VITE_UNIVERSE_API_BASE_URL` and `VITE_REPLAY_SIWE_*` values in Vercel. No AWS,
 S3, OIDC, archive-prefix, staging, or decoder variables belong in Vercel.
 
 ## Local and orb operation
@@ -99,9 +98,8 @@ yarn workspace prediction-indexer-targeter-ui build
 yarn workspace prediction-indexer-targeter-ui start
 ```
 
-The production Express server serves `dist/`, `/healthz`, and the same strict
-Universe proxy on `PORT`. In an Amp orb, register `UNIVERSE_API_BASE_URL` and any
-optional authorization as project secrets, then run `amp orb services ensure`.
+The optional Express server serves only `dist/` and `/healthz` on `PORT`; API
+traffic still goes directly from the browser to Universe.
 
 From the repository root, use `yarn lint`, `yarn typecheck`, `yarn test`, and
 `yarn build`. Repository setup configures `.githooks/pre-commit`; it runs the

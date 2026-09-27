@@ -18,6 +18,7 @@ import {
   ReplayJobsPage,
   ReplayOutputPage,
 } from './replay';
+import { UniverseAuthProvider } from './universe-auth';
 import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
@@ -85,9 +86,11 @@ function App() {
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
+      <UniverseAuthProvider>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </UniverseAuthProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 );

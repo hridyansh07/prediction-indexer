@@ -28,7 +28,7 @@ import {
   targeterRunQuery,
   universeKeys,
 } from '../src/client/universe-queries.js';
-import { handleEventUniverseProxy } from '../../api/event-universe-proxy.js';
+import { handleDirectUniverseTestRequest as handleEventUniverseProxy } from './direct-client-test-helper.js';
 import { EVENT_UNIVERSE_SCHEMA_VERSION } from '../src/event-universe.js';
 import type {
   UniverseRun,
@@ -1312,7 +1312,7 @@ test('live routes use the Universe proxy without cadence or archive dependencies
   assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
   assert.doesNotMatch(client, /StatusPage|>Status</);
   assert.doesNotMatch(proxy, /validateCadence|UniverseCadence|CADENCE_QUERY/);
-  assert.match(apiClient, /method: 'GET'/);
+  assert.match(apiClient, /UniverseClient/);
   for (const removed of [
     '/api/refresh',
     '/api/snapshot',
@@ -1331,10 +1331,7 @@ test('live routes use the Universe proxy without cadence or archive dependencies
   assert.equal(dependencies['@prediction-indexer/rust-v1-decoder'], undefined);
 });
 
-test('Vercel builds only the client and routes Universe before the SPA fallback', async () => {
-  const apiPackage = JSON.parse(
-    await readFile(new URL('../../api/package.json', import.meta.url), 'utf8'),
-  ) as { type?: string };
+test('Vercel builds only the client with no API proxy', async () => {
   const config = JSON.parse(
     await readFile(new URL('../../vercel.json', import.meta.url), 'utf8'),
   ) as {
@@ -1342,81 +1339,12 @@ test('Vercel builds only the client and routes Universe before the SPA fallback'
     outputDirectory: string;
     rewrites: Array<{ source: string; destination: string }>;
   };
-  assert.equal(apiPackage.type, 'module');
   assert.equal(
     config.buildCommand,
     'yarn workspace prediction-indexer-targeter-ui build:client',
   );
   assert.equal(config.outputDirectory, 'targeter-ui/dist');
-  // The group name is `universePath` rather than a generic `path` because Vercel
-  // echoes it into the destination query, where the proxy has to delete it by
-  // name; keeping the two in step is what stops every route 400ing. See the
-  // regression test below.
   assert.deepEqual(config.rewrites, [
-    {
-      source: '/api/event-universe/:universePath*',
-      destination: '/api/event-universe-proxy?__universe_path=/:universePath*',
-    },
     { source: '/(.*)', destination: '/index.html' },
   ]);
-});
-
-test('Vercel proxy drops the rewrite group the platform echoes into the query', async () => {
-  // The vercel.json rewrite both substitutes `:universePath*` into the
-  // destination and echoes it as its own query parameter, so a real request for
-  // `/api/event-universe/healthz` arrives carrying `universePath=healthz`
-  // alongside `__universe_path=/healthz`. Every other proxy test builds the
-  // idealised URL by hand and so never sees it; forwarding it made every route
-  // fail as `Invalid Event Universe request`, because `requireNoQuery` rejects
-  // any key at all and the per-route allow-lists reject unknown ones.
-  const health = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/healthz&universePath=healthz',
-    ),
-    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
-    (async (input) => {
-      assert.equal(String(input), 'https://universe.internal/healthz');
-      return json({
-        status: 'ok',
-        schema_version: EVENT_UNIVERSE_SCHEMA_VERSION,
-        latest_run: null,
-        counts: {
-          targeter_runs: 653,
-          selection_occurrences: 3718,
-          bundle_retirements: 152,
-          bundle_contexts: 153,
-          context_targets: 2125,
-          umbrella_events: 804,
-          canonical_markets: 1912,
-          venue_markets: 3618,
-          claim_classes: 733,
-        },
-        claim_coverage: {
-          relation_shortfall: 0,
-          unreconstructed_bundles: 0,
-          runs_with_shortfall: 0,
-        },
-        sync: { pending_failures: 0 },
-      });
-    }) as typeof fetch,
-  );
-  assert.equal(health.status, 200);
-  assert.equal(
-    (await health.clone().json()).schema_version,
-    EVENT_UNIVERSE_SCHEMA_VERSION,
-  );
-
-  // A route with its own allow-listed parameters must keep them and still shed
-  // the echo, rather than the proxy stripping everything indiscriminately.
-  const runs = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/runs&universePath=v1/runs&limit=20',
-    ),
-    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
-    (async (input) => {
-      assert.equal(String(input), 'https://universe.internal/v1/runs?limit=20');
-      return json({ runs: [], next_cursor: null });
-    }) as typeof fetch,
-  );
-  assert.equal(runs.status, 200);
 });
