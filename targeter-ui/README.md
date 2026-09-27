@@ -67,7 +67,18 @@ their drawer closes.
 - `/targets` — compatibility redirect to `/`
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
+- `/replay` — fixture-driven Replay jobs workspace
+- `/replay/jobs/:jobId` — Replay progress, events, request, and audit detail
+- `/replay/new` — desktop Replay request workflow
+- `/replay/admin` — admin-only allowlist design
+- `/replay/jobs/:jobId/output` — reserved Coming soon route
 - `/api/event-universe/...` — narrow same-origin Universe proxy
+
+Replay routes currently use local fixtures and mocked wallet/session states.
+They do not submit requests, mutate the allowlist, cancel jobs, or integrate
+SIWE. URL fixture controls expose design states for review: `?auth=entry`,
+`?auth=expired`, list `?view=loading|empty|error`, detail `?state=<job-status>`,
+and admin `?state=loading|error|forbidden`.
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.
