@@ -1049,7 +1049,12 @@ def _validate_receipt_row(receipt: JobReceipt, row, image_revision: str) -> None
 def adopt_published_for_row(store, row, image_revision: str) -> int | None:
     """Bridge only a valid receipt-publication/SQLite-finalization crash."""
     try:
-        raw = _read_remote(store, job_receipt_key(row.job_id), MAX_JOB_RECEIPT_BYTES)
+        raw = _read_remote(
+            store,
+            job_receipt_key(row.job_id),
+            MAX_JOB_RECEIPT_BYTES,
+            content_type=JSON_CONTENT_TYPE,
+        )
         if raw is None:
             return None
         receipt = parse_job_receipt(raw)
@@ -1079,12 +1084,16 @@ def _expectation(metadata):
     )
 
 
-def _read_remote(store, key, maximum):
+def _read_remote(store, key, maximum, *, content_type=None):
     metadata = store.head(key)
     if metadata is None:
         return None
     if metadata.byte_length > maximum:
         raise StageFailure("archive_conflict", f"remote {key} exceeds limit")
+    if content_type is not None and (
+        metadata.content_type != content_type or metadata.content_encoding is not None
+    ):
+        raise StageFailure("archive_conflict", f"remote {key} has invalid provider metadata")
     chunks = []
     with store.open_verified(_expectation(metadata)) as source:
         while chunk := source.read(1024 * 1024):
@@ -1163,7 +1172,9 @@ def _verify_remote_objects(store, receipt: JobReceipt) -> None:
 def adopt_remote_receipt(store, expected: JobReceipt, expected_raw: bytes) -> bool:
     key = job_receipt_key(expected.job_id)
     try:
-        remote = _read_remote(store, key, MAX_JOB_RECEIPT_BYTES)
+        remote = _read_remote(
+            store, key, MAX_JOB_RECEIPT_BYTES, content_type=JSON_CONTENT_TYPE
+        )
         if remote is None:
             return False
         receipt = parse_job_receipt(remote)
