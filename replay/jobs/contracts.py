@@ -464,11 +464,11 @@ def retry_later(row, code, detail, orchestration, now_ns):
     _require(code in RETRYABLE_CODES, f"{code!r} is not retryable")
     backoff = orchestration.retry_backoff_seconds * 1_000_000_000
     if row.status == ARCHIVING:
-        # The archiving row keeps its pending outcome's code; the retry cause is detail.
+        # Pending outcome evidence is frozen before archival. Archive diagnostics
+        # belong to the runner's durable reconciliation state, not this row.
         return replace(
             row,
             next_attempt_at_ns=now_ns + backoff,
-            reason_detail=reason_detail(f"{code}: {detail or ''}"),
             updated_at_ns=now_ns,
         )
     return replace(
@@ -552,16 +552,22 @@ def resume_blocked(row, now_ns):
     )
 
 
-def finish(row, now_ns):
-    """The job receipt is durably archived; the pending outcome becomes final."""
+def finish(row, finished_at_ns, now_ns):
+    """Finalize using the receipt's frozen finish time at reconciliation time."""
     _require(row.status == ARCHIVING, "only archiving jobs finish")
+    _ns(finished_at_ns, "finished_at_ns")
+    _ns(now_ns, "now_ns")
+    _require(
+        row.created_at_ns <= finished_at_ns <= now_ns,
+        "finished_at_ns must be between job creation and reconciliation time",
+    )
     return replace(
         row,
         status=row.pending_outcome,
         pending_outcome=None,
         stage_attempts=0,
         next_attempt_at_ns=None,
-        finished_at_ns=now_ns,
+        finished_at_ns=finished_at_ns,
         archive_receipt_key=job_receipt_key(row.job_id),
         updated_at_ns=now_ns,
     )

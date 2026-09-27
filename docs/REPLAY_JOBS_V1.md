@@ -1,8 +1,8 @@
 # Replay jobs V1
 
-Status: **in progress**. The shared contracts and durable control plane (§§3–5)
-are implemented. Canonical restore and the immutable bundle cache (§6) are the
-current stage. Runner, deployment, and UI work (§§7–9) are not implemented.
+Status: **in progress**. The shared contracts, durable control plane, canonical
+restore, immutable bundle cache, and durable runner (§§3–7) are implemented.
+Deployment and UI work (§§8–9) are not implemented.
 
 Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md),
@@ -354,7 +354,9 @@ queued work from starting.
 - `advance(row, stage, now)` commits the current stage and starts the next;
   `stage_attempts` resets to 1 (the running attempt) and a retry reason clears.
 - `retry_later(row, code, detail, orchestration, now)` accepts only retryable
-  codes and schedules backoff.
+  codes and schedules backoff. While archiving it preserves the pending
+  outcome's `reason_code` and `reason_detail` exactly; archive diagnostics live
+  only in the runner's durable local reconciliation state.
 - `succeed` (after `read`), `fail(code)`, and `cancel` (queued only) enter
   `archiving` with the mapped pending outcome.
 - `lose_local_state(row, detail, now)` applies when a running or archiving job's
@@ -363,8 +365,11 @@ queued work from starting.
   whatever objects exist. It **never recreates** a missing supervisor directory
   under the same job ID, because that would reset the supervisor's persisted
   retry budgets.
-- `block_archive`, `resume_blocked` (manual operator action), and `finish`
-  (after the job receipt is durable).
+- `block_archive`, `resume_blocked` (manual operator action), and
+  `finish(row, finished_at_ns, now_ns)` (after the job receipt is durable).
+  `finished_at_ns` is frozen with the receipt before publication and remains
+  byte-identical across a publication-to-SQLite crash; `now_ns` is the later
+  reconciliation time used for the row update and event.
 
 ### 3.9 Bundle history resolution
 
@@ -736,6 +741,12 @@ import test proving `canonical_restore` never imports `replay` or `targeter`.
 
 **Delivers** `python -m replay.jobs tick`, the container entry point.
 
+Implemented by `replay/jobs/runner.py` and `replay/jobs/stages.py`. Runtime
+requires `REPLAY_DATA_ROOT`, `REPLAY_MATERIALIZER`, `REPLAY_PUBLISHER`,
+`REPLAY_IMAGE_REVISION`, and `REDIS_URL`; secret values are neither persisted
+nor included in diagnostics. `python -m replay.jobs tick [RUNNER_CONFIG]` runs
+one nonblocking tick.
+
 ```
 flock(REPLAY_DATA_ROOT/runner.lock, EX|NB)      busy → exit 0
 row ← claim_next(orchestration, now)            none → exit 0
@@ -759,6 +770,22 @@ marker last.
 | run | `run/SUCCESS.json` | Supervisor config: in-image `publisher` and `python`; transport with `run_id = job_id`, config `scope`, the producer's `normalizer`, pinned inputs, snapshot plans, `groups: [name]`, and the preset's byte caps and timeout; the registry factory, `revision = $REPLAY_IMAGE_REVISION`, config merged with the runner-owned snapshot keys; the preset's limits. `validate(...)`, then `python -m replay.supervisor`, with `REDIS_URL` in the environment only. Exit 20 → `supervisor_failed`, 21 → `supervisor_exhausted`. |
 | read | `result.json` | The registry reader (e.g. `read_completed`), then `job_result_bytes`. A reader failure → `result_invalid`. Then `succeed`. |
 | archive | `job_receipt.json` in the store | `put_immutable` of `request.json`, `resolved.json`, `bundle.json`, `context/`, `run/`, and `result.json` — whichever exist — then `job_receipt_bytes` last, listing exactly the uploaded objects. Then `finish`. Runs for every outcome, including `cancelled` (request only) and early failures. |
+
+The local runner also writes canonical `job_receipt.json` and
+`archive_state.json` before the first upload. The latter binds the job ID,
+frozen receipt hash/length/time, and an optional archive-only diagnostic. It is
+never archived. A retry may replace only that diagnostic while preserving the
+frozen identity and pending outcome evidence. A valid remote receipt and every
+object it lists may be adopted after a receipt-publication/SQLite-finalization
+crash; no other remote object bridges missing local state.
+
+Runner-owned limits are 128 history pages and 1 MiB per history response; 16
+levels, 4096 files, and 1 TiB aggregate archived job output; 1 MiB each of
+supervisor stdout and stderr; and a 24-hour hard subprocess ceiling in addition
+to the selected preset's shorter deadline. Existing request, resolved, bundle,
+preparation, result, receipt, occurrence, and bundle-build limits remain
+authoritative. Archive traversal rejects symlinks, multiple hard links,
+non-regular entries, escapes, and unexpected top-level names before upload.
 
 Failure handling uses only codes: retryable codes go to `retry_later`, others to
 `fail`; unexpected exceptions are `internal_failure`. During archiving,
