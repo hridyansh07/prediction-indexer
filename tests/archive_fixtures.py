@@ -79,6 +79,8 @@ def write_canonical_receipt(
     completeness: str = "complete",
     certified: bool = True,
     evidence_lines: int | None = None,
+    expected_lanes: Iterable[str] | None = None,
+    missing_lanes: Iterable[dict[str, Any]] = (),
 ) -> Path:
     """A committed canonical window in the shape `indexer-finalize` writes.
 
@@ -92,6 +94,8 @@ def write_canonical_receipt(
     inputs = list(inputs)
     window_end_ns = window_end_ns or window_start_ns + WINDOW_SECONDS * NANOSECONDS
     lines = sum(entry["line_count"] for entry in inputs) if evidence_lines is None else evidence_lines
+    expected_lanes = sorted({entry["lane"] for entry in inputs}) if expected_lanes is None else sorted(expected_lanes)
+    missing_lanes = list(missing_lanes)
     moment = datetime.fromtimestamp(window_start_ns / NANOSECONDS, tz=timezone.utc)
     directory = (
         Path(canonical_root)
@@ -131,10 +135,10 @@ def write_canonical_receipt(
         "window_end_ns": window_end_ns,
         "completeness": completeness,
         "certified": certified,
-        "expected_lanes": sorted({entry["lane"] for entry in inputs}),
+        "expected_lanes": expected_lanes,
         "present_lanes": sorted({entry["lane"] for entry in inputs}),
         "unexpected_lanes": [],
-        "missing_lanes": [],
+        "missing_lanes": missing_lanes,
         "invalid_lanes": [],
         "finalization_deadline_seconds": 300,
         "deadline_expired": False,
@@ -144,6 +148,11 @@ def write_canonical_receipt(
         "provenance": output(provenance_path, provenance_result),
         "first_canonical_seq": 1 if lines else None,
         "last_canonical_seq": lines if lines else None,
+        "carried": {
+            "ordering": {"connections": [], "epochs": []},
+            "lane_visible_ns": {},
+        },
+        "clock_faults": [],
         "finalizer_version": 1,
     }
     path = directory / "receipt.json"

@@ -8,14 +8,19 @@ use indexer_finalize::{
 use indexer_types::Sha256;
 use replay_domain::SEGMENT_SCHEMA_VERSION;
 use replay_materialize::{
-    DerivativeSpec, NormalizationPolicy, PinnedDerivative, ReadLimits, build_window, inspect_pinned,
+    DerivativeSpec, NormalizationPolicy, PinnedDerivative, ReadLimits, build_window,
+    inspect_pinned, verify_derivative,
 };
 use replay_normalizers::{CanonicalNormalizer, CanonicalNormalizerIdentity};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
 const MAX_WINDOWS: usize = 4096;
+const POLICY_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/materialize-range-policy/v1";
 
 fn enforce_window_limit(count: usize) -> Result<(), String> {
     if count > MAX_WINDOWS {
@@ -52,6 +57,78 @@ struct OutputPin {
     window_end_ns: u64,
     derivative_address: String,
     receipt_sha256: Sha256,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectRequest {
+    version: u16,
+    directory: PathBuf,
+    derivative_address: String,
+    receipt_sha256: String,
+}
+
+fn describe() -> Result<String, String> {
+    let normalizer = CanonicalNormalizer::default();
+    serde_json::to_string(&json!({
+        "materialization_policy_sha256": Sha256::digest(POLICY_DOMAIN),
+        "materializer_version": 2,
+        "normalized_schema_version": SEGMENT_SCHEMA_VERSION,
+        "normalizer": normalizer.identity(),
+        "producer_identity_version": 1,
+    }))
+    .map_err(|error| format!("serializing producer: {error}"))
+}
+
+fn inspect(input: &str) -> Result<String, String> {
+    if input.len() > 1_048_576 {
+        return Err("inspection request exceeds 1 MiB".into());
+    }
+    let request: InspectRequest = serde_json::from_str(input)
+        .map_err(|error| format!("invalid inspection request: {error}"))?;
+    if request.version != 1 {
+        return Err("unsupported inspection request version".into());
+    }
+    let receipt_sha256 = Sha256::from_hex(&request.receipt_sha256)
+        .map_err(|error| format!("invalid receipt_sha256: {error}"))?;
+    let expected = BTreeSet::from([
+        "events.ndjson.zst".to_owned(),
+        "rejects.ndjson.zst".to_owned(),
+        "sources.ndjson.zst".to_owned(),
+        "manifest.json".to_owned(),
+        "receipt.json".to_owned(),
+    ]);
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(&request.directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err("derivative directory contains a non-regular entry".into());
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "derivative filename is not UTF-8")?;
+        actual.insert(name);
+    }
+    if actual != expected {
+        return Err("derivative directory does not contain the exact file allowlist".into());
+    }
+    let verified = verify_derivative(&request.directory)?;
+    if verified.pin.derivative_address != request.derivative_address
+        || verified.pin.receipt_sha256 != receipt_sha256
+    {
+        return Err("verified derivative does not match requested pin".into());
+    }
+    serde_json::to_string(&json!({
+        "derivative_address": verified.pin.derivative_address,
+        "receipt_sha256": verified.pin.receipt_sha256,
+        "version": 1,
+    }))
+    .map_err(|error| format!("serializing inspection response: {error}"))
 }
 
 fn execute(input: &str) -> Result<String, String> {
@@ -91,9 +168,7 @@ fn execute(input: &str) -> Result<String, String> {
             normalizer_bundle_sha256: descriptor.bundle_sha256,
             normalizer_config_sha256: descriptor.config_sha256,
             policy: NormalizationPolicy {
-                policy_sha256: Sha256::digest(
-                    b"prediction-indexer/replay-normalizers/materialize-range-policy/v1",
-                ),
+                policy_sha256: Sha256::digest(POLICY_DOMAIN),
                 effective_from_ns: 0,
                 effective_until_ns: None,
             },
@@ -126,21 +201,40 @@ fn execute(input: &str) -> Result<String, String> {
             receipt_sha256: input.pin.receipt_sha256,
         });
     }
-    serde_json::to_string(&Response {
+    let response = Response {
         version: 1,
         normalizer: identity,
         derivatives: pins,
-    })
-    .map_err(|error| format!("serializing response: {error}"))
+    };
+    let value =
+        serde_json::to_value(response).map_err(|error| format!("serializing response: {error}"))?;
+    serde_json::to_string(&value).map_err(|error| format!("serializing response: {error}"))
 }
 
 fn main() {
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("--describe") {
+        match describe() {
+            Ok(output) => {
+                println!("{output}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("materialize_range: {}", error.replace(['\n', '\r'], " "));
+                std::process::exit(1);
+            }
+        }
+    }
     let mut input = String::new();
-    let result = io::stdin()
+    let read = io::stdin()
         .take(1_048_577)
         .read_to_string(&mut input)
-        .map_err(|error| format!("reading stdin: {error}"))
-        .and_then(|_| execute(&input));
+        .map_err(|error| format!("reading stdin: {error}"));
+    let result = read.and_then(|_| match mode.as_deref() {
+        None => execute(&input),
+        Some("--inspect-pin") => inspect(&input),
+        Some(_) => Err("unknown argument".into()),
+    });
     match result {
         Ok(output) => println!("{output}"),
         Err(error) => {
@@ -283,6 +377,24 @@ mod tests {
     }
 
     #[test]
+    fn describe_is_exact_canonical_producer_json() {
+        let output = describe().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(serde_json::to_string(&value).unwrap(), output);
+        assert_eq!(value["producer_identity_version"], 1);
+        assert_eq!(value["normalized_schema_version"], SEGMENT_SCHEMA_VERSION);
+        assert_eq!(value["materializer_version"], 2);
+        assert_eq!(
+            value["materialization_policy_sha256"],
+            Sha256::digest(POLICY_DOMAIN).as_hex()
+        );
+        assert_eq!(
+            value["normalizer"],
+            json!(CanonicalNormalizer::default().identity())
+        );
+    }
+
+    #[test]
     fn minimal_adjacent_selection_is_verified_ordered_noop_and_source_read_only() {
         let canonical = TempDir::new("helper-canonical").unwrap();
         let output = TempDir::new("helper-output").unwrap();
@@ -309,6 +421,39 @@ mod tests {
             "request exceeds 1 MiB"
         );
         assert_eq!(snapshot(canonical.path()), before);
+
+        let pin = &response.derivatives[0];
+        let inspection = json!({
+            "version": 1,
+            "directory": output.path().join(format!("window={}", pin.window_start_ns)).join(&pin.derivative_address),
+            "derivative_address": pin.derivative_address,
+            "receipt_sha256": pin.receipt_sha256,
+        })
+        .to_string();
+        let inspected: serde_json::Value =
+            serde_json::from_str(&inspect(&inspection).unwrap()).unwrap();
+        assert_eq!(inspected["derivative_address"], pin.derivative_address);
+        assert_eq!(inspected["receipt_sha256"], pin.receipt_sha256.as_hex());
+        assert!(inspect(&inspection.replace(&pin.derivative_address, &"f".repeat(64))).is_err());
+
+        let directory = output
+            .path()
+            .join(format!("window={}", pin.window_start_ns))
+            .join(&pin.derivative_address);
+        let events_path = directory.join("events.ndjson.zst");
+        let events = fs::read(&events_path).unwrap();
+        fs::write(&events_path, [events.as_slice(), b"trailing"].concat()).unwrap();
+        assert!(inspect(&inspection).is_err());
+        fs::write(&events_path, events).unwrap();
+
+        let receipt_path = directory.join("receipt.json");
+        let receipt = fs::read(&receipt_path).unwrap();
+        let noncanonical = [b" ".as_slice(), receipt.as_slice()].concat();
+        fs::write(&receipt_path, &noncanonical).unwrap();
+        let changed_hash = Sha256::digest(&noncanonical).as_hex();
+        let changed_request = inspection.replace(&pin.receipt_sha256.as_hex(), &changed_hash);
+        assert!(inspect(&changed_request).is_err());
+        fs::write(&receipt_path, receipt).unwrap();
     }
 
     #[test]

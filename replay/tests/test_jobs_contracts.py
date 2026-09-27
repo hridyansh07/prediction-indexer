@@ -520,6 +520,12 @@ class BundleReceiptTest(unittest.TestCase):
         self.assertEqual(c.bundle_receipt_bytes(bundle_receipt()), c.bundle_receipt_bytes(bundle_receipt()))
         self.assertNotIn(b"built_by_job", c.bundle_receipt_bytes(bundle_receipt()))
 
+    def test_bundle_has_one_deterministic_receipt_key(self):
+        self.assertEqual(
+            c.bundle_receipt_key("bundle_x"),
+            "replay/bundles/bundle_x/bundle_receipt.json",
+        )
+
     def test_direct_construction_of_invalid_receipt_fails(self):
         """Review item 7."""
         good = windows()
