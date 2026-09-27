@@ -207,45 +207,25 @@ class ReplayPreflightTests(unittest.TestCase):
                 check_capacity(stat, **arguments)
 
     def test_http_preflight_checks_private_and_public_health_without_nonce_probe(self) -> None:
-        origin = "https://ui.example"
-        granted = (204, origin)
         with mock.patch.object(
             preflight, "_request", side_effect=[200, 200]
         ) as request, mock.patch.object(
-            preflight, "_cors_preflight", return_value=granted
+            preflight, "_cors_preflight", return_value=(204, "*")
         ) as cors:
-            preflight._http_checks("http://event-universe:8080", "replay.example", origin)
+            preflight._http_checks("http://event-universe:8080", "replay.example")
         self.assertEqual(request.call_count, 2)
-        cors.assert_called_once_with("https://replay.example/v1/replay/jobs", origin)
+        cors.assert_called_once_with(
+            "https://replay.example/v1/replay/jobs", preflight.CORS_PROBE_ORIGIN
+        )
         with mock.patch.object(preflight, "_request", side_effect=[200, 503]):
             with self.assertRaises(PreflightError):
-                preflight._http_checks("http://event-universe:8080", "replay.example", origin)
-        for response in ((204, None), (204, "https://evil.example"), (501, None)):
+                preflight._http_checks("http://event-universe:8080", "replay.example")
+        for response in ((204, None), (204, "https://ui.example"), (501, None)):
             with self.subTest(response), mock.patch.object(
                 preflight, "_request", side_effect=[200, 200]
             ), mock.patch.object(preflight, "_cors_preflight", return_value=response):
                 with self.assertRaisesRegex(PreflightError, "CORS preflight"):
-                    preflight._http_checks(
-                        "http://event-universe:8080", "replay.example", origin
-                    )
-
-    def test_cors_origin_is_one_https_origin_matching_siwe(self) -> None:
-        preflight.check_cors_origin(
-            "https://ui.example.app", "ui.example.app", "https://ui.example.app/login"
-        )
-        for origin, domain, uri in (
-            ("http://ui.example.app", "ui.example.app", "http://ui.example.app/login"),
-            ("https://ui.example.app/", "ui.example.app", "https://ui.example.app/login"),
-            ("https://ui.example.app:8443", "ui.example.app:8443", "https://ui.example.app:8443/login"),
-            ("https://*.vercel.app", "*.vercel.app", "https://*.vercel.app/login"),
-            ("*", "ui.example.app", "https://ui.example.app/login"),
-            ("https://ui.example.app", "api.example.app", "https://ui.example.app/login"),
-            ("https://ui.example.app", "ui.example.app", "https://ui.example.app.evil/login"),
-            ("https://ui.example.app", "ui.example.app", "https://other.example/login"),
-        ):
-            with self.subTest(origin=origin, domain=domain, uri=uri):
-                with self.assertRaises(PreflightError):
-                    preflight.check_cors_origin(origin, domain, uri)
+                    preflight._http_checks("http://event-universe:8080", "replay.example")
 
     def test_publisher_contract_probe_executes_expected_binary_protocol(self) -> None:
         result = SimpleNamespace(

@@ -318,24 +318,20 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         auth = self.caddy.split("@auth path", 1)[1].split("@api path", 1)[0]
         self.assertNotIn("encode", auth)
 
-    def test_caddy_grants_cors_to_exactly_the_configured_ui_origin(self) -> None:
-        self.assertIn("@cors_origin header Origin {$REPLAY_CORS_ORIGIN}", self.caddy)
-        self.assertIn('Access-Control-Allow-Origin "{$REPLAY_CORS_ORIGIN}"', self.caddy)
+    def test_caddy_grants_cors_to_any_origin_without_credentials(self) -> None:
+        self.assertIn('Access-Control-Allow-Origin "*"', self.caddy)
         self.assertIn('Access-Control-Expose-Headers "Retry-After"', self.caddy)
+        # "*" in Allow-Headers never covers Authorization, so it is listed.
         self.assertIn(
             'Access-Control-Allow-Headers "Authorization, Content-Type, Idempotency-Key"',
             self.caddy,
         )
-        self.assertIn("header Vary Origin", self.caddy)
         self.assertNotIn("Access-Control-Allow-Credentials", self.caddy)
-        self.assertNotIn('Access-Control-Allow-Origin "*"', self.caddy)
         # Preflights are answered by Caddy before any proxy handler.
-        preflight = self.caddy.index("handle @cors_preflight")
-        self.assertLess(preflight, self.caddy.index("handle @auth"))
-        self.assertLess(self.caddy.index("handle @options"), self.caddy.index("handle @auth"))
-        caddy = self.compose.split("\n  caddy:\n", 1)[1]
-        self.assertIn("REPLAY_CORS_ORIGIN:", caddy)
-        self.assertIn('REPLAY_CORS_ORIGIN: "${REPLAY_CORS_ORIGIN:-}"', self.compose)
+        self.assertIn("@cors_preflight method OPTIONS", self.caddy)
+        self.assertLess(
+            self.caddy.index("handle @cors_preflight"), self.caddy.index("handle @auth")
+        )
         self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
 
     def test_non_replay_compose_renders_with_example_environment(self) -> None:

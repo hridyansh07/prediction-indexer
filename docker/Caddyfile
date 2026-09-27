@@ -33,31 +33,22 @@
 		Referrer-Policy "no-referrer"
 	}
 
-	# The UI is served cross-origin from exactly one browser origin. Bearer tokens
-	# travel in Authorization, never cookies, so credentials mode stays off. Caddy
+	# Any browser origin may call the API: the production UI, local and preview
+	# builds, and agent-driven browsers. Bearer tokens travel in Authorization,
+	# never cookies, so there is no ambient credential for another origin to use;
+	# SIWE, the allowlist, and Universe's rate limiter are the controls. Caddy
 	# answers preflights itself; they never reach Universe or its rate limiter.
-	header Vary Origin
-	@cors_origin header Origin {$REPLAY_CORS_ORIGIN}
-	header @cors_origin {
-		Access-Control-Allow-Origin "{$REPLAY_CORS_ORIGIN}"
+	header {
+		Access-Control-Allow-Origin "*"
 		Access-Control-Expose-Headers "Retry-After"
 	}
-	@cors_preflight {
-		method OPTIONS
-		path /v1/*
-		header Origin {$REPLAY_CORS_ORIGIN}
-	}
+	@cors_preflight method OPTIONS
 	handle @cors_preflight {
 		header {
 			Access-Control-Allow-Methods "GET, POST, DELETE"
 			Access-Control-Allow-Headers "Authorization, Content-Type, Idempotency-Key"
 			Access-Control-Max-Age "600"
 		}
-		respond 204
-	}
-	# Any other preflight gets no CORS grant, so the browser refuses the call.
-	@options method OPTIONS
-	handle @options {
 		respond 204
 	}
 

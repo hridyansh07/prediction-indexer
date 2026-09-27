@@ -28,7 +28,6 @@ _REVISION = re.compile(r"[A-Za-z0-9._:+-]{1,128}\Z")
 _PUBLIC_HOST = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
 )
-_CORS_ORIGIN = re.compile(r"https://(?P<host>[^/:?#]+)\Z")
 
 
 class PreflightError(RuntimeError):
@@ -256,23 +255,18 @@ def _cors_preflight(url: str, origin: str, timeout: int = 10) -> tuple[int, str 
         raise PreflightError("HTTP/TLS connectivity check failed") from error
 
 
-def check_cors_origin(origin: str, siwe_domain: str, siwe_uri: str) -> None:
-    """The one browser origin Caddy grants must be the origin users sign in on."""
-    match = _CORS_ORIGIN.fullmatch(origin)
-    if match is None or _PUBLIC_HOST.fullmatch(match["host"]) is None:
-        raise PreflightError("REPLAY_CORS_ORIGIN must be one https://hostname origin")
-    if siwe_domain != match["host"] or not siwe_uri.startswith(origin + "/"):
-        raise PreflightError("REPLAY_CORS_ORIGIN disagrees with the configured SIWE domain and URI")
+#: Any browser origin may call the API; the probe uses an arbitrary one.
+CORS_PROBE_ORIGIN = "https://cors-probe.invalid"
 
 
-def _http_checks(internal_url: str, public_host: str, cors_origin: str) -> None:
+def _http_checks(internal_url: str, public_host: str) -> None:
     if _request(internal_url.rstrip("/") + "/healthz") != 200:
         raise PreflightError("private Event Universe health check failed")
     public = f"https://{public_host}"
     if _request(public + "/healthz") != 200:
         raise PreflightError("public Caddy TLS/proxy health check failed")
-    if _cors_preflight(public + "/v1/replay/jobs", cors_origin) != (204, cors_origin):
-        raise PreflightError("public Caddy CORS preflight does not grant REPLAY_CORS_ORIGIN")
+    if _cors_preflight(public + "/v1/replay/jobs", CORS_PROBE_ORIGIN) != (204, "*"):
+        raise PreflightError("public Caddy CORS preflight does not grant every origin")
 
 
 def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
@@ -288,7 +282,6 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "REPLAY_VOLUME_ID",
         "REDIS_URL",
         "REPLAY_PUBLIC_HOST",
-        "REPLAY_CORS_ORIGIN",
         "REPLAY_INTERNAL_URL",
         "REPLAY_ARCHIVE_PROBE_KEY",
     )
@@ -325,11 +318,6 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
     policy = _descriptor(materializer)
     _publisher_contract(publisher)
     universe_config = load_config(Path(environment.get("EVENT_UNIVERSE_CONFIG", "/etc/prediction-indexer/event_universe.json")))
-    check_cors_origin(
-        required["REPLAY_CORS_ORIGIN"],
-        universe_config.replay.auth.siwe_domain,
-        universe_config.replay.auth.siwe_uri,
-    )
     _database(universe_config, root)
     try:
         store = build_store((root,), environ=environment)
@@ -349,11 +337,7 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         raise PreflightError("archive receipt/IAM probe is absent or unverifiable")
     redis_maxmemory = _positive_environment(environment, "REPLAY_REDIS_MAXMEMORY_BYTES")
     redis_report = _redis(required["REDIS_URL"], redis_maxmemory)
-    _http_checks(
-        required["REPLAY_INTERNAL_URL"],
-        required["REPLAY_PUBLIC_HOST"],
-        required["REPLAY_CORS_ORIGIN"],
-    )
+    _http_checks(required["REPLAY_INTERNAL_URL"], required["REPLAY_PUBLIC_HOST"])
     return {
         "status": "ready",
         "image_revision": required["REPLAY_IMAGE_REVISION"],
@@ -366,5 +350,5 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "archive_store_id": store.store_id,
         "redis": redis_report,
         "rate_limit_enforcement": "event_universe_process",
-        "cors_origin": required["REPLAY_CORS_ORIGIN"],
+        "cors": "any_origin_without_credentials",
     }

@@ -886,9 +886,10 @@ byte-identical semantic files.
   times, security headers, secret-safe JSON access logs, and `/v1/*` plus
   `/healthz` to private `event-universe:8080`. Authentication responses are not
   compressed. There is no UI in this implementation; the separately deployed
-  UI calls cross-origin, and Caddy grants CORS (and answers `/v1/*` `OPTIONS`
-  preflights itself) for exactly one origin, `REPLAY_CORS_ORIGIN`, without
-  credentials mode and exposing `Retry-After`. Stock Caddy does not
+  UI calls cross-origin, and Caddy grants CORS to every origin (and answers
+  `OPTIONS` preflights itself) without credentials mode, exposing
+  `Retry-After`. Bearer tokens are never ambient, so SIWE, the allowlist, and
+  the rate limiter are the controls. Stock Caddy does not
   enforce request rate limits; the singleton Universe in-process limiter from
   §4 does, based on Caddy's statically assigned trusted peer address.
 - `replay-redis`: `redis:8.2` with `--maxmemory <finite>
@@ -935,10 +936,8 @@ declared enforced quota; schema/migration/integrity failure; Redis older than
 8.2, unbounded memory, policy other than `noeviction`, persistence, or prior
 evictions; non-independent archive configuration (including a local same-device
 claim); inability to read a configured known archive receipt using normal
-runner authority; a `REPLAY_CORS_ORIGIN` that is not one `https://hostname`
-origin equal to the origin of `siwe_uri` with host `siwe_domain`; private
-Universe health failure; public TLS/proxy failure; or a public CORS preflight
-that does not return `204` granting exactly `REPLAY_CORS_ORIGIN`.
+runner authority; private Universe health failure; public TLS/proxy failure;
+or a public CORS preflight that does not return `204` granting `*`.
 It prints only identities and bounded status, never URLs with credentials or
 environment values. Limiter behavior is a release/config contract tested at the
 Universe boundary, not a preflight 429 probe that consumes public auth budget.
@@ -996,8 +995,12 @@ sign-in and job views.
   Express proxy. The client calls `https://$REPLAY_PUBLIC_HOST/v1/...` directly
   from the browser, configured by one build-time API base URL; the proxy's
   response-schema checks move into the client's existing validators. Caddy
-  grants CORS only to `REPLAY_CORS_ORIGIN`, the production UI origin; preview
-  deployments cannot sign in against production.
+  grants CORS to every origin, so local, preview, and agent-driven builds reach
+  the production API.
+- The SIWE domain and URI come from build configuration (the production UI's
+  `siwe_domain`/`siwe_uri`), never `window.location`, so any build signs a
+  message production accepts. Agents sign in through an injected EIP-1193 test
+  provider holding their own allowlisted member key.
 - Wallet sign-in: EIP-1193 plus a SIWE message built from `GET /v1/auth/nonce`.
   The token is held in memory only.
 - Replay pages: a job list and a job detail showing status, stage, pending
@@ -1033,5 +1036,6 @@ mocked provider; lint, typecheck, and build.
   carries one configured statement.
 - The Vercel proxy is removed. The UI stays on Vercel and calls the API
   cross-origin. Caddy on the Universe host provides TLS, limits, and a CORS
-  grant to exactly one UI origin, which is also the SIWE domain. The 1.75 MB response budget is Universe's own
+  grant to every origin without credentials; SIWE binds sign-in to the
+  configured UI domain by message content. The 1.75 MB response budget is Universe's own
   constant and can be revisited separately.

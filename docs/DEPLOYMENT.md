@@ -969,23 +969,32 @@ its exact address. Caddy's `/data` volume persists ACME state; auth responses
 are not compressed, and there is no static UI in this rollout.
 
 The UI is deployed separately (Vercel) and calls the API cross-origin from the
-browser. Caddy grants CORS to exactly one origin, `REPLAY_CORS_ORIGIN` (for
-example `https://<project>.vercel.app`): matching requests get
-`Access-Control-Allow-Origin` and `Access-Control-Expose-Headers: Retry-After`,
-and Caddy answers matching `OPTIONS` preflights for `/v1/*` itself with `204`,
-so preflights never reach Universe or its rate limiter. Any other origin,
-including Vercel preview deployments, gets no grant and the browser refuses the
-call. Bearer tokens travel in `Authorization`, never cookies, so credentials
-mode stays off. `REPLAY_CORS_ORIGIN` must equal the origin of `siwe_uri` and its
-host must equal `siwe_domain`; preflight enforces both and sends a live CORS
-preflight through Caddy.
+browser. Caddy grants CORS to every origin (`Access-Control-Allow-Origin: *`,
+`Access-Control-Expose-Headers: Retry-After`, no credentials mode) and answers
+every `OPTIONS` preflight itself with `204`, so preflights never reach Universe
+or its rate limiter. The production UI, local and preview builds, and
+agent-driven browsers therefore all reach the API. This is deliberate: bearer
+tokens travel in `Authorization`, never cookies, so there is no ambient
+credential another origin could use, and public reads are public anyway. SIWE,
+the allowlist, and the rate limiter are the controls. Preflight sends a live
+CORS preflight through Caddy and requires the `*` grant.
+
+SIWE is bound by message content, not request origin: the server accepts a
+message only if it names the configured `siwe_domain` and `siwe_uri`. Build the
+UI with those values from configuration rather than `window.location`, so a
+local, preview, or agent-driven build signs messages production accepts. A
+human's wallet additionally warns when the page origin differs from the
+message domain; an agent's injected test wallet does not. Give each agent its
+own allowlisted member wallet (never the admin) so it can be revoked alone, and
+keep its key in that environment's secrets. Agent sessions see and act on
+production data; they should not submit jobs unless that is the intent.
 
 `REPLAY_PUBLIC_HOST` needs only a DNS name that resolves to the Universe host so
 Caddy can obtain a public certificate. Without an owned domain, a free name such
 as `<name>.duckdns.org` or `<a-b-c-d>.sslip.io` works; reserve a static public
 IP first, since the name only follows the address. Moving to an owned domain
-later changes `REPLAY_PUBLIC_HOST`, `REPLAY_CORS_ORIGIN`, `siwe_domain`, and
-`siwe_uri` only; users sign in again because the SIWE domain changes.
+later changes `REPLAY_PUBLIC_HOST` (and the UI's API base URL) only. Moving the
+UI changes `siwe_domain` and `siwe_uri`; users then sign in again.
 
 The old unauthenticated Vercel proxy is not a supported production ingress
 after this cutover: its users share a small egress-IP pool and therefore share
