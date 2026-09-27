@@ -317,6 +317,21 @@ class ReplayProductionDeploymentTests(unittest.TestCase):
         self.assertIn("max_header_size 32KiB", self.caddy)
         auth = self.caddy.split("@auth path", 1)[1].split("@api path", 1)[0]
         self.assertNotIn("encode", auth)
+
+    def test_caddy_grants_cors_to_any_origin_without_credentials(self) -> None:
+        self.assertIn('Access-Control-Allow-Origin "*"', self.caddy)
+        self.assertIn('Access-Control-Expose-Headers "Retry-After"', self.caddy)
+        # "*" in Allow-Headers never covers Authorization, so it is listed.
+        self.assertIn(
+            'Access-Control-Allow-Headers "Authorization, Content-Type, Idempotency-Key"',
+            self.caddy,
+        )
+        self.assertNotIn("Access-Control-Allow-Credentials", self.caddy)
+        # Preflights are answered by Caddy before any proxy handler.
+        self.assertIn("@cors_preflight method OPTIONS", self.caddy)
+        self.assertLess(
+            self.caddy.index("handle @cors_preflight"), self.caddy.index("handle @auth")
+        )
         self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
 
     def test_non_replay_compose_renders_with_example_environment(self) -> None:

@@ -33,6 +33,25 @@
 		Referrer-Policy "no-referrer"
 	}
 
+	# Any browser origin may call the API: the production UI, local and preview
+	# builds, and agent-driven browsers. Bearer tokens travel in Authorization,
+	# never cookies, so there is no ambient credential for another origin to use;
+	# SIWE, the allowlist, and Universe's rate limiter are the controls. Caddy
+	# answers preflights itself; they never reach Universe or its rate limiter.
+	header {
+		Access-Control-Allow-Origin "*"
+		Access-Control-Expose-Headers "Retry-After"
+	}
+	@cors_preflight method OPTIONS
+	handle @cors_preflight {
+		header {
+			Access-Control-Allow-Methods "GET, POST, DELETE"
+			Access-Control-Allow-Headers "Authorization, Content-Type, Idempotency-Key"
+			Access-Control-Max-Age "600"
+		}
+		respond 204
+	}
+
 	# Authentication responses carry nonces or tokens and are never compressed.
 	@auth path /v1/auth/*
 	handle @auth {
@@ -45,7 +64,7 @@
 		import universe_proxy
 	}
 
-	# Reserved for an eventual same-origin static UI. No UI is shipped here.
+	# No UI is served here; it is deployed separately and calls /v1 cross-origin.
 	handle {
 		respond "not found" 404
 	}

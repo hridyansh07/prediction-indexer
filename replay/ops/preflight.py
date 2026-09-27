@@ -233,12 +233,40 @@ def _request(url: str, timeout: int = 10) -> int:
         raise PreflightError("HTTP/TLS connectivity check failed") from error
 
 
+def _cors_preflight(url: str, origin: str, timeout: int = 10) -> tuple[int, str | None]:
+    request = urllib.request.Request(
+        url,
+        method="OPTIONS",
+        headers={
+            "User-Agent": "prediction-indexer-replay-preflight/1",
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,idempotency-key",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read(1024 * 1024 + 1)
+            return response.status, response.headers.get("Access-Control-Allow-Origin")
+    except urllib.error.HTTPError as error:
+        error.read(1024 * 1024 + 1)
+        return error.code, error.headers.get("Access-Control-Allow-Origin")
+    except (OSError, urllib.error.URLError) as error:
+        raise PreflightError("HTTP/TLS connectivity check failed") from error
+
+
+#: Any browser origin may call the API; the probe uses an arbitrary one.
+CORS_PROBE_ORIGIN = "https://cors-probe.invalid"
+
+
 def _http_checks(internal_url: str, public_host: str) -> None:
     if _request(internal_url.rstrip("/") + "/healthz") != 200:
         raise PreflightError("private Event Universe health check failed")
     public = f"https://{public_host}"
     if _request(public + "/healthz") != 200:
         raise PreflightError("public Caddy TLS/proxy health check failed")
+    if _cors_preflight(public + "/v1/replay/jobs", CORS_PROBE_ORIGIN) != (204, "*"):
+        raise PreflightError("public Caddy CORS preflight does not grant every origin")
 
 
 def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
@@ -322,4 +350,5 @@ def run_preflight(config_path: Path, environ=None) -> dict[str, object]:
         "archive_store_id": store.store_id,
         "redis": redis_report,
         "rate_limit_enforcement": "event_universe_process",
+        "cors": "any_origin_without_credentials",
     }
