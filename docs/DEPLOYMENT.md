@@ -743,7 +743,9 @@ the additive authentication schema in `jobs.sqlite3`; rebuilding
 version-2 config and Universe image together because older configs are rejected
 actionably. Before exposing the authentication routes, replace the shipped zero
 admin placeholder with the operator wallet's EIP-55 address and set
-`siwe_domain`/`siwe_uri` to the exact public origin users sign. While the zero
+`siwe_domain`/`siwe_uri` to the exact UI origin users sign on (for a Vercel UI,
+`siwe_domain` is `<project>.vercel.app` and `siwe_uri` starts with
+`https://<project>.vercel.app/`), not the API host. While the zero
 placeholder remains, the sign-in routes return `503` and every other route is
 unaffected. `siwe_statement` is the exact statement line every sign-in message
 must carry; the UI must use the same text.
@@ -966,11 +968,30 @@ are exempt. Keep the `replay-edge` subnet and Caddy address aligned with
 its exact address. Caddy's `/data` volume persists ACME state; auth responses
 are not compressed, and there is no static UI in this rollout.
 
-The existing unauthenticated Vercel proxy is not a supported production ingress
+The UI is deployed separately (Vercel) and calls the API cross-origin from the
+browser. Caddy grants CORS to exactly one origin, `REPLAY_CORS_ORIGIN` (for
+example `https://<project>.vercel.app`): matching requests get
+`Access-Control-Allow-Origin` and `Access-Control-Expose-Headers: Retry-After`,
+and Caddy answers matching `OPTIONS` preflights for `/v1/*` itself with `204`,
+so preflights never reach Universe or its rate limiter. Any other origin,
+including Vercel preview deployments, gets no grant and the browser refuses the
+call. Bearer tokens travel in `Authorization`, never cookies, so credentials
+mode stays off. `REPLAY_CORS_ORIGIN` must equal the origin of `siwe_uri` and its
+host must equal `siwe_domain`; preflight enforces both and sends a live CORS
+preflight through Caddy.
+
+`REPLAY_PUBLIC_HOST` needs only a DNS name that resolves to the Universe host so
+Caddy can obtain a public certificate. Without an owned domain, a free name such
+as `<name>.duckdns.org` or `<a-b-c-d>.sslip.io` works; reserve a static public
+IP first, since the name only follows the address. Moving to an owned domain
+later changes `REPLAY_PUBLIC_HOST`, `REPLAY_CORS_ORIGIN`, `siwe_domain`, and
+`siwe_uri` only; users sign in again because the SIWE domain changes.
+
+The old unauthenticated Vercel proxy is not a supported production ingress
 after this cutover: its users share a small egress-IP pool and therefore share
-the unauthenticated bucket. Retire that proxy or move its UI to authenticated
-session traffic before enabling public ingress. The localhost-only Universe
-port remains available for SSH tunnels and existing host operations.
+the unauthenticated bucket. Retire that proxy before enabling public ingress.
+The localhost-only Universe port remains available for SSH tunnels and existing
+host operations.
 
 Start private services and Caddy, but leave the scheduler disabled:
 

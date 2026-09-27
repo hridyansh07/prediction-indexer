@@ -78,6 +78,7 @@ x-replay-environment: &replay-environment
   REPLAY_VOLUME_ID: "${REPLAY_VOLUME_ID:-}"
   REDIS_URL: redis://replay-redis:6379/0
   REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:-}"
+  REPLAY_CORS_ORIGIN: "${REPLAY_CORS_ORIGIN:-}"
   REPLAY_INTERNAL_URL: http://event-universe:8080
   REPLAY_REQUIRED_CAPACITY_BYTES: "${REPLAY_REQUIRED_CAPACITY_BYTES:-}"
   REPLAY_REQUIRED_INODES: "${REPLAY_REQUIRED_INODES:-1000000}"
@@ -280,6 +281,7 @@ services:
       - /tmp:size=16m,mode=1777
     environment:
       REPLAY_PUBLIC_HOST: "${REPLAY_PUBLIC_HOST:-replay.invalid}"
+      REPLAY_CORS_ORIGIN: "${REPLAY_CORS_ORIGIN:-https://cors-origin.invalid}"
     volumes:
       - type: bind
         source: ./docker/Caddyfile

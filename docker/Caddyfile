@@ -33,6 +33,34 @@
 		Referrer-Policy "no-referrer"
 	}
 
+	# The UI is served cross-origin from exactly one browser origin. Bearer tokens
+	# travel in Authorization, never cookies, so credentials mode stays off. Caddy
+	# answers preflights itself; they never reach Universe or its rate limiter.
+	header Vary Origin
+	@cors_origin header Origin {$REPLAY_CORS_ORIGIN}
+	header @cors_origin {
+		Access-Control-Allow-Origin "{$REPLAY_CORS_ORIGIN}"
+		Access-Control-Expose-Headers "Retry-After"
+	}
+	@cors_preflight {
+		method OPTIONS
+		path /v1/*
+		header Origin {$REPLAY_CORS_ORIGIN}
+	}
+	handle @cors_preflight {
+		header {
+			Access-Control-Allow-Methods "GET, POST, DELETE"
+			Access-Control-Allow-Headers "Authorization, Content-Type, Idempotency-Key"
+			Access-Control-Max-Age "600"
+		}
+		respond 204
+	}
+	# Any other preflight gets no CORS grant, so the browser refuses the call.
+	@options method OPTIONS
+	handle @options {
+		respond 204
+	}
+
 	# Authentication responses carry nonces or tokens and are never compressed.
 	@auth path /v1/auth/*
 	handle @auth {
@@ -45,7 +73,7 @@
 		import universe_proxy
 	}
 
-	# Reserved for an eventual same-origin static UI. No UI is shipped here.
+	# No UI is served here; it is deployed separately and calls /v1 cross-origin.
 	handle {
 		respond "not found" 404
 	}
