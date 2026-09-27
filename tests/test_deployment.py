@@ -147,7 +147,7 @@ class EventUniverseDeploymentTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            '"database_path": "/var/lib/event-universe/jobs.sqlite3"', config
+            '"database_path": "/var/lib/replay/jobs.sqlite3"', config
         )
         self.assertIn(
             "COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json",
@@ -248,6 +248,77 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")
         self.assertIn('python3 -m venv "$REPO_ROOT/.venv"', setup)
         self.assertIn('"$REPO_ROOT/.venv/bin/python" -m pip install -e', setup)
+
+
+class ReplayProductionDeploymentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.compose = (ROOT / "compose.universe.yaml").read_text(encoding="utf-8")
+        self.runner = (ROOT / "docker" / "replay-runner.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.caddy = (ROOT / "docker" / "Caddyfile").read_text(encoding="utf-8")
+
+    def service(self, name: str) -> str:
+        marker = f"\n  {name}:\n"
+        start = self.compose.index(marker) + len(marker)
+        following = re.search(r"\n  [a-z][a-z0-9-]*:\n", self.compose[start:])
+        return self.compose[start : start + following.start()] if following else self.compose[start:]
+
+    def test_replay_services_are_private_hardened_and_one_shot(self) -> None:
+        redis = self.service("replay-redis")
+        runner = self.service("replay-runner")
+        universe = self.service("event-universe")
+        self.assertIn("redis:8.2", redis)
+        self.assertIn("--maxmemory-policy", redis)
+        self.assertIn("noeviction", redis)
+        self.assertIn('--save', redis)
+        self.assertIn('--appendonly', redis)
+        self.assertNotIn("ports:", redis)
+        self.assertNotIn("volumes:", redis)
+        self.assertIn("REPLAY_REDIS_MAXMEMORY_BYTES", redis)
+        self.assertIn('restart: "no"', runner)
+        self.assertIn("python", runner)
+        self.assertIn("replay.jobs", runner)
+        self.assertIn("REPLAY_IMAGE_REVISION", runner)
+        self.assertIn("REPLAY_RUNNER_IMAGE:?", runner)
+        self.assertIn("*replay-volume", runner)
+        self.assertIn("*universe-runtime", universe)
+        self.assertIn("- *replay-volume", self.compose)
+        self.assertIn("networks: [replay-private, replay-egress]", runner)
+        for service in (runner, redis):
+            self.assertIn("pids_limit:", service)
+            self.assertIn("mem_limit:", service)
+        self.assertNotIn("CAPTURE_DATA_ROOT", self.compose)
+        self.assertNotIn("/var/run/docker.sock", self.compose)
+
+    def test_runner_image_contains_release_tools_dependency_and_nonroot_runtime(self) -> None:
+        self.assertIn("--release", self.runner)
+        self.assertIn("--example materialize_range", self.runner)
+        self.assertIn("replay-publish", self.runner)
+        self.assertIn(".[replay-redis]", self.runner)
+        self.assertIn("ARG REPLAY_IMAGE_REVISION", self.runner)
+        self.assertIn("USER replay:replay", self.runner)
+        self.assertIn("materialize_range --describe", self.runner)
+
+    def test_stock_caddy_does_not_claim_rate_limiting(self) -> None:
+        self.assertIn("REPLAY_PUBLIC_HOST", self.caddy)
+        self.assertIn("reverse_proxy", self.caddy)
+        self.assertIn("request_body", self.caddy)
+        self.assertNotIn("rate_limit", self.caddy)
+        self.assertIn("external edge", self.caddy)
+        self.assertIn("sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d", self.compose)
+
+    def test_scheduler_and_operations_are_documented_as_gated_one_shots(self) -> None:
+        deployment = (ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        replay = deployment.split("## Replay jobs production runtime", 1)[1]
+        self.assertIn("--profile replay run --rm replay-preflight", replay)
+        self.assertIn("--profile replay run --rm replay-runner", replay)
+        self.assertIn("systemd", replay)
+        self.assertIn("local_state_lost", replay)
+        self.assertIn("resume-blocked", replay)
+        self.assertIn("receipt-only", replay)
+        self.assertIn("full-volume snapshot", replay)
+        self.assertIn("external edge/WAF", replay)
 
 
 if __name__ == "__main__":
