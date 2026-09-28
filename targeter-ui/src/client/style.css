@@ -396,9 +396,48 @@ select,
   justify-content: space-between;
   max-width: none;
 }
+.job-detail-head > div:first-child {
+  min-width: 0;
+}
+.job-detail-head h1 {
+  overflow-wrap: anywhere;
+}
 .job-detail-head code {
   color: #858591;
   font-size: 10px;
+}
+.copyable-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(100%, 720px);
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.copyable-id code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+.copy-button {
+  flex: none;
+  border: 0;
+  border-radius: 5px;
+  padding: 4px 7px;
+  background: #24242d;
+  color: #b9b9c4;
+  font: inherit;
+  cursor: pointer;
+}
+.copy-button:hover,
+.copy-button:focus-visible {
+  background: #30303b;
+  color: white;
 }
 .job-actions {
   display: flex;

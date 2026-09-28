@@ -11,8 +11,8 @@ import {
 const RESPONSE_LIMIT = 1_750_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 export const BUNDLE_PAGE_SIZE = 5;
-const MAX_BUNDLE_PAGES = 128;
-const MAX_BUNDLE_RATE_RETRIES = 3;
+const PUBLIC_REQUEST_INTERVAL_MS = 3_500;
+const MAX_BUNDLE_PAGES = 256;
 const JOB_ID = /^\d{8}T\d{6}Z-[0-9a-f]{16}$/;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const HEX_32 = /^[0-9a-f]{32}$/;
@@ -459,6 +459,45 @@ export function validateBundlePage(value: unknown): {
   };
 }
 
+function validateBundleHistoryHead(value: unknown): string | null {
+  const page = object(
+    value,
+    ['selections', 'sort', 'next_cursor'],
+    'bundle history page',
+  );
+  if (string(page.sort, 'sort') !== 'selected')
+    throw contract('bundle history sort is invalid');
+  nullableString(page.next_cursor, 'next_cursor');
+  const selections = array(
+    page.selections,
+    (value) => {
+      const item = object(
+        value,
+        [
+          'run_id',
+          'generated_at',
+          'bundle_id',
+          'occurrence_kind',
+          'continuity_selected',
+          'continuity_disposition',
+          'sport',
+          'game',
+          'topology',
+          'activation_at',
+          'capture_start_at',
+          'retirement',
+          'source',
+          'origin',
+        ],
+        'bundle history selection',
+      );
+      return string(item.run_id, 'run_id');
+    },
+    'selections',
+  );
+  return selections[0] ?? null;
+}
+
 // Replay needs only the closed context from selection detail. Validate every
 // field and retain the typed server shape without interpreting compatibility.
 export function validateSelectionDetail(
@@ -713,14 +752,75 @@ export type UniverseClientOptions = {
   baseUrl: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  requestIntervalMs?: number;
   getToken?: () => string | null;
   onUnauthorized?: () => void;
 };
+
+class RequestCoordinator {
+  private tail = Promise.resolve();
+  private nextStart = 0;
+  private blockedUntil = 0;
+
+  constructor(private readonly intervalMs: number) {}
+
+  get enabled() {
+    return this.intervalMs > 0;
+  }
+
+  async acquire(signal?: AbortSignal) {
+    let releaseTurn!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const prior = this.tail;
+    this.tail = prior.catch(() => undefined).then(() => turn);
+    try {
+      await abortable(prior, signal);
+      await abortableDelay(
+        Math.max(0, Math.max(this.nextStart, this.blockedUntil) - Date.now()),
+        signal,
+      );
+    } catch (error) {
+      releaseTurn();
+      throw error;
+    }
+    return () => {
+      this.nextStart = Date.now() + this.intervalMs;
+      releaseTurn();
+    };
+  }
+
+  defer(milliseconds: number) {
+    this.blockedUntil = Math.max(
+      this.blockedUntil,
+      Date.now() + Math.max(this.intervalMs, milliseconds),
+    );
+  }
+}
+
+const requestCoordinators = new Map<string, RequestCoordinator>();
+
+function requestCoordinator(baseUrl: URL, intervalMs: number) {
+  const key = `${baseUrl.origin}${baseUrl.pathname}|${intervalMs}`;
+  let coordinator = requestCoordinators.get(key);
+  if (!coordinator) {
+    coordinator = new RequestCoordinator(intervalMs);
+    requestCoordinators.set(key, coordinator);
+  }
+  return coordinator;
+}
 
 export class UniverseClient {
   private readonly baseUrl: URL;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly coordinator: RequestCoordinator;
+  private readonly bundleCache = new Map<string, UniverseBundle>();
+  private readonly bundleIdentityCache = new Map<
+    string,
+    { bundle_id: string; participants: string[] }
+  >();
 
   constructor(private readonly options: UniverseClientOptions) {
     this.baseUrl = new URL(options.baseUrl);
@@ -741,6 +841,11 @@ export class UniverseClient {
     this.baseUrl.pathname = `${this.baseUrl.pathname.replace(/\/+$/, '')}/`;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.fetchImpl = options.fetch ?? ((...arguments_) => fetch(...arguments_));
+    this.coordinator = requestCoordinator(
+      this.baseUrl,
+      options.requestIntervalMs ??
+        (options.fetch === undefined ? PUBLIC_REQUEST_INTERVAL_MS : 0),
+    );
   }
 
   strategies(signal?: AbortSignal) {
@@ -763,26 +868,6 @@ export class UniverseClient {
     if (cursor) query.set('cursor', cursor);
     return this.request(`v1/replay/jobs?${query}`, validateJobPage, { signal });
   }
-  async jobPages(
-    status: ReplayStatus | undefined,
-    pageCount: number,
-    signal?: AbortSignal,
-  ) {
-    const jobs: ReplayJobRecord[] = [];
-    const seen = new Set<string>();
-    let cursor: string | null = null;
-    for (let pageNumber = 0; pageNumber < pageCount; pageNumber += 1) {
-      const page = await this.jobs(status, cursor, signal);
-      for (const job of page.jobs) {
-        if (seen.has(job.job_id)) continue;
-        seen.add(job.job_id);
-        jobs.push(job);
-      }
-      cursor = page.next_cursor;
-      if (!cursor) break;
-    }
-    return { jobs, next_cursor: cursor };
-  }
   job(jobId: string, signal?: AbortSignal) {
     return this.request(
       `v1/replay/jobs/${encodeURIComponent(jobId)}`,
@@ -804,13 +889,22 @@ export class UniverseClient {
       { signal },
     );
   }
-  async bundles(signal?: AbortSignal) {
+  async bundles(
+    signal?: AbortSignal,
+    options: {
+      cursor?: string | null;
+      paceMs?: number;
+      onPage?: (bundles: UniverseBundle[]) => void;
+    } = {},
+  ) {
     const bundles: UniverseBundle[] = [];
-    let cursor: string | null = null;
+    let cursor = options.cursor ?? null;
     let pageSize = BUNDLE_PAGE_SIZE;
-    let rateRetries = 0;
+    const paceMs = options.paceMs ?? PUBLIC_REQUEST_INTERVAL_MS;
     const cursors = new Set<string>();
     for (let pageNumber = 0; pageNumber < MAX_BUNDLE_PAGES; ) {
+      if (pageNumber > 0 || pageSize < BUNDLE_PAGE_SIZE)
+        await abortableDelay(paceMs, signal);
       const query = new URLSearchParams({ limit: String(pageSize) });
       if (cursor) query.set('cursor', cursor);
       let page: ReturnType<typeof validateBundlePage>;
@@ -839,35 +933,48 @@ export class UniverseClient {
               bundles,
               next_cursor: cursor,
               warning: `${message} Showing the bundles discovered before it.`,
+              retry_after_seconds: null,
             };
           throw new UniverseApiError(message, 413);
         }
         if (
           error instanceof UniverseApiError &&
           error.status === 429 &&
-          error.retryAfterSeconds !== null &&
-          rateRetries < MAX_BUNDLE_RATE_RETRIES
+          bundles.length
         ) {
-          rateRetries += 1;
-          await abortableDelay(error.retryAfterSeconds * 1_000, signal);
-          continue;
+          return {
+            bundles,
+            next_cursor: cursor,
+            warning:
+              'Universe rate limit paused bundle discovery. The bundles already loaded are preserved; resume after the requested delay.',
+            retry_after_seconds: error.retryAfterSeconds,
+          };
         }
         throw error;
       }
-      rateRetries = 0;
       bundles.push(...page.bundles);
+      for (const bundle of page.bundles)
+        this.bundleCache.set(bundle.bundle_id, bundle);
+      options.onPage?.(page.bundles);
       pageNumber += 1;
       cursor = page.next_cursor;
-      if (!cursor) return { bundles, next_cursor: null, warning: null };
+      if (!cursor)
+        return {
+          bundles,
+          next_cursor: null,
+          warning: null,
+          retry_after_seconds: null,
+        };
       if (cursors.has(cursor)) throw contract('bundle cursor repeated');
       cursors.add(cursor);
     }
-    throw new UniverseApiError(
-      'Historical bundle discovery exceeded the bounded page limit.',
-      null,
-      null,
-      'contract',
-    );
+    return {
+      bundles,
+      next_cursor: cursor,
+      warning:
+        'Historical bundle discovery reached its bounded page limit. The bundles already loaded are preserved; resume from this point.',
+      retry_after_seconds: null,
+    };
   }
   selection(runId: string, bundleId: string, signal?: AbortSignal) {
     return this.request(
@@ -875,6 +982,36 @@ export class UniverseClient {
       validateSelectionDetail,
       { signal },
     );
+  }
+  async bundleIdentity(
+    bundleId: string,
+    signal?: AbortSignal,
+    paceMs = PUBLIC_REQUEST_INTERVAL_MS,
+  ) {
+    const identity = this.bundleIdentityCache.get(bundleId);
+    if (identity) return identity;
+    const cached = this.bundleCache.get(bundleId);
+    if (cached)
+      return {
+        bundle_id: cached.bundle_id,
+        participants: cached.participants,
+      };
+    const history = await this.request(
+      `v1/bundles/${encodeURIComponent(bundleId)}/history?sort=selected&limit=1`,
+      validateBundleHistoryHead,
+      { signal },
+    );
+    if (!history) return { bundle_id: bundleId, participants: [] };
+    // Public reads share a 3/10-second bucket. Pace the second half of this
+    // bounded lookup rather than turning a title enhancement into a 429.
+    await abortableDelay(paceMs, signal);
+    const selection = await this.selection(history, bundleId, signal);
+    const result = {
+      bundle_id: bundleId,
+      participants: selection.context.participants,
+    };
+    this.bundleIdentityCache.set(bundleId, result);
+    return result;
   }
   nonce(signal?: AbortSignal) {
     return this.request('v1/auth/nonce', validateNonce, { signal });
@@ -978,6 +1115,9 @@ export class UniverseClient {
       idempotencyKey?: string;
     } = {},
   ): Promise<T> {
+    const release = this.coordinator.enabled
+      ? await this.coordinator.acquire(options.signal)
+      : () => undefined;
     const controller = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => {
@@ -1023,6 +1163,8 @@ export class UniverseClient {
       if (!response.ok) {
         const error = validateErrorResponse(document);
         const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+        if (response.status === 429)
+          this.coordinator.defer((retryAfter ?? 0) * 1_000);
         if (response.status === 401 && options.authenticated)
           this.options.onUnauthorized?.();
         throw new UniverseApiError(error.error, response.status, retryAfter);
@@ -1049,8 +1191,29 @@ export class UniverseClient {
     } finally {
       clearTimeout(timeout);
       options.signal?.removeEventListener('abort', abort);
+      release();
     }
   }
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal) {
+  if (!signal) return promise;
+  if (signal.aborted)
+    return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function abortableDelay(milliseconds: number, signal?: AbortSignal) {
@@ -1071,27 +1234,109 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal) {
   });
 }
 
+export function bundleDisplayName(participants: string[], bundleId: string) {
+  const names = participants.map((name) => name.trim()).filter(Boolean);
+  return names.length ? names.join(' vs ') : bundleId;
+}
+
+export async function loadReplayDetailCycle(
+  api: UniverseClient,
+  jobId: string,
+  signal?: AbortSignal,
+) {
+  const detail = await api.job(jobId, signal);
+  const eventPage = await api.jobEvents(jobId, null, signal);
+  return { detail, eventPage };
+}
+
 export function startSerializedPolling(
-  task: (signal: AbortSignal) => Promise<void>,
+  task: (signal: AbortSignal) => Promise<void | boolean>,
   intervalMs: number,
+  options: {
+    isPaused?: () => boolean;
+    subscribe?: (resume: () => void) => () => void;
+    random?: () => number;
+    schedule?: typeof setTimeout;
+    clearSchedule?: typeof clearTimeout;
+    maxIntervalMs?: number;
+  } = {},
 ) {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+  let failures = 0;
+  const schedule = options.schedule ?? setTimeout;
+  const clearSchedule = options.clearSchedule ?? clearTimeout;
+  const random = options.random ?? Math.random;
+  const maxIntervalMs = options.maxIntervalMs ?? 60_000;
+  const isPaused =
+    options.isPaused ??
+    (() =>
+      typeof document !== 'undefined' &&
+      (document.visibilityState === 'hidden' || navigator.onLine === false));
+  const subscribe =
+    options.subscribe ??
+    ((resume: () => void) => {
+      if (typeof document === 'undefined') return () => undefined;
+      document.addEventListener('visibilitychange', resume);
+      window.addEventListener('online', resume);
+      window.addEventListener('offline', resume);
+      return () => {
+        document.removeEventListener('visibilitychange', resume);
+        window.removeEventListener('online', resume);
+        window.removeEventListener('offline', resume);
+      };
+    });
+  const later = (delay: number) => {
+    if (controller.signal.aborted || timer !== null) return;
+    timer = schedule(() => {
+      timer = null;
+      void run();
+    }, delay);
+  };
   const run = async () => {
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted || running) return;
+    if (isPaused()) return;
+    running = true;
+    let nextDelay = intervalMs;
+    let completed = false;
     try {
-      await task(controller.signal);
-    } catch {
-      // Polling tasks own their visible error state. Keep the scheduler alive.
+      const keepPolling = await task(controller.signal);
+      failures = 0;
+      completed = keepPolling === false;
+    } catch (error) {
+      failures += 1;
+      const exponential = Math.min(
+        maxIntervalMs,
+        intervalMs * 2 ** Math.min(failures, 8),
+      );
+      const retryAfter =
+        error instanceof UniverseApiError &&
+        error.status === 429 &&
+        error.retryAfterSeconds !== null
+          ? error.retryAfterSeconds * 1_000
+          : 0;
+      const jittered = exponential * (0.8 + random() * 0.4);
+      nextDelay = Math.max(retryAfter, jittered);
     } finally {
-      if (!controller.signal.aborted)
-        timer = setTimeout(() => void run(), intervalMs);
+      running = false;
+      if (!completed && !controller.signal.aborted && !isPaused())
+        later(nextDelay);
     }
   };
-  void run();
+  const resume = () => {
+    if (controller.signal.aborted || isPaused() || running) return;
+    if (timer !== null) clearSchedule(timer);
+    timer = null;
+    later(0);
+  };
+  const unsubscribe = subscribe(resume);
+  // React StrictMode disposes its probe effect before this first task can run.
+  later(0);
   return () => {
     controller.abort();
-    if (timer !== null) clearTimeout(timer);
+    unsubscribe();
+    if (timer !== null) clearSchedule(timer);
   };
 }
 
