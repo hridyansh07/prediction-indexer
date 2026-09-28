@@ -789,6 +789,64 @@ class CancelledRunnerAcceptanceTests(unittest.TestCase):
                 (c.ARCHIVE_BLOCKED, "archive_conflict"),
             )
 
+    def test_bundle_pins_are_obtained_once_per_job_per_tick(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = ReplayJobStore(root / "jobs.sqlite3", Limits(), suffix=lambda: "0123456789abcdef")
+            jobs.initialize()
+            config = runner_config()
+            raw = request_bytes()
+            submitted = jobs.submit(
+                raw,
+                c.parse_request(raw, config),
+                Principal(ADDRESS, "member"),
+                "bundle-once",
+                10,
+                bundle_exists=True,
+            )
+            runtime = Runtime(root, Path("/unused"), Path("/unused"), Path(os.sys.executable), "redis://unused", "revision")
+            bundled = (object(), b"receipt", (object(),))
+            failures = [StageFailure("resource_exhausted", "injected")]
+            now = [100_000_000_000]
+            runner = Runner(
+                jobs, LocalObjectStore(root / "objects"), config, runtime, clock=lambda: now[0]
+            )
+            # Stage bodies are faked here, so their local markers are too.
+            with mock.patch("replay.jobs.runner.resolve_stage"), mock.patch(
+                "replay.jobs.runner.validate_committed_markers"
+            ), mock.patch(
+                "replay.jobs.runner.read_regular", return_value=b"resolved"
+            ), mock.patch.object(c, "parse_resolved_job", return_value="resolved"), mock.patch(
+                "replay.jobs.runner.bundle_stage", return_value=bundled
+            ) as bundle, mock.patch(
+                "replay.jobs.runner.prepare_stage", return_value="snapshot"
+            ) as prepare, mock.patch(
+                "replay.jobs.runner.supervisor_config", return_value="document"
+            ) as supervisor, mock.patch(
+                "replay.jobs.runner.run_stage",
+                side_effect=lambda *a, **k: failures and (_ for _ in ()).throw(failures.pop()),
+            ), mock.patch(
+                "replay.jobs.runner.load_snapshot", return_value="loaded"
+            ), mock.patch(
+                "replay.jobs.runner.read_stage"
+            ) as read, mock.patch.object(Runner, "_archive"):
+                runner.tick()
+                waiting, _ = jobs.get_job(submitted.row.job_id)
+                self.assertEqual(
+                    (waiting.status, waiting.stage, waiting.reason_code),
+                    (c.RUNNING, "run", "resource_exhausted"),
+                )
+                self.assertEqual(bundle.call_count, 1)
+                self.assertEqual(prepare.call_args.args[3:5], (bundled[0], bundled[2]))
+                self.assertEqual(supervisor.call_args.args[3:5], (bundled[0], bundled[2]))
+
+                now[0] += 1_000_000_000_000
+                runner.tick()
+                finished, _ = jobs.get_job(submitted.row.job_id)
+                self.assertEqual((finished.pending_outcome, finished.reason_code), (c.SUCCEEDED, None))
+                self.assertEqual(bundle.call_count, 2)
+                self.assertEqual(read.call_args.args[3], bundled[1])
+
     def test_global_lock_contention_skips_without_running_tick(self):
         with tempfile.TemporaryDirectory() as temporary:
             lock = Path(temporary) / "runner.lock"

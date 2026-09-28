@@ -69,12 +69,21 @@ class Runner:
         self.clock = clock
         self.history = history or HistoryClient(config.universe_base_url)
         self.ensure = ensure
+        # (receipt, receipt_raw, pins) per job, obtained at most once per tick.
+        self._tick_bundles = {}
 
     @property
     def jobs_root(self):
         return self.runtime.data_root / "jobs"
 
     def tick(self) -> None:
+        self._tick_bundles = {}
+        try:
+            self._tick()
+        finally:
+            self._tick_bundles = {}
+
+    def _tick(self) -> None:
         claim = self.jobs.claim_next(self.config.orchestration, self.clock())
         if claim is None or claim.row.status == c.ARCHIVE_BLOCKED:
             return
@@ -180,17 +189,23 @@ class Runner:
         resolved = c.parse_resolved_job(
             read_regular(root / "resolved.json", c.MAX_RESOLVED_JOB_BYTES)
         )
-        receipt, receipt_raw, pins = bundle_stage(
-            root,
-            request,
-            resolved,
-            self.ensure,
-            store=self.archive,
-            work_root=self.runtime.data_root / "bundle-work",
-            derivatives_root=self.runtime.data_root / "derivatives",
-            materializer=self.runtime.materializer,
-            window_seconds=self.config.canonical_window_seconds,
-        )
+        bundled = self._tick_bundles.get(row.job_id)
+        if bundled is None:
+            bundled = bundle_stage(
+                root,
+                request,
+                resolved,
+                self.ensure,
+                store=self.archive,
+                work_root=self.runtime.data_root / "bundle-work",
+                derivatives_root=self.runtime.data_root / "derivatives",
+                materializer=self.runtime.materializer,
+                window_seconds=self.config.canonical_window_seconds,
+            )
+            # Later stages in this tick reuse these pins; a new tick (a
+            # resume after a crash or retry) obtains them again.
+            self._tick_bundles[row.job_id] = bundled
+        receipt, receipt_raw, pins = bundled
         if row.stage == "bundle":
             return self._save(row, c.advance(row, "prepare", self.clock()))
 

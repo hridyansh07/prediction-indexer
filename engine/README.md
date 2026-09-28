@@ -220,7 +220,10 @@ write/fsync/rename the receipt last.
 
 The full strict verifier still runs everywhere a derivative was not written by
 the current process: an existing committed address (verify/no-op), pinned
-inspection, the walker's `open_pinned`, and Replay's download and cache paths.
+inspection, the walker's `open_pinned`, and Replay's archive download path.
+Replay's bundle cache binds a derivative already installed in its local
+derivatives root to its pin by receipt hash and per-file stored identities
+rather than re-inspecting it; `open_pinned` still fully verifies it at read time.
 The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
 lock from before stage creation through publication and cleanup; process death
 releases it. Builds of the same address serialize, while different addresses can

@@ -732,11 +732,20 @@ the bundle cache's pin-inspection API.
    receipt hashes, or full Producer differs, return `StaleCache` without any
    derivative download, materialization, or write. The cache never discovers
    or selects another cache receipt automatically.
-4. For each window, download `replay/derivatives/<address>/*` through
-   `open_verified` into `derivatives_root/<address>/`, receipt last, skipping
-   directories already present and verified.
-5. Run the strict Rust pin inspector on every ordered pin, then return
-   `BundleReady`. A warm hit never invokes materialization.
+4. For each window whose `derivatives_root/<address>/` is absent, download
+   `replay/derivatives/<address>/*` through `open_verified` into a private
+   stage, run the strict Rust pin inspector on it, and install it, receipt
+   last.
+5. A derivative already present locally is bound to its pin by hash instead:
+   the directory must hold exactly the five derivative files as regular files,
+   `receipt.json` must hash to the pinned `receipt_sha256` from the verified
+   bundle receipt, and every other file must match the stored SHA-256 and byte
+   length that derivative receipt records. A mismatch is `integrity_failure`;
+   the local copy is neither repaired, rebuilt, nor deleted. Local derivatives
+   were fully verified when built or downloaded, and the walker's
+   `open_pinned` still fully verifies each pin at read time. Return
+   `BundleReady` with the ordered pins. A warm hit never invokes
+   materialization.
 
 ### 6.3 Cache miss (build)
 
@@ -766,8 +775,8 @@ where books are usable is the coverage strategy's job.
 
 **Engine change:** `materialize_range --describe` prints the exact canonical
 §3.5 Producer and exits, with no materialization or data/configuration I/O. A
-separate strict `--inspect-pin` mode is the cache's derivative verification
-interface.
+separate strict `--inspect-pin` mode is the cache's verification interface for
+derivatives downloaded from the archive.
 
 ### 6.4 Frozen limits, concurrency, and crash recovery
 
