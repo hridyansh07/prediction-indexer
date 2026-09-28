@@ -478,7 +478,17 @@ where
     sync_directory(&window_root)?;
     checkpoint(Checkpoint::DirectoryPublished)?;
     write_receipt_last(&final_directory, &receipt_bytes, &mut checkpoint)?;
-    let derivative = verify_derivative(&final_directory).map_err(BuildError::Verification)?;
+    // `verify_candidate` already verified these exact frames. Publication only
+    // renamed the stage and wrote the receipt, so bind the metadata rather than
+    // decoding every frame a second time.
+    let derivative = verify::inspect_contents(
+        &final_directory,
+        receipt,
+        receipt_bytes,
+        true,
+        &manifest_bytes,
+    )
+    .map_err(BuildError::Verification)?;
     Ok(BuildOutcome {
         disposition: BuildDisposition::Committed,
         derivative,

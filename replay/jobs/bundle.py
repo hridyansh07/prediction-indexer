@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -392,7 +393,43 @@ def _tree_bytes(root: Path, maximum: int) -> int:
     return total
 
 
-def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, materializer: Path, scratch: Path) -> BundlePin:
+def _check_fresh_copy(stage: Path, receipt_sha256: str) -> None:
+    """Bind a copy of a derivative the materializer has just verified to its pin.
+
+    The pinned receipt lists every other file's stored hash and length, so
+    hashing the copy proves it is the verified output without decoding every
+    frame again, which `--inspect-pin` would.
+    """
+    receipt_path = stage / "receipt.json"
+    raw = receipt_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != receipt_sha256:
+        raise BundleFailure("integrity_failure", "copied derivative receipt does not match its pin")
+    try:
+        receipt = json.loads(raw)
+        expected = {receipt["manifest"]["file"]: (receipt["manifest"]["sha256"], receipt["manifest"]["byte_length"])}
+        for part in ("events", "rejects", "sources"):
+            entry = receipt[part]
+            expected[entry["file"]] = (entry["stored"]["sha256"], entry["stored"]["byte_length"])
+    except (ValueError, KeyError, TypeError) as error:
+        raise BundleFailure("integrity_failure", "copied derivative receipt is malformed") from error
+    if set(expected) | {"receipt.json"} != set(DERIVATIVE_FILES):
+        raise BundleFailure("integrity_failure", "copied derivative receipt names unexpected files")
+    for name, (sha256, byte_length) in expected.items():
+        identity = _file_identity(stage / name)
+        if (identity.sha256, identity.byte_length) != (sha256, byte_length):
+            raise BundleFailure("integrity_failure", f"copied derivative file {name} disagrees with its receipt")
+
+
+def _install_local(
+    source: Path,
+    address: str,
+    receipt_sha256: str,
+    root: Path,
+    materializer: Path,
+    scratch: Path,
+    *,
+    freshly_verified: bool = False,
+) -> BundlePin:
     _pin_values(address, receipt_sha256)
     _owned_root(root, "derivatives_root")
     target = root / address
@@ -413,7 +450,10 @@ def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, 
         for name in (*DERIVATIVE_FILES[:-1], DERIVATIVE_FILES[-1]):
             _copy_file(source / name, stage / name, budget)
         _fsync_directory(stage)
-        _inspect(materializer, BundlePin(stage, address, receipt_sha256), scratch)
+        if freshly_verified:
+            _check_fresh_copy(stage, receipt_sha256)
+        else:
+            _inspect(materializer, BundlePin(stage, address, receipt_sha256), scratch)
         try:
             os.rename(stage, target)
             _fsync_directory(root)
@@ -539,9 +579,12 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
         window_root = output_root / f"window={remote.window_start_ns}"
         _validate_materialized_window(window_root, address)
         source = window_root / address
-        built_pin = BundlePin(source, address, receipt_sha256)
-        _inspect(materializer, built_pin, scratch)
-        pin = _install_local(source, address, receipt_sha256, derivatives_root, materializer, scratch)
+        # materialize_range verified this derivative before committing its
+        # receipt; the local install binds the copy to that pin by hash.
+        pin = _install_local(
+            source, address, receipt_sha256, derivatives_root, materializer, scratch,
+            freshly_verified=True,
+        )
         pins.append(pin)
         windows.append(BundleWindow(remote.window_start_ns, remote.window_end_ns, remote.receipt_sha256, address, receipt_sha256))
     receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, tuple(windows))

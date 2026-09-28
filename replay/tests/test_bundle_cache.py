@@ -150,6 +150,34 @@ class BundleCacheTest(unittest.TestCase):
         self.assertIn("--inspect-pin", arguments)
         self.assertNotIn("", arguments)
 
+    def test_cold_build_verifies_each_window_once_inside_the_materializer(self):
+        self.archive_window()
+        log = self.root / "arguments.log"
+        wrapper = self.root / "materializer"
+        wrapper.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {MATERIALIZER} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.assertIsInstance(self.ensure(wrapper), BundleReady)
+        self.assertNotIn("--inspect-pin", log.read_text(encoding="utf-8").splitlines())
+
+    def test_fresh_copy_that_disagrees_with_its_pin_is_rejected(self):
+        self.archive_window()
+        real_copy = bundle._copy_file
+
+        def corrupting_copy(source, destination, budget):
+            real_copy(source, destination, budget)
+            if destination.name == "events.ndjson.zst":
+                with open(destination, "ab") as sink:
+                    sink.write(b"\0")
+
+        with mock.patch.object(bundle, "_copy_file", corrupting_copy):
+            with self.assertRaises(BundleFailure) as caught:
+                self.ensure()
+        self.assertEqual(caught.exception.code, "integrity_failure")
+        self.assertIn("events.ndjson.zst disagrees with its receipt", caught.exception.detail)
+
     def test_cold_publication_order_and_retry_at_each_commit_boundary(self):
         for fail_at in range(1, 7):
             with self.subTest(fail_at=fail_at):
