@@ -445,3 +445,23 @@ export function parseStrategyConfig(
   }
   return { config, errors };
 }
+
+export function validateReplayDraft(
+  form: ReplayForm,
+  limitPreset: string,
+  configKeys: string[],
+  configValues: Record<string, string>,
+) {
+  const errors = validateReplayForm(form);
+  if (!limitPreset) errors.limits = 'Choose a backend run preset.';
+  const parsedConfig = parseStrategyConfig(configKeys, configValues);
+  for (const [key, message] of Object.entries(parsedConfig.errors))
+    errors[`config.${key}`] = message;
+  return { errors, config: parsedConfig.config };
+}
+
+export function replaySummaryHeading(errors: Record<string, string>) {
+  return Object.keys(errors).length
+    ? 'Complete your request'
+    : 'Ready to replay';
+}

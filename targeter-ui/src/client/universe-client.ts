@@ -754,14 +754,34 @@ export class UniverseClient {
   }
   jobs(
     status?: ReplayStatus,
-    after?: string | null,
+    cursor?: string | null,
     signal?: AbortSignal,
     limit = 25,
   ) {
     const query = new URLSearchParams({ limit: String(limit) });
     if (status) query.set('status', status);
-    if (after) query.set('after', after);
+    if (cursor) query.set('cursor', cursor);
     return this.request(`v1/replay/jobs?${query}`, validateJobPage, { signal });
+  }
+  async jobPages(
+    status: ReplayStatus | undefined,
+    pageCount: number,
+    signal?: AbortSignal,
+  ) {
+    const jobs: ReplayJobRecord[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < pageCount; pageNumber += 1) {
+      const page = await this.jobs(status, cursor, signal);
+      for (const job of page.jobs) {
+        if (seen.has(job.job_id)) continue;
+        seen.add(job.job_id);
+        jobs.push(job);
+      }
+      cursor = page.next_cursor;
+      if (!cursor) break;
+    }
+    return { jobs, next_cursor: cursor };
   }
   job(jobId: string, signal?: AbortSignal) {
     return this.request(

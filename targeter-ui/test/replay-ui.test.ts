@@ -8,7 +8,9 @@ import {
   replayJobEvents,
   replayJobs,
   replayStatuses,
+  replaySummaryHeading,
   replayStatusMeta,
+  validateReplayDraft,
   validateReplayForm,
 } from '../src/client/replay-model.js';
 import {
@@ -328,7 +330,7 @@ test('bundle rate-limit retries reset after each completed page', async () => {
   assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
 });
 
-test('job and event cursors use their distinct server query contracts', async () => {
+test('job and event cursors use the server cursor query contract', async () => {
   const paths: string[] = [];
   const api = new UniverseClient({
     baseUrl: 'https://universe.example',
@@ -343,8 +345,41 @@ test('job and event cursors use their distinct server query contracts', async ()
   await api.jobs('queued', 'job-cursor', undefined, 25);
   await api.jobEvents(job.job_id, 'event-cursor', undefined, 50);
   assert.deepEqual(paths, [
-    '/v1/replay/jobs?limit=25&status=queued&after=job-cursor',
+    '/v1/replay/jobs?limit=25&status=queued&cursor=job-cursor',
     `/v1/replay/jobs/${job.job_id}/events?limit=50&cursor=event-cursor`,
+  ]);
+});
+
+test('load older and subsequent polling replay the cursor pages without duplicates', async () => {
+  const older = {
+    ...job,
+    job_id: '20260926T120000Z-fedcba9876543210',
+    created_at_ns: '0',
+    updated_at_ns: '0',
+  };
+  const paths: string[] = [];
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const url = new URL(String(input));
+      paths.push(`${url.pathname}${url.search}`);
+      return url.searchParams.get('cursor') === 'older-page'
+        ? response({ jobs: [job, older], next_cursor: null })
+        : response({ jobs: [job], next_cursor: 'older-page' });
+    }) as typeof fetch,
+  });
+  const afterLoadOlder = await api.jobPages(undefined, 2);
+  const afterPoll = await api.jobPages(undefined, 2);
+  assert.deepEqual(
+    afterLoadOlder.jobs.map((item) => item.job_id),
+    [job.job_id, older.job_id],
+  );
+  assert.deepEqual(afterPoll, afterLoadOlder);
+  assert.deepEqual(paths, [
+    '/v1/replay/jobs?limit=25',
+    '/v1/replay/jobs?limit=25&cursor=older-page',
+    '/v1/replay/jobs?limit=25',
+    '/v1/replay/jobs?limit=25&cursor=older-page',
   ]);
 });
 
@@ -394,6 +429,51 @@ test('strategy config preserves catalogue keys and typed JSON values', () => {
     parseStrategyConfig(['threshold'], { threshold: 'not-json' }).errors,
     { threshold: 'Enter a valid JSON value.' },
   );
+});
+
+test('new replay validation clears corrected fields and gates the summary', () => {
+  const form = {
+    bundleId: '',
+    marketMode: 'all' as const,
+    selectedMarkets: [] as string[],
+    strategy: '',
+  };
+  let validation = validateReplayDraft(form, '', [], {});
+  assert.deepEqual(Object.keys(validation.errors).sort(), [
+    'bundleId',
+    'limits',
+    'strategy',
+  ]);
+  assert.equal(
+    replaySummaryHeading(validation.errors),
+    'Complete your request',
+  );
+
+  form.bundleId = 'bundle-a';
+  validation = validateReplayDraft(form, '', [], {});
+  assert.equal(validation.errors.bundleId, undefined);
+  assert.deepEqual(Object.keys(validation.errors).sort(), [
+    'limits',
+    'strategy',
+  ]);
+
+  form.strategy = 'configured';
+  validation = validateReplayDraft(form, '', ['threshold'], {});
+  assert.equal(validation.errors.strategy, undefined);
+  assert.equal(validation.errors['config.threshold'], 'Enter a JSON value.');
+
+  validation = validateReplayDraft(form, '', ['threshold'], {
+    threshold: '0.5',
+  });
+  assert.deepEqual(validation.errors, {
+    limits: 'Choose a backend run preset.',
+  });
+
+  validation = validateReplayDraft(form, 'small', ['threshold'], {
+    threshold: '0.5',
+  });
+  assert.deepEqual(validation, { errors: {}, config: { threshold: 0.5 } });
+  assert.equal(replaySummaryHeading(validation.errors), 'Ready to replay');
 });
 
 test('direct client preserves actionable 403, 404, 409, and 503 responses', async () => {

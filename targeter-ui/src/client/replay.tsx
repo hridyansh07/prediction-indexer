@@ -10,15 +10,15 @@ import {
 import {
   findReplayJob,
   jobProgress,
-  parseStrategyConfig,
   replayJobEvents,
   replayJobs,
   replayStages,
+  replaySummaryHeading,
   replayStatusMeta,
   type ReplayForm,
   type ReplayJob,
   type ReplayStatus,
-  validateReplayForm,
+  validateReplayDraft,
 } from './replay-model';
 import { useUniverseAuth } from './universe-auth';
 import {
@@ -311,23 +311,14 @@ export function ReplayJobsPage() {
     async (signal?: AbortSignal) => {
       setFailure(null);
       try {
-        const merged: ReplayJobRecord[] = [];
-        let after: string | null = null;
-        let pagesRead = 0;
-        while (pagesRead < loadedPages) {
-          const page = await api.jobs(
-            status === 'all' ? undefined : (status as ReplayStatus),
-            after,
-            signal,
-          );
-          merged.push(...page.jobs);
-          after = page.next_cursor;
-          pagesRead += 1;
-          if (!after) break;
-        }
+        const page = await api.jobPages(
+          status === 'all' ? undefined : (status as ReplayStatus),
+          loadedPages,
+          signal,
+        );
         if (signal?.aborted) return;
-        setJobs(uniqueJobs(merged));
-        setNextCursor(after);
+        setJobs(page.jobs);
+        setNextCursor(page.next_cursor);
         setPageFailure(null);
       } catch (error) {
         if (!(error instanceof Error && error.name === 'AbortError'))
@@ -975,7 +966,7 @@ export function NewReplayPage() {
     selectedMarkets: [],
     strategy: '',
   });
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [validationAttempted, setValidationAttempted] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   useEffect(() => {
     if (fixture) {
@@ -1020,6 +1011,16 @@ export function NewReplayPage() {
   const selectedBundle = bundleOptions.find(
     (bundle) => bundle.id === form.bundleId,
   );
+  const selectedStrategy = strategies.find(
+    (strategy) => strategy.name === form.strategy,
+  );
+  const validation = validateReplayDraft(
+    form,
+    limitPreset,
+    selectedStrategy?.config_keys ?? [],
+    strategyValues,
+  );
+  const errors = validationAttempted ? validation.errors : {};
   useEffect(() => {
     if (fixture || !selectedBundle?.latestRunId) return;
     const controller = new AbortController();
@@ -1046,19 +1047,8 @@ export function NewReplayPage() {
     setForm((current) => ({ ...current, ...next }));
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    const nextErrors = validateReplayForm(form);
-    if (!limitPreset) nextErrors.limits = 'Choose a backend run preset.';
-    const selectedStrategy = strategies.find(
-      (strategy) => strategy.name === form.strategy,
-    );
-    const parsedConfig = parseStrategyConfig(
-      selectedStrategy?.config_keys ?? [],
-      strategyValues,
-    );
-    for (const [key, message] of Object.entries(parsedConfig.errors))
-      nextErrors[`config.${key}`] = message;
-    setErrors(nextErrors);
-    if (Object.keys(nextErrors).length || !session) {
+    setValidationAttempted(true);
+    if (Object.keys(validation.errors).length || !session) {
       if (!session)
         setSubmitError(
           'Sign in with an allowlisted wallet to create a replay.',
@@ -1071,7 +1061,7 @@ export function NewReplayPage() {
       probe_markets:
         form.marketMode === 'all' ? null : [...form.selectedMarkets].sort(),
       interval: null,
-      strategy: { name: form.strategy, config: parsedConfig.config },
+      strategy: { name: form.strategy, config: validation.config },
       limits: limitPreset,
     };
     const fingerprint = JSON.stringify(request);
@@ -1341,7 +1331,7 @@ export function NewReplayPage() {
         </div>
         <aside className="request-review">
           <span className="eyebrow">REQUEST SUMMARY</span>
-          <h2>Ready to replay</h2>
+          <h2>{replaySummaryHeading(validation.errors)}</h2>
           <dl className="fact-list">
             <div>
               <dt>Bundle</dt>
