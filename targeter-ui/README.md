@@ -26,8 +26,10 @@ PORT=3000 # optional local static server
 These values are public and embedded at build time. They must contain no token,
 wallet key, signature, or other secret. The browser client validates closed
 response schemas, bounds response sizes and polling, handles `Retry-After`, and
-sends bearer sessions with `credentials: omit`. Sessions remain in memory and
-are lost on refresh; they are never written to local or session storage.
+sends bearer sessions with `credentials: omit`. The closed session response is
+stored in browser `localStorage` so a refresh can restore the wallet, role, and
+expiry without another signature. Invalid, expired, signed-out, or rejected
+sessions are removed immediately; session tokens must never be logged.
 
 The targets and decisions views resolve the newest complete run through:
 

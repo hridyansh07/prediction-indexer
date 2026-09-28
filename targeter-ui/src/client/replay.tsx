@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { UniverseBundle } from '../event-universe';
 import {
   Link,
+  Navigate,
   NavLink,
   useNavigate,
   useLocation,
@@ -20,7 +22,11 @@ import {
   type ReplayStatus,
   validateReplayDraft,
 } from './replay-model';
-import { useUniverseAuth } from './universe-auth';
+import {
+  adminAccessState,
+  replayEntryDestination,
+  useUniverseAuth,
+} from './universe-auth';
 import {
   UniverseApiError,
   type AllowlistMember,
@@ -29,6 +35,8 @@ import {
   type ReplayJobRecord,
   type ReplayRequest,
   type ReplayStrategy,
+  bundleDisplayName,
+  loadReplayDetailCycle,
   startSerializedPolling,
 } from './universe-client';
 
@@ -153,8 +161,25 @@ function AuthState({ state }: { state: 'entry' | 'expired' }) {
   );
 }
 
+function AuthLoadingState() {
+  return (
+    <section
+      className="replay-auth-card auth-loading"
+      aria-label="Checking Replay access"
+      aria-busy="true"
+    >
+      <span className="auth-glyph" aria-hidden="true">
+        ◇
+      </span>
+      <span className="eyebrow">REPLAY ACCESS</span>
+      <h1>Checking access…</h1>
+      <p>Confirming this browser session.</p>
+    </section>
+  );
+}
+
 function ReplayLocalNav() {
-  const { session } = useUniverseAuth();
+  const { phase } = useUniverseAuth();
   const [params] = useSearchParams();
   const fixtureAdmin =
     replayFixturesEnabled &&
@@ -165,7 +190,7 @@ function ReplayLocalNav() {
       <NavLink to="/replay" end>
         Jobs
       </NavLink>
-      {(session?.role === 'admin' || fixtureAdmin) && (
+      {(phase === 'admin' || fixtureAdmin) && (
         <NavLink
           to={fixtureAdmin ? '/replay/admin?state=ready' : '/replay/admin'}
         >
@@ -179,18 +204,23 @@ function ReplayLocalNav() {
 export function ReplayLayout({ children }: { children: React.ReactNode }) {
   const [params] = useSearchParams();
   const auth = params.get('auth');
-  const { expired } = useUniverseAuth();
+  const { phase } = useUniverseAuth();
+  const destination = auth === 'entry' ? replayEntryDestination(phase) : null;
+  if (destination) return <Navigate to={destination} replace />;
   return (
     <div className="replay-route">
       <MobileReplayNotice />
       <div className="replay-desktop">
         <ReplayLocalNav />
-        {auth === 'entry' ||
-        (replayFixturesEnabled && auth === 'expired') ||
-        expired ? (
+        {auth === 'entry' && phase === 'loading' ? (
+          <AuthLoadingState />
+        ) : auth === 'entry' ||
+          (replayFixturesEnabled && auth === 'expired') ||
+          phase === 'expired' ? (
           <AuthState
             state={
-              (replayFixturesEnabled && auth === 'expired') || expired
+              (replayFixturesEnabled && auth === 'expired') ||
+              phase === 'expired'
                 ? 'expired'
                 : 'entry'
             }
@@ -302,35 +332,39 @@ export function ReplayJobsPage() {
   const [status, setStatus] = useState('all');
   const [jobs, setJobs] = useState<ReplayJobRecord[] | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [loadedPages, setLoadedPages] = useState(1);
   const [loadingMore, setLoadingMore] = useState(false);
   const [pageFailure, setPageFailure] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const loadedPagesRef = useRef(1);
   const load = useCallback(
     async (signal?: AbortSignal) => {
       setFailure(null);
       try {
-        const page = await api.jobPages(
+        const page = await api.jobs(
           status === 'all' ? undefined : (status as ReplayStatus),
-          loadedPages,
+          null,
           signal,
         );
         if (signal?.aborted) return;
-        setJobs(page.jobs);
-        setNextCursor(page.next_cursor);
+        setJobs((current) =>
+          current === null ? page.jobs : uniqueJobs([...page.jobs, ...current]),
+        );
+        if (loadedPagesRef.current === 1) setNextCursor(page.next_cursor);
         setPageFailure(null);
       } catch (error) {
-        if (!(error instanceof Error && error.name === 'AbortError'))
+        if (!(error instanceof Error && error.name === 'AbortError')) {
           setFailure(errorMessage(error));
+          throw error;
+        }
       }
     },
-    [api, loadedPages, status],
+    [api, status],
   );
   useEffect(() => {
     setJobs(null);
     setNextCursor(null);
-    setLoadedPages(1);
+    loadedPagesRef.current = 1;
     setFailure(null);
     setPageFailure(null);
   }, [status]);
@@ -349,7 +383,7 @@ export function ReplayJobsPage() {
       );
       setJobs((current) => uniqueJobs([...(current ?? []), ...page.jobs]));
       setNextCursor(page.next_cursor);
-      setLoadedPages((current) => current + 1);
+      loadedPagesRef.current += 1;
     } catch (error) {
       setPageFailure(errorMessage(error));
     } finally {
@@ -577,69 +611,97 @@ export function ReplayJobPage() {
   const [detail, setDetail] = useState<ReplayJobDetail | null>(null);
   const [events, setEvents] = useState<ReplayJobEventRecord[]>([]);
   const [eventCursor, setEventCursor] = useState<string | null>(null);
-  const [eventPages, setEventPages] = useState(1);
   const [loadingEvents, setLoadingEvents] = useState(false);
   const [eventFailure, setEventFailure] = useState<string | null>(null);
-  const [catalogue, setCatalogue] = useState<ReplayStrategy[]>([]);
+  const [bundleName, setBundleName] = useState<string | null>(null);
+  const [copiedBundle, setCopiedBundle] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const requestActive = useRef(false);
+  const eventsInitialized = useRef(false);
   const cancelDialog = useModalFocus(cancelOpen, () => setCancelOpen(false));
   const load = useCallback(
     async (signal?: AbortSignal) => {
+      if (requestActive.current) return true;
+      requestActive.current = true;
       try {
-        const next = await api.job(jobId, signal);
-        const merged: ReplayJobEventRecord[] = [];
-        let cursor: string | null = null;
-        let pagesRead = 0;
-        while (pagesRead < eventPages) {
-          const history = await api.jobEvents(jobId, cursor, signal);
-          merged.push(...history.events);
-          cursor = history.next_cursor;
-          pagesRead += 1;
-          if (!cursor) break;
-        }
+        const { detail: next, eventPage } = await loadReplayDetailCycle(
+          api,
+          jobId,
+          signal,
+        );
         if (signal?.aborted) return;
         setDetail(next);
-        setEvents(uniqueEvents(merged));
-        setEventCursor(cursor);
+        setEvents((current) =>
+          uniqueEvents([...current, ...eventPage.events]).sort(
+            (left, right) => Number(left.event_id) - Number(right.event_id),
+          ),
+        );
+        if (!eventsInitialized.current) {
+          eventsInitialized.current = true;
+          setEventCursor(eventPage.next_cursor);
+        }
         setEventFailure(null);
         setFailure(null);
+        return ['queued', 'running', 'archiving'].includes(next.status);
       } catch (error) {
-        if (!(error instanceof Error && error.name === 'AbortError'))
+        if (!(error instanceof Error && error.name === 'AbortError')) {
           setFailure(errorMessage(error));
+          throw error;
+        }
+        return false;
+      } finally {
+        requestActive.current = false;
       }
     },
-    [api, eventPages, jobId],
+    [api, jobId],
   );
   useEffect(() => {
-    if (fixtureState) return;
-    return startSerializedPolling(load, 5_000);
-  }, [fixtureState, load, refreshKey, session?.address]);
+    setDetail(null);
+    setEvents([]);
+    setEventCursor(null);
+    setBundleName(null);
+    eventsInitialized.current = false;
+  }, [jobId]);
   useEffect(() => {
     if (fixtureState) return;
+    return startSerializedPolling(load, 15_000);
+  }, [fixtureState, load, refreshKey, session?.address]);
+  const detailBundleId = detail?.request.bundle_id;
+  useEffect(() => {
+    if (fixtureState || !detailBundleId) return;
     const controller = new AbortController();
-    api
-      .strategies(controller.signal)
-      .then((next) => {
-        if (!controller.signal.aborted) setCatalogue(next.strategies);
-      })
-      .catch(() => undefined);
-    return () => controller.abort();
-  }, [api, fixtureState, jobId, session?.address]);
+    const timer = window.setTimeout(() => {
+      api
+        .bundleIdentity(detailBundleId, controller.signal)
+        .then((identity) => {
+          if (!controller.signal.aborted)
+            setBundleName(
+              bundleDisplayName(identity.participants, identity.bundle_id),
+            );
+        })
+        .catch(() => undefined);
+    }, 4_000);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [api, detailBundleId, fixtureState]);
   const loadMoreEvents = async () => {
-    if (!eventCursor || loadingEvents) return;
+    if (!eventCursor || loadingEvents || requestActive.current) return;
+    requestActive.current = true;
     setLoadingEvents(true);
     setEventFailure(null);
     try {
       const page = await api.jobEvents(jobId, eventCursor);
       setEvents((current) => uniqueEvents([...current, ...page.events]));
       setEventCursor(page.next_cursor);
-      setEventPages((current) => current + 1);
     } catch (error) {
       setEventFailure(errorMessage(error));
     } finally {
+      requestActive.current = false;
       setLoadingEvents(false);
     }
   };
@@ -669,15 +731,13 @@ export function ReplayJobPage() {
       </ReplayLayout>
     );
   const strategyName = detail?.request.strategy.name ?? 'bundle_coverage';
-  const strategyLabel =
-    catalogue.find((strategy) => strategy.name === strategyName)?.label ??
-    label(strategyName);
+  const strategyLabel = label(strategyName);
   const job: ReplayJob = fixtureState
     ? findReplayJob(jobId, fixtureState)
     : {
         id: detail!.job_id,
         bundle: detail!.request.bundle_id,
-        event: detail!.request.bundle_id,
+        event: bundleName ?? detail!.request.bundle_id,
         status: detail!.status,
         stage: detail!.stage,
         pendingOutcome: detail!.pending_outcome,
@@ -719,7 +779,26 @@ export function ReplayJobPage() {
         <div>
           <span className="eyebrow">REPLAY JOB</span>
           <h1>{job.event}</h1>
-          <code>{job.id}</code>
+          <div className="copyable-id">
+            <span>Bundle</span>
+            <code>{job.bundle}</code>
+            <button
+              className="copy-button"
+              type="button"
+              aria-label="Copy bundle ID"
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(job.bundle)
+                  .then(() => {
+                    setCopiedBundle(true);
+                    window.setTimeout(() => setCopiedBundle(false), 2_000);
+                  })
+                  .catch(() => setCopiedBundle(false));
+              }}
+            >
+              {copiedBundle ? 'Copied' : 'Copy'}
+            </button>
+          </div>
         </div>
         <div className="job-actions">
           <ReplayOutputControl />
@@ -813,6 +892,12 @@ export function ReplayJobPage() {
             <span className="eyebrow">AUDIT</span>
             <h2>Durable metadata</h2>
             <dl className="fact-list">
+              <div>
+                <dt>Job ID</dt>
+                <dd>
+                  <code>{job.id}</code>
+                </dd>
+              </div>
               <div>
                 <dt>Submitted by</dt>
                 <dd>
@@ -909,6 +994,7 @@ type BundleOption = {
   detail: string;
   markets: string[];
   latestRunId?: string;
+  lifecycle?: 'active' | 'retired';
 };
 
 const fixtureBundles: BundleOption[] = [
@@ -953,6 +1039,7 @@ export function NewReplayPage() {
   const [loading, setLoading] = useState(!fixture);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadWarning, setLoadWarning] = useState<string | null>(null);
+  const [bundleCursor, setBundleCursor] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [limitPreset, setLimitPreset] = useState('');
@@ -968,6 +1055,42 @@ export function NewReplayPage() {
   });
   const [validationAttempted, setValidationAttempted] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const addBundles = useCallback((bundles: UniverseBundle[]) => {
+    setBundleOptions((current) => {
+      const byId = new Map(current.map((bundle) => [bundle.id, bundle]));
+      for (const bundle of bundles)
+        byId.set(bundle.bundle_id, {
+          id: bundle.bundle_id,
+          event: bundleDisplayName(bundle.participants, bundle.bundle_id),
+          detail: `${label(bundle.game ?? bundle.sport)} · ${displayDate(bundle.activation_at)}`,
+          latestRunId: bundle.latest_run_id,
+          markets: byId.get(bundle.bundle_id)?.markets ?? [],
+          lifecycle: bundle.lifecycle,
+        });
+      return [...byId.values()];
+    });
+    setLoading(false);
+  }, []);
+  const discoverBundles = useCallback(
+    async (cursor: string | null, signal?: AbortSignal) => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const result = await api.bundles(signal, {
+          cursor,
+          onPage: addBundles,
+        });
+        setBundleCursor(result.next_cursor);
+        setLoadWarning(result.warning);
+      } catch (error) {
+        if (!(error instanceof Error && error.name === 'AbortError'))
+          setLoadError(errorMessage(error));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [addBundles, api],
+  );
   useEffect(() => {
     if (fixture) {
       setStrategies([
@@ -983,31 +1106,22 @@ export function NewReplayPage() {
       return;
     }
     const controller = new AbortController();
-    Promise.all([
-      api.bundles(controller.signal),
-      api.strategies(controller.signal),
-    ])
-      .then(([bundlePage, catalogue]) => {
-        setBundleOptions(
-          bundlePage.bundles
-            .filter((bundle) => bundle.lifecycle === 'retired')
-            .map((bundle) => ({
-              id: bundle.bundle_id,
-              event: bundle.participants.join(' vs ') || bundle.bundle_id,
-              detail: `${label(bundle.game ?? bundle.sport)} · ${displayDate(bundle.activation_at)}`,
-              latestRunId: bundle.latest_run_id,
-              markets: [] as string[],
-            })),
-        );
-        setStrategies(catalogue.strategies);
-        setLimits(catalogue.limits);
-        setLoadError(null);
-        setLoadWarning(bundlePage.warning);
-      })
-      .catch((error) => setLoadError(errorMessage(error)))
-      .finally(() => setLoading(false));
-    return () => controller.abort();
-  }, [api, fixture]);
+    const timer = window.setTimeout(() => {
+      api
+        .strategies(controller.signal)
+        .then((catalogue) => {
+          setStrategies(catalogue.strategies);
+          setLimits(catalogue.limits);
+          return discoverBundles(null, controller.signal);
+        })
+        .catch((error) => setLoadError(errorMessage(error)))
+        .finally(() => setLoading(false));
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [api, discoverBundles, fixture]);
   const selectedBundle = bundleOptions.find(
     (bundle) => bundle.id === form.bundleId,
   );
@@ -1080,13 +1194,13 @@ export function NewReplayPage() {
       setSubmitting(false);
     }
   };
-  if (loading)
+  if (loading && bundleOptions.length === 0)
     return (
       <ReplayLayout>
         <LoadingRows />
       </ReplayLayout>
     );
-  if (loadError)
+  if (loadError && bundleOptions.length === 0)
     return (
       <ReplayLayout>
         <div className="replay-state-card negative" role="alert">
@@ -1111,6 +1225,31 @@ export function NewReplayPage() {
       {loadWarning && (
         <div className="inline-warning" role="status">
           {loadWarning}
+          {bundleCursor && (
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={loading}
+              onClick={() => void discoverBundles(bundleCursor)}
+            >
+              {loading ? 'Resuming…' : 'Resume discovery'}
+            </button>
+          )}
+        </div>
+      )}
+      {loadError && (
+        <div className="inline-error" role="alert">
+          Bundle discovery paused: {loadError}
+          {bundleCursor && (
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={loading}
+              onClick={() => void discoverBundles(bundleCursor)}
+            >
+              Try again
+            </button>
+          )}
         </div>
       )}
       <form className="new-replay-layout" onSubmit={submit} noValidate>
@@ -1123,7 +1262,10 @@ export function NewReplayPage() {
               <span>1</span>
               <b>Historical bundle</b>
             </legend>
-            <p>Choose one retired Event Universe bundle.</p>
+            <p>
+              All discovered bundles are shown. Retired bundles are eligible for
+              historical replay; active bundles remain visible for context.
+            </p>
             <label className="field-label" htmlFor="bundle">
               Bundle
             </label>
@@ -1137,8 +1279,15 @@ export function NewReplayPage() {
             >
               <option value="">Select a historical bundle</option>
               {bundleOptions.map((bundle) => (
-                <option value={bundle.id} key={bundle.id}>
+                <option
+                  value={bundle.id}
+                  key={bundle.id}
+                  disabled={bundle.lifecycle === 'active'}
+                >
                   {bundle.event} — {bundle.detail}
+                  {bundle.lifecycle === 'active'
+                    ? ' — Active (not yet eligible)'
+                    : ''}
                 </option>
               ))}
             </select>
@@ -1417,8 +1566,13 @@ const initialMembers: Member[] = [
 export function ReplayAdminPage() {
   const [params] = useSearchParams();
   const state = replayFixturesEnabled ? params.get('state') : null;
-  const { client: api, session } = useUniverseAuth();
+  const { client: api, session, phase } = useUniverseAuth();
   const fixture = state !== null;
+  const access = fixture
+    ? state === 'forbidden'
+      ? 'forbidden'
+      : 'console'
+    : adminAccessState(phase);
   const [members, setMembers] = useState(fixture ? initialMembers : []);
   const [membersLoaded, setMembersLoaded] = useState(fixture);
   const [failure, setFailure] = useState<string | null>(null);
@@ -1481,7 +1635,19 @@ export function ReplayAdminPage() {
       setBusy(false);
     }
   };
-  if (state === 'forbidden' || (!fixture && session?.role !== 'admin'))
+  if (access === 'loading')
+    return (
+      <ReplayLayout>
+        <AuthLoadingState />
+      </ReplayLayout>
+    );
+  if (access === 'sign-in' || access === 'expired')
+    return (
+      <ReplayLayout>
+        <AuthState state={access === 'expired' ? 'expired' : 'entry'} />
+      </ReplayLayout>
+    );
+  if (access === 'forbidden')
     return (
       <ReplayLayout>
         <div className="replay-state-card negative">
@@ -1701,7 +1867,7 @@ export function ReplayOutputPage() {
 
 export function AccountMenu() {
   const location = useLocation();
-  const { session, signOut } = useUniverseAuth();
+  const { session, phase, signOut } = useUniverseAuth();
   const [open, setOpen] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -1709,15 +1875,30 @@ export function AccountMenu() {
   const fixtureSignedIn =
     replayFixturesEnabled &&
     params.has('state') &&
-    params.get('state') !== 'forbidden';
-  const signedOut = !session && !fixtureSignedIn;
-  const isAdmin = session?.role === 'admin' || fixtureSignedIn;
+    params.get('auth') !== 'entry';
+  const fixtureRole = fixtureSignedIn
+    ? params.get('state') === 'forbidden'
+      ? 'member'
+      : 'admin'
+    : null;
+  const effectivePhase = fixtureRole ?? phase;
+  const signedOut =
+    effectivePhase === 'signed-out' || effectivePhase === 'expired';
+  const isAdmin = effectivePhase === 'admin';
   const address =
     session?.address ?? '0x7A421D4888A61E5D3945A7B6EAA973CBDBA819F2';
   useEffect(() => {
     if (open)
       menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
   }, [open]);
+  if (effectivePhase === 'loading')
+    return (
+      <span
+        className="account-loading"
+        aria-label="Checking wallet session"
+        aria-busy="true"
+      />
+    );
   if (signedOut)
     return (
       <Link className="header-sign-in" to="/replay?auth=entry">

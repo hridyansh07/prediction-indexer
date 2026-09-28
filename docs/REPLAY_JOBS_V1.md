@@ -1002,7 +1002,10 @@ sign-in and job views.
   message production accepts. Agents sign in through an injected EIP-1193 test
   provider holding their own allowlisted member key.
 - Wallet sign-in: EIP-1193 plus a SIWE message built from `GET /v1/auth/nonce`.
-  The token is held in memory only.
+  The closed session response is retained in browser `localStorage` so refresh
+  restores its token, wallet, role, and expiry without another signature. The
+  UI removes malformed, expired, signed-out, or server-rejected sessions and
+  never logs the bearer token.
 - Replay pages: a job list and a job detail showing status, stage, pending
   outcome, reason code and detail, attempts, and the archive receipt key. There
   is no result summary in V1: the archived receipt is the deliverable. A

@@ -6,7 +6,7 @@ const ROOT =
 const client = ROOT
   ? new UniverseClient({
       baseUrl: ROOT,
-      fetch: (...arguments_) => fetch(...arguments_),
+      requestIntervalMs: typeof window === 'undefined' ? 0 : undefined,
     })
   : null;
 

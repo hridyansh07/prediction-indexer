@@ -14,13 +14,20 @@ import {
   validateReplayForm,
 } from '../src/client/replay-model.js';
 import {
+  adminAccessState,
+  authPhase,
   buildSiweMessage,
+  loadStoredSession,
   normalizeWalletAddress,
+  persistSession,
+  replayEntryDestination,
   signInErrorMessage,
   validateSiweConfig,
 } from '../src/client/universe-auth.js';
 import {
   BUNDLE_PAGE_SIZE,
+  bundleDisplayName,
+  loadReplayDetailCycle,
   parseRetryAfter,
   startSerializedPolling,
   UniverseApiError,
@@ -214,6 +221,87 @@ test('direct client preserves typed HTTP errors, Retry-After, and 401 revocation
   );
 });
 
+test('Universe REST clients share one serialized request-start coordinator', async () => {
+  let active = 0;
+  let maximum = 0;
+  const starts: number[] = [];
+  const fetchImpl = (async (input) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    starts.push(Date.now());
+    await new Promise((resolve) => setTimeout(resolve, 3));
+    active -= 1;
+    return new URL(String(input)).pathname.endsWith('/strategies')
+      ? response({ version: 1, strategies: [], limits: [] })
+      : response({ jobs: [], next_cursor: null });
+  }) as typeof fetch;
+  const first = new UniverseClient({
+    baseUrl: 'https://rest-wide.example',
+    fetch: fetchImpl,
+    requestIntervalMs: 8,
+  });
+  const second = new UniverseClient({
+    baseUrl: 'https://rest-wide.example',
+    fetch: fetchImpl,
+    requestIntervalMs: 8,
+  });
+  await Promise.all([first.jobs(), second.strategies()]);
+  assert.equal(maximum, 1);
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1] - starts[0] >= 8);
+});
+
+test('a REST-wide 429 cooldown delays the next route without retrying it', async () => {
+  const starts: number[] = [];
+  const api = new UniverseClient({
+    baseUrl: 'https://rest-cooldown.example',
+    requestIntervalMs: 10,
+    fetch: (async (input) => {
+      starts.push(Date.now());
+      return new URL(String(input)).pathname.endsWith('/jobs')
+        ? response({ error: 'rate limit exceeded' }, 429, {
+            'retry-after': '0',
+          })
+        : response({ version: 1, strategies: [], limits: [] });
+    }) as typeof fetch,
+  });
+  await assert.rejects(api.jobs(), UniverseApiError);
+  await api.strategies();
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1] - starts[0] >= 9);
+});
+
+test('a stale route aborts while queued in the shared REST coordinator', async () => {
+  let finishFirst!: () => void;
+  let fetches = 0;
+  const api = new UniverseClient({
+    baseUrl: 'https://rest-abort.example',
+    requestIntervalMs: 1,
+    fetch: (async (input) => {
+      fetches += 1;
+      if (new URL(String(input)).pathname.endsWith('/jobs'))
+        await new Promise<void>((resolve) => {
+          finishFirst = resolve;
+        });
+      return new URL(String(input)).pathname.endsWith('/strategies')
+        ? response({ version: 1, strategies: [], limits: [] })
+        : response({ jobs: [], next_cursor: null });
+    }) as typeof fetch,
+  });
+  const first = api.jobs();
+  while (!finishFirst) await new Promise((resolve) => setTimeout(resolve, 1));
+  const controller = new AbortController();
+  const queued = api.strategies(controller.signal);
+  controller.abort();
+  await assert.rejects(
+    queued,
+    (error) => error instanceof Error && error.name === 'AbortError',
+  );
+  finishFirst();
+  await first;
+  assert.equal(fetches, 1);
+});
+
 test('initial SIWE 401 does not expire a session that never existed', async () => {
   let revoked = 0;
   const api = new UniverseClient({
@@ -231,23 +319,104 @@ test('initial SIWE 401 does not expire a session that never existed', async () =
   assert.equal(revoked, 0);
 });
 
-test('bundle discovery paginates and reduces its page size after 413', async () => {
+test('auth hydration distinguishes signed-out, admin, member, expiry, and signout', () => {
+  assert.equal(authPhase(false, null, false, false), 'loading');
+  assert.equal(authPhase(true, null, false, false), 'signed-out');
+  assert.equal(authPhase(true, null, true, false), 'expired');
+  assert.equal(authPhase(true, { role: 'admin' }, false, false), 'admin');
+  assert.equal(authPhase(true, { role: 'member' }, false, false), 'member');
+  assert.equal(authPhase(true, { role: 'admin' }, false, true), 'signed-out');
+});
+
+test('session storage restores a valid closed session without exposing its token', () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+  const session = {
+    token: 'a'.repeat(64),
+    address: '0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58',
+    role: 'admin' as const,
+    expires_at: '2026-09-29T12:00:00Z',
+  };
+  persistSession(storage, session);
+  assert.deepEqual(
+    loadStoredSession(storage, Date.parse('2026-09-29T11:00:00Z')),
+    session,
+  );
+});
+
+test('session hydration removes expired or malformed local storage', () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+  values.set(
+    'prediction-indexer.replay-session.v1',
+    JSON.stringify({
+      token: 'b'.repeat(64),
+      address: '0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58',
+      role: 'member',
+      expires_at: '2026-09-29T10:00:00Z',
+    }),
+  );
+  assert.equal(
+    loadStoredSession(storage, Date.parse('2026-09-29T11:00:00Z')),
+    null,
+  );
+  assert.equal(values.size, 0);
+  values.set('prediction-indexer.replay-session.v1', '{"token":"bad"}');
+  assert.equal(loadStoredSession(storage), null);
+  assert.equal(values.size, 0);
+});
+
+test('direct admin navigation uses loading, sign-in, forbidden, and console states', () => {
+  assert.equal(adminAccessState('loading'), 'loading');
+  assert.equal(adminAccessState('signed-out'), 'sign-in');
+  assert.equal(adminAccessState('expired'), 'expired');
+  assert.equal(adminAccessState('member'), 'forbidden');
+  assert.equal(adminAccessState('admin'), 'console');
+});
+
+test('authenticated standalone sign-in entry redirects by role with replace semantics', () => {
+  assert.equal(replayEntryDestination('admin'), '/replay/admin');
+  assert.equal(replayEntryDestination('member'), '/replay');
+  assert.equal(replayEntryDestination('loading'), null);
+  assert.equal(replayEntryDestination('signed-out'), null);
+});
+
+test('bundle discovery paginates serially and reduces its page size after 413', async () => {
   const requests: Array<{ cursor: string | null; limit: string | null }> = [];
+  let active = 0;
+  let maximum = 0;
   const api = new UniverseClient({
     baseUrl: 'https://universe.example',
     fetch: (async (input) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
       const url = new URL(String(input));
       const cursor = url.searchParams.get('cursor');
       const limit = url.searchParams.get('limit');
       requests.push({ cursor, limit });
-      if (cursor === null)
-        return response({ bundles: [bundle('bundle-a')], next_cursor: 'next' });
-      if (limit === String(BUNDLE_PAGE_SIZE))
-        return response({ error: 'bundle context exceeds limit' }, 413);
-      return response({ bundles: [bundle('bundle-b')], next_cursor: null });
+      try {
+        if (cursor === null)
+          return response({
+            bundles: [bundle('bundle-a')],
+            next_cursor: 'next',
+          });
+        if (limit === String(BUNDLE_PAGE_SIZE))
+          return response({ error: 'bundle context exceeds limit' }, 413);
+        return response({ bundles: [bundle('bundle-b')], next_cursor: null });
+      } finally {
+        active -= 1;
+      }
     }) as typeof fetch,
   });
-  const result = await api.bundles();
+  const result = await api.bundles(undefined, { paceMs: 0 });
   assert.deepEqual(
     result.bundles.map((item) => item.bundle_id),
     ['bundle-a', 'bundle-b'],
@@ -257,6 +426,7 @@ test('bundle discovery paginates and reduces its page size after 413', async () 
     { cursor: 'next', limit: '5' },
     { cursor: 'next', limit: '2' },
   ]);
+  assert.equal(maximum, 1);
 });
 
 test('bundle discovery reports an actionable 413 at one bundle per page', async () => {
@@ -266,7 +436,7 @@ test('bundle discovery reports an actionable 413 at one bundle per page', async 
       response({ error: 'bundle context exceeds limit' }, 413)) as typeof fetch,
   });
   await assert.rejects(
-    api.bundles(),
+    api.bundles(undefined, { paceMs: 0 }),
     (error) =>
       error instanceof UniverseApiError &&
       error.status === 413 &&
@@ -274,7 +444,7 @@ test('bundle discovery reports an actionable 413 at one bundle per page', async 
   );
 });
 
-test('bundle discovery keeps safe earlier pages when a later bundle is oversized', async () => {
+test('bundle discovery keeps safe earlier pages and its resume cursor after a later bundle is oversized', async () => {
   const api = new UniverseClient({
     baseUrl: 'https://universe.example',
     fetch: (async (input) => {
@@ -284,7 +454,7 @@ test('bundle discovery keeps safe earlier pages when a later bundle is oversized
         : response({ error: 'bundle context exceeds limit' }, 413);
     }) as typeof fetch,
   });
-  const result = await api.bundles();
+  const result = await api.bundles(undefined, { paceMs: 0 });
   assert.deepEqual(
     result.bundles.map((item) => item.bundle_id),
     ['bundle-a'],
@@ -296,38 +466,83 @@ test('bundle discovery keeps safe earlier pages when a later bundle is oversized
   assert.equal(result.next_cursor, 'blocked');
 });
 
-test('bundle rate-limit retries reset after each completed page', async () => {
-  const attempts = new Map<string, number>();
-  const pages: Record<string, { id: string; next: string | null }> = {
-    first: { id: 'bundle-a', next: 'page-b' },
-    'page-b': { id: 'bundle-b', next: 'page-c' },
-    'page-c': { id: 'bundle-c', next: 'page-d' },
-    'page-d': { id: 'bundle-d', next: null },
+test('bundle discovery stops on 429, preserves pages, and resumes at the blocked cursor', async () => {
+  const requests: Array<string | null> = [];
+  let allowResume = false;
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const cursor = new URL(String(input)).searchParams.get('cursor');
+      requests.push(cursor);
+      if (cursor === null)
+        return response({
+          bundles: [bundle('bundle-a')],
+          next_cursor: 'page-b',
+        });
+      if (!allowResume)
+        return response({ error: 'rate limit exceeded' }, 429, {
+          'retry-after': '7',
+        });
+      return response({
+        bundles: [bundle('bundle-b')],
+        next_cursor: null,
+      });
+    }) as typeof fetch,
+  });
+  const partial = await api.bundles(undefined, { paceMs: 0 });
+  assert.deepEqual(
+    partial.bundles.map((item) => item.bundle_id),
+    ['bundle-a'],
+  );
+  assert.equal(partial.next_cursor, 'page-b');
+  assert.equal(partial.retry_after_seconds, 7);
+  assert.match(partial.warning ?? '', /rate limit/i);
+
+  allowResume = true;
+  const resumed = await api.bundles(undefined, {
+    cursor: partial.next_cursor,
+    paceMs: 0,
+  });
+  assert.deepEqual(
+    resumed.bundles.map((item) => item.bundle_id),
+    ['bundle-b'],
+  );
+  assert.deepEqual(requests, [null, 'page-b', 'page-b']);
+});
+
+test('one detail refresh cycle reads job then one event page without overlap', async () => {
+  const paths: string[] = [];
+  let active = 0;
+  let maximum = 0;
+  const request = {
+    replay_request_version: 1,
+    bundle_id: 'bundle-1',
+    probe_markets: null,
+    interval: null,
+    strategy: { name: 'coverage', config: {} },
+    limits: 'small',
   };
   const api = new UniverseClient({
     baseUrl: 'https://universe.example',
     fetch: (async (input) => {
-      const cursor =
-        new URL(String(input)).searchParams.get('cursor') ?? 'first';
-      const attempt = (attempts.get(cursor) ?? 0) + 1;
-      attempts.set(cursor, attempt);
-      if (attempt === 1)
-        return response({ error: 'rate limit exceeded' }, 429, {
-          'retry-after': '0',
-        });
-      const page = pages[cursor];
-      return response({
-        bundles: [bundle(page.id)],
-        next_cursor: page.next,
-      });
+      active += 1;
+      maximum = Math.max(maximum, active);
+      const path = new URL(String(input)).pathname;
+      paths.push(path);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      active -= 1;
+      return path.endsWith('/events')
+        ? response({ events: [], next_cursor: null })
+        : response({ ...job, request });
     }) as typeof fetch,
   });
-  const result = await api.bundles();
-  assert.deepEqual(
-    result.bundles.map((item) => item.bundle_id),
-    ['bundle-a', 'bundle-b', 'bundle-c', 'bundle-d'],
-  );
-  assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
+  const result = await loadReplayDetailCycle(api, job.job_id);
+  assert.equal(result.detail.job_id, job.job_id);
+  assert.deepEqual(paths, [
+    `/v1/replay/jobs/${job.job_id}`,
+    `/v1/replay/jobs/${job.job_id}/events`,
+  ]);
+  assert.equal(maximum, 1);
 });
 
 test('job and event cursors use the server cursor query contract', async () => {
@@ -347,39 +562,6 @@ test('job and event cursors use the server cursor query contract', async () => {
   assert.deepEqual(paths, [
     '/v1/replay/jobs?limit=25&status=queued&cursor=job-cursor',
     `/v1/replay/jobs/${job.job_id}/events?limit=50&cursor=event-cursor`,
-  ]);
-});
-
-test('load older and subsequent polling replay the cursor pages without duplicates', async () => {
-  const older = {
-    ...job,
-    job_id: '20260926T120000Z-fedcba9876543210',
-    created_at_ns: '0',
-    updated_at_ns: '0',
-  };
-  const paths: string[] = [];
-  const api = new UniverseClient({
-    baseUrl: 'https://universe.example',
-    fetch: (async (input) => {
-      const url = new URL(String(input));
-      paths.push(`${url.pathname}${url.search}`);
-      return url.searchParams.get('cursor') === 'older-page'
-        ? response({ jobs: [job, older], next_cursor: null })
-        : response({ jobs: [job], next_cursor: 'older-page' });
-    }) as typeof fetch,
-  });
-  const afterLoadOlder = await api.jobPages(undefined, 2);
-  const afterPoll = await api.jobPages(undefined, 2);
-  assert.deepEqual(
-    afterLoadOlder.jobs.map((item) => item.job_id),
-    [job.job_id, older.job_id],
-  );
-  assert.deepEqual(afterPoll, afterLoadOlder);
-  assert.deepEqual(paths, [
-    '/v1/replay/jobs?limit=25',
-    '/v1/replay/jobs?limit=25&cursor=older-page',
-    '/v1/replay/jobs?limit=25',
-    '/v1/replay/jobs?limit=25&cursor=older-page',
   ]);
 });
 
@@ -415,6 +597,196 @@ test('serialized polling never overlaps and aborts the active request', async ()
   assert.equal(maximum, 1);
   assert.ok(calls >= 2);
   assert.equal(observedAbort, true);
+});
+
+test('polling pauses while hidden, resumes once, and terminal state stops it', async () => {
+  let paused = true;
+  let resume: (() => void) | undefined;
+  let calls = 0;
+  const stop = startSerializedPolling(
+    async () => {
+      calls += 1;
+      return false;
+    },
+    1,
+    {
+      isPaused: () => paused,
+      subscribe: (next) => {
+        resume = next;
+        return () => undefined;
+      },
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls, 0);
+  paused = false;
+  resume?.();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls, 1);
+  stop();
+});
+
+test('polling honors Retry-After and backs off after other errors', async () => {
+  const delays: number[] = [];
+  let calls = 0;
+  const stop = startSerializedPolling(
+    async () => {
+      calls += 1;
+      if (calls === 1) throw new UniverseApiError('slow down', 429, 4);
+      if (calls === 2) throw new Error('network');
+      return false;
+    },
+    1_000,
+    {
+      random: () => 0.5,
+      schedule: (callback, delay) => {
+        delays.push(delay);
+        return setTimeout(callback, 0);
+      },
+      clearSchedule: clearTimeout,
+    },
+  );
+  for (let attempt = 0; calls < 3 && attempt < 100; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  stop();
+  assert.deepEqual(delays.slice(1), [4_000, 4_000]);
+});
+
+test('polling jitter cannot exceed the backoff cap', async () => {
+  const delays: number[] = [];
+  let calls = 0;
+  const stop = startSerializedPolling(
+    async () => {
+      calls += 1;
+      if (calls === 8) return false;
+      throw new Error('network');
+    },
+    1_000,
+    {
+      random: () => 1,
+      schedule: (callback, delay) => {
+        delays.push(delay);
+        return setTimeout(callback, 0);
+      },
+      clearSchedule: clearTimeout,
+    },
+  );
+  for (let attempt = 0; calls < 8 && attempt < 100; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  stop();
+  assert.equal(Math.max(...delays), 60_000);
+});
+
+test('StrictMode-style immediate cleanup prevents a duplicate initial poll', async () => {
+  let calls = 0;
+  const task = async () => {
+    calls += 1;
+    return false;
+  };
+  const stopFirst = startSerializedPolling(task, 1);
+  stopFirst();
+  const stopSecond = startSerializedPolling(task, 1);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  stopSecond();
+  assert.equal(calls, 1);
+});
+
+test('stopping polling aborts a stale route request', async () => {
+  let aborted = false;
+  const stop = startSerializedPolling(
+    (signal) =>
+      new Promise<boolean>((resolve) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            aborted = true;
+            resolve(false);
+          },
+          { once: true },
+        );
+      }),
+    1,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  stop();
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(aborted, true);
+});
+
+test('bundle display name prefers authoritative participants and falls back to ID', () => {
+  assert.equal(
+    bundleDisplayName(['A very long participant', 'Opponent'], 'opaque-id'),
+    'A very long participant vs Opponent',
+  );
+  assert.equal(bundleDisplayName([], 'opaque-id'), 'opaque-id');
+});
+
+test('detail title resolves from one bounded Universe lookup and is cached', async () => {
+  const paths: string[] = [];
+  const source = {
+    manifest_key: 'manifest',
+    manifest_sha256: 'a'.repeat(64),
+    report_key: 'report',
+    report_sha256: 'b'.repeat(64),
+  };
+  const selection = {
+    run_id: '20260927T120000.000000Z',
+    generated_at: '2026-09-27T12:00:00Z',
+    bundle_id: 'opaque-id',
+    occurrence_kind: 'complete',
+    continuity_selected: true,
+    continuity_disposition: null,
+    sport: 'esports',
+    game: 'counter_strike_2',
+    topology: 'best_of_series',
+    activation_at: '2026-09-27T13:00:00Z',
+    capture_start_at: '2026-09-27T12:00:00Z',
+    retirement: null,
+    source,
+    origin: {
+      ...source,
+      run_id: '20260927T120000.000000Z',
+      generated_at: '2026-09-27T12:00:00Z',
+    },
+  };
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const path = `${new URL(String(input)).pathname}${new URL(String(input)).search}`;
+      paths.push(path);
+      if (path.includes('/history'))
+        return response({
+          selections: [selection],
+          sort: 'selected',
+          next_cursor: null,
+        });
+      return response({
+        ...selection,
+        context: {
+          bundle_id: 'opaque-id',
+          sport: 'esports',
+          game: 'counter_strike_2',
+          topology: 'best_of_series',
+          participants: ['Alpha', 'Beta'],
+          participant_keys: ['alpha', 'beta'],
+          activation_at: selection.activation_at,
+          capture_start_at: selection.capture_start_at,
+          event_refs: [],
+          markets: [],
+          targets: [],
+          relationships: [],
+        },
+      });
+    }) as typeof fetch,
+  });
+  const first = await api.bundleIdentity('opaque-id', undefined, 0);
+  const second = await api.bundleIdentity('opaque-id', undefined, 0);
+  assert.equal(
+    bundleDisplayName(first.participants, first.bundle_id),
+    'Alpha vs Beta',
+  );
+  assert.deepEqual(second, first);
+  assert.equal(paths.length, 2);
 });
 
 test('strategy config preserves catalogue keys and typed JSON values', () => {
@@ -633,9 +1005,11 @@ test('SIWE configuration rejects a non-canonical URI and explains server mismatc
 });
 
 test('fixtures are build-gated and focus/search/layout regressions stay fixed', async () => {
-  const [source, css] = await Promise.all([
+  const [source, css, html, favicon] = await Promise.all([
     readFile(new URL('../src/client/replay.tsx', import.meta.url), 'utf8'),
     readFile(new URL('../src/client/style.css', import.meta.url), 'utf8'),
+    readFile(new URL('../index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../public/favicon.svg', import.meta.url), 'utf8'),
   ]);
   assert.match(source, /VITE_REPLAY_FIXTURES === 'true'/);
   assert.match(source, /if \(opener\?\.isConnected\) opener\.focus\(\)/);
@@ -643,8 +1017,15 @@ test('fixtures are build-gated and focus/search/layout regressions stay fixed', 
   assert.match(source, /\{filtered\.length\}/);
   assert.match(source, /Load older jobs/);
   assert.match(source, /Load more history/);
+  assert.doesNotMatch(source, /jobPages\(/);
+  assert.match(source, /aria-label="Copy bundle ID"/);
+  assert.match(source, /navigator\.clipboard[\s\S]*\.writeText\(job\.bundle\)/);
   assert.match(
     css,
     /grid-template-columns: minmax\(0, 1fr\) 120px 124px 80px 12px/,
   );
+  assert.match(html, /rel="icon" href="\/favicon\.svg"/);
+  assert.match(html, /rel="apple-touch-icon" href="\/apple-touch-icon\.png"/);
+  assert.match(favicon, /viewBox="0 0 64 64"/);
+  assert.match(favicon, /#a9a7df/);
 });
