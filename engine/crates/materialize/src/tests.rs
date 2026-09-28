@@ -1584,3 +1584,73 @@ fn default_build_line_limit_includes_lf_and_fails_before_commit() {
         }
     }
 }
+
+fn fixture_selection(root: &Path) -> indexer_finalize::CanonicalSelection {
+    indexer_finalize::select_canonical_windows(
+        root,
+        0,
+        10,
+        indexer_finalize::SelectionPolicy {
+            certified: indexer_finalize::CertifiedPolicy::AllowUncertified,
+            lower_bound: indexer_finalize::LowerBoundPolicy::RequireWindowBoundary,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn staged_bytes_changed_after_writing_fail_the_stored_identity_check() {
+    let canonical = TempDir::new("tamper-source").unwrap();
+    let output = TempDir::new("tamper-output").unwrap();
+    canonical_fixture(canonical.path());
+    let window_root = output.path().join("window=0");
+    let result = build_window_inner(
+        fixture_selection(canonical.path()),
+        output.path(),
+        &spec(),
+        &mut FakeNormalizer::new(FakeMode::Normal),
+        |point| {
+            if point == Checkpoint::FilesSynced {
+                let stage = fs::read_dir(&window_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| path.is_dir() && path.extension().is_some_and(|e| e == "open"))
+                    .unwrap();
+                let mut sink = OpenOptions::new()
+                    .append(true)
+                    .open(stage.join("events.ndjson.zst"))
+                    .unwrap();
+                sink.write_all(b"\0").unwrap();
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        BuildError::Verification("staged events.ndjson.zst disagrees with the receipt".into())
+    );
+    assert!(output_directories(output.path()).is_empty());
+}
+
+#[test]
+fn every_committed_build_passes_the_full_independent_verifier() {
+    // Fresh builds skip the full re-read, so the full verifier runs here over
+    // writer output instead: a writer bug fails CI rather than production.
+    let modes = [FakeMode::Normal, FakeMode::Divergent];
+    for mode in modes {
+        let canonical = TempDir::new("independent-source").unwrap();
+        let output = TempDir::new("independent-output").unwrap();
+        canonical_fixture(canonical.path());
+        let built = build_window(
+            canonical.path(),
+            output.path(),
+            0,
+            10,
+            &spec(),
+            &mut FakeNormalizer::new(mode),
+        )
+        .unwrap();
+        let verified = verify_derivative(&built.derivative.directory).unwrap();
+        assert_eq!(verified, built.derivative);
+    }
+}

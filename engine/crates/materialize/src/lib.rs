@@ -4,6 +4,7 @@
 //! privately while Phase 0 is consumed, and cannot be published until verified
 //! EOF, normalizer `finish`, frame finish, and file fsync all succeed.
 
+mod candidate;
 mod evidence;
 mod profile1;
 mod reader;
@@ -189,7 +190,11 @@ where
         )
         .map_err(|e| BuildError::Audit(e.to_string()))?,
     );
-    CoverageEvidence::from_source(&source_receipt).map_err(BuildError::Audit)?;
+    let coverage = CoverageEvidence::from_source(&source_receipt).map_err(BuildError::Audit)?;
+    let mut limits = candidate::CandidateLimits::new();
+    limits
+        .coverage_lanes(coverage.lanes().len())
+        .map_err(BuildError::Verification)?;
     let address = derivative_address(&source_receipt, spec)?;
     // Hold ownership before creating any stage, through cleanup and publication.
     // Declaring this before StageGuard also keeps the lock held during its Drop.
@@ -224,10 +229,15 @@ where
                 .as_str()
                 .to_owned(),
         };
-        write_line(
+        let delivery_header = transport.header.clone();
+        let mut delivery = (0u64, 0u64);
+        write_counted(
             &mut sources,
             &canonical_value(&transport)?,
             "sources.ndjson.zst",
+            &limits,
+            &mut delivery,
+            false,
         )?;
         let normalized = catch_unwind(AssertUnwindSafe(|| normalizer.normalize(&source)))
             .map_err(|_| BuildError::NormalizerPanic)?
@@ -243,7 +253,7 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
+                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -259,12 +269,23 @@ where
                             "one source produced more than u32::MAX children".to_owned(),
                         )
                     })?;
+                    // A fault is only ever paired with its parse reject by the
+                    // Reject arm below; one returned as an ordinary child has none.
+                    if matches!(event, SegmentEvent::NormalizationFault(_)) {
+                        return Err(BuildError::Verification(
+                            "normalization fault events do not pair exactly with parse rejects"
+                                .to_owned(),
+                        ));
+                    }
                     let record = segment_record(&source, index, event)
                         .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                    write_line(
+                    write_counted(
                         &mut events,
                         &record.to_canonical_json(),
                         DERIVATIVE_EVENTS_FILE,
+                        &limits,
+                        &mut delivery,
+                        true,
                     )?;
                     counts.accepted_events =
                         checked_add(counts.accepted_events, 1, "accepted_events")?;
@@ -282,7 +303,7 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
+                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -324,16 +345,19 @@ where
                 let encoded = sidecar
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_line(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE)?;
+                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
                 let fault = NormalizationFault::new(reject_id, reject.impact)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
                 let record =
                     SegmentRecord::new(fault_header, SegmentEvent::NormalizationFault(fault))
                         .map_err(|error| BuildError::Normalizer(error.to_string()))?;
-                write_line(
+                write_counted(
                     &mut events,
                     &record.to_canonical_json(),
                     DERIVATIVE_EVENTS_FILE,
+                    &limits,
+                    &mut delivery,
+                    true,
                 )?;
                 counts.rejected_source_records =
                     checked_add(counts.rejected_source_records, 1, "rejected_source_records")?;
@@ -344,6 +368,9 @@ where
                 )?;
             }
         }
+        limits
+            .delivery(&delivery_header, delivery.0, delivery.1)
+            .map_err(BuildError::Verification)?;
     }
 
     catch_unwind(AssertUnwindSafe(|| normalizer.finish()))
@@ -359,6 +386,9 @@ where
             "finished audit capability disagrees with selected source".to_owned(),
         ));
     }
+    limits
+        .finish(audited.effective_interval(), counts.input_records, &coverage)
+        .map_err(BuildError::Verification)?;
 
     let (events_file, events_result) = events
         .finish()
@@ -447,7 +477,14 @@ where
     };
     receipt.validate().map_err(BuildError::Serialization)?;
     let receipt_bytes = canonical_document(&receipt)?;
-    verify::verify_candidate(&stage, &receipt_bytes).map_err(BuildError::Verification)?;
+    // The writer enforced the reader's line, group, and lane limits as it wrote;
+    // prove the staged bytes are exactly the ones it recorded. Anything this
+    // process did not write still goes through the full `verify_derivative`.
+    limits
+        .metadata(&manifest_bytes, &receipt_bytes)
+        .map_err(BuildError::Verification)?;
+    candidate::verify_stored_identity(&stage, &receipt, &manifest_bytes)
+        .map_err(BuildError::Verification)?;
     checkpoint(Checkpoint::CandidateVerified)?;
 
     let final_directory = window_root.join(&address);
@@ -571,6 +608,25 @@ fn compressed_output(file: &str, result: EncodeResult) -> Result<CompressedOutpu
             ),
         },
     })
+}
+
+/// Writes one line after charging it to the current source delivery's limits.
+/// `record` is false only for source evidence, which the reader does not count
+/// as a group record.
+fn write_counted<W: Write>(
+    sink: &mut W,
+    bytes: &[u8],
+    name: &str,
+    limits: &candidate::CandidateLimits,
+    delivery: &mut (u64, u64),
+    record: bool,
+) -> Result<(), BuildError> {
+    let size = limits.line(bytes).map_err(BuildError::Verification)?;
+    delivery.0 = delivery.0.saturating_add(size);
+    if record {
+        delivery.1 = delivery.1.saturating_add(1);
+    }
+    write_line(sink, bytes, name)
 }
 
 fn canonical_document<T: Serialize>(value: &T) -> Result<Vec<u8>, BuildError> {

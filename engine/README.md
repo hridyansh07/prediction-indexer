@@ -205,11 +205,23 @@ and carry logical and stored identities. The strict verifier checks canonical
 JSON, closed versions and fields, frame EOF and both identities, event/child
 order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
 
-Builds use unique private staging directories. After EOF and both `finish()`
-calls, they finish and fsync frames, rename and fsync data, write and fsync the
-manifest, and strictly verify the complete candidate against the constructed
-receipt bytes. Only then do they atomically publish the uncommitted directory and
-write/fsync/rename the receipt last. Each build holds its per-address OS advisory
+Builds use unique private staging directories. While writing, a build applies
+the default reader's delivery-level checks to every source delivery it emits:
+line, group, tie-run, and lane limits; dense sequence, time order, and per-lane
+delivery order; equal-time tie tags; and, at EOF, the derivative window and
+agreement with the upstream receipt's coverage and clock claims. A fault event
+is only ever written paired with its parse reject. After EOF and both `finish()`
+calls, builds finish and fsync frames, rename and fsync data, write and fsync the
+manifest, check metadata-document limits, and re-hash every staged file against
+the stored identities the receipt records. They do not decode and re-parse their
+own output: the bytes are the ones the writer just produced under those checks.
+Only then do they atomically publish the uncommitted directory and
+write/fsync/rename the receipt last.
+
+The full strict verifier still runs everywhere a derivative was not written by
+the current process: an existing committed address (verify/no-op), pinned
+inspection, the walker's `open_pinned`, and Replay's download and cache paths.
+The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
 lock from before stage creation through publication and cleanup; process death
 releases it. Builds of the same address serialize, while different addresses can
 run concurrently. Before writing a new stage, every run scans directory names
@@ -260,9 +272,9 @@ temporary directory. The 8 GiB per-reader cap does not reserve free space or
 budget concurrent readers. Ordinary drop/error removes the owned snapshot only.
 
 The default 16 MiB NDJSON-line limit (including LF), 1 MiB metadata-document
-limit, and group/lane limits also deliberately apply to build-candidate
-verification: oversized candidates fail before publication, rather than produce
-artifacts rejected by the default verifier. These are operational limits, not
+limit, and group/lane limits also deliberately apply to builds, which enforce
+them while writing: oversized candidates fail before publication, rather than
+produce artifacts rejected by the default verifier. These are operational limits, not
 wire-format changes. Verification currently performs three full decode passes
 before traversal; a single-pass refactor and typed error categories are deferred.
 Do not infer retryability from error strings; an error invalidates the attempt,

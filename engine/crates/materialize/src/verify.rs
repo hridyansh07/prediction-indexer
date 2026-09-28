@@ -69,12 +69,6 @@ pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String>
     verify_contents(directory, receipt, receipt_bytes, true)
 }
 
-pub(crate) fn verify_candidate(directory: &Path, receipt_bytes: &[u8]) -> Result<(), String> {
-    let synthetic_path = directory.join(DERIVATIVE_RECEIPT_FILE);
-    let (receipt, canonical) = decode_receipt_document(receipt_bytes, &synthetic_path)?;
-    verify_contents(directory, receipt, canonical, false).map(|_| ())
-}
-
 pub(crate) fn inspect_contents(
     directory: &Path,
     receipt: DerivativeReceipt,

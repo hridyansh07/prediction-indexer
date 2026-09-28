@@ -148,7 +148,10 @@ automatic root creation. The reader deletes only its owned child on ordinary
 drop or error. The 8 GiB default snapshot cap is per reader, not a free-space
 reservation or process-wide quota; concurrent readers need an external budget.
 
-Build verification intentionally uses default verification limits too: 16 MiB
+Builds enforce the default verification limits while writing, and check a fresh
+candidate by re-hashing its staged files against the recorded identities rather
+than by re-decoding it; the full verifier described here still applies to every
+derivative a process did not just write. The limits are: 16 MiB
 per logical NDJSON line including LF, 1 MiB per metadata document, 64 MiB/100,000
 records per atomic group, and 1,024 lanes. Pinned inspection additionally limits
 combined receipt/manifest bytes to 1 MiB. These are operational limits, not new
