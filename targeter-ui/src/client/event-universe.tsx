@@ -69,7 +69,7 @@ export function EventUniversePage() {
       <MobileDetailNotice />
       <div className="page-heading">
         <span className="eyebrow">BUNDLE HISTORY</span>
-        <h1>One event, one row.</h1>
+        <h1>One event, one row</h1>
         <p>
           Browse bundles Targeter has selected without repeating every retained
           occurrence.

@@ -385,7 +385,7 @@ export function TargetsPage() {
       <MobileDetailNotice />
       <PageHeading
         eyebrow="CURRENT TARGETS"
-        title="Everything being indexed."
+        title="Everything being indexed"
         copy={`Normalized selected markets from the newest complete run · ${date(run.run.generated_at)}`}
       />
       <div className="compact-toolbar">
@@ -833,7 +833,7 @@ export function DecisionsPage() {
       <MobileDetailNotice />
       <PageHeading
         eyebrow="LATEST COMPLETE RUN"
-        title="How Targeter chose."
+        title="How Targeter chose"
         copy="The decision funnel stays separate from the bundles that are currently indexed."
       />
       <section className="decision-funnel">
