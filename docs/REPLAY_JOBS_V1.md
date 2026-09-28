@@ -756,9 +756,10 @@ the bundle cache's pin-inspection API.
    scratch/canonical, output_root: scratch/materialized, start_ns, end_ns}`. Its
    existing receipt scan sees only the restored windows. It returns the
    normalizer identity and ordered pins; the producer comes from `--describe`.
-3. **Inspect and upload** each derivative only after strict Rust pin inspection;
-   upload the fixed data/manifest allowlist with `put_immutable`, then
-   `receipt.json` last.
+3. **Install and upload** each derivative. `materialize_range` has already
+   checked the candidate it built (writer-side limits plus a stored-identity
+   re-hash); the local install binds the copy to its pin by hash. Upload the
+   fixed data/manifest allowlist with `put_immutable`, then `receipt.json` last.
 4. **Publish** `bundle_receipt_bytes(...)` at the one deterministic
    `bundle_receipt_key(bundle_id)` with `put_immutable`. An existing
    identical receipt (another job built it) is a no-op; a different one is an
