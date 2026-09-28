@@ -577,6 +577,31 @@ test('polling honors Retry-After and backs off after other errors', async () => 
   assert.deepEqual(delays.slice(1), [4_000, 4_000]);
 });
 
+test('polling jitter cannot exceed the backoff cap', async () => {
+  const delays: number[] = [];
+  let calls = 0;
+  const stop = startSerializedPolling(
+    async () => {
+      calls += 1;
+      if (calls === 8) return false;
+      throw new Error('network');
+    },
+    1_000,
+    {
+      random: () => 1,
+      schedule: (callback, delay) => {
+        delays.push(delay);
+        return setTimeout(callback, 0);
+      },
+      clearSchedule: clearTimeout,
+    },
+  );
+  for (let attempt = 0; calls < 8 && attempt < 100; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  stop();
+  assert.equal(Math.max(...delays), 60_000);
+});
+
 test('StrictMode-style immediate cleanup prevents a duplicate initial poll', async () => {
   let calls = 0;
   const task = async () => {

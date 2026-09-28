@@ -1316,7 +1316,10 @@ export function startSerializedPolling(
         error.retryAfterSeconds !== null
           ? error.retryAfterSeconds * 1_000
           : 0;
-      const jittered = exponential * (0.8 + random() * 0.4);
+      const jittered = Math.min(
+        maxIntervalMs,
+        exponential * (0.8 + random() * 0.4),
+      );
       nextDelay = Math.max(retryAfter, jittered);
     } finally {
       running = false;
