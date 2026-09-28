@@ -424,3 +424,24 @@ export function validateReplayForm(form: ReplayForm): Record<string, string> {
   if (!form.strategy) errors.strategy = 'Choose an active strategy.';
   return errors;
 }
+
+export function parseStrategyConfig(
+  keys: string[],
+  values: Record<string, string>,
+): { config: Record<string, unknown>; errors: Record<string, string> } {
+  const config: Record<string, unknown> = {};
+  const errors: Record<string, string> = {};
+  for (const key of keys) {
+    const source = values[key]?.trim();
+    if (!source) {
+      errors[key] = 'Enter a JSON value.';
+      continue;
+    }
+    try {
+      config[key] = JSON.parse(source) as unknown;
+    } catch {
+      errors[key] = 'Enter a valid JSON value.';
+    }
+  }
+  return { config, errors };
+}

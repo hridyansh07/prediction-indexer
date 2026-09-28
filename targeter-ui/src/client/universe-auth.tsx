@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { getAddress } from 'viem';
 import {
   createUniverseClient,
   UniverseApiError,
@@ -53,6 +54,48 @@ export function buildSiweMessage(
   return `${config.domain} wants you to sign in with your Ethereum account:\n${address}\n\n${config.statement}\n\nURI: ${config.uri}\nVersion: 1\nChain ID: ${config.chainId}\nNonce: ${nonce}\nIssued At: ${issuedAt}`;
 }
 
+export function normalizeWalletAddress(address: string) {
+  try {
+    return getAddress(address);
+  } catch {
+    throw new Error('The wallet provided an invalid Ethereum account.');
+  }
+}
+
+export function validateSiweConfig(config: SiweConfig) {
+  let uri: URL;
+  try {
+    uri = new URL(config.uri);
+  } catch {
+    throw new Error('Replay SIWE URI build configuration is invalid');
+  }
+  if (
+    !config.domain ||
+    !config.statement ||
+    !Number.isSafeInteger(config.chainId) ||
+    config.chainId <= 0 ||
+    !['http:', 'https:'].includes(uri.protocol) ||
+    uri.host !== config.domain ||
+    uri.username ||
+    uri.password ||
+    uri.search ||
+    uri.hash ||
+    uri.toString() !== config.uri
+  )
+    throw new Error(
+      'Replay SIWE public build configuration must use the exact canonical UI domain and URI (including its trailing slash)',
+    );
+  return config;
+}
+
+export function signInErrorMessage(cause: unknown) {
+  return cause instanceof UniverseApiError && cause.status === 401
+    ? 'Sign-in was rejected. The wallet may not be allowlisted, the signature may not match, or the SIWE domain/URI build configuration may differ from Universe.'
+    : cause instanceof Error
+      ? cause.message
+      : 'Wallet sign-in failed.';
+}
+
 export function readSiweConfig(): SiweConfig {
   const domain = import.meta.env.VITE_REPLAY_SIWE_DOMAIN as string | undefined;
   const uri = import.meta.env.VITE_REPLAY_SIWE_URI as string | undefined;
@@ -69,7 +112,7 @@ export function readSiweConfig(): SiweConfig {
     chainId <= 0
   )
     throw new Error('Replay SIWE public build configuration is incomplete');
-  return { domain, uri, statement, chainId };
+  return validateSiweConfig({ domain, uri, statement, chainId });
 }
 
 export function UniverseAuthProvider({
@@ -130,7 +173,7 @@ export function UniverseAuthProvider({
       });
       if (!Array.isArray(accounts) || typeof accounts[0] !== 'string')
         throw new Error('The wallet did not provide an account.');
-      const address = accounts[0];
+      const address = normalizeWalletAddress(accounts[0]);
       const { nonce } = await client.nonce();
       const message = buildSiweMessage(
         address,
@@ -149,13 +192,7 @@ export function UniverseAuthProvider({
       setSession(next);
       setExpired(false);
     } catch (cause) {
-      const message =
-        cause instanceof UniverseApiError && cause.status === 401
-          ? 'This wallet is not allowlisted or the signature was rejected.'
-          : cause instanceof Error
-            ? cause.message
-            : 'Wallet sign-in failed.';
-      setError(message);
+      setError(signInErrorMessage(cause));
       throw cause;
     } finally {
       setSigningIn(false);

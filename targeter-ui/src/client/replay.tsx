@@ -10,6 +10,7 @@ import {
 import {
   findReplayJob,
   jobProgress,
+  parseStrategyConfig,
   replayJobEvents,
   replayJobs,
   replayStages,
@@ -28,7 +29,10 @@ import {
   type ReplayJobRecord,
   type ReplayRequest,
   type ReplayStrategy,
+  startSerializedPolling,
 } from './universe-client';
+
+const replayFixturesEnabled = import.meta.env.VITE_REPLAY_FIXTURES === 'true';
 
 const displayDate = (value: string | null) =>
   value
@@ -66,6 +70,10 @@ function useModalFocus(open: boolean, close: () => void) {
   closeRef.current = close;
   useEffect(() => {
     if (!open || !dialog.current) return;
+    const opener =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     const element = dialog.current;
     element.focus();
     const keydown = (event: KeyboardEvent) => {
@@ -91,7 +99,10 @@ function useModalFocus(open: boolean, close: () => void) {
       }
     };
     element.addEventListener('keydown', keydown);
-    return () => element.removeEventListener('keydown', keydown);
+    return () => {
+      element.removeEventListener('keydown', keydown);
+      if (opener?.isConnected) opener.focus();
+    };
   }, [open]);
   return dialog;
 }
@@ -146,7 +157,9 @@ function ReplayLocalNav() {
   const { session } = useUniverseAuth();
   const [params] = useSearchParams();
   const fixtureAdmin =
-    params.has('state') && params.get('state') !== 'forbidden';
+    replayFixturesEnabled &&
+    params.has('state') &&
+    params.get('state') !== 'forbidden';
   return (
     <nav className="replay-local-nav" aria-label="Replay navigation">
       <NavLink to="/replay" end>
@@ -172,9 +185,15 @@ export function ReplayLayout({ children }: { children: React.ReactNode }) {
       <MobileReplayNotice />
       <div className="replay-desktop">
         <ReplayLocalNav />
-        {auth === 'entry' || auth === 'expired' || expired ? (
+        {auth === 'entry' ||
+        (replayFixturesEnabled && auth === 'expired') ||
+        expired ? (
           <AuthState
-            state={auth === 'expired' || expired ? 'expired' : 'entry'}
+            state={
+              (replayFixturesEnabled && auth === 'expired') || expired
+                ? 'expired'
+                : 'entry'
+            }
           />
         ) : (
           children
@@ -278,40 +297,74 @@ function LiveJobRow({ job }: { job: ReplayJobRecord }) {
 
 export function ReplayJobsPage() {
   const [params] = useSearchParams();
-  const view = params.get('view');
+  const view = replayFixturesEnabled ? params.get('view') : null;
   const { client: api } = useUniverseAuth();
   const [status, setStatus] = useState('all');
   const [jobs, setJobs] = useState<ReplayJobRecord[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadedPages, setLoadedPages] = useState(1);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [pageFailure, setPageFailure] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
   const load = useCallback(
     async (signal?: AbortSignal) => {
       setFailure(null);
       try {
-        const page = await api.jobs(
-          status === 'all' ? undefined : (status as ReplayStatus),
-          signal,
-        );
-        setJobs(page.jobs);
+        const merged: ReplayJobRecord[] = [];
+        let after: string | null = null;
+        let pagesRead = 0;
+        while (pagesRead < loadedPages) {
+          const page = await api.jobs(
+            status === 'all' ? undefined : (status as ReplayStatus),
+            after,
+            signal,
+          );
+          merged.push(...page.jobs);
+          after = page.next_cursor;
+          pagesRead += 1;
+          if (!after) break;
+        }
+        if (signal?.aborted) return;
+        setJobs(uniqueJobs(merged));
+        setNextCursor(after);
+        setPageFailure(null);
       } catch (error) {
         if (!(error instanceof Error && error.name === 'AbortError'))
           setFailure(errorMessage(error));
       }
     },
-    [api, status],
+    [api, loadedPages, status],
   );
   useEffect(() => {
+    setJobs(null);
+    setNextCursor(null);
+    setLoadedPages(1);
+    setFailure(null);
+    setPageFailure(null);
+  }, [status]);
+  useEffect(() => {
     if (view) return;
-    const controller = new AbortController();
-    void load(controller.signal);
-    const timer = window.setInterval(
-      () => void load(controller.signal),
-      10_000,
-    );
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [load, view]);
+    return startSerializedPolling(load, 10_000);
+  }, [load, refreshKey, view]);
+  const loadMore = async () => {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    setPageFailure(null);
+    try {
+      const page = await api.jobs(
+        status === 'all' ? undefined : (status as ReplayStatus),
+        nextCursor,
+      );
+      setJobs((current) => uniqueJobs([...(current ?? []), ...page.jobs]));
+      setNextCursor(page.next_cursor);
+      setLoadedPages((current) => current + 1);
+    } catch (error) {
+      setPageFailure(errorMessage(error));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
   const fixtureVisible =
     status === 'all'
       ? replayJobs
@@ -351,7 +404,7 @@ export function ReplayJobsPage() {
       </div>
       {view === 'loading' || (!view && jobs === null && !failure) ? (
         <LoadingRows />
-      ) : view === 'error' || failure ? (
+      ) : view === 'error' || (failure && jobs === null) ? (
         <div className="replay-state-card negative" role="alert">
           <b>Replay jobs could not be loaded</b>
           <span>
@@ -360,7 +413,10 @@ export function ReplayJobsPage() {
           <button
             className="quiet-button"
             type="button"
-            onClick={() => void load()}
+            onClick={() => {
+              setJobs(null);
+              setRefreshKey((current) => current + 1);
+            }}
           >
             Try again
           </button>
@@ -380,21 +436,56 @@ export function ReplayJobsPage() {
           </Link>
         </div>
       ) : (
-        <div className="replay-job-table">
-          <div className="replay-job-head" aria-hidden="true">
-            <span>Event</span>
-            <span>Status</span>
-            <span>Strategy</span>
-            <span>Created</span>
-            <span />
+        <>
+          {failure && (
+            <div className="inline-error" role="status">
+              Refresh failed: {failure}
+            </div>
+          )}
+          <div className="replay-job-table">
+            <div className="replay-job-head" aria-hidden="true">
+              <span>Event</span>
+              <span>Status</span>
+              <span>{view ? 'Strategy' : 'Stage'}</span>
+              <span>Created</span>
+              <span />
+            </div>
+            {view
+              ? fixtureVisible.map((job) => <JobRow job={job} key={job.id} />)
+              : jobs?.map((job) => <LiveJobRow job={job} key={job.job_id} />)}
           </div>
-          {view
-            ? fixtureVisible.map((job) => <JobRow job={job} key={job.id} />)
-            : jobs?.map((job) => <LiveJobRow job={job} key={job.job_id} />)}
-        </div>
+          {!view && (nextCursor || pageFailure) && (
+            <div className="pagination-stack">
+              {pageFailure && (
+                <span className="field-error" role="alert">
+                  {pageFailure}
+                </span>
+              )}
+              {nextCursor && (
+                <button
+                  className="quiet-button"
+                  type="button"
+                  disabled={loadingMore}
+                  onClick={() => void loadMore()}
+                >
+                  {loadingMore ? 'Loading…' : 'Load older jobs'}
+                </button>
+              )}
+            </div>
+          )}
+        </>
       )}
     </ReplayLayout>
   );
+}
+
+function uniqueJobs(jobs: ReplayJobRecord[]) {
+  const seen = new Set<string>();
+  return jobs.filter((job) => {
+    if (seen.has(job.job_id)) return false;
+    seen.add(job.job_id);
+    return true;
+  });
 }
 
 function JobProgress({ job }: { job: ReplayJob }) {
@@ -490,41 +581,78 @@ function JobEvents({
 export function ReplayJobPage() {
   const { jobId = '' } = useParams();
   const [params] = useSearchParams();
-  const fixtureState = params.get('state');
+  const fixtureState = replayFixturesEnabled ? params.get('state') : null;
   const { client: api, session } = useUniverseAuth();
   const [detail, setDetail] = useState<ReplayJobDetail | null>(null);
   const [events, setEvents] = useState<ReplayJobEventRecord[]>([]);
+  const [eventCursor, setEventCursor] = useState<string | null>(null);
+  const [eventPages, setEventPages] = useState(1);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+  const [eventFailure, setEventFailure] = useState<string | null>(null);
+  const [catalogue, setCatalogue] = useState<ReplayStrategy[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const cancelDialog = useModalFocus(cancelOpen, () => setCancelOpen(false));
   const load = useCallback(
     async (signal?: AbortSignal) => {
       try {
-        const [next, history] = await Promise.all([
-          api.job(jobId, signal),
-          api.jobEvents(jobId, signal),
-        ]);
+        const next = await api.job(jobId, signal);
+        const merged: ReplayJobEventRecord[] = [];
+        let cursor: string | null = null;
+        let pagesRead = 0;
+        while (pagesRead < eventPages) {
+          const history = await api.jobEvents(jobId, cursor, signal);
+          merged.push(...history.events);
+          cursor = history.next_cursor;
+          pagesRead += 1;
+          if (!cursor) break;
+        }
+        if (signal?.aborted) return;
         setDetail(next);
-        setEvents(history.events);
+        setEvents(uniqueEvents(merged));
+        setEventCursor(cursor);
+        setEventFailure(null);
         setFailure(null);
       } catch (error) {
-        setFailure(errorMessage(error));
+        if (!(error instanceof Error && error.name === 'AbortError'))
+          setFailure(errorMessage(error));
       }
     },
-    [api, jobId],
+    [api, eventPages, jobId],
   );
   useEffect(() => {
     if (fixtureState) return;
+    return startSerializedPolling(load, 5_000);
+  }, [fixtureState, load, refreshKey, session?.address]);
+  useEffect(() => {
+    if (fixtureState) return;
     const controller = new AbortController();
-    void load(controller.signal);
-    const timer = window.setInterval(() => void load(controller.signal), 5_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [fixtureState, load]);
-  if (!fixtureState && failure)
+    api
+      .strategies(controller.signal)
+      .then((next) => {
+        if (!controller.signal.aborted) setCatalogue(next.strategies);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [api, fixtureState, jobId, session?.address]);
+  const loadMoreEvents = async () => {
+    if (!eventCursor || loadingEvents) return;
+    setLoadingEvents(true);
+    setEventFailure(null);
+    try {
+      const page = await api.jobEvents(jobId, eventCursor);
+      setEvents((current) => uniqueEvents([...current, ...page.events]));
+      setEventCursor(page.next_cursor);
+      setEventPages((current) => current + 1);
+    } catch (error) {
+      setEventFailure(errorMessage(error));
+    } finally {
+      setLoadingEvents(false);
+    }
+  };
+  if (!fixtureState && failure && !detail)
     return (
       <ReplayLayout>
         <div className="replay-state-card negative" role="alert">
@@ -533,7 +661,10 @@ export function ReplayJobPage() {
           <button
             className="quiet-button"
             type="button"
-            onClick={() => void load()}
+            onClick={() => {
+              setDetail(null);
+              setRefreshKey((current) => current + 1);
+            }}
           >
             Try again
           </button>
@@ -547,6 +678,9 @@ export function ReplayJobPage() {
       </ReplayLayout>
     );
   const strategyName = detail?.request.strategy.name ?? 'bundle_coverage';
+  const strategyLabel =
+    catalogue.find((strategy) => strategy.name === strategyName)?.label ??
+    label(strategyName);
   const job: ReplayJob = fixtureState
     ? findReplayJob(jobId, fixtureState)
     : {
@@ -557,7 +691,7 @@ export function ReplayJobPage() {
         stage: detail!.stage,
         pendingOutcome: detail!.pending_outcome,
         strategy: strategyName,
-        strategyLabel: label(strategyName),
+        strategyLabel,
         markets: detail!.request.probe_markets ?? 'all',
         submittedBy: detail!.submitted_by,
         createdAt: nsDate(detail!.created_at_ns)!,
@@ -580,7 +714,7 @@ export function ReplayJobPage() {
     try {
       await api.cancel(job.id);
       setCancelOpen(false);
-      await load();
+      setRefreshKey((current) => current + 1);
     } catch (error) {
       setCancelError(errorMessage(error));
     }
@@ -630,8 +764,32 @@ export function ReplayJobPage() {
       </section>
       <div className="replay-detail-grid">
         <div className="detail-main">
+          {failure && (
+            <div className="inline-error" role="status">
+              Refresh failed: {failure}
+            </div>
+          )}
           <JobProgress job={job} />
           <JobEvents job={job} events={fixtureState ? undefined : events} />
+          {!fixtureState && (eventCursor || eventFailure) && (
+            <div className="pagination-stack">
+              {eventFailure && (
+                <span className="field-error" role="alert">
+                  {eventFailure}
+                </span>
+              )}
+              {eventCursor && (
+                <button
+                  className="quiet-button"
+                  type="button"
+                  disabled={loadingEvents}
+                  onClick={() => void loadMoreEvents()}
+                >
+                  {loadingEvents ? 'Loading…' : 'Load more history'}
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <aside className="detail-side" aria-label="Replay job metadata">
           <section className="replay-panel">
@@ -727,7 +885,6 @@ export function ReplayJobPage() {
                 className="quiet-button"
                 type="button"
                 onClick={() => setCancelOpen(false)}
-                autoFocus
               >
                 Keep queued
               </button>
@@ -744,6 +901,15 @@ export function ReplayJobPage() {
       )}
     </ReplayLayout>
   );
+}
+
+function uniqueEvents(events: ReplayJobEventRecord[]) {
+  const seen = new Set<string>();
+  return events.filter((event) => {
+    if (seen.has(event.event_id)) return false;
+    seen.add(event.event_id);
+    return true;
+  });
 }
 
 type BundleOption = {
@@ -787,7 +953,7 @@ export function NewReplayPage() {
   const { client: api, session } = useUniverseAuth();
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const fixture = params.get('fixture') === 'true';
+  const fixture = replayFixturesEnabled && params.get('fixture') === 'true';
   const [bundleOptions, setBundleOptions] = useState<BundleOption[]>(
     fixture ? fixtureBundles : [],
   );
@@ -795,8 +961,13 @@ export function NewReplayPage() {
   const [limits, setLimits] = useState<string[]>([]);
   const [loading, setLoading] = useState(!fixture);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadWarning, setLoadWarning] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [limitPreset, setLimitPreset] = useState('');
+  const [strategyValues, setStrategyValues] = useState<Record<string, string>>(
+    {},
+  );
   const retryRef = useRef<{ fingerprint: string; key: string } | null>(null);
   const [form, setForm] = useState<ReplayForm>({
     bundleId: '',
@@ -840,6 +1011,7 @@ export function NewReplayPage() {
         setStrategies(catalogue.strategies);
         setLimits(catalogue.limits);
         setLoadError(null);
+        setLoadWarning(bundlePage.warning);
       })
       .catch((error) => setLoadError(errorMessage(error)))
       .finally(() => setLoading(false));
@@ -875,6 +1047,16 @@ export function NewReplayPage() {
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const nextErrors = validateReplayForm(form);
+    if (!limitPreset) nextErrors.limits = 'Choose a backend run preset.';
+    const selectedStrategy = strategies.find(
+      (strategy) => strategy.name === form.strategy,
+    );
+    const parsedConfig = parseStrategyConfig(
+      selectedStrategy?.config_keys ?? [],
+      strategyValues,
+    );
+    for (const [key, message] of Object.entries(parsedConfig.errors))
+      nextErrors[`config.${key}`] = message;
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length || !session) {
       if (!session)
@@ -889,8 +1071,8 @@ export function NewReplayPage() {
       probe_markets:
         form.marketMode === 'all' ? null : [...form.selectedMarkets].sort(),
       interval: null,
-      strategy: { name: form.strategy, config: {} },
-      limits: limits[0],
+      strategy: { name: form.strategy, config: parsedConfig.config },
+      limits: limitPreset,
     };
     const fingerprint = JSON.stringify(request);
     if (!retryRef.current || retryRef.current.fingerprint !== fingerprint)
@@ -936,6 +1118,11 @@ export function NewReplayPage() {
           checked when the request is submitted.
         </p>
       </div>
+      {loadWarning && (
+        <div className="inline-warning" role="status">
+          {loadWarning}
+        </div>
+      )}
       <form className="new-replay-layout" onSubmit={submit} noValidate>
         <div className="new-replay-sections">
           <fieldset
@@ -1088,9 +1275,10 @@ export function NewReplayPage() {
                     name="strategy"
                     value={strategy.name}
                     checked={form.strategy === strategy.name}
-                    onChange={(event) =>
-                      update({ strategy: event.target.value })
-                    }
+                    onChange={(event) => {
+                      update({ strategy: event.target.value });
+                      setStrategyValues({});
+                    }}
                   />
                   <span className="strategy-icon" aria-hidden="true">
                     ⌁
@@ -1102,10 +1290,52 @@ export function NewReplayPage() {
                   <em>Active</em>
                 </label>
               ))}
+            {strategies
+              .find((strategy) => strategy.name === form.strategy)
+              ?.config_keys.map((key) => (
+                <label className="field-label strategy-config" key={key}>
+                  {label(key)}
+                  <input
+                    value={strategyValues[key] ?? ''}
+                    aria-invalid={Boolean(errors[`config.${key}`])}
+                    onChange={(event) =>
+                      setStrategyValues((current) => ({
+                        ...current,
+                        [key]: event.target.value,
+                      }))
+                    }
+                    placeholder="JSON value"
+                  />
+                  {errors[`config.${key}`] && (
+                    <span className="field-error">
+                      {errors[`config.${key}`]}
+                    </span>
+                  )}
+                </label>
+              ))}
             {errors.strategy && (
               <span className="field-error" id="strategy-error">
                 {errors.strategy}
               </span>
+            )}
+            <label className="field-label" htmlFor="limit-preset">
+              Backend run preset
+            </label>
+            <select
+              id="limit-preset"
+              value={limitPreset}
+              aria-invalid={Boolean(errors.limits)}
+              onChange={(event) => setLimitPreset(event.target.value)}
+            >
+              <option value="">Select a preset</option>
+              {limits.map((preset) => (
+                <option value={preset} key={preset}>
+                  {preset}
+                </option>
+              ))}
+            </select>
+            {errors.limits && (
+              <span className="field-error">{errors.limits}</span>
             )}
           </fieldset>
         </div>
@@ -1136,12 +1366,16 @@ export function NewReplayPage() {
               <dt>Time</dt>
               <dd>Full bundle history</dd>
             </div>
+            <div>
+              <dt>Preset</dt>
+              <dd>{limitPreset || 'Not selected'}</dd>
+            </div>
           </dl>
           <div className="fixed-note">
             <span aria-hidden="true">i</span>
             <p>
               <b>Time is fixed</b>The complete bundle interval is replayed.
-              There are no run-size or limit controls.
+              Runtime limits come only from the selected backend preset.
             </p>
           </div>
           <button
@@ -1192,7 +1426,7 @@ const initialMembers: Member[] = [
 
 export function ReplayAdminPage() {
   const [params] = useSearchParams();
-  const state = params.get('state');
+  const state = replayFixturesEnabled ? params.get('state') : null;
   const { client: api, session } = useUniverseAuth();
   const fixture = state !== null;
   const [members, setMembers] = useState(fixture ? initialMembers : []);
@@ -1286,7 +1520,10 @@ export function ReplayAdminPage() {
           <div className="panel-heading">
             <div>
               <h2 id="members-heading">Allowed wallets</h2>
-              <p>{members.length} members</p>
+              <p>
+                {filtered.length} {filtered.length === 1 ? 'member' : 'members'}
+                {query ? ` shown · ${members.length} total` : ''}
+              </p>
             </div>
             <label className="admin-search">
               <span aria-hidden="true">⌕</span>
@@ -1423,7 +1660,6 @@ export function ReplayAdminPage() {
                 className="quiet-button"
                 type="button"
                 onClick={() => setRemove(null)}
-                autoFocus
               >
                 Keep access
               </button>
@@ -1481,7 +1717,9 @@ export function AccountMenu() {
   const menu = useRef<HTMLDivElement>(null);
   const params = new URLSearchParams(location.search);
   const fixtureSignedIn =
-    params.has('state') && params.get('state') !== 'forbidden';
+    replayFixturesEnabled &&
+    params.has('state') &&
+    params.get('state') !== 'forbidden';
   const signedOut = !session && !fixtureSignedIn;
   const isAdmin = session?.role === 'admin' || fixtureSignedIn;
   const address =

@@ -10,6 +10,9 @@ import {
 
 const RESPONSE_LIMIT = 1_750_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
+export const BUNDLE_PAGE_SIZE = 5;
+const MAX_BUNDLE_PAGES = 128;
+const MAX_BUNDLE_RATE_RETRIES = 3;
 const JOB_ID = /^\d{8}T\d{6}Z-[0-9a-f]{16}$/;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const HEX_32 = /^[0-9a-f]{32}$/;
@@ -749,9 +752,15 @@ export class UniverseClient {
     const relative = path.replace(/^\//, '');
     return this.request(relative, codec, { signal });
   }
-  jobs(status?: ReplayStatus, signal?: AbortSignal) {
-    const query = new URLSearchParams({ limit: '100' });
+  jobs(
+    status?: ReplayStatus,
+    after?: string | null,
+    signal?: AbortSignal,
+    limit = 25,
+  ) {
+    const query = new URLSearchParams({ limit: String(limit) });
     if (status) query.set('status', status);
+    if (after) query.set('after', after);
     return this.request(`v1/replay/jobs?${query}`, validateJobPage, { signal });
   }
   job(jobId: string, signal?: AbortSignal) {
@@ -761,9 +770,16 @@ export class UniverseClient {
       { signal },
     );
   }
-  jobEvents(jobId: string, signal?: AbortSignal) {
+  jobEvents(
+    jobId: string,
+    cursor?: string | null,
+    signal?: AbortSignal,
+    limit = 50,
+  ) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set('cursor', cursor);
     return this.request(
-      `v1/replay/jobs/${encodeURIComponent(jobId)}/events?limit=100`,
+      `v1/replay/jobs/${encodeURIComponent(jobId)}/events?${query}`,
       validateJobEventPage,
       { signal },
     );
@@ -771,19 +787,67 @@ export class UniverseClient {
   async bundles(signal?: AbortSignal) {
     const bundles: UniverseBundle[] = [];
     let cursor: string | null = null;
-    for (let pageNumber = 0; pageNumber < 8; pageNumber += 1) {
-      const query = new URLSearchParams({ limit: '100' });
+    let pageSize = BUNDLE_PAGE_SIZE;
+    let rateRetries = 0;
+    const cursors = new Set<string>();
+    for (let pageNumber = 0; pageNumber < MAX_BUNDLE_PAGES; ) {
+      const query = new URLSearchParams({ limit: String(pageSize) });
       if (cursor) query.set('cursor', cursor);
-      const page = await this.request(
-        `v1/bundles?${query}`,
-        validateBundlePage,
-        { signal },
-      );
+      let page: ReturnType<typeof validateBundlePage>;
+      try {
+        page = await this.request(`v1/bundles?${query}`, validateBundlePage, {
+          signal,
+        });
+      } catch (error) {
+        if (
+          error instanceof UniverseApiError &&
+          error.status === 413 &&
+          pageSize > 1
+        ) {
+          pageSize = Math.max(1, Math.floor(pageSize / 2));
+          continue;
+        }
+        if (
+          error instanceof UniverseApiError &&
+          error.status === 413 &&
+          pageSize === 1
+        ) {
+          const message =
+            'An older historical bundle exceeds the Universe bundle-context limit even at one bundle per page.';
+          if (bundles.length)
+            return {
+              bundles,
+              next_cursor: cursor,
+              warning: `${message} Showing the bundles discovered before it.`,
+            };
+          throw new UniverseApiError(message, 413);
+        }
+        if (
+          error instanceof UniverseApiError &&
+          error.status === 429 &&
+          error.retryAfterSeconds !== null &&
+          rateRetries < MAX_BUNDLE_RATE_RETRIES
+        ) {
+          rateRetries += 1;
+          await abortableDelay(error.retryAfterSeconds * 1_000, signal);
+          continue;
+        }
+        throw error;
+      }
+      rateRetries = 0;
       bundles.push(...page.bundles);
+      pageNumber += 1;
       cursor = page.next_cursor;
-      if (!cursor) return { bundles, next_cursor: null };
+      if (!cursor) return { bundles, next_cursor: null, warning: null };
+      if (cursors.has(cursor)) throw contract('bundle cursor repeated');
+      cursors.add(cursor);
     }
-    return { bundles, next_cursor: cursor };
+    throw new UniverseApiError(
+      'Historical bundle discovery exceeded the bounded page limit.',
+      null,
+      null,
+      'contract',
+    );
   }
   selection(runId: string, bundleId: string, signal?: AbortSignal) {
     return this.request(
@@ -939,7 +1003,8 @@ export class UniverseClient {
       if (!response.ok) {
         const error = validateErrorResponse(document);
         const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
-        if (response.status === 401) this.options.onUnauthorized?.();
+        if (response.status === 401 && options.authenticated)
+          this.options.onUnauthorized?.();
         throw new UniverseApiError(error.error, response.status, retryAfter);
       }
       return codec(document);
@@ -966,6 +1031,48 @@ export class UniverseClient {
       options.signal?.removeEventListener('abort', abort);
     }
   }
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+export function startSerializedPolling(
+  task: (signal: AbortSignal) => Promise<void>,
+  intervalMs: number,
+) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const run = async () => {
+    if (controller.signal.aborted) return;
+    try {
+      await task(controller.signal);
+    } catch {
+      // Polling tasks own their visible error state. Keep the scheduler alive.
+    } finally {
+      if (!controller.signal.aborted)
+        timer = setTimeout(() => void run(), intervalMs);
+    }
+  };
+  void run();
+  return () => {
+    controller.abort();
+    if (timer !== null) clearTimeout(timer);
+  };
 }
 
 export function parseRetryAfter(

@@ -1,17 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import {
   findReplayJob,
   jobProgress,
+  parseStrategyConfig,
   replayJobEvents,
   replayJobs,
   replayStatuses,
   replayStatusMeta,
   validateReplayForm,
 } from '../src/client/replay-model.js';
-import { buildSiweMessage } from '../src/client/universe-auth.js';
 import {
+  buildSiweMessage,
+  normalizeWalletAddress,
+  signInErrorMessage,
+  validateSiweConfig,
+} from '../src/client/universe-auth.js';
+import {
+  BUNDLE_PAGE_SIZE,
   parseRetryAfter,
+  startSerializedPolling,
   UniverseApiError,
   UniverseClient,
   validateJobPage,
@@ -44,6 +53,23 @@ const response = (body: unknown, status = 200, headers: HeadersInit = {}) =>
     status,
     headers: { 'content-type': 'application/json', ...headers },
   });
+
+const bundle = (id: string) => ({
+  bundle_id: id,
+  latest_run_id: '20260927T120000.000000Z',
+  sport: 'esports',
+  game: 'counter_strike_2',
+  topology: 'best_of_series',
+  participants: ['Alpha', 'Beta'],
+  activation_at: '2026-09-27T12:00:00Z',
+  capture_start_at: '2026-09-27T11:00:00Z',
+  first_selected_at: '2026-09-27T10:00:00Z',
+  last_selected_at: '2026-09-27T11:00:00Z',
+  occurrence_count: 1,
+  venues: ['kalshi', 'polymarket'],
+  target_count: 2,
+  lifecycle: 'retired',
+});
 
 test('fixtures cover every landed visible status with non-color labels', () => {
   assert.deepEqual(
@@ -186,6 +212,190 @@ test('direct client preserves typed HTTP errors, Retry-After, and 401 revocation
   );
 });
 
+test('initial SIWE 401 does not expire a session that never existed', async () => {
+  let revoked = 0;
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async () =>
+      response({ error: 'authentication failed' }, 401)) as typeof fetch,
+    onUnauthorized: () => {
+      revoked += 1;
+    },
+  });
+  await assert.rejects(
+    api.signIn('message', 'signature'),
+    (error) => error instanceof UniverseApiError && error.status === 401,
+  );
+  assert.equal(revoked, 0);
+});
+
+test('bundle discovery paginates and reduces its page size after 413', async () => {
+  const requests: Array<{ cursor: string | null; limit: string | null }> = [];
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const url = new URL(String(input));
+      const cursor = url.searchParams.get('cursor');
+      const limit = url.searchParams.get('limit');
+      requests.push({ cursor, limit });
+      if (cursor === null)
+        return response({ bundles: [bundle('bundle-a')], next_cursor: 'next' });
+      if (limit === String(BUNDLE_PAGE_SIZE))
+        return response({ error: 'bundle context exceeds limit' }, 413);
+      return response({ bundles: [bundle('bundle-b')], next_cursor: null });
+    }) as typeof fetch,
+  });
+  const result = await api.bundles();
+  assert.deepEqual(
+    result.bundles.map((item) => item.bundle_id),
+    ['bundle-a', 'bundle-b'],
+  );
+  assert.deepEqual(requests, [
+    { cursor: null, limit: '5' },
+    { cursor: 'next', limit: '5' },
+    { cursor: 'next', limit: '2' },
+  ]);
+});
+
+test('bundle discovery reports an actionable 413 at one bundle per page', async () => {
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async () =>
+      response({ error: 'bundle context exceeds limit' }, 413)) as typeof fetch,
+  });
+  await assert.rejects(
+    api.bundles(),
+    (error) =>
+      error instanceof UniverseApiError &&
+      error.status === 413 &&
+      error.message.includes('one bundle per page'),
+  );
+});
+
+test('bundle discovery keeps safe earlier pages when a later bundle is oversized', async () => {
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const cursor = new URL(String(input)).searchParams.get('cursor');
+      return cursor === null
+        ? response({ bundles: [bundle('bundle-a')], next_cursor: 'blocked' })
+        : response({ error: 'bundle context exceeds limit' }, 413);
+    }) as typeof fetch,
+  });
+  const result = await api.bundles();
+  assert.deepEqual(
+    result.bundles.map((item) => item.bundle_id),
+    ['bundle-a'],
+  );
+  assert.match(
+    result.warning ?? '',
+    /Showing the bundles discovered before it/,
+  );
+  assert.equal(result.next_cursor, 'blocked');
+});
+
+test('bundle rate-limit retries reset after each completed page', async () => {
+  const attempts = new Map<string, number>();
+  const pages: Record<string, { id: string; next: string | null }> = {
+    first: { id: 'bundle-a', next: 'page-b' },
+    'page-b': { id: 'bundle-b', next: 'page-c' },
+    'page-c': { id: 'bundle-c', next: 'page-d' },
+    'page-d': { id: 'bundle-d', next: null },
+  };
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const cursor =
+        new URL(String(input)).searchParams.get('cursor') ?? 'first';
+      const attempt = (attempts.get(cursor) ?? 0) + 1;
+      attempts.set(cursor, attempt);
+      if (attempt === 1)
+        return response({ error: 'rate limit exceeded' }, 429, {
+          'retry-after': '0',
+        });
+      const page = pages[cursor];
+      return response({
+        bundles: [bundle(page.id)],
+        next_cursor: page.next,
+      });
+    }) as typeof fetch,
+  });
+  const result = await api.bundles();
+  assert.deepEqual(
+    result.bundles.map((item) => item.bundle_id),
+    ['bundle-a', 'bundle-b', 'bundle-c', 'bundle-d'],
+  );
+  assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
+});
+
+test('job and event cursors use their distinct server query contracts', async () => {
+  const paths: string[] = [];
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example',
+    fetch: (async (input) => {
+      const url = new URL(String(input));
+      paths.push(`${url.pathname}${url.search}`);
+      return url.pathname.endsWith('/events')
+        ? response({ events: [], next_cursor: null })
+        : response({ jobs: [], next_cursor: null });
+    }) as typeof fetch,
+  });
+  await api.jobs('queued', 'job-cursor', undefined, 25);
+  await api.jobEvents(job.job_id, 'event-cursor', undefined, 50);
+  assert.deepEqual(paths, [
+    '/v1/replay/jobs?limit=25&status=queued&after=job-cursor',
+    `/v1/replay/jobs/${job.job_id}/events?limit=50&cursor=event-cursor`,
+  ]);
+});
+
+test('serialized polling never overlaps and aborts the active request', async () => {
+  let active = 0;
+  let maximum = 0;
+  let calls = 0;
+  let observedAbort = false;
+  let finishFirst: (() => void) | undefined;
+  const stop = startSerializedPolling(async (signal) => {
+    calls += 1;
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise<void>((resolve) => {
+      if (calls === 1) finishFirst = resolve;
+      signal.addEventListener(
+        'abort',
+        () => {
+          observedAbort = true;
+          resolve();
+        },
+        { once: true },
+      );
+    });
+    active -= 1;
+  }, 2);
+  while (!finishFirst) await new Promise((resolve) => setTimeout(resolve, 1));
+  finishFirst();
+  for (let attempt = 0; calls < 2 && attempt < 100; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  stop();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(maximum, 1);
+  assert.ok(calls >= 2);
+  assert.equal(observedAbort, true);
+});
+
+test('strategy config preserves catalogue keys and typed JSON values', () => {
+  assert.deepEqual(
+    parseStrategyConfig(['threshold', 'enabled'], {
+      threshold: '0.75',
+      enabled: 'true',
+    }),
+    { config: { threshold: 0.75, enabled: true }, errors: {} },
+  );
+  assert.deepEqual(
+    parseStrategyConfig(['threshold'], { threshold: 'not-json' }).errors,
+    { threshold: 'Enter a valid JSON value.' },
+  );
+});
+
 test('direct client preserves actionable 403, 404, 409, and 503 responses', async () => {
   for (const status of [403, 404, 409, 503]) {
     const api = new UniverseClient({
@@ -253,7 +463,7 @@ test('caller cancellation remains an AbortError rather than a timeout failure', 
       })) as typeof fetch,
   });
   const controller = new AbortController();
-  const pending = api.jobs(undefined, controller.signal);
+  const pending = api.jobs(undefined, null, controller.signal);
   controller.abort();
   await assert.rejects(
     pending,
@@ -306,18 +516,55 @@ test('submission sends bearer auth without cookies and reuses the caller idempot
 });
 
 test('SIWE message uses configured values rather than the current browser origin', () => {
+  const address = normalizeWalletAddress(
+    '0x7472005ed1e68c8a82833cb5b251790ea6c0fb58',
+  );
   assert.equal(
     buildSiweMessage(
-      '0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58',
+      address,
       '0123456789abcdef0123456789abcdef',
       '2026-09-27T12:00:00.000Z',
-      {
+      validateSiweConfig({
+        domain: 'prediction-indexer-targeter-ui-b8xg.vercel.app',
+        uri: 'https://prediction-indexer-targeter-ui-b8xg.vercel.app/',
+        statement: 'Sign in to Prediction Indexer.',
+        chainId: 1,
+      }),
+    ),
+    'prediction-indexer-targeter-ui-b8xg.vercel.app wants you to sign in with your Ethereum account:\n0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58\n\nSign in to Prediction Indexer.\n\nURI: https://prediction-indexer-targeter-ui-b8xg.vercel.app/\nVersion: 1\nChain ID: 1\nNonce: 0123456789abcdef0123456789abcdef\nIssued At: 2026-09-27T12:00:00.000Z',
+  );
+});
+
+test('SIWE configuration rejects a non-canonical URI and explains server mismatch', () => {
+  assert.throws(
+    () =>
+      validateSiweConfig({
         domain: 'prediction-indexer-targeter-ui-b8xg.vercel.app',
         uri: 'https://prediction-indexer-targeter-ui-b8xg.vercel.app',
         statement: 'Sign in to Prediction Indexer.',
         chainId: 1,
-      },
-    ),
-    'prediction-indexer-targeter-ui-b8xg.vercel.app wants you to sign in with your Ethereum account:\n0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58\n\nSign in to Prediction Indexer.\n\nURI: https://prediction-indexer-targeter-ui-b8xg.vercel.app\nVersion: 1\nChain ID: 1\nNonce: 0123456789abcdef0123456789abcdef\nIssued At: 2026-09-27T12:00:00.000Z',
+      }),
+    /canonical UI domain and URI.*trailing slash/,
+  );
+  assert.match(
+    signInErrorMessage(new UniverseApiError('unauthorized', 401)),
+    /SIWE domain\/URI build configuration may differ from Universe/,
+  );
+});
+
+test('fixtures are build-gated and focus/search/layout regressions stay fixed', async () => {
+  const [source, css] = await Promise.all([
+    readFile(new URL('../src/client/replay.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/client/style.css', import.meta.url), 'utf8'),
+  ]);
+  assert.match(source, /VITE_REPLAY_FIXTURES === 'true'/);
+  assert.match(source, /if \(opener\?\.isConnected\) opener\.focus\(\)/);
+  assert.doesNotMatch(source, /autoFocus/);
+  assert.match(source, /\{filtered\.length\}/);
+  assert.match(source, /Load older jobs/);
+  assert.match(source, /Load more history/);
+  assert.match(
+    css,
+    /grid-template-columns: minmax\(0, 1fr\) 120px 124px 80px 12px/,
   );
 });

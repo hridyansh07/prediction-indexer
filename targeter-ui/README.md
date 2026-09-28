@@ -16,9 +16,10 @@ credentials. Event Universe owns report verification and lifecycle projection.
 ```text
 VITE_UNIVERSE_API_BASE_URL=https://34-182-18-247.sslip.io
 VITE_REPLAY_SIWE_DOMAIN=<the exact domain in Universe replay.auth.siwe_domain>
-VITE_REPLAY_SIWE_URI=<the exact URI in Universe replay.auth.siwe_uri>
+VITE_REPLAY_SIWE_URI=<the exact canonical URI in Universe replay.auth.siwe_uri, including its trailing slash>
 VITE_REPLAY_SIWE_STATEMENT=Sign in to Prediction Indexer.
 VITE_REPLAY_SIWE_CHAIN_ID=1
+VITE_REPLAY_FIXTURES=false # local visual-regression builds only
 PORT=3000 # optional local static server
 ```
 
@@ -77,7 +78,10 @@ their drawer closes.
 Replay production paths use Universe directly. URL fixture controls remain for
 design regression coverage: `?auth=entry`, `?auth=expired`, list
 `?view=loading|empty|error`, detail `?state=<job-status>`, new replay
-`?fixture=true`, and admin `?state=loading|error|forbidden|ready`.
+`?fixture=true`, and admin `?state=loading|error|forbidden|ready`. Except for the
+real sign-in entry route, these controls are disabled unless the explicit
+test-only `VITE_REPLAY_FIXTURES=true` build flag is present. Never set that flag
+in a production or Vercel environment.
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.
@@ -86,9 +90,11 @@ routes.
 
 Create the Vercel project from the repository root. [`vercel.json`](../vercel.json)
 builds only the Vite client, serves `targeter-ui/dist`, and supplies the SPA
-fallback. It has no API rewrite or function. Configure the same public
-`VITE_UNIVERSE_API_BASE_URL` and `VITE_REPLAY_SIWE_*` values in Vercel. No AWS,
-S3, OIDC, archive-prefix, staging, or decoder variables belong in Vercel.
+fallback. It has no API rewrite or function. The same file supplies the public
+`VITE_UNIVERSE_API_BASE_URL` and `VITE_REPLAY_SIWE_*` production build values;
+keep them exactly aligned with Universe when either deployment changes. No AWS,
+S3, OIDC, archive-prefix, staging, decoder, or private-key variables belong in
+Vercel.
 
 ## Local and orb operation
 

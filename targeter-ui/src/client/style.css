@@ -223,7 +223,8 @@ code {
   font-size: 11px;
 }
 select,
-.add-access input {
+.add-access input,
+.strategy-config input {
   min-height: 40px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -286,6 +287,34 @@ select,
   margin-top: 3px;
   color: var(--muted);
   font-size: 10px;
+}
+.pagination-stack {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.inline-error {
+  margin-bottom: 10px;
+  border: 1px solid #694447;
+  border-radius: 9px;
+  padding: 9px 12px;
+  color: #e8aaa5;
+  font-size: 10px;
+}
+.inline-warning {
+  margin-bottom: 14px;
+  border: 1px solid #66543b;
+  border-radius: 9px;
+  padding: 9px 12px;
+  background: #262219;
+  color: var(--apricot);
+  font-size: 10px;
+}
+.strategy-config input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
 }
 .replay-status {
   display: inline-flex;
@@ -1712,8 +1741,14 @@ main {
   }
   .replay-job-head,
   .replay-job-row {
-    grid-template-columns: minmax(260px, 1.5fr) 125px 140px 110px 18px;
+    grid-template-columns: minmax(0, 1fr) 120px 124px 80px 12px;
     gap: 10px;
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+  .replay-job-row > *,
+  .replay-job-head > * {
+    min-width: 0;
   }
   .new-replay-layout,
   .admin-grid,
