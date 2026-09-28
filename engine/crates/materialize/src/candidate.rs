@@ -75,8 +75,13 @@ impl CandidateLimits {
         logical_bytes: u64,
         record_count: u64,
     ) -> Result<(), String> {
-        add_size(&mut 0, logical_bytes, self.limits.max_group_bytes)?;
-        add_size(&mut 0, record_count, self.limits.max_group_records)?;
+        // `write_counted` sums the whole delivery first, so this is one bound
+        // check of the total rather than the reader's per-line accumulation.
+        if logical_bytes > self.limits.max_group_bytes
+            || record_count > self.limits.max_group_records
+        {
+            return Err("read resource limit exceeded".into());
+        }
 
         self.first_seq.get_or_insert(h.address().canonical_seq());
         let lane = h.address().lane();
