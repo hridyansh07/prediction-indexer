@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { UniverseBundle } from '../event-universe';
 import {
   Link,
+  Navigate,
   NavLink,
   useNavigate,
   useLocation,
@@ -21,7 +22,11 @@ import {
   type ReplayStatus,
   validateReplayDraft,
 } from './replay-model';
-import { useUniverseAuth } from './universe-auth';
+import {
+  adminAccessState,
+  replayEntryDestination,
+  useUniverseAuth,
+} from './universe-auth';
 import {
   UniverseApiError,
   type AllowlistMember,
@@ -156,8 +161,25 @@ function AuthState({ state }: { state: 'entry' | 'expired' }) {
   );
 }
 
+function AuthLoadingState() {
+  return (
+    <section
+      className="replay-auth-card auth-loading"
+      aria-label="Checking Replay access"
+      aria-busy="true"
+    >
+      <span className="auth-glyph" aria-hidden="true">
+        ◇
+      </span>
+      <span className="eyebrow">REPLAY ACCESS</span>
+      <h1>Checking access…</h1>
+      <p>Confirming this browser session.</p>
+    </section>
+  );
+}
+
 function ReplayLocalNav() {
-  const { session } = useUniverseAuth();
+  const { phase } = useUniverseAuth();
   const [params] = useSearchParams();
   const fixtureAdmin =
     replayFixturesEnabled &&
@@ -168,7 +190,7 @@ function ReplayLocalNav() {
       <NavLink to="/replay" end>
         Jobs
       </NavLink>
-      {(session?.role === 'admin' || fixtureAdmin) && (
+      {(phase === 'admin' || fixtureAdmin) && (
         <NavLink
           to={fixtureAdmin ? '/replay/admin?state=ready' : '/replay/admin'}
         >
@@ -182,18 +204,23 @@ function ReplayLocalNav() {
 export function ReplayLayout({ children }: { children: React.ReactNode }) {
   const [params] = useSearchParams();
   const auth = params.get('auth');
-  const { expired } = useUniverseAuth();
+  const { phase } = useUniverseAuth();
+  const destination = auth === 'entry' ? replayEntryDestination(phase) : null;
+  if (destination) return <Navigate to={destination} replace />;
   return (
     <div className="replay-route">
       <MobileReplayNotice />
       <div className="replay-desktop">
         <ReplayLocalNav />
-        {auth === 'entry' ||
-        (replayFixturesEnabled && auth === 'expired') ||
-        expired ? (
+        {auth === 'entry' && phase === 'loading' ? (
+          <AuthLoadingState />
+        ) : auth === 'entry' ||
+          (replayFixturesEnabled && auth === 'expired') ||
+          phase === 'expired' ? (
           <AuthState
             state={
-              (replayFixturesEnabled && auth === 'expired') || expired
+              (replayFixturesEnabled && auth === 'expired') ||
+              phase === 'expired'
                 ? 'expired'
                 : 'entry'
             }
@@ -1539,8 +1566,13 @@ const initialMembers: Member[] = [
 export function ReplayAdminPage() {
   const [params] = useSearchParams();
   const state = replayFixturesEnabled ? params.get('state') : null;
-  const { client: api, session } = useUniverseAuth();
+  const { client: api, session, phase } = useUniverseAuth();
   const fixture = state !== null;
+  const access = fixture
+    ? state === 'forbidden'
+      ? 'forbidden'
+      : 'console'
+    : adminAccessState(phase);
   const [members, setMembers] = useState(fixture ? initialMembers : []);
   const [membersLoaded, setMembersLoaded] = useState(fixture);
   const [failure, setFailure] = useState<string | null>(null);
@@ -1603,7 +1635,19 @@ export function ReplayAdminPage() {
       setBusy(false);
     }
   };
-  if (state === 'forbidden' || (!fixture && session?.role !== 'admin'))
+  if (access === 'loading')
+    return (
+      <ReplayLayout>
+        <AuthLoadingState />
+      </ReplayLayout>
+    );
+  if (access === 'sign-in' || access === 'expired')
+    return (
+      <ReplayLayout>
+        <AuthState state={access === 'expired' ? 'expired' : 'entry'} />
+      </ReplayLayout>
+    );
+  if (access === 'forbidden')
     return (
       <ReplayLayout>
         <div className="replay-state-card negative">
@@ -1823,7 +1867,7 @@ export function ReplayOutputPage() {
 
 export function AccountMenu() {
   const location = useLocation();
-  const { session, signOut } = useUniverseAuth();
+  const { session, phase, signOut } = useUniverseAuth();
   const [open, setOpen] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -1831,15 +1875,30 @@ export function AccountMenu() {
   const fixtureSignedIn =
     replayFixturesEnabled &&
     params.has('state') &&
-    params.get('state') !== 'forbidden';
-  const signedOut = !session && !fixtureSignedIn;
-  const isAdmin = session?.role === 'admin' || fixtureSignedIn;
+    params.get('auth') !== 'entry';
+  const fixtureRole = fixtureSignedIn
+    ? params.get('state') === 'forbidden'
+      ? 'member'
+      : 'admin'
+    : null;
+  const effectivePhase = fixtureRole ?? phase;
+  const signedOut =
+    effectivePhase === 'signed-out' || effectivePhase === 'expired';
+  const isAdmin = effectivePhase === 'admin';
   const address =
     session?.address ?? '0x7A421D4888A61E5D3945A7B6EAA973CBDBA819F2';
   useEffect(() => {
     if (open)
       menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
   }, [open]);
+  if (effectivePhase === 'loading')
+    return (
+      <span
+        className="account-loading"
+        aria-label="Checking wallet session"
+        aria-busy="true"
+      />
+    );
   if (signedOut)
     return (
       <Link className="header-sign-in" to="/replay?auth=entry">

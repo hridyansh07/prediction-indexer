@@ -82,6 +82,16 @@ code {
 .warn {
   color: var(--apricot);
 }
+.account-loading {
+  width: 88px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+.auth-loading .auth-glyph {
+  color: var(--periwinkle);
+}
 
 .app-header {
   position: sticky;

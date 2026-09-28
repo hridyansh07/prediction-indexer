@@ -14,8 +14,13 @@ import {
   validateReplayForm,
 } from '../src/client/replay-model.js';
 import {
+  adminAccessState,
+  authPhase,
   buildSiweMessage,
+  loadStoredSession,
   normalizeWalletAddress,
+  persistSession,
+  replayEntryDestination,
   signInErrorMessage,
   validateSiweConfig,
 } from '../src/client/universe-auth.js';
@@ -312,6 +317,76 @@ test('initial SIWE 401 does not expire a session that never existed', async () =
     (error) => error instanceof UniverseApiError && error.status === 401,
   );
   assert.equal(revoked, 0);
+});
+
+test('auth hydration distinguishes signed-out, admin, member, expiry, and signout', () => {
+  assert.equal(authPhase(false, null, false, false), 'loading');
+  assert.equal(authPhase(true, null, false, false), 'signed-out');
+  assert.equal(authPhase(true, null, true, false), 'expired');
+  assert.equal(authPhase(true, { role: 'admin' }, false, false), 'admin');
+  assert.equal(authPhase(true, { role: 'member' }, false, false), 'member');
+  assert.equal(authPhase(true, { role: 'admin' }, false, true), 'signed-out');
+});
+
+test('session storage restores a valid closed session without exposing its token', () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+  const session = {
+    token: 'a'.repeat(64),
+    address: '0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58',
+    role: 'admin' as const,
+    expires_at: '2026-09-29T12:00:00Z',
+  };
+  persistSession(storage, session);
+  assert.deepEqual(
+    loadStoredSession(storage, Date.parse('2026-09-29T11:00:00Z')),
+    session,
+  );
+});
+
+test('session hydration removes expired or malformed local storage', () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+  values.set(
+    'prediction-indexer.replay-session.v1',
+    JSON.stringify({
+      token: 'b'.repeat(64),
+      address: '0x7472005Ed1e68c8A82833cB5B251790eA6C0FB58',
+      role: 'member',
+      expires_at: '2026-09-29T10:00:00Z',
+    }),
+  );
+  assert.equal(
+    loadStoredSession(storage, Date.parse('2026-09-29T11:00:00Z')),
+    null,
+  );
+  assert.equal(values.size, 0);
+  values.set('prediction-indexer.replay-session.v1', '{"token":"bad"}');
+  assert.equal(loadStoredSession(storage), null);
+  assert.equal(values.size, 0);
+});
+
+test('direct admin navigation uses loading, sign-in, forbidden, and console states', () => {
+  assert.equal(adminAccessState('loading'), 'loading');
+  assert.equal(adminAccessState('signed-out'), 'sign-in');
+  assert.equal(adminAccessState('expired'), 'expired');
+  assert.equal(adminAccessState('member'), 'forbidden');
+  assert.equal(adminAccessState('admin'), 'console');
+});
+
+test('authenticated standalone sign-in entry redirects by role with replace semantics', () => {
+  assert.equal(replayEntryDestination('admin'), '/replay/admin');
+  assert.equal(replayEntryDestination('member'), '/replay');
+  assert.equal(replayEntryDestination('loading'), null);
+  assert.equal(replayEntryDestination('signed-out'), null);
 });
 
 test('bundle discovery paginates serially and reduces its page size after 413', async () => {
@@ -930,9 +1005,11 @@ test('SIWE configuration rejects a non-canonical URI and explains server mismatc
 });
 
 test('fixtures are build-gated and focus/search/layout regressions stay fixed', async () => {
-  const [source, css] = await Promise.all([
+  const [source, css, html, favicon] = await Promise.all([
     readFile(new URL('../src/client/replay.tsx', import.meta.url), 'utf8'),
     readFile(new URL('../src/client/style.css', import.meta.url), 'utf8'),
+    readFile(new URL('../index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../public/favicon.svg', import.meta.url), 'utf8'),
   ]);
   assert.match(source, /VITE_REPLAY_FIXTURES === 'true'/);
   assert.match(source, /if \(opener\?\.isConnected\) opener\.focus\(\)/);
@@ -947,4 +1024,8 @@ test('fixtures are build-gated and focus/search/layout regressions stay fixed', 
     css,
     /grid-template-columns: minmax\(0, 1fr\) 120px 124px 80px 12px/,
   );
+  assert.match(html, /rel="icon" href="\/favicon\.svg"/);
+  assert.match(html, /rel="apple-touch-icon" href="\/apple-touch-icon\.png"/);
+  assert.match(favicon, /viewBox="0 0 64 64"/);
+  assert.match(favicon, /#a9a7df/);
 });

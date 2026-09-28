@@ -35,6 +35,7 @@ export type SiweConfig = {
 type UniverseAuthValue = {
   client: UniverseClient;
   session: ReplaySession | null;
+  phase: AuthPhase;
   expired: boolean;
   signingIn: boolean;
   error: string | null;
@@ -44,6 +45,102 @@ type UniverseAuthValue = {
 };
 
 const UniverseAuthContext = createContext<UniverseAuthValue | null>(null);
+const SESSION_STORAGE_KEY = 'prediction-indexer.replay-session.v1';
+const TOKEN = /^[0-9a-f]{64}$/;
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+type SessionStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+function removeStoredSession(storage: SessionStorage) {
+  try {
+    storage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable in privacy-restricted browser contexts.
+  }
+}
+
+export type AuthPhase =
+  | 'loading'
+  | 'signed-out'
+  | 'expired'
+  | 'member'
+  | 'admin';
+
+export function authPhase(
+  hydrated: boolean,
+  session: Pick<ReplaySession, 'role'> | null,
+  expired: boolean,
+  signingOut: boolean,
+): AuthPhase {
+  if (!hydrated) return 'loading';
+  if (signingOut) return 'signed-out';
+  if (session) return session.role;
+  return expired ? 'expired' : 'signed-out';
+}
+
+export function adminAccessState(phase: AuthPhase) {
+  if (phase === 'loading') return 'loading' as const;
+  if (phase === 'signed-out') return 'sign-in' as const;
+  if (phase === 'expired') return 'expired' as const;
+  return phase === 'admin' ? ('console' as const) : ('forbidden' as const);
+}
+
+export function replayEntryDestination(phase: AuthPhase) {
+  if (phase === 'admin') return '/replay/admin';
+  if (phase === 'member') return '/replay';
+  return null;
+}
+
+export function loadStoredSession(
+  storage: SessionStorage,
+  now = Date.now(),
+): ReplaySession | null {
+  try {
+    const encoded = storage.getItem(SESSION_STORAGE_KEY);
+    if (encoded === null) return null;
+    const value: unknown = JSON.parse(encoded);
+    if (typeof value !== 'object' || value === null || Array.isArray(value))
+      throw new Error('invalid session');
+    const record = value as Record<string, unknown>;
+    if (
+      Object.keys(record).sort().join(',') !==
+        'address,expires_at,role,token' ||
+      typeof record.token !== 'string' ||
+      !TOKEN.test(record.token) ||
+      typeof record.address !== 'string' ||
+      !ADDRESS.test(record.address) ||
+      (record.role !== 'member' && record.role !== 'admin') ||
+      typeof record.expires_at !== 'string' ||
+      !Number.isFinite(Date.parse(record.expires_at)) ||
+      Date.parse(record.expires_at) <= now
+    )
+      throw new Error('invalid session');
+    return {
+      token: record.token,
+      address: record.address,
+      role: record.role,
+      expires_at: record.expires_at,
+    };
+  } catch {
+    removeStoredSession(storage);
+    return null;
+  }
+}
+
+export function persistSession(
+  storage: SessionStorage,
+  session: ReplaySession,
+) {
+  storage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+function browserStorage() {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+}
 
 export function buildSiweMessage(
   address: string,
@@ -120,13 +217,17 @@ export function UniverseAuthProvider({
 }: {
   children: React.ReactNode;
 }) {
+  const [hydrated, setHydrated] = useState(false);
   const [session, setSession] = useState<ReplaySession | null>(null);
   const [expired, setExpired] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<ReplaySession | null>(null);
   sessionRef.current = session;
   const clearSession = useCallback((wasExpired = false) => {
+    const storage = browserStorage();
+    if (storage) removeStoredSession(storage);
     sessionRef.current = null;
     setSession(null);
     setExpired(wasExpired);
@@ -139,6 +240,16 @@ export function UniverseAuthProvider({
       ),
     [clearSession],
   );
+
+  useEffect(() => {
+    const storage = browserStorage();
+    const restored = storage ? loadStoredSession(storage) : null;
+    if (restored) {
+      sessionRef.current = restored;
+      setSession(restored);
+    }
+    setHydrated(true);
+  }, []);
 
   useEffect(() => {
     if (!session) return;
@@ -188,6 +299,13 @@ export function UniverseAuthProvider({
       if (typeof signature !== 'string')
         throw new Error('The wallet did not return a signature.');
       const next = await client.signIn(message, signature);
+      const storage = browserStorage();
+      if (storage)
+        try {
+          persistSession(storage, next);
+        } catch {
+          // A storage failure must not discard a valid in-memory sign-in.
+        }
       sessionRef.current = next;
       setSession(next);
       setExpired(false);
@@ -200,6 +318,9 @@ export function UniverseAuthProvider({
   }, [client]);
 
   const signOut = useCallback(async () => {
+    setSigningOut(true);
+    const storage = browserStorage();
+    if (storage) removeStoredSession(storage);
     try {
       if (sessionRef.current) await client.logout();
     } catch (cause) {
@@ -207,13 +328,17 @@ export function UniverseAuthProvider({
         throw cause;
     } finally {
       clearSession(false);
+      setSigningOut(false);
     }
   }, [client, clearSession]);
+
+  const phase = authPhase(hydrated, session, expired, signingOut);
 
   const value = useMemo(
     () => ({
       client,
       session,
+      phase,
       expired,
       signingIn,
       error,
@@ -221,7 +346,17 @@ export function UniverseAuthProvider({
       signOut,
       clearSession,
     }),
-    [client, session, expired, signingIn, error, signIn, signOut, clearSession],
+    [
+      client,
+      session,
+      phase,
+      expired,
+      signingIn,
+      error,
+      signIn,
+      signOut,
+      clearSession,
+    ],
   );
   return (
     <UniverseAuthContext.Provider value={value}>
