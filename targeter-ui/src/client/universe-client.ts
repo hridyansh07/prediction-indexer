@@ -802,7 +802,7 @@ class RequestCoordinator {
 const requestCoordinators = new Map<string, RequestCoordinator>();
 
 function requestCoordinator(baseUrl: URL, intervalMs: number) {
-  const key = `${baseUrl.origin}${baseUrl.pathname}|${intervalMs}`;
+  const key = `${baseUrl.origin}|${intervalMs}`;
   let coordinator = requestCoordinators.get(key);
   if (!coordinator) {
     coordinator = new RequestCoordinator(intervalMs);
