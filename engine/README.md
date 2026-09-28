@@ -286,6 +286,14 @@ profile-2 composite derivative per exact window, and emits only verified ordered
 pins. It is an example target, not a stable CLI, archive restorer, or indexer.
 The existing 4096-window read limit is unchanged; with half-hour canonical
 windows, one initial materialization request can span at most 85 days 8 hours.
+The helper builds windows concurrently, in-process, with up to
+`std::thread::available_parallelism()` workers (which honors a Linux cgroup CPU
+quota), each window with its own fresh normalizer. Pins and the response stay in
+window order and are byte-identical to a sequential build. Once a window fails,
+no new window starts; in-flight windows finish and the earliest failing
+window's error is reported, the same error a sequential build reports first.
+Windows committed before the failure remain valid, and a retry takes their
+verify/no-op path.
 Transport and Python supervisor preflight bind every selected profile-2 manifest
 to the helper's typed composite identity and derive plan scales from it before any
 Redis command or child process. The initial Redis wire record remains V1.

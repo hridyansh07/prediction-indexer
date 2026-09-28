@@ -17,9 +17,15 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 
 const MAX_WINDOWS: usize = 4096;
+/// Matches the usual main-thread stack so a worker has the same headroom the
+/// sequential build had.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 const POLICY_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/materialize-range-policy/v1";
 
 fn enforce_window_limit(count: usize) -> Result<(), String> {
@@ -131,7 +137,181 @@ fn inspect(input: &str) -> Result<String, String> {
     .map_err(|error| format!("serializing inspection response: {error}"))
 }
 
+/// Builds, verifies, and pins one exact canonical window with a fresh
+/// normalizer. Nothing carries across windows, so windows are independent.
+fn build_one(
+    canonical_root: &Path,
+    output_root: &Path,
+    start: u64,
+    end: u64,
+) -> Result<OutputPin, String> {
+    let mut normalizer = CanonicalNormalizer::default();
+    let descriptor = normalizer.descriptor().clone();
+    let spec = DerivativeSpec {
+        normalized_schema_version: SEGMENT_SCHEMA_VERSION,
+        normalizer_bundle_sha256: descriptor.bundle_sha256,
+        normalizer_config_sha256: descriptor.config_sha256,
+        policy: NormalizationPolicy {
+            policy_sha256: Sha256::digest(POLICY_DOMAIN),
+            effective_from_ns: 0,
+            effective_until_ns: None,
+        },
+    };
+    let built = build_window(
+        canonical_root,
+        output_root,
+        start,
+        end,
+        &spec,
+        &mut normalizer,
+    )
+    .map_err(|error| error.to_string())?;
+    let input = PinnedDerivative {
+        directory: built.derivative.directory.clone(),
+        pin: built.derivative.pin.clone(),
+    };
+    let inspected = inspect_pinned(&input, &ReadLimits::default())?;
+    if !inspected.supports_source_evidence()
+        || inspected.manifest().materializer_version != 2
+        || inspected.manifest().normalizer_bundle_sha256 != descriptor.bundle_sha256
+        || inspected.manifest().normalizer_config_sha256 != descriptor.config_sha256
+    {
+        return Err("materialized pin is not profile 2 with the composite descriptor".into());
+    }
+    Ok(OutputPin {
+        window_start_ns: start,
+        window_end_ns: end,
+        derivative_address: input.pin.derivative_address,
+        receipt_sha256: input.pin.receipt_sha256,
+    })
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Builds `windows` on up to `workers` threads and returns their pins in
+/// window order. Workers claim windows in ascending order from a shared index,
+/// so when any window fails, every lower window has already been claimed and
+/// runs to completion: returning the lowest failing index reports exactly the
+/// error a sequential build would have reported first. After a failure no
+/// worker claims another window.
+fn build_windows(
+    canonical_root: &Path,
+    output_root: &Path,
+    windows: &[(u64, u64)],
+    workers: usize,
+) -> Result<Vec<OutputPin>, String> {
+    build_windows_with(windows, workers, |start, end| {
+        build_one(canonical_root, output_root, start, end)
+    })
+}
+
+/// The scheduling core of [`build_windows`], generic over the per-window build
+/// so tests can inject failures and panics.
+fn build_windows_with<T, F>(
+    windows: &[(u64, u64)],
+    workers: usize,
+    build: F,
+) -> Result<Vec<T>, String>
+where
+    T: Send,
+    F: Fn(u64, u64) -> Result<T, String> + Sync,
+{
+    let workers = workers.clamp(1, windows.len().max(1));
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let run = |index: usize| -> Result<T, String> {
+        let (start, end) = windows[index];
+        panic::catch_unwind(AssertUnwindSafe(|| build(start, end))).unwrap_or_else(|payload| {
+            Err(format!(
+                "materializing window {start}..{end} panicked: {}",
+                panic_message(payload.as_ref())
+            ))
+        })
+    };
+    let worker = || {
+        let mut results = Vec::new();
+        loop {
+            if failed.load(Ordering::SeqCst) {
+                break;
+            }
+            let index = next.fetch_add(1, Ordering::SeqCst);
+            if index >= windows.len() {
+                break;
+            }
+            let result = run(index);
+            if result.is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+            results.push((index, result));
+        }
+        results
+    };
+    let mut slots: Vec<Option<Result<T, String>>> = std::iter::repeat_with(|| None)
+        .take(windows.len())
+        .collect();
+    thread::scope(|scope| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(workers);
+        for number in 0..workers {
+            let handle = thread::Builder::new()
+                .name(format!("materialize-{number}"))
+                .stack_size(WORKER_STACK_BYTES)
+                .spawn_scoped(scope, worker);
+            match handle {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    // Stop the workers already running; they finish in flight.
+                    failed.store(true, Ordering::SeqCst);
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(format!("spawning materializer worker: {error}"));
+                }
+            }
+        }
+        let mut joined = Ok(());
+        for handle in handles {
+            match handle.join() {
+                Ok(results) => {
+                    for (index, result) in results {
+                        slots[index] = Some(result);
+                    }
+                }
+                Err(payload) => {
+                    joined = Err(format!(
+                        "materializer worker panicked: {}",
+                        panic_message(payload.as_ref())
+                    ));
+                }
+            }
+        }
+        joined
+    })?;
+    // Slots are in window order, so the first error is the earliest window's.
+    if let Some(error) = slots.iter().flatten().find_map(|slot| slot.as_ref().err()) {
+        return Err(error.clone());
+    }
+    slots
+        .into_iter()
+        .map(|slot| match slot {
+            Some(Ok(pin)) => Ok(pin),
+            _ => Err("materializer worker left a window unbuilt".to_owned()),
+        })
+        .collect()
+}
+
 fn execute(input: &str) -> Result<String, String> {
+    // Honors cgroup CPU quotas on Linux; clamped to the window count later.
+    let workers = thread::available_parallelism().map_or(1, usize::from);
+    execute_with_workers(input, workers)
+}
+
+fn execute_with_workers(input: &str, workers: usize) -> Result<String, String> {
     if input.len() > 1_048_576 {
         return Err("request exceeds 1 MiB".into());
     }
@@ -159,48 +339,12 @@ fn execute(input: &str) -> Result<String, String> {
     enforce_window_limit(windows.len())?;
 
     let identity = CanonicalNormalizer::default().identity().clone();
-    let mut pins = Vec::with_capacity(windows.len());
-    for (start, end) in windows {
-        let mut normalizer = CanonicalNormalizer::default();
-        let descriptor = normalizer.descriptor().clone();
-        let spec = DerivativeSpec {
-            normalized_schema_version: SEGMENT_SCHEMA_VERSION,
-            normalizer_bundle_sha256: descriptor.bundle_sha256,
-            normalizer_config_sha256: descriptor.config_sha256,
-            policy: NormalizationPolicy {
-                policy_sha256: Sha256::digest(POLICY_DOMAIN),
-                effective_from_ns: 0,
-                effective_until_ns: None,
-            },
-        };
-        let built = build_window(
-            &request.canonical_root,
-            &request.output_root,
-            start,
-            end,
-            &spec,
-            &mut normalizer,
-        )
-        .map_err(|error| error.to_string())?;
-        let input = PinnedDerivative {
-            directory: built.derivative.directory.clone(),
-            pin: built.derivative.pin.clone(),
-        };
-        let inspected = inspect_pinned(&input, &ReadLimits::default())?;
-        if !inspected.supports_source_evidence()
-            || inspected.manifest().materializer_version != 2
-            || inspected.manifest().normalizer_bundle_sha256 != descriptor.bundle_sha256
-            || inspected.manifest().normalizer_config_sha256 != descriptor.config_sha256
-        {
-            return Err("materialized pin is not profile 2 with the composite descriptor".into());
-        }
-        pins.push(OutputPin {
-            window_start_ns: start,
-            window_end_ns: end,
-            derivative_address: input.pin.derivative_address,
-            receipt_sha256: input.pin.receipt_sha256,
-        });
-    }
+    let pins = build_windows(
+        &request.canonical_root,
+        &request.output_root,
+        &windows,
+        workers,
+    )?;
     let response = Response {
         version: 1,
         normalizer: identity,
@@ -477,5 +621,174 @@ mod tests {
         canonical_window(missing.path(), 0, 10);
         fs::remove_file(window_directory(missing.path(), 0).join("evidence.ndjson.zst")).unwrap();
         assert!(execute(&request(missing.path(), output.path(), 0, 10)).is_err());
+    }
+
+    const PARALLEL_WINDOWS: [(u64, u64); 5] = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50)];
+
+    fn parallel_canonical() -> TempDir {
+        let canonical = TempDir::new("helper-parallel-canonical").unwrap();
+        for (start, end) in PARALLEL_WINDOWS {
+            canonical_window(canonical.path(), start, end);
+        }
+        canonical
+    }
+
+    fn corrupt(canonical: &Path, start: u64, name: &str) -> Vec<u8> {
+        let path = window_directory(canonical, start).join(name);
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, vec![0xa5; original.len()]).unwrap();
+        original
+    }
+
+    fn committed(output: &Path, start: u64) -> bool {
+        let window = output.join(format!("window={start}"));
+        window.is_dir()
+            && fs::read_dir(window)
+                .unwrap()
+                .map(|entry| entry.unwrap().path().join("receipt.json"))
+                .any(|receipt| receipt.is_file())
+    }
+
+    #[test]
+    fn parallel_build_is_byte_identical_to_sequential_build() {
+        let canonical = parallel_canonical();
+        let before = snapshot(canonical.path());
+        let sequential_output = TempDir::new("helper-sequential-output").unwrap();
+        let sequential = execute_with_workers(
+            &request(canonical.path(), sequential_output.path(), 0, 50),
+            1,
+        )
+        .unwrap();
+        for workers in [2, 4, 64] {
+            let parallel_output = TempDir::new("helper-parallel-output").unwrap();
+            let input = request(canonical.path(), parallel_output.path(), 0, 50);
+            let parallel = execute_with_workers(&input, workers).unwrap();
+            assert_eq!(parallel, sequential, "{workers} workers");
+            assert_eq!(
+                snapshot(parallel_output.path()),
+                snapshot(sequential_output.path()),
+                "{workers} workers"
+            );
+            // A parallel retry over committed windows is the verify/no-op path.
+            assert_eq!(execute_with_workers(&input, workers).unwrap(), sequential);
+        }
+        let response: Response = serde_json::from_str(&sequential).unwrap();
+        assert_eq!(
+            response
+                .derivatives
+                .iter()
+                .map(|pin| (pin.window_start_ns, pin.window_end_ns))
+                .collect::<Vec<_>>(),
+            PARALLEL_WINDOWS
+        );
+        assert_eq!(snapshot(canonical.path()), before);
+    }
+
+    #[test]
+    fn parallel_failure_reports_the_earliest_failing_window() {
+        let clean = parallel_canonical();
+        let clean_output = TempDir::new("helper-clean-output").unwrap();
+        let expected =
+            execute_with_workers(&request(clean.path(), clean_output.path(), 0, 50), 1).unwrap();
+
+        // Window 10 and window 30 both fail, with distinguishable errors.
+        let failing = [(10, "evidence.ndjson.zst"), (30, "provenance.ndjson.zst")];
+        let canonical = parallel_canonical();
+        let originals =
+            failing.map(|(start, name)| (start, name, corrupt(canonical.path(), start, name)));
+        let errors = failing.map(|(start, name)| {
+            let only = parallel_canonical();
+            corrupt(only.path(), start, name);
+            let output = TempDir::new("helper-single-failure").unwrap();
+            execute_with_workers(&request(only.path(), output.path(), 0, 50), 1).unwrap_err()
+        });
+        assert_ne!(errors[0], errors[1]);
+        let sequential_output = TempDir::new("helper-sequential-failure").unwrap();
+        assert_eq!(
+            execute_with_workers(
+                &request(canonical.path(), sequential_output.path(), 0, 50),
+                1
+            )
+            .unwrap_err(),
+            errors[0]
+        );
+
+        for workers in [2, 5] {
+            let output = TempDir::new("helper-parallel-failure").unwrap();
+            let input = request(canonical.path(), output.path(), 0, 50);
+            assert_eq!(
+                execute_with_workers(&input, workers).unwrap_err(),
+                errors[0],
+                "{workers} workers"
+            );
+            // Lower windows were claimed first and ran to completion; failing
+            // windows publish no receipt.
+            assert!(committed(output.path(), 0), "{workers} workers");
+            assert!(!committed(output.path(), 10), "{workers} workers");
+            assert!(!committed(output.path(), 30), "{workers} workers");
+        }
+
+        // Repair, then retry into the partially committed root: committed
+        // windows verify/no-op and the response matches a clean build.
+        let output = TempDir::new("helper-parallel-retry").unwrap();
+        let input = request(canonical.path(), output.path(), 0, 50);
+        execute_with_workers(&input, 5).unwrap_err();
+        for (start, name, bytes) in originals {
+            fs::write(window_directory(canonical.path(), start).join(name), bytes).unwrap();
+        }
+        assert_eq!(execute_with_workers(&input, 5).unwrap(), expected);
+        assert_eq!(snapshot(output.path()), snapshot(clean_output.path()));
+    }
+
+    #[test]
+    fn scheduler_keeps_order_stops_after_failure_and_surfaces_panics() {
+        let windows: Vec<(u64, u64)> = (0..32).map(|index| (index * 10, index * 10 + 10)).collect();
+        for workers in [1, 3, 8, 64] {
+            let built = build_windows_with(&windows, workers, |start, end| {
+                thread::sleep(std::time::Duration::from_millis((start / 10) % 3));
+                Ok((start, end))
+            })
+            .unwrap();
+            assert_eq!(built, windows);
+
+            let attempted = AtomicUsize::new(0);
+            let error = build_windows_with(&windows, workers, |start, _| {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                match start {
+                    // The later failure finishes first; the earlier one still wins.
+                    50 => {
+                        thread::sleep(std::time::Duration::from_millis(20));
+                        Err("window 50 failed".to_owned())
+                    }
+                    70 => Err("window 70 failed".to_owned()),
+                    _ => Ok(start),
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error, "window 50 failed", "{workers} workers");
+            // No window is started once a failure is observed: at most the
+            // failing window plus the windows in flight on other workers.
+            assert!(
+                attempted.load(Ordering::SeqCst) <= 8 + workers,
+                "{workers} workers"
+            );
+
+            let error = build_windows_with(&windows, workers, |start, _| {
+                if start == 40 {
+                    panic!("injected panic");
+                }
+                Ok(start)
+            })
+            .unwrap_err();
+            assert_eq!(
+                error, "materializing window 40..50 panicked: injected panic",
+                "{workers} workers"
+            );
+        }
+        assert!(
+            build_windows_with(&[], 8, |_, _| Ok(()))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
