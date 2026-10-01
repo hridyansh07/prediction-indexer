@@ -114,12 +114,21 @@ commit; writing such a bundle is not this task.
    buffers. On Unix its directory mode is 0700 before content writes. Check per-file and
    total snapshot limits before copying and enforce them while copying. Never
    trust the original path's metadata as an identity or allocation size.
-3. Verify the private snapshot completely against the pinned receipt: strict
-   canonical metadata, all repeated bindings, address inputs, both compressed
-   identities and frame EOF, domain invariants, source dispositions, paired
-   faults/rejects, and complete equal-time tie semantics before any status or
-   delivery escapes. Read exact expected lengths with an extra-byte check.
-4. Rewind/reopen only files in that private snapshot for traversal. No verified
+3. Bind the private snapshot to the pinned receipt before open returns: strict
+   canonical metadata, all repeated bindings, and address inputs, plus each
+   file's stored SHA-256 and exact length, hashed over the same bytes as they are
+   copied (exact expected lengths with an extra-byte check). No data file is
+   decoded before open returns.
+4. Decode only files in that private snapshot, each exactly once, during
+   traversal. One parsed record per line feeds every semantic check: canonical
+   JSON and closed line schemas, child order, exact reject provenance, one-to-one
+   fault/reject pairing, one disposition per source, delivery/tie/lane/group
+   limits, coverage agreement, both logical identities, and one-frame EOF.
+   Per-line checks run as a line is read, per-delivery checks before that
+   delivery is returned, and whole-window checks (identities, frame EOF, counts,
+   final tie run, coverage) at window EOF. Records may therefore be exposed
+   before their window's verification completes; any later violation poisons
+   the attempt, and only clean, fully checked EOF can finish. No verified
    handle is minted from a caller-supplied `VerifiedDerivative` value. Source
    replacement/deletion after snapshotting cannot change yielded records. A
    concurrent source rewrite during copy either produces the pinned bytes or
@@ -160,10 +169,11 @@ no truncation or partial commit is permitted. Changing these defaults therefore
 requires considering builders as well as walkers. Build verification does not
 create a private snapshot or impose the walker's selected-window/scope limits.
 
-The current implementation retains three complete verification passes (pairing,
-dispositions, source/tie semantics), then traversal. This is bounded-memory but
-costs repeated decompression, including excluded tails. Consolidating the shared
-verifier and delivery join is deferred as a separately tested refactor. Errors
+Verification and traversal are one bounded-memory pass: every output is
+decompressed once, including excluded tails, and the delivery join shares each
+parsed record with the verifier. `verify_derivative` drains that same pass to
+clean EOF and returns a standalone verdict; callers that need a verdict before
+any use (an archive download, for example) still call it first. Errors
 remain diagnostic strings; callers must not classify retryability by matching
 text. Every error invalidates the attempt. Any retry creates a fresh walker with
 the same pins; no automatic retry policy is provided.
@@ -274,10 +284,14 @@ Empty/ignored source deliveries participate in validation and boundaries. A tie 
 half-open source window because all members have the same in-window timestamp.
 Same-hash Polymarket records are not groups and do not delay a pull.
 
-The snapshot verification pass validates equal-time runs using scalar state:
+The streaming verification pass validates equal-time runs using scalar state:
 timestamp, first lane, cross-lane flag, tag consistency, and counters. It does not
 buffer a potentially large single-lane equal-time run; traversal buffers only
-actual atomic groups. Malformed declared tags cannot prematurely release a group.
+actual atomic groups. A tagged group closes only on a lookahead that has already
+validated its run's end, and an untagged run fails as soon as a second lane
+appears. Because single-lane runs are not buffered, an untagged run that is
+single-lane until a later member adds a lane can release its earlier members
+before that violation is found; the attempt then fails and cannot finish.
 
 Read through a different source/tie or verified window EOF before returning the
 last group. A decoder failure while closing a group returns an error, not the
@@ -334,7 +348,8 @@ Expose a separate window-status item at each verified window boundary, including
 empty windows: pin, SourceReceipt, certification flag, counts, and interval.
 These are traversal metadata, not fabricated tape events or mutation groups.
 `next_item()` returns WindowStatus once before the window's first admitted group,
-after the whole private snapshot has verified. It returns a status even when the
+after the private snapshot is bound to the pin (its semantic verification then
+continues during traversal). It returns a status even when the
 window has no admitted groups. Do not hide statuses in an unbounded history or
 provide a convenience group-only API that silently drops them.
 
@@ -442,10 +457,13 @@ Exhausted requires every selected window, both sidecars, all excluded records,
 and the final group to have completed verification. Repeated pulls after clean
 EOF return `Ok(None)`. `finish(self)` succeeds only after that explicit EOF; it
 does not silently drain a prefix or forgive a prior error. Dropping a prefix or
-poisoned reader produces no completion capability. A later-window failure may
-follow earlier verified groups but prevents completion of the run; downstream
-result writers must stage output until FinishedWalk. The walker itself commits
-nothing and cannot certify any strategy result.
+poisoned reader produces no completion capability. Because verification streams
+with traversal, a failure may follow statuses and groups already returned, from
+earlier windows or from the failing window itself, but it prevents completion of
+the run; downstream result writers must stage output until FinishedWalk, and a
+consumer that has seen records from a failed attempt must treat the whole
+attempt as failed. The walker itself commits nothing and cannot certify any
+strategy result.
 
 ## Acceptance tests and verification plan
 

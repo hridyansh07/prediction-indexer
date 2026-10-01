@@ -227,10 +227,12 @@ write/fsync/rename the receipt last.
 
 The full strict verifier still runs everywhere a derivative was not written by
 the current process: an existing committed address (verify/no-op), pinned
-inspection, the walker's `open_pinned`, and Replay's archive download path.
+inspection, the walker's `open_pinned` (as one streaming pass during traversal;
+see below), and Replay's archive download path.
 Replay's bundle cache binds a derivative already installed in its local
 derivatives root to its pin by receipt hash and per-file stored identities
-rather than re-inspecting it; `open_pinned` still fully verifies it at read time.
+rather than re-inspecting it; a pinned read still verifies every byte before it
+can finish.
 The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
 lock from before stage creation through publication and cleanup; process death
 releases it. Builds of the same address serialize, while different addresses can
@@ -258,8 +260,12 @@ defines the reviewed contract and acceptance cases.
 
 - `replay-materialize::{inspect_pinned, open_pinned}` binds the caller's exact
   `DerivativePin` to receipt, manifest, addressed directory, and compressed data.
-  Open verifies a private bounded per-window snapshot completely before exposing
-  records; source replacement cannot change the verified stream.
+  Open copies a private bounded per-window snapshot, hashing each file as it is
+  copied against the receipt's stored identity, and decodes nothing. Traversal
+  then decodes each file once and applies every semantic check to the records
+  it reads, so records may stream before the window's verification completes;
+  any violation poisons the attempt, and nothing is complete until `finish()`.
+  Source replacement cannot change the verified stream.
 - `replay-tape::DerivativeWalker::open` takes explicit pins, requested bounds,
   `ScopeFilter { instruments, lanes }`, `ReadLimits`, and a required
   `LowerBoundPolicy` with no default. It orders adjacent windows and validates
@@ -269,9 +275,12 @@ defines the reviewed contract and acceptance cases.
   Filtering retains original child indexes, source spans, provenance, relevant
   controls/faults, and every selected instrument orientation. `book_keys()` keeps
   Kalshi Outcome/Complement distinct; it performs no projection or mutation.
-- Both reader and walker require explicit clean EOF before consuming `finish()`
-  can mint a completion capability. Errors poison the attempt. `replay-risk`
-  applies every complete group even when its consumer skips evaluation.
+- Both reader and walker require explicit clean EOF, which is reached only after
+  every check of every selected window has passed, before consuming `finish()`
+  can mint a completion capability. Errors poison the attempt, including after
+  records from the failing window were returned; such an attempt has failed as
+  a whole. `replay-risk` applies every complete group even when its consumer
+  skips evaluation, and the publisher's terminal record requires its `finish()`.
 
 RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
 holds one bounded compressed window. Oversized groups fail rather than split.
@@ -285,8 +294,9 @@ The default 16 MiB NDJSON-line limit (including LF), 1 MiB metadata-document
 limit, and group/lane limits also deliberately apply to builds, which enforce
 them while writing: oversized candidates fail before publication, rather than
 produce artifacts rejected by the default verifier. These are operational limits, not
-wire-format changes. Verification currently performs three full decode passes
-before traversal; a single-pass refactor and typed error categories are deferred.
+wire-format changes. Verification is one decode pass per file, shared by pinned
+reads and `verify_derivative`, which drains it for a standalone verdict; typed
+error categories are deferred.
 Do not infer retryability from error strings; an error invalidates the attempt,
 and any fresh retry must retain the explicit pins.
 
