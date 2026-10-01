@@ -205,18 +205,18 @@ class BudgetTests(unittest.TestCase):
         value["venues"][1]["config"]["variables"]["price_scale"]["value"] = 3
         value["venues"][1]["config"]["variables"]["quantity_scale"]["value"] = 6
         value["venues"][2].update(
-            bundle_id="prediction-indexer/polymarket-normalizer/v2", parser_version=2
+            bundle_id="prediction-indexer/polymarket-normalizer/v3", parser_version=3
         )
         value["venues"][2]["config"]["variables"]["price_scale"]["value"] = 4
         value["venues"][2]["config"]["variables"]["quantity_scale"]["value"] = 6
         descriptor = s._normalizer_descriptor(value)
         self.assertEqual(
             descriptor["bundle_sha256"],
-            "fda43b698933486e43d928e3426cdce4056ba335dc1ed93652112867635f7b54",
+            "632f1297913f97a1d27fdd89c1f889b0a2333eafb8149cced8e17f546a48039b",
         )
         self.assertEqual(
             descriptor["config_sha256"],
-            "ddd88e0f1655419676531cd3dbbba98599e3187f84531e01d3de7e2ad7664337",
+            "744419d787b8d14340f043608bf894778e7f3862d177e864a6feee1ec2c033ba",
         )
 
         valid = config()

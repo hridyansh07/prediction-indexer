@@ -338,7 +338,9 @@ never an interpretation of lane names.
   must suppress duplicate mutation before processing events. Conflict, gap,
   backwards cursor, and broken counter remain distinct facts; the walker does
   not decide book availability or apply their payloads.
-- Unsupported state-bearing messages arrive as paired rejects/faults, not no-ops.
+- Validated non-semantic state notifications may be explicit ignores; Polymarket
+  v3 tick-size changes are one such case. Malformed notifications and unsupported
+  state-bearing messages remain paired rejects/faults rather than silent no-ops.
   Unknown persisted event/continuity variants are fatal reader errors.
 - Existing AuditAnchor events are retained as inert typed evidence for selected
   instruments. They never initialize books, gate evaluation, or generate controls.
