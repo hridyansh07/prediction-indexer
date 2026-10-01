@@ -135,8 +135,9 @@ fn frozen_branch_behavior_corpus() {
         Sha256::digest(&transcript).as_hex(),
         "586be1e8b1a5216abd12a3116f673edf9aa2e549005d08203b396e3adcf7ce82"
     );
-    // Hold current behavior fixed and prove that the parser identity remains
-    // part of every reject in the corpus.
+    // This companion golden pins the same transcript after mechanically
+    // replacing Debug-form parser version 3 with 2. It is not independent
+    // evidence about parser identity.
     let previous_parser = String::from_utf8(transcript)
         .unwrap()
         .replace("parser_version: 3", "parser_version: 2");
@@ -569,6 +570,74 @@ fn state_bearing_messages_validate_before_ignore_or_fault() {
     assert_eq!(
         reject(normalize(&ws(&resolved.to_string()))).error_code,
         "unsupported_market_resolved"
+    );
+}
+
+#[test]
+fn ignored_batch_members_do_not_hide_events_or_later_errors() {
+    let book: Value = serde_json::from_str(BOOK).unwrap();
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
+
+    let book_then_tick = events(normalize(&ws(&json!([book, tick]).to_string())));
+    assert_eq!(book_then_tick.len(), 1);
+    assert!(matches!(
+        book_then_tick[0],
+        SegmentEvent::Book(BookEvent::Full(_))
+    ));
+
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let tick_then_delta = events(normalize(&ws(&json!([tick, delta]).to_string())));
+    assert_eq!(tick_then_delta.len(), 2);
+    assert!(
+        tick_then_delta
+            .iter()
+            .all(|event| matches!(event, SegmentEvent::Book(BookEvent::Delta(_))))
+    );
+
+    let book: Value = serde_json::from_str(BOOK).unwrap();
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
+    let around_ignore = events(normalize(&ws(&json!([book, tick, delta]).to_string())));
+    assert_eq!(around_ignore.len(), 3);
+    assert!(matches!(
+        around_ignore[0],
+        SegmentEvent::Book(BookEvent::Full(_))
+    ));
+    assert!(
+        around_ignore[1..]
+            .iter()
+            .all(|event| matches!(event, SegmentEvent::Book(BookEvent::Delta(_))))
+    );
+
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let unknown = json!({"event_type":"future_state"});
+    assert_eq!(
+        reject(normalize(&ws(&json!([tick, unknown]).to_string()))).error_code,
+        "unsupported_message_type"
+    );
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let unknown = json!({"event_type":"future_state"});
+    assert_eq!(
+        reject(normalize(&ws(&json!([unknown, tick]).to_string()))).error_code,
+        "unsupported_message_type"
+    );
+
+    let first: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let second: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    assert_eq!(
+        normalize(&ws(&json!([first, second]).to_string())),
+        Normalization::Ignored {
+            reason_code: "tick_size_change".to_owned()
+        }
+    );
+
+    let valid: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let mut malformed: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    malformed["new_tick_size"] = json!("0.00001");
+    assert_eq!(
+        reject(normalize(&ws(&json!([valid, malformed]).to_string()))).error_code,
+        "inexact_price"
     );
 }
 
