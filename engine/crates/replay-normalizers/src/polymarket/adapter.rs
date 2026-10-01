@@ -76,6 +76,11 @@ impl VenueAdapter for Polymarket {
         for message in messages {
             match normalize_message(envelope, message, self.config) {
                 Ok(MessageOutcome::Events(mut children)) => events.append(&mut children),
+                Ok(MessageOutcome::Ignored(reason)) => {
+                    return Ok(Normalization::Ignored {
+                        reason_code: reason.to_owned(),
+                    });
+                }
                 Err(reject) => {
                     return Ok(input.reject(
                         PARSER_VERSION,
@@ -122,6 +127,9 @@ fn outcome(
 ) -> Normalization {
     match result {
         Ok(MessageOutcome::Events(events)) => Normalization::Events(events),
+        Ok(MessageOutcome::Ignored(reason)) => Normalization::Ignored {
+            reason_code: reason.to_owned(),
+        },
         Err(reject) => input.reject(
             PARSER_VERSION,
             reject.code,
