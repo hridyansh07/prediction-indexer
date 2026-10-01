@@ -1,8 +1,9 @@
 # Offline bundle coverage V1
 
 Implemented: `replay.bundle_coverage:build` is a coverage-only supervisor factory.
-It consumes the existing immutable `replay.streams.Cut` / `Book` interface and
-does not reconstruct Risk policy. No economics, fees, opportunities, episodes,
+It consumes the `replay.streams.Cut` / `Book` interface under its zero-copy hook
+contract (live in-place books, valid only during the callback) and does not
+reconstruct Risk policy. No economics, fees, opportunities, episodes,
 fills, trading, timer/cadence, query language, discovery, cache, or UI is included.
 The opt-in Rust-materializer → Risk → Redis → supervisor → coverage acceptance
 below uses synthetic contracts. It does not establish retained-data acceptance
@@ -58,8 +59,11 @@ Group cuts take effect at `origin.visible_ns`; window cuts at their raw window
 start, clipped for reporting. Expansion/prologue groups before requested start
 may initialize Risk books, but produce no pre-request intervals or trade counts.
 Clipping never rewrites the source window interval. Before processing a later
-cut, intervening scope boundaries use the **prior immutable books**, because the
-Decoder has already installed the incoming cut's entire atomic transition set.
+cut, intervening scope boundaries use the **prior book state**, because the
+Decoder has already applied the incoming cut's entire transition set in place.
+Coverage therefore keeps its own detached `(validity, reason, source)` copy per
+planned book, refreshed only for each cut's transitioned keys after the boundary
+evaluation; it never retains a Decoder book or cut body past the callback.
 Scope changes do not change Risk books. Same-time cuts produce no positive-length
 intermediate state and no overlap; zero-length intervals are discarded.
 
@@ -221,8 +225,8 @@ ownership remain the trust boundary.
 No full output/tape is loaded for validation. Limits: 256 MiB interval bytes,
 1,000,000 records, 64 KiB per line, 32,768 total scope/entity pairs, 16 MiB metadata;
 preparation's snapshot and stream's entry/book bounds apply independently. The
-runtime retains current/prior immutable book snapshots and one open row per active
-entity, not every event reference. The reader retains bounded entity cursors and
+runtime retains one detached status copy per planned book and one open row per
+active entity, not every event reference or book ladder. The reader retains bounded entity cursors and
 duration totals, one line, and active statuses. A private disposable SQLite temporal
 index uses a 2 MiB page-cache target and a 1 GiB main-database cap, with disk-backed
 sort/index scratch additionally bounded by input limits. Resource failures abort
@@ -236,8 +240,8 @@ leave system temporary files; no broad cleanup service is introduced.
   replay.tests.test_preparation replay.tests.test_streams replay.tests.test_supervisor
 ```
 
-Tests use real preparation/strict loaders and real immutable Decoder cuts, small
-hand-authored Risk decisions, plus fake supervisor artifacts checked by its real
+Tests use real preparation/strict loaders and real in-place Decoder cuts, small
+hand-authored Risk decisions (with a locally computed terminal book digest), plus fake supervisor artifacts checked by its real
 success reader. They cover delayed initialization, unrelated cuts, quiet intervals,
 trades/duplicates, faults/recovery, old latched reasons versus new evidence, scope
 changes during silence, mixed/all-uncaptured cases, prologue clipping, equal-time

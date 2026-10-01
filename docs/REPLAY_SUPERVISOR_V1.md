@@ -54,7 +54,11 @@ must remain available even for read-only reruns.
 Each importable factory receives deeply immutable context with `run_id`,
 `attempt_id`, `group`, `identity`, strategy `config`, and `output_directory`.
 It returns an object implementing `__call__(cut)` and `finish()`.
-The adapter delivers initial, cut, and terminal records from `replay.streams`.
+The adapter delivers initial, cut, and terminal records from `replay.streams`,
+reading whole-entry batches (default 128 MiB budget) and ACKing each batch once
+after every callback in it returned. Books and cut bodies are live, in-place views
+valid only during that callback; a strategy must copy anything it keeps (see the
+zero-copy hook contract in [REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md)).
 The expected initial is built independently from the pinned run config, never
 learned from the stream. The terminal callback and `finish()` must both return
 successfully before its ACK. `finish()` must flush and close all strategy files.

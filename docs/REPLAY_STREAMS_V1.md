@@ -21,7 +21,8 @@ One stream holds **one copy** of each payload shared across groups. Setup create
 all required groups at `0` and exactly one `worker` consumer per group before any
 publication. Each group has a single local SDK instance, registered once. Processes
 may start at different times, but the strategy membership is fixed at setup; there
-is no API for adding a group. Every publish, poll and ACK checks membership. External
+is no API for adding a group. `join` and every poll's `check` verify membership;
+publish and ACK do not repeat it (see the stream-path amendment below). External
 clients must not modify these dedicated keys or churn/recreate groups; detecting
 adversarial delete-and-recreate between commands is outside this trusted-server
 contract. Redis ACLs and supervisor process isolation should enforce ownership.
@@ -44,6 +45,8 @@ float, exponent, sign or leading zero is accepted in an integer field. Bounds ar
 u64 except canonical sequence/quantity ≤ i64::MAX, child index ≤ u32::MAX and
 scale ≤18. Conditional price atoms ≤10^scale. All objects are closed and duplicate
 JSON keys are rejected. Unknown versions or variants abort, never get skipped.
+These are **publisher** obligations. The stream consumer enforces them fully only
+for the `initial` record; cut records are checked by the O(1) guard set below.
 
 Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
 
@@ -83,18 +86,73 @@ attempt streams are ephemeral rather than durable interchange artifacts.
   `protocol.py::reason`, mirroring Rust risk reasons including interval details.
   **Ordinary delta transitions never contain the full ladder.** Full market
   observations remain full because they are original input, not redundant views.
-- `terminal`, sequence N+1: `{cuts:N}`. Neither an empty poll, producer process
-  exit, nor the last data cut is terminal. Missing tail cannot pass `finish()`.
+- `terminal`, sequence N+1: closed `{cuts:N, books_sha256}`. Neither an empty
+  poll, producer process exit, nor the last data cut is terminal. Missing tail
+  cannot pass `finish()`. `books_sha256` is the final-book digest defined below.
 
-The Python decoder checks contiguous stream sequence and each affected book's
-previous/new revision. It validates/stages the complete cut before replacing local
-state. It mechanically applies the authoritative operations with exact integers;
-arithmetic/scale errors are protocol corruption, not new risk decisions. Consumers
-must not recompute whether an observation should have applied. Immutable owned cuts
-retain tuple ladders and deeply read-only metadata; all transitions are installed
-before the processing hook. `Book.levels("bid")` is descending; asks ascending.
-Invalid/not-initialized books have no levels. Views are entirely local; there is
-no remote per-book request, cache, book hash, implicit 1-p, or wall-clock expiry.
+### Stream-path amendment (lockstep, still wire version "1")
+
+The hot path was trimmed for throughput. Like `control_events`, this is a lockstep
+V1 amendment: the Rust publisher, `attempt.lua`, and every Python consumer ship in
+one image; mixing a pre-amendment publisher or consumer with this one is unsupported
+(the old terminal `{cuts}` and the new `{cuts, books_sha256}` reject each other).
+
+**Decoder guard set.** Each record is size-checked against `max_entry_bytes` and
+parsed with plain `json.loads` (no duplicate-key or constant hooks). The decoder
+then checks only O(1) facts: closed envelope, `version == "1"`, run/attempt
+identity, contiguous stream sequence, and per transition: planned book key,
+`previous_revision ==` local revision and `revision == previous + 1`, known decision
+kind, operations only on a `usable` book, price atom within `[0, 10^price_scale]`
+(the dense-array index guard), and no negative resulting quantity. Sequence 0
+(`initial`) is still validated completely and bound to the caller's expected body.
+Origins, references/pins, market events, control events, dependencies, reasons,
+operation key/scale agreement, and snapshot ordering are **not** revalidated; the
+publisher is trusted for them. The strict helpers (`obj`, `uint`, `decode`,
+`reason`, …) remain in `replay.streams.protocol` for configuration and output
+readers. Consumers mechanically apply the authoritative operations with exact
+integers and must not recompute whether an observation should have applied.
+
+**Terminal digest.** End-to-end book agreement is checked once, at terminal.
+`books_sha256` is lowercase-hex SHA-256 over UTF-8 lines, one per planned book,
+sorted by (instrument, orientation) — instrument by UTF-8 bytes, orientation by
+its wire spelling (`complement` < `outcome`):
+
+```text
+<instrument> TAB <orientation> TAB <revision> TAB <validity> TAB <bids> TAB <asks> LF
+```
+
+`revision` is decimal; `validity` is `not_initialized`, `usable`, or `unusable`.
+`bids` (descending price) and `asks` (ascending) are comma-joined
+`<price_atoms>:<quantity_atoms>` decimal pairs, and both are empty unless the book
+is usable. The publisher computes it read-only from `RiskEngine::view` for every
+planned book before `finish()` (`wire::books_sha256`); the consumer recomputes it
+from its local books (`protocol.books_sha256`) and fails the attempt on mismatch.
+Corruption healed by a later snapshot before terminal is not detected; earlier
+detection is traded for throughput by design.
+
+**In-place books and the zero-copy hook contract.** Each planned book is mutated
+in place. Per side it holds a dense list indexed by price atom of length
+`10^price_scale + 1` (allocated at first snapshot; scales above 4 use a sparse dict),
+the set of occupied prices, and a cached best price. Set/increase/decrease/delete
+are O(1); removing the best level scans up to 64 adjacent slots and otherwise takes
+`max`/`min` of the occupied set. A snapshot clears only previously occupied slots,
+then writes the publisher's ascending ladder without sorting. `Book.levels(side, n=None)`
+returns `(price, quantity)` tuples, bids descending and asks ascending (sorted only
+when asked); `best_bid()`/`best_ask()` return one pair or `None`; `bids`/`asks` are
+lazy properties. Invalid/not-initialized books have no levels. `revision`,
+`validity`, `dependency`, `as_of` and `reason` remain attributes.
+
+There is no per-cut staging copy and no frozen cut body: the hook receives the
+parsed body and the decoder's live read-only book mapping. **Books, cut bodies and
+everything reachable from them are valid only during that hook invocation.** A
+strategy that needs any value afterwards (for example the prior state at a later
+scope boundary) must copy it explicitly; tuples returned by `levels()`/`best_*()`
+are already copies. Strategies must not mutate bodies. Atomic per-cut visibility is
+no longer provided because it is no longer needed: any decode failure poisons the
+decoder, the hook is never called for that cut, nothing is ACKed, and the attempt
+dies. The `initial` and `terminal` bodies are still frozen.
+Views are entirely local; there is no remote per-book request, cache, implicit 1-p,
+or wall-clock expiry.
 
 ## Redis requirements, limits, ACK and progress
 
@@ -107,7 +165,10 @@ Use isolated networking/ACLs; never put credentials in config/logs.
 Connect/read/write timeouts are finite. Python uses redis-py with zero retry;
 Rust uses synchronous redis crate commands with no retry. Every SDK poll batches
 `XREADGROUP GROUP ... worker COUNT ... BLOCK ... STREAMS ... >`. Batch count ×
-max entry bytes must fit the local byte budget before reading. One cut is one
+max entry bytes must fit the local byte budget before reading. The default budget
+is 128 MiB; by default the count is `min(1024, budget // max_entry_bytes)` (128
+entries at a 1 MiB cap). The supervisor adapter uses the same default, raised to
+one entry when the entry cap exceeds it. One cut is one
 entry and cannot be split. Publisher bounds entries before send; the Redis script
 also checks entry size and retained payload byte total before XADD. Queue exhaustion
 fails immediately instead of deleting unread data or appending indefinitely. Redis
@@ -117,16 +178,28 @@ consumers retain current books and one bounded batch, not history. Returned cuts
 retained by callers are caller memory. There is no capacity reservation against
 other clients; Redis OOM remains a visible fatal attempt failure.
 
-After full application **and successful hook return**, a script verifies pending
-ownership, calls `XACKDEL stream group ACKED IDS 1 id`, and advances the group's
-completed entry sequence. Redis's [official XACKDEL specification](https://redis.io/docs/latest/commands/xackdel/)
-states ACKED deletes only after **all groups have read and acknowledged**. Return
-1 deletes/decrements retained bytes; return 2 retains for others. KEEPREF (default)
+A poll applies each entry and calls the hook for it in order; after **every hook
+in the batch has returned**, one batched `ack` script call verifies the group's
+completed sequence equals the expected previous value, verifies with one bounded
+`XPENDING` range that exactly the batch IDs are pending for `worker`, issues one
+`XACKDEL stream group ACKED IDS n id…`, and advances the completed entry sequence
+to the batch's last entry. A hook exception poisons the attempt with nothing in
+that batch ACKed. Single-entry ACK is the `n = 1` case. Redis's [official XACKDEL specification](https://redis.io/docs/latest/commands/xackdel/)
+states ACKED deletes only after **all groups have read and acknowledged**. Publish
+records each entry's payload length as `size:<entry sequence>` in the state hash;
+per-ID result 1 (deleted) subtracts and removes that stored size, 2 retains it for
+other groups, anything else fails `ack_failed`. Byte accounting therefore needs no
+`XRANGE`, and deleting the two attempt keys still removes all attempt state.
+Scalar state is read with one `HMGET` per script call. Fixed membership (`XINFO
+GROUPS`/`CONSUMERS`) is verified only by `join` and `check`; the `poisoned` flag is
+checked by every operation. KEEPREF (default)
 is unsafe here. No unconditional XDEL, MAXLEN, approximate trim, or PEL claiming is
 used. Lua commands can fail after a prefix (not transactional rollback); every
 script error is fatal and cannot authorize finalization.
 
-`Publisher.progress()` / `Consumer.progress()` returns small progress facts:
+`Publisher.progress()` / `Consumer.progress()` (`check`) returns only these named
+progress fields, never the per-entry `size:*` fields (the supervisor likewise reads
+named fields with `HMGET`):
 `published`, `terminal` (empty until published), `done:<group>` (after hook+ACK),
 `poisoned`, and byte/membership bookkeeping. These use **Redis entry sequence**,
 one greater than wire sequence; `-1` means no published/completed entry. Terminal
@@ -195,7 +268,7 @@ Python optional install: `.venv/bin/pip install -e '.[replay-redis]'`.
 ```python
 consumer = Consumer(redis_url, scope=scope, run_id=run_id,
     attempt_id=attempt_id, group="strategy-a", initial=expected_initial_body,
-    timeout=5, batch_entries=16, batch_bytes=16 * 1048576)
+    timeout=5)  # default batch: 128 MiB, min(1024, 128 MiB // entry cap) entries
 while not consumer.terminal:
     consumer.poll(write_provisional_cut, block_ms=100)
 # Caller/supervisor deadline remains mandatory while other groups finish.
@@ -204,7 +277,8 @@ consumer.close()
 ```
 
 The hook receives initial, cuts and terminal; it may ignore control records for
-strategy logic but must return successfully for their ACK. Caller exceptions are
+strategy logic but must return successfully for their ACK. Whatever it keeps from a
+cut or book past its own return must be an explicit copy. Caller exceptions are
 preserved and poison the attempt. No hook is retried. `abort()` explicitly poisons;
 `close()` only releases the client. `Decoder` is the offline/no-network wire API.
 
@@ -213,9 +287,10 @@ preserved and poison the attempt. No hook is retried. `abort()` explicitly poiso
 Default tests are offline. Frozen `transport/tests/fixtures/contract.ndjson` is
 generated from small canonical evidence through the real materializer, walker and
 risk engine; Rust asserts byte equality and Python independently checks levels,
-trades, revisions, dispositions, immutable old cuts and atomic rejection. Numeric
-and schema corruption, gaps/duplicates, missing tail and bounded retained memory
-have offline tests. `REPLAY_UPDATE_GOLDEN=1` deliberately regenerates the fixture.
+trades, revisions, dispositions (via explicit hook-time copies), the spelled-out
+terminal digest, and decoder poisoning. The O(1) guards, gaps/duplicates, terminal
+digest mismatch, missing tail, in-place book operations against a reference ladder
+(dense and sparse), and bounded retained memory have offline tests. `REPLAY_UPDATE_GOLDEN=1` deliberately regenerates the fixture.
 
 Explicit **disposable server only**: Redis integration tests issue CLIENT PAUSE and
 temporarily CONFIG SET maxmemory to force errors, restoring it afterward. Never
@@ -229,7 +304,9 @@ cargo test --manifest-path engine/Cargo.toml -p replay-transport \
   --test contract -- --ignored --test-threads=1 --nocapture
 ```
 
-Live tests cover two groups, unread retention/last-ACK deletion, hook-before-ACK,
+Live tests cover two groups, unread retention/last-ACK deletion, batched ACK
+(sequence/pending failures, stored-size accounting back to zero), membership only at
+join/check, hook-before-ACK,
 caller failure, duplicate delivery, group removal/single join, truncated tail,
 timeouts, OOM, queue limits, publisher poisoning/no terminal, and actual Rust CLI
 → Redis → two Python consumers. They do not certify production deployment,
