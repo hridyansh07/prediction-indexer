@@ -74,6 +74,13 @@ A full snapshot resets only that key, never every orientation of an instrument.
   instruments, both with `Outcome` orientation relative to their own token.
   Never collapse token IDs to a shared condition ID or reinterpret the NO
   token as `Complement` of the YES token during normalization.
+  Bundle `polymarket-normalizer/v3` (parser 3) treats an exact empty
+  `last_trade_price` in a book or snapshot as absent/no trade yet; nonnumeric,
+  null, and wrong-type values still reject. A `tick_size_change` is intentionally
+  ignored only after its asset, market, timestamp, old tick, and new tick all
+  validate. Ignored members of a batched delivery do not suppress ordered events
+  or validation of later members; the whole delivery is ignored only when every
+  member is a valid ignore.
 
 The key distinguishes stored evidence; it does not assert cross-book economic
 independence. Any complementary-price view belongs in an explicit later consumer.

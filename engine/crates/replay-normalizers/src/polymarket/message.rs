@@ -14,6 +14,7 @@ use super::{
 
 pub(crate) enum MessageOutcome {
     Events(Vec<SegmentEvent>),
+    Ignored(&'static str),
 }
 
 pub(crate) enum ProcessOutcome {
@@ -50,7 +51,7 @@ pub(crate) fn normalize_message(
             expect_public_book(envelope)?;
             Ok(MessageOutcome::Events(Trade::parse(object, config)?.into()))
         }
-        "tick_size_change" => unsupported_tick_size(envelope, object, config),
+        "tick_size_change" => validated_tick_size_change(envelope, object, config),
         "best_bid_ask" => unsupported_best_bid_ask(envelope, object, config),
         "new_market" => unsupported_new_market(envelope, object, config),
         "market_resolved" => unsupported_market_resolved(envelope, object, config),
@@ -78,7 +79,7 @@ pub(crate) fn normalize_rest_snapshot(
     ))
 }
 
-fn unsupported_tick_size(
+fn validated_tick_size_change(
     envelope: &EnvelopeView<'_>,
     object: &Map<String, Value>,
     config: Config,
@@ -106,10 +107,7 @@ fn unsupported_tick_size(
             .price(config.price_scale)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
     }
-    Err(Reject::for_instrument(
-        "unsupported_tick_size_change",
-        instrument,
-    ))
+    Ok(MessageOutcome::Ignored("tick_size_change"))
 }
 
 fn unsupported_best_bid_ask(

@@ -133,16 +133,17 @@ fn frozen_branch_behavior_corpus() {
     }
     assert_eq!(
         Sha256::digest(&transcript).as_hex(),
-        "67e0fe72078a786134226606f02d6903b19bbcefbed318d56a4cfe7e18d07a59"
+        "586be1e8b1a5216abd12a3116f673edf9aa2e549005d08203b396e3adcf7ce82"
     );
-    // No newly classified malformed decimals occur in this corpus; only the
-    // debug reject parser-version field differs from its pre-F8 baseline.
+    // This companion golden pins the same transcript after mechanically
+    // replacing Debug-form parser version 3 with 2. It is not independent
+    // evidence about parser identity.
     let previous_parser = String::from_utf8(transcript)
         .unwrap()
-        .replace("parser_version: 2", "parser_version: 1");
+        .replace("parser_version: 3", "parser_version: 2");
     assert_eq!(
         Sha256::digest(previous_parser.as_bytes()).as_hex(),
-        "d3676175e3606e7f3d3808c7673a1325fa515fb89aedfcfd57c2313aae421c99"
+        "b2660ee2b5c299ce83c7b283536717ca6c802343e7f795455a6e57948c59f321"
     );
 }
 
@@ -239,7 +240,7 @@ fn reject(value: Normalization) -> canonical_normalizer::ParseReject {
 #[test]
 fn descriptor_binds_every_behavior_variable_and_bundle_version() {
     let default = Normalizer::new(Polymarket::default()).unwrap();
-    assert_eq!(PARSER_VERSION, 2);
+    assert_eq!(PARSER_VERSION, 3);
     let canonical = serde_json::to_vec(&json!({
         "schema_version":1,
         "variables":{
@@ -398,6 +399,36 @@ fn rest_book_is_typed_audit_evidence_and_never_a_current_book_reset() {
 }
 
 #[test]
+fn empty_last_trade_price_means_no_trade_yet_for_books_and_snapshots() {
+    let mut book: Value = serde_json::from_str(BOOK).unwrap();
+    book["last_trade_price"] = json!("");
+    assert_eq!(events(normalize(&ws(&book.to_string()))).len(), 1);
+
+    let mut snapshot: Value = serde_json::from_str(REST_BOOK).unwrap();
+    snapshot["last_trade_price"] = json!("");
+    assert_eq!(events(normalize(&rest(&snapshot.to_string()))).len(), 1);
+}
+
+#[test]
+fn malformed_last_trade_price_remains_invalid_for_books_and_snapshots() {
+    for invalid in [json!("abc"), Value::Null, json!(37), json!(false)] {
+        let mut book: Value = serde_json::from_str(BOOK).unwrap();
+        book["last_trade_price"] = invalid.clone();
+        assert_eq!(
+            reject(normalize(&ws(&book.to_string()))).error_code,
+            "invalid_price"
+        );
+
+        let mut snapshot: Value = serde_json::from_str(REST_BOOK).unwrap();
+        snapshot["last_trade_price"] = invalid;
+        assert_eq!(
+            reject(normalize(&rest(&snapshot.to_string()))).error_code,
+            "invalid_price"
+        );
+    }
+}
+
+#[test]
 fn state_hash_is_strict_sha1_not_sha256_or_ambiguous_text() {
     let mut delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
     for value in ["abc", &"a".repeat(64), &"A".repeat(40)] {
@@ -463,10 +494,13 @@ fn official_additive_policy_is_explicit_and_known_fields_remain_strict() {
 }
 
 #[test]
-fn unsupported_state_bearing_messages_are_validated_then_fault_visible() {
-    let tick = reject(normalize(&ws(TICK_SIZE.trim())));
-    assert_eq!(tick.error_code, "unsupported_tick_size_change");
-    assert!(matches!(tick.impact, FaultImpact::Instrument(_)));
+fn state_bearing_messages_validate_before_ignore_or_fault() {
+    assert_eq!(
+        normalize(&ws(TICK_SIZE.trim())),
+        Normalization::Ignored {
+            reason_code: "tick_size_change".to_owned()
+        }
+    );
 
     let mut malformed: Value = serde_json::from_str(TICK_SIZE).unwrap();
     malformed["new_tick_size"] = json!("0.00001");
@@ -474,6 +508,33 @@ fn unsupported_state_bearing_messages_are_validated_then_fault_visible() {
         reject(normalize(&ws(&malformed.to_string()))).error_code,
         "inexact_price"
     );
+    for (field, invalid, code) in [
+        ("old_tick_size", json!("abc"), "invalid_price"),
+        ("market", json!("bad"), "invalid_market_id"),
+        ("asset_id", json!("bad"), "invalid_asset_id"),
+        ("timestamp", json!(0), "invalid_source_time"),
+    ] {
+        let mut malformed: Value = serde_json::from_str(TICK_SIZE).unwrap();
+        malformed[field] = invalid;
+        assert_eq!(
+            reject(normalize(&ws(&malformed.to_string()))).error_code,
+            code
+        );
+    }
+    for field in [
+        "asset_id",
+        "market",
+        "timestamp",
+        "old_tick_size",
+        "new_tick_size",
+    ] {
+        let mut missing: Value = serde_json::from_str(TICK_SIZE).unwrap();
+        missing.as_object_mut().unwrap().remove(field);
+        assert_eq!(
+            reject(normalize(&ws(&missing.to_string()))).error_code,
+            "missing_required_field"
+        );
+    }
     assert_eq!(
         reject(normalize(&ws(r#"{"event_type":"future_state"}"#))).error_code,
         "unsupported_message_type"
@@ -509,6 +570,74 @@ fn unsupported_state_bearing_messages_are_validated_then_fault_visible() {
     assert_eq!(
         reject(normalize(&ws(&resolved.to_string()))).error_code,
         "unsupported_market_resolved"
+    );
+}
+
+#[test]
+fn ignored_batch_members_do_not_hide_events_or_later_errors() {
+    let book: Value = serde_json::from_str(BOOK).unwrap();
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
+
+    let book_then_tick = events(normalize(&ws(&json!([book, tick]).to_string())));
+    assert_eq!(book_then_tick.len(), 1);
+    assert!(matches!(
+        book_then_tick[0],
+        SegmentEvent::Book(BookEvent::Full(_))
+    ));
+
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let tick_then_delta = events(normalize(&ws(&json!([tick, delta]).to_string())));
+    assert_eq!(tick_then_delta.len(), 2);
+    assert!(
+        tick_then_delta
+            .iter()
+            .all(|event| matches!(event, SegmentEvent::Book(BookEvent::Delta(_))))
+    );
+
+    let book: Value = serde_json::from_str(BOOK).unwrap();
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let delta: Value = serde_json::from_str(PRICE_CHANGE).unwrap();
+    let around_ignore = events(normalize(&ws(&json!([book, tick, delta]).to_string())));
+    assert_eq!(around_ignore.len(), 3);
+    assert!(matches!(
+        around_ignore[0],
+        SegmentEvent::Book(BookEvent::Full(_))
+    ));
+    assert!(
+        around_ignore[1..]
+            .iter()
+            .all(|event| matches!(event, SegmentEvent::Book(BookEvent::Delta(_))))
+    );
+
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let unknown = json!({"event_type":"future_state"});
+    assert_eq!(
+        reject(normalize(&ws(&json!([tick, unknown]).to_string()))).error_code,
+        "unsupported_message_type"
+    );
+    let tick: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let unknown = json!({"event_type":"future_state"});
+    assert_eq!(
+        reject(normalize(&ws(&json!([unknown, tick]).to_string()))).error_code,
+        "unsupported_message_type"
+    );
+
+    let first: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let second: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    assert_eq!(
+        normalize(&ws(&json!([first, second]).to_string())),
+        Normalization::Ignored {
+            reason_code: "tick_size_change".to_owned()
+        }
+    );
+
+    let valid: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    let mut malformed: Value = serde_json::from_str(TICK_SIZE).unwrap();
+    malformed["new_tick_size"] = json!("0.00001");
+    assert_eq!(
+        reject(normalize(&ws(&json!([valid, malformed]).to_string()))).error_code,
+        "inexact_price"
     );
 }
 

@@ -14,7 +14,8 @@ use prediction_encoder::{
 };
 use replay_domain::{FaultImpact, SEGMENT_SCHEMA_VERSION, SegmentEvent, SegmentRecord};
 use replay_materialize::{
-    BuildDisposition, DerivativeSpec, NormalizationPolicy, build_window, verify_derivative,
+    BuildDisposition, DerivativeSpec, NormalizationPolicy, RejectDisposition, RejectRecord,
+    build_window, verify_derivative,
 };
 use serde_json::{Value, json};
 use tempdir::TempDir;
@@ -207,6 +208,31 @@ fn read_events(derivative: &replay_materialize::VerifiedDerivative) -> Vec<Segme
     records
 }
 
+fn read_rejects(derivative: &replay_materialize::VerifiedDerivative) -> Vec<RejectRecord> {
+    let output = &derivative.manifest.rejects;
+    let file = fs::File::open(derivative.directory.join(&output.file)).unwrap();
+    let logical = CodecLogical {
+        sha256: output.logical.sha256.as_hex(),
+        byte_length: output.logical.byte_length,
+        line_count: output.logical.line_count,
+    };
+    let stored = CodecStored {
+        sha256: output.stored.sha256.as_hex(),
+        byte_length: output.stored.byte_length,
+    };
+    let decoder =
+        StreamingDecoder::new(file, &logical, Some(&stored), Some(logical.byte_length)).unwrap();
+    let mut reader = BufReader::new(decoder);
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).unwrap() != 0 {
+        records.push(RejectRecord::from_canonical_json(&line[..line.len() - 1]).unwrap());
+        line.clear();
+    }
+    reader.into_inner().finish().unwrap();
+    records
+}
+
 fn spec(normalizer: &Normalizer<Polymarket>) -> DerivativeSpec {
     DerivativeSpec {
         normalized_schema_version: SEGMENT_SCHEMA_VERSION,
@@ -239,10 +265,10 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
     assert_eq!(first.disposition, BuildDisposition::Committed);
     assert_eq!(first.derivative.manifest.counts.input_records, 7);
     assert_eq!(first.derivative.manifest.counts.accepted_events, 6);
-    assert_eq!(first.derivative.manifest.counts.rejected_source_records, 2);
+    assert_eq!(first.derivative.manifest.counts.rejected_source_records, 1);
     assert_eq!(
         first.derivative.manifest.counts.normalization_fault_events,
-        2
+        1
     );
     assert_eq!(
         first
@@ -250,11 +276,11 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
             .manifest
             .counts
             .intentionally_ignored_records,
-        1
+        2
     );
     let verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(verified.pin, first.derivative.pin);
-    // Parser V2 with materializer profile 2. Local paths are not addressed.
+    // Parser V3 with materializer profile 2. Local paths are not addressed.
     assert_eq!(
         format!(
             "{}:{}:{}",
@@ -262,7 +288,7 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
             verified.manifest.events.logical.sha256.as_hex(),
             verified.manifest.rejects.logical.sha256.as_hex()
         ),
-        "f479b6409d1b4fb1959249334f066e51629b0ae4f5f095aee7d91a5b52fc4f83:d340a1e589588f5ca2973fa5cde5c09b60a62ab052fef4bf3739d7eee948d923:b5738391ca7853b6c1bea0c9fded63bacd03ed724a1946fdf4cf6bcf3125850b"
+        "951da731d88fb50b22f1c45a3b686bbb7ab59749b3a68a0c1cf7bf8486195386:7b5a08878e9bcbb65cf527eb80fbe91a90565c714bafca210a1e4b5f1d85fd0b:cc2d0f86d197d1393dad52de77f175b04513456ced88906915f871c320fe0da7"
     );
     let records = read_events(&verified);
     let malformed_fault = records
@@ -273,6 +299,22 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
         malformed_fault.event(),
         SegmentEvent::NormalizationFault(fault)
             if matches!(fault.impact(), FaultImpact::UnattributedLane(_))
+    ));
+    assert!(
+        records
+            .iter()
+            .all(|record| record.header().address().canonical_seq() != 6),
+        "valid tick-size change must not become an event or Risk-visible fault"
+    );
+    let rejects = read_rejects(&verified);
+    let tick_change = rejects
+        .iter()
+        .find(|record| record.header().address().canonical_seq() == 6)
+        .expect("tick-size change sidecar must be persisted");
+    assert!(matches!(
+        tick_change.disposition(),
+        RejectDisposition::IntentionallyIgnored { reason_code }
+            if reason_code == "tick_size_change"
     ));
 
     let retry = build_window(
