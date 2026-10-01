@@ -1537,14 +1537,16 @@ fn snapshot_root_is_used_without_fallback_and_cleaned_on_drop_or_failure() {
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 1);
     drop(reader);
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
-    assert!(
-        open_pinned_with_checkpoint(&input, &limits, |stage, path| {
-            if stage == ReadCheckpoint::SnapshotCopied {
-                fs::write(path.join("events.ndjson.zst"), []).unwrap();
-            }
-        })
-        .is_err()
-    );
+    // The snapshot was bound to the receipt as it was copied, and open runs no
+    // decode pass, so a snapshot replaced afterwards fails on its first read.
+    let mut reader = open_pinned_with_checkpoint(&input, &limits, |stage, path| {
+        if stage == ReadCheckpoint::SnapshotCopied {
+            fs::write(path.join("events.ndjson.zst"), []).unwrap();
+        }
+    })
+    .unwrap();
+    assert!(reader.next_delivery().is_err());
+    assert!(reader.finish().is_err());
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
     limits.snapshot_root = Some(scratch.path().join("missing-volume"));
     assert!(open_pinned(&input, &limits).is_err());
@@ -1652,5 +1654,335 @@ fn every_committed_build_passes_the_full_independent_verifier() {
         .unwrap();
         let verified = verify_derivative(&built.derivative.directory).unwrap();
         assert_eq!(verified, built.derivative);
+    }
+}
+
+// ---- Streaming pinned reads -------------------------------------------------
+//
+// Pinned reads bind stored bytes while copying the snapshot, then run every
+// semantic check in one decode pass per file while records are traversed.
+// Records may stream before a late violation is found; completion may not.
+
+const STREAM_RECORDS: i64 = 64;
+const STREAM_FILES: [&str; 3] = [
+    "events.ndjson.zst",
+    "rejects.ndjson.zst",
+    "sources.ndjson.zst",
+];
+
+/// A window of `STREAM_RECORDS` rejected sources: one fault event, one parse
+/// reject and one source record per delivery, so every output has many lines.
+fn reject_window(output: &Path) -> (TempDir, VerifiedDerivative) {
+    let canonical = TempDir::new("stream-source").unwrap();
+    let end_ns = STREAM_RECORDS as u64 + 1;
+    canonical_fixture_count(canonical.path(), STREAM_RECORDS, end_ns);
+    let mut window_spec = spec();
+    window_spec.policy.effective_until_ns = Some(end_ns);
+    let built = build_window(
+        canonical.path(),
+        output,
+        0,
+        end_ns,
+        &window_spec,
+        &mut RejectAllNormalizer::new(),
+    )
+    .unwrap();
+    (canonical, built.derivative)
+}
+
+fn pinned(derivative: &VerifiedDerivative) -> PinnedDerivative {
+    PinnedDerivative {
+        directory: derivative.directory.clone(),
+        pin: derivative.pin.clone(),
+    }
+}
+
+fn output_of<'a>(manifest: &'a mut DerivativeManifest, file: &str) -> &'a mut CompressedOutput {
+    match file {
+        "events.ndjson.zst" => &mut manifest.events,
+        "rejects.ndjson.zst" => &mut manifest.rejects,
+        "sources.ndjson.zst" => manifest.sources.as_mut().unwrap(),
+        _ => panic!("unknown output {file}"),
+    }
+}
+
+/// Replaces one output's stored bytes and rebinds its stored identity (and its
+/// logical identity when given) in both manifest and receipt, returning the new
+/// pin. Corruption fixtures therefore pass every outer hash check.
+fn republish(
+    derivative: &VerifiedDerivative,
+    file: &str,
+    stored: &[u8],
+    logical: Option<LogicalIdentity>,
+) -> PinnedDerivative {
+    let directory = &derivative.directory;
+    fs::write(directory.join(file), stored).unwrap();
+    let mut manifest = derivative.manifest.clone();
+    let output = output_of(&mut manifest, file);
+    output.stored = StoredIdentity {
+        sha256: Sha256::digest(stored),
+        byte_length: stored.len() as u64,
+    };
+    if let Some(logical) = logical {
+        output.logical = logical;
+    }
+    let manifest_bytes = canonical_document(&manifest).unwrap();
+    fs::write(directory.join("manifest.json"), &manifest_bytes).unwrap();
+    let mut receipt = derivative.receipt.clone();
+    receipt.events = manifest.events.clone();
+    receipt.rejects = manifest.rejects.clone();
+    receipt.sources = manifest.sources.clone();
+    receipt.manifest.sha256 = Sha256::digest(&manifest_bytes);
+    receipt.manifest.byte_length = manifest_bytes.len() as u64;
+    let receipt_bytes = canonical_document(&receipt).unwrap();
+    fs::write(directory.join("receipt.json"), &receipt_bytes).unwrap();
+    PinnedDerivative {
+        directory: directory.clone(),
+        pin: DerivativePin {
+            derivative_address: receipt.derivative_address,
+            receipt_sha256: Sha256::digest(&receipt_bytes),
+        },
+    }
+}
+
+fn decoded_text(derivative: &VerifiedDerivative, file: &str) -> String {
+    use std::io::Read as _;
+    let mut manifest = derivative.manifest.clone();
+    let output = output_of(&mut manifest, file);
+    let logical = CodecLogical {
+        sha256: output.logical.sha256.as_hex(),
+        byte_length: output.logical.byte_length,
+        line_count: output.logical.line_count,
+    };
+    let mut decoder = StreamingDecoder::new(
+        fs::File::open(derivative.directory.join(file)).unwrap(),
+        &logical,
+        None,
+        Some(logical.byte_length),
+    )
+    .unwrap();
+    let mut text = String::new();
+    decoder.read_to_string(&mut text).unwrap();
+    decoder.finish().unwrap();
+    text
+}
+
+/// Re-encodes one output after `change` and rebinds both of its identities.
+fn reencode(
+    derivative: &VerifiedDerivative,
+    file: &str,
+    change: impl FnOnce(&mut String),
+) -> PinnedDerivative {
+    let mut text = decoded_text(derivative, file);
+    change(&mut text);
+    let mut stored = Vec::new();
+    let result = encode_stream(
+        Cursor::new(text.into_bytes()),
+        &mut stored,
+        DEFAULT_ZSTD_LEVEL,
+    )
+    .unwrap();
+    let logical = LogicalIdentity {
+        sha256: Sha256::from_hex(&result.logical.sha256).unwrap(),
+        byte_length: result.logical.byte_length,
+        line_count: result.logical.line_count,
+    };
+    republish(derivative, file, &stored, Some(logical))
+}
+
+/// Drains a reader that must fail: it may expose a prefix, but the failure
+/// poisons it and `finish` never mints a completion capability.
+fn fails_without_completion(mut reader: VerifiedWindowReader) -> (usize, String) {
+    let mut exposed = 0;
+    let error = loop {
+        match reader.next_delivery() {
+            Ok(Some(_)) => exposed += 1,
+            Ok(None) => panic!("corrupt window reached clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        reader.next_delivery().unwrap_err(),
+        "derivative reader is poisoned"
+    );
+    assert_eq!(
+        reader.finish().err().unwrap(),
+        "derivative reader requires verified EOF before finish"
+    );
+    (exposed, error)
+}
+
+#[test]
+fn pinned_open_runs_no_verification_pass_before_the_first_record() {
+    let output = TempDir::new("stream-first-record").unwrap();
+    let (_canonical, derivative) = reject_window(output.path());
+
+    verify::probe::reset();
+    let mut reader = open_pinned(&pinned(&derivative), &ReadLimits::default()).unwrap();
+    for file in STREAM_FILES {
+        assert_eq!(
+            verify::probe::lines(file),
+            0,
+            "{file} decoded before open returned"
+        );
+    }
+    let first = reader.next_delivery().unwrap().unwrap();
+    assert_eq!(first.header().address().canonical_seq(), 1);
+    for file in STREAM_FILES {
+        // One delivery plus at most one line of join lookahead.
+        assert!(verify::probe::lines(file) <= 2, "{file} was pre-scanned");
+    }
+    let mut deliveries = 1;
+    while reader.next_delivery().unwrap().is_some() {
+        deliveries += 1;
+    }
+    assert_eq!(deliveries, STREAM_RECORDS);
+    assert_eq!(reader.finish().unwrap().metadata().pin(), &derivative.pin);
+    for file in STREAM_FILES {
+        assert_eq!(
+            verify::probe::opens(file),
+            1,
+            "{file} decoded more than once"
+        );
+        assert_eq!(verify::probe::lines(file), STREAM_RECORDS as u64, "{file}");
+    }
+}
+
+#[test]
+fn full_verifier_decodes_each_output_exactly_once() {
+    let output = TempDir::new("stream-verifier").unwrap();
+    let (_canonical, derivative) = reject_window(output.path());
+    verify::probe::reset();
+    assert_eq!(
+        verify_derivative(&derivative.directory).unwrap(),
+        derivative
+    );
+    for file in STREAM_FILES {
+        assert_eq!(verify::probe::opens(file), 1, "{file}");
+        assert_eq!(verify::probe::lines(file), STREAM_RECORDS as u64, "{file}");
+    }
+}
+
+#[test]
+fn stored_identity_is_bound_while_copying_before_any_decode() {
+    let output = TempDir::new("stream-stored").unwrap();
+    let (_canonical, derivative) = reject_window(output.path());
+    let path = derivative.directory.join("rejects.ndjson.zst");
+    let mut bytes = fs::read(&path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 1; // same length, different stored digest
+    fs::write(&path, bytes).unwrap();
+    verify::probe::reset();
+    assert_eq!(
+        open_pinned(&pinned(&derivative), &ReadLimits::default())
+            .err()
+            .unwrap(),
+        "snapshot rejects.ndjson.zst disagrees with the receipt"
+    );
+    for file in STREAM_FILES {
+        assert_eq!(
+            verify::probe::opens(file),
+            0,
+            "{file} decoded before binding"
+        );
+    }
+    assert!(verify_derivative(&derivative.directory).is_err());
+}
+
+#[test]
+fn late_semantic_corruption_streams_a_prefix_but_never_completes() {
+    let output = TempDir::new("stream-late").unwrap();
+    let (_canonical, derivative) = reject_window(output.path());
+    let input = reencode(&derivative, "rejects.ndjson.zst", |text| {
+        // Only the final parse reject stops binding its reject_id.
+        let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+        let last = text[start..].replacen("synthetic_reject", "synthetic_rejecx", 1);
+        text.replace_range(start.., &last);
+    });
+    let reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+    let (exposed, error) = fails_without_completion(reader);
+    assert_eq!(
+        error,
+        "parse reject_id does not bind its source and parser result"
+    );
+    assert!(
+        exposed > 0 && exposed < STREAM_RECORDS as usize,
+        "{exposed}"
+    );
+    assert_eq!(verify_derivative(&input.directory).unwrap_err(), error);
+}
+
+#[test]
+fn trailing_frame_rebound_to_its_stored_identity_fails_at_eof() {
+    let output = TempDir::new("stream-trailing").unwrap();
+    let (_canonical, derivative) = reject_window(output.path());
+    let mut stored = fs::read(derivative.directory.join("events.ndjson.zst")).unwrap();
+    stored.extend(stored.clone()); // a second complete, valid frame
+    let input = republish(&derivative, "events.ndjson.zst", &stored, None);
+    let reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+    let (exposed, error) = fails_without_completion(reader);
+    assert_eq!(
+        exposed, STREAM_RECORDS as usize,
+        "every record precedes the EOF check"
+    );
+    assert!(error.contains("events.ndjson.zst"), "{error}");
+    assert!(verify_derivative(&input.directory).is_err());
+}
+
+#[test]
+fn streamed_deliveries_equal_an_independent_decode_of_the_window() {
+    type Joined = (Vec<SegmentRecord>, Option<RejectDisposition>);
+    for reject in [false, true] {
+        let canonical = TempDir::new("stream-equal-source").unwrap();
+        let output = TempDir::new("stream-equal").unwrap();
+        let derivative = if reject {
+            reject_window(output.path()).1
+        } else {
+            canonical_fixture(canonical.path());
+            build_window(
+                canonical.path(),
+                output.path(),
+                0,
+                10,
+                &spec(),
+                &mut FakeNormalizer::new(FakeMode::Normal),
+            )
+            .unwrap()
+            .derivative
+        };
+        // Independent oracle: decode each file and join by canonical sequence.
+        let mut expected = std::collections::BTreeMap::<i64, Joined>::new();
+        for line in decoded_text(&derivative, "events.ndjson.zst").lines() {
+            let record = SegmentRecord::from_canonical_json(line.as_bytes()).unwrap();
+            let seq = record.header().address().canonical_seq();
+            expected.entry(seq).or_default().0.push(record);
+        }
+        for line in decoded_text(&derivative, "rejects.ndjson.zst").lines() {
+            let record = RejectRecord::from_canonical_json(line.as_bytes()).unwrap();
+            let seq = record.header().address().canonical_seq();
+            expected.entry(seq).or_default().1 = Some(record.disposition().clone());
+        }
+        let epochs: Vec<String> = decoded_text(&derivative, "sources.ndjson.zst")
+            .lines()
+            .map(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                value["connection_epoch"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        let mut reader = open_pinned(&pinned(&derivative), &ReadLimits::default()).unwrap();
+        let mut actual = std::collections::BTreeMap::<i64, Joined>::new();
+        let mut actual_epochs = Vec::new();
+        while let Some(delivery) = reader.next_delivery().unwrap() {
+            actual_epochs.push(delivery.connection_epoch().unwrap().to_owned());
+            actual.insert(
+                delivery.header().address().canonical_seq(),
+                (delivery.records().to_vec(), delivery.disposition().cloned()),
+            );
+        }
+        let finished = reader.finish().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual_epochs, epochs);
+        assert_eq!(finished.metadata().pin(), &derivative.pin);
+        assert_eq!(finished.metadata().manifest(), &derivative.manifest);
     }
 }

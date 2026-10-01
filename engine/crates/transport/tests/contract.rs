@@ -149,6 +149,94 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
     output
 }
 
+/// Re-encodes the fixture's events with only the final line changed, rebinding
+/// both identities in manifest, receipt and pin so every hash check passes.
+fn corrupt_last_event(pin: &mut replay_materialize::PinnedDerivative) {
+    use std::io::Read;
+    let directory = pin.directory.clone();
+    let mut manifest: replay_materialize::DerivativeManifest =
+        serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+    let mut receipt: replay_materialize::DerivativeReceipt =
+        serde_json::from_slice(&std::fs::read(directory.join("receipt.json")).unwrap()).unwrap();
+    let logical = prediction_encoder::LogicalIdentity {
+        sha256: manifest.events.logical.sha256.as_hex(),
+        byte_length: manifest.events.logical.byte_length,
+        line_count: manifest.events.logical.line_count,
+    };
+    let mut decoder = prediction_encoder::StreamingDecoder::new(
+        std::fs::File::open(directory.join("events.ndjson.zst")).unwrap(),
+        &logical,
+        None,
+        Some(logical.byte_length),
+    )
+    .unwrap();
+    let mut text = String::new();
+    decoder.read_to_string(&mut text).unwrap();
+    decoder.finish().unwrap();
+    let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+    let last = text[start..].replacen("\"event_index\":1", "\"event_index\":2", 1);
+    assert_ne!(last, text[start..]);
+    text.replace_range(start.., &last);
+    let mut stored = Vec::new();
+    let result =
+        prediction_encoder::encode_stream(std::io::Cursor::new(text), &mut stored, 3).unwrap();
+    std::fs::write(directory.join("events.ndjson.zst"), &stored).unwrap();
+    manifest.events.logical = replay_materialize::LogicalIdentity {
+        sha256: indexer_types::Sha256::from_hex(&result.logical.sha256).unwrap(),
+        byte_length: result.logical.byte_length,
+        line_count: result.logical.line_count,
+    };
+    manifest.events.stored = replay_materialize::StoredIdentity {
+        sha256: indexer_types::Sha256::digest(&stored),
+        byte_length: stored.len() as u64,
+    };
+    let bytes = format!("{}\n", serde_json::to_string(&manifest).unwrap()).into_bytes();
+    receipt.events = manifest.events.clone();
+    receipt.manifest.sha256 = indexer_types::Sha256::digest(&bytes);
+    receipt.manifest.byte_length = bytes.len() as u64;
+    std::fs::write(directory.join("manifest.json"), bytes).unwrap();
+    let bytes = format!("{}\n", serde_json::to_string(&receipt).unwrap()).into_bytes();
+    pin.pin.receipt_sha256 = indexer_types::Sha256::digest(&bytes);
+    std::fs::write(directory.join("receipt.json"), bytes).unwrap();
+}
+
+#[test]
+fn late_corruption_streams_cuts_but_never_reaches_a_terminal() {
+    // Pinned reads verify while they stream, so cuts from a window can precede
+    // its failure. The publisher mints its terminal record only from
+    // `RiskEngine::finish`, which this attempt can never reach.
+    let mut f = fixture();
+    corrupt_last_event(&mut f.pin);
+    let mut engine = RiskEngine::open(
+        vec![f.pin.clone()],
+        0,
+        100,
+        LowerBoundPolicy::Clip,
+        vec![
+            plan("kalshi:A", "x"),
+            plan("kalshi:B", "x"),
+            plan("polymarket:T", "y"),
+        ],
+        RiskLimits::default(),
+    )
+    .unwrap();
+    let mut cuts = 0;
+    let error = loop {
+        match engine.next_cut() {
+            Ok(Some(_)) => cuts += 1,
+            Ok(None) => panic!("corrupt window reached clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error, "normalized events are not in canonical child order");
+    assert!(
+        cuts > 0,
+        "the window status and earlier groups stream first"
+    );
+    assert_eq!(engine.next_cut().unwrap_err(), "risk attempt is poisoned");
+    assert!(engine.finish().is_err());
+}
+
 fn invalid_preflight_configs(f: &Fixture) -> (Vec<(&'static str, Config)>, tempdir::TempDir) {
     let mut cases = Vec::new();
 
