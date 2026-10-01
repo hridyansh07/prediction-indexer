@@ -68,6 +68,12 @@ the original closed reason object. Book identity is instrument **and orientation
 source authority is the snapshot plan's explicit lane. Delayed initialization,
 quiet periods, empty valid ladders, and trades alone do not imply missing data.
 Only authoritative Risk transitions initialize, invalidate, or recover a book.
+`MetadataChanged` is target-file publication metadata, exposed separately as a
+control observation with its `from`/`to` digests. It is not a market event, book
+transition, unusable reason, evidence reason, interval boundary, or rebuild signal;
+bundle coverage therefore leaves availability and revisions unchanged when it sees
+one. Historical wire/output carrying `metadata_changed` as a reason remains
+readable, but new Risk runs do not produce that reason.
 
 Each requested member remains in the denominator, including listed-but-unselected
 members with unknown native mapping. Their member interval has zero required books,
@@ -107,8 +113,12 @@ A later group fault (for example, a connection close) may replace `reason` and
 `source` while `evidence` and `evidence_source` retain the window-level fault.
 Both facts remain visible; neither implies recovery.
 
+Metadata-change controls are positive audit observations rather than negative
+coverage evidence. They never appear in either the window-evidence list above or
+the current book's unusable-reason list.
+
 No inference of positive coverage from silence is made, and no second Python Risk
-verifier or expanded wire format is introduced. Entering a later clean window
+verifier is introduced. Entering a later clean window
 resets current evidence to `unknown` but does not clear a latched unusable book
 reason. Only a later valid Full recovers that book. Window failures are retrospective
 verified interval knowledge, already applied by Risk; these results do not claim

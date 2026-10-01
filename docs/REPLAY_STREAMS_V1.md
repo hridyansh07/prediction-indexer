@@ -52,8 +52,8 @@ Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
   `max_queue_bytes`. Each plan has `instrument`, `orientation`, `lane`, `venue`,
   `price_scale`, `quantity_scale`. Explicit ordered configuration is the identity;
   no lookup of current/latest data is permitted.
-- `cut`, sequences 1…N: `origin`, ordered `market_events`, affected-only
-  `book_transitions`. Origin is `window {pin,start_ns,end_ns}` or
+- `cut`, sequences 1…N: `origin`, ordered `market_events`, optional ordered
+  `control_events`, and affected-only `book_transitions`. Origin is `window {pin,start_ns,end_ns}` or
   `group {pin,first,last,visible_ns}`. An address has `canonical_seq`, `lane`,
   `delivery_index`, `event_index`. A reference has `pin`, `address`, `visible_ns`,
   `order_ns`. All pins must belong to initial selection.
@@ -62,6 +62,11 @@ Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
   Original domain BookEvent/TradeEvent serialization is retained, except all
   integers become strings. Fulls, repeated deltas and trades remain ordered and
   uncoalesced, including invalidated/duplicate observations and uninterpreted hashes.
+- `control_events`, when present, contains referenced non-market observations.
+  V1 currently admits only `metadata_changed {from,to}`. It changes no local book;
+  legacy cuts that omit this field remain valid. The old `metadata_changed`
+  invalidation reason remains decodable for already-produced wire records but is
+  not emitted by the corrected Risk policy.
 - A transition has `key {instrument,orientation}`, `previous_revision`, `revision`,
   `dependency` (null, or `{epoch,anchor,through}`), and `decision`. Decisions are
   `snapshot {bids,asks}` (ascending `[price_atoms,quantity_atoms]` pairs),

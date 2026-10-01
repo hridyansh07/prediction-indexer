@@ -284,9 +284,10 @@ class _AuditState:
             if isinstance(digest, str) and digest not in ("", "broadcast"):
                 self.metadata_digests_referenced.add(digest)
         elif event == "target_metadata_changed":
-            digest = payload.get("to_metadata_digest")
-            if isinstance(digest, str) and digest:
-                self.metadata_digests_referenced.add(digest)
+            for field in ("from_metadata_digest", "to_metadata_digest"):
+                digest = payload.get(field)
+                if isinstance(digest, str) and digest:
+                    self.metadata_digests_referenced.add(digest)
         elif event == "connection_closed":
             self.connection_closed[key] += 1
 

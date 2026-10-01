@@ -335,9 +335,11 @@ overlay is implemented or approved by this generic traversal boundary.
 [`RISK_RECONSTRUCTION_V1.md`](../docs/RISK_RECONSTRUCTION_V1.md) specifies
 `RiskEngine::{open, next_cut, view, finish}`, explicit primary-lane `BookPlan`s,
 and the transport-independent immutable `RiskCut` boundary. It separates ordered
-original Book/Trade observations (including duplicate disposition) from scoped
-book decisions. Only affected books advance revision; failures latch per key,
-receipt faults block their entire intervals, and later valid Fulls recover.
+original Book/Trade observations (including duplicate disposition), non-market
+target-metadata change observations, and scoped book decisions. Metadata changes
+retain both publication digests without changing books. Only affected books advance
+revision; failures latch per key, receipt faults block their entire intervals, and
+later valid Fulls recover.
 Views retain exact initialization/epoch dependencies and remain immutable after
 later cuts. Profile 1 cannot open a strong risk attempt. There is no transport,
 remote query, audit overlay, checkpoint, strategy, or fee change in this crate.

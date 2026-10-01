@@ -69,8 +69,11 @@ logical maximum although stored unsigned.
   counter and identity conflict invalidate dependent books and latch the group.
 - Opening a connection or changing a subscription clears old state, but a valid
   Full later in that same group may initialize it. Epoch change without an opening
-  control behaves the same way. Closed/failed connections and metadata changes
-  invalidate and latch the group; they cannot extend an old delta chain.
+  control behaves the same way. Closed/failed connections invalidate and latch
+  the group; they cannot extend an old delta chain. `MetadataChanged` describes
+  target-file publication metadata only. It is retained as a control observation
+  with both target metadata digests and never initializes, invalidates, resets,
+  latches, or advances a book revision.
 - A normalization fault affects only the intersection of its typed impact and
   its planned source authority. An instrument fault affects that instrument's
   planned orientations; an unattributed lane fault affects dependent keys;
@@ -102,6 +105,8 @@ subsequent cuts. There is no callback inside group staging.
   source span and visible time;
 - `market_events()`: original ordered Book/Trade events, without coalescing trades
   or repeated updates to a key, compact canonical references and disposition;
+- `control_events()`: ordered `MetadataChanged` observations with compact canonical
+  references and exact `from`/`to` target metadata digests;
 - `book_transitions()`: affected keys only, prior revision, new immutable view,
   and authoritative `Decision`.
 
@@ -110,9 +115,11 @@ Any successful group containing a Full uses `Snapshot` with the complete final
 native ladder, including later accepted updates in that group. `Invalidation`
 supplies the closed reason and no usable ladder. Earlier book operations rolled
 back by a later group fault receive `Invalidated` analytics disposition. Trades
-remain observations, not book mutations. `NotAuthority` denotes retained book
-observations without planned source/key authority. Controls, raw rejects,
-sidecar diagnostic payloads and audit anchors are not market events. Original
+remain observations, not book mutations. Metadata changes are control observations,
+not market events or book faults. `NotAuthority` denotes retained book observations
+without planned source/key authority. Controls, raw rejects, sidecar diagnostic
+payloads and audit anchors are not market events; controls other than
+`MetadataChanged` remain represented by their policy effects. Original
 book hashes remain uninterpreted fields of the preserved market observations.
 Consumers apply decisions, not risk policy. They must install all transitions of
 a cut before evaluating or exposing their local state.

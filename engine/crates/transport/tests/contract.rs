@@ -326,6 +326,51 @@ fn golden_wire_from_real_materializer_walker_and_risk() {
 }
 
 #[test]
+fn metadata_change_is_a_noninvalidating_wire_observation() {
+    let f = Fixture::new(
+        0,
+        100,
+        1,
+        vec![
+            row("x", 1, vec![full("kalshi:A", &[(37, 11)], &[])]),
+            row(
+                "x",
+                2,
+                vec![SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: Some("old".into()),
+                    to: "new".into(),
+                })],
+            ),
+        ],
+        |_| {},
+    );
+    let mut engine = RiskEngine::open(
+        vec![f.pin.clone()],
+        0,
+        100,
+        LowerBoundPolicy::Clip,
+        vec![plan("kalshi:A", "x")],
+        RiskLimits::default(),
+    )
+    .unwrap();
+    engine.next_cut().unwrap();
+    engine.next_cut().unwrap();
+    let cut = engine.next_cut().unwrap().unwrap();
+    let encoded = wire::cut(&cut);
+
+    assert!(encoded["book_transitions"].as_array().unwrap().is_empty());
+    assert!(encoded["market_events"].as_array().unwrap().is_empty());
+    assert_eq!(
+        encoded["control_events"][0]["event"],
+        json!({"kind":"metadata_changed","from":"old","to":"new"})
+    );
+    assert_eq!(
+        encoded["control_events"][0]["reference"]["address"]["event_index"],
+        "0"
+    );
+}
+
+#[test]
 #[ignore = "requires explicitly supplied disposable Redis >=8.2"]
 fn invalid_preflight_never_creates_redis_keys() {
     use replay_transport::Publisher;

@@ -1,5 +1,5 @@
 //! Wire V1 uses JSON strings for every integer, including domain integers.
-use replay_domain::BookKey;
+use replay_domain::{BookKey, ControlEvent};
 use replay_risk::{CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut};
 use replay_tape::{DerivativePin, SourceFaultReason};
 use serde_json::{Value, json};
@@ -47,7 +47,6 @@ fn reason(r: &Reason) -> Value {
         Reason::ConnectionClosed => "connection_closed",
         Reason::ConnectionFailed => "connection_failed",
         Reason::SubscriptionChanged => "subscription_changed",
-        Reason::MetadataChanged => "metadata_changed",
         Reason::UnsupportedState => "unsupported_state",
         Reason::ScaleMismatch => "scale_mismatch",
         Reason::QuantityUnderflow => "quantity_underflow",
@@ -86,6 +85,17 @@ pub fn cut(c: &RiskCut) -> Value {
             json!({"reference":reference(&r.reference), "event":event, "disposition":disposition})
         })
         .collect();
+    let controls: Vec<_> = c
+        .control_events()
+        .iter()
+        .filter_map(|r| match &r.event {
+            ControlEvent::MetadataChanged { from, to } => Some(json!({
+                "reference": reference(&r.reference),
+                "event": {"kind":"metadata_changed", "from":from, "to":to},
+            })),
+            _ => None,
+        })
+        .collect();
     let transitions: Vec<_> = c.book_transitions().iter().map(|t| {
         let decision = match &t.decision {
             Decision::Snapshot(l) => json!({"kind":"snapshot", "bids":l.bids().iter().collect::<Vec<_>>(), "asks":l.asks().iter().collect::<Vec<_>>()}),
@@ -95,7 +105,13 @@ pub fn cut(c: &RiskCut) -> Value {
         let dependency = t.view.dependency().map(|d| json!({"epoch":d.epoch,"anchor":reference(&d.anchor),"through":reference(&d.through)}));
         json!({"key":key(&t.key),"previous_revision":t.previous_revision,"revision":t.view.revision(),"dependency":dependency,"decision":decision})
     }).collect();
-    exact(
-        json!({"origin":origin(c.origin()),"market_events":events,"book_transitions":transitions}),
-    )
+    let mut value =
+        json!({"origin":origin(c.origin()),"market_events":events,"book_transitions":transitions});
+    if !controls.is_empty() {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("control_events".into(), Value::Array(controls));
+    }
+    exact(value)
 }
