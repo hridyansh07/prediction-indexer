@@ -1,5 +1,5 @@
 //! Wire V1 uses JSON strings for every integer, including domain integers.
-use replay_domain::{BookKey, ControlEvent};
+use replay_domain::BookKey;
 use replay_risk::{CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut};
 use replay_tape::{DerivativePin, SourceFaultReason};
 use serde_json::{Value, json};
@@ -88,12 +88,11 @@ pub fn cut(c: &RiskCut) -> Value {
     let controls: Vec<_> = c
         .control_events()
         .iter()
-        .filter_map(|r| match &r.event {
-            ControlEvent::MetadataChanged { from, to } => Some(json!({
+        .map(|r| {
+            json!({
                 "reference": reference(&r.reference),
-                "event": {"kind":"metadata_changed", "from":from, "to":to},
-            })),
-            _ => None,
+                "event": {"kind":"metadata_changed", "from":r.from, "to":r.to},
+            })
         })
         .collect();
     let transitions: Vec<_> = c.book_transitions().iter().map(|t| {

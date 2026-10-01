@@ -1164,6 +1164,12 @@ whole volume. Roll back only to a config/image proven compatible with current
 schema and markers. For state rollback use only the stopped full-volume snapshot
 procedure above. Rerun preflight and synthetic acceptance before re-enabling.
 
+Replay stream V1's post-baseline `control_events` extension is a lockstep image
+boundary: deploy the publisher and all strict consumers together, with no active
+attempt crossing the image change. Mixed-version operation and rollback to a
+baseline V1 consumer after publishing such a cut are unsupported; the old consumer
+intentionally fails closed on the added field.
+
 ## Clock and liveness semantics
 
 Linux containers share the host kernel's `CLOCK_MONOTONIC` and boot ID. Each

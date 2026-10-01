@@ -257,26 +257,41 @@ class TargetRecordTests(unittest.TestCase):
 
 
 class Gate1Tests(unittest.TestCase):
-    def test_metadata_change_retains_both_snapshot_references_without_faulting(self) -> None:
+    def test_metadata_change_from_digest_is_not_a_snapshot_availability_requirement(self) -> None:
+        snapshot = {"version": 1, "venue": "polymarket", "targets": []}
+        digest = hashlib.sha256(
+            json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        snapshot["metadata_digest"] = digest
         changed = {
             "event": "target_metadata_changed",
             "target_digest": "unchanged",
-            "from_metadata_digest": "before",
-            "to_metadata_digest": "after",
+            "from_metadata_digest": "outside-this-dataset",
+            "to_metadata_digest": digest,
             "metadata_path": "snapshots/after.json",
         }
         data = _line(1, 1, changed, event_kind="control")
         report = Gate1Auditor().audit(
             MemoryByteStreamer(
-                {"spool/lane=polymarket/date=2026-01-01/a.ndjson": data}
+                {
+                    "spool/lane=polymarket/date=2026-01-01/a.ndjson": data,
+                    f"metadata/polymarket/{digest}.json": json.dumps(snapshot).encode(),
+                }
             )
         )
 
         reference_check = next(
             check for check in report.checks if check.name == "metadata_snapshot_references"
         )
-        self.assertEqual(reference_check.status, "ADVISORY")
-        self.assertEqual(reference_check.evidence["referenced_snapshots"], 2)
+        self.assertEqual(reference_check.status, "PASS")
+        self.assertEqual(reference_check.evidence["referenced_snapshots"], 1)
+        self.assertEqual(reference_check.evidence["missing_references"], [])
 
     def test_a_thin_tape_returns_no_and_names_every_missing_observable(self) -> None:
         opened = {

@@ -86,6 +86,14 @@ fn fixture() -> Fixture {
                     delta("kalshi:A", 12, LevelChange::Increase(qty(4))),
                 ],
             ),
+            row(
+                "x",
+                6,
+                vec![SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: Some("before".into()),
+                    to: "after".into(),
+                })],
+            ),
         ],
         |_| {},
     )
@@ -174,7 +182,7 @@ fn corrupt_last_event(pin: &mut replay_materialize::PinnedDerivative) {
     decoder.read_to_string(&mut text).unwrap();
     decoder.finish().unwrap();
     let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
-    let last = text[start..].replacen("\"event_index\":1", "\"event_index\":2", 1);
+    let last = text[start..].replacen("\"event_index\":0", "\"event_index\":1", 1);
     assert_ne!(last, text[start..]);
     text.replace_range(start.., &last);
     let mut stored = Vec::new();
@@ -322,6 +330,11 @@ fn golden_wire_from_real_materializer_walker_and_risk() {
     assert_eq!(
         values[3]["body"]["market_events"].as_array().unwrap().len(),
         5
+    );
+    assert!(values[6]["body"].get("control_events").is_none());
+    assert_eq!(
+        values[7]["body"]["control_events"][0]["event"],
+        json!({"kind":"metadata_changed","from":"before","to":"after"})
     );
 }
 

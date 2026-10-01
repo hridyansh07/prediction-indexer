@@ -172,7 +172,8 @@ pub struct MarketRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlRecord {
     pub reference: Reference,
-    pub event: ControlEvent,
+    pub from: Option<String>,
+    pub to: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CutOrigin {
@@ -463,14 +464,6 @@ impl RiskEngine {
             }
             for record in delivery.records() {
                 let reference = Reference::new(group.pin(), record.header());
-                if let SegmentEvent::Control(control @ ControlEvent::MetadataChanged { .. }) =
-                    record.event()
-                {
-                    controls.push(ControlRecord {
-                        reference: reference.clone(),
-                        event: control.clone(),
-                    });
-                }
                 let market = match record.event() {
                     SegmentEvent::Book(b) => Some(MarketEvent::Book(b.clone())),
                     SegmentEvent::Trade(t) => Some(MarketEvent::Trade(t.clone())),
@@ -489,6 +482,15 @@ impl RiskEngine {
                 }
                 if duplicate {
                     continue;
+                }
+                if let SegmentEvent::Control(ControlEvent::MetadataChanged { from, to }) =
+                    record.event()
+                {
+                    controls.push(ControlRecord {
+                        reference: reference.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
                 }
                 match record.event() {
                     SegmentEvent::Book(book) => {

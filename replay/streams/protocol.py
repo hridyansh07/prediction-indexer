@@ -335,7 +335,9 @@ class Decoder:
                     m["disposition"],
                     "observed applied duplicate not_authority invalidated",
                 )
-            for c in array(b.get("control_events", [])):
+            controls = array(b.get("control_events", []))
+            require("control_events" not in b or controls, "empty control events")
+            for c in controls:
                 obj(c, "reference event")
                 reference(c["reference"], self._pins)
                 control_event(c["event"])

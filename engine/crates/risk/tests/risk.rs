@@ -489,14 +489,29 @@ fn metadata_changes_are_observed_without_changing_book_state() {
                     to: "y-next".into(),
                 })],
             ),
+            Row {
+                continuity: "duplicate",
+                ..row(
+                    "x",
+                    5,
+                    vec![
+                        SegmentEvent::Control(ControlEvent::MetadataChanged {
+                            from: Some("x-initial".into()),
+                            to: "x-next".into(),
+                        }),
+                        delta("kalshi:A", 37, LevelChange::Increase(qty(99))),
+                        trade("kalshi:A", 7),
+                    ],
+                )
+            },
             row(
                 "x",
-                5,
+                6,
                 vec![delta("kalshi:A", 37, LevelChange::Increase(qty(2)))],
             ),
             row(
                 "y",
-                6,
+                7,
                 vec![delta("polymarket:B", 41, LevelChange::Increase(qty(3)))],
             ),
         ],
@@ -512,10 +527,8 @@ fn metadata_changes_are_observed_without_changing_book_state() {
         c[1].control_events(),
         [ControlRecord {
             reference: c[1].control_events()[0].reference.clone(),
-            event: ControlEvent::MetadataChanged {
-                from: None,
-                to: "x-initial".into(),
-            },
+            from: None,
+            to: "x-initial".into(),
         }]
     );
     assert_eq!(c[1].control_events()[0].reference.address.event_index(), 0);
@@ -542,21 +555,25 @@ fn metadata_changes_are_observed_without_changing_book_state() {
     ] {
         assert!(cut.book_transitions().is_empty());
         assert!(cut.market_events().is_empty());
-        assert!(matches!(
-            &cut.control_events()[0].event,
-            ControlEvent::MetadataChanged { from: observed_from, to: observed_to }
-                if observed_from.as_deref() == from && observed_to == to
-        ));
+        assert_eq!(cut.control_events()[0].from.as_deref(), from);
+        assert_eq!(cut.control_events()[0].to, to);
     }
     assert_eq!(initialized_a.validity(), &Validity::Usable);
     assert_eq!(initialized_b.validity(), &Validity::Usable);
     assert_eq!(initialized_a.revision(), 1);
     assert_eq!(initialized_b.revision(), 1);
-    assert_eq!(bid(&c[5], "kalshi:A", 37), 13);
-    assert_eq!(c[5].book_transitions()[0].previous_revision, 1);
     assert!(c[5].control_events().is_empty());
-    assert_eq!(bid(&c[6], "polymarket:B", 41), 9);
+    assert!(c[5].book_transitions().is_empty());
+    assert_eq!(c[5].market_events().len(), 2);
+    assert!(
+        c[5].market_events()
+            .iter()
+            .all(|event| event.disposition == Disposition::Duplicate)
+    );
+    assert_eq!(bid(&c[6], "kalshi:A", 37), 13);
     assert_eq!(c[6].book_transitions()[0].previous_revision, 1);
+    assert_eq!(bid(&c[7], "polymarket:B", 41), 9);
+    assert_eq!(c[7].book_transitions()[0].previous_revision, 1);
 }
 
 #[test]

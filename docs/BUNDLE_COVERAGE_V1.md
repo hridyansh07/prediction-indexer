@@ -68,12 +68,13 @@ the original closed reason object. Book identity is instrument **and orientation
 source authority is the snapshot plan's explicit lane. Delayed initialization,
 quiet periods, empty valid ladders, and trades alone do not imply missing data.
 Only authoritative Risk transitions initialize, invalidate, or recover a book.
-`MetadataChanged` is target-file publication metadata, exposed separately as a
-control observation with its `from`/`to` digests. It is not a market event, book
-transition, unusable reason, evidence reason, interval boundary, or rebuild signal;
-bundle coverage therefore leaves availability and revisions unchanged when it sees
-one. Historical wire/output carrying `metadata_changed` as a reason remains
-readable, but new Risk runs do not produce that reason.
+`MetadataChanged` is target-file publication metadata, exposed separately on Replay
+stream cuts as a control observation with its `from`/`to` digests. Bundle coverage
+output does not record these controls and ignores them when deriving availability
+and revisions. A metadata change is not a market event, book transition, unusable
+reason, evidence reason, interval boundary, or rebuild signal. Historical wire/output
+carrying `metadata_changed` as a reason remains readable, but new Risk runs do not
+produce that reason.
 
 Each requested member remains in the denominator, including listed-but-unselected
 members with unknown native mapping. Their member interval has zero required books,
