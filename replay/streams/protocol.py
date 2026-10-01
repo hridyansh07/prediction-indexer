@@ -161,6 +161,14 @@ def event(value):
                 uint(b["source_observed_ns"])
 
 
+def control_event(value):
+    obj(value, "kind from to")
+    require(value["kind"] == "metadata_changed")
+    if value["from"] is not None:
+        text(value["from"])
+    text(value["to"])
+
+
 def reason(value):
     require(type(value) is dict)
     kind = value.get("kind")
@@ -308,7 +316,16 @@ class Decoder:
             self.terminal = True
         else:
             require(r["kind"] == "cut")
-            obj(b, "origin market_events book_transitions")
+            require(type(b) is dict)
+            fields = set(b)
+            require(
+                fields
+                in (
+                    {"origin", "market_events", "book_transitions"},
+                    {"origin", "market_events", "control_events", "book_transitions"},
+                ),
+                "closed schema",
+            )
             origin(b["origin"], self._pins)
             for m in array(b["market_events"]):
                 obj(m, "reference event disposition")
@@ -318,6 +335,12 @@ class Decoder:
                     m["disposition"],
                     "observed applied duplicate not_authority invalidated",
                 )
+            controls = array(b.get("control_events", []))
+            require("control_events" not in b or controls, "empty control events")
+            for c in controls:
+                obj(c, "reference event")
+                reference(c["reference"], self._pins)
+                control_event(c["event"])
             affected = set()
             for t in array(b["book_transitions"]):
                 obj(t, "key previous_revision revision dependency decision")

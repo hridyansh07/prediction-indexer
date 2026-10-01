@@ -47,13 +47,20 @@ JSON keys are rejected. Unknown versions or variants abort, never get skipped.
 
 Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
 
+`control_events` is an accepted post-baseline V1 lockstep extension. The publisher
+and every strict consumer for an attempt must be deployed together. A baseline V1
+consumer intentionally fails closed when a cut contains this field; mixed-version
+operation and rollback to that consumer across this boundary are unsupported. This
+is retained as V1 because the fixed publisher and consumers ship in one image and
+attempt streams are ephemeral rather than durable interchange artifacts.
+
 - `initial`, sequence 0: `pins` (`derivative_address`, `receipt_sha256`),
   `start_ns`, `end_ns`, `lower_bound`, `plans`, `groups`, `max_entry_bytes`,
   `max_queue_bytes`. Each plan has `instrument`, `orientation`, `lane`, `venue`,
   `price_scale`, `quantity_scale`. Explicit ordered configuration is the identity;
   no lookup of current/latest data is permitted.
-- `cut`, sequences 1…N: `origin`, ordered `market_events`, affected-only
-  `book_transitions`. Origin is `window {pin,start_ns,end_ns}` or
+- `cut`, sequences 1…N: `origin`, ordered `market_events`, optional ordered
+  `control_events`, and affected-only `book_transitions`. Origin is `window {pin,start_ns,end_ns}` or
   `group {pin,first,last,visible_ns}`. An address has `canonical_seq`, `lane`,
   `delivery_index`, `event_index`. A reference has `pin`, `address`, `visible_ns`,
   `order_ns`. All pins must belong to initial selection.
@@ -62,6 +69,12 @@ Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
   Original domain BookEvent/TradeEvent serialization is retained, except all
   integers become strings. Fulls, repeated deltas and trades remain ordered and
   uncoalesced, including invalidated/duplicate observations and uninterpreted hashes.
+- `control_events`, when present, contains referenced non-market observations.
+  V1 currently admits only `metadata_changed {from,to}`. It changes no local book;
+  legacy cuts that omit this field remain valid. The canonical encoding omits
+  `control_events` when there are no controls; an empty array is invalid. The old `metadata_changed`
+  invalidation reason remains decodable for already-produced wire records but is
+  not emitted by the corrected Risk policy.
 - A transition has `key {instrument,orientation}`, `previous_revision`, `revision`,
   `dependency` (null, or `{epoch,anchor,through}`), and `decision`. Decisions are
   `snapshot {bids,asks}` (ascending `[price_atoms,quantity_atoms]` pairs),

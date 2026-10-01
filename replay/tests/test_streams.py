@@ -135,6 +135,39 @@ class ProtocolTests(unittest.TestCase):
             cuts[2].body["book_transitions"][0]["dependency"]["epoch"] = "wrong"
         self.assertEqual(cuts[2].books[("kalshi:A", "outcome")].revision, 1)
 
+    def test_rust_metadata_control_observation_and_canonical_omission(self):
+        values = records()
+        d = decoder(values)
+        cuts = [d.apply(encoded(record)) for record in values]
+        d.finish()
+        cut = cuts[-2]
+
+        self.assertEqual(
+            cut.body["control_events"][0]["event"],
+            {"kind": "metadata_changed", "from": "before", "to": "after"},
+        )
+        self.assertEqual(
+            cut.body["control_events"][0]["reference"]["address"],
+            {
+                "canonical_seq": "7",
+                "lane": "x",
+                "delivery_index": "6",
+                "event_index": "0",
+            },
+        )
+        self.assertEqual(cut.books[("kalshi:A", "outcome")].validity, "usable")
+        self.assertTrue(
+            all("control_events" not in prior.body for prior in cuts[1:-2])
+        )
+
+        noncanonical = copy.deepcopy(values[2])
+        noncanonical["body"]["control_events"] = []
+        d = decoder(values)
+        d.apply(encoded(values[0]))
+        d.apply(encoded(values[1]))
+        with self.assertRaises(ProtocolError):
+            d.apply(encoded(noncanonical))
+
     def test_bad_second_transition_exposes_neither_transition(self):
         values = records()
         d = decoder(values)

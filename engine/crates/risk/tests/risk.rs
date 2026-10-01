@@ -421,14 +421,6 @@ fn all_continuity_classes_and_control_classes() {
             Reason::SubscriptionChanged,
             true,
         ),
-        (
-            ControlEvent::MetadataChanged {
-                from: None,
-                to: "next".into(),
-            },
-            Reason::MetadataChanged,
-            false,
-        ),
     ] {
         let f = Fixture::new(
             0,
@@ -462,6 +454,126 @@ fn all_continuity_classes_and_control_classes() {
             &Validity::Usable
         );
     }
+}
+
+#[test]
+fn metadata_changes_are_observed_without_changing_book_state() {
+    let f = Fixture::new(
+        0,
+        100,
+        1,
+        vec![
+            row(
+                "x",
+                1,
+                vec![SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: None,
+                    to: "x-initial".into(),
+                })],
+            ),
+            row("x", 2, vec![full("kalshi:A", &[(37, 11)], &[])]),
+            row("y", 2, vec![full("polymarket:B", &[(41, 6)], &[])]),
+            row(
+                "x",
+                3,
+                vec![SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: Some("x-initial".into()),
+                    to: "x-next".into(),
+                })],
+            ),
+            row(
+                "y",
+                4,
+                vec![SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: Some("y-initial".into()),
+                    to: "y-next".into(),
+                })],
+            ),
+            Row {
+                continuity: "duplicate",
+                ..row(
+                    "x",
+                    5,
+                    vec![
+                        SegmentEvent::Control(ControlEvent::MetadataChanged {
+                            from: Some("x-initial".into()),
+                            to: "x-next".into(),
+                        }),
+                        delta("kalshi:A", 37, LevelChange::Increase(qty(99))),
+                        trade("kalshi:A", 7),
+                    ],
+                )
+            },
+            row(
+                "x",
+                6,
+                vec![delta("kalshi:A", 37, LevelChange::Increase(qty(2)))],
+            ),
+            row(
+                "y",
+                7,
+                vec![delta("polymarket:B", 41, LevelChange::Increase(qty(3)))],
+            ),
+        ],
+        |_| {},
+    );
+    let c = collect(open(
+        &f,
+        vec![plan("kalshi:A", "x"), plan("polymarket:B", "y")],
+    ));
+
+    assert!(c[1].book_transitions().is_empty());
+    assert_eq!(
+        c[1].control_events(),
+        [ControlRecord {
+            reference: c[1].control_events()[0].reference.clone(),
+            from: None,
+            to: "x-initial".into(),
+        }]
+    );
+    assert_eq!(c[1].control_events()[0].reference.address.event_index(), 0);
+
+    assert_eq!(c[2].book_transitions().len(), 2);
+    let initialized_a = c[2]
+        .book_transitions()
+        .iter()
+        .find(|transition| transition.key == key("kalshi:A"))
+        .unwrap()
+        .view
+        .clone();
+    let initialized_b = c[2]
+        .book_transitions()
+        .iter()
+        .find(|transition| transition.key == key("polymarket:B"))
+        .unwrap()
+        .view
+        .clone();
+
+    for (cut, from, to) in [
+        (&c[3], Some("x-initial"), "x-next"),
+        (&c[4], Some("y-initial"), "y-next"),
+    ] {
+        assert!(cut.book_transitions().is_empty());
+        assert!(cut.market_events().is_empty());
+        assert_eq!(cut.control_events()[0].from.as_deref(), from);
+        assert_eq!(cut.control_events()[0].to, to);
+    }
+    assert_eq!(initialized_a.validity(), &Validity::Usable);
+    assert_eq!(initialized_b.validity(), &Validity::Usable);
+    assert_eq!(initialized_a.revision(), 1);
+    assert_eq!(initialized_b.revision(), 1);
+    assert!(c[5].control_events().is_empty());
+    assert!(c[5].book_transitions().is_empty());
+    assert_eq!(c[5].market_events().len(), 2);
+    assert!(
+        c[5].market_events()
+            .iter()
+            .all(|event| event.disposition == Disposition::Duplicate)
+    );
+    assert_eq!(bid(&c[6], "kalshi:A", 37), 13);
+    assert_eq!(c[6].book_transitions()[0].previous_revision, 1);
+    assert_eq!(bid(&c[7], "polymarket:B", 41), 9);
+    assert_eq!(c[7].book_transitions()[0].previous_revision, 1);
 }
 
 #[test]
