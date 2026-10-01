@@ -16,7 +16,7 @@ from replay.coverage_output import (
 )
 from replay.preparation import encoded, prepare
 from replay.strategy_sdk import plain
-from replay.streams.protocol import Decoder, ProtocolError, freeze
+from replay.streams.protocol import Decoder, ProtocolError, books_sha256, freeze
 from replay.tests.test_preparation import G2, R1, R2, config, detail
 from replay.tests.test_supervisor import config as supervisor_config, metadata_pin
 
@@ -223,8 +223,15 @@ class Harness:
             },
         )
 
+    def terminal(self):
+        # Hand-authored decisions: the expected final digest is the local state.
+        return self.send(
+            "terminal",
+            {"cuts": str(self.seq - 1), "books_sha256": books_sha256(self.decoder.books)},
+        )
+
     def finish(self):
-        self.send("terminal", {"cuts": str(self.seq - 1)})
+        self.terminal()
         self.decoder.finish()
         self.strategy.finish()
         return read_provisional(
@@ -254,16 +261,17 @@ class CoverageTests(unittest.TestCase):
         h = self.harness()
         h.window()
         h.group(11, trades=("observed", "duplicate"))
-        old = h.group(14, h.initial["plans"][:1])
+        h.group(14, h.initial["plans"][:1])
+        # Books are live during the hook only: assert this cut's state now.
+        self.assertEqual(
+            h.decoder.books["polymarket:987", "outcome"].validity, "not_initialized"
+        )
         h.group(17, h.initial["plans"][1:])
         h.group(19, trades=("observed",))
         h.group(20)  # unrelated/empty observations cannot split availability
         h.group(28, h.initial["plans"][:1], {"kind": "quantity_underflow"})
         h.group(31, h.initial["plans"][:1])
         result = h.finish()
-        self.assertEqual(
-            old.books["polymarket:987", "outcome"].validity, "not_initialized"
-        )
         self.assertEqual(
             [(r["start_ns"], r["end_ns"], r["state"]) for r in h.rows("bundle")],
             [
@@ -468,7 +476,7 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "missing terminal"):
             h.strategy.finish()
         with self.assertRaisesRegex(ProtocolError, "closed coverage"):
-            h.send("terminal", {"cuts": str(h.seq - 1)})
+            h.terminal()
         self.assertFalse((h.output / "content_receipt.json").exists())
 
     def test_snapshot_and_transport_binding(self):
@@ -533,7 +541,7 @@ class CoverageTests(unittest.TestCase):
     def test_finish_crashes_receipt_last_and_no_overwrite(self):
         h = self.harness()
         h.window()
-        h.send("terminal", {"cuts": str(h.seq - 1)})
+        h.terminal()
         real = supervisor.write_json_durable
 
         def fail(path, value):
@@ -617,6 +625,7 @@ class CoverageTests(unittest.TestCase):
         h = self.harness()
         h.window()
         before = h.strategy.books
+        kept = dict(before)
         plans = h.initial["plans"]
         transitions = [h.transition(p, 12) for p in plans]
         transitions[1]["previous_revision"] = "9"
@@ -637,6 +646,7 @@ class CoverageTests(unittest.TestCase):
                 },
             )
         self.assertIs(h.strategy.books, before)
+        self.assertEqual(h.strategy.books, kept)
         self.assertEqual(h.strategy.sequence, 1)
         with self.assertRaises(ProtocolError):
             h.strategy.finish()
@@ -678,7 +688,7 @@ class CoverageTests(unittest.TestCase):
             other = Harness(root)
             self.addCleanup(other.strategy.writer.stream.close)
             other.window()
-            other.send("terminal", {"cuts": str(other.seq - 1)})
+            other.terminal()
             target = (
                 "replay.strategy_sdk.os.fsync"
                 if failure == "fsync"

@@ -1,8 +1,11 @@
 //! Wire V1 uses JSON strings for every integer, including domain integers.
-use replay_domain::BookKey;
-use replay_risk::{CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut};
+use replay_domain::{BookKey, ContractOrientation};
+use replay_risk::{
+    CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut, RiskEngine, Validity,
+};
 use replay_tape::{DerivativePin, SourceFaultReason};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub fn exact(mut value: Value) -> Value {
     match &mut value {
@@ -113,4 +116,65 @@ pub fn cut(c: &RiskCut) -> Value {
             .insert("control_events".into(), Value::Array(controls));
     }
     exact(value)
+}
+
+/// Terminal digest of every planned book's final Risk state (read-only).
+///
+/// SHA-256 over UTF-8 lines, one per planned book sorted by instrument bytes,
+/// then orientation spelling: `instrument TAB orientation TAB revision TAB
+/// validity TAB bids TAB asks LF`. Validity is `not_initialized`, `usable` or
+/// `unusable`; bids (descending price) and asks (ascending) are comma-joined
+/// `price:quantity` decimal atoms and are empty unless the book is usable.
+/// Python `replay.streams.protocol.books_sha256` computes the same bytes.
+pub fn books_sha256(engine: &RiskEngine) -> String {
+    let mut rows: Vec<_> = engine
+        .plans()
+        .keys()
+        .filter_map(|key| {
+            let orientation = match key.orientation {
+                ContractOrientation::Outcome => "outcome",
+                ContractOrientation::Complement => "complement",
+            };
+            engine
+                .view(key)
+                .map(|view| (key.instrument.as_str().to_owned(), orientation, view))
+        })
+        .collect();
+    rows.sort_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
+    let mut digest = Sha256::new();
+    for (instrument, orientation, view) in rows {
+        let validity = match view.validity() {
+            Validity::NotInitialized => "not_initialized",
+            Validity::Usable => "usable",
+            Validity::Unusable(_) => "unusable",
+        };
+        let (bids, asks) = match (view.validity(), view.ladder()) {
+            (Validity::Usable, Some(ladder)) => {
+                (join(ladder.bids().iter().rev()), join(ladder.asks().iter()))
+            }
+            _ => (String::new(), String::new()),
+        };
+        digest.update(
+            format!(
+                "{instrument}\t{orientation}\t{}\t{validity}\t{bids}\t{asks}\n",
+                view.revision()
+            )
+            .as_bytes(),
+        );
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn join<'a>(levels: impl Iterator<Item = (&'a i64, &'a u64)>) -> String {
+    levels
+        .map(|(price, quantity)| format!("{price}:{quantity}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+/// Closed terminal body: the cut count and the final book digest.
+pub fn terminal(cuts: u64, books_sha256: String) -> Value {
+    json!({"cuts": cuts.to_string(), "books_sha256": books_sha256})
 }

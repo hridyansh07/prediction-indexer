@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from replay.streams import Consumer, TransportError
+from replay.streams.consumer import DEFAULT_BATCH_BYTES
 from replay.streams.protocol import freeze, require
 from replay.supervisor import identity, initial, read, validate, write_json_durable
 
@@ -58,8 +59,8 @@ def execute(root, attempt, group):
         group=group,
         initial=initial(config),
         timeout=t["command_timeout_ms"] / 1000,
-        batch_entries=1,
-        batch_bytes=t["max_entry_bytes"],
+        # Whole-entry batches up to 128 MiB (at least one entry); one ACK each.
+        batch_bytes=max(DEFAULT_BATCH_BYTES, t["max_entry_bytes"]),
     )
     deadline = time.monotonic() + config["limits"]["attempt_seconds"]
     try:

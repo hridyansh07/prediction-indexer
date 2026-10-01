@@ -148,11 +148,12 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
     while let Some(cut) = engine.next_cut().unwrap() {
         output.push(wrap(cut.sequence(), "cut", wire::cut(&cut)));
     }
+    let books = wire::books_sha256(&engine);
     let done = engine.finish().unwrap();
     output.push(wrap(
         done.cuts() + 1,
         "terminal",
-        json!({"cuts":done.cuts().to_string()}),
+        wire::terminal(done.cuts(), books),
     ));
     output
 }
@@ -477,8 +478,11 @@ fn redis_script_cache_fallback_and_ready_path_failure() {
         .arg("slow")
         .query(&mut admin)
         .unwrap();
-    assert!(matches!(publisher.step(), Err(Error::Protocol(_))));
+    // Fixed membership is verified at join/check, not on every publish.
+    assert!(publisher.step().unwrap());
+    assert!(matches!(publisher.progress(), Err(Error::Protocol(_))));
     assert_eq!(calls(&mut admin), before + 2); // no fallback on an executed error
+    assert!(matches!(publisher.step(), Err(Error::Poisoned)));
     let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
 
     c.attempt_id = format!("ready-{}", std::process::id());

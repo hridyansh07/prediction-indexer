@@ -1,8 +1,14 @@
-"""Closed Replay wire V1. All wire integers are canonical unsigned strings."""
+"""Replay wire V1. All wire integers are canonical unsigned strings.
 
+The strict helpers below (closed objects, canonical integers, duplicate-key
+rejection) remain the reusable validators for configuration and output files.
+The stream Decoder applies only O(1) guards to cuts; see REPLAY_STREAMS_V1.md.
+"""
+
+import hashlib
+import heapq
 import json
 import re
-from dataclasses import dataclass
 from types import MappingProxyType
 
 
@@ -210,6 +216,8 @@ def pairs(values):
 
 
 def decode(data, limit):
+    """Strict JSON for configuration/output readers: duplicate keys and NaN or
+    Infinity constants are rejected. The stream Decoder uses plain json.loads."""
     require(type(data) is bytes and len(data) <= limit, "entry limit")
     try:
         return json.loads(
@@ -219,37 +227,251 @@ def decode(data, limit):
         raise ProtocolError("malformed JSON") from e
 
 
-@dataclass(frozen=True)
+INITIAL_FIELDS = (
+    "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes"
+)
+ENVELOPE_FIELDS = "version run_id attempt_id sequence kind body"
+SIDES = {"bid": 0, "ask": 1}
+# Dense price arrays cost 16 * (10**scale + 1) bytes per initialized book
+# (Kalshi/Polymarket scale 4: ~160 KiB; Limitless scale 3: ~16 KiB). Larger
+# scales would make that allocation unreasonable, so they use a sparse dict.
+DENSE_MAX_PRICE_SCALE = 4
+# Removing the best level: scanning adjacent slots is fastest for dense books
+# (gaps of a few ticks: ~0.2 us), while max()/min() over the occupied set is
+# C-level but O(levels) (~0.1 us at 10 levels, ~7 us at 1000). A long Python
+# scan across a wide gap is the slowest option (~12 us per 500 empty ticks).
+# Scan a bounded number of slots, then fall back to max()/min() of the set.
+BEST_SCAN_SLOTS = 64
+
+
+class _Sparse(dict):
+    """Price -> quantity for scales too wide for a dense array; absent is 0."""
+
+    __slots__ = ()
+
+    def __missing__(self, price):
+        return 0
+
+
 class Book:
-    revision: int = 0
-    validity: str = "not_initialized"
-    bids: tuple = ()
-    asks: tuple = ()
-    dependency: object = None
-    as_of: object = None
-    reason: object = None
+    """One planned book, mutated IN PLACE by its Decoder.
 
-    def levels(self, side):
-        require(side in ("bid", "ask"))
-        return self.bids if side == "bid" else self.asks
+    Books (and the parsed cut bodies their metadata references) are valid only
+    while the hook that received them runs. A strategy that needs any value
+    after its hook returns must copy it. `levels()` and `best_*()` return new
+    tuples, which may be retained. Invalid/not-initialized books have no levels.
+    """
+
+    __slots__ = (
+        "revision",
+        "validity",
+        "dependency",
+        "as_of",
+        "reason",
+        "_limit",
+        "_dense",
+        "_quantities",
+        "_occupied",
+        "_best",
+    )
+
+    def __init__(self, price_scale):
+        self.revision = 0
+        self.validity = "not_initialized"
+        self.dependency = self.as_of = self.reason = None
+        self._limit = 10**price_scale
+        self._dense = price_scale <= DENSE_MAX_PRICE_SCALE
+        self._quantities = None  # allocated by the first snapshot
+        self._occupied = (set(), set())
+        self._best = [None, None]
+
+    def __repr__(self):
+        return (
+            f"Book(revision={self.revision}, validity={self.validity!r}, "
+            f"bids={len(self._occupied[0])}, asks={len(self._occupied[1])})"
+        )
+
+    def levels(self, side, n=None):
+        """(price_atoms, quantity_atoms) tuples: bids descending, asks ascending."""
+        require(side in SIDES)
+        require(n is None or (type(n) is int and n >= 0), "level count")
+        if self.validity != "usable":
+            return ()
+        s = SIDES[side]
+        occupied, quantities = self._occupied[s], self._quantities[s]
+        if n is None:
+            prices = sorted(occupied, reverse=s == 0)
+        elif n == 1:
+            best = self._best[s]
+            prices = () if best is None else (best,)
+        else:
+            prices = (heapq.nlargest if s == 0 else heapq.nsmallest)(n, occupied)
+        return tuple((p, quantities[p]) for p in prices)
+
+    def _top(self, s):
+        best = self._best[s]
+        if self.validity != "usable" or best is None:
+            return None
+        return best, self._quantities[s][best]
+
+    def best_bid(self):
+        """(price_atoms, quantity_atoms) of the highest bid, or None."""
+        return self._top(0)
+
+    def best_ask(self):
+        """(price_atoms, quantity_atoms) of the lowest ask, or None."""
+        return self._top(1)
+
+    @property
+    def bids(self):
+        return self.levels("bid")
+
+    @property
+    def asks(self):
+        return self.levels("ask")
+
+    def _clear(self):
+        if self._quantities is not None:
+            for s in (0, 1):
+                occupied, quantities = self._occupied[s], self._quantities[s]
+                if self._dense:
+                    for price in occupied:
+                        quantities[price] = 0
+                else:
+                    quantities.clear()
+                occupied.clear()
+        self._best[0] = self._best[1] = None
+
+    def _snapshot(self, bids, asks):
+        if self._quantities is None:
+            size = self._limit + 1
+            self._quantities = (
+                ([0] * size, [0] * size) if self._dense else (_Sparse(), _Sparse())
+            )
+        else:
+            self._clear()  # only previously occupied slots
+        limit = self._limit
+        for s, ladder in ((0, bids), (1, asks)):
+            occupied, quantities = self._occupied[s], self._quantities[s]
+            for price, quantity in ladder:
+                p = int(price)
+                # Dense-array index guard: a negative index would silently alias.
+                require(0 <= p <= limit, "price outside plan scale")
+                quantities[p] = int(quantity)
+                occupied.add(p)
+            # Publisher ladders are ascending: best bid last, best ask first.
+            if ladder:
+                self._best[s] = int(ladder[-1 if s == 0 else 0][0])
+
+    def _operations(self, operations):
+        limit, dense, best = self._limit, self._dense, self._best
+        for op in operations:
+            s = SIDES[op["side"]]
+            p = int(op["price"]["atoms"])
+            require(0 <= p <= limit, "price outside plan scale")
+            quantities, occupied = self._quantities[s], self._occupied[s]
+            change = op["change"]
+            kind = change["kind"]
+            if kind == "set":
+                new = int(change["value"]["atoms"])
+            elif kind == "increase":
+                new = quantities[p] + int(change["value"]["atoms"])
+            elif kind == "decrease":
+                new = quantities[p] - int(change["value"]["atoms"])
+            else:
+                require(kind == "delete", "unknown level change")
+                new = 0
+            if new > 0:
+                quantities[p] = new
+                if p not in occupied:
+                    occupied.add(p)
+                    top = best[s]
+                    if top is None or (p > top if s == 0 else p < top):
+                        best[s] = p
+                continue
+            require(new == 0, "invalid authoritative operation")
+            if p not in occupied:
+                continue
+            occupied.discard(p)
+            if dense:
+                quantities[p] = 0
+            else:
+                del quantities[p]
+            if p == best[s]:
+                best[s] = self._next_best(s, p)
+
+    def _next_best(self, s, removed):
+        occupied = self._occupied[s]
+        if not occupied:
+            return None
+        if self._dense:
+            quantities = self._quantities[s]
+            if s == 0:
+                scan = range(removed - 1, max(removed - 1 - BEST_SCAN_SLOTS, -1), -1)
+            else:
+                scan = range(
+                    removed + 1, min(removed + 1 + BEST_SCAN_SLOTS, self._limit + 1)
+                )
+            for price in scan:
+                if quantities[price]:
+                    return price
+        return max(occupied) if s == 0 else min(occupied)
 
 
-@dataclass(frozen=True)
+def books_sha256(books):
+    """Terminal digest of final local book state; see REPLAY_STREAMS_V1.md.
+
+    SHA-256 over UTF-8 lines, one per planned book sorted by (instrument,
+    orientation) code points:
+    instrument TAB orientation TAB revision TAB validity TAB bids TAB asks LF,
+    where bids (descending) and asks (ascending) are comma-joined
+    `price:quantity` decimal atoms, empty unless the book is usable.
+    """
+    digest = hashlib.sha256()
+    for key in sorted(books):
+        book = books[key]
+        sides = [
+            ",".join(f"{p}:{q}" for p, q in book.levels(side)) for side in SIDES
+        ]
+        digest.update(
+            f"{key[0]}\t{key[1]}\t{book.revision}\t{book.validity}\t{sides[0]}\t{sides[1]}\n".encode()
+        )
+    return digest.hexdigest()
+
+
 class Cut:
-    sequence: int
-    kind: str
-    body: object
-    books: object
+    """One delivered record. `body` is the parsed wire body (initial/terminal
+    bodies are frozen; cut bodies are not) and `books` is the decoder's live
+    read-only mapping. Neither may be retained past the hook that received it.
+    """
+
+    __slots__ = ("sequence", "kind", "body", "books")
+
+    def __init__(self, sequence, kind, body, books):
+        self.sequence, self.kind, self.body, self.books = sequence, kind, body, books
+
+    def __repr__(self):
+        return f"Cut(sequence={self.sequence}, kind={self.kind!r})"
+
+
+MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError)
 
 
 class Decoder:
-    """Single-owner local state. Returned cuts/books contain no mutable aliases."""
+    """Single-owner local state, mutated in place; any failure poisons it.
+
+    Cut validation is limited to O(1) guards per record/transition: version,
+    identity, stream sequence, planned key, book revision chain, usable book
+    for operations, and the terminal cut count plus final book digest. The
+    publisher ships in the same image and is trusted for everything else.
+    """
 
     def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes):
         self.run_id, self.attempt_id = run_id, attempt_id
         self._expected = decode(json.dumps(expected_initial).encode(), max_entry_bytes)
         self.limit = max_entry_bytes
         self._books = {}
+        self._view = MappingProxyType(self._books)
         self._plans = {}
         self._pins = set()
         self.sequence = -1
@@ -258,175 +480,117 @@ class Decoder:
 
     @property
     def books(self):
-        return MappingProxyType(self._books)
+        return self._view
 
     def apply(self, data):
         require(not self.poisoned and not self.terminal, "closed decoder")
         try:
             return self._apply(data)
+        except ProtocolError:
+            self.poisoned = True
+            raise
+        except MALFORMED as e:
+            self.poisoned = True
+            raise ProtocolError("malformed record") from e
         except Exception:
             self.poisoned = True
             raise
 
     def _apply(self, data):
-        r = obj(
-            decode(data, self.limit), "version run_id attempt_id sequence kind body"
-        )
+        require(type(data) is bytes and len(data) <= self.limit, "entry limit")
+        try:
+            r = json.loads(data)
+        except (ValueError, UnicodeError, RecursionError) as e:
+            raise ProtocolError("malformed JSON") from e
+        obj(r, ENVELOPE_FIELDS)
         require(
             r["version"] == "1"
             and r["run_id"] == self.run_id
             and r["attempt_id"] == self.attempt_id,
             "identity/version",
         )
-        seq = uint(r["sequence"])
-        require(seq == self.sequence + 1, "stream sequence gap or duplicate")
-        b = r["body"]
-        staged = self._books.copy()
+        seq = self.sequence + 1
+        require(r["sequence"] == str(seq), "stream sequence gap or duplicate")
+        kind, b = r["kind"], r["body"]
         if seq == 0:
-            require(r["kind"] == "initial" and b == self._expected, "initial binding")
-            obj(
-                b,
-                "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes",
-            )
-            require(uint(b["start_ns"]) < uint(b["end_ns"]))
-            choice(
-                b["lower_bound"], "clip expand_to_window_start require_window_boundary"
-            )
-            require(uint(b["max_entry_bytes"]) == self.limit)
-            require(uint(b["max_queue_bytes"]) >= self.limit)
-            self._pins = {pin(p) for p in array(b["pins"])}
-            require(self._pins and len(self._pins) == len(b["pins"]))
-            groups = [text(g) for g in array(b["groups"])]
-            require(groups and len(groups) == len(set(groups)))
-            for p in array(b["plans"]):
-                obj(p, "instrument orientation lane venue price_scale quantity_scale")
-                k = key({f: p[f] for f in ("instrument", "orientation")})
-                require(k not in self._plans)
-                text(p["lane"])
-                require(p["venue"] == k[0].split(":", 1)[0])
-                self._plans[k] = (
-                    uint(p["price_scale"], 18),
-                    uint(p["quantity_scale"], 18),
-                )
-                staged[k] = Book()
-            require(staged)
-        elif r["kind"] == "terminal":
-            obj(b, "cuts")
+            self._initial(kind, b)
+            b = freeze(b)
+        elif kind == "terminal":
+            obj(b, "cuts books_sha256")
             require(uint(b["cuts"]) == seq - 1, "terminal count")
-            self.terminal = True
-        else:
-            require(r["kind"] == "cut")
-            require(type(b) is dict)
-            fields = set(b)
             require(
-                fields
-                in (
-                    {"origin", "market_events", "book_transitions"},
-                    {"origin", "market_events", "control_events", "book_transitions"},
-                ),
-                "closed schema",
+                b["books_sha256"] == books_sha256(self._books), "terminal book digest"
             )
-            origin(b["origin"], self._pins)
-            for m in array(b["market_events"]):
-                obj(m, "reference event disposition")
-                reference(m["reference"], self._pins)
-                event(m["event"])
-                choice(
-                    m["disposition"],
-                    "observed applied duplicate not_authority invalidated",
-                )
-            controls = array(b.get("control_events", []))
-            require("control_events" not in b or controls, "empty control events")
-            for c in controls:
-                obj(c, "reference event")
-                reference(c["reference"], self._pins)
-                control_event(c["event"])
-            affected = set()
-            for t in array(b["book_transitions"]):
-                obj(t, "key previous_revision revision dependency decision")
-                k = key(t["key"])
-                require(
-                    k in staged and k not in affected, "unplanned/repeated transition"
-                )
-                affected.add(k)
-                old = staged[k]
-                revision = uint(t["revision"])
-                require(
-                    uint(t["previous_revision"]) == old.revision
-                    and revision == old.revision + 1,
-                    "book revision gap",
-                )
-                d = t["decision"]
-                require(type(d) is dict)
-                if d.get("kind") == "invalidation":
-                    obj(d, "kind reason")
-                    reason(d["reason"])
-                    require(t["dependency"] is None)
-                    staged[k] = Book(
-                        revision,
-                        "unusable",
-                        as_of=freeze(b["origin"]),
-                        reason=freeze(d["reason"]),
-                    )
-                    continue
-                dep = obj(t["dependency"], "epoch anchor through")
-                text(dep["epoch"])
-                reference(dep["anchor"], self._pins)
-                reference(dep["through"], self._pins)
-                ps, qs = self._plans[k]
-                if d.get("kind") == "snapshot":
-                    obj(d, "kind bids asks")
-                    sides = []
-                    for side in ("bids", "asks"):
-                        levels = []
-                        for level in array(d[side]):
-                            require(type(level) is list and len(level) == 2)
-                            p, q = uint(level[0], 10**ps), uint(level[1], 2**63 - 1)
-                            require(q > 0)
-                            levels.append((p, q))
-                        require(
-                            [p for p, _ in levels] == sorted({p for p, _ in levels})
-                        )
-                        sides.append(dict(levels))
-                    bids, asks = sides
-                else:
-                    obj(d, "kind operations")
-                    require(d["kind"] == "operations" and old.validity == "usable")
-                    bids, asks = dict(old.bids), dict(old.asks)
-                    for op in array(d["operations"]):
-                        dk, side, p, ops, kind, q, oqs = delta(op)
-                        require(
-                            dk == k and ops == ps and (oqs is None or oqs == qs),
-                            "operation plan",
-                        )
-                        levels = bids if side == "bid" else asks
-                        prior = levels.get(p, 0)
-                        if kind == "delete":
-                            new = 0
-                        elif kind == "set":
-                            new = q
-                        elif kind == "increase":
-                            new = prior + q
-                        else:
-                            new = prior - q
-                        require(
-                            0 <= new <= 2**63 - 1, "invalid authoritative operation"
-                        )
-                        if new:
-                            levels[p] = new
-                        else:
-                            levels.pop(p, None)
-                staged[k] = Book(
-                    revision,
-                    "usable",
-                    tuple(sorted(bids.items(), reverse=True)),
-                    tuple(sorted(asks.items())),
-                    freeze(dep),
-                    freeze(b["origin"]),
-                )
-        self._books = staged  # the only visibility point, after complete validation
+            self.terminal = True
+            b = freeze(b)
+        else:
+            require(kind == "cut", "record kind")
+            self._cut(b)
         self.sequence = seq
-        return Cut(seq, r["kind"], freeze(b), MappingProxyType(staged))
+        return Cut(seq, kind, b, self._view)
+
+    def _initial(self, kind, b):
+        """Sequence 0 only: complete closed validation of the pinned plan."""
+        require(kind == "initial" and b == self._expected, "initial binding")
+        obj(b, INITIAL_FIELDS)
+        require(uint(b["start_ns"]) < uint(b["end_ns"]))
+        choice(b["lower_bound"], "clip expand_to_window_start require_window_boundary")
+        require(uint(b["max_entry_bytes"]) == self.limit)
+        require(uint(b["max_queue_bytes"]) >= self.limit)
+        self._pins = {pin(p) for p in array(b["pins"])}
+        require(self._pins and len(self._pins) == len(b["pins"]))
+        groups = [text(g) for g in array(b["groups"])]
+        require(groups and len(groups) == len(set(groups)))
+        books = {}
+        for p in array(b["plans"]):
+            obj(p, "instrument orientation lane venue price_scale quantity_scale")
+            k = key({f: p[f] for f in ("instrument", "orientation")})
+            require(k not in self._plans)
+            text(p["lane"])
+            require(p["venue"] == k[0].split(":", 1)[0])
+            self._plans[k] = (
+                uint(p["price_scale"], 18),
+                uint(p["quantity_scale"], 18),
+            )
+            books[k] = Book(self._plans[k][0])
+        require(books)
+        self._books.update(books)
+
+    def _cut(self, b):
+        # Atomic per-cut visibility is unnecessary: any failure below poisons
+        # the decoder and therefore the whole attempt, so a partially applied
+        # cut can never reach a hook or an ACK.
+        origin = b["origin"]
+        books = self._books
+        for t in b["book_transitions"]:
+            k = t["key"]
+            book = books.get((k["instrument"], k["orientation"]))
+            require(book is not None, "unplanned transition")
+            revision = int(t["revision"])
+            require(
+                int(t["previous_revision"]) == book.revision
+                and revision == book.revision + 1,
+                "book revision gap",
+            )
+            d = t["decision"]
+            kind = d["kind"]
+            if kind == "operations":
+                require(book.validity == "usable", "operations on unusable book")
+                book._operations(d["operations"])
+                book.dependency = t["dependency"]
+            elif kind == "snapshot":
+                book._snapshot(d["bids"], d["asks"])
+                book.validity = "usable"
+                book.dependency = t["dependency"]
+                book.reason = None
+            else:
+                require(kind == "invalidation", "unknown decision")
+                book._clear()
+                book.validity = "unusable"
+                book.dependency = None
+                book.reason = d["reason"]
+            book.revision = revision
+            book.as_of = origin
 
     def finish(self):
         require(

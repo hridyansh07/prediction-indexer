@@ -706,6 +706,7 @@ dependencies = [
  "replay-tape",
  "serde",
  "serde_json",
+ "sha2",
  "tempdir",
 ]
 

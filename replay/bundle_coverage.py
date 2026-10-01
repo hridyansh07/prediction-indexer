@@ -16,6 +16,11 @@ from replay.streams.protocol import require
 from replay.supervisor import write_json_durable
 
 
+def status(book):
+    """Detached copy of the fields coverage keeps from a live, in-place Book."""
+    return book.validity, plain(book.reason), plain(book.as_of)
+
+
 def availability(usable, required, uncaptured):
     if not required:
         return "NOT_CAPTURED"
@@ -48,6 +53,9 @@ class Coverage:
         self.time = int(self.snapshot["config"]["start_ns"])
         self.end = int(self.snapshot["config"]["end_ns"])
         self.sequence = -1
+        # Detached (validity, reason, source) per planned book. Decoder books
+        # mutate in place and are valid only during the hook, so the PRIOR
+        # state needed at scope boundaries must be this explicit copy.
         self.books = None
         self.window = None
         self.evidence = {}
@@ -79,7 +87,7 @@ class Coverage:
         if cut.kind == "initial":
             require(cut.sequence == 0)
             self.input.bind(cut.body)
-            self.books = cut.books
+            self.books = {k: status(book) for k, book in cut.books.items()}
             self._evaluate(self.time)
             return
         require(self.input.bound, "missing initial")
@@ -120,8 +128,8 @@ class Coverage:
             )
         t = max(raw_time, int(self.snapshot["config"]["start_ns"]))
         require(self.time <= t < self.end, "coverage time order")
-        # The decoder has ALREADY installed the new books. Scope boundaries
-        # before this cut must use the previous immutable snapshot.
+        # The decoder has ALREADY applied this cut to its books in place. Scope
+        # boundaries before this cut use the previous detached copy.
         self._advance(t)
         if origin["kind"] == "window":
             self.window = origin
@@ -142,7 +150,9 @@ class Coverage:
                 )
                 k = (transition["key"]["instrument"], transition["key"]["orientation"])
                 self.evidence[k] = (why, origin)
-        self.books = cut.books
+        for transition in cut.body["book_transitions"]:
+            k = (transition["key"]["instrument"], transition["key"]["orientation"])
+            self.books[k] = status(cut.books[k])
         self._evaluate(t)
         if raw_time >= int(self.snapshot["config"]["start_ns"]):
             required = {
@@ -210,21 +220,21 @@ class Coverage:
             count = 0
             for b in member["books"]:
                 k = b["instrument"], b["orientation"]
-                book = self.books[k]
+                validity, why, source = self.books[k]
                 evidence, evidence_source = self.evidence.get(k, ("unknown", None))
                 self._set(
                     book_id(b),
                     t,
                     {
                         "kind": "book",
-                        "state": book.validity,
+                        "state": validity,
                         "evidence": evidence,
-                        "reason": plain(book.reason),
-                        "source": plain(book.as_of),
+                        "reason": why,
+                        "source": source,
                         "evidence_source": evidence_source,
                     },
                 )
-                count += book.validity == "usable"
+                count += validity == "usable"
             required = len(member["books"])
             outside = int(not member["capture_selected"])
             self._set(

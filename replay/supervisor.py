@@ -629,7 +629,18 @@ def attempt(root, config, state, redis, lock_fd, url):
             if codes.get("publisher") == 0 and not joined:
                 raise AttemptFailure("missing_ready", True)
             if joined:
-                p = redis.hgetall(keys(config, a["id"])[1])
+                # Named fields only: the state hash also holds one `size:<seq>`
+                # field per retained entry, which HGETALL would copy each poll.
+                fields = ["published", "terminal", "poisoned"] + [
+                    f"done:{g}" for g in t["groups"]
+                ]
+                p = {
+                    f: v
+                    for f, v in zip(
+                        fields, redis.hmget(keys(config, a["id"])[1], fields)
+                    )
+                    if v is not None
+                }
                 require(
                     p and all(f"done:{g}" in p for g in t["groups"]), "missing progress"
                 )

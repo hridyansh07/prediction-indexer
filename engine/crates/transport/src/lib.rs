@@ -390,10 +390,13 @@ impl Publisher {
             self.publish("cut", wire::cut(&cut), &previous)?;
             Ok(true)
         } else {
-            let finished = self.engine.take().unwrap().finish().map_err(Error::Risk)?;
+            let engine = self.engine.take().unwrap();
+            // Read-only view of final Risk books, taken before finish consumes it.
+            let books_sha256 = wire::books_sha256(&engine);
+            let finished = engine.finish().map_err(Error::Risk)?;
             self.publish(
                 "terminal",
-                json!({"cuts":finished.cuts().to_string()}),
+                wire::terminal(finished.cuts(), books_sha256),
                 &previous,
             )?;
             self.terminal = true;
