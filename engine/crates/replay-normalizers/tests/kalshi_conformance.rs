@@ -234,7 +234,7 @@ fn multiply_invalid_messages_preserve_reject_precedence() {
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
-    assert_eq!(PARSER_VERSION, 4);
+    assert_eq!(PARSER_VERSION, 5);
     let default_config = serde_json::to_vec(&json!({
         "schema_version": 2,
         "variables": {
@@ -458,6 +458,138 @@ fn snapshot_schema_families_are_explicit_and_empty_current_snapshot_is_valid() {
         reject_code(normalize(&sequenced(&mixed.to_string(), "public_book", 2))),
         "mixed_snapshot_schema"
     );
+}
+
+fn full_books(normalized: &[SegmentEvent]) -> Vec<&replay_domain::FullBook> {
+    normalized
+        .iter()
+        .map(|event| match event {
+            SegmentEvent::Book(BookEvent::Full(book)) => book,
+            other => panic!("expected full book, got {other:?}"),
+        })
+        .collect()
+}
+
+fn bid_levels(book: &replay_domain::FullBook) -> Vec<(i64, u64)> {
+    book.bids()
+        .iter()
+        .map(|level| (level.price().atoms(), level.quantity().atoms()))
+        .collect()
+}
+
+#[test]
+fn empty_book_snapshot_with_empty_market_id_is_two_empty_full_books() {
+    // Live shape: a snapshot of a book with no resting orders carries no level
+    // arrays and an empty `market_id`. It is a valid empty book, not a fault.
+    let payload = r#"{"type":"orderbook_snapshot","sid":1,"seq":7,"msg":{"market_ticker":"KX-EMPTY","market_id":""}}"#;
+    let normalized = events(normalize(&sequenced(payload, "public_book", 7)));
+    let books = full_books(&normalized);
+    assert_eq!(books.len(), 2);
+    assert_eq!(books[0].orientation(), ContractOrientation::Outcome);
+    assert_eq!(books[1].orientation(), ContractOrientation::Complement);
+    for book in books {
+        assert_eq!(book.instrument().as_str(), "kalshi:KX-EMPTY");
+        assert!(book.bids().is_empty());
+        assert!(book.asks().is_empty());
+    }
+}
+
+#[test]
+fn get_snapshot_reply_echoing_command_id_is_an_ordinary_snapshot() {
+    // Live shape: a snapshot answering a command echoes that command's `id` at
+    // the top level, alongside an empty `market_id`, for every level family.
+    let msgs = [
+        json!({"market_ticker":"KX-ID","market_id":""}),
+        json!({"market_ticker":"KX-ID","market_id":"",
+               "yes_dollars_fp":[["0.0800","300.00"],["0.2200","333.00"]],
+               "no_dollars_fp":[["0.5600","146.00"]]}),
+        json!({"market_ticker":"KX-ID","market_id":"",
+               "yes_dollars_fp":[["0.2200","333.00"]]}),
+        json!({"market_ticker":"KX-ID","market_id":"",
+               "no_dollars_fp":[["0.5600","146.00"]]}),
+    ];
+    type Ladder = &'static [(i64, u64)];
+    let expected: [(Ladder, Ladder); 4] = [
+        (&[], &[]),
+        (&[(2200, 33_300), (800, 30_000)], &[(5600, 14_600)]),
+        (&[(2200, 33_300)], &[]),
+        (&[], &[(5600, 14_600)]),
+    ];
+    for (msg, (yes, no)) in msgs.into_iter().zip(expected) {
+        let with_id = json!({
+            "type":"orderbook_snapshot","id":5844,"sid":1,"seq":545008,"msg":msg
+        });
+        let without_id = json!({
+            "type":"orderbook_snapshot","sid":1,"seq":545008,"msg":msg
+        });
+        let normalized = events(normalize(&sequenced(
+            &with_id.to_string(),
+            "public_book",
+            545_008,
+        )));
+        let books = full_books(&normalized);
+        assert_eq!(books.len(), 2, "{with_id}");
+        assert_eq!(books[0].orientation(), ContractOrientation::Outcome);
+        assert_eq!(books[1].orientation(), ContractOrientation::Complement);
+        assert_eq!(bid_levels(books[0]), yes, "{with_id}");
+        assert_eq!(bid_levels(books[1]), no, "{with_id}");
+        assert!(books.iter().all(|book| book.asks().is_empty()));
+        // The echoed command id carries no book meaning.
+        assert_eq!(
+            normalized,
+            events(normalize(&sequenced(
+                &without_id.to_string(),
+                "public_book",
+                545_008,
+            )))
+        );
+    }
+}
+
+#[test]
+fn snapshot_top_level_stays_closed_apart_from_a_valid_command_id() {
+    let msg = json!({"market_ticker":"KX-ID","market_id":""});
+    for (outer, code) in [
+        (
+            json!({"type":"orderbook_snapshot","sid":1,"seq":3,"extra":1,"msg":msg}),
+            "unknown_field",
+        ),
+        (
+            json!({"type":"orderbook_snapshot","id":1,"sid":1,"seq":3,"extra":1,"msg":msg}),
+            "unknown_field",
+        ),
+        (
+            json!({"type":"orderbook_snapshot","id":0,"sid":1,"seq":3,"msg":msg}),
+            "invalid_command_id",
+        ),
+        (
+            json!({"type":"orderbook_snapshot","id":"5844","sid":1,"seq":3,"msg":msg}),
+            "invalid_command_id",
+        ),
+        (
+            json!({"type":"orderbook_snapshot","id":null,"sid":1,"seq":3,"msg":msg}),
+            "invalid_command_id",
+        ),
+    ] {
+        assert_eq!(
+            reject_code(normalize(&sequenced(&outer.to_string(), "public_book", 3))),
+            code,
+            "{outer}"
+        );
+    }
+    // Only the empty string is newly accepted for `market_id`; other invalid
+    // values keep their established classification.
+    for market_id in [json!("bad\nid"), json!(7), Value::Null] {
+        let outer = json!({
+            "type":"orderbook_snapshot","sid":1,"seq":3,
+            "msg":{"market_ticker":"KX-ID","market_id":market_id}
+        });
+        assert_eq!(
+            reject_code(normalize(&sequenced(&outer.to_string(), "public_book", 3))),
+            "invalid_market_id",
+            "{outer}"
+        );
+    }
 }
 
 #[test]

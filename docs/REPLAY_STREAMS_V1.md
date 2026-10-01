@@ -139,7 +139,7 @@ Strict config is ≤1 MiB, with fields:
 {
   "run_id":"run-1", "attempt_id":"attempt-1", "scope":"research",
   "normalizer":{"identity_version":1,"venues":[
-    {"venue":"kalshi","bundle_id":"prediction-indexer/kalshi-normalizer/v4","parser_version":4,"config":{"schema_version":2,"variables":{"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":2}}}},
+    {"venue":"kalshi","bundle_id":"prediction-indexer/kalshi-normalizer/v5","parser_version":5,"config":{"schema_version":2,"variables":{"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":2}}}},
     {"venue":"limitless","bundle_id":"prediction-indexer/limitless-normalizer/v2","parser_version":2,"config":{"schema_version":1,"variables":{"price_scale":{"type":"unsigned","value":3},"quantity_scale":{"type":"unsigned","value":6}}}},
     {"venue":"polymarket","bundle_id":"prediction-indexer/polymarket-normalizer/v2","parser_version":2,"config":{"schema_version":1,"variables":{"accept_additive_fields":{"type":"boolean","value":true},"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":6}}}}
   ]},

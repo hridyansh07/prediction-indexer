@@ -62,6 +62,13 @@ A full snapshot resets only that key, never every orientation of an instrument.
   one binary market, not independent liquidity: a NO bid at 0.56 implies a YES
   ask at 0.44. Normalization preserves both bid ladders without that conversion.
   Empty `asks` means no explicit ask ladder was emitted, not no implied asks.
+  An `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg`,
+  and an optional positive `id` that Kalshi echoes when the snapshot answers a
+  `subscribe` or `get_snapshot` command. A snapshot `msg` may carry
+  `market_id: ""`, which is treated as absent; a snapshot with no level arrays
+  is a valid empty book and yields both orientations as empty Full books.
+  Bundle `kalshi-normalizer/v5` (parser 5) introduced both acceptances; v4
+  rejected those frames as `unknown_field` / `invalid_market_id`.
 - [Polymarket](https://docs.polymarket.com/market-data/overview) gives each
   outcome its own token ID. YES and NO remain different `polymarket:TOKEN_ID`
   instruments, both with `Outcome` orientation relative to their own token.

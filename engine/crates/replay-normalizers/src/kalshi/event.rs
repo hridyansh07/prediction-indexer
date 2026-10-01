@@ -52,7 +52,7 @@ impl Snapshot {
         } else {
             msg.checked_fields(&["market_ticker", "market_id", "yes", "no"])?;
         }
-        optional_nonempty_text(msg.get("market_id"), "invalid_market_id")?;
+        snapshot_market_id(msg.get("market_id"))?;
         let (yes, no) = if modern {
             (
                 levels(msg.get("yes_dollars_fp"), config, false, &instrument)?,
@@ -396,6 +396,17 @@ fn optional_nonempty_text(value: Option<&Value>, code: &'static str) -> Result<(
             .map(|_| ())
             .map_err(|_| Reject::new(code)),
         None => Ok(()),
+    }
+}
+
+/// Live Kalshi snapshots, including every snapshot of an empty book, may send
+/// `market_id: ""`. The empty string is accepted exactly as if the field were
+/// absent: `market_id` identifies nothing here, and the book is keyed by
+/// `market_ticker`. Any other value keeps the strict non-empty text rule.
+fn snapshot_market_id(value: Option<&Value>) -> Result<(), Reject> {
+    match value {
+        Some(Value::String(text)) if text.is_empty() => Ok(()),
+        other => optional_nonempty_text(other, "invalid_market_id"),
     }
 }
 
