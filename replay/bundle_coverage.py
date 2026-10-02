@@ -60,6 +60,8 @@ class Coverage:
         self.window = None
         self.evidence = {}
         self.open = {}
+        self.layouts = {}
+        self.counts = []
         self.terminal = self.finished = self.poisoned = False
         self.trades = {
             d: 0
@@ -131,8 +133,13 @@ class Coverage:
         # The decoder has ALREADY applied this cut to its books in place. Scope
         # boundaries before this cut use the previous detached copy.
         self._advance(t)
+        # Only books named by this cut (or whose window evidence was reset or
+        # set) can change coverage fields; every other book would re-derive
+        # exactly its previous fields, which _set ignores.
+        changed = set()
         if origin["kind"] == "window":
             self.window = origin
+            changed.update(self.evidence)
             self.evidence = {}
             for transition in cut.body["book_transitions"]:
                 decision = transition["decision"]
@@ -150,15 +157,15 @@ class Coverage:
                 )
                 k = (transition["key"]["instrument"], transition["key"]["orientation"])
                 self.evidence[k] = (why, origin)
+                changed.add(k)
         for transition in cut.body["book_transitions"]:
             k = (transition["key"]["instrument"], transition["key"]["orientation"])
             self.books[k] = status(cut.books[k])
-        self._evaluate(t)
+            changed.add(k)
+        if changed:
+            self._evaluate(t, changed)
         if raw_time >= int(self.snapshot["config"]["start_ns"]):
-            required = {
-                (b["instrument"], b["orientation"])
-                for b in self.scopes[self.scope]["required_books"]
-            }
+            required = self._layout()["required"]
             for observation in cut.body["market_events"]:
                 event = observation["event"]
                 if event["kind"] == "trade":
@@ -213,17 +220,59 @@ class Coverage:
             self._emit(entity, self.open[entity], t)
         self.open.clear()
 
-    def _evaluate(self, t):
-        scope = self.scopes[self.scope]
-        total = usable = uncaptured = 0
-        for member in scope["members"]:
+    def _layout(self):
+        """Per-scope constants: book ids, member shapes, required trade keys.
+
+        A book id hashes only (instrument, orientation), so it is computed once
+        per scope instead of once per book per cut.
+        """
+        layout = self.layouts.get(self.scope)
+        if layout is None:
+            scope = self.scopes[self.scope]
+            layout = {
+                "members": [
+                    (
+                        "member:" + member["market_id"],
+                        [
+                            ((b["instrument"], b["orientation"]), book_id(b))
+                            for b in member["books"]
+                        ],
+                        int(not member["capture_selected"]),
+                    )
+                    for member in scope["members"]
+                ],
+                "required": {
+                    (b["instrument"], b["orientation"])
+                    for b in scope["required_books"]
+                },
+            }
+            self.layouts[self.scope] = layout
+        return layout
+
+    def _evaluate(self, t, changed=None):
+        """Re-derive coverage fields; with `changed`, only for those books.
+
+        Entities are visited in the same order either way (members in scope
+        order, each member's books, the member, then the bundle), so the rows
+        _set emits are identical to a full evaluation.
+        """
+        layout = self._layout()
+        if changed is None:
+            self.counts = [None] * len(layout["members"])
+        touched = False
+        for index, (member_id, books, outside) in enumerate(layout["members"]):
+            if changed is not None and not any(k in changed for k, _ in books):
+                continue
+            touched = True
             count = 0
-            for b in member["books"]:
-                k = b["instrument"], b["orientation"]
+            for k, entity in books:
                 validity, why, source = self.books[k]
+                count += validity == "usable"
+                if changed is not None and k not in changed:
+                    continue
                 evidence, evidence_source = self.evidence.get(k, ("unknown", None))
                 self._set(
-                    book_id(b),
+                    entity,
                     t,
                     {
                         "kind": "book",
@@ -234,11 +283,10 @@ class Coverage:
                         "evidence_source": evidence_source,
                     },
                 )
-                count += validity == "usable"
-            required = len(member["books"])
-            outside = int(not member["capture_selected"])
+            required = len(books)
+            self.counts[index] = (count, required, outside)
             self._set(
-                "member:" + member["market_id"],
+                member_id,
                 t,
                 {
                     "kind": "member",
@@ -248,6 +296,10 @@ class Coverage:
                     "uncaptured_members": outside,
                 },
             )
+        if not touched:
+            return
+        total = usable = uncaptured = 0
+        for count, required, outside in self.counts:
             total += required
             usable += count
             uncaptured += outside

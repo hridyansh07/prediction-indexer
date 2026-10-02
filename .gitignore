@@ -42,3 +42,6 @@ targeter-ui/dist-server/
 # Orb service runtime state
 .amp/portals/
 .amp/runtime/
+
+# Local replay benchmark workspace (downloaded windows, rebuilt derivatives, run outputs)
+.bench/
