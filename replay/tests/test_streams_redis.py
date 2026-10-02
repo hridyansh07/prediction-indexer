@@ -48,20 +48,24 @@ class RedisTests(unittest.TestCase):
         self.redis.delete(*self.keys)
         self.redis.close()
 
+    def publish_reply(self, r):
+        seq = int(r["sequence"])
+        return self.redis.eval(
+            SCRIPT,
+            2,
+            *self.keys,
+            "publish",
+            "-1" if seq == 0 else str(seq),
+            str(seq + 1),
+            encoded(r),
+            "1" if r["kind"] == "terminal" else "0",
+        )
+
     def publish(self, values=None):
         values = self.values if values is None else values
         for r in values:
-            seq = int(r["sequence"])
-            self.redis.eval(
-                SCRIPT,
-                2,
-                *self.keys,
-                "publish",
-                "-1" if seq == 0 else str(seq),
-                str(seq + 1),
-                encoded(r),
-                "1" if r["kind"] == "terminal" else "0",
-            )
+            # A FULL reply writes nothing; it must never pass for a publish.
+            self.assertEqual(self.publish_reply(r), b"OK")
 
     def consumer(self, group="fast", **kwargs):
         c = Consumer(
@@ -319,15 +323,50 @@ class RedisTests(unittest.TestCase):
         finally:
             self.redis.config_set("maxmemory", old)
 
-    def test_queue_limit_retains_unread_prefix(self):
+    def test_full_queue_returns_status_writes_nothing_and_keeps_attempt_live(self):
         self.publish(self.values[:1])
-        self.redis.hset(self.keys[1], "limit", 1)
+        retained = self.redis.hget(self.keys[1], "bytes")
+        # Exactly the retained bytes: the next entry cannot fit.
+        self.redis.hset(self.keys[1], "limit", retained)
+        before = self.redis.hgetall(self.keys[1])
+        self.assertEqual(self.publish_reply(self.values[1]), b"FULL")
+        self.assertEqual(self.redis.xlen(self.keys[0]), 1)
+        self.assertEqual(self.redis.hgetall(self.keys[1]), before)
+        self.assertEqual(self.redis.hget(self.keys[1], "published"), b"1")
+        self.assertEqual(self.redis.hget(self.keys[1], "bytes"), retained)
+        self.assertEqual(self.redis.hget(self.keys[1], "poisoned"), b"0")
+        self.assertNotIn(b"size:2", self.sizes())
+        # The identical command succeeds once space exists: same sequence and
+        # previous value, so a waiting publisher resumes without any gap.
+        fast, slow = self.consumer(), self.consumer("slow")
+        fast.poll(lambda _: None)
+        self.assertEqual(self.publish_reply(self.values[1]), b"FULL")
+        slow.poll(lambda _: None)
+        self.assertEqual(self.redis.hget(self.keys[1], "bytes"), b"0")
+        self.assertEqual(self.publish_reply(self.values[1]), b"OK")
+        self.assertEqual(self.redis.hget(self.keys[1], "published"), b"2")
+
+    def test_oversized_entry_is_fatal_and_poison_wins_over_full(self):
         import redis
 
-        with self.assertRaisesRegex(redis.ResponseError, "resource_limit"):
-            self.publish(self.values[1:2])
+        self.publish(self.values[:1])
+        # A single entry above the per-entry cap can never fit: still an error.
+        self.redis.hset(self.keys[1], "entry", 1)
+        with self.assertRaisesRegex(redis.ResponseError, "REPLAY resource_limit"):
+            self.publish_reply(self.values[1])
         self.assertEqual(self.redis.xlen(self.keys[0]), 1)
         self.assertEqual(self.redis.hget(self.keys[1], "published"), b"1")
+        self.redis.hset(
+            self.keys[1],
+            mapping={"entry": self.initial["max_entry_bytes"], "limit": 1},
+        )
+        self.assertEqual(self.publish_reply(self.values[1]), b"FULL")
+        # A poisoned attempt errors even while its queue is full, so a waiting
+        # publisher stops on its next retry.
+        self.redis.hset(self.keys[1], "poisoned", "1")
+        with self.assertRaisesRegex(redis.ResponseError, "REPLAY poisoned"):
+            self.publish_reply(self.values[1])
+        self.assertEqual(self.redis.xlen(self.keys[0]), 1)
 
 
 def existing(initial_path, attempt):

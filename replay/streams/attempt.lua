@@ -38,7 +38,12 @@ if op == 'publish' then
     if s[1] ~= '0' then return fail('poisoned') end
     if s[2] ~= ARGV[2] or s[3] ~= '' then return fail('sequence') end
     local size = string.len(ARGV[4])
-    if size > tonumber(s[4]) or size + tonumber(s[5]) > tonumber(s[6]) then return fail('resource_limit') end
+    -- An entry larger than the per-entry cap can never fit: fatal.
+    if size > tonumber(s[4]) then return fail('resource_limit') end
+    -- A full queue is not an error. Nothing is written; the publisher keeps the
+    -- same sequence and entry and retries after a bounded backoff. Poisoned is
+    -- checked first above, so a failed attempt still stops a waiting publisher.
+    if size + tonumber(s[5]) > tonumber(s[6]) then return 'FULL' end
     redis.call('XADD', stream, ARGV[3] .. '-0', 'record', ARGV[4])
     redis.call('HINCRBY', state, 'bytes', size)
     if ARGV[5] == '1' then

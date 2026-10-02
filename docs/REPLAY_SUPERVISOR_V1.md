@@ -107,8 +107,14 @@ wall-clock deadline across invocations. Command timeouts may extend observed
 deadline handling by one command timeout; child teardown adds `stop_seconds`.
 Run clocks must not be moved backwards. Setup readiness is a new file created by
 the Rust publisher after setup and initial publication; consumers never reconnect
-or mistake pre-setup absence for an attempt failure. Queue exhaustion is retryable
-but bounded by the same budgets, not hidden by dropping data.
+or mistake pre-setup absence for an attempt failure. A full queue is waited out
+inside the attempt: the publisher backs off on `FULL` and resumes when consumers
+ACK, without dropping data or failing the attempt. Progress is the slowest group's
+completed sequence, so ACKs while the publisher waits reset the stall clock, and a
+consumer that stops ACKing still trips the stall, attempt, and run deadlines, which
+stop the waiting publisher; the no-progress budget then bounds retries. Redis OOM
+remains a retryable (exit 21) participant failure; a setup rejection, including
+maxmemory below 13/10 of the queue byte budget, is fatal (exit 20).
 
 A nonblocking flock protects one local run directory. Its descriptor is inherited
 by participants; Linux parent-death SIGKILL kills direct children on supervisor

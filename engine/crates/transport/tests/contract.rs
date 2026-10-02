@@ -512,7 +512,9 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
         .unwrap()
         .get_connection()
         .unwrap();
-    for failure in ["queue", "timeout", "oom", "risk"] {
+    // A full queue is waited out (see `redis_publisher_waits_on_full_queue_...`);
+    // an entry above the per-entry cap can never fit and stays fatal.
+    for failure in ["entry", "timeout", "oom", "risk"] {
         let mut c = config(&f);
         c.attempt_id = format!("{}-{}", failure, std::process::id());
         c.command_timeout_ms = 50;
@@ -522,10 +524,10 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
             ..RiskLimits::default()
         };
         let mut publisher = Publisher::open(&url, c, limits).unwrap();
-        if failure == "queue" {
+        if failure == "entry" {
             let _: () = redis::cmd("HSET")
                 .arg(&keys[1])
-                .arg("limit")
+                .arg("entry")
                 .arg(1)
                 .query(&mut admin)
                 .unwrap();
@@ -567,7 +569,7 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
         }
         assert!(
             match failure {
-                "oom" | "queue" => matches!(result, Err(Error::Resource)),
+                "oom" | "entry" => matches!(result, Err(Error::Resource)),
                 "timeout" => matches!(result, Err(Error::Transport)),
                 "risk" => matches!(result, Err(Error::Risk(_))),
                 _ => unreachable!(),
@@ -714,4 +716,200 @@ fn redis_bundle_coverage_acceptance() {
             .unwrap()
             .success()
     );
+}
+
+const SCRIPT: &str = include_str!("../../../../replay/streams/attempt.lua");
+
+fn state_field(admin: &mut redis::Connection, key: &str, field: &str) -> String {
+    redis::cmd("HGET").arg(key).arg(field).query(admin).unwrap()
+}
+
+#[test]
+#[ignore = "requires explicitly supplied disposable Redis >=8.2; run with --test-threads=1"]
+fn redis_publisher_waits_on_full_queue_then_completes_in_order() {
+    let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    let f = fixture();
+    let mut c = config(&f);
+    c.attempt_id = format!("full-{}", std::process::id());
+    // Entries are 0.2–5.6 KB: initial and the first two cuts fit, the third
+    // cut does not, so with no consumer the publisher must wait at sequence 3.
+    c.max_entry_bytes = 8192;
+    c.max_queue_bytes = 8192;
+    let expected: Vec<String> = records(&f, &c)
+        .iter()
+        .map(|v| serde_json::to_string(v).unwrap())
+        .collect();
+    assert!(expected[..3].iter().map(String::len).sum::<usize>() <= c.max_queue_bytes);
+    assert!(expected[..4].iter().map(String::len).sum::<usize>() > c.max_queue_bytes);
+    let keys = c.keys();
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+    let scratch = tempdir::TempDir::new("replay-full-queue").unwrap();
+    let path = scratch.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_replay-publish"))
+        .arg(&path)
+        .env("REDIS_URL", &url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Phase 1: no consumer reads, so the publisher blocks on a full queue
+    // instead of failing; nothing past the limit is written or poisoned.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let exists: u64 = redis::cmd("EXISTS")
+            .arg(&keys[1])
+            .query(&mut admin)
+            .unwrap();
+        if exists == 1 && state_field(&mut admin, &keys[1], "published") == "3" {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "publisher exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "publisher never filled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "publisher must wait on a full queue, not fail"
+    );
+    assert_eq!(state_field(&mut admin, &keys[1], "published"), "3");
+    assert_eq!(state_field(&mut admin, &keys[1], "terminal"), "");
+    assert_eq!(state_field(&mut admin, &keys[1], "poisoned"), "0");
+    let length: u64 = redis::cmd("XLEN").arg(&keys[0]).query(&mut admin).unwrap();
+    assert_eq!(length, 3);
+    let bytes: usize = state_field(&mut admin, &keys[1], "bytes").parse().unwrap();
+    assert!(bytes <= c.max_queue_bytes);
+
+    // Phase 2: both groups resume, one entry at a time; the publisher drains.
+    let script = redis::Script::new(SCRIPT);
+    let mut delivered: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while c
+        .groups
+        .iter()
+        .any(|g| delivered.get(g).map_or(0, Vec::len) < expected.len())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "consumers never finished"
+        );
+        let mut idle = true;
+        for group in &c.groups {
+            let done = delivered.entry(group.clone()).or_default();
+            if done.len() == expected.len() {
+                continue;
+            }
+            type Reply = Option<Vec<(String, Vec<(String, BTreeMap<String, String>)>)>>;
+            let reply: Reply = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("worker")
+                .arg("COUNT")
+                .arg(1)
+                .arg("STREAMS")
+                .arg(&keys[0])
+                .arg(">")
+                .query(&mut admin)
+                .unwrap();
+            for (id, fields) in reply.into_iter().flatten().flat_map(|(_, ids)| ids) {
+                idle = false;
+                let record = fields["record"].clone();
+                let previous = if done.is_empty() {
+                    "-1".to_string()
+                } else {
+                    done.len().to_string()
+                };
+                done.push(record);
+                let acked: u64 = script
+                    .key(&keys[0])
+                    .key(&keys[1])
+                    .arg("ack")
+                    .arg(group)
+                    .arg(previous)
+                    .arg(done.len().to_string())
+                    .arg(&id)
+                    .invoke(&mut admin)
+                    .unwrap();
+                assert_eq!(acked, 1);
+            }
+        }
+        if idle {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{:?} {stderr}", output.status);
+    for group in &c.groups {
+        assert_eq!(delivered[group], expected, "{group}: every entry, in order");
+    }
+    assert_eq!(
+        state_field(&mut admin, &keys[1], "terminal"),
+        expected.len().to_string()
+    );
+    assert_eq!(state_field(&mut admin, &keys[1], "bytes"), "0");
+    let waits = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("replay-publish: queue_full_waits="))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .expect("queue wait summary line");
+    assert!(waits > 0, "{stderr}");
+    assert!(stderr.contains(" wait_ms="), "{stderr}");
+    let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicitly supplied disposable Redis >=8.2"]
+fn redis_setup_rejects_maxmemory_below_queue_headroom() {
+    use replay_transport::{Error, Publisher};
+    let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    let f = fixture();
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let settings: BTreeMap<String, String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("maxmemory")
+        .query(&mut admin)
+        .unwrap();
+    let maxmemory: u64 = settings["maxmemory"].parse().unwrap();
+    // Largest queue a server of this size admits: 10 * maxmemory >= 13 * queue.
+    let largest = usize::try_from(maxmemory * 10 / 13).unwrap();
+    assert!(
+        largest < 1_000_000_000,
+        "use a disposable Redis below ~1.2 GiB"
+    );
+    for (queue, admitted) in [(largest + 1, false), (largest, true)] {
+        let mut c = config(&f);
+        c.attempt_id = format!("guard-{admitted}-{}", std::process::id());
+        c.max_queue_bytes = queue;
+        let keys = c.keys();
+        let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+        match Publisher::open(&url, c, RiskLimits::default()) {
+            Ok(_) => assert!(admitted, "{queue} admitted above the guard"),
+            Err(Error::Protocol(message)) => {
+                assert!(!admitted, "{queue}: {message}");
+                assert!(message.contains("maxmemory"), "{message}");
+                // Refused before setup: no Redis key is created.
+                let count: u64 = redis::cmd("EXISTS").arg(&keys).query(&mut admin).unwrap();
+                assert_eq!(count, 0);
+            }
+            Err(other) => panic!("{queue}: {other:?}"),
+        }
+        let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
+    }
 }

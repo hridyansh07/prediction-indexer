@@ -7,9 +7,26 @@ use replay_risk::{BookPlan, RiskEngine, RiskLimits};
 use replay_tape::{DerivativePin, LowerBoundPolicy, PinnedDerivative};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 const SCRIPT: &str = include_str!("../../../../replay/streams/attempt.lua");
+/// Queue-full backoff: 1 ms, doubling, capped at 50 ms, reset per entry. The
+/// publisher has no wait deadline of its own; the supervisor's no-progress,
+/// stall and attempt deadlines bound it.
+const FULL_BACKOFF_START: Duration = Duration::from_millis(1);
+const FULL_BACKOFF_CAP: Duration = Duration::from_millis(50);
+/// Stream/node/group/hash overhead was measured at ~22% of payload; Redis
+/// `maxmemory` must be at least 13/10 of the payload budget at setup.
+const MAXMEMORY_NUMERATOR: u128 = 13;
+const MAXMEMORY_DENOMINATOR: u128 = 10;
+/// True when `maxmemory` leaves room for the whole queue byte budget plus
+/// stream overhead. Exact integer arithmetic; no rounding admits a short Redis.
+pub fn maxmemory_fits_queue(maxmemory: u64, max_queue_bytes: usize) -> bool {
+    u128::from(maxmemory) * MAXMEMORY_DENOMINATOR >= max_queue_bytes as u128 * MAXMEMORY_NUMERATOR
+}
 #[derive(Debug)]
 pub enum Error {
     Protocol(String),
@@ -203,6 +220,15 @@ impl Config {
     }
 }
 
+/// Diagnostic totals for queue-full waiting. Not persisted or part of the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueWaits {
+    /// Number of `FULL` replies received across all publishes.
+    pub full_replies: u64,
+    /// Total time spent sleeping before retrying a `FULL` publish.
+    pub waited: Duration,
+}
+
 /// Owns both the risk lifecycle and publication sequence. Terminal cannot be
 /// supplied by callers, nor can a risk cut from a different engine be inserted.
 pub struct Publisher {
@@ -213,6 +239,7 @@ pub struct Publisher {
     sequence: u64,
     poisoned: bool,
     terminal: bool,
+    waits: QueueWaits,
 }
 impl Publisher {
     pub fn open(url: &str, config: Config, limits: RiskLimits) -> Result<Self> {
@@ -274,18 +301,26 @@ impl Publisher {
             .arg("maxmemory-policy")
             .query(&mut connection)
             .map_err(redis_error)?;
+        let maxmemory = settings
+            .get("maxmemory")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         if parts.len() != 2
             || (parts[0], parts[1]) < (8, 2)
             || settings.get("maxmemory-policy").map(String::as_str) != Some("noeviction")
-            || settings
-                .get("maxmemory")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-                == 0
+            || maxmemory == 0
         {
             return Err(Error::Protocol(
                 "Redis >=8.2 with maxmemory and noeviction required".into(),
             ));
+        }
+        // Waiting on a full queue is only safe if the queue itself cannot drive
+        // Redis into OOM. A deterministic deployment mismatch: never retried.
+        if !maxmemory_fits_queue(maxmemory, config.max_queue_bytes) {
+            return Err(Error::Protocol(format!(
+                "Redis maxmemory {maxmemory} is below 13/10 of max_queue_bytes {}",
+                config.max_queue_bytes
+            )));
         }
         let mut p = Self {
             config,
@@ -295,6 +330,7 @@ impl Publisher {
             sequence: 0,
             poisoned: false,
             terminal: false,
+            waits: QueueWaits::default(),
         };
         let setup = p.eval::<String>(&[
             "setup".into(),
@@ -345,17 +381,40 @@ impl Publisher {
             return Err(Error::Resource);
         }
         // Redis IDs start at 1; wire sequences start at 0 (initial).
-        let result = self.eval::<String>(&[
+        let args = [
             "publish".into(),
             previous.into(),
             (self.sequence + 1).to_string(),
             bytes,
             if kind == "terminal" { "1" } else { "0" }.into(),
-        ]);
-        if result.is_err() {
-            self.poison();
+        ];
+        // `FULL` wrote nothing, so the identical command is retried with the
+        // same sequence and previous value. Every error reply still poisons.
+        let mut backoff = FULL_BACKOFF_START;
+        loop {
+            match self.eval::<String>(&args) {
+                Ok(reply) if reply == "OK" => return Ok(()),
+                Ok(reply) if reply == "FULL" => {
+                    self.waits.full_replies += 1;
+                    let started = Instant::now();
+                    std::thread::sleep(backoff);
+                    self.waits.waited += started.elapsed();
+                    backoff = (backoff * 2).min(FULL_BACKOFF_CAP);
+                }
+                Ok(_) => {
+                    self.poison();
+                    return Err(Error::Protocol("publish reply".into()));
+                }
+                Err(error) => {
+                    self.poison();
+                    return Err(error);
+                }
+            }
         }
-        result.map(|_| ())
+    }
+    /// Totals of queue-full replies and backoff sleep so far.
+    pub fn queue_waits(&self) -> QueueWaits {
+        self.waits
     }
     fn record(&self, kind: &str, body: Value) -> Value {
         json!({"version":"1","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
@@ -419,6 +478,23 @@ impl Publisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maxmemory_guard_requires_thirteen_tenths_of_queue_bytes() {
+        const MIB: u64 = 1024 * 1024;
+        // Production `small` preset (64 MiB queue) on a 150 MiB Redis.
+        assert!(maxmemory_fits_queue(150 * MIB, 64 * MIB as usize));
+        // Exact boundary: 10 * maxmemory == 13 * queue passes; one byte less fails.
+        assert!(maxmemory_fits_queue(13, 10));
+        assert!(!maxmemory_fits_queue(12, 10));
+        assert!(maxmemory_fits_queue(1_300_000_000, 1_000_000_000));
+        assert!(!maxmemory_fits_queue(1_299_999_999, 1_000_000_000));
+        // A Redis sized to the payload alone has no room for stream overhead.
+        assert!(!maxmemory_fits_queue(64 * MIB, 64 * MIB as usize));
+        // No overflow at the extremes of the operand types.
+        assert!(maxmemory_fits_queue(u64::MAX, 1_000_000_000));
+        assert!(!maxmemory_fits_queue(1, usize::MAX));
+    }
 
     #[test]
     fn redis_oom_is_resource_but_other_server_errors_are_not() {

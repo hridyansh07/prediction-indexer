@@ -33,6 +33,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let url = std::env::var("REDIS_URL").map_err(|_| "REDIS_URL required")?;
     let mut publisher = Publisher::open(&url, config, replay_risk::RiskLimits::default())?;
+    let result = publish(&mut publisher);
+    // One diagnostic line on terminal or failure; never persisted or parsed.
+    let waits = publisher.queue_waits();
+    eprintln!(
+        "replay-publish: queue_full_waits={} wait_ms={}",
+        waits.full_replies,
+        waits.waited.as_millis()
+    );
+    result?;
+    println!("terminal published; output remains provisional until all consumers complete");
+    Ok(())
+}
+
+fn publish(publisher: &mut Publisher) -> Result<(), Box<dyn std::error::Error>> {
     // Optional supervisor handshake. No consumer joins before setup and initial.
     if let Some(path) = std::env::args().nth(2) {
         let file = std::fs::OpenOptions::new()
@@ -42,7 +56,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sync_ready(&file)?;
     }
     while publisher.step()? {}
-    println!("terminal published; output remains provisional until all consumers complete");
     Ok(())
 }
 

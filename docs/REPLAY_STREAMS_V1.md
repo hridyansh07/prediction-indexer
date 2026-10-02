@@ -157,7 +157,14 @@ or wall-clock expiry.
 ## Redis requirements, limits, ACK and progress
 
 Redis ≥8.2, positive configured `maxmemory`, and `maxmemory-policy noeviction`
-are mandatory at publisher setup. Clients need INFO/CONFIG GET, EVAL, stream/group
+are mandatory at publisher setup. Setup also requires
+`10 × maxmemory ≥ 13 × max_queue_bytes` (exact integers): stream/node/group/hash
+overhead was measured at about 22% of payload, plus headroom, so a full queue
+cannot by itself drive Redis into OOM. The 64 MiB `small` preset therefore needs
+at least 83.2 MiB (a 150 MiB or the default 512 MiB Redis passes). Every setup
+requirement fails before any key is created, as a `Protocol` error (exit 20): it
+is a deterministic deployment mismatch that a retry against the same Redis
+cannot cure. Clients need INFO/CONFIG GET, EVAL, stream/group
 commands and hash commands. A trusted standalone Redis endpoint is supported;
 Redis Cluster routing and TLS are not implemented by this V1 Rust dependency.
 Use isolated networking/ACLs; never put credentials in config/logs.
@@ -170,9 +177,23 @@ is 128 MiB; by default the count is `min(1024, budget // max_entry_bytes)` (128
 entries at a 1 MiB cap). The supervisor adapter uses the same default, raised to
 one entry when the entry cap exceeds it. One cut is one
 entry and cannot be split. Publisher bounds entries before send; the Redis script
-also checks entry size and retained payload byte total before XADD. Queue exhaustion
-fails immediately instead of deleting unread data or appending indefinitely. Redis
-maxmemory bounds stream/node/group/hash overhead beyond the payload byte budget.
+also checks entry size and retained payload byte total before XADD. An entry above
+`max_entry_bytes` can never fit and remains a fatal `resource_limit` error. When an
+entry fits but the retained total would exceed `max_queue_bytes`, `publish` returns
+the non-error reply `FULL` and writes nothing (no XADD, byte, size or `published`
+change, and no poison). The Rust publisher then sleeps and retries the identical
+command (same sequence and previous value) with exponential backoff from 1 ms,
+doubling, capped at 50 ms, and reset after each successful publish. The `poisoned`
+check runs before the size checks, so a poisoned attempt still stops a waiting
+publisher. The queue byte limit therefore still bounds memory; no unread data is
+deleted or dropped and nothing is appended past the limit. The publisher has no
+wait deadline of its own: the supervisor's stall, attempt and run deadlines bound
+the wait, and its no-progress budget bounds retries (a waiting publisher alone is
+not progress; only consumer ACKs are). Redis OOM is unchanged: still fatal to the
+attempt as a `Resource` failure.
+On exit after terminal or failure the CLI prints one stderr diagnostic line,
+`replay-publish: queue_full_waits=N wait_ms=M`; it is not persisted or parsed.
+Redis maxmemory bounds stream/node/group/hash overhead beyond the payload byte budget.
 Risk/walker limits independently bound the one in-flight cut and retained books;
 consumers retain current books and one bounded batch, not history. Returned cuts
 retained by callers are caller memory. There is no capacity reservation against
@@ -308,7 +329,9 @@ Live tests cover two groups, unread retention/last-ACK deletion, batched ACK
 (sequence/pending failures, stored-size accounting back to zero), membership only at
 join/check, hook-before-ACK,
 caller failure, duplicate delivery, group removal/single join, truncated tail,
-timeouts, OOM, queue limits, publisher poisoning/no terminal, and actual Rust CLI
+timeouts, OOM, oversized entries, queue-full `FULL` replies that write nothing,
+a publisher that waits on a full queue and completes in order once consumers resume,
+the setup maxmemory guard, publisher poisoning/no terminal, and actual Rust CLI
 → Redis → two Python consumers. They do not certify production deployment,
 availability, adversarial Redis mutation, global exactly-once effects, or a retry
 supervisor.
