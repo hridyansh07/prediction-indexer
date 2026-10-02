@@ -393,7 +393,7 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
 
 ```json
 {
-  "replay_runner_config_version": 2,
+  "replay_runner_config_version": 3,
   "universe_base_url": "http://event-universe:8080",
   "scope": "jobs",
   "canonical_window_seconds": 1800,
@@ -409,7 +409,8 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
     }
   },
   "limits": {"small": {"max_entry_bytes": 1048576, "max_queue_bytes": 67108864,
-    "command_timeout_ms": 5000, "attempts": 3, "no_progress": 2, "progress_margin": 100,
+    "command_timeout_ms": 5000, "publish_batch_entries": 100,
+    "attempts": 3, "no_progress": 2, "progress_margin": 100,
     "stall_seconds": 30, "attempt_seconds": 300, "run_seconds": 900,
     "poll_seconds": 0.1, "stop_seconds": 2}},
   "orchestration": {"max_stage_attempts": 20, "max_job_seconds": 86400,
@@ -425,7 +426,11 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
   Polymarket's authority is its market channel `polymarket`.
 - `limits` presets are checked early against the supervisor's rules; the
   supervisor's own `validate` stays authoritative. Every preset's `run_seconds`
-  must be below `max_job_seconds`.
+  must be below `max_job_seconds`. Each preset requires `publish_batch_entries`
+  (an integer 1–1024), passed to the publisher's transport configuration; it
+  sizes the publisher buffer (hard capacity `ceil(1.25 ×` batch`)`) and never
+  changes delivered records. Version 3 added this required field; version 2
+  configs are rejected.
 - `orchestration` is server-owned; no request can change it. The numbers may be
   tuned, but the semantics in §3.8 are fixed.
 

@@ -355,6 +355,28 @@ class BudgetTests(unittest.TestCase):
             s.validate(bad)
         self.assertNotEqual(s.identity(c), s.identity({**c, "python": "/another"}))
 
+    def test_publish_batch_entries_is_optional_bounded_and_off_the_wire(self):
+        c = config()
+        self.assertNotIn("publish_batch_entries", c["transport"])
+        s.validate(c)
+        for batch in (1, 100, 1024):
+            good = copy.deepcopy(c)
+            good["transport"]["publish_batch_entries"] = batch
+            s.validate(good)
+            # Buffering never changes delivered content or the initial body,
+            # but the run identity binds the whole transport configuration.
+            self.assertEqual(s.initial(good), s.initial(c))
+            self.assertNotEqual(s.identity(good), s.identity(c))
+        for batch in (0, 1025, -1, True, 100.0, "100", None):
+            bad = copy.deepcopy(c)
+            bad["transport"]["publish_batch_entries"] = batch
+            with self.subTest(batch=batch), self.assertRaises(ProtocolError):
+                s.validate(bad)
+        bad = copy.deepcopy(c)
+        bad["transport"]["publish_batch"] = 100
+        with self.assertRaises(ProtocolError):
+            s.validate(bad)
+
 
 class Strategy:
     def __init__(self, context):
@@ -468,20 +490,21 @@ def fake_publisher(path, ready, mode):
     for value, entry in zip(values, entries):
         seq = int(value["sequence"])
         while True:
+            # A one-entry batch append: 1 appended, 0 is the FULL reply.
             reply = r.eval(
                 SCRIPT,
                 2,
                 *k,
-                "publish",
+                "append",
                 "-1" if seq == 0 else str(seq),
                 str(seq + 1),
-                entry,
                 "1" if value["kind"] == "terminal" else "0",
+                entry,
             )
-            if reply == "OK":
+            if reply == 1:
                 backoff = 0.001
                 break
-            if reply != "FULL":
+            if reply != 0:
                 return 20
             if not waited:
                 # Outside the run directory: proves this attempt really waited.

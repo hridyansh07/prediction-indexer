@@ -34,6 +34,12 @@ Replace `transport` with the complete publisher configuration documented in
 [REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md), **omitting `attempt_id`**. Use absolute
 input directories. All limits above are illustrative operational choices, not
 defaults; every field is required. Command timeout is 2–60000 milliseconds.
+The transport's optional `publish_batch_entries` (an integer 1–1024; absent means
+the publisher default of 100) sizes the publisher's buffer only. It is not in the
+expected initial record, but like every transport field it is part of the run
+identity when present. A `run.json` written before the field existed still
+validates. Replay jobs pass their limits preset's value; the narrow bundle entry
+point below does not set it and so uses 100.
 Groups must match strategy keys exactly; `.`, `..`, `publisher`, `ready`,
 `publisher.json`, `result.json`, and `interrupted.json` are reserved.
 The config is limited to 1 MiB, validated before launching, copied durably as
@@ -109,7 +115,10 @@ Run clocks must not be moved backwards. Setup readiness is a new file created by
 the Rust publisher after setup and initial publication; consumers never reconnect
 or mistake pre-setup absence for an attempt failure. A full queue is waited out
 inside the attempt: the publisher backs off on `FULL` and resumes when consumers
-ACK, without dropping data or failing the attempt. Progress is the slowest group's
+ACK, without dropping data or failing the attempt. Publisher buffering (see
+[REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md)) holds at most `ceil(1.25 × batch)`
+unappended entries and flushes everything with the terminal, so it delays
+consumers by at most a batch of cuts and never creates a stall on its own. Progress is the slowest group's
 completed sequence, so ACKs while the publisher waits reset the stall clock, and a
 consumer that stops ACKing still trips the stall, attempt, and run deadlines, which
 stop the waiting publisher; the no-progress budget then bounds retries. Redis OOM

@@ -176,23 +176,75 @@ max entry bytes must fit the local byte budget before reading. The default budge
 is 128 MiB; by default the count is `min(1024, budget // max_entry_bytes)` (128
 entries at a 1 MiB cap). The supervisor adapter uses the same default, raised to
 one entry when the entry cap exceeds it. One cut is one
-entry and cannot be split. Publisher bounds entries before send; the Redis script
-also checks entry size and retained payload byte total before XADD. An entry above
-`max_entry_bytes` can never fit and remains a fatal `resource_limit` error. When an
-entry fits but the retained total would exceed `max_queue_bytes`, `publish` returns
-the non-error reply `FULL` and writes nothing (no XADD, byte, size or `published`
-change, and no poison). The Rust publisher then sleeps and retries the identical
-command (same sequence and previous value) with exponential backoff from 1 ms,
-doubling, capped at 50 ms, and reset after each successful publish. The `poisoned`
-check runs before the size checks, so a poisoned attempt still stops a waiting
-publisher. The queue byte limit therefore still bounds memory; no unread data is
+entry and cannot be split. Publisher bounds entries at buffer insert; the Redis
+script also checks every entry's size and the retained payload byte total before
+any XADD. An entry above `max_entry_bytes` can never fit and remains a fatal
+`resource_limit` error (from the script, nothing in that call is written).
+
+**Batch append.** The publisher writes only through one script operation,
+`append previous first terminal entry…`: a contiguous run of one or more encoded
+entries whose first Redis entry sequence is `first`. In order, before any write:
+`poisoned` must be `0`; `published` must equal `previous` (`-1` before initial),
+`terminal` must be empty, and `first` must be the canonical decimal directly
+after `previous` (1 after `-1`); no entry may exceed the entry cap. The script
+then appends the **longest prefix** of the run whose payload fits under
+`max_queue_bytes` (so a run larger than the free space, or larger than the whole
+queue, still progresses entry by entry), XADDs each as `<sequence>-0`, records
+`size:<sequence>` per entry, adds the bytes, advances `published` to the last
+appended entry, and sets `terminal` only when the flag is `1` **and** the run's
+last entry (the terminal record) was appended. It returns the appended count as
+an integer reply. `0` is the non-error FULL reply: nothing is written (no XADD,
+byte, size or `published` change, and no poison). The `poisoned` check runs before
+the size checks, so a poisoned attempt still stops a waiting publisher. The
+single-entry `publish` operation was replaced by `append` (lockstep, like the
+stream-path amendment below; the fake test publisher uses one-entry runs).
+
+**Publisher buffering.** `PublishBuffer<S: StreamSink>` owns every backend write
+of the Rust publisher; `RedisSink` is the Redis/Lua adapter behind the
+`StreamSink` trait (`setup`, `append`, `progress`, `poison`), so another backend
+is one more adapter. The publisher inserts each encoded record (initial, cuts,
+terminal) in wire order. `publish_batch_entries` (`batch`, 1–1024, default 100)
+sets the drain point and the hard capacity `ceil(1.25 × batch)` (125 for 100).
+Single-threaded semantics:
+
+- On reaching `batch` buffered entries, one **non-blocking** drain appends as many
+  as the queue accepts (one append per call; a call never carries more than
+  `max_queue_bytes` of payload, since more could never be accepted). A short or
+  `0` reply ends it without sleeping.
+- If entries remain, further inserts are accepted without another attempt until
+  the hard capacity is reached.
+- At the hard capacity a **blocking** drain appends everything buffered: after any
+  short reply it sleeps with exponential backoff from 1 ms, doubling, capped at
+  50 ms, reset after each call that appended something, and retries the remainder
+  with the same `previous` sequence.
+- `initial` is inserted and drained fully (blocking) during setup, so it is visible
+  before the CLI writes its ready file, as before. The terminal record is inserted
+  like any entry and the buffer is then drained fully; `step()` reports terminal
+  (and the CLI exits 0) only after that.
+
+Any error poisons the attempt without draining the buffer: entries still buffered
+at a failure are never appended, so a failed attempt's published prefix (and its
+consumers' progress) can trail Risk by up to `ceil(1.25 × batch)` entries. That
+only lowers a failed attempt's measured progress; it cannot let a failure pass.
+`batch = 1` appends each entry in its own call as soon as it is inserted; on a full
+queue it holds at most one more entry before blocking. Buffering changes neither
+delivered content, order, sequence numbers, entry IDs, nor the wire records:
+`publish_batch_entries` is not in the `initial` body and consumers need no change.
+Supervisor progress is still the slowest group's `done:<group>`; a buffered entry
+is at most `batch − 1` cuts behind Risk (about 10 ms of input at ~10k cuts/s), and
+end of input always flushes the remainder with the terminal, so buffering cannot
+starve consumers into an artificial stall.
+
+The queue byte limit therefore still bounds memory; no unread data is
 deleted or dropped and nothing is appended past the limit. The publisher has no
 wait deadline of its own: the supervisor's stall, attempt and run deadlines bound
 the wait, and its no-progress budget bounds retries (a waiting publisher alone is
 not progress; only consumer ACKs are). Redis OOM is unchanged: still fatal to the
 attempt as a `Resource` failure.
 On exit after terminal or failure the CLI prints one stderr diagnostic line,
-`replay-publish: queue_full_waits=N wait_ms=M`; it is not persisted or parsed.
+`replay-publish: queue_full_waits=N wait_ms=M batches=B mean_batch_entries=X`
+(blocking-drain backoff sleeps, their total time, append calls that wrote at least
+one entry, and entries per such call); it is not persisted or parsed.
 Redis maxmemory bounds stream/node/group/hash overhead beyond the payload byte budget.
 Risk/walker limits independently bound the one in-flight cut and retained books;
 consumers retain current books and one bounded batch, not history. Returned cuts
@@ -206,7 +258,7 @@ completed sequence equals the expected previous value, verifies with one bounded
 `XACKDEL stream group ACKED IDS n id…`, and advances the completed entry sequence
 to the batch's last entry. A hook exception poisons the attempt with nothing in
 that batch ACKed. Single-entry ACK is the `n = 1` case. Redis's [official XACKDEL specification](https://redis.io/docs/latest/commands/xackdel/)
-states ACKED deletes only after **all groups have read and acknowledged**. Publish
+states ACKED deletes only after **all groups have read and acknowledged**. Append
 records each entry's payload length as `size:<entry sequence>` in the state hash;
 per-ID result 1 (deleted) subtracts and removes that stored size, 2 retains it for
 other groups, anything else fails `ack_failed`. Byte accounting therefore needs no
@@ -234,7 +286,10 @@ attempt deadline for a stuck/missing participant and preserve fatal local errors
 ## Minimal API and CLI
 
 Rust: `Publisher::open(redis_url, Config, RiskLimits)`, then `step()` until false;
-`progress()` exposes completion facts. `Error::{Protocol,Risk,Poisoned}` are
+`progress()` exposes completion facts, `queue_waits()`/`publish_stats()` the
+diagnostics. `Publisher<S: StreamSink = RedisSink>` is generic over the backend
+adapter; `Publisher::with_sink(sink, Config, RiskLimits)` runs the same lifecycle
+over another adapter. `Error::{Protocol,Risk,Poisoned}` are
 nonretryable for that input/attempt; `Transport` and `Resource` are typed transport
 or resource failures. Every error still kills the attempt. Risk's diagnostic
 strings are **not** parsed into retry classes. No retry policy is prescribed.
@@ -254,7 +309,8 @@ Strict config is ≤1 MiB, with fields:
   "start_ns":"0", "end_ns":"100", "lower_bound":"clip",
   "plans":[{"instrument":"kalshi:A","orientation":"outcome","lane":"x","venue":"kalshi","price_scale":"4","quantity_scale":"2"}],
   "groups":["strategy-a","strategy-b"], "command_timeout_ms":5000,
-  "max_entry_bytes":1048576, "max_queue_bytes":67108864
+  "max_entry_bytes":1048576, "max_queue_bytes":67108864,
+  "publish_batch_entries":100
 }
 ```
 
@@ -269,7 +325,12 @@ transport configuration.
 
 Operational config limits above are JSON numbers; **wire** integers are strings.
 Identifiers are 1–128 ASCII alphanumeric/underscore/hyphen/dot. Groups are distinct,
-1–128 entries; queue payload cap ≤1GB; timeout ≤60s. Keys are
+1–128 entries; queue payload cap ≤1GB; timeout ≤60s; `publish_batch_entries`
+1–1024. `publish_batch_entries` is the only optional field: absent means 100, so a
+configuration written before it existed still parses (unknown fields are still
+rejected). It is deliberately **not** in the initial record, because it does not
+change delivered content; the supervisor run identity hashes the whole transport
+configuration, so it binds the batch size whenever the field is present. Keys are
 `replay:<scope>:<run>:<attempt>:stream` and `...:state`. Existing keys fail setup;
 never resume them. Supervisor owns deleting only its disposable keys after all
 participants stop. CLI exit 0 means terminal published, **not** strategy success.
@@ -312,6 +373,12 @@ trades, revisions, dispositions (via explicit hook-time copies), the spelled-out
 terminal digest, and decoder poisoning. The O(1) guards, gaps/duplicates, terminal
 digest mismatch, missing tail, in-place book operations against a reference ladder
 (dense and sparse), and bounded retained memory have offline tests. `REPLAY_UPDATE_GOLDEN=1` deliberately regenerates the fixture.
+`PublishBuffer` unit tests use an in-memory `StreamSink`: the drain attempt at the
+batch size, partial acceptance keeping the remainder without further attempts,
+the blocking drain at the hard capacity with backoff and reset, the terminal flush,
+sequence continuity, oversized entries rejected at insert, per-call byte bounds,
+and `batch = 1`. `publish_batch_entries` bounds, default and absence from the
+initial record are checked offline.
 
 Explicit **disposable server only**: Redis integration tests issue CLIENT PAUSE and
 temporarily CONFIG SET maxmemory to force errors, restoring it afterward. Never
@@ -329,8 +396,11 @@ Live tests cover two groups, unread retention/last-ACK deletion, batched ACK
 (sequence/pending failures, stored-size accounting back to zero), membership only at
 join/check, hook-before-ACK,
 caller failure, duplicate delivery, group removal/single join, truncated tail,
-timeouts, OOM, oversized entries, queue-full `FULL` replies that write nothing,
-a publisher that waits on a full queue and completes in order once consumers resume,
+timeouts, OOM, oversized entries, batch append (contiguous IDs, per-entry sizes,
+terminal only with its entry), longest-prefix acceptance on a partly full queue
+and on a run larger than the whole queue, sequence errors and `0` (FULL) replies
+that write nothing, a publisher that waits on a full queue and completes in order
+once consumers resume (at batch sizes 1, 2 and 100),
 the setup maxmemory guard, publisher poisoning/no terminal, and actual Rust CLI
 → Redis → two Python consumers. They do not certify production deployment,
 availability, adversarial Redis mutation, global exactly-once effects, or a retry

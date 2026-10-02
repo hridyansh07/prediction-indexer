@@ -1,5 +1,12 @@
 //! One single-producer, fixed-membership Redis attempt. No retry or resumption.
+pub mod buffer;
+mod redis_sink;
 pub mod wire;
+pub use buffer::{
+    DEFAULT_BATCH_ENTRIES, Entry, MAX_BATCH_ENTRIES, MIN_BATCH_ENTRIES, PublishBuffer,
+    PublishStats, QueueWaits, StreamSink, hard_capacity,
+};
+pub use redis_sink::RedisSink;
 use replay_domain::*;
 use replay_materialize::{ReadLimits, inspect_pinned};
 use replay_normalizers::CanonicalNormalizerIdentity;
@@ -7,17 +14,8 @@ use replay_risk::{BookPlan, RiskEngine, RiskLimits};
 use replay_tape::{DerivativePin, LowerBoundPolicy, PinnedDerivative};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
 
-const SCRIPT: &str = include_str!("../../../../replay/streams/attempt.lua");
-/// Queue-full backoff: 1 ms, doubling, capped at 50 ms, reset per entry. The
-/// publisher has no wait deadline of its own; the supervisor's no-progress,
-/// stall and attempt deadlines bound it.
-const FULL_BACKOFF_START: Duration = Duration::from_millis(1);
-const FULL_BACKOFF_CAP: Duration = Duration::from_millis(50);
 /// Stream/node/group/hash overhead was measured at ~22% of payload; Redis
 /// `maxmemory` must be at least 13/10 of the payload budget at setup.
 const MAXMEMORY_NUMERATOR: u128 = 13;
@@ -42,7 +40,7 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
-fn redis_error(e: redis::RedisError) -> Error {
+pub(crate) fn redis_error(e: redis::RedisError) -> Error {
     if e.code() == Some("OOM") {
         Error::Resource
     } else if e.code() == Some("REPLAY") {
@@ -111,6 +109,13 @@ pub struct Config {
     pub command_timeout_ms: u64,
     pub max_entry_bytes: usize,
     pub max_queue_bytes: usize,
+    /// Publisher buffering only (1..=1024; 100 when absent). It never changes
+    /// delivered content, so it is not part of the `initial` wire record.
+    #[serde(default = "default_publish_batch_entries")]
+    pub publish_batch_entries: usize,
+}
+fn default_publish_batch_entries() -> usize {
+    DEFAULT_BATCH_ENTRIES
 }
 pub fn integer(s: &str) -> Result<u64> {
     if s.is_empty() || (s.len() > 1 && s.starts_with('0')) || !s.bytes().all(|b| b.is_ascii_digit())
@@ -147,6 +152,7 @@ impl Config {
             || self.max_entry_bytes == 0
             || self.max_queue_bytes < self.max_entry_bytes
             || self.max_queue_bytes > 1_000_000_000
+            || !(MIN_BATCH_ENTRIES..=MAX_BATCH_ENTRIES).contains(&self.publish_batch_entries)
         {
             return Err(Error::Protocol("configuration".into()));
         }
@@ -220,206 +226,119 @@ impl Config {
     }
 }
 
-/// Diagnostic totals for queue-full waiting. Not persisted or part of the wire.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct QueueWaits {
-    /// Number of `FULL` replies received across all publishes.
-    pub full_replies: u64,
-    /// Total time spent sleeping before retrying a `FULL` publish.
-    pub waited: Duration,
-}
-
 /// Owns both the risk lifecycle and publication sequence. Terminal cannot be
 /// supplied by callers, nor can a risk cut from a different engine be inserted.
-pub struct Publisher {
+/// Every stream-backend write goes through the `PublishBuffer`; the backend is
+/// the `StreamSink` adapter `S` (Redis by default).
+pub struct Publisher<S: StreamSink = RedisSink> {
     config: Config,
     engine: Option<RiskEngine>,
-    connection: redis::Connection,
-    script: redis::Script,
+    buffer: PublishBuffer<S>,
     sequence: u64,
     poisoned: bool,
     terminal: bool,
-    waits: QueueWaits,
 }
-impl Publisher {
+fn risk_engine(config: &Config, limits: RiskLimits) -> Result<RiskEngine> {
+    let policy = match config.lower_bound.as_str() {
+        "clip" => LowerBoundPolicy::Clip,
+        "expand_to_window_start" => LowerBoundPolicy::ExpandToWindowStart,
+        "require_window_boundary" => LowerBoundPolicy::RequireWindowBoundary,
+        _ => return Err(Error::Protocol("lower_bound".into())),
+    };
+    let inputs = config
+        .inputs
+        .iter()
+        .map(|i| PinnedDerivative {
+            directory: i.directory.clone(),
+            pin: DerivativePin {
+                derivative_address: i.derivative_address.clone(),
+                receipt_sha256: i.receipt_sha256,
+            },
+        })
+        .collect();
+    RiskEngine::open(
+        inputs,
+        integer(&config.start_ns)?,
+        integer(&config.end_ns)?,
+        policy,
+        config.plans.iter().map(Plan::risk).collect::<Result<_>>()?,
+        limits,
+    )
+    .map_err(Error::Risk)
+}
+impl Publisher<RedisSink> {
+    /// Validates, opens Risk, connects and checks Redis, then creates the
+    /// attempt keys and publishes `initial` before returning (the CLI writes
+    /// its readiness file only afterwards).
     pub fn open(url: &str, config: Config, limits: RiskLimits) -> Result<Self> {
         config.validate()?;
-        let policy = match config.lower_bound.as_str() {
-            "clip" => LowerBoundPolicy::Clip,
-            "expand_to_window_start" => LowerBoundPolicy::ExpandToWindowStart,
-            "require_window_boundary" => LowerBoundPolicy::RequireWindowBoundary,
-            _ => return Err(Error::Protocol("lower_bound".into())),
-        };
-        let inputs = config
-            .inputs
-            .iter()
-            .map(|i| PinnedDerivative {
-                directory: i.directory.clone(),
-                pin: DerivativePin {
-                    derivative_address: i.derivative_address.clone(),
-                    receipt_sha256: i.receipt_sha256,
-                },
-            })
-            .collect();
-        let engine = RiskEngine::open(
-            inputs,
-            integer(&config.start_ns)?,
-            integer(&config.end_ns)?,
-            policy,
-            config.plans.iter().map(Plan::risk).collect::<Result<_>>()?,
-            limits,
-        )
-        .map_err(Error::Risk)?;
-        let timeout = Duration::from_millis(config.command_timeout_ms);
-        let mut connection = redis::Client::open(url)
-            .map_err(redis_error)?
-            .get_connection_with_timeout(timeout)
-            .map_err(redis_error)?;
-        connection
-            .set_read_timeout(Some(timeout))
-            .map_err(redis_error)?;
-        connection
-            .set_write_timeout(Some(timeout))
-            .map_err(redis_error)?;
-        let info: String = redis::cmd("INFO")
-            .arg("server")
-            .query(&mut connection)
-            .map_err(redis_error)?;
-        let version = info
-            .lines()
-            .find_map(|l| l.strip_prefix("redis_version:"))
-            .unwrap_or("");
-        let parts: Vec<u64> = version
-            .trim()
-            .split('.')
-            .take(2)
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let settings: BTreeMap<String, String> = redis::cmd("CONFIG")
-            .arg("GET")
-            .arg("maxmemory")
-            .arg("maxmemory-policy")
-            .query(&mut connection)
-            .map_err(redis_error)?;
-        let maxmemory = settings
-            .get("maxmemory")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if parts.len() != 2
-            || (parts[0], parts[1]) < (8, 2)
-            || settings.get("maxmemory-policy").map(String::as_str) != Some("noeviction")
-            || maxmemory == 0
-        {
-            return Err(Error::Protocol(
-                "Redis >=8.2 with maxmemory and noeviction required".into(),
-            ));
-        }
-        // Waiting on a full queue is only safe if the queue itself cannot drive
-        // Redis into OOM. A deterministic deployment mismatch: never retried.
-        if !maxmemory_fits_queue(maxmemory, config.max_queue_bytes) {
-            return Err(Error::Protocol(format!(
-                "Redis maxmemory {maxmemory} is below 13/10 of max_queue_bytes {}",
-                config.max_queue_bytes
-            )));
-        }
+        let engine = risk_engine(&config, limits)?;
+        let sink = RedisSink::connect(url, &config)?;
+        Self::start(config, engine, sink)
+    }
+}
+impl<S: StreamSink> Publisher<S> {
+    /// The same lifecycle as `open` over any stream backend adapter.
+    pub fn with_sink(sink: S, config: Config, limits: RiskLimits) -> Result<Self> {
+        config.validate()?;
+        let engine = risk_engine(&config, limits)?;
+        Self::start(config, engine, sink)
+    }
+    fn start(config: Config, engine: RiskEngine, sink: S) -> Result<Self> {
+        let buffer = PublishBuffer::new(
+            sink,
+            config.publish_batch_entries,
+            config.max_entry_bytes,
+            config.max_queue_bytes,
+        );
         let mut p = Self {
             config,
             engine: Some(engine),
-            connection,
-            script: redis::Script::new(SCRIPT),
+            buffer,
             sequence: 0,
             poisoned: false,
             terminal: false,
-            waits: QueueWaits::default(),
         };
-        let setup = p.eval::<String>(&[
-            "setup".into(),
-            serde_json::to_string(&p.config.groups).unwrap(),
-            p.config.max_queue_bytes.to_string(),
-            p.config.max_entry_bytes.to_string(),
-        ]);
-        setup?;
+        let groups = p.config.groups.clone();
+        let (entry, queue) = (p.config.max_entry_bytes, p.config.max_queue_bytes);
+        p.buffer.sink_mut().setup(&groups, entry, queue)?;
+        // Initial must be visible before readiness: insert, then drain fully.
         let initial = p.config.initial();
-        p.publish("initial", initial, "-1")?;
-        Ok(p)
-    }
-    fn eval<T: redis::FromRedisValue>(&mut self, args: &[String]) -> Result<T> {
-        let result = redis::cmd("EVALSHA")
-            .arg(self.script.get_hash())
-            .arg(2)
-            .arg(&self.config.keys())
-            .arg(args)
-            .query(&mut self.connection);
-        match result {
-            Err(e) if e.kind() == redis::ErrorKind::NoScriptError => {
-                // NOSCRIPT guarantees no execution. All ambiguous failures stay fatal.
-                redis::cmd("EVAL")
-                    .arg(SCRIPT)
-                    .arg(2)
-                    .arg(&self.config.keys())
-                    .arg(args)
-                    .query(&mut self.connection)
-                    .map_err(redis_error)
-            }
-            other => other.map_err(redis_error),
+        let published = p
+            .insert("initial", initial)
+            .and_then(|()| p.buffer.flush());
+        if published.is_err() {
+            p.poison();
         }
+        published?;
+        Ok(p)
     }
     fn poison(&mut self) {
         self.poisoned = true;
         // Best effort only; supervisor must also regard local failure as fatal.
-        let _: redis::RedisResult<()> = redis::cmd("HSET")
-            .arg(&self.config.keys()[1])
-            .arg("poisoned")
-            .arg("1")
-            .query(&mut self.connection);
+        self.buffer.sink_mut().poison();
     }
-    fn publish(&mut self, kind: &str, body: Value, previous: &str) -> Result<()> {
+    fn insert(&mut self, kind: &str, body: Value) -> Result<()> {
         let record = self.record(kind, body);
-        let bytes = serde_json::to_string(&record).unwrap();
-        if bytes.len() > self.config.max_entry_bytes {
-            self.poison();
-            return Err(Error::Resource);
-        }
-        // Redis IDs start at 1; wire sequences start at 0 (initial).
-        let args = [
-            "publish".into(),
-            previous.into(),
-            (self.sequence + 1).to_string(),
-            bytes,
-            if kind == "terminal" { "1" } else { "0" }.into(),
-        ];
-        // `FULL` wrote nothing, so the identical command is retried with the
-        // same sequence and previous value. Every error reply still poisons.
-        let mut backoff = FULL_BACKOFF_START;
-        loop {
-            match self.eval::<String>(&args) {
-                Ok(reply) if reply == "OK" => return Ok(()),
-                Ok(reply) if reply == "FULL" => {
-                    self.waits.full_replies += 1;
-                    let started = Instant::now();
-                    std::thread::sleep(backoff);
-                    self.waits.waited += started.elapsed();
-                    backoff = (backoff * 2).min(FULL_BACKOFF_CAP);
-                }
-                Ok(_) => {
-                    self.poison();
-                    return Err(Error::Protocol("publish reply".into()));
-                }
-                Err(error) => {
-                    self.poison();
-                    return Err(error);
-                }
-            }
-        }
+        self.buffer.insert(Entry {
+            sequence: self.sequence,
+            record: serde_json::to_string(&record).unwrap(),
+            terminal: kind == "terminal",
+        })
     }
-    /// Totals of queue-full replies and backoff sleep so far.
+    /// Totals of queue-full waits and backoff sleep so far.
     pub fn queue_waits(&self) -> QueueWaits {
-        self.waits
+        self.buffer.stats().waits
+    }
+    /// Queue waits plus append calls and entries written so far.
+    pub fn publish_stats(&self) -> PublishStats {
+        self.buffer.stats()
     }
     fn record(&self, kind: &str, body: Value) -> Value {
         json!({"version":"1","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
     }
-    /// Publishes one cut, or EOF terminal. Returns false only after terminal.
+    /// Buffers one cut, or EOF terminal. Returns false only after terminal,
+    /// and only once every buffered entry, terminal included, is appended.
     pub fn step(&mut self) -> Result<bool> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -440,24 +359,20 @@ impl Publisher {
             .unwrap()
             .next_cut()
             .map_err(Error::Risk)?;
-        let previous = (self.sequence + 1).to_string();
         self.sequence = self.sequence.checked_add(1).ok_or(Error::Resource)?;
         if let Some(cut) = cut {
             if cut.sequence() != self.sequence {
                 return Err(Error::Protocol("risk sequence".into()));
             }
-            self.publish("cut", wire::cut(&cut), &previous)?;
+            self.insert("cut", wire::cut(&cut))?;
             Ok(true)
         } else {
             let engine = self.engine.take().unwrap();
             // Read-only view of final Risk books, taken before finish consumes it.
             let books_sha256 = wire::books_sha256(&engine);
             let finished = engine.finish().map_err(Error::Risk)?;
-            self.publish(
-                "terminal",
-                wire::terminal(finished.cuts(), books_sha256),
-                &previous,
-            )?;
+            self.insert("terminal", wire::terminal(finished.cuts(), books_sha256))?;
+            self.buffer.flush()?;
             self.terminal = true;
             Ok(false)
         }
@@ -467,7 +382,7 @@ impl Publisher {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        let result = self.eval(&["check".into()]);
+        let result = self.buffer.sink_mut().progress();
         if result.is_err() {
             self.poison();
         }

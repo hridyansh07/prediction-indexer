@@ -1,5 +1,5 @@
 {
-  "replay_runner_config_version": 2,
+  "replay_runner_config_version": 3,
   "universe_base_url": "http://event-universe:8080",
   "scope": "jobs",
   "canonical_window_seconds": 1800,
@@ -23,6 +23,7 @@
       "max_entry_bytes": 1048576,
       "max_queue_bytes": 67108864,
       "command_timeout_ms": 5000,
+      "publish_batch_entries": 100,
       "attempts": 3,
       "no_progress": 2,
       "progress_margin": 100,

@@ -222,10 +222,19 @@ def validate(config):
     require(config["version"] == 1)
     for name in ("publisher", "python"):
         require(type(config[name]) is str and Path(config[name]).is_absolute())
-    t = obj(
-        config["transport"],
-        "run_id scope normalizer inputs start_ns end_ns lower_bound plans groups command_timeout_ms max_entry_bytes max_queue_bytes",
-    )
+    fields = "run_id scope normalizer inputs start_ns end_ns lower_bound plans groups command_timeout_ms max_entry_bytes max_queue_bytes"
+    # Optional publisher buffering size: absent means the publisher default of
+    # 100, so run.json written before the field existed still validates. It
+    # never reaches the initial record; run identity hashes it like any field.
+    if type(config["transport"]) is dict and "publish_batch_entries" in config["transport"]:
+        fields += " publish_batch_entries"
+    t = obj(config["transport"], fields)
+    if "publish_batch_entries" in t:
+        batch = t["publish_batch_entries"]
+        require(
+            type(batch) is int and 1 <= batch <= 1024,
+            "publish_batch_entries must be 1-1024",
+        )
     for s in [t["run_id"], t["scope"], *t["groups"]]:
         require(
             type(s) is str and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", s) is not None

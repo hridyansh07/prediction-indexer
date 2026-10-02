@@ -127,6 +127,7 @@ fn config(f: &Fixture) -> Config {
         command_timeout_ms: 1000,
         max_entry_bytes: 65536,
         max_queue_bytes: 1_048_576,
+        publish_batch_entries: 100,
     }
 }
 fn records(f: &Fixture, c: &Config) -> Vec<Value> {
@@ -306,6 +307,33 @@ fn publisher_preflight_binds_descriptor_config_venues_scales_and_profile() {
         let error = invalid.validate().unwrap_err().to_string();
         assert!(error.contains(name), "{name}: {error}");
     }
+}
+
+#[test]
+fn publish_batch_entries_is_bounded_defaulted_and_not_on_the_wire() {
+    let f = fixture();
+    let base = config(&f);
+    for (batch, valid) in [(0, false), (1, true), (100, true), (1024, true), (1025, false)] {
+        let mut c = base.clone();
+        c.publish_batch_entries = batch;
+        match c.validate() {
+            Ok(()) => assert!(valid, "{batch} admitted"),
+            Err(replay_transport::Error::Protocol(message)) => {
+                assert!(!valid, "{batch}: {message}");
+                assert_eq!(message, "configuration");
+            }
+            Err(other) => panic!("{batch}: {other:?}"),
+        }
+        // Buffering never changes delivered content: initial is identical.
+        assert_eq!(c.initial(), base.initial());
+    }
+    let mut value = serde_json::to_value(&base).unwrap();
+    assert_eq!(value["publish_batch_entries"], json!(100));
+    value.as_object_mut().unwrap().remove("publish_batch_entries");
+    let parsed: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(parsed.publish_batch_entries, 100);
+    value["publish_batch"] = json!(5);
+    assert!(serde_json::from_value::<Config>(value).is_err());
 }
 
 #[test]
@@ -518,6 +546,8 @@ fn redis_publisher_resource_timeout_oom_and_no_terminal_after_failure() {
         let mut c = config(&f);
         c.attempt_id = format!("{}-{}", failure, std::process::id());
         c.command_timeout_ms = 50;
+        // One entry per append, so each step reaches Redis immediately.
+        c.publish_batch_entries = 1;
         let keys = c.keys();
         let limits = RiskLimits {
             max_levels_per_book: if failure == "risk" { 1 } else { 100_000 },
@@ -728,9 +758,20 @@ fn state_field(admin: &mut redis::Connection, key: &str, field: &str) -> String 
 #[ignore = "requires explicitly supplied disposable Redis >=8.2; run with --test-threads=1"]
 fn redis_publisher_waits_on_full_queue_then_completes_in_order() {
     let url = std::env::var("REPLAY_REDIS_URL").expect("disposable REPLAY_REDIS_URL required");
+    // Batch 1 appends per entry, 2 drains mid-stream at the batch and at its
+    // hard capacity of 3, and 100 buffers everything until the terminal flush.
+    // Every size must append the same longest prefix and then wait.
+    for batch in [1, 2, 100] {
+        full_queue_case(&url, batch);
+    }
+}
+
+fn full_queue_case(url: &str, batch: usize) {
+    let url = url.to_string();
     let f = fixture();
     let mut c = config(&f);
-    c.attempt_id = format!("full-{}", std::process::id());
+    c.attempt_id = format!("full-{batch}-{}", std::process::id());
+    c.publish_batch_entries = batch;
     // Entries are 0.2–5.6 KB: initial and the first two cuts fit, the third
     // cut does not, so with no consumer the publisher must wait at sequence 3.
     c.max_entry_bytes = 8192;
@@ -868,6 +909,17 @@ fn redis_publisher_waits_on_full_queue_then_completes_in_order() {
         .expect("queue wait summary line");
     assert!(waits > 0, "{stderr}");
     assert!(stderr.contains(" wait_ms="), "{stderr}");
+    let field = |name: &str| -> f64 {
+        stderr
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(name))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing: {stderr}"))
+    };
+    let (batches, mean) = (field("batches="), field("mean_batch_entries="));
+    assert!((1.0..=expected.len() as f64).contains(&batches), "{stderr}");
+    // Every entry was appended exactly once across the reported batches.
+    assert!((mean * batches - expected.len() as f64).abs() < 0.05 * batches, "{stderr}");
     let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
 }
 

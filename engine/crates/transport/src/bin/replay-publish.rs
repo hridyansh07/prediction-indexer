@@ -35,11 +35,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut publisher = Publisher::open(&url, config, replay_risk::RiskLimits::default())?;
     let result = publish(&mut publisher);
     // One diagnostic line on terminal or failure; never persisted or parsed.
-    let waits = publisher.queue_waits();
+    let stats = publisher.publish_stats();
+    let mean = if stats.batches == 0 {
+        0.0
+    } else {
+        stats.entries as f64 / stats.batches as f64
+    };
     eprintln!(
-        "replay-publish: queue_full_waits={} wait_ms={}",
-        waits.full_replies,
-        waits.waited.as_millis()
+        "replay-publish: queue_full_waits={} wait_ms={} batches={} mean_batch_entries={mean:.2}",
+        stats.waits.full_replies,
+        stats.waits.waited.as_millis(),
+        stats.batches,
     );
     result?;
     println!("terminal published; output remains provisional until all consumers complete");

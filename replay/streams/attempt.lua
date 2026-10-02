@@ -18,7 +18,7 @@ if op == 'setup' then
     return 'OK'
 end
 -- Fixed membership is verified only where a participant (re)enters or polls:
--- `join` and `check`. Publish and ACK rely on the trusted-server contract.
+-- `join` and `check`. Append and ACK rely on the trusted-server contract.
 local function membership(expected)
     local actual = redis.call('XINFO', 'GROUPS', stream)
     if #actual ~= #expected then return false end
@@ -33,25 +33,53 @@ local function membership(expected)
     end
     return true
 end
-if op == 'publish' then
+if op == 'append' then
+    -- ARGV: previous published entry sequence ('-1' before initial), first
+    -- entry sequence, terminal flag ('1' when the last entry is terminal),
+    -- then one or more contiguous encoded entries. Appends the longest prefix
+    -- that fits under the queue byte limit and returns its length; 0 is the
+    -- non-error FULL reply. Every check precedes every write.
+    local previous, first, last_terminal = ARGV[2], ARGV[3], ARGV[4]
+    local n = #ARGV - 4
     local s = redis.call('HMGET', state, 'poisoned', 'published', 'terminal', 'entry', 'bytes', 'limit')
+    -- Poisoned first, so a failed attempt still stops a waiting publisher.
     if s[1] ~= '0' then return fail('poisoned') end
-    if s[2] ~= ARGV[2] or s[3] ~= '' then return fail('sequence') end
-    local size = string.len(ARGV[4])
+    if n < 1 or s[2] ~= previous or s[3] ~= '' then return fail('sequence') end
+    local start = tonumber(first)
+    local expected = previous == '-1' and 1 or tonumber(previous) + 1
+    if not string.match(first, '^[1-9]%d*$') or start ~= expected then return fail('sequence') end
     -- An entry larger than the per-entry cap can never fit: fatal.
-    if size > tonumber(s[4]) then return fail('resource_limit') end
-    -- A full queue is not an error. Nothing is written; the publisher keeps the
-    -- same sequence and entry and retries after a bounded backoff. Poisoned is
-    -- checked first above, so a failed attempt still stops a waiting publisher.
-    if size + tonumber(s[5]) > tonumber(s[6]) then return 'FULL' end
-    redis.call('XADD', stream, ARGV[3] .. '-0', 'record', ARGV[4])
-    redis.call('HINCRBY', state, 'bytes', size)
-    if ARGV[5] == '1' then
-        redis.call('HSET', state, 'published', ARGV[3], 'size:' .. ARGV[3], size, 'terminal', ARGV[3])
-    else
-        redis.call('HSET', state, 'published', ARGV[3], 'size:' .. ARGV[3], size)
+    local cap, sizes = tonumber(s[4]), {}
+    for i=1,n do
+        sizes[i] = string.len(ARGV[4 + i])
+        if sizes[i] > cap then return fail('resource_limit') end
     end
-    return 'OK'
+    -- A full queue is not an error: append only the prefix that fits. The
+    -- publisher keeps the remainder and retries it, never dropping data.
+    local bytes, limit, k = tonumber(s[5]), tonumber(s[6]), 0
+    while k < n and bytes + sizes[k + 1] <= limit do
+        k = k + 1
+        bytes = bytes + sizes[k]
+    end
+    if k == 0 then return 0 end
+    local fields, total = {}, 0
+    for i=1,k do
+        local id = string.format('%d', start + i - 1)
+        redis.call('XADD', stream, id .. '-0', 'record', ARGV[4 + i])
+        fields[#fields + 1] = 'size:' .. id
+        fields[#fields + 1] = sizes[i]
+        total = total + sizes[i]
+    end
+    local last = string.format('%d', start + k - 1)
+    fields[#fields + 1] = 'published'
+    fields[#fields + 1] = last
+    if k == n and last_terminal == '1' then
+        fields[#fields + 1] = 'terminal'
+        fields[#fields + 1] = last
+    end
+    redis.call('HINCRBY', state, 'bytes', total)
+    redis.call('HSET', state, unpack(fields))
+    return k
 end
 if op == 'ack' then
     -- ARGV: group, previous done, last sequence, then ascending entry IDs.
