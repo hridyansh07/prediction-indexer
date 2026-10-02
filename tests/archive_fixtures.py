@@ -94,7 +94,9 @@ def write_canonical_receipt(
     inputs = list(inputs)
     window_end_ns = window_end_ns or window_start_ns + WINDOW_SECONDS * NANOSECONDS
     lines = sum(entry["line_count"] for entry in inputs) if evidence_lines is None else evidence_lines
-    expected_lanes = sorted({entry["lane"] for entry in inputs}) if expected_lanes is None else sorted(expected_lanes)
+    # `indexer-finalize` records expected lanes in its `--expect-lane` order, not
+    # sorted; an explicit list is kept as given so tests see production's shape.
+    expected_lanes = sorted({entry["lane"] for entry in inputs}) if expected_lanes is None else list(expected_lanes)
     missing_lanes = list(missing_lanes)
     moment = datetime.fromtimestamp(window_start_ns / NANOSECONDS, tz=timezone.utc)
     directory = (

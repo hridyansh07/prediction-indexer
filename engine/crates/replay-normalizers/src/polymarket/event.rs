@@ -48,7 +48,7 @@ impl Snapshot {
     fn validate(object: &Map<String, Value>, config: Config) -> Result<Self, Reject> {
         let (instrument, timestamp_ms) = Self::prefix(object, config)?;
         optional_price(object.get("tick_size"), config, &instrument)?;
-        optional_price(object.get("last_trade_price"), config, &instrument)?;
+        optional_last_trade_price(object.get("last_trade_price"), config, &instrument)?;
         optional_positive_quantity(object.get("min_order_size"), config, &instrument)?;
         if object
             .get("neg_risk")
@@ -132,10 +132,7 @@ impl AuditSnapshot {
             .required("neg_risk")?
             .as_bool()
             .ok_or_else(|| Reject::for_instrument("invalid_neg_risk", instrument.clone()))?;
-        object
-            .required("last_trade_price")?
-            .price(config.price_scale)
-            .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
+        last_trade_price(object.required("last_trade_price")?, config, &instrument)?;
         let hash = state_hash(object.required("hash")?)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
         let bids = levels(object.required("bids")?, config, &instrument)?;
@@ -442,6 +439,31 @@ fn optional_price(
             .price(config.price_scale)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
     }
+    Ok(())
+}
+
+fn optional_last_trade_price(
+    value: Option<&Value>,
+    config: Config,
+    instrument: &InstrumentId,
+) -> Result<(), Reject> {
+    match value {
+        Some(value) => last_trade_price(value, config, instrument),
+        None => Ok(()),
+    }
+}
+
+fn last_trade_price(
+    value: &Value,
+    config: Config,
+    instrument: &InstrumentId,
+) -> Result<(), Reject> {
+    if value.as_str() == Some("") {
+        return Ok(());
+    }
+    value
+        .price(config.price_scale)
+        .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
     Ok(())
 }
 

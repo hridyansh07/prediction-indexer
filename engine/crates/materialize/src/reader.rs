@@ -4,12 +4,16 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use replay_domain::{EventHeader, SegmentRecord};
+use replay_domain::{EventHeader, LaneId, SegmentRecord};
 use tempfile::TempDir;
 
-use crate::verify::{VerifiedLines, decode_receipt_document, inspect_contents, verify_data};
+use crate::verify::{
+    ReadMode, VerificationCounts, VerifiedLines, decode_receipt_document, inspect_contents,
+    parse_event, parse_reject, verify_counts, verify_disposition,
+};
 use crate::{
-    DerivativeManifest, DerivativePin, DerivativeReceipt, RejectDisposition, RejectRecord, Sha256,
+    CompressedOutput, DerivativeManifest, DerivativePin, DerivativeReceipt, RejectDisposition,
+    RejectRecord, Sha256,
 };
 
 #[derive(Clone, Debug)]
@@ -196,6 +200,13 @@ impl SourceDelivery {
     }
 }
 
+/// The single pass over one derivative. Each output is decoded once and each
+/// line parsed once; that one parsed record feeds every check. Per-line checks
+/// run as a line is read, per-delivery checks before its delivery is returned,
+/// and whole-window checks in `finish`. A delivery returned here is therefore
+/// checked as far as its own and its lookahead's lines go: a later violation
+/// fails the stream, and only `finish` proves the whole window. `mode` selects
+/// only whether byte identities are re-proved (see [`ReadMode`]).
 struct Deliveries {
     events: VerifiedLines,
     rejects: VerifiedLines,
@@ -204,6 +215,12 @@ struct Deliveries {
     reject: Option<(RejectRecord, u64)>,
     limits: ReadLimits,
     primed: bool,
+    manifest: DerivativeManifest,
+    counts: VerificationCounts,
+    previous_event: Option<(i64, u32)>,
+    previous_reject_seq: Option<i64>,
+    checks: DeliveryChecks,
+    mode: ReadMode,
 }
 
 impl Deliveries {
@@ -211,17 +228,20 @@ impl Deliveries {
         directory: &Path,
         manifest: &DerivativeManifest,
         limits: &ReadLimits,
+        mode: ReadMode,
     ) -> Result<Self, String> {
         Ok(Self {
             events: VerifiedLines::open_limit(
                 &directory.join("events.ndjson.zst"),
                 &manifest.events,
                 limits.max_line_bytes,
+                mode,
             )?,
             rejects: VerifiedLines::open_limit(
                 &directory.join("rejects.ndjson.zst"),
                 &manifest.rejects,
                 limits.max_line_bytes,
+                mode,
             )?,
             sources: manifest
                 .sources
@@ -231,6 +251,7 @@ impl Deliveries {
                         &directory.join(&output.file),
                         output,
                         limits.max_line_bytes,
+                        mode,
                     )
                 })
                 .transpose()?,
@@ -238,26 +259,38 @@ impl Deliveries {
             reject: None,
             limits: limits.clone(),
             primed: false,
+            manifest: manifest.clone(),
+            counts: VerificationCounts::default(),
+            previous_event: None,
+            previous_reject_seq: None,
+            checks: DeliveryChecks::default(),
+            mode,
         })
     }
     fn read_event(&mut self) -> Result<(), String> {
-        self.event = self
-            .events
-            .next_line()?
-            .map(|line| {
-                SegmentRecord::from_canonical_json(line)
-                    .map(|r| (r, line.len() as u64 + 1))
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?;
+        self.event = match self.events.next_line()? {
+            Some(line) => Some((
+                parse_event(line, &mut self.previous_event, &mut self.counts, self.mode)?,
+                line.len() as u64 + 1,
+            )),
+            None => None,
+        };
         Ok(())
     }
     fn read_reject(&mut self) -> Result<(), String> {
-        self.reject = self
-            .rejects
-            .next_line()?
-            .map(|line| RejectRecord::from_canonical_json(line).map(|r| (r, line.len() as u64 + 1)))
-            .transpose()?;
+        self.reject = match self.rejects.next_line()? {
+            Some(line) => Some((
+                parse_reject(
+                    line,
+                    &mut self.previous_reject_seq,
+                    &mut self.counts,
+                    &self.manifest,
+                    self.mode,
+                )?,
+                line.len() as u64 + 1,
+            )),
+            None => None,
+        };
         Ok(())
     }
     fn next(&mut self) -> Result<Option<SourceDelivery>, String> {
@@ -306,7 +339,12 @@ impl Deliveries {
             let bytes = sources
                 .next_line()?
                 .ok_or("missing source evidence record")?;
-            let source = crate::evidence::SourceEvidence::decode(bytes)?;
+            let canonical = self.mode == ReadMode::Audit;
+            #[cfg(test)]
+            if canonical {
+                crate::verify::probe::canonical_check();
+            }
+            let source = crate::evidence::SourceEvidence::decode(bytes, canonical)?;
             if source.header != delivery.header {
                 return Err("source evidence header disagrees with delivery".into());
             }
@@ -337,14 +375,15 @@ impl Deliveries {
             delivery.records.push(record);
             self.read_event()?;
         }
+        let mut reject = None;
         if reject_seq == Some(seq) {
-            let (reject, bytes) = self.reject.take().unwrap();
-            if reject.header() != &delivery.header {
+            let (record, bytes) = self.reject.take().unwrap();
+            if record.header() != &delivery.header {
                 return Err("reject source header disagrees with delivery".into());
             }
             if let Some(epoch) = delivery.connection_epoch() {
                 let view =
-                    indexer_types::EnvelopeView::parse(reject.canonical_envelope().as_bytes())
+                    indexer_types::EnvelopeView::parse(record.canonical_envelope().as_bytes())
                         .map_err(|e| e.to_string())?;
                 if epoch != view.connection_epoch.as_str() {
                     return Err("source connection epoch disagrees with reject envelope".into());
@@ -356,17 +395,27 @@ impl Deliveries {
                 self.limits.max_group_bytes,
             )?;
             add_size(&mut delivery.record_count, 1, self.limits.max_group_records)?;
-            delivery.disposition = Some(reject.disposition().clone());
             self.read_reject()?;
+            reject = Some(record);
         }
+        verify_disposition(&delivery.records, reject.as_ref(), &mut self.counts)?;
+        delivery.disposition = reject.map(|record| record.disposition().clone());
+        self.checks
+            .observe(&delivery, &self.manifest, &self.limits)?;
         Ok(Some(delivery))
     }
+    /// The whole-window checks, valid only after `next` returned `None`: both
+    /// frames' EOF and identities, line counts, the final tie run, coverage
+    /// agreement, and the source sidecar's own EOF and identities.
     fn finish(self) -> Result<(), String> {
         self.events.finish()?;
+        self.rejects.finish()?;
+        verify_counts(&self.counts, &self.manifest)?;
+        self.checks.finish(&self.manifest)?;
         if let Some(sources) = self.sources {
             sources.finish()?;
         }
-        self.rejects.finish()
+        Ok(())
     }
 }
 
@@ -387,40 +436,59 @@ pub fn add_size(total: &mut u64, amount: u64, maximum: u64) -> Result<(), String
     Ok(())
 }
 
-pub(crate) fn verify_deliveries(
+/// Drains one derivative through the single pass: a full verdict in `mode`.
+pub(crate) fn verify_stream(
     directory: &Path,
     manifest: &DerivativeManifest,
     limits: &ReadLimits,
+    mode: ReadMode,
 ) -> Result<(), String> {
-    let mut stream = Deliveries::open(directory, manifest, limits)?;
-    let mut previous: Option<EventHeader> = None;
-    let mut first_seq = None;
-    let mut run_first: Option<EventHeader> = None;
-    let mut cross_lane = false;
-    let mut run_bytes = 0;
-    let mut run_records = 0;
-    let mut lane_deliveries = BTreeMap::new();
-    let mut lane_counts = BTreeMap::new();
-    let mut first_visible = BTreeMap::new();
-    let mut lane_bytes = 0;
-    while let Some(delivery) = stream.next()? {
+    let mut stream = Deliveries::open(directory, manifest, limits, mode)?;
+    while stream.next()?.is_some() {}
+    stream.finish()
+}
+
+/// Source-level ordering, window, lane, tie and coverage checks, kept as scalar
+/// state across deliveries. Same-lane equal-time runs are not buffered.
+#[derive(Default)]
+struct DeliveryChecks {
+    previous: Option<EventHeader>,
+    first_seq: Option<i64>,
+    run_first: Option<EventHeader>,
+    cross_lane: bool,
+    run_bytes: u64,
+    run_records: u64,
+    lane_deliveries: BTreeMap<LaneId, u64>,
+    lane_counts: BTreeMap<LaneId, u64>,
+    first_visible: BTreeMap<LaneId, u64>,
+    lane_bytes: u64,
+}
+
+impl DeliveryChecks {
+    fn observe(
+        &mut self,
+        delivery: &SourceDelivery,
+        manifest: &DerivativeManifest,
+        limits: &ReadLimits,
+    ) -> Result<(), String> {
         let h = delivery.header();
-        first_seq.get_or_insert(h.address().canonical_seq());
+        self.first_seq.get_or_insert(h.address().canonical_seq());
         let lane = h.address().lane();
-        let count = lane_counts.entry(lane.clone()).or_insert(0u64);
+        let count = self.lane_counts.entry(lane.clone()).or_insert(0u64);
         *count = count.checked_add(1).ok_or("source lane count overflow")?;
-        if !lane_deliveries.contains_key(lane) {
-            if lane_deliveries.len() == limits.max_lanes {
+        if !self.lane_deliveries.contains_key(lane) {
+            if self.lane_deliveries.len() == limits.max_lanes {
                 return Err("lane count exceeds read limit".into());
             }
-            first_visible.insert(lane.clone(), h.visible_ns());
+            self.first_visible.insert(lane.clone(), h.visible_ns());
             add_size(
-                &mut lane_bytes,
+                &mut self.lane_bytes,
                 lane.as_str().len() as u64,
                 limits.max_metadata_bytes,
             )?;
         }
-        if lane_deliveries
+        if self
+            .lane_deliveries
             .insert(lane.clone(), h.address().delivery_index())
             .is_some_and(|previous| previous >= h.address().delivery_index())
         {
@@ -431,7 +499,7 @@ pub(crate) fn verify_deliveries(
         {
             return Err("source timestamp outside derivative window".into());
         }
-        if let Some(p) = &previous {
+        if let Some(p) = &self.previous {
             if p.address().canonical_seq().checked_add(1) != Some(h.address().canonical_seq()) {
                 return Err("source canonical sequence is not dense".into());
             }
@@ -439,77 +507,88 @@ pub(crate) fn verify_deliveries(
                 return Err("source timestamps decrease".into());
             }
         }
-        if run_first
+        if self
+            .run_first
             .as_ref()
             .is_some_and(|first| first.visible_ns() != h.visible_ns())
         {
-            validate_tie(run_first.as_ref().unwrap(), cross_lane)?;
-            run_first = None;
+            validate_tie(self.run_first.as_ref().unwrap(), self.cross_lane)?;
+            self.run_first = None;
         }
-        if let Some(first) = &run_first {
+        if let Some(first) = &self.run_first {
             if first.visible_tie_group() != h.visible_tie_group() {
                 return Err("inconsistent equal-time tie tags".into());
             }
-            cross_lane |= first.address().lane() != h.address().lane();
+            self.cross_lane |= first.address().lane() != h.address().lane();
+            // A run that is already cross-lane can only be valid tagged with its
+            // time. Failing now, not at the run's end, stops a streaming walker
+            // from releasing an untagged member before its second lane is seen.
+            if self.cross_lane {
+                validate_tie(first, true)?;
+            }
         } else {
-            run_first = Some(h.clone());
-            cross_lane = false;
-            run_bytes = 0;
-            run_records = 0;
+            self.run_first = Some(h.clone());
+            self.cross_lane = false;
+            self.run_bytes = 0;
+            self.run_records = 0;
         }
         if h.visible_tie_group().is_some() {
             add_size(
-                &mut run_bytes,
+                &mut self.run_bytes,
                 delivery.logical_bytes,
                 limits.max_group_bytes,
             )?;
             add_size(
-                &mut run_records,
+                &mut self.run_records,
                 delivery.record_count,
                 limits.max_group_records,
             )?;
         }
-        previous = Some(h.clone());
+        self.previous = Some(h.clone());
+        Ok(())
     }
-    if let Some(first) = &run_first {
-        validate_tie(first, cross_lane)?;
-    }
-    if manifest.source_receipt.document.is_some() {
-        let coverage = crate::CoverageEvidence::from_source(&manifest.source_receipt)?;
-        if coverage.sequence()
-            != (
-                first_seq,
-                previous.as_ref().map(|h| h.address().canonical_seq()),
-            )
-        {
-            return Err("source sequence disagrees with coverage".into());
+
+    fn finish(mut self, manifest: &DerivativeManifest) -> Result<(), String> {
+        if let Some(first) = &self.run_first {
+            validate_tie(first, self.cross_lane)?;
         }
-        if coverage.records() != manifest.counts.input_records {
-            return Err("source coverage count disagrees with derivative".into());
-        }
-        for (lane, status) in coverage.lanes() {
-            if let crate::LaneState::Present { records } = status.state {
-                if lane_counts.remove(lane).unwrap_or(0) != records {
-                    return Err("source lane count disagrees with coverage".into());
-                }
-            }
-        }
-        if !lane_counts.is_empty() {
-            return Err("source delivery from excluded lane".into());
-        }
-        for fault in coverage.faults() {
-            if let crate::SourceFaultReason::VisibleClockRegression {
-                observed_visible_ns,
-                ..
-            } = fault.reason
+        if manifest.source_receipt.document.is_some() {
+            let coverage = crate::CoverageEvidence::from_source(&manifest.source_receipt)?;
+            if coverage.sequence()
+                != (
+                    self.first_seq,
+                    self.previous.as_ref().map(|h| h.address().canonical_seq()),
+                )
             {
-                if first_visible.get(&fault.lane) != Some(&observed_visible_ns) {
-                    return Err("source clock diagnosis disagrees with first delivery".into());
+                return Err("source sequence disagrees with coverage".into());
+            }
+            if coverage.records() != manifest.counts.input_records {
+                return Err("source coverage count disagrees with derivative".into());
+            }
+            for (lane, status) in coverage.lanes() {
+                if let crate::LaneState::Present { records } = status.state {
+                    if self.lane_counts.remove(lane).unwrap_or(0) != records {
+                        return Err("source lane count disagrees with coverage".into());
+                    }
+                }
+            }
+            if !self.lane_counts.is_empty() {
+                return Err("source delivery from excluded lane".into());
+            }
+            for fault in coverage.faults() {
+                if let crate::SourceFaultReason::VisibleClockRegression {
+                    observed_visible_ns,
+                    ..
+                } = fault.reason
+                {
+                    if self.first_visible.get(&fault.lane) != Some(&observed_visible_ns) {
+                        return Err("source clock diagnosis disagrees with first delivery".into());
+                    }
                 }
             }
         }
+        Ok(())
     }
-    stream.finish()
 }
 
 fn validate_tie(first: &EventHeader, cross_lane: bool) -> Result<(), String> {
@@ -579,29 +658,27 @@ pub(crate) fn open_pinned_with_checkpoint(
         std::fs::set_permissions(snapshot.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
+    // The installed directory's exact bytes were bound to this pin by SHA-256
+    // at install, and the receipt and manifest were just re-bound to it by
+    // SHA-256 above. The copy re-proves only each data file's exact stored
+    // length; the structural decode re-proves frame, checksum, length and LF
+    // count. Data bytes are not re-hashed on this hot path.
     for output in metadata.manifest.outputs() {
-        let source = File::open(input.directory.join(&output.file)).map_err(|e| e.to_string())?;
-        let mut sink =
-            File::create(snapshot.path().join(&output.file)).map_err(|e| e.to_string())?;
-        let count = std::io::copy(
-            &mut source.take(
-                output
-                    .stored
-                    .byte_length
-                    .checked_add(1)
-                    .ok_or("stored length overflow")?,
-            ),
-            &mut sink,
-        )
-        .map_err(|e| e.to_string())?;
-        if count != output.stored.byte_length {
-            return Err("snapshot stored length mismatch".into());
-        }
-        sink.flush().map_err(|e| e.to_string())?;
+        copy_bound(
+            &input.directory.join(&output.file),
+            &snapshot.path().join(&output.file),
+            output,
+        )?;
     }
     checkpoint(ReadCheckpoint::SnapshotCopied, snapshot.path());
-    verify_data(snapshot.path(), &metadata.manifest, limits)?;
-    let stream = Deliveries::open(snapshot.path(), &metadata.manifest, limits)?;
+    // No verification pass runs here: every semantic check runs once, while
+    // the caller traverses, and only a clean, fully checked EOF can finish.
+    let stream = Deliveries::open(
+        snapshot.path(),
+        &metadata.manifest,
+        limits,
+        ReadMode::PinnedReplay,
+    )?;
     checkpoint(ReadCheckpoint::ReaderOpened, snapshot.path());
     Ok(VerifiedWindowReader {
         stream: Some(stream),
@@ -610,6 +687,35 @@ pub(crate) fn open_pinned_with_checkpoint(
         poisoned: false,
         exhausted: false,
     })
+}
+
+/// Copies one stored output into the private snapshot, bounded by and checked
+/// against the receipt's exact stored length (with an extra-byte check). It
+/// computes no digest: the pin's install-time SHA-256 binding covers content.
+fn copy_bound(source: &Path, target: &Path, output: &CompressedOutput) -> Result<(), String> {
+    let limit = output
+        .stored
+        .byte_length
+        .checked_add(1)
+        .ok_or("stored length overflow")?;
+    let mut source = File::open(source).map_err(|e| e.to_string())?.take(limit);
+    let mut sink = File::create(target).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut count = 0u64;
+    loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        sink.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+        count += read as u64;
+    }
+    if count != output.stored.byte_length {
+        return Err("snapshot stored length mismatch".into());
+    }
+    sink.flush().map_err(|e| e.to_string())
 }
 
 impl VerifiedWindowReader {

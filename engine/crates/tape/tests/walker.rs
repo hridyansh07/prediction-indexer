@@ -292,6 +292,45 @@ fn drain(mut walker: DerivativeWalker) -> (Vec<AtomicGroup>, Vec<WindowStatus>, 
     (groups, statuses, walker.finish().unwrap())
 }
 
+/// Drains a walk that must fail. Verification streams with traversal, so a
+/// window status and earlier groups may precede the error; the error must
+/// poison the walker, and no completion capability can be minted.
+fn fails_without_completion(mut walker: DerivativeWalker) -> (Vec<AtomicGroup>, String) {
+    let mut groups = vec![];
+    let error = loop {
+        match walker.next_item() {
+            Ok(Some(WalkItem::Group(group))) => groups.push(group),
+            Ok(Some(WalkItem::WindowStatus(_))) => {}
+            Ok(None) => panic!("corrupt walk reached clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        walker.next_item().unwrap_err(),
+        "derivative walker is poisoned"
+    );
+    assert!(walker.finish().is_err());
+    (groups, error)
+}
+
+/// The reader-level form: open may fail, or reading may fail after a prefix,
+/// but a corrupt window never reaches clean EOF or a finished capability.
+fn read_fails_without_completion(input: &PinnedDerivative) -> String {
+    let mut reader = match open_pinned(input, &ReadLimits::default()) {
+        Ok(reader) => reader,
+        Err(error) => return error,
+    };
+    let error = loop {
+        match reader.next_delivery() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("corrupt window reached clean EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert!(reader.finish().is_err());
+    error
+}
+
 #[test]
 fn multi_window_ties_orientation_ignored_rejected_and_empty_coverage() {
     let canonical_root = TempDir::new("source").unwrap();
@@ -577,8 +616,9 @@ fn limits_apply_before_filtering_and_same_lane_equal_times_do_not_buffer_a_run()
             ..ReadLimits::default()
         },
     ] {
-        let mut walker = DerivativeWalker::open(vec![input.clone()], req.clone(), limits).unwrap();
-        assert!(walker.next_item().is_err());
+        let walker = DerivativeWalker::open(vec![input.clone()], req.clone(), limits).unwrap();
+        let (groups, _) = fails_without_completion(walker);
+        assert!(groups.is_empty());
     }
     let (groups, _, _) =
         drain(DerivativeWalker::open(vec![input], request(0, 10), ReadLimits::default()).unwrap());
@@ -707,9 +747,7 @@ fn one_composite_derivative_keeps_all_three_venues_and_native_books() {
 // accidentally pass merely because the compressed digest no longer matches.
 fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut String)) {
     use std::io::Read;
-    let mut receipt: replay_materialize::DerivativeReceipt =
-        serde_json::from_slice(&fs::read(input.directory.join("receipt.json")).unwrap()).unwrap();
-    let mut manifest: replay_materialize::DerivativeManifest =
+    let manifest: replay_materialize::DerivativeManifest =
         serde_json::from_slice(&fs::read(input.directory.join("manifest.json")).unwrap()).unwrap();
     let object = match file {
         "events.ndjson.zst" => &manifest.events,
@@ -737,26 +775,41 @@ fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut St
     decoder.read_to_string(&mut text).unwrap();
     decoder.finish().unwrap();
     change(&mut text);
-    let result = encode_stream(
-        Cursor::new(text),
-        fs::File::create(input.directory.join(file)).unwrap(),
-        3,
-    )
-    .unwrap();
+    let mut stored = Vec::new();
+    let result = encode_stream(Cursor::new(text), &mut stored, 3).unwrap();
+    let logical = replay_materialize::LogicalIdentity {
+        sha256: Sha256::from_hex(&result.logical.sha256).unwrap(),
+        byte_length: result.logical.byte_length,
+        line_count: result.logical.line_count,
+    };
+    rebind(input, file, &stored, Some(logical));
+}
+
+/// Writes `stored` as one output and rebinds its stored identity (and logical
+/// identity when given) in manifest, receipt, and the caller's pin.
+fn rebind(
+    input: &mut PinnedDerivative,
+    file: &str,
+    stored: &[u8],
+    logical: Option<replay_materialize::LogicalIdentity>,
+) {
+    let mut receipt: replay_materialize::DerivativeReceipt =
+        serde_json::from_slice(&fs::read(input.directory.join("receipt.json")).unwrap()).unwrap();
+    let mut manifest: replay_materialize::DerivativeManifest =
+        serde_json::from_slice(&fs::read(input.directory.join("manifest.json")).unwrap()).unwrap();
+    fs::write(input.directory.join(file), stored).unwrap();
     let object = match file {
         "events.ndjson.zst" => &mut manifest.events,
         "rejects.ndjson.zst" => &mut manifest.rejects,
         "sources.ndjson.zst" => manifest.sources.as_mut().unwrap(),
         _ => panic!("unknown output"),
     };
-    object.logical = replay_materialize::LogicalIdentity {
-        sha256: Sha256::from_hex(&result.logical.sha256).unwrap(),
-        byte_length: result.logical.byte_length,
-        line_count: result.logical.line_count,
-    };
+    if let Some(logical) = logical {
+        object.logical = logical;
+    }
     object.stored = replay_materialize::StoredIdentity {
-        sha256: Sha256::from_hex(&result.stored.sha256).unwrap(),
-        byte_length: result.stored.byte_length,
+        sha256: Sha256::digest(stored),
+        byte_length: stored.len() as u64,
     };
     receipt.events = manifest.events.clone();
     receipt.rejects = manifest.rejects.clone();
@@ -770,8 +823,100 @@ fn rewrite(input: &mut PinnedDerivative, file: &str, change: impl FnOnce(&mut St
     fs::write(input.directory.join("receipt.json"), bytes).unwrap();
 }
 
+fn first_seqs(groups: &[AtomicGroup]) -> Vec<i64> {
+    groups.iter().map(|g| g.first().canonical_seq()).collect()
+}
+
 #[test]
-fn rehashed_semantic_corruption_fails_before_window_status() {
+fn late_window_corruption_streams_earlier_groups_but_never_completes() {
+    let source = TempDir::new("late-source").unwrap();
+    let out = TempDir::new("late-out").unwrap();
+    let book = |time| row("kalshi", time, "book");
+    canonical(source.path(), 0, 10, 1, &[book(1), book(2)], true);
+    canonical(
+        source.path(),
+        10,
+        20,
+        3,
+        &[book(11), book(12), book(13)],
+        true,
+    );
+    let first = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    let mut second = build(source.path(), out.path(), 10, 20, &mut Fake::new());
+    // Only the second window's final event line breaks canonical child order.
+    rewrite(&mut second, "events.ndjson.zst", |text| {
+        let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+        let last = text[start..].replacen("\"event_index\":1", "\"event_index\":2", 1);
+        text.replace_range(start.., &last);
+    });
+    let walker = DerivativeWalker::open(
+        vec![first.clone(), second.clone()],
+        request(0, 20),
+        ReadLimits::default(),
+    )
+    .unwrap();
+    let (groups, error) = fails_without_completion(walker);
+    assert_eq!(error, "normalized events are not in canonical child order");
+    // Earlier groups streamed, but the group whose closing lookahead failed
+    // (seq 4) and the corrupt delivery (seq 5) were never released.
+    assert_eq!(first_seqs(&groups), [1, 2, 3]);
+    // A fresh attempt with the same pins fails the same way: nothing completes.
+    let retry =
+        DerivativeWalker::open(vec![first, second], request(0, 20), ReadLimits::default()).unwrap();
+    assert_eq!(fails_without_completion(retry).1, error);
+}
+
+#[test]
+fn trailing_frame_withholds_the_last_group_of_its_window() {
+    let source = TempDir::new("trailing-source").unwrap();
+    let out = TempDir::new("trailing-out").unwrap();
+    let book = |time| row("kalshi", time, "book");
+    canonical(source.path(), 0, 10, 1, &[book(1), book(2), book(3)], true);
+    let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    let mut stored = fs::read(input.directory.join("events.ndjson.zst")).unwrap();
+    stored.extend(stored.clone()); // a second valid frame, bound by the receipt
+    rebind(&mut input, "events.ndjson.zst", &stored, None);
+    let walker =
+        DerivativeWalker::open(vec![input], request(0, 10), ReadLimits::default()).unwrap();
+    let (groups, error) = fails_without_completion(walker);
+    assert!(error.contains("events.ndjson.zst"), "{error}");
+    // The last group closes only on verified window EOF, which fails here.
+    assert_eq!(first_seqs(&groups), [1, 2]);
+}
+
+#[test]
+fn untagged_cross_lane_run_fails_before_releasing_its_first_member() {
+    let source = TempDir::new("untagged-source").unwrap();
+    let out = TempDir::new("untagged-out").unwrap();
+    canonical(
+        source.path(),
+        0,
+        10,
+        1,
+        &[row("polymarket", 5, "book"), row("kalshi", 5, "book")],
+        true,
+    );
+    let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    for file in ["events.ndjson.zst", "sources.ndjson.zst"] {
+        rewrite(&mut input, file, |text| {
+            *text = text.replace("\"visible_tie_group\":5", "\"visible_tie_group\":null");
+        });
+    }
+    let walker =
+        DerivativeWalker::open(vec![input], request(0, 10), ReadLimits::default()).unwrap();
+    let (groups, error) = fails_without_completion(walker);
+    assert_eq!(
+        error,
+        "tie group disagrees with complete equal-time source run"
+    );
+    assert!(
+        groups.is_empty(),
+        "an untagged cross-lane member was released"
+    );
+}
+
+#[test]
+fn rehashed_semantic_corruption_poisons_before_completion() {
     for mutation in [
         "child_header",
         "child_gap",
@@ -824,11 +969,10 @@ fn rehashed_semantic_corruption_fails_before_window_status() {
                 _ => unreachable!(),
             };
         });
-        let mut walker =
+        let walker =
             DerivativeWalker::open(vec![input], request(0, 1), ReadLimits::default()).unwrap();
-        assert!(walker.next_item().is_err(), "{mutation}");
-        assert!(walker.next_item().unwrap_err().contains("poisoned"));
-        assert!(walker.finish().is_err());
+        let (groups, _) = fails_without_completion(walker);
+        assert!(groups.is_empty(), "{mutation}");
     }
 }
 
@@ -865,10 +1009,20 @@ fn codec_and_pin_corruption_never_becomes_eof() {
             _ => unreachable!(),
         }
         fs::write(path, bytes).unwrap();
-        assert!(
-            open_pinned(&input, &ReadLimits::default()).is_err(),
-            "{mutation}"
-        );
+        // Length changes and pin/receipt corruption fail at open. A same-length
+        // checksum flip is not re-hashed at open (the pin's bytes are bound by
+        // SHA-256 at install); the Zstandard frame checksum fails it while
+        // reading instead. Either way it never reaches clean EOF.
+        if mutation == "checksum" {
+            assert!(open_pinned(&input, &ReadLimits::default()).is_ok());
+            let error = read_fails_without_completion(&input);
+            assert!(error.contains("events.ndjson.zst"), "{error}");
+        } else {
+            assert!(
+                open_pinned(&input, &ReadLimits::default()).is_err(),
+                "{mutation}"
+            );
+        }
     }
 }
 
@@ -893,10 +1047,7 @@ fn ignored_sources_cannot_hide_sequence_gaps_or_nonzero_indexes() {
                 text.replacen("\"event_index\":0", "\"event_index\":1", 1)
             };
         });
-        assert!(
-            open_pinned(&input, &ReadLimits::default()).is_err(),
-            "{mutation}"
-        );
+        read_fails_without_completion(&input);
     }
 }
 
@@ -1039,7 +1190,7 @@ fn repeated_source_delivery_index_cannot_hide_behind_dense_canonical_sequence() 
     rewrite(&mut input, "events.ndjson.zst", |text| {
         *text = text.replace("\"delivery_index\":2", "\"delivery_index\":1");
     });
-    assert!(open_pinned(&input, &ReadLimits::default()).is_err());
+    read_fails_without_completion(&input);
 }
 
 #[test]
@@ -1346,7 +1497,7 @@ fn upstream_lane_and_clock_facts_precede_groups_even_when_empty_or_unrelated() {
 }
 
 #[test]
-fn rehashed_source_metadata_fails_before_status_and_poisons() {
+fn rehashed_source_metadata_poisons_before_completion() {
     for mutation in [
         "epoch",
         "empty_epoch",
@@ -1392,13 +1543,9 @@ fn rehashed_source_metadata_fails_before_status_and_poisons() {
             };
         });
         let opened = DerivativeWalker::open(vec![input], request(8, 9), ReadLimits::default());
-        if let Ok(mut walker) = opened {
-            assert!(walker.next_item().is_err(), "{mutation}");
-            assert_eq!(
-                walker.next_item().unwrap_err(),
-                "derivative walker is poisoned"
-            );
-            assert!(walker.finish().is_err());
+        if let Ok(walker) = opened {
+            let (groups, _) = fails_without_completion(walker);
+            assert!(groups.is_empty(), "{mutation}");
         }
     }
 }
@@ -1476,14 +1623,17 @@ fn source_sidecar_codec_corruption_cannot_hide_in_clipped_tail() {
             _ => unreachable!(),
         }
         fs::write(path, bytes).unwrap();
-        let mut walker =
+        let walker =
             DerivativeWalker::open(vec![input], request(0, 1), ReadLimits::default()).unwrap();
-        assert!(walker.next_item().is_err(), "{mutation}");
-        assert_eq!(
-            walker.next_item().unwrap_err(),
-            "derivative walker is poisoned"
+        // A length change fails the snapshot copy before the window status; a
+        // same-length checksum flip fails at the sidecar's frame EOF, after the
+        // status. Neither releases a group from the clipped tail or completes.
+        let (groups, error) = fails_without_completion(walker);
+        assert!(groups.is_empty(), "{mutation}");
+        assert!(
+            mutation != "checksum" || error.contains("sources.ndjson.zst"),
+            "{error}"
         );
-        assert!(walker.finish().is_err());
     }
 }
 

@@ -393,7 +393,7 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
 
 ```json
 {
-  "replay_runner_config_version": 2,
+  "replay_runner_config_version": 3,
   "universe_base_url": "http://event-universe:8080",
   "scope": "jobs",
   "canonical_window_seconds": 1800,
@@ -409,7 +409,8 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
     }
   },
   "limits": {"small": {"max_entry_bytes": 1048576, "max_queue_bytes": 67108864,
-    "command_timeout_ms": 5000, "attempts": 3, "no_progress": 2, "progress_margin": 100,
+    "command_timeout_ms": 5000, "publish_batch_entries": 100,
+    "attempts": 3, "no_progress": 2, "progress_margin": 100,
     "stall_seconds": 30, "attempt_seconds": 300, "run_seconds": 900,
     "poll_seconds": 0.1, "stop_seconds": 2}},
   "orchestration": {"max_stage_attempts": 20, "max_job_seconds": 86400,
@@ -425,7 +426,11 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
   Polymarket's authority is its market channel `polymarket`.
 - `limits` presets are checked early against the supervisor's rules; the
   supervisor's own `validate` stays authoritative. Every preset's `run_seconds`
-  must be below `max_job_seconds`.
+  must be below `max_job_seconds`. Each preset requires `publish_batch_entries`
+  (an integer 1–1024), passed to the publisher's transport configuration; it
+  sizes the publisher buffer (hard capacity `ceil(1.25 ×` batch`)`) and never
+  changes delivered records. Version 3 added this required field; version 2
+  configs are rejected.
 - `orchestration` is server-owned; no request can change it. The numbers may be
   tuned, but the semantics in §3.8 are fixed.
 
@@ -732,11 +737,23 @@ the bundle cache's pin-inspection API.
    receipt hashes, or full Producer differs, return `StaleCache` without any
    derivative download, materialization, or write. The cache never discovers
    or selects another cache receipt automatically.
-4. For each window, download `replay/derivatives/<address>/*` through
-   `open_verified` into `derivatives_root/<address>/`, receipt last, skipping
-   directories already present and verified.
-5. Run the strict Rust pin inspector on every ordered pin, then return
-   `BundleReady`. A warm hit never invokes materialization.
+4. For each window whose `derivatives_root/<address>/` is absent, download
+   `replay/derivatives/<address>/*` through `open_verified` into a private
+   stage, run the strict Rust pin inspector on it, and install it, receipt
+   last.
+5. A derivative already present locally is bound to its pin by hash instead:
+   the directory must hold exactly the five derivative files as regular files,
+   `receipt.json` must hash to the pinned `receipt_sha256` from the verified
+   bundle receipt, and every other file must match the stored SHA-256 and byte
+   length that derivative receipt records. A mismatch is `integrity_failure`;
+   the local copy is neither repaired, rebuilt, nor deleted. Local derivatives
+   were fully verified when built or downloaded. This SHA-256 binding is the
+   read-time integrity root: the walker's `open_pinned` re-hashes only the
+   receipt and manifest and checks frames, lengths, LF counts, ordering and
+   line semantics without re-hashing data bytes or re-encoding lines (see
+   `VERIFIED_DERIVATIVE_WALKER_V1.md`, "Read-time integrity contract"). Return
+   `BundleReady` with the ordered pins. A warm hit never invokes
+   materialization.
 
 ### 6.3 Cache miss (build)
 
@@ -747,9 +764,10 @@ the bundle cache's pin-inspection API.
    scratch/canonical, output_root: scratch/materialized, start_ns, end_ns}`. Its
    existing receipt scan sees only the restored windows. It returns the
    normalizer identity and ordered pins; the producer comes from `--describe`.
-3. **Inspect and upload** each derivative only after strict Rust pin inspection;
-   upload the fixed data/manifest allowlist with `put_immutable`, then
-   `receipt.json` last.
+3. **Install and upload** each derivative. `materialize_range` has already
+   checked the candidate it built (writer-side limits plus a stored-identity
+   re-hash); the local install binds the copy to its pin by hash. Upload the
+   fixed data/manifest allowlist with `put_immutable`, then `receipt.json` last.
 4. **Publish** `bundle_receipt_bytes(...)` at the one deterministic
    `bundle_receipt_key(bundle_id)` with `put_immutable`. An existing
    identical receipt (another job built it) is a no-op; a different one is an
@@ -766,8 +784,8 @@ where books are usable is the coverage strategy's job.
 
 **Engine change:** `materialize_range --describe` prints the exact canonical
 §3.5 Producer and exits, with no materialization or data/configuration I/O. A
-separate strict `--inspect-pin` mode is the cache's derivative verification
-interface.
+separate strict `--inspect-pin` mode is the cache's verification interface for
+derivatives downloaded from the archive.
 
 ### 6.4 Frozen limits, concurrency, and crash recovery
 

@@ -397,11 +397,11 @@ mod composite_tests {
         );
         assert_eq!(
             default.descriptor().bundle_sha256.as_hex(),
-            "8076a1e1156470b053856c4100f9f38f83a675bdb625383cb42c1d4e5603fb92"
+            "632f1297913f97a1d27fdd89c1f889b0a2333eafb8149cced8e17f546a48039b"
         );
         assert_eq!(
             default.descriptor().config_sha256.as_hex(),
-            "5a70988d6be21716850f50eecdf393733ca8d6b551896cfda4299cabca547d7f"
+            "744419d787b8d14340f043608bf894778e7f3862d177e864a6feee1ec2c033ba"
         );
         let changed = CanonicalNormalizer::new(
             kalshi::Kalshi::default(),

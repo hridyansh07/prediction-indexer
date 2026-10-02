@@ -1,8 +1,9 @@
 # Offline bundle coverage V1
 
 Implemented: `replay.bundle_coverage:build` is a coverage-only supervisor factory.
-It consumes the existing immutable `replay.streams.Cut` / `Book` interface and
-does not reconstruct Risk policy. No economics, fees, opportunities, episodes,
+It consumes the `replay.streams.Cut` / `Book` interface under its zero-copy hook
+contract (live in-place books, valid only during the callback) and does not
+reconstruct Risk policy. No economics, fees, opportunities, episodes,
 fills, trading, timer/cadence, query language, discovery, cache, or UI is included.
 The opt-in Rust-materializer → Risk → Redis → supervisor → coverage acceptance
 below uses synthetic contracts. It does not establish retained-data acceptance
@@ -58,8 +59,11 @@ Group cuts take effect at `origin.visible_ns`; window cuts at their raw window
 start, clipped for reporting. Expansion/prologue groups before requested start
 may initialize Risk books, but produce no pre-request intervals or trade counts.
 Clipping never rewrites the source window interval. Before processing a later
-cut, intervening scope boundaries use the **prior immutable books**, because the
-Decoder has already installed the incoming cut's entire atomic transition set.
+cut, intervening scope boundaries use the **prior book state**, because the
+Decoder has already applied the incoming cut's entire transition set in place.
+Coverage therefore keeps its own detached `(validity, reason, source)` copy per
+planned book, refreshed only for each cut's transitioned keys after the boundary
+evaluation; it never retains a Decoder book or cut body past the callback.
 Scope changes do not change Risk books. Same-time cuts produce no positive-length
 intermediate state and no overlap; zero-length intervals are discarded.
 
@@ -68,6 +72,13 @@ the original closed reason object. Book identity is instrument **and orientation
 source authority is the snapshot plan's explicit lane. Delayed initialization,
 quiet periods, empty valid ladders, and trades alone do not imply missing data.
 Only authoritative Risk transitions initialize, invalidate, or recover a book.
+`MetadataChanged` is target-file publication metadata, exposed separately on Replay
+stream cuts as a control observation with its `from`/`to` digests. Bundle coverage
+output does not record these controls and ignores them when deriving availability
+and revisions. A metadata change is not a market event, book transition, unusable
+reason, evidence reason, interval boundary, or rebuild signal. Historical wire/output
+carrying `metadata_changed` as a reason remains readable, but new Risk runs do not
+produce that reason.
 
 Each requested member remains in the denominator, including listed-but-unselected
 members with unknown native mapping. Their member interval has zero required books,
@@ -107,8 +118,12 @@ A later group fault (for example, a connection close) may replace `reason` and
 `source` while `evidence` and `evidence_source` retain the window-level fault.
 Both facts remain visible; neither implies recovery.
 
+Metadata-change controls are positive audit observations rather than negative
+coverage evidence. They never appear in either the window-evidence list above or
+the current book's unusable-reason list.
+
 No inference of positive coverage from silence is made, and no second Python Risk
-verifier or expanded wire format is introduced. Entering a later clean window
+verifier is introduced. Entering a later clean window
 resets current evidence to `unknown` but does not clear a latched unusable book
 reason. Only a later valid Full recovers that book. Window failures are retrospective
 verified interval knowledge, already applied by Risk; these results do not claim
@@ -210,8 +225,8 @@ ownership remain the trust boundary.
 No full output/tape is loaded for validation. Limits: 256 MiB interval bytes,
 1,000,000 records, 64 KiB per line, 32,768 total scope/entity pairs, 16 MiB metadata;
 preparation's snapshot and stream's entry/book bounds apply independently. The
-runtime retains current/prior immutable book snapshots and one open row per active
-entity, not every event reference. The reader retains bounded entity cursors and
+runtime retains one detached status copy per planned book and one open row per
+active entity, not every event reference or book ladder. The reader retains bounded entity cursors and
 duration totals, one line, and active statuses. A private disposable SQLite temporal
 index uses a 2 MiB page-cache target and a 1 GiB main-database cap, with disk-backed
 sort/index scratch additionally bounded by input limits. Resource failures abort
@@ -225,8 +240,8 @@ leave system temporary files; no broad cleanup service is introduced.
   replay.tests.test_preparation replay.tests.test_streams replay.tests.test_supervisor
 ```
 
-Tests use real preparation/strict loaders and real immutable Decoder cuts, small
-hand-authored Risk decisions, plus fake supervisor artifacts checked by its real
+Tests use real preparation/strict loaders and real in-place Decoder cuts, small
+hand-authored Risk decisions (with a locally computed terminal book digest), plus fake supervisor artifacts checked by its real
 success reader. They cover delayed initialization, unrelated cuts, quiet intervals,
 trades/duplicates, faults/recovery, old latched reasons versus new evidence, scope
 changes during silence, mixed/all-uncaptured cases, prologue clipping, equal-time

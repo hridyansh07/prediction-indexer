@@ -192,23 +192,23 @@ fn materializes_verifies_and_idempotently_retries_kalshi_derivative() {
     // non-fault event wire bytes remain covered by conformance tests.
     assert_eq!(
         first.derivative.manifest.events.logical.sha256.as_hex(),
-        "eb7cd9a9050635f923c5f7476e5a01a3fbeda414ae8f43a37404f4021acbe80a"
+        "3e6c273c441a36d4bb2207cc39d43566f4d57031c9fd7e1662bf9501f6432b5d"
     );
     assert_eq!(first.derivative.manifest.events.logical.byte_length, 2304);
     assert_eq!(first.derivative.manifest.events.logical.line_count, 3);
     assert_eq!(
         first.derivative.manifest.rejects.logical.sha256.as_hex(),
-        "2a792ad161994c7e06e7b210dff25aa4edc9327746aca8397977dbbf61958cc1"
+        "daf90b625776f916f218c9968ead35fca31ee990503c466aa61ef949335b8e32"
     );
     assert_eq!(first.derivative.manifest.rejects.logical.byte_length, 2113);
     assert_eq!(first.derivative.manifest.rejects.logical.line_count, 2);
     assert_eq!(
         first.derivative.pin.derivative_address,
-        "0c16ee7392118e96650fc8b361934ffffa7250be29240194d7493073df6aedc4"
+        "de43dae6befba03578bde12f9da8581d0daf0e988f7f03887bcd239700ded58f"
     );
     assert_eq!(
         first.derivative.pin.receipt_sha256.as_hex(),
-        "a1be1bfd954bbe2dd6eef48891a90d8167e28d77bc014f7970ba5193ccef9d1a"
+        "7141f80cde223cf29be1806106e68b7827003e5eb570147b175d25570e4aa9a5"
     );
     let independently_verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(independently_verified.pin, first.derivative.pin);

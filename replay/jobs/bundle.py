@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -392,19 +393,77 @@ def _tree_bytes(root: Path, maximum: int) -> int:
     return total
 
 
-def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, materializer: Path, scratch: Path) -> BundlePin:
+def _check_pinned_files(directory: Path, receipt_sha256: str, label: str) -> int:
+    """Bind a local derivative directory to its pin without decoding it again.
+
+    The directory must hold exactly the derivative file allowlist as regular
+    files. `receipt.json` must hash to the pinned `receipt_sha256`, and every
+    other file must match the stored hash and length that receipt lists. A
+    derivative only reaches a local directory after the materializer verified
+    it (a fresh build) or `--inspect-pin` verified it (an archive download),
+    so this proves the directory still holds those exact verified bytes. This
+    SHA-256 binding is what the walker's `open_pinned` relies on: the replay
+    read re-hashes only the receipt and manifest, then checks Zstandard frames,
+    exact lengths, LF counts, ordering and line semantics without re-hashing
+    data bytes. Returns the directory's total byte length.
+    """
+    try:
+        entries = {entry.name: entry for entry in os.scandir(directory)}
+    except OSError as error:
+        raise _failure("integrity_failure", error) from error
+    if set(entries) != set(DERIVATIVE_FILES):
+        raise BundleFailure("integrity_failure", f"{label} directory has unexpected entries")
+    if not all(entry.is_file(follow_symlinks=False) for entry in entries.values()):
+        raise BundleFailure("integrity_failure", f"{label} directory contains a non-regular entry")
+    raw = (directory / "receipt.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != receipt_sha256:
+        raise BundleFailure("integrity_failure", f"{label} receipt does not match its pin")
+    try:
+        receipt = json.loads(raw)
+        expected = {receipt["manifest"]["file"]: (receipt["manifest"]["sha256"], receipt["manifest"]["byte_length"])}
+        for part in ("events", "rejects", "sources"):
+            entry = receipt[part]
+            expected[entry["file"]] = (entry["stored"]["sha256"], entry["stored"]["byte_length"])
+    except (ValueError, KeyError, TypeError) as error:
+        raise BundleFailure("integrity_failure", f"{label} receipt is malformed") from error
+    if set(expected) | {"receipt.json"} != set(DERIVATIVE_FILES):
+        raise BundleFailure("integrity_failure", f"{label} receipt names unexpected files")
+    total = len(raw)
+    for name, (sha256, byte_length) in expected.items():
+        identity = _file_identity(directory / name)
+        if (identity.sha256, identity.byte_length) != (sha256, byte_length):
+            raise BundleFailure("integrity_failure", f"{label} file {name} disagrees with its receipt")
+        total += identity.byte_length
+    return total
+
+
+def _local_pin(target: Path, address: str, receipt_sha256: str) -> tuple[BundlePin, int]:
+    """Accept a derivative already installed under derivatives_root by hash."""
+    if target.is_symlink() or not target.is_dir():
+        raise BundleFailure("integrity_failure", "derivative target is not a regular directory")
+    return BundlePin(target, address, receipt_sha256), _check_pinned_files(target, receipt_sha256, "local derivative")
+
+
+def _install_local(
+    source: Path,
+    address: str,
+    receipt_sha256: str,
+    root: Path,
+    materializer: Path,
+    scratch: Path,
+    *,
+    freshly_verified: bool = False,
+) -> BundlePin:
     _pin_values(address, receipt_sha256)
     _owned_root(root, "derivatives_root")
     target = root / address
     if target.exists():
         if target.is_symlink() or not target.is_dir():
             raise BundleFailure("integrity_failure", "derivative target is not a regular directory")
-        pin = BundlePin(target, address, receipt_sha256)
         if not (target / "receipt.json").exists():
             shutil.rmtree(target)
         else:
-            _inspect(materializer, pin, scratch)
-            return pin
+            return _local_pin(target, address, receipt_sha256)[0]
     stage_root = Path(tempfile.mkdtemp(prefix=".bundle-stage-", dir=root))
     stage = stage_root / address
     stage.mkdir()
@@ -413,34 +472,31 @@ def _install_local(source: Path, address: str, receipt_sha256: str, root: Path, 
         for name in (*DERIVATIVE_FILES[:-1], DERIVATIVE_FILES[-1]):
             _copy_file(source / name, stage / name, budget)
         _fsync_directory(stage)
-        _inspect(materializer, BundlePin(stage, address, receipt_sha256), scratch)
+        if freshly_verified:
+            _check_pinned_files(stage, receipt_sha256, "copied derivative")
+        else:
+            _inspect(materializer, BundlePin(stage, address, receipt_sha256), scratch)
         try:
             os.rename(stage, target)
             _fsync_directory(root)
         except OSError:
             if target.is_dir() and not target.is_symlink():
-                pin = BundlePin(target, address, receipt_sha256)
-                _inspect(materializer, pin, scratch)
-                return pin
+                return _local_pin(target, address, receipt_sha256)[0]
             raise
         return BundlePin(target, address, receipt_sha256)
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
 
 
-def _add_derivative_bytes(paths, budget: list[int]) -> None:
-    for path in paths:
-        budget[0] += _file_identity(path).byte_length
-        if budget[0] > MAX_DERIVATIVE_BYTES:
-            raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
-
-
 def _download_derivative(store, address, receipt_sha256, root, materializer, scratch, budget) -> BundlePin:
     target = root / address
     if target.exists() and (target / "receipt.json").is_file():
-        pin = BundlePin(target, address, receipt_sha256)
-        _inspect(materializer, pin, scratch)
-        _add_derivative_bytes((target / name for name in DERIVATIVE_FILES), budget)
+        # Already installed locally: bind it to the pin from the verified
+        # archive bundle receipt by hash. Only archive downloads are inspected.
+        pin, byte_length = _local_pin(target, address, receipt_sha256)
+        budget[0] += byte_length
+        if budget[0] > MAX_DERIVATIVE_BYTES:
+            raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
         return pin
     stage_source = Path(tempfile.mkdtemp(prefix=".bundle-download-", dir=scratch)) / address
     stage_source.mkdir()
@@ -539,9 +595,12 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
         window_root = output_root / f"window={remote.window_start_ns}"
         _validate_materialized_window(window_root, address)
         source = window_root / address
-        built_pin = BundlePin(source, address, receipt_sha256)
-        _inspect(materializer, built_pin, scratch)
-        pin = _install_local(source, address, receipt_sha256, derivatives_root, materializer, scratch)
+        # materialize_range verified this derivative before committing its
+        # receipt; the local install binds the copy to that pin by hash.
+        pin = _install_local(
+            source, address, receipt_sha256, derivatives_root, materializer, scratch,
+            freshly_verified=True,
+        )
         pins.append(pin)
         windows.append(BundleWindow(remote.window_start_ns, remote.window_end_ns, remote.receipt_sha256, address, receipt_sha256))
     receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, tuple(windows))

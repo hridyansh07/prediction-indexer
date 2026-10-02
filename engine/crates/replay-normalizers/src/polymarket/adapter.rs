@@ -73,9 +73,18 @@ impl VenueAdapter for Polymarket {
             return Ok(Normalization::Events(Vec::new()));
         }
         let mut events = Vec::new();
+        let mut ignored_reason = None;
         for message in messages {
             match normalize_message(envelope, message, self.config) {
                 Ok(MessageOutcome::Events(mut children)) => events.append(&mut children),
+                Ok(MessageOutcome::Ignored(reason)) => {
+                    if ignored_reason.is_some_and(|existing| existing != reason) {
+                        return Err(NormalizerError::new(
+                            "Polymarket batch has conflicting ignored reason codes",
+                        ));
+                    }
+                    ignored_reason = Some(reason);
+                }
                 Err(reject) => {
                     return Ok(input.reject(
                         PARSER_VERSION,
@@ -89,7 +98,16 @@ impl VenueAdapter for Polymarket {
                 }
             }
         }
-        Ok(Normalization::Events(events))
+        Ok(if events.is_empty() {
+            ignored_reason.map_or_else(
+                || Normalization::Events(events),
+                |reason| Normalization::Ignored {
+                    reason_code: reason.to_owned(),
+                },
+            )
+        } else {
+            Normalization::Events(events)
+        })
     }
 
     fn normalize_non_json(
@@ -122,6 +140,9 @@ fn outcome(
 ) -> Normalization {
     match result {
         Ok(MessageOutcome::Events(events)) => Normalization::Events(events),
+        Ok(MessageOutcome::Ignored(reason)) => Normalization::Ignored {
+            reason_code: reason.to_owned(),
+        },
         Err(reject) => input.reject(
             PARSER_VERSION,
             reject.code,

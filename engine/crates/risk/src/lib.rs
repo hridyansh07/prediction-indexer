@@ -45,7 +45,6 @@ pub enum Reason {
     ConnectionClosed,
     ConnectionFailed,
     SubscriptionChanged,
-    MetadataChanged,
     Continuity(ContinuityVerdict),
     UnsupportedState,
     ScaleMismatch,
@@ -171,6 +170,12 @@ pub struct MarketRecord {
     pub disposition: Disposition,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlRecord {
+    pub reference: Reference,
+    pub from: Option<String>,
+    pub to: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CutOrigin {
     Window {
         pin: DerivativePin,
@@ -190,6 +195,7 @@ pub struct RiskCut {
     sequence: u64,
     origin: CutOrigin,
     market_events: Vec<MarketRecord>,
+    control_events: Vec<ControlRecord>,
     book_transitions: Vec<BookTransition>,
 }
 impl RiskCut {
@@ -201,6 +207,9 @@ impl RiskCut {
     }
     pub fn market_events(&self) -> &[MarketRecord] {
         &self.market_events
+    }
+    pub fn control_events(&self) -> &[ControlRecord] {
+        &self.control_events
     }
     pub fn book_transitions(&self) -> &[BookTransition] {
         &self.book_transitions
@@ -398,12 +407,14 @@ impl RiskEngine {
                 end_ns: m.manifest().effective_end_ns,
             },
             vec![],
+            vec![],
             staged,
         )
     }
     fn group(&mut self, group: &AtomicGroup) -> Result<RiskCut, String> {
         let mut staged = BTreeMap::<BookKey, Work>::new();
         let mut events = vec![];
+        let mut controls = vec![];
         for delivery in group.deliveries() {
             let h = delivery.header();
             let lane = h.address().lane();
@@ -471,6 +482,15 @@ impl RiskEngine {
                 }
                 if duplicate {
                     continue;
+                }
+                if let SegmentEvent::Control(ControlEvent::MetadataChanged { from, to }) =
+                    record.event()
+                {
+                    controls.push(ControlRecord {
+                        reference: reference.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
                 }
                 match record.event() {
                     SegmentEvent::Book(book) => {
@@ -559,7 +579,7 @@ impl RiskEngine {
                             ControlEvent::SubscriptionChanged { .. } => {
                                 (Reason::SubscriptionChanged, false)
                             }
-                            ControlEvent::MetadataChanged { .. } => (Reason::MetadataChanged, true),
+                            ControlEvent::MetadataChanged { .. } => continue,
                         };
                         invalidate(&mut staged, &self.books, &relevant, reason, latch);
                     }
@@ -588,6 +608,7 @@ impl RiskEngine {
                 visible_ns: group.visible_ns(),
             },
             events,
+            controls,
             staged,
         )
     }
@@ -595,6 +616,7 @@ impl RiskEngine {
         &mut self,
         origin: CutOrigin,
         market_events: Vec<MarketRecord>,
+        control_events: Vec<ControlRecord>,
         staged: BTreeMap<BookKey, Work>,
     ) -> Result<RiskCut, String> {
         let sequence = self
@@ -627,6 +649,7 @@ impl RiskEngine {
             sequence,
             origin,
             market_events,
+            control_events,
             book_transitions: transitions,
         })
     }

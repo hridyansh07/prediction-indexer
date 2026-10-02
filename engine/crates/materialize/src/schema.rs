@@ -379,6 +379,15 @@ impl RejectRecord {
         Ok(record)
     }
 
+    /// The pinned replay read's single-pass decode: the same closed wire type
+    /// and validation as [`Self::from_canonical_json`], without the re-encode
+    /// equality check. The pin's install-time SHA-256 binding proves the bytes.
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let wire: RejectRecordWire = serde_json::from_slice(bytes)
+            .map_err(|error| format!("decoding reject record: {error}"))?;
+        Self::from_wire(wire)
+    }
+
     fn from_wire(wire: RejectRecordWire) -> Result<Self, String> {
         if wire.reject_version != 1 {
             return Err(format!(

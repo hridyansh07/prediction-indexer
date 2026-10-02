@@ -94,7 +94,8 @@ class FakeWriter(io.BytesIO):
                 generation=self.blob.client.next_generation,
                 metageneration=1,
                 metadata=self.blob.metadata,
-                type=self.blob.content_type,
+                # GCS stores an upload without a content type as octet-stream.
+                type=self.blob.content_type or "application/octet-stream",
                 encoding=self.blob.content_encoding,
             )
         super().close()
@@ -142,7 +143,7 @@ class FakeClient:
                 SHA256_METADATA: identity(data).sha256,
                 BYTE_LENGTH_METADATA: str(len(data)),
             },
-            type=metadata.get("content_type"),
+            type=metadata.get("content_type") or "application/octet-stream",
             encoding=metadata.get("content_encoding"),
         )
 
@@ -180,6 +181,16 @@ class GCSStoreTests(unittest.TestCase):
             (result.provider_checksum, result.provider_checksum_algorithm),
             (crc(self.data), "CRC32C"),
         )
+
+    def test_put_without_content_type_accepts_the_gcs_default(self):
+        result = self.put()
+        self.assertEqual(result.content_type, "application/octet-stream")
+        self.assertTrue(result.matches(identity(self.data)))
+
+    def test_retry_without_content_type_resolves_an_existing_default_typed_object(self):
+        # A Replay job file uploaded before the store understood GCS's default.
+        self.client.seed(self.key, self.data, content_type="application/octet-stream")
+        self.assertEqual(self.put().content_type, "application/octet-stream")
 
     def test_verify_metadata_uses_provider_metadata_without_downloading_the_object(self):
         self.client.seed(self.key, self.data)
