@@ -201,7 +201,10 @@ fn read_events(derivative: &replay_materialize::VerifiedDerivative) -> Vec<Segme
     let mut records = Vec::new();
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line).unwrap() != 0 {
-        records.push(SegmentRecord::from_canonical_json(&line[..line.len() - 1]).unwrap());
+        let json = &line[..line.len() - 1];
+        let record = SegmentRecord::from_canonical_json(json).unwrap();
+        assert_eq!(SegmentRecord::from_json(json).unwrap(), record);
+        records.push(record);
         line.clear();
     }
     reader.into_inner().finish().unwrap();

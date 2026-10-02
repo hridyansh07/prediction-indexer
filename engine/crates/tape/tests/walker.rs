@@ -1009,10 +1009,20 @@ fn codec_and_pin_corruption_never_becomes_eof() {
             _ => unreachable!(),
         }
         fs::write(path, bytes).unwrap();
-        assert!(
-            open_pinned(&input, &ReadLimits::default()).is_err(),
-            "{mutation}"
-        );
+        // Length changes and pin/receipt corruption fail at open. A same-length
+        // checksum flip is not re-hashed at open (the pin's bytes are bound by
+        // SHA-256 at install); the Zstandard frame checksum fails it while
+        // reading instead. Either way it never reaches clean EOF.
+        if mutation == "checksum" {
+            assert!(open_pinned(&input, &ReadLimits::default()).is_ok());
+            let error = read_fails_without_completion(&input);
+            assert!(error.contains("events.ndjson.zst"), "{error}");
+        } else {
+            assert!(
+                open_pinned(&input, &ReadLimits::default()).is_err(),
+                "{mutation}"
+            );
+        }
     }
 }
 
@@ -1613,14 +1623,17 @@ fn source_sidecar_codec_corruption_cannot_hide_in_clipped_tail() {
             _ => unreachable!(),
         }
         fs::write(path, bytes).unwrap();
-        let mut walker =
+        let walker =
             DerivativeWalker::open(vec![input], request(0, 1), ReadLimits::default()).unwrap();
-        assert!(walker.next_item().is_err(), "{mutation}");
-        assert_eq!(
-            walker.next_item().unwrap_err(),
-            "derivative walker is poisoned"
+        // A length change fails the snapshot copy before the window status; a
+        // same-length checksum flip fails at the sidecar's frame EOF, after the
+        // status. Neither releases a group from the clipped tail or completes.
+        let (groups, error) = fails_without_completion(walker);
+        assert!(groups.is_empty(), "{mutation}");
+        assert!(
+            mutation != "checksum" || error.contains("sources.ndjson.zst"),
+            "{error}"
         );
-        assert!(walker.finish().is_err());
     }
 }
 

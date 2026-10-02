@@ -5,12 +5,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use replay_domain::{EventHeader, LaneId, SegmentRecord};
-use sha2::{Digest, Sha256 as Sha256Hasher};
 use tempfile::TempDir;
 
 use crate::verify::{
-    VerificationCounts, VerifiedLines, decode_receipt_document, inspect_contents, parse_event,
-    parse_reject, verify_counts, verify_disposition,
+    ReadMode, VerificationCounts, VerifiedLines, decode_receipt_document, inspect_contents,
+    parse_event, parse_reject, verify_counts, verify_disposition,
 };
 use crate::{
     CompressedOutput, DerivativeManifest, DerivativePin, DerivativeReceipt, RejectDisposition,
@@ -201,12 +200,13 @@ impl SourceDelivery {
     }
 }
 
-/// The single strict pass over one derivative. Each output is decoded once and
-/// each line parsed once; that one parsed record feeds every check. Per-line
-/// checks run as a line is read, per-delivery checks before its delivery is
-/// returned, and whole-window checks in `finish`. A delivery returned here is
-/// therefore checked as far as its own and its lookahead's lines go: a later
-/// violation fails the stream, and only `finish` proves the whole window.
+/// The single pass over one derivative. Each output is decoded once and each
+/// line parsed once; that one parsed record feeds every check. Per-line checks
+/// run as a line is read, per-delivery checks before its delivery is returned,
+/// and whole-window checks in `finish`. A delivery returned here is therefore
+/// checked as far as its own and its lookahead's lines go: a later violation
+/// fails the stream, and only `finish` proves the whole window. `mode` selects
+/// only whether byte identities are re-proved (see [`ReadMode`]).
 struct Deliveries {
     events: VerifiedLines,
     rejects: VerifiedLines,
@@ -220,6 +220,7 @@ struct Deliveries {
     previous_event: Option<(i64, u32)>,
     previous_reject_seq: Option<i64>,
     checks: DeliveryChecks,
+    mode: ReadMode,
 }
 
 impl Deliveries {
@@ -227,17 +228,20 @@ impl Deliveries {
         directory: &Path,
         manifest: &DerivativeManifest,
         limits: &ReadLimits,
+        mode: ReadMode,
     ) -> Result<Self, String> {
         Ok(Self {
             events: VerifiedLines::open_limit(
                 &directory.join("events.ndjson.zst"),
                 &manifest.events,
                 limits.max_line_bytes,
+                mode,
             )?,
             rejects: VerifiedLines::open_limit(
                 &directory.join("rejects.ndjson.zst"),
                 &manifest.rejects,
                 limits.max_line_bytes,
+                mode,
             )?,
             sources: manifest
                 .sources
@@ -247,6 +251,7 @@ impl Deliveries {
                         &directory.join(&output.file),
                         output,
                         limits.max_line_bytes,
+                        mode,
                     )
                 })
                 .transpose()?,
@@ -259,12 +264,13 @@ impl Deliveries {
             previous_event: None,
             previous_reject_seq: None,
             checks: DeliveryChecks::default(),
+            mode,
         })
     }
     fn read_event(&mut self) -> Result<(), String> {
         self.event = match self.events.next_line()? {
             Some(line) => Some((
-                parse_event(line, &mut self.previous_event, &mut self.counts)?,
+                parse_event(line, &mut self.previous_event, &mut self.counts, self.mode)?,
                 line.len() as u64 + 1,
             )),
             None => None,
@@ -279,6 +285,7 @@ impl Deliveries {
                     &mut self.previous_reject_seq,
                     &mut self.counts,
                     &self.manifest,
+                    self.mode,
                 )?,
                 line.len() as u64 + 1,
             )),
@@ -332,7 +339,12 @@ impl Deliveries {
             let bytes = sources
                 .next_line()?
                 .ok_or("missing source evidence record")?;
-            let source = crate::evidence::SourceEvidence::decode(bytes)?;
+            let canonical = self.mode == ReadMode::Audit;
+            #[cfg(test)]
+            if canonical {
+                crate::verify::probe::canonical_check();
+            }
+            let source = crate::evidence::SourceEvidence::decode(bytes, canonical)?;
             if source.header != delivery.header {
                 return Err("source evidence header disagrees with delivery".into());
             }
@@ -424,13 +436,14 @@ pub fn add_size(total: &mut u64, amount: u64, maximum: u64) -> Result<(), String
     Ok(())
 }
 
-/// Drains one derivative through the single strict pass: a full verdict.
+/// Drains one derivative through the single pass: a full verdict in `mode`.
 pub(crate) fn verify_stream(
     directory: &Path,
     manifest: &DerivativeManifest,
     limits: &ReadLimits,
+    mode: ReadMode,
 ) -> Result<(), String> {
-    let mut stream = Deliveries::open(directory, manifest, limits)?;
+    let mut stream = Deliveries::open(directory, manifest, limits, mode)?;
     while stream.next()?.is_some() {}
     stream.finish()
 }
@@ -645,8 +658,11 @@ pub(crate) fn open_pinned_with_checkpoint(
         std::fs::set_permissions(snapshot.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
-    // The copy reads every stored byte once; hashing those same bytes binds the
-    // private snapshot to the pinned receipt before anything is decoded.
+    // The installed directory's exact bytes were bound to this pin by SHA-256
+    // at install, and the receipt and manifest were just re-bound to it by
+    // SHA-256 above. The copy re-proves only each data file's exact stored
+    // length; the structural decode re-proves frame, checksum, length and LF
+    // count. Data bytes are not re-hashed on this hot path.
     for output in metadata.manifest.outputs() {
         copy_bound(
             &input.directory.join(&output.file),
@@ -657,7 +673,12 @@ pub(crate) fn open_pinned_with_checkpoint(
     checkpoint(ReadCheckpoint::SnapshotCopied, snapshot.path());
     // No verification pass runs here: every semantic check runs once, while
     // the caller traverses, and only a clean, fully checked EOF can finish.
-    let stream = Deliveries::open(snapshot.path(), &metadata.manifest, limits)?;
+    let stream = Deliveries::open(
+        snapshot.path(),
+        &metadata.manifest,
+        limits,
+        ReadMode::PinnedReplay,
+    )?;
     checkpoint(ReadCheckpoint::ReaderOpened, snapshot.path());
     Ok(VerifiedWindowReader {
         stream: Some(stream),
@@ -668,8 +689,9 @@ pub(crate) fn open_pinned_with_checkpoint(
     })
 }
 
-/// Copies one stored output into the private snapshot, hashing exactly the
-/// bytes written, and binds them to the receipt's stored identity.
+/// Copies one stored output into the private snapshot, bounded by and checked
+/// against the receipt's exact stored length (with an extra-byte check). It
+/// computes no digest: the pin's install-time SHA-256 binding covers content.
 fn copy_bound(source: &Path, target: &Path, output: &CompressedOutput) -> Result<(), String> {
     let limit = output
         .stored
@@ -678,7 +700,6 @@ fn copy_bound(source: &Path, target: &Path, output: &CompressedOutput) -> Result
         .ok_or("stored length overflow")?;
     let mut source = File::open(source).map_err(|e| e.to_string())?.take(limit);
     let mut sink = File::create(target).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256Hasher::new();
     let mut buffer = vec![0; 1024 * 1024];
     let mut count = 0u64;
     loop {
@@ -688,18 +709,11 @@ fn copy_bound(source: &Path, target: &Path, output: &CompressedOutput) -> Result
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.to_string()),
         };
-        hasher.update(&buffer[..read]);
         sink.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
         count += read as u64;
     }
     if count != output.stored.byte_length {
         return Err("snapshot stored length mismatch".into());
-    }
-    if Sha256::from_bytes(hasher.finalize().into()) != output.stored.sha256 {
-        return Err(format!(
-            "snapshot {} disagrees with the receipt",
-            output.file
-        ));
     }
     sink.flush().map_err(|e| e.to_string())
 }

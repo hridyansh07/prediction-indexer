@@ -211,6 +211,36 @@ class BundleCacheTest(unittest.TestCase):
         self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["--describe"])
         self.assertEqual(store.puts, [])
 
+    def test_same_length_tamper_is_caught_by_install_hash_and_inspect_pin(self):
+        # The pinned replay read no longer re-hashes derivative bytes; it relies
+        # on this install-time SHA-256 binding plus Zstandard frame checks. A
+        # same-length change (which the read's exact-length check cannot see)
+        # must therefore fail here, and the on-demand `--inspect-pin` audit must
+        # still reject it by digest.
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        pin = first.pins[0]
+        events = pin.directory / "events.ndjson.zst"
+        original = events.read_bytes()
+        altered = bytearray(original)
+        altered[len(altered) // 2] ^= 1
+        events.write_bytes(bytes(altered))
+        self.assertEqual(len(events.read_bytes()), len(original))
+        with self.assertRaises(BundleFailure) as caught:
+            self.ensure()
+        self.assertEqual(caught.exception.code, "integrity_failure")
+        self.assertIn("events.ndjson.zst disagrees with its receipt", caught.exception.detail)
+        scratch = self.root / "inspect-scratch"
+        scratch.mkdir()
+        with self.assertRaises(BundleFailure) as inspected:
+            bundle._inspect(MATERIALIZER, pin, scratch)
+        self.assertEqual(inspected.exception.code, "tool_failure")
+        self.assertEqual(events.read_bytes(), bytes(altered))
+        events.write_bytes(original)
+        bundle._inspect(MATERIALIZER, pin, scratch)
+        self.assertIsInstance(self.ensure(), BundleReady)
+
     def test_warm_local_derivative_with_unexpected_or_linked_entry_fails_closed(self):
         self.archive_window()
         first = self.ensure()

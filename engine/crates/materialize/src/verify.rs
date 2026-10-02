@@ -6,7 +6,7 @@ use indexer_types::EnvelopeView;
 use indexer_types::Sha256;
 use prediction_encoder::{
     LogicalIdentity as CodecLogicalIdentity, StoredIdentity as CodecStoredIdentity,
-    StreamingDecoder,
+    StreamingDecoder, StructuralDecoder, StructuralIdentity,
 };
 use replay_domain::{SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
@@ -53,8 +53,10 @@ impl VerifiedDerivative {
 
 /// Independently verifies the marker, strict schemas, canonical JSON, both
 /// Zstandard identities, one-frame EOF, line schemas, and reject/fault pairing.
-/// It drains the same single-pass stream a pinned read uses and returns only
-/// after that stream's clean, fully checked EOF: a standalone verdict.
+/// It drains the same single-pass stream a pinned read uses, in
+/// [`ReadMode::Audit`] (every SHA-256 identity and canonical re-encode
+/// equality), and returns only after that stream's clean, fully checked EOF:
+/// a standalone verdict. It is the on-demand audit behind `--inspect-pin`.
 pub fn verify_derivative(directory: &Path) -> Result<VerifiedDerivative, String> {
     let receipt_path = directory.join(DERIVATIVE_RECEIPT_FILE);
     if !receipt_path.is_file() {
@@ -167,25 +169,55 @@ fn verify_contents(
     Ok(verified)
 }
 
-/// The single strict verification pass shared by `verify_derivative` and every
-/// pinned read: each output is decoded once and each line parsed once, with the
+/// The audit form of the single verification pass shared with every pinned
+/// read: each output is decoded once and each line parsed once, with the
 /// per-record, per-delivery and end-of-stream checks applied as it streams.
 pub(crate) fn verify_data(
     directory: &Path,
     manifest: &DerivativeManifest,
     limits: &super::ReadLimits,
 ) -> Result<(), String> {
-    super::reader::verify_stream(directory, manifest, limits)
+    super::reader::verify_stream(directory, manifest, limits, ReadMode::Audit)
 }
 
-/// Strictly parses one normalized event line and checks canonical child order.
+/// How much of a derivative's byte identity one read re-proves.
+///
+/// Every mode applies the same semantic, ordering, count, limit and Zstandard
+/// frame checks (one checksummed frame, no truncation or trailing bytes, the
+/// stored length, decoded length and LF count). They differ only in work that
+/// re-proves bytes another boundary already bound by SHA-256.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadMode {
+    /// `verify_derivative`, and through it `--inspect-pin`, the existing
+    /// address no-op check and every other audit: both SHA-256 identities of
+    /// every output and decode/re-encode equality of every line. This is the
+    /// independent verdict for bytes nobody has hash-bound yet.
+    Audit,
+    /// `open_pinned`, the Replay walker's hot read. The installed directory
+    /// was bound to the pin by SHA-256 at install, and `open_pinned` binds the
+    /// receipt and manifest to the pin again by SHA-256. Data bytes are not
+    /// re-hashed and lines are decoded once without re-encoding them.
+    PinnedReplay,
+}
+
+/// Parses one normalized event line and checks canonical child order. `Audit`
+/// also proves the line's canonical encoding; `PinnedReplay` decodes it in a
+/// single typed pass with the same closed-schema and domain validation.
 pub(crate) fn parse_event(
     line: &[u8],
     previous: &mut Option<(i64, u32)>,
     counts: &mut VerificationCounts,
+    mode: ReadMode,
 ) -> Result<SegmentRecord, String> {
-    let record = SegmentRecord::from_canonical_json(line)
-        .map_err(|error| format!("invalid normalized event: {error}"))?;
+    let record = match mode {
+        ReadMode::Audit => {
+            #[cfg(test)]
+            probe::canonical_check();
+            SegmentRecord::from_canonical_json(line)
+        }
+        ReadMode::PinnedReplay => SegmentRecord::from_json(line),
+    }
+    .map_err(|error| format!("invalid normalized event: {error}"))?;
     let current = (
         record.header().address().canonical_seq(),
         record.header().address().event_index(),
@@ -199,15 +231,24 @@ pub(crate) fn parse_event(
     Ok(record)
 }
 
-/// Strictly parses one sidecar line: exact envelope provenance, source order,
-/// and, for a parse reject, the normalizer identity and reject_id binding.
+/// Parses one sidecar line: exact envelope provenance, source order, and, for
+/// a parse reject, the normalizer identity and reject_id binding. Only `Audit`
+/// re-encodes the line to prove its canonical encoding.
 pub(crate) fn parse_reject(
     line: &[u8],
     previous_seq: &mut Option<i64>,
     counts: &mut VerificationCounts,
     manifest: &DerivativeManifest,
+    mode: ReadMode,
 ) -> Result<RejectRecord, String> {
-    let record = RejectRecord::from_canonical_json(line)?;
+    let record = match mode {
+        ReadMode::Audit => {
+            #[cfg(test)]
+            probe::canonical_check();
+            RejectRecord::from_canonical_json(line)?
+        }
+        ReadMode::PinnedReplay => RejectRecord::from_json(line)?,
+    };
     verify_reject_source(&record)?;
     let current_seq = record.header().address().canonical_seq();
     if previous_seq.is_some_and(|previous| current_seq <= previous) {
@@ -356,9 +397,35 @@ fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
     Ok(())
 }
 
+/// The shared codec's decoder for one output: identity-checking (both
+/// SHA-256 digests) for `Audit`, structural (no digests) for `PinnedReplay`.
+/// Both enforce the identical frame, length and LF-count rules.
+enum LineDecoder {
+    Identity(StreamingDecoder<File>),
+    Structural(StructuralDecoder<File>),
+}
+
+impl Read for LineDecoder {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Identity(decoder) => decoder.read(buffer),
+            Self::Structural(decoder) => decoder.read(buffer),
+        }
+    }
+}
+
+impl LineDecoder {
+    fn finish(self) -> Result<(), prediction_encoder::CodecError> {
+        match self {
+            Self::Identity(decoder) => decoder.finish().map(|_| ()),
+            Self::Structural(decoder) => decoder.finish().map(|_| ()),
+        }
+    }
+}
+
 pub(crate) struct VerifiedLines {
     path: PathBuf,
-    reader: Option<BufReader<StreamingDecoder<File>>>,
+    reader: Option<BufReader<LineDecoder>>,
     line: Vec<u8>,
     max_line_bytes: u64,
 }
@@ -368,23 +435,37 @@ impl VerifiedLines {
         path: &Path,
         output: &super::CompressedOutput,
         max_line_bytes: u64,
+        mode: ReadMode,
     ) -> Result<Self, String> {
         let source =
             File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
-        let logical = CodecLogicalIdentity {
-            sha256: output.logical.sha256.as_hex(),
-            byte_length: output.logical.byte_length,
-            line_count: output.logical.line_count,
-        };
-        let stored = CodecStoredIdentity {
-            sha256: output.stored.sha256.as_hex(),
-            byte_length: output.stored.byte_length,
-        };
-        let decoder =
-            StreamingDecoder::new(source, &logical, Some(&stored), Some(logical.byte_length))
-                .map_err(|error| format!("opening {}: {error}", path.display()))?;
+        let decoder = match mode {
+            ReadMode::Audit => {
+                let logical = CodecLogicalIdentity {
+                    sha256: output.logical.sha256.as_hex(),
+                    byte_length: output.logical.byte_length,
+                    line_count: output.logical.line_count,
+                };
+                let stored = CodecStoredIdentity {
+                    sha256: output.stored.sha256.as_hex(),
+                    byte_length: output.stored.byte_length,
+                };
+                StreamingDecoder::new(source, &logical, Some(&stored), Some(logical.byte_length))
+                    .map(LineDecoder::Identity)
+            }
+            ReadMode::PinnedReplay => {
+                let expected = StructuralIdentity {
+                    logical_byte_length: output.logical.byte_length,
+                    line_count: output.logical.line_count,
+                    stored_byte_length: output.stored.byte_length,
+                };
+                StructuralDecoder::new(source, &expected, Some(expected.logical_byte_length))
+                    .map(LineDecoder::Structural)
+            }
+        }
+        .map_err(|error| format!("opening {}: {error}", path.display()))?;
         #[cfg(test)]
-        probe::opened(path);
+        probe::opened(path, mode);
         Ok(Self {
             path: path.to_path_buf(),
             reader: Some(BufReader::new(decoder)),
@@ -425,7 +506,6 @@ impl VerifiedLines {
             .expect("reader is open")
             .into_inner()
             .finish()
-            .map(|_| ())
             .map_err(|error| format!("verifying {}: {error}", self.path.display()))
     }
 }
@@ -492,9 +572,13 @@ pub(crate) mod probe {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    use super::ReadMode;
+
     thread_local! {
         static OPENS: RefCell<BTreeMap<String, u64>> = RefCell::default();
+        static HASHED_OPENS: RefCell<BTreeMap<String, u64>> = RefCell::default();
         static LINES: RefCell<BTreeMap<String, u64>> = RefCell::default();
+        static CANONICAL_CHECKS: RefCell<u64> = const { RefCell::new(0) };
     }
 
     fn name(path: &Path) -> String {
@@ -503,11 +587,30 @@ pub(crate) mod probe {
 
     pub(crate) fn reset() {
         OPENS.with(|counts| counts.borrow_mut().clear());
+        HASHED_OPENS.with(|counts| counts.borrow_mut().clear());
         LINES.with(|counts| counts.borrow_mut().clear());
+        CANONICAL_CHECKS.with(|count| *count.borrow_mut() = 0);
     }
 
-    pub(crate) fn opened(path: &Path) {
+    pub(crate) fn opened(path: &Path, mode: ReadMode) {
         OPENS.with(|counts| *counts.borrow_mut().entry(name(path)).or_default() += 1);
+        if mode == ReadMode::Audit {
+            HASHED_OPENS.with(|counts| *counts.borrow_mut().entry(name(path)).or_default() += 1);
+        }
+    }
+
+    /// One line decoded with a canonical re-encode equality check.
+    pub(crate) fn canonical_check() {
+        CANONICAL_CHECKS.with(|count| *count.borrow_mut() += 1);
+    }
+
+    /// Decoders that compute both SHA-256 identities over `file`.
+    pub(crate) fn hashed_opens(file: &str) -> u64 {
+        HASHED_OPENS.with(|counts| counts.borrow().get(file).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn canonical_checks() -> u64 {
+        CANONICAL_CHECKS.with(|count| *count.borrow())
     }
 
     pub(crate) fn line(path: &Path) {

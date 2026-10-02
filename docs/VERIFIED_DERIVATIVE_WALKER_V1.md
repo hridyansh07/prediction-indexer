@@ -116,23 +116,28 @@ commit; writing such a bundle is not this task.
    trust the original path's metadata as an identity or allocation size.
 3. Bind the private snapshot to the pinned receipt before open returns: strict
    canonical metadata, all repeated bindings, and address inputs, plus each
-   file's stored SHA-256 and exact length, hashed over the same bytes as they are
-   copied (exact expected lengths with an extra-byte check). No data file is
-   decoded before open returns.
+   data file's exact stored length while it is copied (exact expected length
+   with an extra-byte check). Data bytes are not re-hashed here; see
+   [Read-time integrity contract](#read-time-integrity-contract). No data file
+   is decoded before open returns.
 4. Decode only files in that private snapshot, each exactly once, during
-   traversal. One parsed record per line feeds every semantic check: canonical
-   JSON and closed line schemas, child order, exact reject provenance, one-to-one
+   traversal. One parsed record per line feeds every semantic check: closed
+   line schemas and versions, child order, exact reject provenance, one-to-one
    fault/reject pairing, one disposition per source, delivery/tie/lane/group
-   limits, coverage agreement, both logical identities, and one-frame EOF.
+   limits, coverage agreement, the structural frame identity (stored length,
+   decoded length and LF count), and one-frame EOF with its Zstandard checksum.
    Per-line checks run as a line is read, per-delivery checks before that
-   delivery is returned, and whole-window checks (identities, frame EOF, counts,
-   final tie run, coverage) at window EOF. Records may therefore be exposed
+   delivery is returned, and whole-window checks (frame identity, frame EOF,
+   counts, final tie run, coverage) at window EOF. Records may therefore be exposed
    before their window's verification completes; any later violation poisons
    the attempt, and only clean, fully checked EOF can finish. No verified
    handle is minted from a caller-supplied `VerifiedDerivative` value. Source
    replacement/deletion after snapshotting cannot change yielded records. A
-   concurrent source rewrite during copy either produces the pinned bytes or
-   fails verification; no automatic switch to a newer pin.
+   concurrent source rewrite during copy that changes a file's length fails
+   open; one that preserves length is caught only by the structural, frame and
+   semantic checks above, not by a digest (the installed directory is
+   operator-owned and hash-bound at install). There is no automatic switch to
+   a newer pin.
 5. Streaming traversal also checks decoder EOF/finish and poisons on errors.
    Snapshot lifetime is owned by the reader and cleaned on drop. Hard-crash
    residue is operational work, not a new root-wide cleanup feature. Do not
@@ -159,8 +164,9 @@ reservation or process-wide quota; concurrent readers need an external budget.
 
 Builds enforce the default verification limits while writing, and check a fresh
 candidate by re-hashing its staged files against the recorded identities rather
-than by re-decoding it; the full verifier described here still applies to every
-derivative a process did not just write. The limits are: 16 MiB
+than by re-decoding it; the full audit verifier (`verify_derivative`) still
+applies to an existing committed address and to every derivative installed from
+the archive (`--inspect-pin`). The limits are: 16 MiB
 per logical NDJSON line including LF, 1 MiB per metadata document, 64 MiB/100,000
 records per atomic group, and 1,024 lanes. Pinned inspection additionally limits
 combined receipt/manifest bytes to 1 MiB. These are operational limits, not new
@@ -172,11 +178,56 @@ create a private snapshot or impose the walker's selected-window/scope limits.
 Verification and traversal are one bounded-memory pass: every output is
 decompressed once, including excluded tails, and the delivery join shares each
 parsed record with the verifier. `verify_derivative` drains that same pass to
-clean EOF and returns a standalone verdict; callers that need a verdict before
-any use (an archive download, for example) still call it first. Errors
+clean EOF in its audit mode and returns a standalone verdict; callers that need
+a verdict before any use (an archive download, for example) still call it
+first. Errors
 remain diagnostic strings; callers must not classify retryability by matching
 text. Every error invalidates the attempt. Any retry creates a fresh walker with
 the same pins; no automatic retry policy is provided.
+
+## Read-time integrity contract
+
+Exact derivative bytes are bound to their pin by SHA-256 at install, not
+re-proved on every replay read:
+
+- **Install.** Replay installs a derivative into its local derivatives root
+  only after the materializer verified it (a fresh build) or the strict
+  `--inspect-pin` audit verified it (an archive download). A local copy is then
+  bound to its pin by `replay/jobs/bundle.py::_check_pinned_files`: the receipt
+  must hash to the pin and every other file must match the stored SHA-256 and
+  byte length the receipt records. A mismatch is `integrity_failure`.
+- **Replay read (`open_pinned`, and so `DerivativeWalker` and `replay-risk`).**
+  Open re-hashes only the bounded receipt (against the pin) and manifest
+  (against the receipt) and checks every metadata binding. It copies each data
+  file checking only its exact stored length, and decodes each file with the
+  shared codec's structural decoder: exactly one checksummed, dictionary-free
+  Zstandard frame, no truncation, no trailing or concatenated bytes, the frame
+  content checksum, the output bound, a final LF, and the recorded stored
+  length, decoded length and LF count. Each line is decoded once into its
+  final typed record (`SegmentRecord::from_json`, and the closed reject and
+  source-evidence types), which still rejects malformed JSON, trailing data,
+  unknown/duplicate/missing/reordered fields, unknown variants, unsupported
+  versions (before the header or event is interpreted) and every invalid
+  domain state. All ordering, pairing, provenance, tie, lane, limit, count and
+  coverage checks are unchanged. The read performs **no** SHA-256 over stored
+  or decoded data bytes and **no** decode/re-encode canonical comparison.
+- **Canonical encoding** is enforced where bytes are produced or first
+  accepted: the writer emits only `to_canonical_json` output under its build
+  checks, and the audit verifier proves it. The read relies on the install
+  binding for it, so a hash-bound, non-canonical spelling of valid records
+  would read as those records; the audit would reject it.
+- **On-demand audit (`verify_derivative`, behind `materialize_range
+  --inspect-pin`, and the existing-address no-op check).** Runs the same single
+  pass in its audit mode: both SHA-256 identities of every output and
+  decode/re-encode canonical equality of every line, in addition to every
+  check above. Use it whenever a derivative's bytes have not been hash-bound
+  by this contract, or to re-verify a local copy on demand.
+
+Consequently a digest-only disagreement (a receipt rebound to a wrong logical or
+stored digest over unchanged, valid bytes) is an install/audit finding, not a
+read failure. Same-length damage to a hash-bound file is caught by the frame
+checksum or a semantic check during traversal; as with every streaming
+failure, records may precede the error and the attempt cannot finish.
 
 ## Minimum version-coexistence mechanism
 
@@ -476,8 +527,11 @@ strategy result.
    repeated identity independently; reject wrong pins even when the artifact is
    otherwise self-consistent. No unreceipted-directory success.
 3. Codec corruption: truncation, concatenated frame, trailing byte, checksum,
-   logical SHA/length/LF count, stored SHA/length, missing final LF. Fail even when
-   corruption is wholly outside the requested interval/scope.
+   logical length/LF count, stored length, missing final LF. Fail even when
+   corruption is wholly outside the requested interval/scope. Logical and stored
+   SHA-256 mismatches are rejected by the install binding and the
+   `verify_derivative`/`--inspect-pin` audit, and are proved *not* to be
+   re-checked by the replay read (see the read-time integrity contract).
 4. Source union: accepted-many, rejected-pair, ignored-only; omitted and duplicate
    source sequence; reordered children; mismatched same-delivery headers; zero,
    gap, and overflow child indexes; reject/fault mismatch; rehashed count fraud.

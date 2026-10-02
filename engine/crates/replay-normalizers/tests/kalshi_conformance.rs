@@ -84,7 +84,17 @@ fn canonical_event_hashes(payload: &str, stream: &str, seq: u64) -> Vec<String> 
         .enumerate()
         .map(|(index, event)| {
             let record = segment_record(&source, index as u32, event).unwrap();
-            Sha256::digest(&record.to_canonical_json()).as_hex()
+            let json = record.to_canonical_json();
+            // The pinned replay read's single-pass decode yields the same record.
+            assert_eq!(
+                replay_domain::SegmentRecord::from_json(&json),
+                replay_domain::SegmentRecord::from_canonical_json(&json)
+            );
+            assert_eq!(
+                replay_domain::SegmentRecord::from_json(&json).unwrap(),
+                record
+            );
+            Sha256::digest(&json).as_hex()
         })
         .collect()
 }

@@ -747,8 +747,11 @@ the bundle cache's pin-inspection API.
    bundle receipt, and every other file must match the stored SHA-256 and byte
    length that derivative receipt records. A mismatch is `integrity_failure`;
    the local copy is neither repaired, rebuilt, nor deleted. Local derivatives
-   were fully verified when built or downloaded, and the walker's
-   `open_pinned` still fully verifies each pin at read time. Return
+   were fully verified when built or downloaded. This SHA-256 binding is the
+   read-time integrity root: the walker's `open_pinned` re-hashes only the
+   receipt and manifest and checks frames, lengths, LF counts, ordering and
+   line semantics without re-hashing data bytes or re-encoding lines (see
+   `VERIFIED_DERIVATIVE_WALKER_V1.md`, "Read-time integrity contract"). Return
    `BundleReady` with the ordered pins. A warm hit never invokes
    materialization.
 

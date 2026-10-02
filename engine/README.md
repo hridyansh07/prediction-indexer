@@ -98,9 +98,15 @@ impact classification selected before book state. Exact rejected bytes
 and parser error codes live in the committed reject sidecar, not this event.
 
 Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
-Struct field order and adjacent enum tags are schema. The strict reader rejects
+Struct field order and adjacent enum tags are schema. The strict reader
+(`SegmentRecord::from_canonical_json`, used by writers, audits and tests) rejects
 unknown fields/variants, unsupported versions, invalid domain states, alternate
 field order, and insignificant whitespace by decode/validate/re-encode equality.
+`SegmentRecord::from_json` is the pinned replay read's single-pass decode: it
+deserializes header and event directly into their final types, checks the
+version first, and rejects the same malformed, unknown, duplicate, reordered,
+unsupported and invalid inputs, but does not prove the canonical spelling; the
+pin's install-time SHA-256 binding does.
 Callers add an LF only when framing records as NDJSON; the LF is not part of one
 record's canonical JSON bytes.
 
@@ -215,9 +221,12 @@ See the walker's [profile-2 contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#i
 for address inputs, independent validation, and compatibility limits.
 
 All NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
-and carry logical and stored identities. The strict verifier checks canonical
-JSON, closed versions and fields, frame EOF and both identities, event/child
-order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
+and carry logical and stored identities. The strict audit verifier
+(`verify_derivative`) checks canonical JSON, closed versions and fields, frame
+EOF and both identities, event/child order, exact reject-envelope provenance,
+and one-to-one reject/fault pairing. The pinned replay read runs the same pass
+without the two SHA-256 identities and the canonical re-encode comparison; see
+[Read-time integrity contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#read-time-integrity-contract).
 
 Builds use unique private staging directories. While writing, a build applies
 the default reader's delivery-level checks to every source delivery it emits:
@@ -232,14 +241,15 @@ own output: the bytes are the ones the writer just produced under those checks.
 Only then do they atomically publish the uncommitted directory and
 write/fsync/rename the receipt last.
 
-The full strict verifier still runs everywhere a derivative was not written by
-the current process: an existing committed address (verify/no-op), pinned
-inspection, the walker's `open_pinned` (as one streaming pass during traversal;
-see below), and Replay's archive download path.
-Replay's bundle cache binds a derivative already installed in its local
-derivatives root to its pin by receipt hash and per-file stored identities
-rather than re-inspecting it; a pinned read still verifies every byte before it
-can finish.
+The full strict audit verifier runs on an existing committed address
+(verify/no-op) and through `materialize_range --inspect-pin`, which Replay's
+archive download path calls and an operator can run on demand. Replay's bundle cache binds a derivative already
+installed in its local derivatives root to its pin by receipt hash and per-file
+stored SHA-256 identities rather than re-inspecting it. The walker's
+`open_pinned` relies on that binding: it re-hashes the receipt and manifest,
+then checks every frame, length, LF count, ordering, pairing and line schema in
+one streaming pass during traversal, without re-hashing data bytes or
+re-encoding lines (see below).
 The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
 lock from before stage creation through publication and cleanup; process death
 releases it. Builds of the same address serialize, while different addresses can
@@ -266,13 +276,17 @@ different bytes at the same address are an immutable conflict.
 defines the reviewed contract and acceptance cases.
 
 - `replay-materialize::{inspect_pinned, open_pinned}` binds the caller's exact
-  `DerivativePin` to receipt, manifest, addressed directory, and compressed data.
-  Open copies a private bounded per-window snapshot, hashing each file as it is
-  copied against the receipt's stored identity, and decodes nothing. Traversal
-  then decodes each file once and applies every semantic check to the records
-  it reads, so records may stream before the window's verification completes;
+  `DerivativePin` to receipt and manifest by SHA-256, and to the addressed
+  directory and the receipt's stored lengths. Open copies a private bounded
+  per-window snapshot, checking each file's exact stored length as it is
+  copied, and decodes nothing. Traversal then decodes each file once with the
+  codec's structural decoder (one checksummed frame, no trailing bytes, exact
+  stored/decoded lengths and LF count; no SHA-256), parses each line once into
+  its final typed record, and applies every semantic check to the records it
+  reads, so records may stream before the window's verification completes;
   any violation poisons the attempt, and nothing is complete until `finish()`.
-  Source replacement cannot change the verified stream.
+  Source replacement cannot change the snapshotted stream. Data-byte digests
+  and canonical encoding are proved at install and by `verify_derivative`.
 - `replay-tape::DerivativeWalker::open` takes explicit pins, requested bounds,
   `ScopeFilter { instruments, lanes }`, `ReadLimits`, and a required
   `LowerBoundPolicy` with no default. It orders adjacent windows and validates

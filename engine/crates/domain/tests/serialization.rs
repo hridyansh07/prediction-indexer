@@ -329,6 +329,100 @@ fn direct_record_decode_preserves_duplicate_field_rejection() {
 }
 
 #[test]
+fn single_pass_decode_equals_the_strict_decode() {
+    let canonical = record().to_canonical_json();
+    assert_eq!(SegmentRecord::from_json(&canonical).unwrap(), record());
+    assert_eq!(
+        SegmentRecord::from_json(&canonical),
+        SegmentRecord::from_canonical_json(&canonical)
+    );
+    // The single pass proves structure and domain validity, not the encoding:
+    // a pin's SHA-256 binding does that. Insignificant whitespace decodes to
+    // the same record the strict path rejects as non-canonical.
+    let with_newline = [canonical.clone(), b"\n".to_vec()].concat();
+    assert_eq!(SegmentRecord::from_json(&with_newline).unwrap(), record());
+    assert_eq!(
+        SegmentRecord::from_canonical_json(&with_newline),
+        Err(DomainError::NonCanonicalEncoding)
+    );
+}
+
+#[test]
+fn single_pass_decode_rejects_malformed_unknown_and_invalid_records() {
+    let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
+    let header_start = canonical.find("\"header\"").unwrap();
+    let event_start = canonical.find(",\"event\"").unwrap();
+    let header_field = &canonical[header_start..event_start];
+    let cases = [
+        // malformed JSON and trailing data
+        canonical[..canonical.len() - 1].to_owned(),
+        format!("{canonical}x"),
+        format!("{canonical}{canonical}"),
+        "[3]".to_owned(),
+        String::new(),
+        // unknown, reordered, duplicate and missing top-level fields
+        canonical.replacen(
+            "{\"schema_version\":3",
+            "{\"unknown\":0,\"schema_version\":3",
+            1,
+        ),
+        canonical.replacen("}}}}}", "}}}},\"unknown\":0}", 1),
+        canonical.replacen(
+            &format!("\"schema_version\":3,{header_field}"),
+            &format!("{header_field},\"schema_version\":3"),
+            1,
+        ),
+        canonical.replacen("}}}}}", &(String::from("}}}},") + header_field + "}"), 1),
+        canonical[..event_start].to_owned() + "}",
+        // unknown nested fields and variants, duplicate nested field
+        canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
+        canonical.replacen("\"kind\":\"delta\"", "\"kind\":\"replace\"", 1),
+        canonical.replacen("\"kind\":\"decrease\"", "\"kind\":\"shift\"", 1),
+        canonical.replacen("\"atoms\":5100", "\"atoms\":5100,\"float\":0.51", 1),
+        canonical.replacen(
+            "\"continuity\":\"continuous\"",
+            "\"continuity\":\"guessed\"",
+            1,
+        ),
+        canonical.replacen(
+            "\"canonical_seq\":42",
+            "\"canonical_seq\":42,\"canonical_seq\":42",
+            1,
+        ),
+        // invalid domain states
+        canonical.replacen("\"atoms\":5100", "\"atoms\":-1", 1),
+        canonical.replacen("\"atoms\":250", "\"atoms\":0", 1),
+        canonical.replacen("\"atoms\":250", "\"atoms\":9223372036854775808", 1),
+        canonical.replacen("\"canonical_seq\":42", "\"canonical_seq\":0", 1),
+        canonical.replacen("\"visible_ns\":1785409600000000000", "\"visible_ns\":1", 1),
+    ];
+    for invalid in cases {
+        assert_ne!(invalid, canonical);
+        assert!(
+            SegmentRecord::from_json(invalid.as_bytes()).is_err(),
+            "accepted {invalid}"
+        );
+        assert!(
+            SegmentRecord::from_canonical_json(invalid.as_bytes()).is_err(),
+            "strict accepted {invalid}"
+        );
+    }
+    // The version is checked before the header or event is interpreted.
+    let future = canonical
+        .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
+        .replacen("\"canonical_seq\":42", "\"canonical_seq\":0", 1);
+    assert_eq!(
+        SegmentRecord::from_json(future.as_bytes()),
+        Err(DomainError::UnsupportedSchemaVersion(4))
+    );
+    let future = canonical.replacen("\"schema_version\":3", "\"schema_version\":99", 1);
+    assert_eq!(
+        SegmentRecord::from_json(future.as_bytes()),
+        Err(DomainError::UnsupportedSchemaVersion(99))
+    );
+}
+
+#[test]
 fn side_orientation_and_absolute_relative_semantics_stay_distinct() {
     let decoded = SegmentRecord::from_canonical_json(&record().to_canonical_json()).unwrap();
     let SegmentEvent::Book(BookEvent::Delta(delta)) = decoded.event() else {

@@ -401,9 +401,11 @@ def _check_pinned_files(directory: Path, receipt_sha256: str, label: str) -> int
     other file must match the stored hash and length that receipt lists. A
     derivative only reaches a local directory after the materializer verified
     it (a fresh build) or `--inspect-pin` verified it (an archive download),
-    so this proves the directory still holds those exact verified bytes. The
-    walker's `open_pinned` still fully verifies at read time. Returns the
-    directory's total byte length.
+    so this proves the directory still holds those exact verified bytes. This
+    SHA-256 binding is what the walker's `open_pinned` relies on: the replay
+    read re-hashes only the receipt and manifest, then checks Zstandard frames,
+    exact lengths, LF counts, ordering and line semantics without re-hashing
+    data bytes. Returns the directory's total byte length.
     """
     try:
         entries = {entry.name: entry for entry in os.scandir(directory)}

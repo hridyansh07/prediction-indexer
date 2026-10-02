@@ -148,20 +148,32 @@ pub fn encoder_version() -> String {
     )
 }
 
-#[derive(Default)]
+/// Byte length, LF count and (when hashing) SHA-256 of decoded or accepted
+/// NDJSON. A structural counter skips the digest and measures only the rest.
 struct LogicalCounter {
-    digest: Sha256,
+    digest: Option<Sha256>,
     byte_length: u64,
     line_count: u64,
     last_byte: Option<u8>,
 }
 
 impl LogicalCounter {
+    fn new(hash: bool) -> Self {
+        Self {
+            digest: hash.then(Sha256::new),
+            byte_length: 0,
+            line_count: 0,
+            last_byte: None,
+        }
+    }
+
     fn observe(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        self.digest.update(bytes);
+        if let Some(digest) = &mut self.digest {
+            digest.update(bytes);
+        }
         self.byte_length += bytes.len() as u64;
         self.line_count += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
         self.last_byte = bytes.last().copied();
@@ -171,9 +183,15 @@ impl LogicalCounter {
         self.byte_length == 0 || self.last_byte == Some(b'\n')
     }
 
+    /// Only hashing counters have an identity; structural ones never call this.
     fn identity(self) -> LogicalIdentity {
         LogicalIdentity {
-            sha256: format!("{:x}", self.digest.finalize()),
+            sha256: format!(
+                "{:x}",
+                self.digest
+                    .expect("logical identity requires a hashing counter")
+                    .finalize()
+            ),
             byte_length: self.byte_length,
             line_count: self.line_count,
         }
@@ -224,20 +242,21 @@ impl<W: Write> Write for HashingWriter<W> {
 /// byte, four dictionary-ID bytes and eight content-size bytes.
 const MAX_FRAME_HEADER_BYTES: usize = 18;
 
-/// Counts and hashes every compressed byte the decoder pulls from the source,
-/// keeping the first few so the frame header can be inspected after the fact.
+/// Counts (and, when hashing, hashes) every compressed byte the decoder pulls
+/// from the source, keeping the first few so the frame header can be inspected
+/// after the fact.
 struct HashingReader<R: Read> {
     inner: R,
-    digest: Sha256,
+    digest: Option<Sha256>,
     byte_length: u64,
     header: Vec<u8>,
 }
 
 impl<R: Read> HashingReader<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, hash: bool) -> Self {
         Self {
             inner,
-            digest: Sha256::new(),
+            digest: hash.then(Sha256::new),
             byte_length: 0,
             header: Vec::with_capacity(MAX_FRAME_HEADER_BYTES),
         }
@@ -252,7 +271,9 @@ impl<R: Read> HashingReader<R> {
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buffer)?;
-        self.digest.update(&buffer[..read]);
+        if let Some(digest) = &mut self.digest {
+            digest.update(&buffer[..read]);
+        }
         self.byte_length += read as u64;
         if self.header.len() < MAX_FRAME_HEADER_BYTES {
             let wanted = MAX_FRAME_HEADER_BYTES - self.header.len();
@@ -286,7 +307,7 @@ impl<W: Write> StreamingEncoder<W> {
             .map_err(|error| CodecError::Compression(error.to_string()))?;
         Ok(Self {
             encoder,
-            logical: LogicalCounter::default(),
+            logical: LogicalCounter::new(true),
         })
     }
 
@@ -321,41 +342,35 @@ impl<W: Write> Write for StreamingEncoder<W> {
     }
 }
 
-/// A bounded incremental decoder for consumers that must inspect canonical
-/// evidence without materializing a decoded copy on disk.
-///
-/// `Read` never returns bytes beyond `max_decoded_bytes`. [`finish`](Self::finish)
-/// drains any unread payload, rejects trailing frames/bytes, and verifies both
-/// identities. Callers must not trust bytes read before `finish` succeeds.
-pub struct StreamingDecoder<R: Read> {
+/// The frame-walking, bounded, poisoning decode shared by [`StreamingDecoder`]
+/// and [`StructuralDecoder`]. It hashes only when its owner compares digests.
+struct DecoderCore<R: Read> {
     decoder: Option<zstd::stream::read::Decoder<'static, std::io::BufReader<HashingReader<R>>>>,
     logical: LogicalCounter,
-    expected_logical: LogicalIdentity,
-    expected_stored: Option<StoredIdentity>,
     limit: u64,
     eof: bool,
     error: Option<CodecError>,
     header_checked: bool,
 }
 
-impl<R: Read> StreamingDecoder<R> {
-    pub fn new(
-        source: R,
-        expected_logical: &LogicalIdentity,
-        expected_stored: Option<&StoredIdentity>,
-        max_decoded_bytes: Option<u64>,
-    ) -> Result<Self, CodecError> {
-        let hashing = HashingReader::new(source);
+/// What [`DecoderCore::close`] measured over one complete, single frame.
+struct Measured {
+    logical: LogicalCounter,
+    stored_digest: Option<Sha256>,
+    stored_byte_length: u64,
+}
+
+impl<R: Read> DecoderCore<R> {
+    fn new(source: R, hash: bool, limit: u64) -> Result<Self, CodecError> {
+        let hashing = HashingReader::new(source, hash);
         let buffered = std::io::BufReader::with_capacity(DECODE_INPUT_BYTES, hashing);
         let decoder = zstd::stream::read::Decoder::with_buffer(buffered)
             .map_err(|error| CodecError::Compression(error.to_string()))?
             .single_frame();
         Ok(Self {
             decoder: Some(decoder),
-            logical: LogicalCounter::default(),
-            expected_logical: expected_logical.clone(),
-            expected_stored: expected_stored.cloned(),
-            limit: max_decoded_bytes.unwrap_or(expected_logical.byte_length),
+            logical: LogicalCounter::new(hash),
+            limit,
             eof: false,
             error: None,
             header_checked: false,
@@ -367,7 +382,27 @@ impl<R: Read> StreamingDecoder<R> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
     }
 
-    pub fn finish(mut self) -> Result<DecodeResult, CodecError> {
+    fn check_header(&mut self) -> std::io::Result<()> {
+        if self.header_checked {
+            return Ok(());
+        }
+        let header = self
+            .decoder
+            .as_ref()
+            .expect("decoder exists")
+            .get_ref()
+            .get_ref()
+            .header_bytes();
+        if let Err(error) = check_frame_header(header) {
+            return Err(self.remember(error));
+        }
+        self.header_checked = true;
+        Ok(())
+    }
+
+    /// Drains any unread payload and rejects trailing frames/bytes. Comparing
+    /// identities is the owner's job; this proves only one complete frame.
+    fn close(mut self) -> Result<Measured, CodecError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -388,25 +423,15 @@ impl<R: Read> StreamingDecoder<R> {
             return Err(CodecError::TrailingBytes);
         }
         let hashing = buffered.into_inner();
-        let stored = StoredIdentity {
-            sha256: format!("{:x}", hashing.digest.finalize()),
-            byte_length: hashing.byte_length,
-        };
-        verify_stored(&stored, self.expected_stored.as_ref())?;
-
-        if !self.logical.ends_in_newline() {
-            return Err(CodecError::MissingTrailingNewline);
-        }
-        let decoded = self.logical.identity();
-        verify_logical(&decoded, &self.expected_logical)?;
-        Ok(DecodeResult {
-            logical: decoded,
-            stored,
+        Ok(Measured {
+            logical: self.logical,
+            stored_digest: hashing.digest,
+            stored_byte_length: hashing.byte_length,
         })
     }
 }
 
-impl<R: Read> Read for StreamingDecoder<R> {
+impl<R: Read> Read for DecoderCore<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if buffer.is_empty() || self.eof {
             return Ok(0);
@@ -423,19 +448,7 @@ impl<R: Read> Read for StreamingDecoder<R> {
                 .as_mut()
                 .expect("decoder exists")
                 .read(&mut probe);
-            if !self.header_checked {
-                let header = self
-                    .decoder
-                    .as_ref()
-                    .expect("decoder exists")
-                    .get_ref()
-                    .get_ref()
-                    .header_bytes();
-                if let Err(error) = check_frame_header(header) {
-                    return Err(self.remember(error));
-                }
-                self.header_checked = true;
-            }
+            self.check_header()?;
             return match outcome {
                 Ok(0) => {
                     self.eof = true;
@@ -458,19 +471,7 @@ impl<R: Read> Read for StreamingDecoder<R> {
             .as_mut()
             .expect("decoder exists")
             .read(&mut buffer[..allowed]);
-        if !self.header_checked {
-            let header = self
-                .decoder
-                .as_ref()
-                .expect("decoder exists")
-                .get_ref()
-                .get_ref()
-                .header_bytes();
-            if let Err(error) = check_frame_header(header) {
-                return Err(self.remember(error));
-            }
-            self.header_checked = true;
-        }
+        self.check_header()?;
         match outcome {
             Ok(0) => {
                 self.eof = true;
@@ -485,6 +486,146 @@ impl<R: Read> Read for StreamingDecoder<R> {
                 Err(self.remember(error))
             }
         }
+    }
+}
+
+/// A bounded incremental decoder for consumers that must inspect canonical
+/// evidence without materializing a decoded copy on disk.
+///
+/// `Read` never returns bytes beyond `max_decoded_bytes`. [`finish`](Self::finish)
+/// drains any unread payload, rejects trailing frames/bytes, and verifies both
+/// identities. Callers must not trust bytes read before `finish` succeeds.
+pub struct StreamingDecoder<R: Read> {
+    core: DecoderCore<R>,
+    expected_logical: LogicalIdentity,
+    expected_stored: Option<StoredIdentity>,
+}
+
+impl<R: Read> StreamingDecoder<R> {
+    pub fn new(
+        source: R,
+        expected_logical: &LogicalIdentity,
+        expected_stored: Option<&StoredIdentity>,
+        max_decoded_bytes: Option<u64>,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            core: DecoderCore::new(
+                source,
+                true,
+                max_decoded_bytes.unwrap_or(expected_logical.byte_length),
+            )?,
+            expected_logical: expected_logical.clone(),
+            expected_stored: expected_stored.cloned(),
+        })
+    }
+
+    pub fn finish(self) -> Result<DecodeResult, CodecError> {
+        let measured = self.core.close()?;
+        let stored = StoredIdentity {
+            sha256: format!(
+                "{:x}",
+                measured
+                    .stored_digest
+                    .expect("a streaming decoder always hashes")
+                    .finalize()
+            ),
+            byte_length: measured.stored_byte_length,
+        };
+        verify_stored(&stored, self.expected_stored.as_ref())?;
+
+        if !measured.logical.ends_in_newline() {
+            return Err(CodecError::MissingTrailingNewline);
+        }
+        let decoded = measured.logical.identity();
+        verify_logical(&decoded, &self.expected_logical)?;
+        Ok(DecodeResult {
+            logical: decoded,
+            stored,
+        })
+    }
+}
+
+impl<R: Read> Read for StreamingDecoder<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.core.read(buffer)
+    }
+}
+
+/// The lengths and LF count a [`StructuralDecoder`] checks, without digests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuralIdentity {
+    pub logical_byte_length: u64,
+    pub line_count: u64,
+    pub stored_byte_length: u64,
+}
+
+/// A [`StreamingDecoder`] that computes no SHA-256 over either side.
+///
+/// It keeps every frame rule: exactly one checksummed, dictionary-free frame,
+/// no truncation, no trailing or concatenated bytes, the Zstandard content
+/// checksum, the output bound, a final LF, and the stored length, decoded
+/// length and LF count. It does **not** prove which bytes were committed, so it
+/// is only for a consumer whose exact stored bytes were already bound to their
+/// receipt by SHA-256 at an earlier boundary: the Replay pinned-derivative
+/// read, whose local copy is hash-bound when it is installed. Archive,
+/// finalizer and audit decodes use [`StreamingDecoder`].
+pub struct StructuralDecoder<R: Read> {
+    core: DecoderCore<R>,
+    expected: StructuralIdentity,
+}
+
+impl<R: Read> StructuralDecoder<R> {
+    pub fn new(
+        source: R,
+        expected: &StructuralIdentity,
+        max_decoded_bytes: Option<u64>,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            core: DecoderCore::new(
+                source,
+                false,
+                max_decoded_bytes.unwrap_or(expected.logical_byte_length),
+            )?,
+            expected: expected.clone(),
+        })
+    }
+
+    /// Same checks and failure order as [`StreamingDecoder::finish`], minus
+    /// the two digest comparisons.
+    pub fn finish(self) -> Result<StructuralIdentity, CodecError> {
+        let measured = self.core.close()?;
+        if measured.stored_byte_length != self.expected.stored_byte_length {
+            return Err(CodecError::IdentityMismatch(format!(
+                "stored byte length {} is not the expected {}",
+                measured.stored_byte_length, self.expected.stored_byte_length
+            )));
+        }
+        if !measured.logical.ends_in_newline() {
+            return Err(CodecError::MissingTrailingNewline);
+        }
+        if measured.logical.byte_length != self.expected.logical_byte_length {
+            return Err(CodecError::IdentityMismatch(format!(
+                "decoded byte length {} is not the expected {}",
+                measured.logical.byte_length, self.expected.logical_byte_length
+            )));
+        }
+        if measured.logical.line_count != self.expected.line_count {
+            return Err(CodecError::IdentityMismatch(format!(
+                "decoded line count {} is not the expected {}",
+                measured.logical.line_count, self.expected.line_count
+            )));
+        }
+        Ok(StructuralIdentity {
+            logical_byte_length: measured.logical.byte_length,
+            line_count: measured.logical.line_count,
+            stored_byte_length: measured.stored_byte_length,
+        })
+    }
+}
+
+impl<R: Read> Read for StructuralDecoder<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.core.read(buffer)
     }
 }
 
@@ -528,6 +669,7 @@ pub fn decode_stream<R: Read, W: Write>(
         StreamingDecoder::new(source, expected_logical, expected_stored, max_decoded_bytes)?;
     std::io::copy(&mut decoder, &mut sink).map_err(|error| {
         decoder
+            .core
             .error
             .take()
             .unwrap_or_else(|| CodecError::Io(error.to_string()))
@@ -579,7 +721,7 @@ fn verify_logical(decoded: &LogicalIdentity, expected: &LogicalIdentity) -> Resu
 
 /// Digest, length and LF count of a stream, without compressing it.
 pub fn logical_identity_of<R: Read>(mut source: R) -> Result<LogicalIdentity, CodecError> {
-    let mut logical = LogicalCounter::default();
+    let mut logical = LogicalCounter::new(true);
     let mut buffer = vec![0_u8; DEFAULT_BUFFER_BYTES];
     loop {
         let read = source.read(&mut buffer)?;

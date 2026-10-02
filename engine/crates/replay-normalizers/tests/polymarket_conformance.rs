@@ -118,11 +118,19 @@ fn frozen_branch_behavior_corpus() {
                 match result {
                     Normalization::Events(events) => {
                         for (index, event) in events.into_iter().enumerate() {
-                            transcript.extend(
-                                segment_record(&input, index as u32, event)
-                                    .unwrap()
-                                    .to_canonical_json(),
+                            let record = segment_record(&input, index as u32, event).unwrap();
+                            let json = record.to_canonical_json();
+                            // The pinned replay read's single-pass decode
+                            // yields the same record as the strict decode.
+                            assert_eq!(
+                                replay_domain::SegmentRecord::from_json(&json),
+                                replay_domain::SegmentRecord::from_canonical_json(&json)
                             );
+                            assert_eq!(
+                                replay_domain::SegmentRecord::from_json(&json).unwrap(),
+                                record
+                            );
+                            transcript.extend(json);
                         }
                     }
                     other => transcript.extend(format!("{other:?}").bytes()),
