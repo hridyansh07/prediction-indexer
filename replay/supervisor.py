@@ -314,7 +314,7 @@ def validate(config):
     Decoder(t["run_id"], "validation", expected, t["max_entry_bytes"]).apply(
         json.dumps(
             {
-                "version": "1",
+                "version": "2",
                 "run_id": t["run_id"],
                 "attempt_id": "validation",
                 "sequence": "0",

@@ -105,8 +105,14 @@ impl CandidateLimits {
         {
             return Err("source delivery index repeats or decreases within lane".into());
         }
-        self.min_visible_ns = Some(self.min_visible_ns.map_or(h.visible_ns(), |v| v.min(h.visible_ns())));
-        self.max_visible_ns = Some(self.max_visible_ns.map_or(h.visible_ns(), |v| v.max(h.visible_ns())));
+        self.min_visible_ns = Some(
+            self.min_visible_ns
+                .map_or(h.visible_ns(), |v| v.min(h.visible_ns())),
+        );
+        self.max_visible_ns = Some(
+            self.max_visible_ns
+                .map_or(h.visible_ns(), |v| v.max(h.visible_ns())),
+        );
         if let Some(p) = &self.previous {
             if p.address().canonical_seq().checked_add(1) != Some(h.address().canonical_seq()) {
                 return Err("source canonical sequence is not dense".into());
@@ -135,7 +141,11 @@ impl CandidateLimits {
             self.run_records = 0;
         }
         if h.visible_tie_group().is_some() {
-            add_size(&mut self.run_bytes, logical_bytes, self.limits.max_group_bytes)?;
+            add_size(
+                &mut self.run_bytes,
+                logical_bytes,
+                self.limits.max_group_bytes,
+            )?;
             add_size(
                 &mut self.run_records,
                 record_count,
@@ -209,8 +219,16 @@ impl CandidateLimits {
     /// pinned inspection, their combined limit.
     pub(crate) fn metadata(&self, manifest: &[u8], receipt: &[u8]) -> Result<(), String> {
         let mut combined = 0;
-        add_size(&mut combined, manifest.len() as u64, self.limits.max_metadata_bytes)?;
-        add_size(&mut combined, receipt.len() as u64, self.limits.max_metadata_bytes)
+        add_size(
+            &mut combined,
+            manifest.len() as u64,
+            self.limits.max_metadata_bytes,
+        )?;
+        add_size(
+            &mut combined,
+            receipt.len() as u64,
+            self.limits.max_metadata_bytes,
+        )
     }
 }
 

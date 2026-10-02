@@ -379,7 +379,10 @@ mod tests {
         }
         // 200 inserted: the second drain at 200 accepted 0 (FULL), so it is
         // deferred; a non-blocking FULL is not a wait.
-        assert_eq!(b.sink.calls, vec![(0, 100, false, 100), (100, 100, false, 0)]);
+        assert_eq!(
+            b.sink.calls,
+            vec![(0, 100, false, 100), (100, 100, false, 0)]
+        );
         assert_eq!(b.stats().waits, QueueWaits::default());
         for s in 200..224 {
             b.insert(entry(s)).unwrap();

@@ -122,9 +122,7 @@ impl StreamSink for RedisSink {
         let flag = if terminal { "1" } else { "0" };
         let reply: redis::Value = self.eval(&["append", &previous, &id, flag], entries)?;
         match reply {
-            redis::Value::Int(n) if n >= 0 && (n as u64) <= entries.len() as u64 => {
-                Ok(n as usize)
-            }
+            redis::Value::Int(n) if n >= 0 && (n as u64) <= entries.len() as u64 => Ok(n as usize),
             _ => Err(Error::Protocol("append reply".into())),
         }
     }

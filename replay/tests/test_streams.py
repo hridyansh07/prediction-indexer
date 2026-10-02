@@ -312,7 +312,8 @@ class ProtocolTests(unittest.TestCase):
             ("sequence", "4"),
             ("sequence", "2"),
             ("sequence", "03"),
-            ("version", "2"),
+            ("version", "1"),
+            ("version", "3"),
             ("run_id", "other"),
             ("attempt_id", "other"),
             ("kind", "initial"),
@@ -484,7 +485,7 @@ class InPlaceBook:
         return self.decoder.apply(
             encoded(
                 {
-                    "version": "1",
+                    "version": "2",
                     "run_id": "r",
                     "attempt_id": "a",
                     "sequence": str(self.decoder.sequence + 1),
@@ -541,6 +542,20 @@ class InPlaceBook:
 
 
 class InPlaceBookTests(unittest.TestCase):
+    def test_a_wire_version_1_record_is_rejected(self):
+        h = InPlaceBook(4)
+        decoder = Decoder("r", "a", h.initial, 1048576)
+        record = {
+            "version": "1",
+            "run_id": "r",
+            "attempt_id": "a",
+            "sequence": "0",
+            "kind": "initial",
+            "body": h.initial,
+        }
+        with self.assertRaisesRegex(ProtocolError, "identity/version"):
+            decoder.apply(encoded(record))
+
     def test_level_operations_best_and_limits(self):
         for scale in (4, 6):  # dense array, then sparse dict
             with self.subTest(scale=scale):

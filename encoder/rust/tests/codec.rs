@@ -4,6 +4,7 @@
 //! that the codec refuses it. A decoder that merely happens to fail on today's
 //! corrupt input is not the same as one that cannot be made to succeed on one.
 
+use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -281,6 +282,7 @@ fn structural_of(frame: &[u8], logical: &LogicalIdentity) -> StructuralIdentity 
         logical_byte_length: logical.byte_length,
         line_count: logical.line_count,
         stored_byte_length: frame.len() as u64,
+        stored_sha256: format!("{:x}", Sha256::digest(frame)),
     }
 }
 
@@ -392,6 +394,7 @@ fn the_structural_decoder_keeps_every_frame_rule() {
                 logical_byte_length: 7,
                 line_count: 1,
                 stored_byte_length: unterminated.len() as u64,
+                stored_sha256: format!("{:x}", Sha256::digest(&unterminated)),
             },
             None
         )
@@ -401,9 +404,10 @@ fn the_structural_decoder_keeps_every_frame_rule() {
 }
 
 #[test]
-fn the_structural_decoder_computes_no_digest() {
+fn the_structural_decoder_rejects_a_same_length_forged_frame() {
     // Same lengths and LF count, different bytes: only a digest tells them
-    // apart. The structural decoder accepts it; the identity decoder does not.
+    // apart. The structural decoder hashes the stored frame, so it rejects the
+    // forgery even though it never hashes the decoded bytes.
     let (original, logical, stored) = encode(b"one\ntwo\n");
     let (forged, _, _) = encode(b"six\nten\n");
     assert_eq!(
@@ -412,9 +416,13 @@ fn the_structural_decoder_computes_no_digest() {
         "fixture keeps the stored length"
     );
     let expected = structural_of(&original, &logical);
+    assert!(matches!(
+        decode_structural(&forged, &expected, None).expect_err("stored digest"),
+        CodecError::IdentityMismatch(_)
+    ));
     assert_eq!(
-        decode_structural(&forged, &expected, None).expect("structure only"),
-        b"six\nten\n"
+        decode_structural(&original, &expected, None).expect("original"),
+        b"one\ntwo\n"
     );
     assert!(matches!(
         decode(&forged, &logical, Some(&stored), None).expect_err("digests"),

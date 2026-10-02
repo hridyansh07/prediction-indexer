@@ -48,14 +48,16 @@ JSON keys are rejected. Unknown versions or variants abort, never get skipped.
 These are **publisher** obligations. The stream consumer enforces them fully only
 for the `initial` record; cut records are checked by the O(1) guard set below.
 
-Envelope: `{version:"1", run_id, attempt_id, sequence, kind, body}`.
+Envelope: `{version:"2", run_id, attempt_id, sequence, kind, body}`.
 
-`control_events` is an accepted post-baseline V1 lockstep extension. The publisher
-and every strict consumer for an attempt must be deployed together. A baseline V1
-consumer intentionally fails closed when a cut contains this field; mixed-version
-operation and rollback to that consumer across this boundary are unsupported. This
-is retained as V1 because the fixed publisher and consumers ship in one image and
-attempt streams are ephemeral rather than durable interchange artifacts.
+**Wire version "2".** Version `"2"` replaces the original `"1"` wire. It adds the
+optional cut field `control_events`, the terminal `books_sha256`, and the
+stream-path amendment below (batched appends, reduced decoder guard set). A
+version-2 consumer rejects a version-1 record and a version-1 consumer rejects a
+version-2 record at the envelope check, so a mismatched publisher and consumer fail
+on the first record with an explicit version error instead of later on a closed
+schema. Publisher and consumers still ship in one image and attempt streams are
+ephemeral, so no cross-version reading is provided.
 
 - `initial`, sequence 0: `pins` (`derivative_address`, `receipt_sha256`),
   `start_ns`, `end_ns`, `lower_bound`, `plans`, `groups`, `max_entry_bytes`,
@@ -90,12 +92,12 @@ attempt streams are ephemeral rather than durable interchange artifacts.
   poll, producer process exit, nor the last data cut is terminal. Missing tail
   cannot pass `finish()`. `books_sha256` is the final-book digest defined below.
 
-### Stream-path amendment (lockstep, still wire version "1")
+### Stream-path amendment (part of wire version "2")
 
-The hot path was trimmed for throughput. Like `control_events`, this is a lockstep
-V1 amendment: the Rust publisher, `attempt.lua`, and every Python consumer ship in
-one image; mixing a pre-amendment publisher or consumer with this one is unsupported
-(the old terminal `{cuts}` and the new `{cuts, books_sha256}` reject each other).
+The hot path was trimmed for throughput. Together with `control_events` this is
+what wire version `"2"` means: the Rust publisher, `attempt.lua`, and every Python
+consumer ship in one image, and a version-1 publisher or consumer is rejected at the
+envelope version check.
 
 **Decoder guard set.** Each record is size-checked against `max_entry_bytes` and
 parsed with plain `json.loads` (no duplicate-key or constant hooks). The decoder
@@ -196,8 +198,8 @@ last entry (the terminal record) was appended. It returns the appended count as
 an integer reply. `0` is the non-error FULL reply: nothing is written (no XADD,
 byte, size or `published` change, and no poison). The `poisoned` check runs before
 the size checks, so a poisoned attempt still stops a waiting publisher. The
-single-entry `publish` operation was replaced by `append` (lockstep, like the
-stream-path amendment below; the fake test publisher uses one-entry runs).
+single-entry `publish` operation was replaced by `append` (part of wire version
+`"2"`; the fake test publisher uses one-entry runs).
 
 **Publisher buffering.** `PublishBuffer<S: StreamSink>` owns every backend write
 of the Rust publisher; `RedisSink` is the Redis/Lua adapter behind the

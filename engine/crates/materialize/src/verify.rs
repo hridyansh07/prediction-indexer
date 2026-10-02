@@ -398,7 +398,7 @@ fn verify_reject_source(record: &RejectRecord) -> Result<(), String> {
 }
 
 /// The shared codec's decoder for one output: identity-checking (both
-/// SHA-256 digests) for `Audit`, structural (no digests) for `PinnedReplay`.
+/// SHA-256 digests) for `Audit`, stored-digest only for `PinnedReplay`.
 /// Both enforce the identical frame, length and LF-count rules.
 enum LineDecoder {
     Identity(StreamingDecoder<File>),
@@ -458,6 +458,7 @@ impl VerifiedLines {
                     logical_byte_length: output.logical.byte_length,
                     line_count: output.logical.line_count,
                     stored_byte_length: output.stored.byte_length,
+                    stored_sha256: output.stored.sha256.as_hex(),
                 };
                 StructuralDecoder::new(source, &expected, Some(expected.logical_byte_length))
                     .map(LineDecoder::Structural)

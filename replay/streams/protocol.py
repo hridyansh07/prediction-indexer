@@ -504,7 +504,7 @@ class Decoder:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)
         require(
-            r["version"] == "1"
+            r["version"] == "2"
             and r["run_id"] == self.run_id
             and r["attempt_id"] == self.attempt_id,
             "identity/version",

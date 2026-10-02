@@ -121,7 +121,7 @@ class Harness:
         cut = self.decoder.apply(
             encoded(
                 {
-                    "version": "1",
+                    "version": "2",
                     "run_id": "coverage-test",
                     "attempt_id": self.context["attempt_id"],
                     "sequence": str(self.seq),

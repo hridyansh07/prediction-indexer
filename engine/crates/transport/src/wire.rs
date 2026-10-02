@@ -162,11 +162,7 @@ pub fn books_sha256(engine: &RiskEngine) -> String {
             .as_bytes(),
         );
     }
-    digest
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    format!("{:x}", digest.finalize())
 }
 fn join<'a>(levels: impl Iterator<Item = (&'a i64, &'a u64)>) -> String {
     levels

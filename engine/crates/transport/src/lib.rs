@@ -304,9 +304,7 @@ impl<S: StreamSink> Publisher<S> {
         p.buffer.sink_mut().setup(&groups, entry, queue)?;
         // Initial must be visible before readiness: insert, then drain fully.
         let initial = p.config.initial();
-        let published = p
-            .insert("initial", initial)
-            .and_then(|()| p.buffer.flush());
+        let published = p.insert("initial", initial).and_then(|()| p.buffer.flush());
         if published.is_err() {
             p.poison();
         }
@@ -335,7 +333,7 @@ impl<S: StreamSink> Publisher<S> {
         self.buffer.stats()
     }
     fn record(&self, kind: &str, body: Value) -> Value {
-        json!({"version":"1","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
+        json!({"version":"2","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
     }
     /// Buffers one cut, or EOF terminal. Returns false only after terminal,
     /// and only once every buffered entry, terminal included, is appended.

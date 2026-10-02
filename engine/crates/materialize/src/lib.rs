@@ -253,7 +253,14 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
+                write_counted(
+                    &mut rejects,
+                    &encoded,
+                    DERIVATIVE_REJECTS_FILE,
+                    &limits,
+                    &mut delivery,
+                    true,
+                )?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -303,7 +310,14 @@ where
                 let encoded = ignored
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
+                write_counted(
+                    &mut rejects,
+                    &encoded,
+                    DERIVATIVE_REJECTS_FILE,
+                    &limits,
+                    &mut delivery,
+                    true,
+                )?;
                 counts.intentionally_ignored_records = checked_add(
                     counts.intentionally_ignored_records,
                     1,
@@ -345,7 +359,14 @@ where
                 let encoded = sidecar
                     .to_canonical_json()
                     .map_err(BuildError::Serialization)?;
-                write_counted(&mut rejects, &encoded, DERIVATIVE_REJECTS_FILE, &limits, &mut delivery, true)?;
+                write_counted(
+                    &mut rejects,
+                    &encoded,
+                    DERIVATIVE_REJECTS_FILE,
+                    &limits,
+                    &mut delivery,
+                    true,
+                )?;
                 let fault = NormalizationFault::new(reject_id, reject.impact)
                     .map_err(|error| BuildError::Normalizer(error.to_string()))?;
                 let record =
@@ -387,7 +408,11 @@ where
         ));
     }
     limits
-        .finish(audited.effective_interval(), counts.input_records, &coverage)
+        .finish(
+            audited.effective_interval(),
+            counts.input_records,
+            &coverage,
+        )
         .map_err(BuildError::Verification)?;
 
     let (events_file, events_result) = events

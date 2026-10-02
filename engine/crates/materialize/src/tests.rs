@@ -1949,14 +1949,13 @@ fn pinned_read_neither_rehashes_nor_reencodes_but_the_audit_does() {
     );
 }
 
-/// Formerly the read path also failed a derivative whose receipt names a
-/// wrong logical or stored digest. That detection now belongs to the hashing
-/// boundaries only: install (`_check_pinned_files`, for stored digests) and
-/// `verify_derivative`/`--inspect-pin` (both digests). A pin whose receipt is
-/// rebound to a wrong digest over unchanged, valid bytes therefore still reads
-/// identically, and the audit still rejects it.
+/// The read hashes each stored (compressed) frame but not the decoded bytes.
+/// A receipt rebound to a wrong logical digest over unchanged, valid bytes
+/// therefore still reads identically and only the audit rejects it, while a
+/// wrong stored digest fails the read itself, so the bytes Rust decodes are
+/// always the pinned frame (no gap between the install hash and the open).
 #[test]
-fn digest_only_mismatch_is_an_audit_finding_not_a_read_failure() {
+fn logical_digest_mismatch_is_an_audit_finding_stored_mismatch_fails_the_read() {
     for (file, which) in [
         ("events.ndjson.zst", "logical"),
         ("sources.ndjson.zst", "logical"),
@@ -2003,13 +2002,23 @@ fn digest_only_mismatch_is_an_audit_finding_not_a_read_failure() {
                 },
             }
         };
-        let mut reader = open_pinned(&input, &ReadLimits::default()).unwrap();
-        let mut actual = Vec::new();
-        while let Some(delivery) = reader.next_delivery().unwrap() {
-            actual.push(delivery);
+        if which == "stored" {
+            let read = (|| {
+                let mut reader = open_pinned(&input, &ReadLimits::default())?;
+                while reader.next_delivery()?.is_some() {}
+                reader.finish().map(|_| ())
+            })();
+            let error = read.expect_err("a wrong stored digest fails the read");
+            assert!(error.contains("sha256"), "{file}: {error}");
+        } else {
+            let mut reader = open_pinned(&input, &ReadLimits::default()).unwrap();
+            let mut actual = Vec::new();
+            while let Some(delivery) = reader.next_delivery().unwrap() {
+                actual.push(delivery);
+            }
+            assert_eq!(reader.finish().unwrap().metadata().pin(), &input.pin);
+            assert_eq!(actual, expected, "{file}");
         }
-        assert_eq!(reader.finish().unwrap().metadata().pin(), &input.pin);
-        assert_eq!(actual, expected, "{file}");
         let audit = verify_derivative(&input.directory).unwrap_err();
         assert!(audit.contains(file) && audit.contains("sha256"), "{audit}");
     }

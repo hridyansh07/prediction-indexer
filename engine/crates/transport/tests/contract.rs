@@ -144,7 +144,7 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
         RiskLimits::default(),
     )
     .unwrap();
-    let wrap = |seq: u64, kind: &str, body: Value| json!({"version":"1","run_id":c.run_id,"attempt_id":c.attempt_id,"sequence":seq.to_string(),"kind":kind,"body":body});
+    let wrap = |seq: u64, kind: &str, body: Value| json!({"version":"2","run_id":c.run_id,"attempt_id":c.attempt_id,"sequence":seq.to_string(),"kind":kind,"body":body});
     let mut output = vec![wrap(0, "initial", c.initial())];
     while let Some(cut) = engine.next_cut().unwrap() {
         output.push(wrap(cut.sequence(), "cut", wire::cut(&cut)));
@@ -313,7 +313,13 @@ fn publisher_preflight_binds_descriptor_config_venues_scales_and_profile() {
 fn publish_batch_entries_is_bounded_defaulted_and_not_on_the_wire() {
     let f = fixture();
     let base = config(&f);
-    for (batch, valid) in [(0, false), (1, true), (100, true), (1024, true), (1025, false)] {
+    for (batch, valid) in [
+        (0, false),
+        (1, true),
+        (100, true),
+        (1024, true),
+        (1025, false),
+    ] {
         let mut c = base.clone();
         c.publish_batch_entries = batch;
         match c.validate() {
@@ -329,7 +335,10 @@ fn publish_batch_entries_is_bounded_defaulted_and_not_on_the_wire() {
     }
     let mut value = serde_json::to_value(&base).unwrap();
     assert_eq!(value["publish_batch_entries"], json!(100));
-    value.as_object_mut().unwrap().remove("publish_batch_entries");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("publish_batch_entries");
     let parsed: Config = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(parsed.publish_batch_entries, 100);
     value["publish_batch"] = json!(5);
@@ -919,7 +928,10 @@ fn full_queue_case(url: &str, batch: usize) {
     let (batches, mean) = (field("batches="), field("mean_batch_entries="));
     assert!((1.0..=expected.len() as f64).contains(&batches), "{stderr}");
     // Every entry was appended exactly once across the reported batches.
-    assert!((mean * batches - expected.len() as f64).abs() < 0.05 * batches, "{stderr}");
+    assert!(
+        (mean * batches - expected.len() as f64).abs() < 0.05 * batches,
+        "{stderr}"
+    );
     let _: () = redis::cmd("DEL").arg(&keys).query(&mut admin).unwrap();
 }
 
