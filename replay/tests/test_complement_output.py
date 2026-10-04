@@ -174,7 +174,7 @@ class ComplementOutputCorruptionTests(unittest.TestCase):
         h, snapshot, manifest = self.fixture()
         with self.assertRaises(ProtocolError):
             read_completed(self.root, "coverage")
-        with patch("replay.complement_output.MAX_STATE", 1):
+        with patch("replay.economic_sdk.bounds.MAX_STATE", 1):
             with self.assertRaisesRegex(ProtocolError, "reader state budget"):
                 validate_content(h.output, snapshot, manifest)
             with self.assertRaisesRegex(ProtocolError, "quantile working copy"):

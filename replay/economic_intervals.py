@@ -3,16 +3,6 @@
 from replay.streams.protocol import require
 
 
-def changed_keys(cut):
-    """Return detached keys named by a cut's book transitions."""
-    if cut.kind != "cut":
-        return frozenset()
-    return frozenset(
-        (item["key"]["instrument"], item["key"]["orientation"])
-        for item in cut.body["book_transitions"]
-    )
-
-
 class CutClock:
     """Validate Replay cut time/window contracts and yield crossed scope bounds."""
 

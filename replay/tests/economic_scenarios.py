@@ -137,3 +137,37 @@ def run(name, root, *, policy=None, files=FILES):
     h.finish()
     return h, {f: hashlib.sha256((h.output / f).read_bytes()).hexdigest()
                for f in files if (h.output / f).exists()}
+
+
+def operations(h, time, instrument, orientation, side, price, quantity):
+    """One ``set``/``delete`` operation on a usable book at ``price``."""
+    book = h.decoder.books[instrument, orientation]
+    ref = h.ref(time)
+    change = ({"kind": "set", "value": {"atoms": str(quantity), "scale": "6", "unit": "contracts"}}
+              if quantity else {"kind": "delete"})
+    operation = {"instrument": instrument, "orientation": orientation, "side": side,
+                 "price": {"atoms": str(price), "scale": "3", "unit": "quote_per_contract"},
+                 "change": change, "book_hash": None}
+    transition = {"key": {"instrument": instrument, "orientation": orientation},
+                  "previous_revision": str(book.revision), "revision": str(book.revision + 1),
+                  "dependency": {"epoch": "one", "anchor": ref, "through": ref},
+                  "decision": {"kind": "operations", "operations": [operation]}}
+    return h.send("cut", {"origin": {"kind": "group", "pin": h.pin, "first": ref["address"],
+                                     "last": ref["address"], "visible_ns": str(time)},
+                          "market_events": [], "book_transitions": [transition]})
+
+
+def v2_policy(**overrides):
+    """Complement policy 2 on the harness's small time scale."""
+    policy = {"version": 2, "detail": {"real": "episodes", "control": "intervals"},
+              "controls": [{"kind": "time_shift", "shift_ns": ["5"]}],
+              "time_shift_ring_entries": "1000", "profile": None}
+    policy.update(overrides)
+    return policy
+
+
+PROFILE_POLICY = {
+    "version": 1, "bucket_ns": "7",
+    "groups": ["activity", "depth", "pair_consistency", "quote_stability", "self_crossing", "top_of_book"],
+    "sizes_contracts": ["1", "3"], "tick_atoms": {"kalshi": "10", "limitless": "1", "polymarket": "10"},
+    "depth_ticks": ["1", "5"], "survival_edges_ns": ["2", "5", "10"]}
