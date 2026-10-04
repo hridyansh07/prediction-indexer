@@ -17,6 +17,7 @@ owns everything else (complement spec §§3, 5, 7 and SDK spec §4):
 from __future__ import annotations
 
 import heapq
+from bisect import bisect_right
 from pathlib import Path
 
 from replay.economic_fills import Fill  # noqa: F401  (re-exported for strategies)
@@ -38,6 +39,21 @@ def episode_id(scope, entity, kind, start):
 
 def quotes_json(quotes):
     return [[[str(price), str(quantity)] for price, quantity in leg] for leg in quotes]
+
+
+class _Ring:
+    """Committed views of one book in time order, with shared-fill refcounts."""
+
+    __slots__ = ("times", "views", "costs", "fills")
+
+    def __init__(self):
+        self.times, self.views, self.costs, self.fills = [], [], [], {}
+
+
+def _view_fills(view):
+    for group in (view.fills, view.transformed):
+        for fills in group.values():
+            yield from fills.values()
 
 
 class _Episode:
@@ -115,8 +131,7 @@ class Runtime:
                 if entity.shift is not None:
                     key = entity.legs[entity.shift[0]]
                     self.shifts.setdefault(key, set()).add(entity.shift[1])
-        self.rings = {key: [] for key in self.shifts}
-        self.ring_costs = {key: [] for key in self.shifts}
+        self.rings = {key: _Ring() for key in self.shifts}
         self.timers = []
 
         self.scope = 0
@@ -236,43 +251,58 @@ class Runtime:
         self.view_costs[key] = cost
 
     def _ring_append(self, key, time, view):
-        ring, costs = self.rings[key], self.ring_costs[key]
-        if ring and ring[-1][0] == time:
-            self.budget.release(costs.pop())
-            ring.pop()
-        require(len(ring) < self.experiment.ring_entries, "time_shift ring bound")
-        cost = bounds.RING_ENTRY + bounds.view_cost(view, len(self.builders[key].sizes))
+        ring = self.rings[key]
+        if ring.times and ring.times[-1] == time:
+            self._ring_drop(ring, len(ring.times) - 1)
+        self._ring_prune(key, time)
+        require(len(ring.times) < self.experiment.ring_entries, "time_shift ring bound")
+        cost = bounds.RING_ENTRY + bounds.VIEW + 4 * bounds.CONTAINER
+        for fill in _view_fills(view):
+            entry = ring.fills.get(id(fill))
+            if entry is None:
+                # Consecutive views share interned fills; each object is
+                # charged once while any ring entry references it.
+                share = bounds.SLOT + bounds.FILL + (len(fill.taken) + len(fill.consumed)) * (
+                    bounds.PAIR + bounds.SLOT)
+                self.budget.charge(share)
+                ring.fills[id(fill)] = [1, share]
+            else:
+                entry[0] += 1
         self.budget.charge(cost)
-        ring.append((time, view))
-        costs.append(cost)
+        ring.times.append(time)
+        ring.views.append(view)
+        ring.costs.append(cost)
         for shift in sorted(self.shifts[key]):
             due = time + shift
             if due < self.clock.end:
                 heapq.heappush(self.timers, (due, key, shift))
 
+    def _ring_drop(self, ring, index):
+        view = ring.views.pop(index)
+        ring.times.pop(index)
+        self.budget.release(ring.costs.pop(index))
+        for fill in _view_fills(view):
+            entry = ring.fills[id(fill)]
+            entry[0] -= 1
+            if not entry[0]:
+                self.budget.release(entry[1])
+                del ring.fills[id(fill)]
+
+    def _ring_prune(self, key, time):
+        # Times only advance, so entries older than the one the largest shift
+        # needs at ``time`` are never needed again.
+        ring, keep = self.rings[key], time - max(self.shifts[key])
+        drop = bisect_right(ring.times, keep) - 1
+        for _ in range(max(0, drop)):
+            self._ring_drop(ring, 0)
+
     def _shifted(self, key, shift, time):
-        """Committed view of ``key`` at ``time - shift``; pruned to the oldest need."""
+        """Committed view of ``key`` at ``time - shift``."""
         ring = self.rings[key]
-        target = time - shift
-        index = None
-        for i in range(len(ring) - 1, -1, -1):
-            if ring[i][0] <= target:
-                index = i
-                break
-        if index is None:
+        index = bisect_right(ring.times, time - shift) - 1
+        if index < 0:
             return unavailable_view(self.clock.start)
-        # Times only advance, so entries before the one needed by the largest
-        # shift are never needed again.
-        keep = time - max(self.shifts[key])
-        drop = 0
-        while drop + 1 < len(ring) and ring[drop + 1][0] <= keep:
-            drop += 1
-        if drop:
-            del ring[:drop]
-            self.budget.release(sum(self.ring_costs[key][:drop]))
-            del self.ring_costs[key][:drop]
-            index -= drop
-        return ring[index][1]
+        return ring.views[index]
 
     # -- scopes ---------------------------------------------------------------
     def _scope(self, index):
@@ -347,7 +377,10 @@ class Runtime:
         inputs = entity.basket.inputs
         fingerprint = None
         if inputs is not None:
-            fingerprint = tuple(_fingerprint(view, sources) for view, sources in zip(views, inputs))
+            fingerprint = []
+            for view, sources in zip(views, inputs):
+                fingerprint.append(_fingerprint(view, sources))
+            fingerprint = tuple(fingerprint)
             memo = self.memo.get(entity_id)
             if memo is not None and memo[0] == fingerprint:
                 observation = memo[1]
@@ -372,7 +405,8 @@ class Runtime:
     def _views(self, entity, time):
         shift = entity.shift
         if shift is None:
-            return tuple(self.views[key] for key in entity.legs)
+            views = self.views
+            return tuple([views[key] for key in entity.legs])
         return tuple(self._shifted(key, shift[1], time) if position == shift[0]
                      else self.views[key] for position, key in enumerate(entity.legs))
 
@@ -412,12 +446,15 @@ class Runtime:
         return observation
 
     def _observation_cost(self, observation):
-        if observation.payload is None and not observation.reasons:
-            cost = self._plain_costs.get(observation.fields)
-            if cost is None:
-                cost = self._plain_costs[observation.fields] = bounds.observation_cost(observation)
-            return cost
-        return bounds.observation_cost(observation)
+        if observation.payload is not None:
+            return bounds.observation_cost(observation)
+        key = (observation.reasons, observation.fields)
+        cost = self._plain_costs.get(key)
+        if cost is None:
+            if len(self._plain_costs) >= 4096:
+                self._plain_costs.clear()  # a cache only; costs are recomputed exactly
+            cost = self._plain_costs[key] = bounds.observation_cost(observation)
+        return cost
 
     def _stage(self, time, entities):
         if self.staged_time is None:

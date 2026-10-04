@@ -1,7 +1,9 @@
 # Same-venue complement strategy V1
 
-Status: **proposed**. Nothing in this document is implemented yet. Approving this
-document is separate from implementing or deploying the strategy.
+Status: **implemented** as policy version 1, on the economic strategy SDK
+([ECONOMIC_STRATEGY_SDK_V1.md](ECONOMIC_STRATEGY_SDK_V1.md)). Policy version 2, defined
+in that document's §§11 and 13, changes detail, controls, and the verdict input below.
+Deployment is separately authorized.
 
 `replay.same_venue_complement:build` is the first economic Replay strategy. On every
 captured binary instrument it measures whether buying, or selling, **both sides of
@@ -645,7 +647,10 @@ The rules apply in this order:
 1. `E == 0` or `E < minimum_evaluated_ns` gives `INCONCLUSIVE_FIXTURE`.
 2. `Q × 1,000,000 > maximum_positive_time_fraction_ppm × E` gives
    `INTRA_INSTRUMENT_GAPS_PRESENT_INVESTIGATE`.
-3. `X > 0` gives `INCONCLUSIVE_FIXTURE`, reason `UNRESOLVED_POSITIVE_GROSS`.
+3. `X > 0` gives `INCONCLUSIVE_FIXTURE`, reason `UNRESOLVED_POSITIVE_GROSS`. Under
+   policy version 2, `X` counts only `FEE_UNKNOWN` time inside gross slices whose
+   survival reaches the headline latency. The total stays visible as
+   `fee_unknown_total_ns`.
 4. Otherwise the result is `INTRA_INSTRUMENT_GAPS_ABSENT_IN_FIXTURE`.
 
 Every verdict carries `basis: PINNED_FEE_MODEL_AND_DISPLAYED_DEPTH_POLICY`. Absence

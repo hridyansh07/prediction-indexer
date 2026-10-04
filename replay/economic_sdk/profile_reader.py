@@ -13,12 +13,19 @@ from pathlib import Path
 
 from replay.economic_sdk.profile import DISPOSITIONS, FILES, GROUPS, pairs_of, profile_policy
 from replay.economic_sdk.reader import lines, signed
-from replay.streams.protocol import obj, require, uint
+from replay.streams.protocol import obj, require, uint  # noqa: F401
 
 _STATE = ("usable_ns", "not_initialized_ns", "unusable_ns", "bid_empty_ns", "ask_empty_ns",
           "both_empty_ns", "two_sided_ns")
 _PAIR = ("both_bids_ns", "both_asks_ns", "bid_sum_dev_ns", "ask_sum_dev_ns", "bid_sum_abs_dev_ns",
          "ask_sum_abs_dev_ns", "bid_sum_above_unit_ns", "ask_sum_below_unit_ns")
+
+
+def _big(value):
+    """Canonical unsigned decimal; time integrals (quantity x ns) exceed 64 bits."""
+    require(type(value) is str and 0 < len(value) <= 64 and value.isascii() and value.isdigit()
+            and (value == "0" or value[0] != "0"), "canonical unsigned integral")
+    return int(value)
 
 
 def _rank(histogram, percent):
@@ -92,7 +99,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                 and row["tick_atoms"] == policy["tick_atoms"][plan["venue"]]
                 and row["ask_source"] == ("projected" if plan["venue"] == "kalshi" else "native")
                 and row["groups"] == policy["groups"], "profile book identity")
-        start, end = uint(row["start_ns"]), uint(row["end_ns"])
+        start, end = _big(row["start_ns"]), _big(row["end_ns"])
         scope_start, scope_end = int(scopes[scope]["start_ns"]), int(scopes[scope]["end_ns"])
         _bucketed(start, end, width, scope_start, scope_end)
         order = (end, scope, key[0], key[1])
@@ -103,11 +110,11 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         duration = end - start
 
         state = obj(row["state"], " ".join(_STATE) + " unusable_ns_by_reason")
-        d = {name: uint(state[name]) for name in _STATE}
+        d = {name: _big(state[name]) for name in _STATE}
         require(d["usable_ns"] + d["not_initialized_ns"] + d["unusable_ns"] == duration,
                 "profile state partition")
         reasons = state["unusable_ns_by_reason"]
-        require(type(reasons) is dict and sum(uint(v) for v in reasons.values()) == d["unusable_ns"],
+        require(type(reasons) is dict and sum(_big(v) for v in reasons.values()) == d["unusable_ns"],
                 "profile unusable reasons")
         require(d["both_empty_ns"] <= min(d["bid_empty_ns"], d["ask_empty_ns"])
                 and d["two_sided_ns"] + d["bid_empty_ns"] + d["ask_empty_ns"] - d["both_empty_ns"]
@@ -127,7 +134,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
             histogram = []
             for entry in top["spread_histogram"]:
                 require(type(entry) is list and len(entry) == 2, "spread histogram entry")
-                histogram.append((signed(entry[0]), uint(entry[1])))
+                histogram.append((signed(entry[0]), _big(entry[1])))
             require([v for v, _ in histogram] == sorted({v for v, _ in histogram})
                     and all(ns > 0 for _, ns in histogram), "spread histogram order")
             require(sum(ns for _, ns in histogram) == d["two_sided_ns"], "spread histogram time")
@@ -136,10 +143,10 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
             require(top["spread_p50_atoms"] == _rank(histogram, 50)
                     and top["spread_p90_atoms"] == _rank(histogram, 90), "spread quantiles")
             for name in ("mid2_atoms_ns", "bid_top_quantity_ns", "ask_top_quantity_ns"):
-                uint(top[name])
+                _big(top[name])
         if "self_crossing" in groups:
             crossing = obj(row["self_crossing"], "crossed_ns locked_ns")
-            crossed, locked = uint(crossing["crossed_ns"]), uint(crossing["locked_ns"])
+            crossed, locked = _big(crossing["crossed_ns"]), _big(crossing["locked_ns"])
             require(crossed + locked <= d["two_sided_ns"], "self-crossing time")
             if "top_of_book" in groups:
                 require(crossed == sum(ns for v, ns in histogram if v < 0)
@@ -154,13 +161,13 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                 present = d["usable_ns"] - d[side + "_empty_ns"]
                 require(len(values["within_ticks_quantity_ns"]) == len(policy["depth_ticks"]))
                 for v in values["within_ticks_quantity_ns"]:
-                    uint(v)
+                    _big(v)
                 for name in ("filled_ns", "depth_limited_ns", "slippage_cost_ns"):
                     require(type(values[name]) is list and len(values[name]) == len(policy["sizes_contracts"]))
                 for filled, limited, slip in zip(values["filled_ns"], values["depth_limited_ns"],
                                                  values["slippage_cost_ns"]):
-                    require(uint(filled) + uint(limited) == present, "depth time partition")
-                    uint(slip)
+                    require(_big(filled) + _big(limited) == present, "depth time partition")
+                    _big(slip)
         if "activity" in groups:
             activity = obj(row["activity"], "transitions snapshots operations invalidations trades "
                                             "traded_quantity_atoms trade_mid2_deviation_atoms trades_priced "
@@ -182,7 +189,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
             require(type(activity["aggressor"]) is dict
                     and set(activity["aggressor"]) <= {"bid", "ask", "none"}
                     and sum(activity["aggressor"].values()) == nonduplicate, "aggressor partition")
-            uint(activity["traded_quantity_atoms"])
+            _big(activity["traded_quantity_atoms"])
             signed(activity["trade_mid2_deviation_atoms"])
         if "quote_stability" in groups:
             stability = obj(row["quote_stability"], "edges_ns bid ask censored")
@@ -209,12 +216,12 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         require(key in books[scope] and row["kind"] == "self_cross"
                 and row["ask_source"] == ("projected" if plans[key]["venue"] == "kalshi" else "native")
                 and row["tick_atoms"] == policy["tick_atoms"][plans[key]["venue"]], "incident book")
-        start, end = uint(row["start_ns"]), uint(row["end_ns"])
+        start, end = _big(row["start_ns"]), _big(row["end_ns"])
         require(int(scopes[scope]["start_ns"]) <= start < end <= int(scopes[scope]["end_ns"]),
                 "incident bounds")
         require(row["end_reason"] in {"UNCROSSED", "SCOPE_END", "RUN_END"}
                 and row["censored"] == (row["end_reason"] == "RUN_END"), "incident end")
-        require(uint(row["max_cross_atoms"]) >= 0)
+        require(_big(row["max_cross_atoms"]) >= 0)
         _quotes(row["quotes_at_max"])
         order = (end, scope, key[0], key[1], start)
         require(last is None or last < order, "incident close order")
@@ -240,7 +247,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         identity(row, scope)
         books_key = tuple(tuple(k) for k in row["books"])
         require((row["market_id"], books_key) in pairs[scope], "unknown pair")
-        start, end = uint(row["start_ns"]), uint(row["end_ns"])
+        start, end = _big(row["start_ns"]), _big(row["end_ns"])
         _bucketed(start, end, width, int(scopes[scope]["start_ns"]), int(scopes[scope]["end_ns"]))
         order = (end, scope, row["market_id"])
         require(last is None or last < order, "pair close order")

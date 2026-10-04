@@ -177,7 +177,7 @@ class ControlTests(Base):
         h.group(30)
         control = self.entity(h, direction="short", size_contracts="1",
                               control={"kind": "time_shift", "leg": 1, "shift_ns": "5"})
-        self.assertEqual(h.strategy.rings["polymarket:987", "outcome"][-1][0], 14)
+        self.assertEqual(h.strategy.rings["polymarket:987", "outcome"].times[-1], 14)
         h.finish()
         self.assertTrue(self.control_rows(h, control.id))
 

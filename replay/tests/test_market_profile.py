@@ -184,6 +184,16 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(row["self_crossing"], {"crossed_ns": "2", "locked_ns": "0"})
         self.assertEqual(h.records("pair_profile.ndjson"), [])
 
+    def test_quantity_time_integrals_beyond_64_bits_are_exact(self):
+        h = Harness(self.root)
+        h.window()
+        huge = 10**18  # quantity atoms: 30 ns of it exceeds 2**64
+        ladder(h, 10, "polymarket:123", bids=((400, huge),), asks=((450, huge),))
+        h.finish()
+        total = sum(int(r["top_of_book"]["bid_top_quantity_ns"]) for r in book_rows(h, "polymarket:123"))
+        self.assertEqual(total, huge * 30)
+        self.assertGreater(total, 2**64)
+
     def test_reader_rejects_a_rehashed_partition_gap(self):
         h = Harness(self.root)
         h.window()
