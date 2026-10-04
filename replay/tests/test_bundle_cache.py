@@ -150,6 +150,140 @@ class BundleCacheTest(unittest.TestCase):
         self.assertIn("--inspect-pin", arguments)
         self.assertNotIn("", arguments)
 
+    def test_cold_build_verifies_each_window_once_inside_the_materializer(self):
+        self.archive_window()
+        log = self.root / "arguments.log"
+        wrapper = self.root / "materializer"
+        wrapper.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {MATERIALIZER} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.assertIsInstance(self.ensure(wrapper), BundleReady)
+        self.assertNotIn("--inspect-pin", log.read_text(encoding="utf-8").splitlines())
+
+    def logging_wrapper(self, log):
+        wrapper = self.root / "materializer"
+        wrapper.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {MATERIALIZER} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_warm_local_derivative_is_bound_by_hash_without_reinspection(self):
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        log = self.root / "arguments.log"
+        store = RecordingStore(self.store)
+        second = ensure_bundle(
+            "bundle-1", (BASE_NS, BASE_NS + WINDOW_SECONDS * 1_000_000_000),
+            store=store, work_root=self.work, derivatives_root=self.derivatives,
+            materializer=self.logging_wrapper(log), window_seconds=WINDOW_SECONDS,
+        )
+        self.assertIsInstance(second, BundleReady)
+        self.assertEqual(second.receipt_bytes, first.receipt_bytes)
+        self.assertEqual(second.pins, first.pins)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["--describe"])
+        self.assertFalse(any(key.startswith("replay/derivatives/") for key in store.opens))
+        self.assertEqual(store.puts, [])
+
+    def test_warm_local_derivative_that_disagrees_with_its_pin_fails_closed(self):
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        events = first.pins[0].directory / "events.ndjson.zst"
+        with open(events, "ab") as sink:
+            sink.write(b"\0")
+        altered = events.read_bytes()
+        store = RecordingStore(self.store)
+        log = self.root / "arguments.log"
+        with self.assertRaises(BundleFailure) as caught:
+            ensure_bundle(
+                "bundle-1", (BASE_NS, BASE_NS + WINDOW_SECONDS * 1_000_000_000),
+                store=store, work_root=self.work, derivatives_root=self.derivatives,
+                materializer=self.logging_wrapper(log), window_seconds=WINDOW_SECONDS,
+            )
+        self.assertEqual(caught.exception.code, "integrity_failure")
+        self.assertIn("events.ndjson.zst disagrees with its receipt", caught.exception.detail)
+        self.assertEqual(events.read_bytes(), altered)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["--describe"])
+        self.assertEqual(store.puts, [])
+
+    def test_same_length_tamper_is_caught_by_install_hash_and_inspect_pin(self):
+        # The pinned replay read no longer re-hashes derivative bytes; it relies
+        # on this install-time SHA-256 binding plus Zstandard frame checks. A
+        # same-length change (which the read's exact-length check cannot see)
+        # must therefore fail here, and the on-demand `--inspect-pin` audit must
+        # still reject it by digest.
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        pin = first.pins[0]
+        events = pin.directory / "events.ndjson.zst"
+        original = events.read_bytes()
+        altered = bytearray(original)
+        altered[len(altered) // 2] ^= 1
+        events.write_bytes(bytes(altered))
+        self.assertEqual(len(events.read_bytes()), len(original))
+        with self.assertRaises(BundleFailure) as caught:
+            self.ensure()
+        self.assertEqual(caught.exception.code, "integrity_failure")
+        self.assertIn("events.ndjson.zst disagrees with its receipt", caught.exception.detail)
+        scratch = self.root / "inspect-scratch"
+        scratch.mkdir()
+        with self.assertRaises(BundleFailure) as inspected:
+            bundle._inspect(MATERIALIZER, pin, scratch)
+        self.assertEqual(inspected.exception.code, "tool_failure")
+        self.assertEqual(events.read_bytes(), bytes(altered))
+        events.write_bytes(original)
+        bundle._inspect(MATERIALIZER, pin, scratch)
+        self.assertIsInstance(self.ensure(), BundleReady)
+
+    def test_warm_local_derivative_with_unexpected_or_linked_entry_fails_closed(self):
+        self.archive_window()
+        first = self.ensure()
+        self.assertIsInstance(first, BundleReady)
+        directory = first.pins[0].directory
+        extra = directory / "extra.json"
+        manifest = directory / "manifest.json"
+        moved = self.root / "manifest.json"
+        cases = (
+            ("extra", lambda: extra.write_bytes(b"{}"), lambda: extra.unlink()),
+            (
+                "symlink",
+                lambda: (manifest.rename(moved), manifest.symlink_to(moved)),
+                lambda: (manifest.unlink(), moved.rename(manifest)),
+            ),
+        )
+        for name, alter, restore in cases:
+            with self.subTest(case=name):
+                alter()
+                try:
+                    with self.assertRaises(BundleFailure) as caught:
+                        self.ensure()
+                    self.assertEqual(caught.exception.code, "integrity_failure")
+                finally:
+                    restore()
+        self.assertIsInstance(self.ensure(), BundleReady)
+
+    def test_fresh_copy_that_disagrees_with_its_pin_is_rejected(self):
+        self.archive_window()
+        real_copy = bundle._copy_file
+
+        def corrupting_copy(source, destination, budget):
+            real_copy(source, destination, budget)
+            if destination.name == "events.ndjson.zst":
+                with open(destination, "ab") as sink:
+                    sink.write(b"\0")
+
+        with mock.patch.object(bundle, "_copy_file", corrupting_copy):
+            with self.assertRaises(BundleFailure) as caught:
+                self.ensure()
+        self.assertEqual(caught.exception.code, "integrity_failure")
+        self.assertIn("events.ndjson.zst disagrees with its receipt", caught.exception.detail)
+
     def test_cold_publication_order_and_retry_at_each_commit_boundary(self):
         for fail_at in range(1, 7):
             with self.subTest(fail_at=fail_at):

@@ -195,7 +195,7 @@ class BudgetTests(unittest.TestCase):
     def test_normalizer_hash_parity_and_closed_scale_binding(self):
         value = normalizer()
         value["venues"][0].update(
-            bundle_id="prediction-indexer/kalshi-normalizer/v4", parser_version=4
+            bundle_id="prediction-indexer/kalshi-normalizer/v5", parser_version=5
         )
         value["venues"][0]["config"]["variables"]["price_scale"]["value"] = 4
         value["venues"][0]["config"]["variables"]["quantity_scale"]["value"] = 2
@@ -205,18 +205,18 @@ class BudgetTests(unittest.TestCase):
         value["venues"][1]["config"]["variables"]["price_scale"]["value"] = 3
         value["venues"][1]["config"]["variables"]["quantity_scale"]["value"] = 6
         value["venues"][2].update(
-            bundle_id="prediction-indexer/polymarket-normalizer/v2", parser_version=2
+            bundle_id="prediction-indexer/polymarket-normalizer/v3", parser_version=3
         )
         value["venues"][2]["config"]["variables"]["price_scale"]["value"] = 4
         value["venues"][2]["config"]["variables"]["quantity_scale"]["value"] = 6
         descriptor = s._normalizer_descriptor(value)
         self.assertEqual(
             descriptor["bundle_sha256"],
-            "8076a1e1156470b053856c4100f9f38f83a675bdb625383cb42c1d4e5603fb92",
+            "632f1297913f97a1d27fdd89c1f889b0a2333eafb8149cced8e17f546a48039b",
         )
         self.assertEqual(
             descriptor["config_sha256"],
-            "5a70988d6be21716850f50eecdf393733ca8d6b551896cfda4299cabca547d7f",
+            "744419d787b8d14340f043608bf894778e7f3862d177e864a6feee1ec2c033ba",
         )
 
         valid = config()
@@ -355,6 +355,28 @@ class BudgetTests(unittest.TestCase):
             s.validate(bad)
         self.assertNotEqual(s.identity(c), s.identity({**c, "python": "/another"}))
 
+    def test_publish_batch_entries_is_optional_bounded_and_off_the_wire(self):
+        c = config()
+        self.assertNotIn("publish_batch_entries", c["transport"])
+        s.validate(c)
+        for batch in (1, 100, 1024):
+            good = copy.deepcopy(c)
+            good["transport"]["publish_batch_entries"] = batch
+            s.validate(good)
+            # Buffering never changes delivered content or the initial body,
+            # but the run identity binds the whole transport configuration.
+            self.assertEqual(s.initial(good), s.initial(c))
+            self.assertNotEqual(s.identity(good), s.identity(c))
+        for batch in (0, 1025, -1, True, 100.0, "100", None):
+            bad = copy.deepcopy(c)
+            bad["transport"]["publish_batch_entries"] = batch
+            with self.subTest(batch=batch), self.assertRaises(ProtocolError):
+                s.validate(bad)
+        bad = copy.deepcopy(c)
+        bad["transport"]["publish_batch"] = 100
+        with self.assertRaises(ProtocolError):
+            s.validate(bad)
+
 
 class Strategy:
     def __init__(self, context):
@@ -374,6 +396,8 @@ class Strategy:
         if mode == "stall":
             (self.path.parent / "pid").write_text(str(os.getpid()))
             time.sleep(10)
+        if mode == "slow_progress":
+            time.sleep(0.15)
         if mode == "ack_ambiguity":
             from replay.streams import Consumer
 
@@ -457,18 +481,42 @@ def fake_publisher(path, ready, mode):
         values = values[:-1]
     for value in values:
         value["attempt_id"] = c["attempt_id"]
+    entries = [json.dumps(value) for value in values]
+    if mode == "waiting":
+        # Every entry fits alone, but not the whole attempt: the publisher must
+        # wait for both groups to ACK, exactly as the Rust publisher does.
+        r.hset(k[1], "limit", max(len(e) for e in entries))
+    backoff, waited = 0.001, False
+    for value, entry in zip(values, entries):
         seq = int(value["sequence"])
-        r.eval(
-            SCRIPT,
-            2,
-            *k,
-            "publish",
-            "-1" if seq == 0 else str(seq),
-            str(seq + 1),
-            json.dumps(value),
-            "1" if value["kind"] == "terminal" else "0",
-        )
-    Path(ready).touch()
+        while True:
+            # A one-entry batch append: 1 appended, 0 is the FULL reply.
+            reply = r.eval(
+                SCRIPT,
+                2,
+                *k,
+                "append",
+                "-1" if seq == 0 else str(seq),
+                str(seq + 1),
+                "1" if value["kind"] == "terminal" else "0",
+                entry,
+            )
+            if reply == 1:
+                backoff = 0.001
+                break
+            if reply != 0:
+                return 20
+            if not waited:
+                # Outside the run directory: proves this attempt really waited.
+                (Path(path).parents[2] / f"waited-{c['attempt_id']}").touch()
+                waited = True
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 0.05)
+        if mode == "waiting" and seq == 0:
+            # Consumers start only after ready; they must drain the queue.
+            Path(ready).touch()
+    if mode != "waiting":
+        Path(ready).touch()
     r.close()
     return 0
 
@@ -578,6 +626,43 @@ class SubprocessTests(unittest.TestCase):
                                 ].values()
                             )
                         )
+
+    def test_waiting_publisher_with_progressing_consumer_is_not_a_stall(self):
+        # Total slow-group work (~1.35 s) exceeds stall_seconds, so success
+        # proves each ACK, not publisher activity, resets the stall clock.
+        c, root = self.config("waiting"), self.root / "waiting-progress"
+        c["strategies"]["slow"]["config"]["mode"] = "slow_progress"
+        c["limits"].update(stall_seconds=1.0, attempts=1)
+        receipt = s.run(c, root, URL)
+        self.assertEqual(s.read_success(root), receipt)
+        self.assertTrue((self.root / f"waited-{receipt['attempt']}").exists())
+        for location in receipt["outputs"].values():
+            self.assertEqual(
+                (root / location / "sequences.txt").read_text().splitlines(),
+                [str(i) for i in range(len(records()))],
+            )
+
+    def test_waiting_publisher_with_stalled_consumer_hits_stall_deadline(self):
+        c, root = self.config("waiting"), self.root / "waiting-stall"
+        c["strategies"]["slow"]["config"]["mode"] = "stall"
+        c["limits"].update(stall_seconds=0.6, attempts=1)
+        started = time.monotonic()
+        with self.assertRaises(s.AttemptFailure) as e:
+            s.run(c, root, URL)
+        # Ended by the stall limit (well before the 5 s attempt deadline and the
+        # stalled hook's 10 s sleep), not hung behind the waiting publisher.
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse(e.exception.fatal)
+        (attempt,) = [a for a in root.iterdir() if a.is_dir()]
+        self.assertTrue((self.root / f"waited-{attempt.name}").exists())
+        result = s.read(attempt / "result.json")
+        self.assertEqual(result["outcome"], "deadline")
+        self.assertFalse(result["fatal"])
+        self.assertEqual(result["progress"], -1)
+        # The waiting publisher had not exited; the supervisor stopped it.
+        self.assertLess(result["participants"]["publisher"], 0)
+        self.assertEqual(self.redis.exists(*s.keys(c, attempt.name)), 0)
+        self.assertFalse((root / "SUCCESS.json").exists())
 
     def test_ack_ambiguity_after_local_work_never_commits(self):
         c, root = self.config(), self.root / "ambiguous"

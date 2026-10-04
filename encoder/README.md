@@ -76,6 +76,20 @@ because libzstd's streaming readers buffer ahead: "how many bytes did the source
 hand over" does not answer "where did the frame stop", and without that answer a
 padded or concatenated object decodes as one healthy stream.
 
+### Structural decode (Rust, pinned Replay derivatives only)
+
+`prediction_encoder::StructuralDecoder` is the same bounded Rust decoder with
+both SHA-256 digests removed. It keeps every other rule above: one checksummed,
+dictionary-free frame, the Zstandard content checksum, no truncation, no
+trailing or concatenated bytes, the output bound, a final LF, and the expected
+stored length, decoded length and LF count. It does not prove *which* bytes
+were committed, so it exists only for a consumer whose exact stored bytes were
+already bound to their receipt by SHA-256 at an earlier boundary: the Replay
+pinned-derivative read, whose local copy is hash-bound at install (see
+`docs/VERIFIED_DERIVATIVE_WALKER_V1.md`, "Read-time integrity contract").
+Archive, canonical, finalizer and audit decodes keep using the identity-checking
+decoder; Python has no structural mode.
+
 ## Streaming only
 
 No production path may call an API whose source or result is one complete

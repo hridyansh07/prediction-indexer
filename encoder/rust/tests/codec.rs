@@ -4,12 +4,14 @@
 //! that the codec refuses it. A decoder that merely happens to fail on today's
 //! corrupt input is not the same as one that cannot be made to succeed on one.
 
+use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use prediction_encoder::{
     CodecError, DEFAULT_ZSTD_LEVEL, LogicalIdentity, StoredIdentity, StreamingDecoder,
-    StreamingEncoder, decode_stream, encode_stream, encoder_version, logical_identity_of,
+    StreamingEncoder, StructuralDecoder, StructuralIdentity, decode_stream, encode_stream,
+    encoder_version, logical_identity_of,
 };
 
 fn fixtures() -> PathBuf {
@@ -271,6 +273,159 @@ fn a_wrong_stored_hash_and_a_wrong_logical_hash_fail_independently() {
     };
     assert!(matches!(
         decode(&frame, &wrong_lines, Some(&stored), None).expect_err("lines"),
+        CodecError::IdentityMismatch(_)
+    ));
+}
+
+fn structural_of(frame: &[u8], logical: &LogicalIdentity) -> StructuralIdentity {
+    StructuralIdentity {
+        logical_byte_length: logical.byte_length,
+        line_count: logical.line_count,
+        stored_byte_length: frame.len() as u64,
+        stored_sha256: format!("{:x}", Sha256::digest(frame)),
+    }
+}
+
+fn decode_structural(
+    frame: &[u8],
+    expected: &StructuralIdentity,
+    limit: Option<u64>,
+) -> Result<Vec<u8>, CodecError> {
+    let mut decoder = StructuralDecoder::new(Cursor::new(frame.to_vec()), expected, limit)?;
+    let mut decoded = Vec::new();
+    if decoder.read_to_end(&mut decoded).is_err() {
+        // The decoder remembers the classified error; finish reports it.
+        return Err(decoder.finish().expect_err("read error is remembered"));
+    }
+    assert_eq!(decoder.finish()?, *expected);
+    Ok(decoded)
+}
+
+#[test]
+fn the_structural_decoder_keeps_every_frame_rule() {
+    let (frame, logical, _) = encode(b"one\ntwo\n");
+    let expected = structural_of(&frame, &logical);
+    assert_eq!(
+        decode_structural(&frame, &expected, None).expect("valid"),
+        b"one\ntwo\n"
+    );
+
+    let truncated = &frame[..frame.len() - 3];
+    assert_eq!(
+        decode_structural(truncated, &structural_of(truncated, &logical), None)
+            .expect_err("truncated"),
+        CodecError::TruncatedFrame
+    );
+    let mut trailing = frame.clone();
+    trailing.extend_from_slice(b"junk");
+    assert_eq!(
+        decode_structural(&trailing, &structural_of(&trailing, &logical), None)
+            .expect_err("trailing"),
+        CodecError::TrailingBytes
+    );
+    let mut concatenated = frame.clone();
+    concatenated.extend_from_slice(&frame);
+    assert_eq!(
+        decode_structural(&concatenated, &structural_of(&concatenated, &logical), None)
+            .expect_err("concatenated"),
+        CodecError::TrailingBytes
+    );
+    let mut corrupt = frame.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xFF;
+    assert!(matches!(
+        decode_structural(&corrupt, &expected, None).expect_err("checksum"),
+        CodecError::Compression(_) | CodecError::TruncatedFrame
+    ));
+    assert!(matches!(
+        decode_structural(
+            &frame,
+            &StructuralIdentity {
+                stored_byte_length: expected.stored_byte_length + 1,
+                ..expected.clone()
+            },
+            None
+        )
+        .expect_err("stored length"),
+        CodecError::IdentityMismatch(_)
+    ));
+    assert!(matches!(
+        decode_structural(
+            &frame,
+            &StructuralIdentity {
+                line_count: expected.line_count + 1,
+                ..expected.clone()
+            },
+            None
+        )
+        .expect_err("lines"),
+        CodecError::IdentityMismatch(_)
+    ));
+    assert!(matches!(
+        decode_structural(
+            &frame,
+            &StructuralIdentity {
+                logical_byte_length: expected.logical_byte_length + 1,
+                ..expected.clone()
+            },
+            None
+        )
+        .expect_err("length"),
+        CodecError::IdentityMismatch(_)
+    ));
+    assert_eq!(
+        decode_structural(&frame, &expected, Some(3)).expect_err("limit"),
+        CodecError::LimitExceeded { limit: 3 }
+    );
+
+    // Same as StreamingDecoder: an unterminated payload is refused at finish.
+    let mut unterminated = Vec::new();
+    {
+        let mut encoder =
+            zstd::stream::write::Encoder::new(&mut unterminated, DEFAULT_ZSTD_LEVEL).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(b"one\ntwo").unwrap();
+        encoder.finish().unwrap();
+    }
+    assert_eq!(
+        decode_structural(
+            &unterminated,
+            &StructuralIdentity {
+                logical_byte_length: 7,
+                line_count: 1,
+                stored_byte_length: unterminated.len() as u64,
+                stored_sha256: format!("{:x}", Sha256::digest(&unterminated)),
+            },
+            None
+        )
+        .expect_err("unterminated"),
+        CodecError::MissingTrailingNewline
+    );
+}
+
+#[test]
+fn the_structural_decoder_rejects_a_same_length_forged_frame() {
+    // Same lengths and LF count, different bytes: only a digest tells them
+    // apart. The structural decoder hashes the stored frame, so it rejects the
+    // forgery even though it never hashes the decoded bytes.
+    let (original, logical, stored) = encode(b"one\ntwo\n");
+    let (forged, _, _) = encode(b"six\nten\n");
+    assert_eq!(
+        forged.len(),
+        original.len(),
+        "fixture keeps the stored length"
+    );
+    let expected = structural_of(&original, &logical);
+    assert!(matches!(
+        decode_structural(&forged, &expected, None).expect_err("stored digest"),
+        CodecError::IdentityMismatch(_)
+    ));
+    assert_eq!(
+        decode_structural(&original, &expected, None).expect("original"),
+        b"one\ntwo\n"
+    );
+    assert!(matches!(
+        decode(&forged, &logical, Some(&stored), None).expect_err("digests"),
         CodecError::IdentityMismatch(_)
     ));
 }

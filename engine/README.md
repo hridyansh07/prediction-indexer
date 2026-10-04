@@ -62,11 +62,25 @@ A full snapshot resets only that key, never every orientation of an instrument.
   one binary market, not independent liquidity: a NO bid at 0.56 implies a YES
   ask at 0.44. Normalization preserves both bid ladders without that conversion.
   Empty `asks` means no explicit ask ladder was emitted, not no implied asks.
+  An `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg`,
+  and an optional positive `id` that Kalshi echoes when the snapshot answers a
+  `subscribe` or `get_snapshot` command. A snapshot `msg` may carry
+  `market_id: ""`, which is treated as absent; a snapshot with no level arrays
+  is a valid empty book and yields both orientations as empty Full books.
+  Bundle `kalshi-normalizer/v5` (parser 5) introduced both acceptances; v4
+  rejected those frames as `unknown_field` / `invalid_market_id`.
 - [Polymarket](https://docs.polymarket.com/market-data/overview) gives each
   outcome its own token ID. YES and NO remain different `polymarket:TOKEN_ID`
   instruments, both with `Outcome` orientation relative to their own token.
   Never collapse token IDs to a shared condition ID or reinterpret the NO
   token as `Complement` of the YES token during normalization.
+  Bundle `polymarket-normalizer/v3` (parser 3) treats an exact empty
+  `last_trade_price` in a book or snapshot as absent/no trade yet; nonnumeric,
+  null, and wrong-type values still reject. A `tick_size_change` is intentionally
+  ignored only after its asset, market, timestamp, old tick, and new tick all
+  validate. Ignored members of a batched delivery do not suppress ordered events
+  or validation of later members; the whole delivery is ignored only when every
+  member is a valid ignore.
 
 The key distinguishes stored evidence; it does not assert cross-book economic
 independence. Any complementary-price view belongs in an explicit later consumer.
@@ -84,9 +98,15 @@ impact classification selected before book state. Exact rejected bytes
 and parser error codes live in the committed reject sidecar, not this event.
 
 Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
-Struct field order and adjacent enum tags are schema. The strict reader rejects
+Struct field order and adjacent enum tags are schema. The strict reader
+(`SegmentRecord::from_canonical_json`, used by writers, audits and tests) rejects
 unknown fields/variants, unsupported versions, invalid domain states, alternate
 field order, and insignificant whitespace by decode/validate/re-encode equality.
+`SegmentRecord::from_json` is the pinned replay read's single-pass decode: it
+deserializes header and event directly into their final types, checks the
+version first, and rejects the same malformed, unknown, duplicate, reordered,
+unsupported and invalid inputs, but does not prove the canonical spelling; the
+pin's install-time SHA-256 binding does.
 Callers add an LF only when framing records as NDJSON; the LF is not part of one
 record's canonical JSON bytes.
 
@@ -201,15 +221,36 @@ See the walker's [profile-2 contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#i
 for address inputs, independent validation, and compatibility limits.
 
 All NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
-and carry logical and stored identities. The strict verifier checks canonical
-JSON, closed versions and fields, frame EOF and both identities, event/child
-order, exact reject-envelope provenance, and one-to-one reject/fault pairing.
+and carry logical and stored identities. The strict audit verifier
+(`verify_derivative`) checks canonical JSON, closed versions and fields, frame
+EOF and both identities, event/child order, exact reject-envelope provenance,
+and one-to-one reject/fault pairing. The pinned replay read runs the same pass
+without the two SHA-256 identities and the canonical re-encode comparison; see
+[Read-time integrity contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#read-time-integrity-contract).
 
-Builds use unique private staging directories. After EOF and both `finish()`
-calls, they finish and fsync frames, rename and fsync data, write and fsync the
-manifest, and strictly verify the complete candidate against the constructed
-receipt bytes. Only then do they atomically publish the uncommitted directory and
-write/fsync/rename the receipt last. Each build holds its per-address OS advisory
+Builds use unique private staging directories. While writing, a build applies
+the default reader's delivery-level checks to every source delivery it emits:
+line, group, tie-run, and lane limits; dense sequence, time order, and per-lane
+delivery order; equal-time tie tags; and, at EOF, the derivative window and
+agreement with the upstream receipt's coverage and clock claims. A fault event
+is only ever written paired with its parse reject. After EOF and both `finish()`
+calls, builds finish and fsync frames, rename and fsync data, write and fsync the
+manifest, check metadata-document limits, and re-hash every staged file against
+the stored identities the receipt records. They do not decode and re-parse their
+own output: the bytes are the ones the writer just produced under those checks.
+Only then do they atomically publish the uncommitted directory and
+write/fsync/rename the receipt last.
+
+The full strict audit verifier runs on an existing committed address
+(verify/no-op) and through `materialize_range --inspect-pin`, which Replay's
+archive download path calls and an operator can run on demand. Replay's bundle cache binds a derivative already
+installed in its local derivatives root to its pin by receipt hash and per-file
+stored SHA-256 identities rather than re-inspecting it. The walker's
+`open_pinned` relies on that binding: it re-hashes the receipt and manifest,
+then checks every frame, length, LF count, ordering, pairing and line schema in
+one streaming pass during traversal, without re-hashing data bytes or
+re-encoding lines (see below).
+The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
 lock from before stage creation through publication and cleanup; process death
 releases it. Builds of the same address serialize, while different addresses can
 run concurrently. Before writing a new stage, every run scans directory names
@@ -235,9 +276,17 @@ different bytes at the same address are an immutable conflict.
 defines the reviewed contract and acceptance cases.
 
 - `replay-materialize::{inspect_pinned, open_pinned}` binds the caller's exact
-  `DerivativePin` to receipt, manifest, addressed directory, and compressed data.
-  Open verifies a private bounded per-window snapshot completely before exposing
-  records; source replacement cannot change the verified stream.
+  `DerivativePin` to receipt and manifest by SHA-256, and to the addressed
+  directory and the receipt's stored lengths. Open copies a private bounded
+  per-window snapshot, checking each file's exact stored length as it is
+  copied, and decodes nothing. Traversal then decodes each file once with the
+  codec's structural decoder (one checksummed frame, no trailing bytes, exact
+  stored/decoded lengths and LF count; no SHA-256), parses each line once into
+  its final typed record, and applies every semantic check to the records it
+  reads, so records may stream before the window's verification completes;
+  any violation poisons the attempt, and nothing is complete until `finish()`.
+  Source replacement cannot change the snapshotted stream. Data-byte digests
+  and canonical encoding are proved at install and by `verify_derivative`.
 - `replay-tape::DerivativeWalker::open` takes explicit pins, requested bounds,
   `ScopeFilter { instruments, lanes }`, `ReadLimits`, and a required
   `LowerBoundPolicy` with no default. It orders adjacent windows and validates
@@ -247,9 +296,12 @@ defines the reviewed contract and acceptance cases.
   Filtering retains original child indexes, source spans, provenance, relevant
   controls/faults, and every selected instrument orientation. `book_keys()` keeps
   Kalshi Outcome/Complement distinct; it performs no projection or mutation.
-- Both reader and walker require explicit clean EOF before consuming `finish()`
-  can mint a completion capability. Errors poison the attempt. `replay-risk`
-  applies every complete group even when its consumer skips evaluation.
+- Both reader and walker require explicit clean EOF, which is reached only after
+  every check of every selected window has passed, before consuming `finish()`
+  can mint a completion capability. Errors poison the attempt, including after
+  records from the failing window were returned; such an attempt has failed as
+  a whole. `replay-risk` applies every complete group even when its consumer
+  skips evaluation, and the publisher's terminal record requires its `finish()`.
 
 RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
 holds one bounded compressed window. Oversized groups fail rather than split.
@@ -260,11 +312,12 @@ temporary directory. The 8 GiB per-reader cap does not reserve free space or
 budget concurrent readers. Ordinary drop/error removes the owned snapshot only.
 
 The default 16 MiB NDJSON-line limit (including LF), 1 MiB metadata-document
-limit, and group/lane limits also deliberately apply to build-candidate
-verification: oversized candidates fail before publication, rather than produce
-artifacts rejected by the default verifier. These are operational limits, not
-wire-format changes. Verification currently performs three full decode passes
-before traversal; a single-pass refactor and typed error categories are deferred.
+limit, and group/lane limits also deliberately apply to builds, which enforce
+them while writing: oversized candidates fail before publication, rather than
+produce artifacts rejected by the default verifier. These are operational limits, not
+wire-format changes. Verification is one decode pass per file, shared by pinned
+reads and `verify_derivative`, which drains it for a standalone verdict; typed
+error categories are deferred.
 Do not infer retryability from error strings; an error invalidates the attempt,
 and any fresh retry must retain the explicit pins.
 
@@ -274,6 +327,14 @@ profile-2 composite derivative per exact window, and emits only verified ordered
 pins. It is an example target, not a stable CLI, archive restorer, or indexer.
 The existing 4096-window read limit is unchanged; with half-hour canonical
 windows, one initial materialization request can span at most 85 days 8 hours.
+The helper builds windows concurrently, in-process, with up to
+`std::thread::available_parallelism()` workers (which honors a Linux cgroup CPU
+quota), each window with its own fresh normalizer. Pins and the response stay in
+window order and are byte-identical to a sequential build. Once a window fails,
+no new window starts; in-flight windows finish and the earliest failing
+window's error is reported, the same error a sequential build reports first.
+Windows committed before the failure remain valid, and a retry takes their
+verify/no-op path.
 Transport and Python supervisor preflight bind every selected profile-2 manifest
 to the helper's typed composite identity and derive plan scales from it before any
 Redis command or child process. The initial Redis wire record remains V1.
@@ -295,9 +356,11 @@ overlay is implemented or approved by this generic traversal boundary.
 [`RISK_RECONSTRUCTION_V1.md`](../docs/RISK_RECONSTRUCTION_V1.md) specifies
 `RiskEngine::{open, next_cut, view, finish}`, explicit primary-lane `BookPlan`s,
 and the transport-independent immutable `RiskCut` boundary. It separates ordered
-original Book/Trade observations (including duplicate disposition) from scoped
-book decisions. Only affected books advance revision; failures latch per key,
-receipt faults block their entire intervals, and later valid Fulls recover.
+original Book/Trade observations (including duplicate disposition), non-market
+target-metadata change observations, and scoped book decisions. Metadata changes
+retain both publication digests without changing books. Only affected books advance
+revision; failures latch per key, receipt faults block their entire intervals, and
+later valid Fulls recover.
 Views retain exact initialization/epoch dependencies and remain immutable after
 later cuts. Profile 1 cannot open a strong risk attempt. There is no transport,
 remote query, audit overlay, checkpoint, strategy, or fee change in this crate.

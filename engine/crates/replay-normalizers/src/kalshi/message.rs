@@ -49,9 +49,13 @@ fn snapshot(
     config: Config,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["type", "sid", "seq", "msg"])?;
+    // A snapshot answering a command (`subscribe` or `get_snapshot`) echoes that
+    // command's `id` at the top level. It is the only optional field here and is
+    // validated like every other echoed command id; it carries no book meaning.
+    outer.checked_fields(&["id", "type", "sid", "seq", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     sequence(outer, envelope, batched)?;
+    optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     outer
         .checked_required("sid")?
         .checked_positive_u64()

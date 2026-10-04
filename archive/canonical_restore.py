@@ -180,7 +180,12 @@ def _validate_receipt_details(document: dict[str, Any]) -> None:
         lanes = document[name]
         if not isinstance(lanes, list) or any(not isinstance(lane, str) or not lane for lane in lanes):
             raise CanonicalRestoreError(f"canonical receipt {name} is invalid")
-        if lanes != sorted(set(lanes)):
+        # `indexer-finalize` writes expected lanes in its `--expect-lane` order,
+        # so only uniqueness is a property of that list, as in the Rust reader.
+        if name == "expected_lanes":
+            if len(set(lanes)) != len(lanes):
+                raise CanonicalRestoreError(f"canonical receipt {name} is not unique")
+        elif lanes != sorted(set(lanes)):
             raise CanonicalRestoreError(f"canonical receipt {name} is not sorted and unique")
     for name, reason in (("missing_lanes", "lane_missing"), ("invalid_lanes", "lane_invalid")):
         if not isinstance(document[name], list):

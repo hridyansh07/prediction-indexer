@@ -85,6 +85,43 @@ impl SegmentRecord {
         Ok(decoded)
     }
 
+    /// Single-pass typed decode for bytes whose exact encoding is proven at
+    /// another boundary (the Replay pinned-derivative read, whose files are
+    /// bound to their receipt by SHA-256 at install). Header and event are
+    /// deserialized directly into their final types from one parse; there is
+    /// no intermediate raw value, second parse, or re-encode comparison.
+    ///
+    /// It still rejects malformed JSON, trailing data, unknown, duplicate,
+    /// missing or reordered top-level fields, unknown nested fields and
+    /// variants, and every state the domain types reject. `schema_version`
+    /// must come first and is checked before the header or event is
+    /// interpreted. It does not reject insignificant whitespace or alternate
+    /// number/string spellings: use [`Self::from_canonical_json`] wherever the
+    /// canonical encoding itself must be proven (writers, audits, tests).
+    pub fn from_json(bytes: &[u8]) -> Result<Self, DomainError> {
+        let mut unsupported = None;
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let decoded = serde::de::DeserializeSeed::deserialize(
+            SinglePass {
+                unsupported: &mut unsupported,
+            },
+            &mut deserializer,
+        )
+        .and_then(|record| deserializer.end().map(|()| record));
+        let (schema_version, header, event) = match (decoded, unsupported) {
+            (_, Some(version)) => return Err(DomainError::UnsupportedSchemaVersion(version)),
+            (Err(error), None) => return Err(DomainError::Json(error.to_string())),
+            (Ok(fields), None) => fields,
+        };
+        header.validate()?;
+        event.validate()?;
+        Ok(Self {
+            schema_version,
+            header,
+            event,
+        })
+    }
+
     fn from_wire(wire: SegmentRecordWire) -> Result<Self, DomainError> {
         if wire.schema_version != crate::SEGMENT_SCHEMA_V3 {
             return Err(DomainError::UnsupportedSchemaVersion(wire.schema_version));
@@ -100,6 +137,87 @@ impl SegmentRecord {
             header,
             event,
         })
+    }
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum SegmentRecordField {
+    SchemaVersion,
+    Header,
+    Event,
+}
+
+/// `SegmentRecord::from_json`'s one-pass visitor. Fields must arrive in schema
+/// order, so the version is known before any header or event byte is decoded.
+struct SinglePass<'a> {
+    unsupported: &'a mut Option<u16>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for SinglePass<'_> {
+    type Value = (u16, EventHeader, SegmentEvent);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "SegmentRecord",
+            &["schema_version", "header", "event"],
+            self,
+        )
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SinglePass<'_> {
+    type Value = (u16, EventHeader, SegmentEvent);
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a segment record object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error;
+        next_field(
+            &mut map,
+            SegmentRecordField::SchemaVersion,
+            "schema_version",
+        )?;
+        let schema_version: u16 = map.next_value()?;
+        if schema_version != crate::SEGMENT_SCHEMA_V3 {
+            *self.unsupported = Some(schema_version);
+            return Err(A::Error::custom("unsupported segment schema version"));
+        }
+        next_field(&mut map, SegmentRecordField::Header, "header")?;
+        let header: EventHeader = map.next_value()?;
+        next_field(&mut map, SegmentRecordField::Event, "event")?;
+        let event: SegmentEvent = map.next_value()?;
+        if map.next_key::<SegmentRecordField>()?.is_some() {
+            return Err(A::Error::custom("duplicate segment record field"));
+        }
+        Ok((schema_version, header, event))
+    }
+}
+
+/// Requires the next top-level key to be exactly `expected`.
+fn next_field<'de, A>(
+    map: &mut A,
+    expected: SegmentRecordField,
+    name: &'static str,
+) -> Result<(), A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+{
+    use serde::de::Error;
+    match map.next_key::<SegmentRecordField>()? {
+        Some(found) if found == expected => Ok(()),
+        Some(_) => Err(A::Error::custom(format!(
+            "segment record field `{name}` is missing or out of schema order"
+        ))),
+        None => Err(A::Error::missing_field(name)),
     }
 }
 

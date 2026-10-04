@@ -68,6 +68,32 @@ class CanonicalRestoreTest(unittest.TestCase):
                     preflight_canonical_window(self.store, BASE_NS, WINDOW_SECONDS)
                 path.write_bytes(original)
 
+    def test_expected_lanes_in_finalizer_flag_order_restore(self):
+        # Production receipts list expected lanes in `--expect-lane` order.
+        store = LocalObjectStore(self.root / "lane-order-objects")
+        source_root = self.root / "lane-order-source"
+        source = write_canonical_receipt(
+            source_root,
+            evidence_lines=2,
+            expected_lanes=["polymarket", "polymarket_snapshots", "limitless", "kalshi"],
+        )
+        self.assertEqual(
+            CanonicalArchiver(source_root, store).archive_window(source).status, "archived"
+        )
+        remote = preflight_canonical_window(store, BASE_NS, WINDOW_SECONDS)
+        restored = restore_canonical_window(store, remote, self.root / "lane-order-restored")
+        self.assertEqual(restored.read_bytes(), source.read_bytes())
+
+    def test_duplicate_expected_lanes_fail(self):
+        store = LocalObjectStore(self.root / "duplicate-objects")
+        source_root = self.root / "duplicate-source"
+        source = write_canonical_receipt(
+            source_root, evidence_lines=2, expected_lanes=["kalshi", "polymarket", "kalshi"]
+        )
+        CanonicalArchiver(source_root, store).archive_window(source)
+        with self.assertRaisesRegex(CanonicalRestoreError, "expected_lanes is not unique"):
+            preflight_canonical_window(store, BASE_NS, WINDOW_SECONDS)
+
     def test_module_has_no_replay_or_targeter_import(self):
         before = set(sys.modules)
         sys.modules.pop("archive.canonical_restore", None)

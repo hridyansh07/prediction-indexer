@@ -24,7 +24,7 @@ PRODUCER_IDENTITY_VERSION = 1
 RESOLVED_JOB_VERSION = 1
 JOB_RESULT_VERSION = 1
 JOB_RECEIPT_VERSION = 1
-RUNNER_CONFIG_VERSION = 2
+RUNNER_CONFIG_VERSION = 3
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_BUNDLE_RECEIPT_BYTES = 1024 * 1024
@@ -1497,7 +1497,7 @@ def parse_job_receipt(raw):
 VENUES = ("kalshi", "limitless", "polymarket")
 
 _LIMIT_FIELDS = (
-    "max_entry_bytes max_queue_bytes command_timeout_ms attempts no_progress "
+    "max_entry_bytes max_queue_bytes command_timeout_ms publish_batch_entries attempts no_progress "
     "progress_margin stall_seconds attempt_seconds run_seconds poll_seconds stop_seconds"
 )
 
@@ -1643,6 +1643,11 @@ def _check_limits(preset, name):
     _require(
         preset["max_entry_bytes"] <= preset["max_queue_bytes"] <= 1_000_000_000,
         f"{where} requires max_entry_bytes <= max_queue_bytes <= 1000000000",
+    )
+    _positive_int(preset["publish_batch_entries"], f"{where}.publish_batch_entries")
+    _require(
+        preset["publish_batch_entries"] <= 1024,
+        f"{where}.publish_batch_entries must be 1-1024",
     )
     for field in ("attempts", "no_progress", "progress_margin"):
         _positive_int(preset[field], f"{where}.{field}")

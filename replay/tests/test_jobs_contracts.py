@@ -753,6 +753,7 @@ class RunnerConfigTest(unittest.TestCase):
         self.assertEqual(set(config.authorities), {"kalshi", "limitless", "polymarket"})
         self.assertEqual(config.orchestration, c.Orchestration(20, 86400, 60))
         self.assertIn("small", config.limits)
+        self.assertEqual(config.limits["small"]["publish_batch_entries"], 100)
         self.assertEqual(
             config.strategies["bundle_coverage"],
             c.StrategyEntry(
@@ -791,6 +792,16 @@ class RunnerConfigTest(unittest.TestCase):
             "window seconds": with_(canonical_window_seconds=7),
             "missing venue": with_(authorities={"kalshi": "kalshi", "limitless": "limitless"}),
             "version 1": with_(replay_runner_config_version=1),
+            "version 2 without batch size": with_(replay_runner_config_version=2),
+            "missing batch size": with_(
+                limits={"small": {k: v for k, v in small.items() if k != "publish_batch_entries"}}
+            ),
+            "zero batch size": with_(limits={"small": {**small, "publish_batch_entries": 0}}),
+            "batch size above 1024": with_(
+                limits={"small": {**small, "publish_batch_entries": 1025}}
+            ),
+            "boolean batch size": with_(limits={"small": {**small, "publish_batch_entries": True}}),
+            "float batch size": with_(limits={"small": {**small, "publish_batch_entries": 100.0}}),
             "no strategies": with_(strategies={}),
             "bad factory": entry(factory="nope"),
             "unknown schema": entry(config_schema="nope"),

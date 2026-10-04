@@ -247,6 +247,9 @@ def acceptance(config_path, publisher):
         with (damaged / "events.ndjson.zst").open("r+b") as stream:
             stream.truncate(1)
         bad["transport"]["inputs"][-1]["directory"] = str(damaged)
+        # A failing publisher never flushes its buffer, so append per entry to
+        # observe the cuts streamed before the late failure.
+        bad["transport"]["publish_batch_entries"] = 1
         # Inspect actual Redis state before cleanup, not merely absent SUCCESS.
         attempt = uuid.uuid4().hex
         publisher_config = root / "bad-publisher.json"

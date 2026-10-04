@@ -659,6 +659,7 @@ def supervisor_config(
             "command_timeout_ms": preset["command_timeout_ms"],
             "max_entry_bytes": preset["max_entry_bytes"],
             "max_queue_bytes": preset["max_queue_bytes"],
+            "publish_batch_entries": preset["publish_batch_entries"],
         },
         "strategies": {
             request.strategy: {

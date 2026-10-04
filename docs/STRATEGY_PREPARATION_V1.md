@@ -157,6 +157,14 @@ transport configuration, and consume scope changes in order. It must not use
 those changes to mutate Risk policy or infer lifecycle evidence. Publisher groups,
 derivative filesystem paths, and executable identity remain supervisor concerns.
 
+Stage-2 strategies receive Replay stream cuts under the zero-copy hook contract of
+[REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md): `cut.books` and `cut.body` are live
+views valid only while `__call__(cut)` runs. Books are updated in place, so state
+needed later — for example the prior book state at a scope boundary — must be
+copied during the hook (`replay.bundle_coverage` keeps a detached
+`(validity, reason, source)` per book). Use `Book.levels(side, n=None)`,
+`Book.best_bid()`, and `Book.best_ask()`; their returned tuples are copies.
+
 `receipt.json` (version 1) is the commit marker, written last after fsync/rename
 of context. It records `snapshot_sha256` over exact file bytes,
 `snapshot_byte_length`, and `config_sha256` over canonical UTF-8 JSON (sorted keys,

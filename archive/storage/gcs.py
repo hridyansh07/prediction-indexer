@@ -27,6 +27,8 @@ __all__ = ["GCSObjectStore"]
 
 SHA256_METADATA = "stored-sha256"
 BYTE_LENGTH_METADATA = "stored-byte-length"
+# GCS always stores a content type; an upload that names none gets this one.
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 
 class _CRC32C:
@@ -93,6 +95,9 @@ class GCSObjectStore:
         _validate_identity(expected_identity)
         if not reader.seekable():
             raise ObjectStoreError(f"{key}: put_immutable requires a seekable reader")
+        # Compare against what GCS will actually store, including on the
+        # conditional-create retry of an object an earlier attempt uploaded.
+        content_type = content_type or DEFAULT_CONTENT_TYPE
 
         blob = self._client.bucket(self.bucket).blob(
             key, chunk_size=DEFAULT_BUFFER_BYTES

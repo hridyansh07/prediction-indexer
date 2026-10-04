@@ -15,7 +15,10 @@ pub(crate) struct SourceEvidence {
 }
 
 impl SourceEvidence {
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+    /// `canonical` adds the re-encode equality check. The audit verifier sets
+    /// it; the pinned replay read does not, because the pin's install-time
+    /// SHA-256 binding already proves these exact bytes.
+    pub fn decode(bytes: &[u8], canonical: bool) -> Result<Self, String> {
         let value: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if value.source_version != 1
             || value.connection_epoch.is_empty()
@@ -24,7 +27,7 @@ impl SourceEvidence {
                 .bytes()
                 .all(|b| b.is_ascii() && !b.is_ascii_control() && b != b'"' && b != b'\\')
             || value.header.address().event_index() != 0
-            || serde_json::to_vec(&value).map_err(|e| e.to_string())? != bytes
+            || (canonical && serde_json::to_vec(&value).map_err(|e| e.to_string())? != bytes)
         {
             return Err("invalid source evidence record".into());
         }
