@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 SIDES = ("bid", "ask")
 # Closed SDK measurement statuses; ``DEPTH_SUFFICIENT`` is the only evaluated one.
@@ -11,7 +11,6 @@ UNUSABLE, ONE_SIDED, DEPTH_LIMITED, EVALUATED = (
 SDK_STATUSES = (UNUSABLE, ONE_SIDED, DEPTH_LIMITED, EVALUATED)
 # Admission statuses never reach ``evaluate``. NO_MATCH is control-only.
 ADMISSIONS = ("NOT_CAPTURED", "UNSUPPORTED_SHAPE", "UNSUPPORTED_SCALE", "NO_MATCH")
-DETAILS = ("intervals", "episodes", "slices")
 TRANSFORMS = ("kalshi_complement_ask",)
 CONTROLS = ("cyclic_neighbor", "time_shift")
 REAL, CONTROL = "real", "control"
@@ -103,8 +102,9 @@ class Context:
 class Experiment:
     """Everything the SDK needs from a configured strategy, fixed before callbacks.
 
-    ``layout`` 1 is the legacy complement V1 file layout (mixed measurement and
-    slice files, ``placebo_episodes.ndjson``); 2 separates real and control rows.
+    ``layout`` 1 is the frozen V1 wire (complete interval partition, placebo
+    rows beside real rows); 2 is the SDK default: denominators, real episodes,
+    and opt-in controls and audit (see ``output``).
     """
 
     strategy: str
@@ -121,9 +121,11 @@ class Experiment:
     unevaluated_fields: tuple
     maxima: tuple[str, ...]
     slice_invariant: tuple[str, ...]
-    detail: dict = field(default_factory=lambda: {REAL: "slices", CONTROL: "slices"})
     controls: tuple[Control, ...] = ()
     layout: int = 2
+    audit_intervals: bool = False
+    controls_episodes: bool = False
+    controls_slices: bool = False
     ring_entries: int = 0
     static_reservation: int = 0
     profile: object = None

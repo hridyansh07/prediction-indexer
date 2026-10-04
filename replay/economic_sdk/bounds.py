@@ -15,6 +15,7 @@ MAX_LINE = 64 * 1024
 MAX_METADATA = 8 * 1024 * 1024
 MAX_STATE = 128 * 1024 * 1024
 MAX_CONSUMED_LEVELS = 1024
+MAX_SKEW_POINTS = 100_000
 
 # Per-object upper bounds (64-bit CPython 3.11+), with allocator slack.
 INT = 48            # an int below 2**120
@@ -52,17 +53,18 @@ def fills_cost(sizes, levels):
 
 
 def fingerprint_cost(fingerprint):
-    """A memoized input fingerprint: per-leg tuples holding fills or quotes."""
+    """A memoized flat input fingerprint: fills, best quotes, validity, reasons."""
     cost = CONTAINER
-    for leg in fingerprint:
-        cost += CONTAINER + SLOT
-        for part in leg:
-            cost += CONTAINER + SLOT + PAIR
-            fill = part[0] if type(part) is tuple and part and hasattr(part[0], "consumed") else part
-            if hasattr(fill, "consumed"):
-                cost += FILL + (len(fill.taken) + len(fill.consumed)) * (PAIR + SLOT)
-            elif type(part) is dict:
-                cost += json_cost(part)
+    for part in fingerprint:
+        cost += SLOT
+        if hasattr(part, "consumed"):
+            cost += FILL + (len(part.taken) + len(part.consumed)) * (PAIR + SLOT)
+        elif type(part) is tuple:
+            cost += PAIR
+        elif type(part) is dict:
+            cost += json_cost(part)
+        elif type(part) is str:
+            cost += STR + 4 * len(part)
     return cost
 
 

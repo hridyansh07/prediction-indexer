@@ -1,35 +1,21 @@
 """Closed configuration, identities and baskets for the same-venue complement.
 
-Policy version 1 is the frozen V1 experiment: full slice detail for real and
-placebo entities, the cyclic-neighbour placebo and the legacy file layout.
-Policy version 2 (ECONOMIC_STRATEGY_SDK_V1.md §11.2) selects detail per entity
-class, named controls, an optional market profile and the SDK file layout.
+Policy version 1 is the frozen V1 experiment (output layout 1): a complete
+interval partition with skew buckets, the cyclic-neighbour placebo beside real
+rows, and full slices. Its wire contract is recorded in
+SAME_VENUE_COMPLEMENT_V1.md §9 and is pinned byte for byte by
+``replay/tests/fixtures/complement_v1_golden.json``.
 
-Output wire contract (all fields required, unknown fields rejected):
-common = version(1|2), experiment_sha256, scope(int), entity(sha), start_ns, end_ns.
-measurement = common + status, reasons(list), skew_bucket(int|null), value_class
-    (str|null), fee_status(SKIPPED|KNOWN|UNKNOWN|NOT_APPLICABLE), diagnostic(str|null).
-episode = common + episode_id, kind(gross|net), basket(descriptor),
-    end_reason, censored(bool), gap_lifetime_ns, opening_slice_survival_ns,
-    viable_tiers(list of ns strings), qualified_ns(map tier->ns),
-    open_values, max_gap_gross, max_gap_net, opening_skew_bucket
-    [+ open_quotes at "episodes" detail].
-open_values = gap_gross(signed str), gap_net(signed str|null), gross_scale(int),
-    net_scale(18), fee_status, assessments(list of per-leg lists),
-    assumptions(list[str]), evidence(list[str]).
-slice ("slices" detail) = common + episode_id, kind, end_reason, censored,
-    consumed(list of two lists of [price str, displayed quantity str]),
-    survival_ns, viable_tiers, open_values, opening_skew_bucket.
-slice ("episodes" detail) = episode_id, start_ns, end_ns, end_reason, censored.
-Manifest = version,strategy,snapshot_sha256,policy,policy_sha256,experiment_sha256,
-    fee_config(no directory),fee_engine_identity,files(map basename->identity),
-    instantaneous_positive(map entity->int),payout_assumption,
-    [summary_sha256 only after validation].
-Episode IDs hash [scope, entity, kind, start_ns].
+Policy version 2 is the SDK default (output layout 2, ECONOMIC_STRATEGY_SDK_V1.md
+§5): episodes are the result, time per key is aggregated into denominators,
+reasons are structured, controls and the full interval audit are opt-in.
+Policy 2 fields beyond policy 1: ``controls`` (list, default empty),
+``controls_episodes``, ``controls_slices``, ``audit_intervals`` (booleans),
+``time_shift_ring_entries`` and ``profile`` (null or a profile policy).
 """
 
 from replay.economic_sdk.bounds import MAX_METADATA
-from replay.economic_sdk.types import CONTROL, REAL, Basket, Control, Experiment
+from replay.economic_sdk.types import Basket, Control, Experiment
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
 from replay.streams.protocol import obj, require, uint
@@ -47,7 +33,8 @@ SELF_CROSSED = "SELF_CROSSED_LEG"
 RESOLVER_RESERVATION = 1024 * 64 * 1024
 _V1_FIELDS = ("version sizes_contracts headline_size_contracts latency_tiers_ns headline_latency_ns "
               "minimum_net_gap_per_contract_e18 leg_skew_buckets_ns verdict")
-_V2_FIELDS = _V1_FIELDS + " detail controls time_shift_ring_entries profile"
+_V2_FIELDS = _V1_FIELDS + (" controls controls_episodes controls_slices audit_intervals "
+                           "time_shift_ring_entries profile")
 
 
 def policy_config(value):
@@ -69,9 +56,10 @@ def policy_config(value):
     uint(verdict["maximum_positive_time_fraction_ppm"], 1_000_000)
     require(uint(verdict["minimum_evaluated_ns"]) > 0, "minimum evaluated duration")
     if value["version"] == 2:
-        detail = obj(value["detail"], "real control")
-        for level in detail.values():
-            require(level in ("intervals", "episodes", "slices"), "detail level")
+        for flag in ("controls_episodes", "controls_slices", "audit_intervals"):
+            require(type(value[flag]) is bool, "policy flag")
+        require(value["controls_episodes"] or not value["controls_slices"],
+                "control slices require control episodes")
         controls = value["controls"]
         require(type(controls) is list and len(controls) <= 2, "controls")
         kinds = []
@@ -96,6 +84,11 @@ def policy_config(value):
     return value
 
 
+def reason(value):
+    """A structured reason: canonical JSON object text (policy 2)."""
+    return encoded(value).decode()
+
+
 def experiment_identity(snapshot_sha, policy, fee_config):
     return digest({"strategy": STRATEGY, "bridge_version": 1, "policy": policy,
                    "fees": fee_config, "snapshot_sha256": snapshot_sha})
@@ -103,11 +96,13 @@ def experiment_identity(snapshot_sha, policy, fee_config):
 
 def experiment(policy, experiment_sha256):
     """SDK experiment description, derived from the policy alone."""
+    flags = {}
     if policy["version"] == 1:
-        detail = {REAL: "slices", CONTROL: "slices"}
         controls, layout, ring, profile = (Control("cyclic_neighbor"),), 1, 0, None
+        fields, unevaluated = FIELDS, ("NOT_APPLICABLE", None)
     else:
-        detail = dict(policy["detail"])
+        flags = {name: policy[name] for name in ("audit_intervals", "controls_episodes", "controls_slices")}
+        fields, unevaluated = (), ()
         controls = []
         for control in policy["controls"]:
             if control["kind"] == "time_shift":
@@ -122,10 +117,10 @@ def experiment(policy, experiment_sha256):
         skew_edges_ns=tuple(int(e) for e in policy["leg_skew_buckets_ns"]),
         kinds=("gross", "net"), episode_classes=EPISODE_CLASSES, value_classes=VALUE_CLASSES,
         diagnostic_statuses=LIMITLESS_STATUSES + ((SELF_CROSSED,) if policy["version"] == 2 else ()),
-        measurement_fields=FIELDS, unevaluated_fields=("NOT_APPLICABLE", None),
-        maxima=("gap_gross", "gap_net"), slice_invariant=("gap_gross",), detail=detail,
+        measurement_fields=fields, unevaluated_fields=unevaluated,
+        maxima=("gap_gross", "gap_net"), slice_invariant=("gap_gross",),
         controls=controls, layout=layout, ring_entries=ring,
-        static_reservation=RESOLVER_RESERVATION, profile=profile)
+        static_reservation=RESOLVER_RESERVATION, profile=profile, **flags)
 
 
 class Inputs:
@@ -167,7 +162,9 @@ def baskets(snapshot, policy, scope_index):
         if not member["capture_selected"]:
             status = "NOT_CAPTURED"
         elif not valid:
-            status, reasons = "UNSUPPORTED_SHAPE", (str(len(books)),)
+            status = "UNSUPPORTED_SHAPE"
+            reasons = ((str(len(books)),) if policy["version"] == 1
+                       else (reason({"kind": "book_count", "value": len(books)}),))
         elif len({(plans[k]["price_scale"], plans[k]["quantity_scale"]) for k in keys}) != 1:
             status = "UNSUPPORTED_SCALE"
         paired = venue in ("polymarket", "kalshi")
@@ -179,8 +176,6 @@ def baskets(snapshot, policy, scope_index):
                               "direction": direction, "size_contracts": size}
                 if policy["version"] == 1:
                     descriptor |= {"placebo": False, "replaced_leg": None}
-                else:
-                    descriptor["control"] = None
                 result.append(Basket(descriptor, keys, (venue, market, direction, int(size)),
                                      status, reasons, 1 if paired else None,
                                      (venue, direction, size), market, inputs))
@@ -198,7 +193,7 @@ def _inputs(venue, direction, size, legs, version):
     else:
         return None
     if version == 2 and venue != "limitless":
-        sources += (("best", None),)
+        sources += (("crossed", None),)
     return (sources,) * legs
 
 
@@ -219,7 +214,7 @@ def control_descriptor(policy, basket, control, replacement, admission):
         label = {"kind": control.kind, "leg": basket.control_leg}
         if control.kind == "time_shift":
             label["shift_ns"] = str(control.shift_ns)
-        else:
+        elif replaced is not None:
             label["replaced_leg"] = replaced
         descriptor["control"] = label
     return descriptor
@@ -228,7 +223,7 @@ def control_descriptor(policy, basket, control, replacement, admission):
 def control_label(descriptor):
     if "placebo" in descriptor:
         return descriptor["placebo"]
-    control = descriptor["control"]
+    control = descriptor.get("control")
     if control is None:
         return None
     return control["kind"] + (":" + control["shift_ns"] if control["kind"] == "time_shift" else "")

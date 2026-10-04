@@ -1,14 +1,15 @@
 # Economic strategy SDK V1
 
-Status: **implemented, offline gates only.** The SDK (`replay/economic_sdk/`), the
-complement port (policies 1 and 2), and the market profile
-(`replay.market_profile:build`) are implemented on `feat/economic-strategy-sdk`, and
-the offline tests pass. The bench-corpus acceptance in §9 and §11 has **not** been
-run yet. That covers byte identity of the V1 port on the corpus, the timing and
-output-size targets, and the profile readouts. §13 records the decisions and
-deviations made during implementation. The document builds on the same-venue
-complement strategy ([SAME_VENUE_COMPLEMENT_V1.md](SAME_VENUE_COMPLEMENT_V1.md)) and
-on the fixture review of that strategy.
+Status: **implemented; offline gates pass; bench acceptance pending.** The
+following are implemented on `feat/economic-strategy-sdk`:
+
+- the SDK (`replay/economic_sdk/`);
+- the same-venue complement on it (policies 1 and 2, §11);
+- the market profile (`replay.market_profile:build`, §7).
+
+The bench-corpus acceptance in §11 runs outside the repository and has not yet
+been run against this revision. The document builds on the same-venue complement
+strategy ([SAME_VENUE_COMPLEMENT_V1.md](SAME_VENUE_COMPLEMENT_V1.md)).
 
 Every economic strategy needs the same machinery:
 
@@ -17,512 +18,600 @@ Every economic strategy needs the same machinery:
 - decide what to re-evaluate;
 - stage same-timestamp cuts;
 - split time at scope boundaries;
-- track intervals, episodes, and slices;
-- write bounded output in close order;
-- verify it with an independent reader.
+- account time per measured key;
+- track episodes and slices;
+- write bounded output;
+- verify that output with an independent reader.
 
-The complement strategy implements all of that inside its own module. This
-document moves it into a shared SDK. A strategy then supplies only:
+The SDK owns all of it. A strategy supplies only:
 
-- what book data it needs;
-- which baskets it evaluates;
+- the book data it needs;
+- the baskets it evaluates;
 - a pure function that turns book views into an observation.
 
-The SDK also adds a standard **market profile** output: per-book trading data
-points. These describe how each market behaves on each venue, whether or not any
-strategy finds an edge. That is the primary product of the current research phase.
+The SDK also provides a standard **market profile**: per-book trading data points
+describing how each market behaves on each venue, whether or not any strategy finds
+an edge.
+
+**Principle.** A strategy's result is its **episodes**. "No episodes", together
+with **denominators**, is the complete negative result. Denominators record how
+long each basket was measurable, and why it was not measurable otherwise.
+Everything else is optional diagnostics or audit, and is off by default.
 
 Out of scope:
 
-- changes to the Replay stream wire, Risk, normalizers, preparation, the
-  supervisor, or the fee SDK;
-- Universe claims and outcome masks (the separate context.json v2 work);
-- cross-bundle corpus orchestration (§10 lists only the requirements it places on
-  this SDK).
+- changes to the Replay stream wire, Risk, normalizers, preparation, the supervisor
+  or the fee SDK;
+- Universe claims and outcome masks (the context.json v2 work);
+- the fee catalog;
+- cross-bundle corpus orchestration (§10 lists only what it requires of this SDK).
 
-## 1. Why: findings from the complement fixture review
+## 1. Why: findings
 
-The complement strategy ran on the local bench corpus: bundle
-`bundle_e8a92effa246b9548571c907`, Procyon vs Galorys CS2. The window was 140
-minutes, with 18 planned books and 2,008,580 stream entries. It ran beside
-`bundle_coverage` in one supervisor attempt.
+All findings come from the local bench corpus: bundle
+`bundle_e8a92effa246b9548571c907`, Procyon vs Galorys CS2. The window is
+140 minutes, with 18 planned books and 2,008,580 stream entries. Each run was
+beside `bundle_coverage`, which alone takes 55.2 s.
 
-The arithmetic and timing were correct. Coverage still reproduced its reference
-hashes (semantic `87cb094d…`, intervals `41be6ad8…`). The problems all sit in the
-shared machinery:
+**The pre-SDK complement** had correct arithmetic and timing. Coverage still
+reproduced its reference hashes (semantic `87cb094d…`, intervals `41be6ad8…`).
+Every problem sat in the shared machinery:
 
 | Finding | Measurement |
 |---|---|
-| Throughput | About 3,000 stream entries/s, against about 37,000 for coverage alone. The attempt took 665 s, against 55 s for coverage alone. With the stock 300 s attempt deadline, a run failed at 57% (`budget_exhausted`). |
-| Where the time went | 77% of strategy callback time was in recursive retained-size accounting (`_deep_size` through `_entry_cost`), measured by a local cProfile on synthetic deep books. Evaluation, walks, and projections took about 15%. |
-| Output volume | 372 MB of output for 2.3 hours of one match. `slices.ndjson` was 256 MB of its 512 MiB fail-closed cap. |
-| Placebo share | Placebo entities produced 307,522 of 307,676 slice rows, 141,485 of 267,428 measurement rows, and about 323 MB of the 372 MB. 306,831 placebo slices ended `CONSUMED_CHANGED`: one 735-byte row per quote change during minutes-long placebo episodes. |
-| Placebo meaning | In a single-event bundle, the cyclic neighbour is a sibling market of the same match. On Kalshi it paired NO on GLS winning with YES on PRO winning, which is the same outcome. That produced "gaps" up to 98–99.8¢ lasting until each scope boundary. As a null control it carried no information here. |
-| Real signal | Nine Polymarket self-crossings (a token's bid above its ask) of 0.09–1.95 ms, during fills, each recorded twice: as a long episode and as a short episode. They are useful market data, but no label identified them. |
+| Throughput | The attempt took 665 s, later 396.6 s, against 55 s for coverage alone. 77% of callback time went to recursive retained-size accounting. |
+| Output volume | 372 MB for 2.3 hours of one match. `slices.ndjson` was 256 MB of its 512 MiB cap. |
+| Placebo share | Placebo entities produced about 323 MB of the 372 MB: one 735-byte slice row per quote change during minutes-long placebo episodes. |
+| Placebo meaning | In a single-event bundle, the cyclic neighbour is a sibling market of the same match. On Kalshi it paired NO on one team with YES on the other, which is the same outcome. As a null it carried no information. |
+| Real signal | Nine Polymarket self-crossings (a token's bid above its ask) of 0.09–1.95 ms. Each was recorded as both a long and a short episode, and no label identified them. |
 
-A follow-up change made the accounting cheaper: 396.6 s, still about 7× coverage
-(§9). That accounting is still strategy-local, so the SDK must solve it once for
-every strategy.
+**The first SDK revision (80aa64c)** gave these results:
+
+| Run | Result |
+|---|---|
+| Policy 1 compat | 179.6 s and 372.7 MB. Byte-identical to V1 (semantic `2d85b833…`). |
+| Policy 2 with `time_shift` | **Failed.** `control_measurements` hit the 512 MiB cap at 55% of the stream. 1,369,515 of 1,384,680 control rows were skew-bucket flips: a time-shifted leg keeps its historical last-change time, so its skew bucket changed on almost every update. |
+| Policy 2 with controls off | 98.8 s and 48.5 MB. Results were correct: nine Polymarket `SELF_CROSSED_LEG` intervals, and both verdicts absent. |
+| Market profile | 84.5 s and 8.5 MB. |
+
+In the V1 measurement file, the bloat came from:
+
+- skew-bucket boundaries: 93% of rows;
+- the experiment SHA and entity ID repeated in every row: about 40% of bytes;
+- reason strings: 17 MB, including a Python `b'…'` repr bug;
+- one entity per size × direction × real/placebo.
+
+Placebo and control rows were the majority of every file. §§5 and 6 are the
+response: denominators instead of a time series, skew that never splits time, and
+controls that are opt-in and isolated.
 
 ## 2. Strategy interface
-
-A strategy is a module exposing one object that the SDK wraps into a supervisor
-factory:
 
 ```python
 from replay.economic_sdk import Strategy, factory
 
 class SameVenueComplement(Strategy):
-    name = "same_venue_complement"
-    version = 2
-
     def requirements(self, snapshot, policy) -> Requirements: ...
     def baskets(self, snapshot, policy, scope_index) -> tuple[Basket, ...]: ...
-    def evaluate(self, basket, views, context) -> Observation: ...
+    def control_descriptor(self, basket, control, replacement, admission) -> dict: ...
+    def evaluate(self, entity, views, context) -> Observation: ...
 
-build = factory(SameVenueComplement())
+build = factory(SameVenueComplement)
 ```
 
-- **`requirements`** runs once, before any callback. It returns, per book key:
-  - the sides needed;
-  - the ticket sizes in contracts, or a level depth;
-  - whether consumed displayed quotes are needed (for slices);
-  - an optional SDK-provided view transform. V1 has one: `kalshi_complement_ask`,
-    which projects the other orientation's bids to asks at `P − p`, as defined in
-    the complement spec §4.2.
+`factory(StrategyClass)` builds one configured instance per supervisor context,
+because fees and the snapshot are configured per run. A reader-only instance is
+built from a manifest; it never sees fee configuration or filesystem paths.
+Strategies write no files, track no time, and keep no state between callbacks.
 
-  Requirements are static for the run and part of the experiment identity.
-- **`baskets`** returns the immutable basket descriptors for one scope. Each
-  descriptor has a stable sorted identity, its legs (book keys), and an optional
-  admission status (`NOT_CAPTURED`, `UNSUPPORTED_SHAPE`, `UNSUPPORTED_SCALE`, or a
-  strategy-registered value). The SDK owns:
-  - the reverse map from book to baskets, including control legs;
-  - entity identities;
-  - the denominator rules from the complement spec §2.
-- **`evaluate`** is a pure function of the basket and detached `BookView`s. It
-  never sees a live `Book` or cut body. It returns an `Observation`:
-  - `status`: one of the SDK's closed statuses (`UNUSABLE`, `ONE_SIDED`,
-    `DEPTH_LIMITED`, `DEPTH_SUFFICIENT`), or a strategy-registered diagnostic
-    status;
-  - `value_class`: from a closed set the strategy declares, with a declared map
-    from class to episode predicates;
-  - `predicates`: map of episode kind to bool, consistent with the class map. The
-    SDK rejects contradictions;
-  - `payload`: declared numeric fields with explicit scales (for example `gap_gross`
-    with `gross_scale`), written at episode open and at maximum;
-  - `quotes`: the consumed displayed quotes per leg that define slice identity. The
-    default is the consumed levels of the fills the strategy used;
-  - `skew_legs`: the legs whose last-change times define skew. The default is all
-    legs.
+**`requirements`** runs once, before any callback. Per book key it gives:
 
-  Fee assessment stays a strategy concern, through the existing fee bridge, and is
-  called only from `evaluate`.
+- the sides needed;
+- the ticket sizes, in contracts;
+- an optional SDK view transform. V1 has one, `kalshi_complement_ask`: the other
+  orientation's bids, projected to asks at `P − p` (complement spec §4.2).
 
-Strategies do not write files, track time, or keep state between callbacks. A
-strategy that needs history (for example a time-shifted control, §6) declares it
-in `requirements`, and the SDK keeps it bounded.
+It may also request the market profile (§7). Requirements are static for the run.
 
-## 3. Book views and projections
+**`baskets`** returns one `Basket` per measured key: a basket at one direction and
+size. A basket carries:
 
-For every changed book key in a cut, the SDK:
+- `descriptor`: strategy-owned JSON. Its digest is the entity identity, and its
+  `legs` list corresponds to `legs` by index.
+- `legs`: book keys.
+- `order`: the strategy part of the close-order key.
+- an optional `admission` status (`NOT_CAPTURED`, `UNSUPPORTED_SHAPE`,
+  `UNSUPPORTED_SCALE`), with `admission_reasons`.
+- `control_leg`, `peer_group`, and `peer_order`: which leg a control substitutes,
+  and how cyclic-neighbour peers are chosen.
+- optional `inputs`.
 
-1. reads each required side **once** (`Book.levels(side)`);
-2. walks it **once** for the union of all requested sizes across all baskets,
-   using the existing `replay.economic_fills.walk`;
-3. applies declared view transforms once;
-4. stores a detached `BookView`:
-   - `validity` and `reason`;
+`inputs` declares, per leg, every `(source, size)` that `evaluate` reads. A source
+is a side, a transform, `("crossed", None)` for the book's own bid-above-ask flag,
+or `("best", None)` for the best quotes.
+
+The SDK owns:
+
+- the reverse map from book to entities;
+- control construction (§6);
+- entity identities;
+- the scale admission of substituted legs;
+- the denominators.
+
+**`evaluate`** is a pure function of the entity and its detached `BookView`s; it
+never sees a live `Book` or cut body. It returns an `Observation` with these
+fields:
+
+- `status`: an SDK status (`UNUSABLE`, `ONE_SIDED`, `DEPTH_LIMITED`,
+  `DEPTH_SUFFICIENT`) or a declared diagnostic status.
+- `reasons`: structured reasons, as canonical JSON object text. They are
+  deduplicated into the reason table (§5).
+- `value_class`: from the strategy's closed set. It is present exactly when the
+  status is `DEPTH_SUFFICIENT`.
+- `predicates`: the active episode kinds. These must equal the declared map from
+  class to kinds, and the SDK rejects contradictions.
+- `payload`: the strategy's values, written at episode open and at maximum.
+- `quotes`: the consumed displayed quotes per leg. These define slice identity.
+- `skew_legs`: the legs whose last-change times define skew. The default is all
+  legs.
+- `context_free`: an assertion that the result used only the declared inputs, not
+  the time, sequence, or scope.
+
+With `inputs` and `context_free`, an entity whose inputs are unchanged keeps its
+observation and is not staged at all (§3). Fee assessment stays a strategy concern,
+through the fee bridge. Fee-assessed observations hash the time and sequence into
+their order identities, so they are never context-free.
+
+Reader hooks let a strategy add its own checks:
+
+- `open_facts` and `check_open` validate the payload schema and fee class;
+- `check_quotes` re-walks consumed quotes against the gross;
+- `summary_key` and the summary builders shape `summary.json`.
+
+## 3. Book views
+
+For every changed book key in a cut, the SDK takes these steps:
+
+1. It learns from the cut which sides the operations touched, and the best price
+   touched on each side. A snapshot or invalidation counts as touching every side.
+2. It reuses a side unchanged when the side was not touched, or when every touched
+   price is strictly worse than the deepest level the largest size consumed. Such
+   an operation cannot change any fill, the best quote, or presence, so the side
+   is neither read nor walked.
+3. Otherwise it reads the side once (`Book.levels(side)`) and walks it once, for
+   the union of sizes (`replay.economic_fills.walk`). The walk validates only the
+   levels it touches. A bounded `levels(side, n)` read was measured and is slower:
+   its selection is a Python-level heap, while the full read is a C sort.
+4. It interns results. A re-walked fill or best quote equal to its predecessor
+   keeps the predecessor's object, so input fingerprints are flat tuples compared
+   by object identity.
+5. It applies declared transforms. A transform is reused while its source fills
+   are identical.
+6. It stores a detached `BookView` holding:
+   - validity and reason;
    - last-change time;
    - side presence;
    - best quotes;
-   - per-size `Fill`s (with `taken` and `consumed`);
+   - the `crossed` flag;
+   - per-size fills;
    - transformed fills.
 
-Views are shared across every real and control basket that uses the book. They
-outlive the callback and never reference live decoder objects. The complement
-spec's rules on prior projections, scope entry, and pre-start prologue cuts apply
-unchanged (§5 there).
+Views are shared by every real and control entity that uses the book. They outlive
+the callback and never reference decoder objects.
 
-## 4. Runtime semantics (moved, not changed)
+**Re-evaluation.** An entity on a changed book is staged unless all three of these
+hold:
 
-These rules move verbatim from the complement spec into the SDK and become the
-contract for every strategy:
+- its current observation is context-free;
+- every object its declared inputs read is identical to its last evaluation;
+- in layout 1 only, its skew bucket is unchanged.
+
+A staged entity whose fingerprint still matches reuses its observation without
+calling `evaluate`.
+
+## 4. Runtime semantics
+
+These rules move from the complement spec (§§3, 5, 7 there) into the SDK, and are
+the contract for every strategy:
 
 - the cut clock;
-- same-time staging and commit;
+- same-time staging, where only the final state at a time is committed;
 - prior-state boundary advancement;
 - quiet scope entry;
-- the re-evaluation set;
-- half-open intervals;
+- pre-start prologue cuts, which initialize state only;
+- half-open, exact-nanosecond time;
 - zero-length suppression;
-- `instantaneous_positive` as a writer-attested diagnostic;
-- censoring at run end;
 - `SCOPE_END` closure;
-- leg skew at each instant;
+- censoring at run end;
+- `instantaneous_positive` as a writer-attested diagnostic: a count of superseded
+  positive same-time observations;
 - latency-qualified entry time.
 
-The sections concerned are §§3, 5, and 7 of the complement spec. The
-complement-specific parts (pricing, fees, verdict wording) stay in the strategy.
+Complement-specific parts (pricing, fees, verdict wording) stay in the strategy.
 
-## 5. Output detail levels
+**Skew** is the absolute spread of the skew legs' **live** last-change times. It is
+always computed from the live views, so a time-shifted control leg, whose view
+keeps its historical last-change time, cannot churn skew. In layout 2 skew never
+splits time:
 
-Every strategy writes the same files with the same row schema. Only the
-basket-descriptor and payload fields differ. Detail is chosen per **entity class**
-(real or control) in the policy, so it is part of the experiment identity:
+- it is recorded (`leg_skew_ns` and its bucket) at each episode open and each slice
+  open;
+- latency-qualified entry time is attributed to the skew bucket in force at each
+  entry instant, inside positive slices only.
 
-| Level | Files | What the reader can recompute exactly |
-|---|---|---|
-| `intervals` | `measurements.ndjson`, `summary.json` | status and value-class durations, skew attribution of time, denominators |
-| `episodes` (default for real) | adds `episodes.ndjson` and compact `slices.ndjson` | the above, plus episode partitions, lifetimes, slice survival, latency-qualified time, tiers, quantiles, verdicts |
-| `slices` | full `slices.ndjson` | the above, plus consumed quotes and payload at every slice, and the gross arithmetic of every slice |
+Layout 1 (complement policy 1) keeps skew as a measurement dimension, for byte
+identity.
 
-- **Compact slice rows** carry `episode_id`, `start_ns`, `end_ns`, `end_reason`, and
-  `censored` only, about 180 bytes against today's 735. Quotes and payload are
-  written once per episode, at open, so the reader can still check the opening
-  arithmetic. Full slice rows are today's format.
-- **Controls default to `intervals`.** Their summary rows report the same
-  time-weighted fractions as real baskets.
-- **Real and control rows go to separate files** at every level. A reader never
-  needs an entity lookup to tell them apart.
+## 5. Output
 
-The independent reader is generic. It checks:
+Output **layout 2** is the SDK default. These are the files under the group's
+output directory:
 
-- the complete interval partition per entity;
-- maximal predicate runs against episodes;
-- slice partitions of episodes;
-- close order;
-- bounds;
-- recomputation of every summary figure available at the chosen level.
+| File | Contents |
+|---|---|
+| `entities.json` | One record, `{scopes: [[{hash, descriptor}, …], …]}`. Per scope, the entities in close order. A row's `entity` is an index into its scope's list. |
+| `reasons.json` | One record, `{reasons: [object, …]}`. Each distinct structured reason appears once, and rows reference reasons by index. |
+| `denominators.ndjson` | One row per (scope, entity). |
+| `episodes.ndjson` | One row per episode of a **real** entity. Always written. |
+| `slices.ndjson` | Compact rows, only inside positive episodes. |
+| `controls/<name>/…` | Only for enabled controls (§6). |
+| `audit/measurements.ndjson`, `audit/slices.ndjson` | Only with `audit_intervals`. |
+| `manifest.json`, `summary.json`, `content_receipt.json` | As before. |
 
-Strategy-specific checks (for example the complement re-walk of consumed quotes)
-plug in as reader hooks.
+**Denominator rows** have these fields:
+
+- `scope` and `entity`;
+- `status_ns`: exact nanoseconds per status (SDK statuses, admissions,
+  diagnostics);
+- `class_ns`: per value class within `DEPTH_SUFFICIENT`. It is present exactly when
+  that status is.
+- `reason_ns`: a list of `[status, [reason indexes], ns]` entries for observations
+  that carry reasons. For example, unusable time is broken down by structured
+  reason kind.
+
+Durations are canonical decimal strings. Denominators are **writer-attested**. The
+reader proves their internal arithmetic and their exact agreement with the
+episodes. Proving each interval needs the audit.
+
+**Episode rows** have these fields:
+
+- `scope`, `entity`, and `episode_id`, where the ID is the SHA-256 of
+  `[scope, entity hash, kind, start_ns]`;
+- `kind`, `start_ns`, `end_ns`, `end_reason`, and `censored`;
+- `opening_slice_survival_ns`, `viable_tiers`, and `qualified_ns` per tier;
+- `qualified_by_skew_ns`: per tier, entry time by skew bucket;
+- `class_ns`: time per value class within the episode;
+- `qualifying_class_ns`: per tier, the class time inside slices that reach the tier;
+- `open`: `value_class`, reasons, `leg_skew_ns`, `skew_bucket`, `values`, and
+  `quotes`;
+- `maxima`: per declared maximum field;
+- `at_max`: `values` and `quotes` when the first maximum field was last raised.
+
+Consumed quotes and the payload appear only at open and at maximum.
+
+**Compact slice rows** have these fields:
+
+- `episode_id`, `start_ns`, `end_ns`, `end_reason`, and `censored`;
+- `leg_skew_ns` and `skew_bucket` at slice open.
+
+A slice ends on any change to the consumed displayed quotes, or at its episode's
+end.
+
+**Row hygiene.** The experiment SHA, policy SHA, and version appear once, in the
+manifest. Entities and reasons are table indexes. Reasons are never formatted from
+`encoded()` bytes, and no field is always null.
+
+**Audit.** `audit_intervals: true` restores the complete per-entity interval
+partition:
+
+- `audit/measurements.ndjson` holds `{scope, entity, start_ns, end_ns, status,
+  reasons, value_class?}`, without skew splits;
+- `audit/slices.ndjson` holds the compact slice fields plus `quotes` and `values`.
+
+Both cover real entities only. The audit is off by default.
+
+**Layout 1** is the frozen V1 wire, used only by complement policy 1. It is a
+complete measurement partition with skew buckets, real and placebo rows mixed,
+full slices, and `placebo_episodes.ndjson`. It is pinned byte for byte by
+`replay/tests/fixtures/complement_v1_golden.json` (§11).
+
+**Independent reader.** The layout-2 reader is `aggregate_reader`. It re-resolves
+every entity from the manifest's policy and the snapshot, then checks the
+following:
+
+- The entity and reason tables round-trip exactly.
+- Every scoped entity has one denominator row. Status time sums exactly to the
+  scope length, class time sums to `DEPTH_SUFFICIENT` time, and reason time stays
+  within its status.
+- Episodes follow a closed schema, stay in bounds, follow close order and do not
+  overlap. End reasons are consistent with scope and run ends.
+- For every key and kind, the episode lifetimes per class equal the denominators'
+  class time for that kind. So every episode lies inside `DEPTH_SUFFICIENT` time,
+  and none is missing.
+- Slices partition their episodes. Opening survival, tiers and `Q` recompute.
+  Skew-attributed entry time sums to `Q`, and skew buckets match `leg_skew_ns`.
+- With the audit:
+  - the partition recomputes the denominators exactly;
+  - its maximal predicate runs and their end reasons equal the episodes;
+  - audit slices equal the compact slices;
+  - first-slice values and quotes equal the episode's open.
+- Strategy hooks check payloads and re-walk quotes.
+- The summary and verdicts are recomputed from denominators and episodes.
+
+The layout-1 reader (`reader`) keeps the V1 checks unchanged.
 
 ## 6. Controls
 
-The placebo becomes an optional, named **control** with a declared construction.
-The default is none.
+Controls are **opt-in**. The default policy has `controls: []`.
 
-| Control | Construction | What it measures |
+| Control | Construction | Measures |
 |---|---|---|
-| `time_shift` | Leg 2 replaced by the same leg's view `Δ` earlier (policy, for example 1 s and 5 s). The SDK keeps a bounded per-book ring of detached views covering `Δ`. | How often stale quotes alone produce a positive. This is the staleness null from the partition-sum spec §6. |
-| `cyclic_neighbor` | Today's construction. | A broken-pair diagnostic only. In a single-event bundle it pairs related markets and must not be read as a null. |
+| `time_shift` | The control leg is replaced by the same leg's committed view `Δ` earlier. There is one control per shift, named `time_shift_<Δ>`. | How often stale quotes alone produce a positive: the staleness null from the partition-sum spec §6. |
+| `cyclic_neighbor` | The control leg comes from the next supported basket in the same peer group, in cyclic order. | A broken-pair diagnostic only. In a single-event bundle it pairs related markets, and it must not be read as a null. |
 
-- Controls use the same `evaluate` function and the same views.
-- They never produce verdict inputs, only comparison rows.
-- The ring for `time_shift` is bounded by a per-book entry count. The run fails
-  closed if the bound is exceeded inside `Δ`.
+Isolation rules:
 
-## 7. Market profile output
+- An enabled control writes only under `controls/<name>/`. By default that is
+  `entities.json`, `denominators.ndjson`, and `summary.json`.
+- It adds `episodes.ndjson` with `controls_episodes: true`, and `slices.ndjson` with
+  `controls_slices: true`, which requires episodes. Without `controls_episodes`,
+  control entities track no episodes at all.
+- Control rows never appear in the real files, and controls never feed verdicts.
+- Controls use the same `evaluate` and the same views.
 
-`replay.market_profile:build` is an SDK-provided strategy group, meant to run on
-every bundle beside any economic strategy. It needs no fee configuration. It writes
-`profile.ndjson`: one row per (book key, scope, bucket), with a policy bucket width
-(default 60 s, clipped to scope boundaries). It also writes `incidents.ndjson` for
-discrete events.
+`time_shift` mechanics:
 
-Every duration is time-weighted in exact nanoseconds over the bucket. Every price
-statistic carries its scale.
+- The SDK keeps one ring of committed views per shifted book, across all scopes.
+- A ring entry is recorded at its exact commit time, even when nothing is staged.
+- Each change is re-evaluated by a timer at `τ + Δ`. Timers run in time order
+  with scope boundaries, and a timer at a cut's time joins that cut's stage.
+- Before any history exists at `t − Δ`, the shifted leg is a `not_initialized`
+  view, so the control measures `UNUSABLE`.
+- Ring memory charges each shared fill once, by reference count. Exceeding
+  `time_shift_ring_entries` fails the attempt.
+- Skew uses the live legs (§4).
+
+## 7. Market profile
+
+`replay.market_profile:build` runs beside any strategy and needs no fee
+configuration. Its closed configuration is
+`{version, snapshot_directory, snapshot_sha256, policy}`. It can instead run inside
+an SDK strategy through `Requirements.profile`; complement policy 2 exposes this as
+`"profile": null | <profile policy>`. It records no economic judgement.
+
+**Gating.** `policy.groups` selects any of `activity`, `depth`,
+`pair_consistency`, `quote_stability`, `self_crossing`, and `top_of_book`. `state`
+is always on. A disabled group does no work; without `depth`, the collector reads
+best quotes only.
+
+**Profile policy** (closed):
+
+- `version`;
+- `bucket_ns`;
+- `groups`;
+- `sizes_contracts`;
+- `tick_atoms`, a tick in price atoms for every planned venue;
+- `depth_ticks`;
+- `survival_edges_ns`.
+
+**Files.**
+
+- `profile.ndjson` has one row per (scope, book, bucket). Buckets are aligned to
+  multiples of `bucket_ns` in visible time, then clipped to scope boundaries.
+- `incidents.ndjson` holds self-crossing incidents.
+- `pair_profile.ndjson` has one row per (scope, member pair, bucket).
+
+Rows carry:
+
+- the snapshot SHA, experiment SHA, bundle ID, scope and scope run ID;
+- the native key, venue and member `market_id`;
+- the scales and tick.
+
+**Groups.** Every duration is in exact nanoseconds. Prices are integers in plan
+price atoms. Means are exact time integrals (`*_ns`) plus their denominators, and
+these integrals may exceed 64 bits.
 
 | Group | Data points |
 |---|---|
-| State | `usable_ns`, `unusable_ns` by reason kind, `not_initialized_ns`, `bid_empty_ns`, `ask_empty_ns`, `two_sided_ns` |
-| Top of book | Time-weighted spread (mean, plus p50/p90 from an exact tick histogram); best bid and ask at bucket open and close; time-weighted mid; top-of-book quantity on each side (time-weighted mean) |
-| Depth and cost to fill | Per configured size and side: time-weighted mean slippage of VWAP against best, in ticks; `depth_limited_ns`; time-weighted displayed depth within 1, 5, and 10 ticks |
-| Activity | Book transitions; snapshots; operation counts; invalidations by reason; trades by disposition (`applied`, `observed`, `duplicate`, `not_authority`, `invalidated`, as coverage counts them); traded quantity; trade price against the prevailing mid (ticks, signed); aggressor side when the venue provides it |
-| Quote stability | Distribution of top-of-book survival (time a best price stays unchanged), as an exact histogram over fixed log-spaced edges |
-| Self-crossing | `crossed_ns` and `locked_ns` (book's own bid ≥ ask); per incident, a row in `incidents.ndjson` with start, end, maximum cross in ticks, and the quotes at maximum |
-| Pair consistency | For a Kalshi outcome/complement pair and a Polymarket token pair: time-weighted deviation of the best-bid sum and best-ask sum from one unit, and time with each sum on the wrong side of one unit |
+| state | `usable_ns`, `not_initialized_ns`, `unusable_ns` (with a breakdown by reason kind), `bid_empty_ns`, `ask_empty_ns`, `both_empty_ns`, `two_sided_ns` |
+| top_of_book | Open and close quotes; an exact spread histogram, with time-weighted p50/p90 and the spread integral; the integral of bid + ask; top quantity integrals |
+| depth | Per side: displayed quantity within each `depth_ticks` band (integral). Per size: filled and depth-limited time, and the integral of the absolute VWAP-versus-best cost |
+| activity | Transitions, snapshots, operations, invalidations by reason; trades by coverage's dispositions; traded quantity; signed `2·price − (bid + ask)` against the prevailing book; trades without a mid; trades at mismatched scales; aggressor counts |
+| quote_stability | Best-price survival histograms over fixed edges. A survival that started before scope entry, or was cut by scope end, counts as `censored` |
+| self_crossing | `crossed_ns` and `locked_ns`. Incidents are maximal intervals with bid ≥ ask, recording start, end, maximum cross and the quotes at maximum |
+| pair_consistency | For PM token pairs and Kalshi outcome/complement pairs: signed and absolute deviation integrals of the bid sum and ask sum from one unit, and time on the wrong side of one unit |
 
-Kalshi books carry bids only. For Kalshi, ask-side statistics are computed from the
-`kalshi_complement_ask` projection and labelled `projected`.
+**Kalshi.** Asks are the counterpart's bids projected to `P − p`, with rows labelled
+`ask_source: "projected"`. A projected ask has the counterpart bid's depth and
+slippage, so it needs no extra walk.
 
-Profile rows identify the book only by native key, venue, and the snapshot's member
-`market_id`. Linking books across venues to one claim or event is downstream work
-over the context.json v2 claims. The profile records no economic judgement.
+**Speed.**
 
-## 8. Retained-state bounds without recursive traversal
+- Per (book, side), the collector keeps the best quote, depth bands, slippages, and
+  a horizon. The horizon is the worst price any band or walked fill depends on.
+- Only touched sides are recomputed. A touched price strictly beyond the horizon
+  leaves a side unchanged.
+- Embedded, the collector reuses the economic group's walked fills when they cover
+  its sizes.
 
-The SDK replaces runtime `_deep_size` accounting with **count-based bounds**:
+**Reader checks.** `profile_reader` checks:
 
-- Per-entry costs are closed-form functions of declared shapes: the number of
-  books, sides, and sizes, the levels per consumed slice, the open episodes, and
-  the ring entries.
-- They use constants that a unit test proves conservative. The test measures a
-  real recursive `sys.getsizeof` traversal on representative maximal states, and
-  asserts that the formula is greater than or equal to it.
-- Hard caps:
-  - levels per consumed slice: 1,024;
-  - open episodes: entities × kinds;
-  - ring entries per book: a policy value.
+- identities and bucket alignment;
+- a complete per-book partition;
+- the state partition;
+- the histogram time, integral and quantiles;
+- that crossed and locked time equals the histogram's negative and zero spreads;
+- that incident time equals crossed plus locked time;
+- the depth time partitions;
+- the trade and aggressor partitions;
+- close order.
 
-  Exceeding a cap fails the attempt. Nothing is truncated.
-- The 128 MiB detached-state limit and the file, line, and row limits from the
-  complement spec stay in force.
+## 8. Retained-state bounds
 
-## 9. Performance requirements
+Recursive size accounting is replaced by **count-based bounds**.
 
-On the bench corpus, with this SDK's complement port at default detail:
+- **Costs.** Costs are closed-form functions of shapes (`replay.economic_sdk.bounds`)
+  for views, observations, episodes, fingerprints, ring entries, denominators,
+  reasons and snapshot-shaped JSON. A unit test proves each formula is at least a
+  real recursive `sys.getsizeof` traversal of representative maximal states.
+- **Hard caps.**
+  - 1,024 levels per consumed slice;
+  - entities × kinds open episodes;
+  - 100,000 skew changes per open slice;
+  - ring entries per book, from policy.
+  - the 128 MiB detached-state limit;
+  - the file, line and row limits of the complement spec.
 
-- **Speed.** The economic group must not be the slowest group by more than 20%. The
-  two-group attempt must finish within 1.2× the coverage-only wall time (55.2 s on
-  the reference build) plus 15 s.
-- **Output.** Total output for the two-group attempt must stay below 64 MB at
-  default detail, with controls at `intervals`.
-- **Profiling harness.** A profiling factory wrapper (cProfile around callbacks
-  only, with periodic dumps) ships with the SDK test utilities.
+  Exceeding any cap fails the attempt. Nothing is truncated.
 
-**Baseline at this branch's head**, which includes the follow-up accounting change:
+## 9. Performance
 
-- the two-group attempt took **396.6 s**, against 55.2 s for coverage alone (about
-  7.2×);
-- the complement semantic SHA was `2d85b833…`, identical to the pre-change run;
-- coverage reproduced `87cb094d…`.
+**Requirements** on the bench corpus, beside coverage:
 
-The 665 s figure in §1 is the earlier code.
+- every economic and profile group finishes in at most 81.2 s, which is 1.2 × 55.2 s
+  plus 15 s;
+- complement policy 2 default output is under 5 MB;
+- control output with `time_shift` aggregates is under 5 MB.
+
+**Measures, by cost centre** (corpus profile of 80aa64c):
+
+| Cost centre | Cumulative s | Measure |
+|---|---|---|
+| `views.build` | 35.8 | Untouched and beyond-depth sides are reused, unread |
+| `read_side` | 23.1 | Untouched and beyond-depth sides are reused, unread |
+| `walk` | 18.8 | Untouched and beyond-depth sides are reused, unwalked |
+| `_evaluate` (4.79 M calls) | 35.0 | Unchanged inputs are never staged, and staged matches skip `evaluate` |
+| `_fingerprint` (9.59 M calls) | 9.0 | Flat identity tuples: no rebuilt structures, no equality calls |
+| skew staging | — | Layout 2 no longer stages on skew-only changes |
+| profile `_derive`, `walk` | 44.1, 29.5 | Per-side facts, horizon skips, shared economic walks |
+
+**Synthetic dense tape** (150-level books, 8 sizes from 1 to 1,000 contracts, about
+2,500 changes/s). These are relative figures only:
+
+| Run | µs per cut |
+|---|---|
+| Policy 1 compat | ≈330, as at 80aa64c |
+| Policy 2 default | ≈250, from ≈370 before these changes |
+| Policy 2 + `time_shift` | ≈440, from ≈700 |
+| Standalone profile | ≈146, from ≈178 |
+
+**Profiling harness.** `replay/economic_sdk/profiling.py` wraps a factory with
+cProfile around callbacks only. It dumps periodically and at finish, outside the
+output directory.
 
 ## 10. Requirements for corpus runs
 
-Strategies and the profile will later run unattended over every bundle with
-existing materialized derivatives. Materialization is reused unless a normalizer
-or materializer identity changes. This SDK must therefore guarantee:
-
-- Output depends only on pins, snapshot, policy, requirements, and code revision.
-- Retries reproduce identical semantic hashes. The complement strategy already
-  proves this for itself, and the SDK must preserve it for every strategy.
+- Output depends only on pins, snapshot, policy, requirements and code revision.
+- Retries reproduce identical semantic hashes, with distinct receipts.
 - A completed reader works per bundle without network access.
-- Profile and summary rows carry enough identity (snapshot SHA, experiment SHA,
-  bundle ID, scope run ID) to concatenate across bundles without joining back to
-  run directories.
+- Manifest, entity tables and profile rows carry enough identity to concatenate
+  results across bundles:
+  - snapshot SHA;
+  - experiment SHA;
+  - bundle ID;
+  - scope run ID.
 
-## 11. Porting and acceptance
+## 11. Complement policies and acceptance
 
-1. **Port first, change nothing.** Port `same_venue_complement` onto the SDK as
-   policy version 1, with `slices` detail for real and control entities and the
-   `cyclic_neighbor` control. On the bench corpus, the port must reproduce the
-   committed V1 output byte for byte: semantic SHA, and the measurement, episode,
-   placebo, and slice files. This proves the SDK preserves the semantics.
-2. **Then switch defaults.** Introduce complement policy version 2:
-   - `episodes` detail for real entities;
-   - `time_shift` control at `intervals`;
-   - a `SELF_CROSSED_LEG` diagnostic status when a leg's own book is crossed;
-   - the verdict refinement below.
+**Policy 1** (compat) uses layout 1:
 
-   It is a new experiment hash and is not expected to match V1.
+- full slices;
+- the `cyclic_neighbor` placebo beside real rows;
+- skew as a measurement dimension;
+- V1 reason strings, including the `b'…'` formatting.
 
-   **Verdict refinement.** Count only fee-unknown time inside gross slices long
-   enough to qualify at the headline latency, instead of all fee-unknown time.
-   With this rule, the reviewed fixture reads as absent on both venues, because no
-   before-fee slice reached 250 ms. Update the complement spec §9 when this lands.
-3. **Market profile.** Run `market_profile` on the bench corpus beside coverage.
-   It must:
-   - reproduce coverage's trade disposition totals for the same books;
-   - report the nine Polymarket self-crossing incidents;
-   - show the one-sided onsets (about 12.1 and 64.5 minutes into the window).
-4. **Close the open complement findings.**
-   - Emit `SKEW_ARTIFACT_LIKELY` (complement spec §5).
-   - Stop formatting `encoded()` bytes into reason strings: decode, or use a
-     structured reason field.
-5. **Port coverage as well, if it stays hash-identical.** Migrating
-   `bundle_coverage` onto the SDK's clock and changed-books helpers is optional.
-   If attempted, it must keep its reference hashes.
+It must reproduce the committed V1 output byte for byte (semantic `2d85b833…`).
+Offline, seven synthetic multi-venue tapes pin every file. The tapes cover pairs,
+placebos, slices, scopes, prologue cuts, Limitless and partial fees. Their hashes
+were recorded from the pre-SDK code.
 
-**Offline tests** extend the complement test list with:
+**Policy 2** is the SDK default and uses layout 2. It adds these fields to policy 1's:
 
-- shared-view reuse across baskets;
-- one walk per changed side per cut;
-- control legs re-evaluated through the reverse map;
-- `time_shift` ring bounds and its effect at exact nanoseconds;
-- each detail level's reader recomputation;
-- separate real and control files;
-- count-based bound conservativeness;
-- profile time partitions summing to the bucket duration;
-- tick histograms;
-- incident rows;
-- Kalshi projected labels.
+| Field | Meaning (default) |
+|---|---|
+| `controls` | A list of `{kind: "time_shift", shift_ns: [..]}` and/or `{kind: "cyclic_neighbor"}`. Default `[]`. |
+| `controls_episodes` | Write control episodes. Default `false`. |
+| `controls_slices` | Write control slices; requires `controls_episodes`. Default `false`. |
+| `audit_intervals` | Write the full audit partition. Default `false`. |
+| `time_shift_ring_entries` | Ring bound per shifted book. |
+| `profile` | `null` or a profile policy (§7). |
+
+The schema is closed, so every field is required.
+
+Policy 2 semantics:
+
+- **`SELF_CROSSED_LEG`.** A pair basket has this status when a leg's own best bid is
+  strictly above its best ask (the view's `crossed` flag). The check comes after
+  `UNUSABLE` and before `ONE_SIDED`, and its reasons name the legs. Kalshi books
+  carry no native asks, so the profile reports Kalshi projected crosses instead.
+- **Reasons.** Reasons are structured:
+  - unusable legs: `{leg, validity, kind}`;
+  - self-crossed legs: `{leg, kind: "self_crossed"}`;
+  - fee bridge reasons: `{kind: "fee", detail}`;
+  - unsupported shape: `{kind: "book_count", value}`.
+
+  `DEPTH_LIMITED` carries no reason, and measurement fields are empty.
+- **Verdict refinement.** In verdict rule 3, `X` is the `FEE_UNKNOWN` time inside
+  real gross slices whose survival reaches the headline latency, at the headline
+  size. This comes from the episodes' `qualifying_class_ns`. The full unknown total
+  is reported as `fee_unknown_total_ns`.
+- **`SKEW_ARTIFACT_LIKELY`.** This verdict label is set when positive gross slice
+  time at the headline size, bucketed by skew at slice open, exists and lies
+  entirely in buckets whose lower edge is ≥ 1 s. It does not change the verdict.
+- **Summary.** Rows are per (venue, basket kind, direction, size), with no skew
+  dimension:
+  - status and class time;
+  - episode and slice counts;
+  - `Q` and gross `Q`, overall and by skew bucket;
+  - quantiles;
+  - censored counts;
+  - qualifying unknown time;
+  - gross slice time by skew.
+
+  Each control has its own summary under `summary.controls[<name>]`, also written
+  to `controls/<name>/summary.json`.
+
+**Bench acceptance** (run locally after push). Coverage must keep semantic
+`87cb094d…` and intervals `41be6ad8…`.
+
+| Run, beside coverage | Required |
+|---|---|
+| Complement policy 1 compat | Byte-identical, semantic `2d85b833…` |
+| Complement policy 2 default | ≤ 81.2 s; complement output < 5 MB; 9 crossings as `SELF_CROSSED_LEG`; both verdicts absent |
+| Complement policy 2 + `time_shift` (aggregates) | Completes; control output < 5 MB |
+| Market profile | ≤ 81.2 s; coverage's trade disposition totals; the 9 Polymarket incidents; one-sided onsets at about 12.1 and 64.5 minutes |
+
+**Offline tests.** Beyond the complement list, the offline tests cover:
+
+- the V1 golden files and retries;
+- shared views;
+- one walk per touched side, and none beyond consumed depth;
+- the unchanged-fill evaluate skip;
+- predicate and class-map contradictions;
+- the consumed-level cap;
+- denominators summing to the scope length;
+- episodes contained in, and exactly covering, positive time;
+- a reader rejecting an episode outside positive time;
+- entity and reason table round-trip and tamper rejection;
+- compact slices with mid-slice skew attribution;
+- the audit partition reproducing V1's partition without skew splits;
+- control files appearing only when enabled;
+- `time_shift` at exact nanoseconds, its ring bound, and history without staging;
+- live-leg control skew that never splits time;
+- cyclic controls;
+- `SELF_CROSSED_LEG`, the verdict refinement, and the skew artifact label;
+- conservativeness of the count-based bounds;
+- the profiling harness;
+- profile partitions, histograms, incidents, Kalshi projection, coverage trade
+  parity, group gating, >64-bit integrals, and reader rejection.
 
 ## 12. Open items
 
-- **Bucket width and edges.** Choose the profile bucket width and the histogram
-  edges for production. Both are part of the profile policy hash.
-- **Trade fields.** Confirm which trade fields each venue's normalized `TradeEvent`
-  carries (aggressor in particular) before relying on them in profile rows.
-- **Fee catalog.** A reviewed fee catalog and instrument bindings remain the
-  prerequisite for net economics (complement spec §12). The profile does not need
-  them.
-
-## 13. Implementation notes and decisions
-
-This section records how the implementation resolves points that §§2–12 left
-open, and where it deviates from them. Where this section and an earlier section
-disagree, the code follows this section.
-
-**Interface (§2)**
-
-- `factory(StrategyClass)` builds a fresh, configured instance per supervisor
-  context. It is not a singleton instance as the §2 sketch shows, because
-  configuration (fees, snapshot) is per run.
-- A reader-only instance is built from the manifest. It never sees fee
-  configuration or paths.
-- Hooks beyond §2:
-  - `control_descriptor`, which is how a strategy spells control identities;
-  - `manifest`, `validate`, and `bind`;
-  - the reader hooks `check_measurement`, `open_facts`, `check_open`,
-    `check_quotes`, `summary_key`, `duration_label`, and `summarize`.
-- `Basket` carries:
-  - `order`, the strategy part of the close-order key;
-  - `control_leg`, `peer_group`, and `peer_order`, which drive the
-    cyclic-neighbour peers;
-  - optional `inputs`.
-- `inputs` declares, per leg, every `(source, size)` that `evaluate` reads: a
-  side, a transform, or `("best", None)`. `Observation.context_free` asserts that
-  the result used nothing else, in particular not the time, sequence, or scope.
-  With both, the runtime reuses the previous observation while those inputs are
-  unchanged (identity or equality of the detached fills), and re-stages the entity
-  only when its leg skew bucket moves. Without them, every affected entity is
-  re-evaluated. A strategy that declares inputs incorrectly gets wrong output, so
-  declarations are covered by the strategy's own tests.
-- Fee-assessed complement observations are never context-free, because their
-  order identities hash the time and sequence. They are therefore always
-  re-evaluated, which keeps V1's `instantaneous_positive` counts identical.
-
-**Views and reads (§3)**
-
-- Each touched side is read in full once with `Book.levels(side)`, then walked
-  once for the union of sizes.
-- A bounded `levels(side, n)` prefix read was measured. It is slower, because its
-  selection is a Python-level heap and the full read is a C sort.
-- The walk validates only the levels it touches.
-- Sides that a cut's operations did not touch are reused from the prior view.
-- Re-walked fills equal to their predecessors keep the old object, so downstream
-  comparisons are identity checks.
-
-**Files (§5)**
-
-- Output layout 1 is the frozen V1 wire. Measurements and slices mix real and
-  placebo rows, and `placebo_episodes.ndjson` exists. It is used only by complement
-  policy 1, and only at `slices` detail.
-- Layout 2 writes real rows to `measurements.ndjson`, `episodes.ndjson`, and
-  `slices.ndjson`, and control rows to the same names with a `control_` prefix.
-  Only the files a class's detail level needs are created.
-- Row `version` equals the layout version.
-- At `episodes` detail, episode rows add `open_quotes`. Compact slice rows are
-  exactly `{episode_id, start_ns, end_ns, end_reason, censored}`. The reader maps
-  them to their parent episode, recomputes tiers and `Q`, and re-walks the opening
-  quotes against the opening gross.
-
-**Controls (§6)**
-
-- `time_shift` keeps one ring of committed views per shifted book across all
-  scopes.
-- A ring entry is recorded at its exact commit time, even when no entity is staged
-  at that time.
-- Each shift change is re-evaluated by a timer at `τ + Δ`. Timers run in time
-  order with scope boundaries. A timer at a cut's time joins that cut's stage.
-- Before any history exists at `t − Δ`, the shifted leg is a `not_initialized`
-  view, so the control measures `UNUSABLE`. The SDK never invents pre-start state.
-- Ring memory charges each shared fill object once, by reference count, and
-  exceeding `time_shift_ring_entries` fails the attempt.
-- Control descriptors in complement policy 2 carry
-  `control: {kind, leg, shift_ns | replaced_leg}`. Real descriptors carry
-  `control: null`.
-
-**Market profile (§7)**
-
-- **Gating.** The profile is computed only when asked for. It runs either as its
-  own group, `replay.market_profile:build` with
-  `{version, snapshot_directory, snapshot_sha256, policy}`, or embedded in an SDK
-  strategy through `Requirements.profile`; complement policy 2 exposes this as
-  `"profile": null | <profile policy>`. Within a profile, `policy.groups` selects
-  any of `activity`, `depth`, `pair_consistency`, `quote_stability`,
-  `self_crossing`, and `top_of_book`. `state` is always on. A disabled group does
-  no work: without `depth` the collector reads only best quotes and never whole
-  ladders.
-- **Profile policy**, which is closed:
-  - `version`;
-  - `bucket_ns`;
-  - `groups`;
-  - `sizes_contracts`;
-  - `tick_atoms`, a per-venue tick in price atoms that must cover every planned
-    venue;
-  - `depth_ticks`;
-  - `survival_edges_ns`.
-
-  The bucket width and edges remain an open production choice (§12).
-- **Buckets** are aligned to multiples of `bucket_ns` in visible time, then
-  clipped to scope boundaries, so bundles line up on the wall clock.
-- **Exact integers.** Prices are integers in plan price atoms, with the row
-  carrying `price_scale` and `tick_atoms`. Means are emitted as exact time
-  integrals (`*_ns`) plus their nanosecond denominators, and are never rounded.
-  For example, `spread_atoms_ns / two_sided_ns` is the time-weighted mean spread,
-  `mid2_atoms_ns` integrates bid + ask (twice the mid), and `slippage_cost_ns`
-  integrates the absolute VWAP-versus-best cost at `price_scale + quantity_scale`.
-  Integrals may exceed 64 bits.
-- **Spread** quantiles are time-weighted nearest ranks over an exact histogram
-  keyed by spread atoms. The histogram itself is written.
-- **Self-crossing incidents** are maximal intervals with bid ≥ ask. A locked book
-  counts. The reader checks that incident time equals `crossed_ns + locked_ns`.
-- **Quote survival.** Survival is recorded where it ends. A survival that started
-  before scope entry, or is cut by a scope end, is counted as `censored`, not
-  binned.
-- **Activity and trades** are counted only for cuts at or after the requested
-  start, for the current scope's books, with coverage's dispositions. A trade's
-  mid is the profile state prevailing before that cut's transitions. Trades whose
-  wire scales differ from the plan are counted separately and excluded from price
-  and quantity statistics. Aggressor counts include `none`; whether each venue's
-  normalizer fills `aggressor` is still open (§12).
-- **Deviation: pair consistency** is written to its own file,
-  `pair_profile.ndjson`, with one row per (scope, member pair, bucket), because it
-  is a property of a pair, not of one book. Pairs are PM token pairs and Kalshi
-  outcome/complement pairs.
-- **Kalshi asks** are the complement projection. Profile and incident rows carry
-  `ask_source: "projected"`.
-- **Summaries.** A standalone profile writes its own manifest, summary, and
-  receipt. An embedded profile's files are listed in the strategy manifest, and
-  its summary is included under `summary.profile`.
-
-**Bounds (§8)**
-
-- Costs are closed-form functions of shapes in `replay.economic_sdk.bounds`.
-- The tests compare them with a recursive `sys.getsizeof` traversal of maximal
-  states: views, observations, episodes, input fingerprints, and snapshot-shaped
-  JSON.
-- The reader keeps its own budget, using the same closed-form costs.
-
-**Complement policy 2 (§11.2–4)**
-
-- **Policy fields.** Policy 2 adds `detail {real, control}`, `controls` (a list of
-  `{kind: "time_shift", shift_ns: [..]}` and/or `{kind: "cyclic_neighbor"}`),
-  `time_shift_ring_entries`, and `profile`. All are required, because the schema
-  is closed.
-- **`SELF_CROSSED_LEG`** applies to pair baskets when a leg's own best bid is
-  strictly above its best ask. It is checked after `UNUSABLE` and before
-  `ONE_SIDED`, and its reasons name the legs. Kalshi books carry no native asks,
-  so this check never fires there; the profile reports Kalshi projected crosses
-  instead.
-- **Verdict refinement.** Each summary row adds
-  `fee_unknown_in_qualifying_gross_slices_ns`. This is the `FEE_UNKNOWN`
-  measurement time inside real gross slices whose survival reaches the headline
-  latency, attributed at each instant. In verdict rule 3, `X` is the sum of these
-  values at the headline size. The old total is kept as `fee_unknown_total_ns`.
-- **`SKEW_ARTIFACT_LIKELY`** is set, in a verdict's `labels`, when positive gross
-  time at the headline size exists and every bit of it lies in skew buckets whose
-  lower edge is ≥ 1 s. It does not change the verdict.
-- **`UNUSABLE` reasons** use the reason's JSON text. Policy 1 keeps V1's
-  `b'…'` formatting for byte identity.
-
-**Verification**
-
-- **V1 port.** Seven synthetic multi-venue tapes are driven through the real
-  `Decoder`. They cover pairs, placebos, slices, scope boundaries, prologue cuts,
-  Limitless, and partial fee bindings. Their output hashes were recorded from the
-  pre-SDK implementation (`replay/tests/fixtures/complement_v1_golden.json`), and
-  the SDK port reproduces every file byte for byte.
-- **Synthetic speed.** On a dense synthetic tape, the old runtime takes about
-  846 µs per cut. The new runtime takes about 310 µs at policy 1 and about 470 µs
-  at policy 2: 150-level books, 8 sizes from 1 to 1000 contracts, and about 2,500
-  changes per second. These are relative figures only. The §9 targets are
-  measured on the bench corpus.
-
-**Not done**
-
-- `bundle_coverage` is not ported (§11.5, optional).
+- **Profile production values.** The bucket width and histogram edges are still to
+  be chosen. Both are part of the profile policy hash.
+- **Trade fields.** Confirm which venues fill `aggressor` in their normalized
+  `TradeEvent` before relying on it.
+- **Fee catalog.** A reviewed fee catalog and bindings remain the prerequisite for
+  net economics (complement spec §12).
+- **Coverage.** Porting `bundle_coverage` onto the SDK is optional, and it has not
+  been done. If attempted, it must keep coverage's reference hashes.

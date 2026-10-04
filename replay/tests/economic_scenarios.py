@@ -158,10 +158,9 @@ def operations(h, time, instrument, orientation, side, price, quantity):
 
 
 def v2_policy(**overrides):
-    """Complement policy 2 on the harness's small time scale."""
-    policy = {"version": 2, "detail": {"real": "episodes", "control": "intervals"},
-              "controls": [{"kind": "time_shift", "shift_ns": ["5"]}],
-              "time_shift_ring_entries": "1000", "profile": None}
+    """Complement policy 2 on the harness's small time scale (SDK defaults)."""
+    policy = {"version": 2, "controls": [], "controls_episodes": False, "controls_slices": False,
+              "audit_intervals": False, "time_shift_ring_entries": "1000", "profile": None}
     policy.update(overrides)
     return policy
 

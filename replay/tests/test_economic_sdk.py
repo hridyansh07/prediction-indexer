@@ -94,7 +94,9 @@ class SharedViewTests(Base):
 
         with patch("replay.economic_sdk.views.walk", side_effect=counting):
             operations(h, 13, "polymarket:123", "outcome", "ask", 495, M)
-            self.assertEqual(len(calls), 1)           # one touched side, one walk
+            self.assertEqual(len(calls), 0)           # beyond every consumed ask level: no read
+            operations(h, 13, "polymarket:123", "outcome", "ask", 490, 2 * M)
+            self.assertEqual(len(calls), 1)           # one touched side, one walk (bids untouched)
             ladder(h, 14, "polymarket:123", bids=((400, M),), asks=((490, M),))
             self.assertEqual(len(calls), 3)           # snapshot: both sides
             ladder(h, 15, "kalshi:series", "outcome", bids=((400, M),))
@@ -146,28 +148,222 @@ class ClockTests(unittest.TestCase):
         self.assertEqual(clock.window, ("0", "40", "p"))
 
 
+def table(h, name):
+    return json.loads((h.output / name).read_bytes())
+
+
+def denominators(h, group=""):
+    return {(r["scope"], r["entity"]): r for r in rows(h, group + "denominators.ndjson")}
+
+
+def entity_index(h, group="", scope=0, **match):
+    entities = table(h, group + "entities.json")["scopes"][scope]
+    return next(i for i, e in enumerate(entities)
+                if all(e["descriptor"].get(k) == v for k, v in match.items()))
+
+
+class AggregateOutputTests(Base):
+    """Layout 2: denominators, real episodes, tables, opt-in controls and audit."""
+
+    def test_denominators_sum_to_scope_length_and_split_sufficient_time_by_class(self):
+        h = self.harness(scopes=True, policy=v2_policy())
+        h.window(); h.quote(12, 0); h.quote(12, 1)
+        h.quote(20, 1, why={"kind": "connection_closed"}); h.quote(26, 1)
+        h.finish()
+        snapshot = h.snapshot
+        for (scope, _), row in denominators(h).items():
+            length = int(snapshot["scopes"][scope]["end_ns"]) - int(snapshot["scopes"][scope]["start_ns"])
+            self.assertEqual(sum(int(v) for v in row["status_ns"].values()), length)
+            self.assertEqual(sum(int(v) for v in row.get("class_ns", {}).values()),
+                             int(row["status_ns"].get("DEPTH_SUFFICIENT", "0")))
+        long = entity_index(h, scope=0, direction="long", size_contracts="1")
+        row = denominators(h)[0, long]
+        reasons = table(h, "reasons.json")["reasons"]
+        unusable = {tuple(i): v for s, i, v in row["reason_ns"] if s == "UNUSABLE"}
+        closed = reasons.index({"kind": "connection_closed", "leg": 1, "validity": "unusable"})
+        self.assertEqual(unusable[(closed,)], "3")  # 20..23, then scope 1 takes over
+
+    def test_episodes_are_contained_in_and_exactly_cover_positive_class_time(self):
+        h = self.harness(known=True, policy=v2_policy())
+        h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(13, 0, ask=480); h.quote(30, 0, ask=700)
+        h.finish()
+        dens = denominators(h)
+        for episode in rows(h, "episodes.ndjson"):
+            row = dens[episode["scope"], episode["entity"]]
+            self.assertIn("DEPTH_SUFFICIENT", row["status_ns"])
+            for name, amount in episode["class_ns"].items():
+                self.assertLessEqual(int(amount), int(row["class_ns"][name]))
+        long = entity_index(h, direction="long", size_contracts="1")
+        net = [e for e in rows(h, "episodes.ndjson") if e["entity"] == long and e["kind"] == "net"]
+        self.assertEqual([(e["start_ns"], e["end_ns"]) for e in net], [("12", "30")])
+        self.assertEqual(dens[0, long]["class_ns"]["NET_POSITIVE"], "18")
+
+    def test_reader_rejects_an_episode_outside_positive_time(self):
+        h = self.harness(known=True, policy=v2_policy())
+        h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(30, 0, ask=700)
+        h.finish()
+        manifest = json.loads((h.output / "manifest.json").read_bytes())
+        del manifest["summary_sha256"]
+        snapshot = load_snapshot(self.root / "context", expected_sha256=h.sha)
+        from replay.tests.test_complement_output import ComplementOutputCorruptionTests as C
+        rewrite = C.rewrite.__get__(self)
+
+        def lengthen(rs):
+            r = rs[0]
+            r["end_ns"] = str(int(r["end_ns"]) + 1)
+            r["class_ns"] = {k: str(int(v) + 1) for k, v in r["class_ns"].items()}
+        rewrite(h, manifest, "episodes.ndjson", lengthen)
+        with self.assertRaisesRegex(ProtocolError, "episode|slice|class"):
+            validate_content(h.output, snapshot, manifest)
+
+    def test_entity_and_reason_tables_round_trip(self):
+        h = self.harness(pairs=True, policy=v2_policy())
+        h.window(); h.quote(12, 0, why={"kind": "connection_closed"})
+        h.finish()
+        entities = table(h, "entities.json")["scopes"][0]
+        expected = sorted(h.strategy.entities.values(), key=lambda e: e.order)
+        self.assertEqual(entities, [{"hash": e.id, "descriptor": e.descriptor} for e in expected])
+        self.assertNotIn("control", entities[0]["descriptor"])  # no always-null fields
+        reasons = table(h, "reasons.json")["reasons"]
+        self.assertTrue(all(type(r) is dict for r in reasons))
+        indexes = {i for r in rows(h, "denominators.ndjson") for _, ix, _ in r.get("reason_ns", [])
+                   for i in ix}
+        self.assertEqual(indexes, set(range(len(reasons))))
+        text = (h.output / "denominators.ndjson").read_text()
+        self.assertNotIn("experiment_sha256", text)
+        self.assertNotIn("b'", text + (h.output / "reasons.json").read_text())
+        manifest = json.loads((h.output / "manifest.json").read_bytes())
+        snapshot = load_snapshot(self.root / "context", expected_sha256=h.sha)
+        stored = table(h, "entities.json")
+        stored["scopes"][0][0]["descriptor"]["market_id"] = "tampered"
+        payload = json.dumps(stored, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        (h.output / "entities.json").write_bytes(payload)
+        import hashlib
+        manifest["files"]["entities.json"] = {"sha256": hashlib.sha256(payload).hexdigest(),
+                                              "byte_length": len(payload), "records": 1}
+        del manifest["summary_sha256"]
+        with self.assertRaisesRegex(ProtocolError, "entity table"):
+            validate_content(h.output, snapshot, manifest)
+
+    def test_compact_slices_partition_episodes_and_carry_open_skew(self):
+        h = self.harness(known=True, policy=v2_policy())
+        h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(13, 0, ask=480)
+        # An unconsumed change on leg 1 moves its last change (skew 1 -> 7) mid-slice.
+        operations(h, 20, "polymarket:987", "outcome", "bid", 100, M)
+        result = h.finish()
+        slices = rows(h, "slices.ndjson")
+        self.assertTrue(slices)
+        self.assertTrue(all(set(r) == {"episode_id", "start_ns", "end_ns", "end_reason", "censored",
+                                       "leg_skew_ns", "skew_bucket"} for r in slices))
+        long = entity_index(h, direction="long", size_contracts="1")
+        net = [e for e in rows(h, "episodes.ndjson") if e["entity"] == long and e["kind"] == "net"][0]
+        self.assertEqual(net["qualified_ns"], {"1": "26", "5": "22", "10": "17"})
+        # Entry time follows the skew in force at each entry instant.
+        self.assertEqual({t: sum(int(v) for v in m.values()) for t, m in net["qualified_by_skew_ns"].items()},
+                         {"1": 26, "5": 22, "10": 17})
+        self.assertEqual(net["qualified_by_skew_ns"], {"1": {"1": "7", "2": "19"},
+                                                       "5": {"1": "7", "2": "15"},
+                                                       "10": {"1": "7", "2": "10"}})
+        self.assertEqual([(r["start_ns"], r["skew_bucket"]) for r in slices
+                          if r["episode_id"] == net["episode_id"]], [("12", 0), ("13", 1)])
+        self.assertEqual(result["summary"]["verdicts"][0]["qualified_ns"], "22")
+
+    def test_audit_intervals_reproduce_the_v1_partition_without_skew_splits(self):
+        def partition(h, path, version):
+            descriptors = ({e.id: e.descriptor for e in h.strategy.entities.values()} if version == 1
+                           else None)
+            entities = None if version == 1 else table(h, "entities.json")["scopes"][0]
+            merged = {}
+            for r in rows(h, path):
+                d = descriptors[r["entity"]] if version == 1 else entities[r["entity"]]["descriptor"]
+                if version == 1 and d["placebo"]:
+                    continue
+                key = (d["market_id"], d["direction"], d["size_contracts"])
+                runs = merged.setdefault(key, [])
+                value = (r["status"], r["value_class"] if version == 1 else r.get("value_class"))
+                if runs and runs[-1][2] == value and runs[-1][1] == r["start_ns"]:
+                    runs[-1] = (runs[-1][0], r["end_ns"], value)
+                else:
+                    runs.append((r["start_ns"], r["end_ns"], value))
+            return merged
+
+        results = []
+        for policy in (None, v2_policy(audit_intervals=True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                h = Harness(Path(tmp), known=True, policy=policy)
+                from replay.tests.economic_scenarios import scenario_single_known_slices
+                scenario_single_known_slices(h)
+                h.finish()
+                results.append(partition(h, "measurements.ndjson" if policy is None
+                                         else "audit/measurements.ndjson", 1 if policy is None else 2))
+        self.assertEqual(results[0], results[1])
+
+    def test_control_files_appear_only_when_enabled(self):
+        for controls, episodes in (([], False), ([{"kind": "time_shift", "shift_ns": ["5"]}], False),
+                                   ([{"kind": "time_shift", "shift_ns": ["5"]}], True)):
+            with self.subTest(controls=bool(controls), episodes=episodes), tempfile.TemporaryDirectory() as tmp:
+                h = Harness(Path(tmp), policy=v2_policy(controls=controls, controls_episodes=episodes))
+                h.window(); h.quote(12, 0); h.quote(12, 1)
+                result = h.finish()
+                files = {str(p.relative_to(h.output)) for p in h.output.rglob("*") if p.is_file()}
+                control = {f for f in files if f.startswith("controls/")}
+                if not controls:
+                    self.assertEqual(control, set())
+                    self.assertNotIn("controls", result["summary"])
+                else:
+                    expected = {"controls/time_shift_5/entities.json",
+                                "controls/time_shift_5/denominators.ndjson",
+                                "controls/time_shift_5/summary.json"}
+                    if episodes:
+                        expected.add("controls/time_shift_5/episodes.ndjson")
+                    self.assertEqual(control, expected)
+                    real = {r["entity"] for r in rows(h, "denominators.ndjson")}
+                    self.assertEqual(len(real), len(table(h, "entities.json")["scopes"][0]))
+                    self.assertEqual(json.loads((h.output / "controls/time_shift_5/summary.json").read_bytes()),
+                                     result["summary"]["controls"]["time_shift_5"])
+                self.assertFalse(any(f.startswith("audit/") for f in files))
+
+
 class ControlTests(Base):
-    def control_rows(self, h, entity):
-        return [(r["start_ns"], r["end_ns"], r["status"], r["value_class"])
-                for r in rows(h, "control_measurements.ndjson") if r["entity"] == entity]
+    def control_denominator(self, h, name, **match):
+        index = entity_index(h, f"controls/{name}/", **match)
+        return denominators(h, f"controls/{name}/")[0, index]
 
     def test_time_shift_leg_changes_exactly_shift_later(self):
-        h = self.harness(policy=v2_policy())
+        h = self.harness(policy=v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                                          controls_episodes=True, controls_slices=True))
         h.window(); h.quote(12, 0); h.quote(12, 1)
         h.quote(20, 1, ask=700)
-        control = self.entity(h, direction="long", size_contracts="1",
-                              control={"kind": "time_shift", "leg": 1, "shift_ns": "5"})
-        real = self.entity(h, direction="long", size_contracts="1", control=None)
         h.finish()
-        self.assertEqual(
-            [(s, e, st) for s, e, st, _ in self.control_rows(h, control.id)],
-            [("10", "12", "UNUSABLE"), ("12", "17", "UNUSABLE"),
-             ("17", "25", "DEPTH_SUFFICIENT"), ("25", "40", "DEPTH_SUFFICIENT")])
-        self.assertEqual(self.control_rows(h, control.id)[2][3], "FEE_UNKNOWN")
-        self.assertEqual(self.control_rows(h, control.id)[3][3], "GROSS_NONPOSITIVE")
-        real_rows = [(r["start_ns"], r["end_ns"]) for r in rows(h, "measurements.ndjson")
-                     if r["entity"] == real.id and r["status"] == "DEPTH_SUFFICIENT"]
-        self.assertEqual(real_rows, [("12", "20"), ("20", "40")])
+        row = self.control_denominator(h, "time_shift_5", direction="long", size_contracts="1")
+        # [10,17) UNUSABLE (shifted leg before history), [17,25) positive, [25,40) nonpositive.
+        self.assertEqual(row["status_ns"], {"DEPTH_SUFFICIENT": "23", "UNUSABLE": "7"})
+        self.assertEqual(row["class_ns"], {"FEE_UNKNOWN": "8", "GROSS_NONPOSITIVE": "15"})
+        index = entity_index(h, "controls/time_shift_5/", direction="long", size_contracts="1")
+        episodes = [(e["start_ns"], e["end_ns"]) for e in rows(h, "controls/time_shift_5/episodes.ndjson")
+                    if e["entity"] == index]
+        self.assertEqual(episodes, [("17", "25")])
+        real = denominators(h)[0, entity_index(h, direction="long", size_contracts="1")]
+        self.assertEqual(real["class_ns"], {"FEE_UNKNOWN": "8", "GROSS_NONPOSITIVE": "20"})
+
+    def test_time_shift_control_skew_uses_live_legs_and_never_splits_time(self):
+        h = self.harness(policy=v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                                          controls_episodes=True))
+        h.window(); h.quote(12, 0); h.quote(12, 1)
+        # Only the live (unshifted) leg updates, at unconsumed depth.
+        for time in range(13, 35):
+            operations(h, time, "polymarket:123", "outcome", "bid", 100 + time, M)
+        h.finish()
+        name = "controls/time_shift_5/"
+        self.assertEqual(len(rows(h, name + "denominators.ndjson")),
+                         len(table(h, name + "entities.json")["scopes"][0]))
+        index = entity_index(h, name, direction="long", size_contracts="1")
+        episode = [e for e in rows(h, name + "episodes.ndjson") if e["entity"] == index][0]
+        # Opened by the timer at 17, when the live legs' last changes were 17 and 12.
+        self.assertEqual((episode["start_ns"], episode["open"]["leg_skew_ns"]), ("17", "5"))
+        real = entity_index(h, direction="long", size_contracts="1")
+        real_episode = [e for e in rows(h, "episodes.ndjson") if e["entity"] == real][0]
+        self.assertEqual(real_episode["open"]["leg_skew_ns"], "0")
 
     def test_time_shift_history_without_a_staged_entity_keeps_its_exact_time(self):
         h = self.harness(policy=v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}]))
@@ -175,104 +371,40 @@ class ControlTests(Base):
         # A deep change stages no entity, but the ring still records time 14.
         operations(h, 14, "polymarket:987", "outcome", "bid", 100, M)
         h.group(30)
-        control = self.entity(h, direction="short", size_contracts="1",
-                              control={"kind": "time_shift", "leg": 1, "shift_ns": "5"})
         self.assertEqual(h.strategy.rings["polymarket:987", "outcome"].times[-1], 14)
         h.finish()
-        self.assertTrue(self.control_rows(h, control.id))
 
     def test_time_shift_ring_bound_fails_closed(self):
-        h = self.harness(policy=v2_policy(time_shift_ring_entries="2"))
+        h = self.harness(policy=v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                                          time_shift_ring_entries="2"))
         h.window(); h.quote(12, 0); h.quote(12, 1)
         h.quote(13, 1, ask=480)
         with self.assertRaisesRegex(ProtocolError, "time_shift ring bound"):
             h.quote(14, 1, ask=470)
 
-    def test_controls_and_real_rows_never_share_a_file(self):
-        h = self.harness(pairs=True, known=True, policy=v2_policy(
-            controls=[{"kind": "cyclic_neighbor"}, {"kind": "time_shift", "shift_ns": ["2", "5"]}]))
+    def test_cyclic_neighbor_controls_name_the_replaced_leg(self):
+        h = self.harness(pairs=True, known=True, policy=v2_policy(controls=[{"kind": "cyclic_neighbor"}]))
         h.window()
         for index, plan in enumerate(h.initial["plans"]):
             h.quote(12, index, ask=None if plan["venue"] == "kalshi" else 490,
                     bid=600 if plan["venue"] == "kalshi" else 400)
-        h.finish()
-        real = {e.id for e in h.strategy.entities.values() if e.cls == "real"}
-        control = {e.id for e in h.strategy.entities.values() if e.cls == "control"}
-        self.assertTrue(rows(h, "measurements.ndjson") and rows(h, "control_measurements.ndjson"))
-        self.assertTrue({r["entity"] for r in rows(h, "measurements.ndjson")} <= real)
-        self.assertTrue({r["entity"] for r in rows(h, "control_measurements.ndjson")} <= control)
-        self.assertFalse((h.output / "control_episodes.ndjson").exists())
-        cyclic = [e.descriptor for e in h.strategy.entities.values()
-                  if e.cls == "control" and e.descriptor["control"]["kind"] == "cyclic_neighbor"
-                  and e.admission is None]
-        self.assertTrue(cyclic and all(d["control"]["replaced_leg"] for d in cyclic))
-        summary = json.loads((h.output / "summary.json").read_bytes())
-        labels = {row["control"] for row in summary["rows"]}
-        self.assertEqual(labels, {None, "cyclic_neighbor", "time_shift:2", "time_shift:5"})
-
-
-class DetailTests(Base):
-    def snapshot(self, h):
-        return load_snapshot(self.root / "context", expected_sha256=h.sha)
-
-    def test_episode_detail_writes_compact_slices_and_opening_quotes(self):
-        h = self.harness(known=True, policy=v2_policy())
-        h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(13, 0, ask=480)
         result = h.finish()
-        slices, episodes = rows(h, "slices.ndjson"), rows(h, "episodes.ndjson")
-        self.assertTrue(slices and episodes)
-        self.assertTrue(all(set(r) == {"episode_id", "start_ns", "end_ns", "end_reason", "censored"}
-                            for r in slices))
-        self.assertTrue(all("open_quotes" in r for r in episodes))
-        net = [r for r in episodes if r["kind"] == "net"
-               and h.strategy.layout[r["entity"]]["size_contracts"] == "1"
-               and h.strategy.layout[r["entity"]]["direction"] == "long"][0]
-        self.assertEqual(net["qualified_ns"], {"1": "26", "5": "22", "10": "17"})
-        self.assertEqual(result["summary"]["verdicts"][0]["qualified_ns"], "22")
-
-    def test_reader_rejects_a_moved_compact_slice_and_a_bad_opening_quote(self):
-        h = self.harness(known=True, policy=v2_policy())
-        h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(13, 0, ask=480)
-        h.finish()
-        manifest = json.loads((h.output / "manifest.json").read_bytes())
-        del manifest["summary_sha256"]
-        snapshot = self.snapshot(h)
-        from replay.tests.test_complement_output import ComplementOutputCorruptionTests as C
-        rewrite = C.rewrite.__get__(self)
-        rewrite(h, manifest, "slices.ndjson",
-                lambda rs: rs[0].update(end_ns=str(int(rs[0]["end_ns"]) + 1)))
-        with self.assertRaises(ProtocolError):
-            validate_content(h.output, snapshot, manifest)
-
-    def test_intervals_detail_controls_report_time_fractions_only(self):
-        h = self.harness(known=True, policy=v2_policy())
-        h.window(); h.quote(12, 0); h.quote(12, 1)
-        result = h.finish()
-        controls = [r for r in result["summary"]["rows"] if r["control"] == "time_shift:5"]
-        self.assertTrue(controls)
-        self.assertTrue(all(r["episode_count"] == {"gross": 0, "net": 0} for r in controls))
-        self.assertTrue(any(int(r["evaluated_ns"]) > 0 for r in controls))
+        entities = table(h, "controls/cyclic_neighbor/entities.json")["scopes"][0]
+        admitted = [e["descriptor"] for e in entities if e["descriptor"]["admission"] is None]
+        self.assertTrue(admitted and all(d["control"]["replaced_leg"] for d in admitted))
+        self.assertTrue(result["summary"]["controls"]["cyclic_neighbor"]["rows"])
 
 
 class ComplementV2Tests(Base):
     def test_self_crossed_leg_is_a_diagnostic_status(self):
         h = self.harness(policy=v2_policy())
         h.window(); h.quote(12, 0, bid=600, ask=490); h.quote(12, 1)
-        long = self.entity(h, direction="long", size_contracts="1", control=None)
         h.finish()
-        statuses = [(r["status"], r["reasons"]) for r in rows(h, "measurements.ndjson")
-                    if r["entity"] == long.id and r["start_ns"] == "12"]
-        self.assertEqual(statuses, [("SELF_CROSSED_LEG", ["leg:0"])])
-
-    def test_unusable_reasons_are_structured_json_text(self):
-        h = self.harness(policy=v2_policy())
-        h.window(); h.quote(12, 0); h.quote(12, 1)
-        h.quote(20, 1, why={"kind": "connection_closed"})
-        h.finish()
-        reasons = [reason for r in rows(h, "measurements.ndjson") if r["status"] == "UNUSABLE"
-                   for reason in r["reasons"]]
-        self.assertIn('leg:1:unusable:{"kind":"connection_closed"}', reasons)
-        self.assertFalse(any("b'" in reason for reason in reasons))
+        row = denominators(h)[0, entity_index(h, direction="long", size_contracts="1")]
+        self.assertEqual(row["status_ns"]["SELF_CROSSED_LEG"], "28")
+        reasons = table(h, "reasons.json")["reasons"]
+        self.assertIn({"kind": "self_crossed", "leg": 0}, reasons)
+        self.assertEqual(rows(h, "episodes.ndjson"), [])
 
     def test_verdict_counts_only_unknown_fees_inside_qualifying_gross_slices(self):
         for policy, expected in ((None, "INCONCLUSIVE_FIXTURE"),
@@ -296,11 +428,10 @@ class ComplementV2Tests(Base):
 
     def test_skew_artifact_label_requires_positive_time_only_at_or_above_one_second(self):
         policy = {"leg_skew_buckets_ns": ["100000000", "1000000000", "5000000000"]}
-        positive = lambda bucket: {"skew_bucket": bucket, "gross_positive_ns": "7"}
-        self.assertTrue(_skew_artifact([positive("2"), positive("3")], policy))
-        self.assertFalse(_skew_artifact([positive("0"), positive("2")], policy))
-        self.assertFalse(_skew_artifact([positive("1")], policy))
-        self.assertFalse(_skew_artifact([{"skew_bucket": "2", "gross_positive_ns": "0"}], policy))
+        self.assertTrue(_skew_artifact({"2": 7, "3": 7}, policy))
+        self.assertFalse(_skew_artifact({"0": 7, "2": 7}, policy))
+        self.assertFalse(_skew_artifact({"1": 7}, policy))
+        self.assertFalse(_skew_artifact({"2": 0}, policy))
 
 
 class BoundTests(unittest.TestCase):
@@ -334,8 +465,8 @@ class BoundTests(unittest.TestCase):
         self.assertGreaterEqual(bounds.observation_cost(observation), deep_size(observation))
         self.assertGreaterEqual(bounds.episode_cost(observation, 8),
                                 deep_size([payload, quotes, {str(t): 10**18 for t in range(8)}]))
-        fingerprint = (((self.fill(32), True), (self.fill(32), False), ((10**6, 10**12), None)),
-                       ("unusable", {"kind": "lane_invalid", "detail": "y" * 100}))
+        fingerprint = [self.fill(32), self.fill(32), (10**6, 10**12), None,
+                       "unusable", {"kind": "lane_invalid", "detail": "y" * 100}]
         self.assertGreaterEqual(bounds.fingerprint_cost(fingerprint), deep_size(fingerprint))
 
     def test_json_cost_is_conservative_for_snapshot_shaped_values(self):

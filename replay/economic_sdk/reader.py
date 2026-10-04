@@ -1,4 +1,6 @@
-"""Generic independent reader for SDK strategy output.
+"""Independent reader for layout-1 output (the frozen complement V1 wire).
+
+Layout 2 is read by ``aggregate_reader``; the helpers below are shared.
 
 It does not import the runtime. From the manifest's policy and the snapshot it
 re-resolves the scoped entities, then streams every file once and checks:
@@ -147,7 +149,7 @@ class Group:
     """Recomputed facts for one summary key and skew bucket."""
 
     __slots__ = ("durations", "episode_count", "slice_count", "q", "episode_values",
-                 "slice_values", "censored_episodes", "censored_slices", "qualifying")
+                 "slice_values", "censored_episodes", "censored_slices")
 
     def __init__(self, kinds, tiers):
         self.durations = {}
@@ -158,8 +160,6 @@ class Group:
         self.slice_values = {k: array("Q") for k in kinds}
         self.censored_episodes = {k: 0 for k in kinds}
         self.censored_slices = {k: 0 for k in kinds}
-        # value class -> time inside slices of ``kind`` surviving at least ``tier``.
-        self.qualifying = {k: {t: {} for t in tiers} for k in kinds}
 
 
 class Aggregates:
@@ -302,7 +302,7 @@ def validate(directory, snapshot, manifest, strategy):
     index_of = {}
     ep = {name: [] for name in ("scope", "entity", "kind", "start", "end", "opening", "last",
                                 "quotes", "q", "expected_q", "reached", "tiers", "reason",
-                                "open_values", "maxima", "slice_maxima", "detail")}
+                                "open_values", "maxima", "slice_maxima")}
     runs_seen = {key: [0] * len(kinds) for key in expected}
     episode_rows = 0
     max_fields = tuple("max_" + name for name in experiment.maxima)
@@ -311,11 +311,9 @@ def validate(directory, snapshot, manifest, strategy):
         if ("episodes", cls) not in layout.names:
             continue
         name = layout.name("episodes", cls)
-        detail = experiment.detail[cls]
         fields = ("version experiment_sha256 scope entity start_ns end_ns episode_id kind basket "
                   "end_reason censored gap_lifetime_ns opening_slice_survival_ns viable_tiers "
-                  "qualified_ns open_values opening_skew_bucket " + " ".join(max_fields)
-                  + (" open_quotes" if detail == "episodes" else ""))
+                  "qualified_ns open_values opening_skew_bucket " + " ".join(max_fields))
         last = None
         for row in lines(root, name, manifest["files"][name]):
             episode_rows += 1
@@ -348,8 +346,6 @@ def validate(directory, snapshot, manifest, strategy):
                 require(opening is None or (parsed is not None and parsed >= signed(opening)),
                         "maximum consistency")
                 maxima[field] = parsed
-            if detail == "episodes":
-                strategy.check_quotes(row["open_quotes"], row["open_values"], entity)
             require(type(row["viable_tiers"]) is list
                     and row["viable_tiers"] == sorted(set(row["viable_tiers"]), key=int))
             require(type(row["qualified_ns"]) is dict and set(row["qualified_ns"]) == set(tiers))
@@ -384,7 +380,6 @@ def validate(directory, snapshot, manifest, strategy):
             ep["reached"].append(0); ep["tiers"].append(tuple(row["viable_tiers"]))
             ep["reason"].append(row["end_reason"]); ep["open_values"].append(row["open_values"])
             ep["maxima"].append(maxima); ep["slice_maxima"].append({})
-            ep["detail"].append(detail)
             runs_seen[key][kind_index] += 1
             g = group(row["entity"], bucket(row["opening_skew_bucket"]))
             g.episode_count[row["kind"]] += 1
@@ -394,8 +389,6 @@ def validate(directory, snapshot, manifest, strategy):
 
     # Classes determine the required number of maximal runs.
     for key, a in measurements.items():
-        if experiment.detail[expected[key].cls] == "intervals":
-            continue
         for kind_index in range(len(kinds)):
             bit, runs, opened = 1 << kind_index, 0, False
             for value in masks[key]:
@@ -407,116 +400,80 @@ def validate(directory, snapshot, manifest, strategy):
             require(runs == runs_seen[key][kind_index], "episode predicate/maximal coverage")
 
     slice_reasons = end_reasons | {"CONSUMED_CHANGED"}
-    for cls in (REAL, CONTROL):
-        if ("slices", cls) not in layout.names:
-            continue
-        name = layout.name("slices", cls)
-        if layout.version == 1 and cls == CONTROL:
-            continue  # the V1 slice file is shared and already read
-        full = experiment.detail[cls] == "slices"
-        last = None
-        for row in lines(root, name, manifest["files"][name]):
-            if full:
-                obj(row, "version experiment_sha256 scope entity start_ns end_ns episode_id kind "
-                         "end_reason censored consumed survival_ns viable_tiers open_values "
-                         "opening_skew_bucket")
-                start, end = common(row)
-                require(row["episode_id"] in index_of, "orphan slice")
-                ei = index_of[row["episode_id"]]
-                require(row["scope"] == ep["scope"][ei] and row["entity"] == ep["entity"][ei],
-                        "slice parent scope/entity")
-                require(row["kind"] in kinds, "slice kind")
-                require(row["kind"] == ep["kind"][ei] and ep["start"][ei] <= start < end <= ep["end"][ei])
-                require(uint(row["survival_ns"]) == end - start and type(row["censored"]) is bool)
-            else:
-                obj(row, "episode_id start_ns end_ns end_reason censored")
-                require(type(row["episode_id"]) is str and row["episode_id"] in index_of, "orphan slice")
-                ei = index_of[row["episode_id"]]
-                start, end = uint(row["start_ns"]), uint(row["end_ns"])
-                require(ep["start"][ei] <= start < end <= ep["end"][ei], "slice parent interval")
-                require(type(row["censored"]) is bool)
-            key = ep["scope"][ei], ep["entity"][ei]
-            entity, kind = expected[key], ep["kind"][ei]
-            require(entity.cls == cls or layout.version == 1, "slice entity class/file")
-            require(row["end_reason"] in slice_reasons)
-            require(row["censored"] == (row["end_reason"] == "RUN_END"), "slice censor reason")
-            require(row["end_reason"] == (ep["reason"][ei] if end == ep["end"][ei] else "CONSUMED_CHANGED"),
-                    "slice end reason/parent")
-            a, mi = measurement_at(key, start)
-            opening_class = code_of(class_codes, a[3][mi])
-            bit = 1 << kinds.index(kind)
-            require(class_bits[opening_class] & bit, "slice/class mismatch")
-            if full:
-                facts = strategy.open_facts(row["open_values"], entity, kind)
-                strategy.check_open(row["open_values"], facts, entity, kind, opening_class, "slice")
-            overlap = mi
-            while overlap < len(a[0]) and a[0][overlap] < end:
-                require(masks[key][overlap] & bit, "slice/measurement eligibility mismatch")
-                overlap += 1
-            if full:
-                require(bucket(row["opening_skew_bucket"]) == skew_at(a, mi), "slice opening skew")
-                require(row["viable_tiers"] == [t for t in tiers if end - start >= int(t)], "slice tiers")
-                order = order_key(row, entity, kind)
-                require(last is None or last <= order, "slice close order")
-                last = order
-                strategy.check_quotes(row["consumed"], row["open_values"], entity)
-                quotes = digest(row["consumed"])
-                if start == ep["start"][ei]:
-                    require(row["open_values"] == ep["open_values"][ei],
-                            "episode/first slice opening values")
-                if ep["quotes"][ei] is not None:
-                    require(ep["quotes"][ei] != quotes, "adjacent slices must change consumed depth")
-                ep["quotes"][ei] = quotes
-                for field in experiment.slice_invariant:
-                    value = row["open_values"][field]
-                    prior = ep["slice_maxima"][ei].get(field)
-                    if value is not None and (prior is None or signed(value) > prior):
-                        ep["slice_maxima"][ei][field] = signed(value)
-            else:
-                order = (end, ep["scope"][ei]) + entity.order + (kind, start)
-                require(last is None or last <= order, "slice close order")
-                last = order
-                ep["quotes"][ei] = True
-            require(start == ep["last"][ei], "slice partition/order")
-            budget.reserve(64)
-            ep["last"][ei] = end
-            if start == ep["start"][ei]:
-                require(ep["opening"][ei] == end - start, "opening survival")
-            for ti, tier in enumerate(tier_ints):
-                if end - start >= tier:
-                    ep["reached"][ei] |= 1 << ti
-                ep["q"][ei][ti] += max(0, end - start - tier)
-            g = group(key[1], skew_at(a, mi))
-            g.slice_count[kind] += 1
-            g.slice_values[kind].append(end - start)
-            if row["censored"]:
-                g.censored_slices[kind] += 1
-            # Entry time goes to the skew at each entry instant; whole-slice
-            # time of qualifying slices goes to the class at each instant.
-            for tier, tier_int in zip(tiers, tier_ints):
-                qualifying = end - start >= tier_int
-                qend = end - tier_int
-                i = max(0, bisect_right(a[1], start))
-                while i < len(a[0]) and a[0][i] < end:
-                    target = None
-                    overlap = max(0, min(qend, a[1][i]) - max(start, a[0][i]))
-                    if overlap:
-                        target = group(key[1], skew_at(a, i))
-                        target.q[kind][tier] += overlap
-                    if qualifying:
-                        whole = min(end, a[1][i]) - max(start, a[0][i])
-                        target = target or group(key[1], skew_at(a, i))
-                        value_class = code_of(class_codes, a[3][i])
-                        bucket_map = target.qualifying[kind][tier]
-                        bucket_map[value_class] = bucket_map.get(value_class, 0) + whole
-                    i += 1
+    last = None
+    for row in lines(root, layout.name("slices", REAL), manifest["files"][layout.name("slices", REAL)]):
+        obj(row, "version experiment_sha256 scope entity start_ns end_ns episode_id kind "
+                 "end_reason censored consumed survival_ns viable_tiers open_values "
+                 "opening_skew_bucket")
+        start, end = common(row)
+        require(row["episode_id"] in index_of, "orphan slice")
+        ei = index_of[row["episode_id"]]
+        require(row["scope"] == ep["scope"][ei] and row["entity"] == ep["entity"][ei],
+                "slice parent scope/entity")
+        require(row["kind"] in kinds, "slice kind")
+        require(row["kind"] == ep["kind"][ei] and ep["start"][ei] <= start < end <= ep["end"][ei])
+        require(uint(row["survival_ns"]) == end - start and type(row["censored"]) is bool)
+        key = ep["scope"][ei], ep["entity"][ei]
+        entity, kind = expected[key], ep["kind"][ei]
+        require(row["end_reason"] in slice_reasons)
+        require(row["censored"] == (row["end_reason"] == "RUN_END"), "slice censor reason")
+        require(row["end_reason"] == (ep["reason"][ei] if end == ep["end"][ei] else "CONSUMED_CHANGED"),
+                "slice end reason/parent")
+        a, mi = measurement_at(key, start)
+        opening_class = code_of(class_codes, a[3][mi])
+        bit = 1 << kinds.index(kind)
+        require(class_bits[opening_class] & bit, "slice/class mismatch")
+        facts = strategy.open_facts(row["open_values"], entity, kind)
+        strategy.check_open(row["open_values"], facts, entity, kind, opening_class, "slice")
+        overlap = mi
+        while overlap < len(a[0]) and a[0][overlap] < end:
+            require(masks[key][overlap] & bit, "slice/measurement eligibility mismatch")
+            overlap += 1
+        require(bucket(row["opening_skew_bucket"]) == skew_at(a, mi), "slice opening skew")
+        require(row["viable_tiers"] == [t for t in tiers if end - start >= int(t)], "slice tiers")
+        order = order_key(row, entity, kind)
+        require(last is None or last <= order, "slice close order")
+        last = order
+        strategy.check_quotes(row["consumed"], row["open_values"], entity)
+        quotes = digest(row["consumed"])
+        if start == ep["start"][ei]:
+            require(row["open_values"] == ep["open_values"][ei], "episode/first slice opening values")
+        if ep["quotes"][ei] is not None:
+            require(ep["quotes"][ei] != quotes, "adjacent slices must change consumed depth")
+        ep["quotes"][ei] = quotes
+        for field in experiment.slice_invariant:
+            value = row["open_values"][field]
+            prior = ep["slice_maxima"][ei].get(field)
+            if value is not None and (prior is None or signed(value) > prior):
+                ep["slice_maxima"][ei][field] = signed(value)
+        require(start == ep["last"][ei], "slice partition/order")
+        budget.reserve(64)
+        ep["last"][ei] = end
+        if start == ep["start"][ei]:
+            require(ep["opening"][ei] == end - start, "opening survival")
+        for ti, tier in enumerate(tier_ints):
+            if end - start >= tier:
+                ep["reached"][ei] |= 1 << ti
+            ep["q"][ei][ti] += max(0, end - start - tier)
+        g = group(key[1], skew_at(a, mi))
+        g.slice_count[kind] += 1
+        g.slice_values[kind].append(end - start)
+        if row["censored"]:
+            g.censored_slices[kind] += 1
+        # Entry time is attributed to the skew at each entry instant.
+        for tier, tier_int in zip(tiers, tier_ints):
+            qend = end - tier_int
+            i = max(0, bisect_right(a[1], start))
+            while i < len(a[0]) and a[0][i] < qend:
+                overlap = max(0, min(qend, a[1][i]) - max(start, a[0][i]))
+                if overlap:
+                    group(key[1], skew_at(a, i)).q[kind][tier] += overlap
+                i += 1
 
     for ei in range(len(ep["start"])):
         require(ep["quotes"][ei] is not None and ep["last"][ei] == ep["end"][ei], "slice partition/order")
-        if ep["detail"][ei] == "slices":
-            for field in experiment.slice_invariant:
-                require(ep["slice_maxima"][ei].get(field) == ep["maxima"][ei][field],
-                        "episode maximum/slices")
+        for field in experiment.slice_invariant:
+            require(ep["slice_maxima"][ei].get(field) == ep["maxima"][ei][field], "episode maximum/slices")
         reached = [t for ti, t in enumerate(tiers) if ep["reached"][ei] & (1 << ti)]
         require(reached == list(ep["tiers"][ei]), "episode tiers")
         require(ep["q"][ei] == ep["expected_q"][ei], "episode Q")

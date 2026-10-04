@@ -1,9 +1,16 @@
 # Same-venue complement strategy V1
 
-Status: **implemented** as policy version 1, on the economic strategy SDK
-([ECONOMIC_STRATEGY_SDK_V1.md](ECONOMIC_STRATEGY_SDK_V1.md)). Policy version 2, defined
-in that document's §§11 and 13, changes detail, controls, and the verdict input below.
+Status: **implemented** on the economic strategy SDK
+([ECONOMIC_STRATEGY_SDK_V1.md](ECONOMIC_STRATEGY_SDK_V1.md)), as two policy versions.
 Deployment is separately authorized.
+
+- **Policy 1** is the frozen V1 experiment described by this document's output
+  rules (§9, layout 1).
+- **Policy 2** is the SDK default. Where it differs, this document says so:
+  - its policy fields (§1);
+  - skew (§5);
+  - controls (§8);
+  - output (§9).
 
 `replay.same_venue_complement:build` is the first economic Replay strategy. On every
 captured binary instrument it measures whether buying, or selling, **both sides of
@@ -87,6 +94,14 @@ Supervisor entry:
   }
 }
 ```
+
+**Policy version 2** adds these closed fields to the policy above (SDK spec §11):
+
+- `controls`, default `[]`;
+- `controls_episodes` and `controls_slices`, both default `false`;
+- `audit_intervals`, default `false`;
+- `time_shift_ring_entries`;
+- `profile`, which is `null` or a market-profile policy.
 
 **Schema and loading**
 
@@ -430,6 +445,11 @@ the current cut.
 - The interpretation is decided in advance. A positive that occurs only in buckets
   ≥ 1 s and disappears below that is labelled `SKEW_ARTIFACT_LIKELY`. It still
   counts toward the verdict, so it remains visible.
+- **Policy 2: skew never splits time.** Skew is computed from the legs' *live*
+  last-change times, including for controls. It is recorded at each episode and
+  slice open. Latency-qualified entry time is attributed to the bucket in force at
+  each entry instant, inside positive slices only. `SKEW_ARTIFACT_LIKELY` uses
+  positive gross slice time, bucketed by skew at slice open.
 
 ## 6. Gaps, fees, and net results
 
@@ -550,7 +570,12 @@ cannot observe queue position, other takers, acknowledgements, or fills. Every
 economic output is a detection or an estimate. Labels say `DETECTED`, never
 `CAPTURED` or `FILLED`.
 
-## 8. Placebo control
+## 8. Placebo and controls
+
+Policy 1 always runs the placebo below. Policy 2 runs no control by default. It
+can enable this construction as the `cyclic_neighbor` control, and the
+`time_shift` staleness control, both under the SDK spec §6. Enabled controls write
+only under `controls/<name>/` and never feed a verdict.
 
 The gate 3 placebo is adapted to single-instrument baskets. For each supported pair
 basket `A` on venue `V`:
@@ -576,6 +601,27 @@ fixed by this section and `policy.version`, and is hashed before any observation
 All files are written under the supplied output directory, which must start empty.
 Writers follow the `LineWriter` and `write_json_durable` discipline of bundle
 coverage.
+
+**Policy 2** writes the SDK's output layout 2 (SDK spec §5). It contains:
+
+- entity and reason tables;
+- one denominator row per (scope, basket, direction, size), with exact time per
+  status and per value class;
+- real episodes, holding quotes and values at open and at maximum;
+- compact slices;
+- opt-in controls and audit.
+
+Policy 2 also differs in these ways:
+
+- its reasons are structured (SDK spec §11);
+- it has no per-row `fee_status` or `diagnostic`, because the value class
+  determines fee knowledge;
+- its summary rows have no skew dimension.
+
+The verdict rules below apply to both policies. Rule 3's `X` differs as stated
+there.
+
+The rest of this section describes **policy 1** (layout 1).
 
 **Files.** Each ordinary row carries `version`, `experiment_sha256`, and `scope`.
 

@@ -8,7 +8,7 @@ experiment byte for byte; version 2 is the SDK-default experiment.
 
 from __future__ import annotations
 
-from replay.complement_contract import SELF_CROSSED, Inputs
+from replay.complement_contract import SELF_CROSSED, Inputs, reason
 from replay.complement_output import ComplementReader, validate_content
 from replay.economic_sdk import (
     DEPTH_LIMITED, EVALUATED, ONE_SIDED, UNUSABLE, BookRequirement, Observation, Requirements,
@@ -17,9 +17,6 @@ from replay.economic_sdk import (
 from replay.preparation import encoded
 from replay.streams.protocol import require
 
-_UNEVALUATED = ("NOT_APPLICABLE", None)
-_SKIPPED = {"gap_net": None, "fee_status": "SKIPPED", "assessments": [[], []],
-            "reasons": [], "assumptions": [], "evidence": []}
 _GROSS, _GROSS_NET = frozenset({"gross"}), frozenset({"gross", "net"})
 
 
@@ -36,6 +33,7 @@ class SameVenueComplement(ComplementReader):
         self.threshold = int(self.policy["minimum_net_gap_per_contract_e18"])
         self.v2 = self.policy["version"] == 2
         self.snapshot_sha256 = self.inputs.prepared.sha256
+        self.unevaluated = self.experiment.unevaluated_fields
 
     # -- binding -----------------------------------------------------------------
     def bind(self, initial):
@@ -58,36 +56,48 @@ class SameVenueComplement(ComplementReader):
         return Requirements(books, self.experiment.profile)
 
     # -- evaluation --------------------------------------------------------------
-    def _reason(self, reason):
-        if reason is None:
-            return "null"
-        # V1 formatted the encoded bytes object itself; V2 writes the JSON text.
-        return encoded(reason).decode() if self.v2 else f"{encoded(reason)}"
+    def _unusable(self, views):
+        if not self.v2:
+            # V1 formatted the encoded bytes object itself; frozen for byte identity.
+            return tuple(f"leg:{i}:{view.validity}:"
+                         f"{encoded(view.reason) if view.reason is not None else 'null'}"
+                         for i, view in enumerate(views))
+        reasons = []
+        for i, view in enumerate(views):
+            if view.validity == "usable":
+                continue
+            value = {"leg": i, "validity": view.validity}
+            if view.reason is not None:
+                value["kind"] = view.reason["kind"]
+            reasons.append(reason(value))
+        return tuple(reasons)
+
+    def _limited(self, fills):
+        # V1 recorded the fillable quantity; policy 2 keeps reasons categorical.
+        return () if self.v2 else (str(min(f.filled_atoms for f in fills)),)
 
     def evaluate(self, entity, views, context):
         desc = entity.descriptor
         size = int(desc["size_contracts"])
         venue, direction = desc["venue"], desc["direction"]
+        plain_fields = self.unevaluated
         if any(view.validity != "usable" for view in views):
-            return Observation(UNUSABLE, tuple(
-                f"leg:{i}:{view.validity}:{self._reason(view.reason)}"
-                for i, view in enumerate(views)), fields=_UNEVALUATED, context_free=True)
+            return Observation(UNUSABLE, self._unusable(views), fields=plain_fields, context_free=True)
         if venue == "limitless":
             view = views[0]
             bid, ask = view.fills["bid"][size], view.fills["ask"][size]
             if not view.bid_present or not view.ask_present:
-                return Observation(ONE_SIDED, fields=_UNEVALUATED, context_free=True)
+                return Observation(ONE_SIDED, fields=plain_fields, context_free=True)
             if bid.depth_limited or ask.depth_limited:
-                return Observation(DEPTH_LIMITED, (str(min(bid.filled_atoms, ask.filled_atoms)),),
-                                   fields=_UNEVALUATED, context_free=True)
+                return Observation(DEPTH_LIMITED, self._limited((bid, ask)), fields=plain_fields,
+                                   context_free=True)
             status = "LOCKED" if bid.cost == ask.cost else ("CROSSED" if bid.cost > ask.cost else "NOT_CROSSED")
-            return Observation(status, fields=_UNEVALUATED, context_free=True)
+            return Observation(status, fields=plain_fields, context_free=True)
         if self.v2:
-            crossed = tuple(f"leg:{i}" for i, view in enumerate(views)
-                            if view.best_bid is not None and view.best_ask is not None
-                            and view.best_bid[0] > view.best_ask[0])
+            crossed = tuple(reason({"leg": i, "kind": "self_crossed"})
+                            for i, view in enumerate(views) if view.crossed)
             if crossed:
-                return Observation(SELF_CROSSED, crossed, fields=_UNEVALUATED, context_free=True)
+                return Observation(SELF_CROSSED, crossed, fields=plain_fields, context_free=True)
         projected = venue == "kalshi"
         if projected:
             side = "bid"
@@ -96,10 +106,10 @@ class SameVenueComplement(ComplementReader):
             side = "ask" if direction == "long" else "bid"
             fills = [view.fills[side][size] for view in views]
         if any(not view.present(side) for view in views):
-            return Observation(ONE_SIDED, fields=_UNEVALUATED, context_free=True)
+            return Observation(ONE_SIDED, fields=plain_fields, context_free=True)
         if any(fill.depth_limited for fill in fills):
-            return Observation(DEPTH_LIMITED, (str(min(f.filled_atoms for f in fills)),),
-                               fields=_UNEVALUATED, context_free=True)
+            return Observation(DEPTH_LIMITED, self._limited(fills), fields=plain_fields,
+                               context_free=True)
         plan = self.plans[entity.legs[0]]
         gross_scale = int(plan["price_scale"]) + int(plan["quantity_scale"])
         unit = size * 10 ** gross_scale
@@ -107,8 +117,8 @@ class SameVenueComplement(ComplementReader):
         gross = (unit - sum(f.cost for f in fills) if direction in ("long", "both_bids")
                  else sum(f.cost for f in fills) - unit)
         if gross <= 0:
-            return Observation(EVALUATED, (), "GROSS_NONPOSITIVE", ("SKIPPED", None),
-                               context_free=True)
+            return Observation(EVALUATED, (), "GROSS_NONPOSITIVE",
+                               () if self.v2 else ("SKIPPED", None), context_free=True)
         fee_direction = "SELL" if direction == "short" else "BUY"
         legs = tuple({"market_id": leg["market_id"],
                       "key": _opposite(leg) if projected else (leg["instrument"], leg["orientation"]),
@@ -129,8 +139,12 @@ class SameVenueComplement(ComplementReader):
                    "gross_scale": gross_scale, "net_scale": 18,
                    "fee_status": assessment["fee_status"], "assessments": assessment["assessments"],
                    "assumptions": assessment["assumptions"], "evidence": assessment["evidence"]}
-        return Observation(EVALUATED, tuple(assessment["reasons"]), value,
-                           (assessment["fee_status"], None),
+        if self.v2:
+            reasons = tuple(reason({"kind": "fee", "detail": r}) for r in assessment["reasons"])
+            fields = ()
+        else:
+            reasons, fields = tuple(assessment["reasons"]), (assessment["fee_status"], None)
+        return Observation(EVALUATED, reasons, value, fields,
                            _GROSS_NET if net_positive else _GROSS, payload,
                            tuple(fill.consumed for fill in fills))
 

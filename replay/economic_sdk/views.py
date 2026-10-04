@@ -9,7 +9,7 @@ class BookView:
     """Immutable detached state of one book; never references decoder objects."""
 
     __slots__ = ("validity", "reason", "last_change", "bid_present", "ask_present",
-                 "best_bid", "best_ask", "fills", "transformed", "levels")
+                 "best_bid", "best_ask", "fills", "transformed", "levels", "crossed")
 
     def __init__(self, validity, reason, last_change, bid_present, ask_present,
                  best_bid, best_ask, fills, transformed, levels):
@@ -17,6 +17,9 @@ class BookView:
         self.bid_present, self.ask_present = bid_present, ask_present
         self.best_bid, self.best_ask = best_bid, best_ask
         self.fills, self.transformed, self.levels = fills, transformed, levels
+        # The book's own best bid strictly above its best ask.
+        self.crossed = (best_bid is not None and best_ask is not None
+                        and best_bid[0] > best_ask[0])
 
     def present(self, side):
         return self.bid_present if side == "bid" else self.ask_present
@@ -75,7 +78,7 @@ class ViewBuilder:
                  and prior.validity == "usable")
         fills, presence, best, levels = {}, {}, {}, 0
         for side in self.sides:
-            if reuse and side not in sides:
+            if reuse and (side not in sides or beyond(prior.fills[side], side, sides[side])):
                 fills[side] = prior.fills[side]
                 presence[side] = prior.present(side)
                 best[side] = prior.best_bid if side == "bid" else prior.best_ask
@@ -90,6 +93,11 @@ class ViewBuilder:
                 fills[side] = dict(zip(self.sizes, side_fills))
                 presence[side] = bool(side_levels)
                 best[side] = side_levels[0] if side_levels else None
+                if prior is not None:
+                    # Keep the prior object for an equal best quote (identity fingerprints).
+                    old = prior.best_bid if side == "bid" else prior.best_ask
+                    if old == best[side]:
+                        best[side] = old
             levels += sum(len(f.taken) + len(f.consumed) for f in fills[side].values())
         transformed = {}
         if "kalshi_complement_ask" in self.transforms:
@@ -108,7 +116,12 @@ class ViewBuilder:
 
 
 def touched_sides(cut):
-    """Per changed key, the sides its operations touched, or ``None`` for all."""
+    """Per changed key: ``None`` (rebuild every side) or ``{side: extreme price}``.
+
+    Operations name their side and price. The extreme is the best touched
+    price (highest bid, lowest ask): a side whose touched prices are all
+    strictly worse than everything its fills consumed is provably unchanged.
+    """
     result = {}
     for transition in cut.body["book_transitions"]:
         key = (transition["key"]["instrument"], transition["key"]["orientation"])
@@ -116,7 +129,21 @@ def touched_sides(cut):
         if decision["kind"] != "operations" or result.get(key, ()) is None:
             result[key] = None
             continue
-        sides = set(result.get(key, ()))
-        sides.update(operation["side"] for operation in decision["operations"])
-        result[key] = sides
+        sides = result.setdefault(key, {})
+        for operation in decision["operations"]:
+            side, price = operation["side"], int(operation["price"]["atoms"])
+            prior = sides.get(side)
+            if prior is None or (price > prior if side == "bid" else price < prior):
+                sides[side] = price
     return result
+
+
+def beyond(fills, side, price):
+    """True when ``price`` is strictly worse than every level ``fills`` consumed."""
+    if not fills:
+        return False
+    largest = fills[next(reversed(fills))]
+    if largest.depth_limited or not largest.consumed:
+        return False
+    last = largest.consumed[-1][0]
+    return price > last if side == "ask" else price < last

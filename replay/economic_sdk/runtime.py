@@ -4,33 +4,45 @@ A strategy supplies requirements, baskets and a pure ``evaluate``; this module
 owns everything else (complement spec §§3, 5, 7 and SDK spec §4):
 
 - the cut clock, quiet scope entry and pre-start prologue initialization;
-- one bounded read and one walk per changed book side per cut, shared by
-  every real and control entity through detached ``BookView`` objects;
+- one read and one walk per touched book side per cut, shared by every real
+  and control entity through detached ``BookView`` objects;
 - same-time staging: only the final state at a time is committed, superseded
   positive intermediates are counted in ``instantaneous_positive``;
-- half-open measurement intervals, episodes and slices with zero-length
+- per-key status/value-class time, episodes and slices with zero-length
   suppression, ``SCOPE_END`` closure and censoring at run end;
 - controls, including the bounded view ring of ``time_shift``;
 - count-based retained-state bounds and bounded output in close order.
+
+Layout 1 (complement policy 1) writes the frozen V1 interval partition, with
+skew as a measurement dimension. Layout 2 never splits time on skew: skew is
+recorded at episode and slice open, and latency-qualified entry time is
+attributed to the skew at each entry instant, inside positive slices only.
 """
 
 from __future__ import annotations
 
 import heapq
+import json
 from bisect import bisect_right
+from operator import is_
 from pathlib import Path
 
 from replay.economic_fills import Fill  # noqa: F401  (re-exported for strategies)
 from replay.economic_intervals import CutClock, EpisodeMath
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
-from replay.economic_sdk.output import Layout, row_common
+from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, Observation
 from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
 from replay.supervisor import write_json_durable
+
+# Book sides each declared input source reads.
+_SOURCE_SIDES = {"best": frozenset(("bid", "ask")), "crossed": frozenset(("bid", "ask")),
+                 "kalshi_complement_ask": frozenset(("bid",))}
+_FILL, _TRANSFORM, _BEST, _CROSSED = 0, 1, 2, 3
 
 
 def episode_id(scope, entity, kind, start):
@@ -59,26 +71,39 @@ def _view_fills(view):
 class _Episode:
     __slots__ = ("entity", "kind", "start", "open_values", "open_quotes", "maxima",
                  "opening_skew", "slice_start", "slice_skew", "slice_values",
-                 "quotes", "qualified", "viable", "opening_survival", "cost")
+                 "quotes", "qualified", "viable", "opening_survival", "cost",
+                 # layout 2 only
+                 "open_class", "open_reasons", "class_now", "class_since", "slice_classes",
+                 "class_ns", "qualifying", "skew_points", "by_skew", "at_max")
 
 
-# Book sides each declared input source reads.
-_SOURCE_SIDES = {"best": frozenset(("bid", "ask")), "kalshi_complement_ask": frozenset(("bid",))}
+def _fingerprint(views, plan):
+    """Every object a declared input reads, flattened; compared by identity.
 
-
-def _fingerprint(view, sources):
-    """Everything a declared input reads from one leg's view."""
-    if view.validity != "usable":
-        return view.validity, view.reason
+    Equal fills are interned by the view builder, so an unchanged input is the
+    same object. A false mismatch only costs a re-evaluation.
+    """
     parts = []
-    for source, size in sources:
-        if source == "best":
-            parts.append((view.best_bid, view.best_ask))
-        elif source in view.fills:
-            parts.append((view.fills[source][size], view.present(source)))
-        else:
-            parts.append(view.transformed[source][size])
-    return tuple(parts)
+    for view, sources in zip(views, plan):
+        if view.validity != "usable":
+            parts.append(view.validity)
+            parts.append(view.reason)
+            continue
+        for kind, name, size in sources:
+            if kind == _FILL:
+                parts.append(view.fills[name][size])
+            elif kind == _TRANSFORM:
+                parts.append(view.transformed[name][size])
+            elif kind == _CROSSED:
+                parts.append(view.crossed)
+            else:
+                parts.append(view.best_bid)
+                parts.append(view.best_ask)
+    return parts
+
+
+def _same(left, right):
+    return len(left) == len(right) and all(map(is_, left, right))
 
 
 class Runtime:
@@ -87,15 +112,25 @@ class Runtime:
     def __init__(self, strategy, context):
         self.strategy = strategy
         experiment = self.experiment = strategy.experiment
+        self.legacy = experiment.layout == 1
         self.snapshot = strategy.snapshot
         self.root = Path(context["output_directory"])
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
-        self.layout_files = Layout(experiment)
-        self.writers = {name: LineWriter(self.root / name, max_bytes=bounds.MAX_BYTES,
-                                         max_records=bounds.MAX_ROWS,
-                                         max_line_bytes=bounds.MAX_LINE)
-                        for name in self.layout_files.files}
+        if self.legacy:
+            self.layout_files = Layout(experiment)
+            names = self.layout_files.files
+        else:
+            self.groups = aggregate_files(experiment)
+            names = tuple(group + name for group, files in self.groups.items()
+                          for name in files if name.endswith(".ndjson"))
+        self.writers = {}
+        for name in names:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.writers[name] = LineWriter(path, max_bytes=bounds.MAX_BYTES,
+                                            max_records=bounds.MAX_ROWS,
+                                            max_line_bytes=bounds.MAX_LINE)
         self.clock = CutClock(self.snapshot)
         self.plans = {(p["instrument"], p["orientation"]): plain(p) for p in self.snapshot["plans"]}
         self.budget = bounds.StateBudget()
@@ -111,7 +146,8 @@ class Runtime:
         if requirements.profile is not None:
             from replay.economic_sdk.profile import Collector
             self.profile = Collector(requirements.profile, self.snapshot, strategy.snapshot_sha256,
-                                     self.root, experiment.experiment_sha256, self.budget)
+                                     self.root, experiment.experiment_sha256, self.budget,
+                                     views=self.views_for_profile)
 
         self.kind_classes = {value: frozenset(k for k in experiment.kinds
                                               if value in experiment.episode_classes[k])
@@ -140,13 +176,17 @@ class Runtime:
         self.view_costs = {}
         self.entities = {}
         self.entities_cost = 0
+        self.index = {}
         self.reverse = {}
         self.shift_reverse = {}
         self.memo = {}
         self.reads = {}
+        self.plans_of = {}
         self.current = {}
         self._plain_costs = {}
         self.open_measurements = {}
+        self.denominators, self.denominator_cost = {}, 0
+        self.reasons, self.reason_list = {}, []
         self.episodes = {}
         self.instantaneous = {}
         self.staged_time = None
@@ -159,6 +199,9 @@ class Runtime:
     def layout(self):
         """Descriptors of the current scope's entities, for inspection only."""
         return {entity_id: entity.descriptor for entity_id, entity in self.entities.items()}
+
+    def views_for_profile(self, key):
+        return self.views.get(key)
 
     # -- callback ---------------------------------------------------------
     def __call__(self, cut):
@@ -198,8 +241,6 @@ class Runtime:
                 entered = self._advance(time)
             else:
                 entered = set()
-            if self.profile is not None:
-                self.profile.cut(cut, raw, time)
             changed = touched_sides(cut)
             affected = set(entered)
             if raw < self.clock.start:
@@ -210,6 +251,8 @@ class Runtime:
                     self._set_view(key, builder.build(cut.books[key], time, self.views.get(key), sides))
                     if key in self.rings:
                         self.staged_books.add(key)
+            if self.profile is not None:
+                self.profile.cut(cut, raw, time, changed)
             for key, sides in changed.items():
                 self._select(key, sides, time, affected)
             # A changed time-shift book must reach its ring at this exact time,
@@ -224,9 +267,9 @@ class Runtime:
         """Add the entities a change to ``key`` can change to ``affected``.
 
         An entity whose current observation is context-free and whose declared
-        inputs on ``key`` were not touched would re-derive the same observation;
-        only its skew bucket can move, so it is staged only when that bucket
-        changes. Everything else is re-evaluated, exactly as without inputs.
+        inputs on ``key`` were not touched would re-derive the same observation.
+        In layout 2 it is skipped; in layout 1 skew is a measurement dimension,
+        so it is staged when its skew bucket moves.
         """
         reads, staged, current = self.reads, self.staged, self.current
         for entity_id in self.reverse.get(key, ()):
@@ -235,12 +278,18 @@ class Runtime:
             value = staged.get(entity_id)
             value = value[0] if value is not None else current.get(entity_id)
             read = reads.get((entity_id, key))
-            if (value is None or not value[0].context_free or read is None or sides is None
-                    or not read.isdisjoint(sides)):
+            if value is None or not value[0].context_free or read is None:
                 affected.add(entity_id)
-            elif value[0].status == EVALUATED:
+            elif sides is None or not read.isdisjoint(sides):
+                # A touched input: unchanged when every object it reads is identical.
+                memo = self.memo.get(entity_id)
+                if (self.legacy or memo is None or memo[1] is not value[0] or not _same(
+                        memo[0], _fingerprint(self._views(self.entities[entity_id], time),
+                                              self.plans_of[entity_id]))):
+                    affected.add(entity_id)
+            elif self.legacy and value[0].status == EVALUATED:
                 entity = self.entities[entity_id]
-                if self._skew(entity, self._views(entity, time), value[0].skew_legs) != value[1]:
+                if self._skew(entity, value[0].skew_legs)[1] != value[1]:
                     affected.add(entity_id)
 
     # -- views and history ---------------------------------------------------
@@ -315,11 +364,26 @@ class Runtime:
         self.memo = {}
         self.current = {}
         self.reads = {}
+        self.plans_of = {}
         self.reverse, self.shift_reverse = {}, {}
+        if not self.legacy:
+            self.index = {}
+            by_group = {}
+            for entity in entities.values():
+                by_group.setdefault(group_of(entity), []).append(entity)
+            for members in by_group.values():
+                for position, entity in enumerate(sorted(members, key=lambda e: e.order)):
+                    self.index[entity.id] = position
         for entity in entities.values():
             if entity.admission is not None:
                 continue
             inputs = entity.basket.inputs
+            if inputs is not None:
+                self.plans_of[entity.id] = tuple(
+                    tuple((_BEST if source == "best" else _CROSSED if source == "crossed"
+                           else _TRANSFORM if source in _SOURCE_SIDES else _FILL, source, size)
+                          for source, size in leg)
+                    for leg in inputs)
             for position, key in enumerate(entity.legs):
                 if inputs is not None:
                     read = self.reads.get((entity.id, key), frozenset())
@@ -374,21 +438,17 @@ class Runtime:
             return (Observation(entity.admission, entity.admission_reasons,
                                 fields=self.experiment.unevaluated_fields), None)
         views = self._views(entity, self.staged_time)
-        inputs = entity.basket.inputs
-        fingerprint = None
-        if inputs is not None:
-            fingerprint = []
-            for view, sources in zip(views, inputs):
-                fingerprint.append(_fingerprint(view, sources))
-            fingerprint = tuple(fingerprint)
+        plan = self.plans_of.get(entity_id)
+        if plan is not None:
+            fingerprint = _fingerprint(views, plan)
             memo = self.memo.get(entity_id)
-            if memo is not None and memo[0] == fingerprint:
+            if memo is not None and _same(memo[0], fingerprint):
                 observation = memo[1]
             else:
                 observation = self._fresh(entity, views)
                 old = memo[2] if memo is not None else 0
                 if observation.context_free:
-                    # The fingerprint may outlive its views, so its fills are charged.
+                    # The fingerprint may outlive its views, so its objects are charged.
                     cost = bounds.fingerprint_cost(fingerprint) + self._observation_cost(observation)
                     self.budget.replace(old, cost)
                     self.memo[entity_id] = (fingerprint, observation, cost)
@@ -397,9 +457,11 @@ class Runtime:
                     del self.memo[entity_id]
         else:
             observation = self._fresh(entity, views)
-        skew = None
-        if observation.status == EVALUATED:
-            skew = self._skew(entity, views, observation.skew_legs)
+        if self.legacy:
+            skew = self._skew(entity, observation.skew_legs)[1] if observation.status == EVALUATED else None
+        else:
+            # Skew never splits time in layout 2; it is needed only inside episodes.
+            skew = self._skew(entity, observation.skew_legs) if observation.predicates else None
         return observation, skew
 
     def _views(self, entity, time):
@@ -410,21 +472,28 @@ class Runtime:
         return tuple(self._shifted(key, shift[1], time) if position == shift[0]
                      else self.views[key] for position, key in enumerate(entity.legs))
 
-    def _skew(self, entity, views, legs):
-        """Skew bucket of the legs' last-change spread (half-open edges)."""
-        legs = legs or range(len(views))
-        low = high = views[legs[0]].last_change
-        for i in legs:
-            change = views[i].last_change
-            if change < low:
-                low = change
-            elif change > high:
-                high = change
-        spread = high - low
-        for i, edge in enumerate(self.edges):
+    def _skew(self, entity, legs):
+        """``(leg_skew_ns, bucket)`` from the legs' *live* last-change times.
+
+        A time-shifted leg keeps its historical last-change time, so control
+        skew always uses the live views of every leg.
+        """
+        views, keys = self.views, entity.legs
+        if legs:
+            keys = [keys[i] for i in legs]
+        if len(keys) == 2:
+            spread = views[keys[0]].last_change - views[keys[1]].last_change
+            if spread < 0:
+                spread = -spread
+        else:
+            changes = [views[key].last_change for key in keys]
+            spread = max(changes) - min(changes)
+        index = 0
+        for edge in self.edges:
             if spread < edge:
-                return i
-        return len(self.edges)
+                return spread, index
+            index += 1
+        return spread, index
 
     def _fresh(self, entity, views):
         context = Context(self.staged_time, self.sequence, self.scope,
@@ -492,8 +561,12 @@ class Runtime:
     def _commit(self, entity, time, value):
         observation, skew = value
         self.current[entity.id] = value
-        fields = (observation.status, observation.reasons, skew, observation.value_class,
-                  observation.fields)
+        if self.legacy:
+            fields = (observation.status, observation.reasons, skew, observation.value_class,
+                      observation.fields)
+        else:
+            fields = (observation.status, observation.reasons, observation.value_class,
+                      observation.fields)
         prior = self.open_measurements.get(entity.id)
         if prior is None or prior[1] != fields:
             if prior is not None:
@@ -501,7 +574,7 @@ class Runtime:
             cost = bounds.MEASUREMENT + self._observation_cost(observation) - bounds.OBSERVATION
             self.budget.replace(prior[2] if prior is not None else 0, cost)
             self.open_measurements[entity.id] = (time, fields, cost)
-        if self.experiment.detail[entity.cls] == "intervals":
+        if not self.legacy and entity.cls == CONTROL and not self.experiment.controls_episodes:
             return
         for kind in self.experiment.kinds:
             key = (entity.id, kind)
@@ -542,6 +615,16 @@ class Runtime:
         episode.viable = set()
         episode.opening_survival = None
         episode.cost = bounds.episode_cost(observation, len(self.tiers))
+        if not self.legacy:
+            episode.open_class = episode.class_now = observation.value_class
+            episode.open_reasons = observation.reasons
+            episode.class_since = time
+            episode.slice_classes, episode.class_ns = {}, {}
+            episode.qualifying = {t: {} for t in self.tiers}
+            episode.by_skew = {t: {} for t in self.tiers}
+            episode.skew_points = [(time, skew)]
+            episode.at_max = (observation.payload, observation.quotes)
+            episode.cost *= 2  # opening, maximum and current slice payloads
         require(len(self.episodes) < len(self.entities) * len(self.experiment.kinds),
                 "open episode bound")
         self.budget.charge(episode.cost)
@@ -549,15 +632,31 @@ class Runtime:
 
     def _update_episode(self, episode, time, observation, skew):
         payload = observation.payload
+        if not self.legacy and observation.value_class != episode.class_now:
+            classes = episode.slice_classes
+            classes[episode.class_now] = classes.get(episode.class_now, 0) + time - episode.class_since
+            episode.class_now, episode.class_since = observation.value_class, time
         if observation.quotes != episode.quotes:
             self._check_retained_slice(observation.quotes, payload)
-            cost = bounds.episode_cost(observation, len(self.tiers))
+            cost = bounds.episode_cost(observation, len(self.tiers)) * (1 if self.legacy else 2)
             self.budget.replace(episode.cost, cost)
             episode.cost = cost
             self._emit_slice(episode, time, "CONSUMED_CHANGED", False)
             episode.slice_start, episode.slice_values = time, payload
             episode.quotes, episode.slice_skew = observation.quotes, skew
-        episode.maxima = self._maxima(payload, episode.maxima)
+            if not self.legacy:
+                self.budget.release((len(episode.skew_points) - 1) * (bounds.PAIR + bounds.SLOT))
+                episode.skew_points = [(time, skew)]
+        elif not self.legacy and skew != episode.skew_points[-1][1]:
+            require(len(episode.skew_points) < bounds.MAX_SKEW_POINTS, "skew changes per slice")
+            episode.skew_points.append((time, skew))
+            self.budget.charge(bounds.PAIR + bounds.SLOT)
+        maxima = self._maxima(payload, episode.maxima)
+        if not self.legacy:
+            first = self.experiment.maxima[0]
+            if maxima[first] is not None and maxima[first] != episode.maxima[first]:
+                episode.at_max = (payload, observation.quotes)
+        episode.maxima = maxima
 
     def _emit_slice(self, episode, end, reason, censored):
         start = episode.slice_start
@@ -570,8 +669,8 @@ class Runtime:
         for tier, amount in qualified.items():
             episode.qualified[tier] += int(amount)
         entity = self.entities[episode.entity]
-        identity = episode_id(self.scope, episode.entity, episode.kind, episode.start)
-        if self.experiment.detail[entity.cls] == "slices":
+        if self.legacy:
+            identity = episode_id(self.scope, episode.entity, episode.kind, episode.start)
             row = self._common(episode.entity, start, end) | {
                 "episode_id": identity, "kind": episode.kind, "end_reason": reason,
                 "censored": censored, "consumed": quotes_json(episode.quotes),
@@ -579,10 +678,43 @@ class Runtime:
                 "open_values": episode.slice_values, "opening_skew_bucket": episode.slice_skew,
             }
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
-        else:
-            row = {"episode_id": identity, "start_ns": str(start), "end_ns": str(end),
-                   "end_reason": reason, "censored": censored}
-        self.writers[self.layout_files.name("slices", entity.cls)].append(row)
+            self.writers[self.layout_files.name("slices", entity.cls)].append(row)
+            return
+        self._close_slice_facts(episode, start, end, survival)
+        group = group_of(entity)
+        skew_ns, skew_bucket = episode.slice_skew
+        row = {"episode_id": episode_id(self.scope, episode.entity, episode.kind, episode.start),
+               "start_ns": str(start), "end_ns": str(end), "end_reason": reason,
+               "censored": censored, "leg_skew_ns": str(skew_ns), "skew_bucket": skew_bucket}
+        if group + "slices.ndjson" in self.writers:
+            self.writers[group + "slices.ndjson"].append(row)
+        if entity.cls == REAL and self.experiment.audit_intervals:
+            row = row | {"quotes": quotes_json(episode.quotes), "values": episode.slice_values}
+            require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
+            self.writers["audit/slices.ndjson"].append(row)
+
+    def _close_slice_facts(self, episode, start, end, survival):
+        """Fold one closed slice into its episode's class and skew facts."""
+        classes = episode.slice_classes
+        classes[episode.class_now] = classes.get(episode.class_now, 0) + end - episode.class_since
+        episode.class_since = end
+        for value_class, amount in classes.items():
+            episode.class_ns[value_class] = episode.class_ns.get(value_class, 0) + amount
+        points = episode.skew_points
+        for tier, tier_int in zip(self.tiers, self.tier_ints):
+            if survival >= tier_int:
+                target = episode.qualifying[tier]
+                for value_class, amount in classes.items():
+                    target[value_class] = target.get(value_class, 0) + amount
+            # Entry instants [start, end - tier) take the skew in force at each.
+            window = end - tier_int
+            buckets = episode.by_skew[tier]
+            for i, (at, skew) in enumerate(points):
+                until = points[i + 1][0] if i + 1 < len(points) else end
+                overlap = min(until, window) - at
+                if overlap > 0:
+                    buckets[skew[1]] = buckets.get(skew[1], 0) + overlap
+        episode.slice_classes = {}
 
     def _close_episodes(self, closures):
         entities = self.entities
@@ -590,39 +722,127 @@ class Runtime:
             entities[item[0][0]].order, item[0][1], self.episodes[item[0]].start))
         for key, end, reason, censored in closures:
             episode = self.episodes.pop(key)
-            self.budget.release(episode.cost)
+            self.budget.release(episode.cost + (len(episode.skew_points) - 1) * (bounds.PAIR + bounds.SLOT)
+                                if not self.legacy else episode.cost)
             self._emit_slice(episode, end, reason, censored)
             if episode.start >= end:
                 continue
             entity = entities[episode.entity]
-            row = self._common(episode.entity, episode.start, end) | {
+            require(self.episode_rows < bounds.MAX_ROWS, "combined episode row budget")
+            self.episode_rows += 1
+            if self.legacy:
+                row = self._common(episode.entity, episode.start, end) | {
+                    "episode_id": episode_id(self.scope, episode.entity, episode.kind, episode.start),
+                    "kind": episode.kind, "basket": entity.descriptor, "end_reason": reason,
+                    "censored": censored, "gap_lifetime_ns": str(end - episode.start),
+                    "opening_slice_survival_ns": str(episode.opening_survival or 0),
+                    "viable_tiers": [t for t in self.tiers if t in episode.viable],
+                    "qualified_ns": {t: str(v) for t, v in episode.qualified.items()},
+                    "open_values": episode.open_values,
+                    "opening_skew_bucket": episode.opening_skew,
+                } | {"max_" + name: value for name, value in episode.maxima.items()}
+                self.writers[self.layout_files.name("episodes", entity.cls)].append(row)
+                continue
+            skew_ns, skew_bucket = episode.opening_skew
+            row = {
+                "scope": self.scope, "entity": self.index[episode.entity],
                 "episode_id": episode_id(self.scope, episode.entity, episode.kind, episode.start),
-                "kind": episode.kind, "basket": entity.descriptor, "end_reason": reason,
-                "censored": censored, "gap_lifetime_ns": str(end - episode.start),
-                "opening_slice_survival_ns": str(episode.opening_survival or 0),
+                "kind": episode.kind, "start_ns": str(episode.start), "end_ns": str(end),
+                "end_reason": reason, "censored": censored,
+                "opening_slice_survival_ns": str(episode.opening_survival),
                 "viable_tiers": [t for t in self.tiers if t in episode.viable],
                 "qualified_ns": {t: str(v) for t, v in episode.qualified.items()},
-                "open_values": episode.open_values,
-                "opening_skew_bucket": episode.opening_skew,
-            } | {"max_" + name: value for name, value in episode.maxima.items()}
-            if self.experiment.detail[entity.cls] == "episodes":
-                row["open_quotes"] = quotes_json(episode.open_quotes)
-            require(self.episode_rows < bounds.MAX_ROWS, "combined episode row budget")
-            self.writers[self.layout_files.name("episodes", entity.cls)].append(row)
-            self.episode_rows += 1
+                "qualified_by_skew_ns": {t: {str(b): str(v) for b, v in sorted(m.items())}
+                                         for t, m in episode.by_skew.items()},
+                "class_ns": {c: str(v) for c, v in sorted(episode.class_ns.items())},
+                "qualifying_class_ns": {t: {c: str(v) for c, v in sorted(m.items())}
+                                        for t, m in episode.qualifying.items()},
+                "open": {"value_class": episode.open_class,
+                         "reasons": [self._reason(r) for r in episode.open_reasons],
+                         "leg_skew_ns": str(skew_ns), "skew_bucket": skew_bucket,
+                         "values": episode.open_values, "quotes": quotes_json(episode.open_quotes)},
+                "maxima": episode.maxima,
+                "at_max": {"values": episode.at_max[0], "quotes": quotes_json(episode.at_max[1])},
+            }
+            self.writers[group_of(entity) + "episodes.ndjson"].append(row)
+
+    # -- measurements and denominators ---------------------------------------
+    def _reason(self, text):
+        """Index of a structured reason (canonical JSON object text) in the table."""
+        index = self.reasons.get(text)
+        if index is None:
+            value = json.loads(text)
+            require(type(value) is dict and encoded(value).decode() == text,
+                    "reasons must be canonical JSON objects")
+            self.budget.charge(bounds.SLOT + bounds.STR + 4 * len(text), "detached state budget")
+            index = self.reasons[text] = len(self.reason_list)
+            self.reason_list.append(value)
+        return index
 
     def _emit_measurements(self, closures):
         entities = self.entities
+        closures = sorted(closures, key=lambda item: (item[2], entities[item[0]].order, item[1][0]))
+        if self.legacy:
+            names = self.experiment.measurement_fields
+            for entity, (start, fields, _), end in closures:
+                if start < end:
+                    status, reasons, skew, value_class, extra = fields
+                    row = self._common(entity, start, end) | {
+                        "status": status, "reasons": list(reasons), "skew_bucket": skew,
+                        "value_class": value_class} | dict(zip(names, extra))
+                    self.writers[self.layout_files.name("measurements", entities[entity].cls)].append(row)
+            return
+        audit = self.experiment.audit_intervals
         names = self.experiment.measurement_fields
-        for entity, (start, fields, _), end in sorted(
-            closures, key=lambda item: (item[2], entities[item[0]].order, item[1][0])
-        ):
-            if start < end:
-                status, reasons, skew, value_class, extra = fields
-                row = self._common(entity, start, end) | {
-                    "status": status, "reasons": list(reasons), "skew_bucket": skew,
-                    "value_class": value_class} | dict(zip(names, extra))
-                self.writers[self.layout_files.name("measurements", entities[entity].cls)].append(row)
+        for entity_id, (start, fields, _), end in closures:
+            if start >= end:
+                continue
+            status, reasons, value_class, extra = fields
+            totals = self.denominators.get(entity_id)
+            if totals is None:
+                totals = self.denominators[entity_id] = ({}, {}, {})
+                self._charge_denominator(bounds.MEASUREMENT)
+            duration = end - start
+            for table, key in ((totals[0], status), (totals[1], value_class)):
+                if key is None:
+                    continue
+                if key not in table:
+                    self._charge_denominator(bounds.SLOT + bounds.STR + bounds.INT)
+                table[key] = table.get(key, 0) + duration
+            indexes = [self._reason(r) for r in reasons]
+            if indexes:
+                key = (status, tuple(indexes))
+                if key not in totals[2]:
+                    self._charge_denominator(bounds.SLOT + bounds.CONTAINER + bounds.INT * (2 + len(indexes)))
+                totals[2][key] = totals[2].get(key, 0) + duration
+            if audit and entities[entity_id].cls == REAL:
+                row = {"scope": self.scope, "entity": self.index[entity_id], "start_ns": str(start),
+                       "end_ns": str(end), "status": status, "reasons": indexes}
+                if value_class is not None:
+                    row["value_class"] = value_class
+                row |= dict(zip(names, extra))
+                self.writers["audit/measurements.ndjson"].append(row)
+
+    def _charge_denominator(self, amount):
+        self.budget.charge(amount)
+        self.denominator_cost += amount
+
+    def _write_denominators(self):
+        rows = []
+        for entity_id, (status, classes, reasons) in self.denominators.items():
+            entity = self.entities[entity_id]
+            row = {"scope": self.scope, "entity": self.index[entity_id],
+                   "status_ns": {k: str(v) for k, v in sorted(status.items())}}
+            if classes:
+                row["class_ns"] = {k: str(v) for k, v in sorted(classes.items())}
+            if reasons:
+                row["reason_ns"] = [[s, list(i), str(v)] for (s, i), v in sorted(reasons.items())]
+            rows.append((group_of(entity), self.index[entity_id], row))
+        for group, _, row in sorted(rows, key=lambda item: (item[0], item[1])):
+            self.writers[group + "denominators.ndjson"].append(row)
+        self.denominators = {}
+        self.budget.release(self.denominator_cost)
+        self.denominator_cost = 0
 
     def _common(self, entity, start, end):
         return row_common(self.layout_files.version, self.experiment.experiment_sha256,
@@ -633,13 +853,40 @@ class Runtime:
         self.budget.release(sum(p[2] for p in self.open_measurements.values()))
         self.open_measurements.clear()
         self._close_episodes([(key, time, reason, censored) for key in sorted(self.episodes)])
+        if not self.legacy:
+            self._write_denominators()
 
     # -- completion ------------------------------------------------------------
+    def _write_table(self, name, value):
+        writer = LineWriter(self.root / name, max_bytes=bounds.MAX_METADATA, max_records=1,
+                            max_line_bytes=bounds.MAX_METADATA)
+        writer.append(value)
+        return writer.finish()
+
+    def _tables(self):
+        """Entity tables (once per scope, per group) and the reason table."""
+        tables = {}
+        scopes = {group: [] for group in self.groups}
+        for index in range(len(self.snapshot["scopes"])):
+            entities = resolve(self.strategy, self.snapshot, index, self.plans)
+            members = {group: [] for group in self.groups}
+            for entity in sorted(entities.values(), key=lambda e: e.order):
+                members[group_of(entity)].append({"hash": entity.id, "descriptor": entity.descriptor})
+            for group in self.groups:
+                scopes[group].append(members[group])
+        for group in self.groups:
+            tables[group + "entities.json"] = self._write_table(group + "entities.json",
+                                                                {"scopes": scopes[group]})
+        tables["reasons.json"] = self._write_table("reasons.json", {"reasons": self.reason_list})
+        return tables
+
     def finish(self):
         try:
             require(self.terminal and not self.poisoned and not self.finished,
                     "missing terminal / failed economic strategy")
             files = {name: writer.finish() for name, writer in self.writers.items()}
+            if not self.legacy:
+                files |= self._tables()
             if self.profile is not None:
                 files |= self.profile.finish_files()
             manifest = self.strategy.manifest(files, self.instantaneous)
@@ -647,9 +894,13 @@ class Runtime:
             # Release runtime state before the reader so the two peaks never overlap.
             self.views.clear(); self.rings.clear(); self.staged.clear()
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
+            self.memo.clear(); self.reasons.clear()
             self.budget = None
             summary = strategy.validate(self.root, snapshot, manifest)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")
+            if not self.legacy:
+                for name, control in summary.get("controls", {}).items():
+                    write_json_durable(self.root / "controls" / name / "summary.json", control)
             write_json_durable(self.root / "summary.json", summary)
             manifest["summary_sha256"] = digest(summary)
             require(len(encoded(manifest)) <= bounds.MAX_METADATA, "manifest budget")

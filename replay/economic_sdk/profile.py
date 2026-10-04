@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from replay.economic_fills import walk
 from replay.economic_sdk import bounds
+from replay.economic_sdk.views import touched_sides
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import obj, require, uint
@@ -108,8 +109,12 @@ class _Accumulator:
 class Collector:
     """Per-book profile over one stream; scope-, bucket- and staging-aware."""
 
-    def __init__(self, policy, snapshot, snapshot_sha256, root, experiment_sha256, budget=None):
+    def __init__(self, policy, snapshot, snapshot_sha256, root, experiment_sha256, budget=None,
+                 views=None):
         self.policy = profile_policy(policy)
+        # Embedded in an SDK strategy, ``views(key)`` returns that group's
+        # detached view, whose walked fills are reused when they cover our sizes.
+        self.views = views
         self.snapshot = snapshot
         self.snapshot_sha = snapshot_sha256
         self.experiment = experiment_sha256
@@ -140,7 +145,8 @@ class Collector:
         self.start = int(snapshot["config"]["start_ns"])
         self.end = int(snapshot["config"]["end_ns"])
         self.scope = 0
-        self.raw_books = {}     # key -> (validity, reason kind, bids, asks) of the live book
+        self.validity = {}      # key -> (validity, reason kind) of the live book
+        self.side_facts = {}    # key -> {side: (best, depth bands, slippages) | None}
         self.state = {}         # key -> committed _State
         self.since = {}         # key -> time the committed state started accruing
         self.pending = {}       # key -> _State at the staged time
@@ -153,63 +159,93 @@ class Collector:
         self.budget.charge(len(self.plans) * 4096, "profile state budget")
 
     # -- inputs ------------------------------------------------------------------
-    def _snapshot_book(self, key, book):
-        validity = book.validity
+    def _read(self, key, book, sides):
+        """Refresh the live book's validity and only the ``sides`` it touched."""
         reason = None if book.reason is None else book.reason.get("kind")
-        need_levels = "depth" in self.groups
-        if validity != "usable":
-            return validity, reason, (), ()
-        if need_levels:
-            return validity, reason, book.levels("bid"), book.levels("ask")
-        bid, ask = book.best_bid(), book.best_ask()
-        return validity, reason, (bid,) if bid else (), (ask,) if ask else ()
+        self.validity[key] = (book.validity, reason)
+        if book.validity != "usable":
+            self.side_facts[key] = {"bid": None, "ask": None}
+            return
+        facts = self.side_facts.setdefault(key, {"bid": None, "ask": None})
+        for side in sides or ("bid", "ask"):
+            current = facts[side]
+            if sides and current is not None and current[3] is not None and (
+                    sides[side] > current[3] if side == "ask" else sides[side] < current[3]):
+                continue  # strictly beyond every band and walked level: unchanged
+            facts[side] = self._side(key, book, side)
+
+    def _side(self, key, book, side):
+        if "depth" not in self.groups:
+            best = book.best_bid() if side == "bid" else book.best_ask()
+            return None if best is None else (best, None, None, best[0])
+        levels = book.levels(side)
+        if not levels:
+            return None
+        best = levels[0]
+        plan = self.plans[key]
+        band_unit = int(self.policy["tick_atoms"][plan["venue"]])
+        within = []
+        for k in self.depth_ticks:
+            band, total = k * band_unit, 0
+            for price, quantity in levels:
+                if abs(price - best[0]) > band:
+                    break
+                total += quantity
+            within.append(total)
+        fills = None
+        view = self.views(key) if self.views is not None else None
+        if view is not None and view.validity == "usable" and side in view.fills:
+            walked = view.fills[side]
+            if all(size in walked for size in self.sizes):
+                fills = [walked[size] for size in self.sizes]
+        if fills is None:
+            unit_q = 10 ** int(plan["quantity_scale"])
+            fills = walk(levels, tuple(size * unit_q for size in self.sizes))
+        # Horizon: the worst price any band or walked fill depends on.
+        largest = fills[-1]
+        if largest.depth_limited or not largest.consumed:
+            horizon = None
+        else:
+            band = self.depth_ticks[-1] * band_unit
+            edge = best[0] + band if side == "ask" else best[0] - band
+            last = largest.consumed[-1][0]
+            horizon = max(edge, last) if side == "ask" else min(edge, last)
+        return best, tuple(within), tuple(
+            None if fill.depth_limited else abs(fill.cost - best[0] * fill.filled_atoms)
+            for fill in fills), horizon
 
     def _derive(self, key):
-        validity, reason, bids, asks = self.raw_books[key]
-        plan = self.plans[key]
+        validity, reason = self.validity[key]
         if validity != "usable":
             return _State(validity if validity == "not_initialized" else "unusable:" + (reason or "unknown"))
+        own = self.side_facts[key]
+        bid, ask = own["bid"], own["ask"]
+        plan = self.plans[key]
         if plan["venue"] == "kalshi":
-            unit = 10 ** int(plan["price_scale"])
-            other = self.raw_books.get(self.counterpart.get(key))
-            asks = (tuple((unit - p, q) for p, q in other[2])
-                    if other is not None and other[0] == "usable" else ())
-        state = _State("usable", bids[0] if bids else None, asks[0] if asks else None)
+            # Asks are the counterpart's bids at ``P - p``: same depth and slippage.
+            other = self.counterpart.get(key)
+            ask = None
+            if other is not None and self.validity.get(other, ("",))[0] == "usable":
+                source = self.side_facts[other]["bid"]
+                if source is not None:
+                    unit = 10 ** int(plan["price_scale"])
+                    ask = ((unit - source[0][0], source[0][1]), source[1], source[2], None)
+        state = _State("usable", bid[0] if bid else None, ask[0] if ask else None)
         if "depth" in self.groups:
-            tick = int(self.policy["tick_atoms"][plan["venue"]])
-            unit_q = 10 ** int(plan["quantity_scale"])
-            sizes = tuple(size * unit_q for size in self.sizes)
-            state.depth, state.fills = {}, {}
-            for side, levels in (("bid", bids), ("ask", asks)):
-                if not levels:
-                    continue
-                best = levels[0][0]
-                within = []
-                for k in self.depth_ticks:
-                    band = k * tick
-                    total = 0
-                    for price, quantity in levels:
-                        if abs(price - best) > band:
-                            break
-                        total += quantity
-                    within.append(total)
-                state.depth[side] = tuple(within)
-                fills = walk(tuple(levels), sizes)
-                state.fills[side] = tuple(
-                    None if fill.depth_limited else abs(fill.cost - best * fill.filled_atoms)
-                    for fill in fills)
+            state.depth = {side: facts[1] for side, facts in (("bid", bid), ("ask", ask)) if facts}
+            state.fills = {side: facts[2] for side, facts in (("bid", bid), ("ask", ask)) if facts}
         return state
 
     # -- callbacks ---------------------------------------------------------------
     def initial(self, cut, start):
         for key in self.plans:
-            self.raw_books[key] = self._snapshot_book(key, cut.books[key])
+            self._read(key, cut.books[key], None)
         for key in self.plans:
             self.state[key] = self._derive(key)
             self.since[key] = start
         self._open_scope(0, start)
 
-    def cut(self, cut, raw, time):
+    def cut(self, cut, raw, time, changed=None):
         if self.staged is not None and time > self.staged:
             self._commit()
         self._advance(time)
@@ -248,16 +284,19 @@ class Collector:
                 if "activity" not in self.groups or disposition == "duplicate":
                     continue
                 self._trade(key, row, value)
-        changed = set()
-        for transition in transitions:
-            key = (transition["key"]["instrument"], transition["key"]["orientation"])
-            self.raw_books[key] = self._snapshot_book(key, cut.books[key])
-            changed.add(key)
+        if changed is None:
+            changed = touched_sides(cut)
+        derive = set()
+        for key, sides in changed.items():
+            if key not in self.plans:
+                continue
+            self._read(key, cut.books[key], sides)
+            derive.add(key)
             if key in self.counterpart:
-                changed.add(self.counterpart[key])
-        if changed:
+                derive.add(self.counterpart[key])
+        if derive:
             self.staged = time
-            for key in changed:
+            for key in derive:
                 self.pending[key] = self._derive(key)
 
     def terminal(self, end):

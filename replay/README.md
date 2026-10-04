@@ -33,7 +33,7 @@ declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns
 
 - time and same-time staging;
 - shared detached book views;
-- intervals, episodes, and slices;
+- per-key denominators, episodes and slices;
 - controls;
 - bounded output;
 - the independent reader.

@@ -12,7 +12,7 @@ from replay.complement_contract import (
     FIELDS, LIMITLESS_STATUSES, PAYOUT, SELF_CROSSED, STRATEGY, Inputs, baskets,
     control_descriptor, control_label, experiment, experiment_identity, policy_config,
 )
-from replay.economic_sdk import Strategy, reader
+from replay.economic_sdk import Strategy, aggregate_reader, reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.output import Layout
 from replay.economic_sdk.reader import quantiles as _quantiles  # noqa: F401  (stable test surface)
@@ -196,80 +196,100 @@ class ComplementReader(Strategy):
         return (d["venue"], d["basket_kind"], d["direction"], d["size_contracts"], control_label(d))
 
     def summarize(self, aggregates, manifest, snapshot):
-        policy, v2 = self.policy, self.policy["version"] == 2
+        """Policy 1 (layout 1) summary: rows per skew bucket, placebo beside real."""
+        policy = self.policy
         headline, latency = policy["headline_size_contracts"], policy["headline_latency_ns"]
         rows = []
-        qualifying_unknown = {}
         for key, g in sorted(aggregates.groups.items(),
-                             key=lambda x: (x[0][0], x[0][1], x[0][2], int(x[0][3]),
-                                            _label_order(x[0][4]), x[0][5])):
-            venue, bkind, direction, size, control, skew = key
+                             key=lambda x: (x[0][0], x[0][1], x[0][2], int(x[0][3]), x[0][4], x[0][5])):
+            venue, bkind, direction, size, placebo, skew = key
             d = g.durations
-            evaluated = sum(d.get(k, 0) for k in ("gross_nonpositive_ns", "net_positive_ns",
-                                                  "net_nonpositive_ns", "fee_unknown_ns"))
-            row = {"venue": venue, "basket_kind": bkind, "direction": direction, "size_contracts": size,
-                   "skew_bucket": skew, "policy_sha256": manifest["policy_sha256"],
-                   "durations_ns": {k: str(v) for k, v in sorted(d.items())},
-                   "evaluated_ns": str(evaluated),
-                   "gross_positive_ns": str(d.get("net_positive_ns", 0) + d.get("net_nonpositive_ns", 0)
-                                            + d.get("fee_unknown_ns", 0)),
-                   "net_assessed_ns": str(d.get("net_positive_ns", 0) + d.get("net_nonpositive_ns", 0)),
-                   "episode_count": g.episode_count, "slice_count": g.slice_count,
-                   "q_ns": {k: str(v) for k, v in g.q["net"].items()},
-                   "gross_q_ns": {k: str(v) for k, v in g.q["gross"].items()},
-                   "episode_lifetime_quantiles_ns": {kind: aggregates.quantiles(g.episode_values[kind])
-                                                     for kind in ("gross", "net")},
-                   "slice_survival_quantiles_ns": {kind: aggregates.quantiles(g.slice_values[kind])
-                                                   for kind in ("gross", "net")},
-                   "censored_episodes": g.censored_episodes, "censored_slices": g.censored_slices}
-            if v2:
-                row["control"] = control
-                unknown = g.qualifying["gross"][latency].get("FEE_UNKNOWN", 0)
-                row["fee_unknown_in_qualifying_gross_slices_ns"] = str(unknown)
-                if control is None and size == headline:
-                    qualifying_unknown[venue] = qualifying_unknown.get(venue, 0) + unknown
-            else:
-                row["placebo"] = control
-            rows.append(row)
+            rows.append({
+                "venue": venue, "basket_kind": bkind, "direction": direction, "size_contracts": size,
+                "placebo": placebo, "skew_bucket": skew, "policy_sha256": manifest["policy_sha256"],
+                "durations_ns": {k: str(v) for k, v in sorted(d.items())},
+                "evaluated_ns": str(sum(d.get(k, 0) for k in _EVALUATED_LABELS)),
+                "gross_positive_ns": str(d.get("net_positive_ns", 0) + d.get("net_nonpositive_ns", 0)
+                                         + d.get("fee_unknown_ns", 0)),
+                "net_assessed_ns": str(d.get("net_positive_ns", 0) + d.get("net_nonpositive_ns", 0)),
+                "episode_count": g.episode_count, "slice_count": g.slice_count,
+                "q_ns": {k: str(v) for k, v in g.q["net"].items()},
+                "gross_q_ns": {k: str(v) for k, v in g.q["gross"].items()},
+                "episode_lifetime_quantiles_ns": {kind: aggregates.quantiles(g.episode_values[kind])
+                                                  for kind in ("gross", "net")},
+                "slice_survival_quantiles_ns": {kind: aggregates.quantiles(g.slice_values[kind])
+                                                for kind in ("gross", "net")},
+                "censored_episodes": g.censored_episodes, "censored_slices": g.censored_slices})
         verdicts = []
         venues = sorted({e.descriptor["venue"] for e in aggregates.entities.values()} - {"limitless"})
         for venue in venues:
             relevant = [r for r in rows if r["venue"] == venue and r["size_contracts"] == headline
-                        and not r.get("placebo") and r.get("control") is None]
-            E = sum(sum(int(v) for k, v in r["durations_ns"].items()
-                        if k in {"gross_nonpositive_ns", "net_positive_ns", "net_nonpositive_ns", "fee_unknown_ns"})
+                        and not r["placebo"]]
+            E = sum(sum(int(v) for k, v in r["durations_ns"].items() if k in _EVALUATED_LABELS)
                     for r in relevant)
             Q = sum(int(r["q_ns"][latency]) for r in relevant)
-            total_unknown = sum(int(r["durations_ns"].get("fee_unknown_ns", "0")) for r in relevant)
-            # V2 counts only unknown-fee time inside gross slices long enough to
-            # qualify at the headline latency (SDK spec §11.2).
-            X = qualifying_unknown.get(venue, 0) if v2 else total_unknown
-            if E < int(policy["verdict"]["minimum_evaluated_ns"]):
-                verdict, reason = "INCONCLUSIVE_FIXTURE", "INSUFFICIENT_EVALUATED_TIME"
-            elif Q * 1_000_000 > int(policy["verdict"]["maximum_positive_time_fraction_ppm"]) * E:
-                verdict, reason = "INTRA_INSTRUMENT_GAPS_PRESENT_INVESTIGATE", None
-            elif X:
-                verdict, reason = "INCONCLUSIVE_FIXTURE", "UNRESOLVED_POSITIVE_GROSS"
-            else:
-                verdict, reason = "INTRA_INSTRUMENT_GAPS_ABSENT_IN_FIXTURE", None
-            row = {"venue": venue, "verdict": verdict, "reason": reason, "evaluated_ns": str(E),
-                   "qualified_ns": str(Q), "fee_unknown_ns": str(X),
-                   "basis": "PINNED_FEE_MODEL_AND_DISPLAYED_DEPTH_POLICY"}
-            if v2:
-                row["fee_unknown_total_ns"] = str(total_unknown)
-                row["labels"] = ["SKEW_ARTIFACT_LIKELY"] if _skew_artifact(relevant, policy) else []
-            verdicts.append(row)
+            X = sum(int(r["durations_ns"].get("fee_unknown_ns", "0")) for r in relevant)
+            verdicts.append(_verdict(policy, venue, E, Q, X))
         exclusions = sorted({(e.descriptor["venue"], e.descriptor["market_id"], e.descriptor["admission"])
                              for e in aggregates.entities.values() if e.descriptor["admission"] is not None})
-        summary = {"version": manifest["version"], "snapshot_sha256": manifest["snapshot_sha256"],
+        summary = {"version": 1, "snapshot_sha256": manifest["snapshot_sha256"],
                    "policy_sha256": manifest["policy_sha256"],
                    "experiment_sha256": manifest["experiment_sha256"],
                    "instantaneous_positive": manifest["instantaneous_positive"], "rows": rows,
                    "verdicts": verdicts,
                    "member_exclusions": [{"venue": v, "market_id": m, "status": s} for v, m, s in exclusions],
                    "history_complete": snapshot["history_complete"], "vendor_completeness": "NOT_PROVEN",
-                   "qualifiers": ["DETECTED_NOT_EXECUTED", "RETROSPECTIVE_DISPLAYED_DEPTH_SURVIVAL",
-                                  "PINNED_FEE_ESTIMATE", "NOT_RESOLUTION_PROOF"]}
+                   "qualifiers": QUALIFIERS}
+        require(len(encoded(summary)) <= MAX_METADATA, "summary budget")
+        require(aggregates.budget.used + len(encoded(summary)) <= MAX_STATE, "reader state budget")
+        return summary
+
+    def summarize_aggregate(self, aggregates, manifest, snapshot):
+        """Policy 2 (layout 2) summary from denominators and episodes.
+
+        Rows are per (venue, basket kind, direction, size), with no skew
+        dimension; skew appears only as attributed positive time. Controls get
+        their own summaries and never feed a verdict.
+        """
+        policy = self.policy
+        headline, latency = policy["headline_size_contracts"], policy["headline_latency_ns"]
+        rows = _aggregate_rows(aggregates, aggregates.groups[""], latency)
+        verdicts = []
+        venues = sorted({e.descriptor["venue"] for e in aggregates.entities[""].values()} - {"limitless"})
+        for venue in venues:
+            relevant = [r for r in rows if r["venue"] == venue and r["size_contracts"] == headline]
+            E = sum(int(r["evaluated_ns"]) for r in relevant)
+            Q = sum(int(r["q_ns"][latency]) for r in relevant)
+            # Only unknown-fee time inside gross slices that reach the headline
+            # latency can hide a qualifying opportunity.
+            X = sum(int(r["fee_unknown_in_qualifying_gross_slices_ns"]) for r in relevant)
+            row = _verdict(policy, venue, E, Q, X)
+            row["fee_unknown_total_ns"] = str(sum(int(r["class_ns"].get("FEE_UNKNOWN", "0"))
+                                                  for r in relevant))
+            positive = {}
+            for r in relevant:
+                for b, v in r["gross_slice_ns_by_skew"].items():
+                    positive[b] = positive.get(b, 0) + int(v)
+            row["labels"] = ["SKEW_ARTIFACT_LIKELY"] if _skew_artifact(positive, policy) else []
+            verdicts.append(row)
+        exclusions = sorted({(e.descriptor["venue"], e.descriptor["market_id"], e.descriptor["admission"])
+                             for e in aggregates.entities[""].values() if e.descriptor["admission"] is not None})
+        summary = {"version": 2, "snapshot_sha256": manifest["snapshot_sha256"],
+                   "policy_sha256": manifest["policy_sha256"],
+                   "experiment_sha256": manifest["experiment_sha256"],
+                   "instantaneous_positive": manifest["instantaneous_positive"],
+                   "reasons": aggregates.reasons, "rows": rows, "verdicts": verdicts,
+                   "member_exclusions": [{"venue": v, "market_id": m, "status": s} for v, m, s in exclusions],
+                   "history_complete": snapshot["history_complete"], "vendor_completeness": "NOT_PROVEN",
+                   "qualifiers": QUALIFIERS}
+        controls = {}
+        for group, facts in sorted(aggregates.groups.items()):
+            if group:
+                name = group.split("/")[1]
+                controls[name] = {"control": name, "experiment_sha256": manifest["experiment_sha256"],
+                                  "rows": _aggregate_rows(aggregates, facts, latency)}
+        if controls:
+            summary["controls"] = controls
         if self.experiment.profile is not None:
             summary["profile"] = self.profile_summary
         require(len(encoded(summary)) <= MAX_METADATA, "summary budget")
@@ -277,22 +297,61 @@ class ComplementReader(Strategy):
         return summary
 
 
-def _label_order(label):
-    # V1 sorts the placebo flag; V2 sorts real (None) before named controls.
-    return (0, label) if type(label) is bool else (0, "") if label is None else (1, label)
+_EVALUATED_LABELS = ("gross_nonpositive_ns", "net_positive_ns", "net_nonpositive_ns", "fee_unknown_ns")
+QUALIFIERS = ["DETECTED_NOT_EXECUTED", "RETROSPECTIVE_DISPLAYED_DEPTH_SURVIVAL",
+              "PINNED_FEE_ESTIMATE", "NOT_RESOLUTION_PROOF"]
 
 
-def _skew_artifact(rows, policy):
-    """Positive time exists and lies entirely in buckets whose lower edge is >= 1 s."""
+def _verdict(policy, venue, E, Q, X):
+    if E < int(policy["verdict"]["minimum_evaluated_ns"]):
+        verdict, reason = "INCONCLUSIVE_FIXTURE", "INSUFFICIENT_EVALUATED_TIME"
+    elif Q * 1_000_000 > int(policy["verdict"]["maximum_positive_time_fraction_ppm"]) * E:
+        verdict, reason = "INTRA_INSTRUMENT_GAPS_PRESENT_INVESTIGATE", None
+    elif X:
+        verdict, reason = "INCONCLUSIVE_FIXTURE", "UNRESOLVED_POSITIVE_GROSS"
+    else:
+        verdict, reason = "INTRA_INSTRUMENT_GAPS_ABSENT_IN_FIXTURE", None
+    return {"venue": venue, "verdict": verdict, "reason": reason, "evaluated_ns": str(E),
+            "qualified_ns": str(Q), "fee_unknown_ns": str(X),
+            "basis": "PINNED_FEE_MODEL_AND_DISPLAYED_DEPTH_POLICY"}
+
+
+def _aggregate_rows(aggregates, facts, latency):
+    rows = []
+    for key, g in sorted(facts.items(), key=lambda x: (x[0][0], x[0][1], x[0][2], int(x[0][3]))):
+        venue, bkind, direction, size, _ = key
+        c = g.class_ns
+        row = {"venue": venue, "basket_kind": bkind, "direction": direction, "size_contracts": size,
+               "status_ns": {k: str(v) for k, v in sorted(g.status_ns.items())},
+               "class_ns": {k: str(v) for k, v in sorted(c.items())},
+               "evaluated_ns": str(g.status_ns.get("DEPTH_SUFFICIENT", 0)),
+               "gross_positive_ns": str(sum(c.get(k, 0) for k in ("NET_POSITIVE", "NET_NONPOSITIVE",
+                                                                  "FEE_UNKNOWN"))),
+               "net_assessed_ns": str(c.get("NET_POSITIVE", 0) + c.get("NET_NONPOSITIVE", 0))}
+        if g.episodes:
+            row |= {
+                "episode_count": g.episode_count, "slice_count": g.slice_count,
+                "q_ns": {t: str(v) for t, v in g.q["net"].items()},
+                "gross_q_ns": {t: str(v) for t, v in g.q["gross"].items()},
+                "q_by_skew_ns": {kind: {t: {b: str(v) for b, v in sorted(m.items())}
+                                        for t, m in g.q_by_skew[kind].items()} for kind in ("gross", "net")},
+                "episode_lifetime_quantiles_ns": {kind: aggregates.quantiles(g.lifetimes[kind])
+                                                  for kind in ("gross", "net")},
+                "slice_survival_quantiles_ns": {kind: aggregates.quantiles(g.survival[kind])
+                                                for kind in ("gross", "net")},
+                "censored_episodes": g.censored_episodes, "censored_slices": g.censored_slices,
+                "fee_unknown_in_qualifying_gross_slices_ns":
+                    str(g.qualifying["gross"][latency].get("FEE_UNKNOWN", 0)),
+                "gross_slice_ns_by_skew": {b: str(v) for b, v in sorted(g.slice_ns_by_skew["gross"].items())}}
+        rows.append(row)
+    return rows
+
+
+def _skew_artifact(positive, policy):
+    """Positive time exists and lies entirely in skew buckets whose lower edge is >= 1 s."""
     edges = [0] + [int(e) for e in policy["leg_skew_buckets_ns"]]
-    positive = {}
-    for row in rows:
-        amount = int(row["gross_positive_ns"])
-        if amount:
-            positive[row["skew_bucket"]] = positive.get(row["skew_bucket"], 0) + amount
-    if not positive or "unknown" in positive:
-        return False
-    return all(edges[int(b)] >= SKEW_ARTIFACT_EDGE_NS for b in positive)
+    positive = {b: v for b, v in positive.items() if v}
+    return bool(positive) and all(edges[int(b)] >= SKEW_ARTIFACT_EDGE_NS for b in positive)
 
 
 def validate_content(directory, snapshot, manifest):
@@ -305,7 +364,9 @@ def validate_content(directory, snapshot, manifest):
                                                     strategy.experiment.profile,
                                                     manifest["experiment_sha256"],
                                                     manifest["snapshot_sha256"])
-    return reader.validate(directory, snapshot, manifest, strategy)
+    if strategy.experiment.layout == 1:
+        return reader.validate(directory, snapshot, manifest, strategy)
+    return aggregate_reader.validate(directory, snapshot, manifest, strategy)
 
 
 def read_provisional(directory, snapshot_directory, *, expected_sha256):
