@@ -28,7 +28,7 @@ from pathlib import Path
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.output import aggregate_files, file_list, group_of
-from replay.economic_sdk.reader import Budget, check_files, lines, quantiles, signed
+from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
@@ -50,9 +50,7 @@ def _ns_map(value, allowed):
 
 
 def _table(root, name, files):
-    rows = list(lines(root, name, files[name]))
-    require(len(rows) == 1, "table is one record")
-    return rows[0]
+    return document(root, name, files[name])
 
 
 class GroupFacts:

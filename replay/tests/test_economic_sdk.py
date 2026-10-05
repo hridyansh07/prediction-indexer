@@ -497,5 +497,41 @@ class ProfilingHarnessTests(unittest.TestCase):
             self.assertEqual(hashes, golden["single_known_slices"])
 
 
+class TableSizeTests(unittest.TestCase):
+    """Entity/reason tables are one record; real bundles exceed the 64 KiB line cap."""
+
+    def _roundtrip(self, value):
+        from types import SimpleNamespace
+        from replay.economic_sdk.aggregate_reader import _table
+        from replay.economic_sdk.runtime import Runtime
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = Runtime._write_table(SimpleNamespace(root=root), "entities.json", value)
+            return identity, _table(root, "entities.json", {"entities.json": identity})
+
+    def test_table_larger_than_line_cap_round_trips(self):
+        # 1,500 entities with ~600-byte descriptors: about 0.9 MB, as on the bench bundle.
+        scopes = [[{"hash": f"{i:064x}", "descriptor": {"legs": ["x" * 600], "index": i}}
+                   for i in range(1500)]]
+        identity, table = self._roundtrip({"scopes": scopes})
+        self.assertGreater(identity["byte_length"], bounds.MAX_LINE)
+        self.assertEqual(table, {"scopes": scopes})
+
+    def test_table_identity_and_bound_still_fail_closed(self):
+        from types import SimpleNamespace
+        from replay.economic_sdk.aggregate_reader import _table
+        from replay.economic_sdk.runtime import Runtime
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = Runtime._write_table(SimpleNamespace(root=root), "reasons.json", {"reasons": ["a"]})
+            with self.assertRaisesRegex(ProtocolError, "file identity"):
+                _table(root, "reasons.json", {"reasons.json": {**identity, "sha256": "0" * 64}})
+            (root / "big.json").write_bytes(b"{" + b" " * bounds.MAX_METADATA + b"}\n")
+            with self.assertRaisesRegex(ProtocolError, "table/size|line/truncation"):
+                _table(root, "big.json", {"big.json": {"sha256": "0" * 64,
+                                                       "byte_length": bounds.MAX_METADATA + 3,
+                                                       "records": 1}})
+
+
 if __name__ == "__main__":
     unittest.main()

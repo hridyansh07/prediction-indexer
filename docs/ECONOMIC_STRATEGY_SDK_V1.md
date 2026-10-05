@@ -473,6 +473,42 @@ Recursive size accounting is replaced by **count-based bounds**.
 - complement policy 2 default output is under 5 MB;
 - control output with `time_shift` aggregates is under 5 MB.
 
+**Measured on the bench corpus** (bundle `bundle_e8a92effa246b9548571c907`, 2,008,580
+stream entries). Each run is one supervisor attempt beside `bundle_coverage`, on the
+commit that reads entity and reason tables as bounded single-record documents. The
+table reader previously failed every layout-2 attempt at finish, because
+`entities.json` (867,761 bytes) exceeded the 64 KiB row cap. In every run, coverage
+reproduced semantic `87cb094d…` and intervals `41be6ad8…`.
+
+| Run (beside coverage) | Attempt s | Group output | Semantic SHA | Requirement |
+|---|---|---|---|---|
+| Coverage alone (reference) | 55.2 | — | `87cb094d…` | — |
+| Complement policy 1 compat | 156.8 | 372.7 MB (audit layout) | `2d85b833…`, identical to V1 | byte-identical ✔ |
+| Complement policy 2 default | 65.7 | 1.08 MB (`entities.json` 0.87 MB, denominators 0.18 MB, no episodes) | `e4281dc4…` | ≤ 81.2 s ✔, < 5 MB ✔ |
+| Complement policy 2 + `time_shift` (1 s, 5 s) | 120.0 | 3.53 MB total, of which controls 2.42 MB | `51a69b90…` | completes ✔, controls < 5 MB ✔, ≤ 81.2 s ✘ |
+| Market profile | 54.7 | 7.49 MB | `6ffead22…` | ≤ 81.2 s ✔ |
+
+Policy 2 results on this fixture:
+
+- both venues `INTRA_INSTRUMENT_GAPS_ABSENT_IN_FIXTURE`;
+- Polymarket `SELF_CROSSED_LEG` time 8,033,078 ns at sizes 1 and 100, equal to V1's
+  nine real crossings;
+- Kalshi time only `GROSS_NONPOSITIVE`.
+
+The profiled runs took 151.5 s (complement policy 2, 98.8 s profiled) and 105.4 s
+(market profile, 51.1 s profiled). Top cumulative costs:
+
+- **Complement:**
+  - `_select` 29.0 s;
+  - `views.build` 20.8 s;
+  - `_evaluate` 20.6 s (1.25 M calls);
+  - `_fingerprint` 11.8 s (8.92 M calls);
+  - `walk` 8.5 s.
+- **Market profile:**
+  - `profile.cut` 30.8 s;
+  - `_side` 15.1 s;
+  - `walk` 8.6 s.
+
 **Measures, by cost centre** (corpus profile of 80aa64c):
 
 | Cost centre | Cumulative s | Measure |
