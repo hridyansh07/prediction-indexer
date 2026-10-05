@@ -738,6 +738,11 @@ Policy 2 semantics:
 
 ## 12. Open items
 
+Outcome masks are available through `outcome_scope` and context.json version 2;
+see [OUTCOME_MASKS_V1.md](OUTCOME_MASKS_V1.md). Mask-dependent strategy manifests
+must record `settlement_model: "normal_resolution_only"` and the outcomes provider.
+Structural strategies remain a separate implementation.
+
 - **Profile production values.** The bucket width and histogram edges are still to
   be chosen. Both are part of the profile policy hash.
 - **Trade fields.** Confirm which venues fill `aggressor` in their normalized

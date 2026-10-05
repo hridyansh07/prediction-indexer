@@ -157,6 +157,14 @@ class UniverseHTTP:
             + "/selections/"
             + quote(bundle_id, safe="")
         )
+        return self._get(url)
+
+    def outcomes(self, bundle_id):
+        return self._get(
+            self.base_url + "/v1/bundles/" + quote(bundle_id, safe="") + "/outcomes"
+        )
+
+    def _get(self, url):
         deadline = time.monotonic() + self.timeout
         try:
             with build_opener(ProxyHandler({}), _NoRedirect()).open(
@@ -375,8 +383,13 @@ def resolve_scope(config, occurrence, detail):
     }
 
 
-def build_snapshot(config, evidence):
+def build_snapshot(config, evidence, outcomes=None):
+    # None preserves the exact legacy v1 reconstruction used by old receipts.
+    from replay.outcome_model import outcome_books, validate_outcomes
+
     validate_config(config)
+    if outcomes is not None:
+        validate_outcomes(outcomes, config["bundle_id"])
     array(evidence)
     require(len(encoded(evidence)) <= MAX_BYTES, "evidence byte budget")
     require(len(evidence) == len(config["occurrences"]))
@@ -392,7 +405,10 @@ def build_snapshot(config, evidence):
             "occurrence evidence changed",
         )
         seen[detail["run_id"]] = identity
-        scopes.append(resolve_scope(config, occurrence, detail))
+        scope = resolve_scope(config, occurrence, detail)
+        if outcomes is not None:
+            scope["outcome_books"] = outcome_books(scope, detail, outcomes)
+        scopes.append(scope)
     required = {key(b) for s in scopes for b in s["required_books"]}
     require(len(required) <= MAX_BOOKS, "book plan budget")
     authorities = {p["venue"]: p for p in config["authorities"]}
@@ -404,7 +420,7 @@ def build_snapshot(config, evidence):
             {"instrument": instrument, "orientation": orientation, **authorities[venue]}
         )
     snapshot = {
-        "version": 1,
+        "version": 1 if outcomes is None else 2,
         "config": config,
         "evidence": evidence,
         "scopes": scopes,
@@ -412,6 +428,8 @@ def build_snapshot(config, evidence):
         "membership_basis": "caller_pinned_expectations",
         "history_complete": False,
     }
+    if outcomes is not None:
+        snapshot["outcomes"] = outcomes
     require(len(encoded(snapshot)) <= MAX_BYTES, "context snapshot too large")
     require(
         len((json.dumps(snapshot, sort_keys=True, allow_nan=False) + "\n").encode())
@@ -444,13 +462,19 @@ def load_snapshot(directory, *, expected_sha256=None):
     if expected_sha256 is not None:
         require(receipt["snapshot_sha256"] == expected_sha256, "snapshot pin mismatch")
     snapshot = decode(payload, MAX_BYTES)
+    require(type(snapshot.get("version")) is int and snapshot["version"] in (1, 2))
     obj(
         snapshot,
-        "version config evidence scopes plans membership_basis history_complete",
+        "version config evidence scopes plans membership_basis history_complete"
+        + (" outcomes" if snapshot["version"] == 2 else ""),
     )
     require(
         encoded(snapshot)
-        == encoded(build_snapshot(snapshot["config"], snapshot["evidence"])),
+        == encoded(
+            build_snapshot(
+                snapshot["config"], snapshot["evidence"], snapshot.get("outcomes")
+            )
+        ),
         "resolved snapshot conflict",
     )
     require(
@@ -460,7 +484,7 @@ def load_snapshot(directory, *, expected_sha256=None):
     return freeze(snapshot)
 
 
-def prepare(config, directory, *, universe, fallback=None):
+def prepare(config, directory, *, universe, fallback=None, outcomes=None):
     """Commit once, or load the exact previous result without any source lookup.
 
     Sources accept (occurrence, bundle_id), returning selection-detail or None.
@@ -503,7 +527,26 @@ def prepare(config, directory, *, universe, fallback=None):
             validate_detail(detail, occurrence, config["bundle_id"])
             evidence.append({"provider": provider, "detail": detail})
             require(len(encoded(evidence)) <= MAX_BYTES, "evidence byte budget")
-        snapshot = build_snapshot(config, evidence)
+        from replay.outcome_model import UNAVAILABLE
+
+        source = (
+            outcomes if outcomes is not None else getattr(universe, "outcomes", None)
+        )
+        document = None
+        if source is not None:
+            try:
+                document = source(config["bundle_id"])
+            except SourceUnavailable:
+                pass
+        recorded_outcomes = (
+            dict(UNAVAILABLE)
+            if document is None
+            else {
+                "provider": "universe",
+                "document": decode(encoded(document), MAX_BYTES),
+            }
+        )
+        snapshot = build_snapshot(config, evidence, recorded_outcomes)
         write_json_durable(root / "context.json", snapshot)
         payload = (root / "context.json").read_bytes()
         require(len(payload) <= MAX_BYTES, "serialized snapshot too large")

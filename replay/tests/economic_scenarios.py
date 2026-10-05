@@ -8,6 +8,7 @@ byte of V1 output fails.
 
 import hashlib
 from unittest.mock import patch
+from contextlib import nullcontext
 
 from replay.tests.test_same_venue_complement import Harness, paired_detail
 
@@ -119,7 +120,7 @@ FILES = ("measurements.ndjson", "episodes.ndjson", "placebo_episodes.ndjson",
          "slices.ndjson", "summary.json", "manifest.json")
 
 
-def run(name, root, *, policy=None, files=FILES):
+def run(name, root, *, policy=None, files=FILES, legacy_snapshot=False):
     kwargs, drive = SCENARIOS[name]
     kwargs = dict(kwargs)
     detail = None
@@ -128,11 +129,17 @@ def run(name, root, *, policy=None, files=FILES):
         detail = limitless_detail
     if policy is not None:
         kwargs["policy"] = policy
-    if detail is None:
-        h = Harness(root, **kwargs)
-    else:
-        with patch("replay.tests.test_same_venue_complement.paired_detail", side_effect=detail):
+    # Frozen pre-SDK goldens bind context v1. Exercise the legacy loader with
+    # those bytes; current preparation tests separately exercise context v2.
+    from replay.preparation import build_snapshot
+    legacy = patch("replay.preparation.build_snapshot",
+                   side_effect=lambda config, evidence, outcomes=None: build_snapshot(config, evidence))
+    with legacy if legacy_snapshot else nullcontext():
+        if detail is None:
             h = Harness(root, **kwargs)
+        else:
+            with patch("replay.tests.test_same_venue_complement.paired_detail", side_effect=detail):
+                h = Harness(root, **kwargs)
     drive(h)
     h.finish()
     return h, {f: hashlib.sha256((h.output / f).read_bytes()).hexdigest()

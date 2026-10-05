@@ -55,6 +55,8 @@ the authority: prefix listings are not accepted as commit evidence. Each read
 freshly verifies the receipted remote manifest and selected object, fully stages
 and verifies the decoded logical identity, and only then yields bytes.
 
+`replay.economic_sdk.outcomes.outcome_scope` exposes frozen normal-resolution masks, payoffs, implications, and exhaustive complete sets during basket construction; see [OUTCOME_MASKS_V1.md](../docs/OUTCOME_MASKS_V1.md).
+
 ## Ordered exit gates
 
 Work advances only after the preceding gate is demonstrated against real venue
