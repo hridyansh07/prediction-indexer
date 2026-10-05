@@ -20,7 +20,7 @@ class ComplementV1PortTests(unittest.TestCase):
         self.assertEqual(set(GOLDEN), set(economic_scenarios.SCENARIOS))
         for name in economic_scenarios.SCENARIOS:
             with self.subTest(scenario=name), tempfile.TemporaryDirectory() as tmp:
-                _, hashes = economic_scenarios.run(name, Path(tmp))
+                _, hashes = economic_scenarios.run(name, Path(tmp), legacy_snapshot=True)
                 self.assertEqual(hashes, GOLDEN[name])
 
     def test_retries_reproduce_semantics_with_distinct_receipts(self):

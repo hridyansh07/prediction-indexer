@@ -403,36 +403,48 @@ def _spaces(bundle: EventBundle) -> tuple[tuple[OutcomeSpace, ...], tuple[str, .
     return tuple(spaces), tuple(diagnostics)
 
 
+def market_scope_masks(
+    bundle: EventBundle,
+    space: OutcomeSpace,
+    excluded: frozenset[str] = frozenset(),
+) -> list[tuple[CanonicalMarket, tuple[Mask, ...], str | None]]:
+    """Compile per-market results, sharing selection's exact mask path.
+
+    Scope misses and esports rejection codes remain visible to semantic readers.
+    Exclusions are selection policy; readers can deliberately pass none.
+    """
+    results = []
+    for market in bundle.markets:
+        if market.target_id in excluded:
+            continue
+        applicable = market.scope == space.scope or (
+            bool(bundle.game)
+            and space.scope == SCOPE_SERIES
+            and market.market_type in {"map_winner", "total_maps", "map_handicap"}
+        )
+        if not applicable:
+            results.append((market, (), "DIFFERENT_SCOPE"))
+        elif bundle.game:
+            masks, reason = validate_esports_market(bundle, market, space)
+            results.append((market, masks, reason))
+        else:
+            masks = tuple(
+                compile_mask(view, space) for view in _market_views(bundle, market)
+            )
+            results.append((market, masks, None))
+    return results
+
+
 def _scope_masks(
     bundle: EventBundle,
     space: OutcomeSpace,
     excluded: frozenset[str],
 ) -> list[Mask]:
-    """Every mask this bundle contributes to one outcome space.
-
-    Extracted so relationship derivation and claim derivation compile masks
-    through exactly one code path; the two must never drift.
-    """
+    """Every mask contributed to one space, in the original market/view order."""
     return [
         mask
-        for market in bundle.markets
-        if market.target_id not in excluded
-        and (
-            market.scope == space.scope
-            or (
-                space.scope == SCOPE_SERIES
-                and market.market_type
-                in {"map_winner", "total_maps", "map_handicap"}
-            )
-        )
-        for mask in validate_esports_market(bundle, market, space)[0]
-        if bundle.game
-    ] + [
-        compile_mask(view, space)
-        for market in bundle.markets
-        if not bundle.game and market.target_id not in excluded
-        and market.scope == space.scope
-        for view in _market_views(bundle, market)
+        for _market, masks, _reason in market_scope_masks(bundle, space, excluded)
+        for mask in masks
     ]
 
 

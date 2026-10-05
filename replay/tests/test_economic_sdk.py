@@ -581,7 +581,7 @@ class ProfilingHarnessTests(unittest.TestCase):
             dumps = Path(tmp) / "profile"
             with patch("replay.tests.test_same_venue_complement.build",
                        side_effect=profiled(build, dumps, every=5)):
-                _, hashes = economic_scenarios.run("single_known_slices", Path(tmp) / "run")
+                _, hashes = economic_scenarios.run("single_known_slices", Path(tmp) / "run", legacy_snapshot=True)
             self.assertTrue((dumps / "callbacks.prof").is_file())
             self.assertEqual(hashes, golden["single_known_slices"])
 

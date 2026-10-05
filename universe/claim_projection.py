@@ -110,8 +110,11 @@ def project_claims(
     implied: set[tuple[str, str, str]] = set()
 
     for event_id in sorted(events):
-        bundle = _bundle(events[event_id], venue_events.get(event_id, ()),
-                         venue_markets.get(event_id, ()))
+        bundle = rebuild_bundle(
+            events[event_id],
+            venue_events.get(event_id, ()),
+            venue_markets.get(event_id, ()),
+        )
         if bundle is None:
             # A bundle that cannot be rebuilt contributes no claims. Counting it
             # keeps that visible; silently skipping would make missing evidence
@@ -230,7 +233,7 @@ def _split(market_key: str) -> tuple[str, str, str]:
     return venue, native, claim if marker else ""
 
 
-def _bundle(
+def rebuild_bundle(
     event: Mapping[str, Any],
     venue_events: Sequence[Mapping[str, Any]],
     venue_markets: Sequence[Mapping[str, Any]],

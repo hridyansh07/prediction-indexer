@@ -271,7 +271,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_fallback_only_for_absence_or_unavailability(self):
         for i, universe in enumerate(
-            (Mock(return_value=None), Mock(side_effect=SourceUnavailable()))
+            (Mock(spec=(), return_value=None), Mock(spec=(), side_effect=SourceUnavailable()))
         ):
             fallback = Mock(return_value=detail())
             snapshot = prepare(
@@ -295,7 +295,7 @@ class PreparationTests(unittest.TestCase):
                 prepare(
                     config(),
                     self.root / f"invalid-{i}",
-                    universe=Mock(return_value=d),
+                    universe=Mock(spec=(), return_value=d),
                     fallback=fallback,
                 )
             fallback.assert_not_called()
@@ -305,7 +305,7 @@ class PreparationTests(unittest.TestCase):
             d = detail()
             d["context"]["targets"][1]["subscription_ids"] = subscriptions
             with self.assertRaises((ProtocolError, EvidenceConflict)):
-                prepare(config(), self.root / str(i), universe=Mock(return_value=d))
+                prepare(config(), self.root / str(i), universe=Mock(spec=(), return_value=d))
         c = config()
         c["authorities"] = [c["authorities"][0]]
         with self.assertRaisesRegex(ProtocolError, "source authority"):
@@ -335,7 +335,7 @@ class PreparationTests(unittest.TestCase):
         ]
         # Same pinned identity may not return changed historical context.
         with self.assertRaisesRegex(ProtocolError, "occurrence evidence changed"):
-            prepare(c, self.root / "conflict", universe=Mock(side_effect=[d, later]))
+            prepare(c, self.root / "conflict", universe=Mock(spec=(), side_effect=[d, later]))
         snapshot = prepare(c, self.root / "valid", universe=lambda *_: d)
         self.assertEqual(
             [(s["start_ns"], s["end_ns"]) for s in snapshot["scopes"]],
@@ -348,7 +348,7 @@ class PreparationTests(unittest.TestCase):
         later["origin"] = {**later["source"], "run_id": R2, "generated_at": G2}
         changed_config["occurrences"][1].update(run_id=R2, source=later["source"])
         changed = prepare(
-            changed_config, self.root / "changed", universe=Mock(side_effect=[d, later])
+            changed_config, self.root / "changed", universe=Mock(spec=(), side_effect=[d, later])
         )
         self.assertEqual(
             changed["scopes"][0]["unresolved_market_ids"], ("polymarket:map-one",)
