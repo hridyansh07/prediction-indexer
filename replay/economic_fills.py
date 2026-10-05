@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 
 
@@ -13,29 +12,6 @@ class Fill:
     depth_limited: bool
     taken: tuple[tuple[int, int], ...]
     consumed: tuple[tuple[int, int], ...]
-
-
-def retained_size(fill: Fill) -> int:
-    """Return a conservative shallow-graph size for one detached fill.
-
-    Fill's schema is closed, so this avoids the much more expensive generic
-    object traversal used by the strategy's retained-state accounting. Scalar
-    objects are charged on every occurrence, which can only overcount sharing.
-    """
-    def pairs_size(values: tuple[tuple[int, int], ...]) -> int:
-        return sys.getsizeof(values) + sum(
-            sys.getsizeof(pair) + sys.getsizeof(pair[0]) + sys.getsizeof(pair[1])
-            for pair in values
-        )
-
-    return (
-        sys.getsizeof(fill)
-        + sys.getsizeof(fill.filled_atoms)
-        + sys.getsizeof(fill.cost)
-        + sys.getsizeof(fill.depth_limited)
-        + pairs_size(fill.taken)
-        + pairs_size(fill.consumed)
-    )
 
 
 def walk(
@@ -52,25 +28,31 @@ def walk(
         raise ValueError("positive integer sizes required")
     if sizes_atoms != tuple(sorted(set(sizes_atoms))):
         raise ValueError("sizes must be sorted and unique")
-    for level in levels:
+
+    # Only levels the walk touches can affect a fill, so only those are
+    # validated; deep books are not scanned past the largest size.
+    def level(index):
+        value = levels[index]
         if (
-            type(level) is not tuple
-            or len(level) != 2
-            or any(type(value) is not int for value in level)
-            or level[0] < 0
-            or level[1] <= 0
+            type(value) is not tuple
+            or len(value) != 2
+            or type(value[0]) is not int
+            or type(value[1]) is not int
+            or value[0] < 0
+            or value[1] <= 0
         ):
             raise ValueError("levels require nonnegative prices and positive quantities")
+        return value
 
     results: list[Fill] = []
     level_index = 0
-    remaining = levels[0][1] if levels else 0
+    remaining = level(0)[1] if levels else 0
     filled = cost = 0
     taken: list[tuple[int, int]] = []
     consumed: list[tuple[int, int]] = []
     for target in sizes_atoms:
         while filled < target and level_index < len(levels):
-            price, displayed = levels[level_index]
+            price, displayed = levels[level_index]  # validated on entry
             amount = min(remaining, target - filled)
             if remaining == displayed:
                 taken.append((price, amount))
@@ -84,7 +66,7 @@ def walk(
             if remaining == 0:
                 level_index += 1
                 if level_index < len(levels):
-                    remaining = levels[level_index][1]
+                    remaining = level(level_index)[1]
         results.append(
             Fill(
                 filled_atoms=min(filled, target),

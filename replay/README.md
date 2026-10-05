@@ -27,6 +27,24 @@ policy, not vendor completeness or opportunities. Its strict completed reader
 requires both content identity and supervisor success; see
 [`BUNDLE_COVERAGE_V1.md`](../docs/BUNDLE_COVERAGE_V1.md). No shared cache is included.
 
+Economic strategies build on `replay.economic_sdk`
+([`ECONOMIC_STRATEGY_SDK_V1.md`](../docs/ECONOMIC_STRATEGY_SDK_V1.md)). A strategy
+declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns:
+
+- time and same-time staging;
+- shared detached book views;
+- per-key denominators, episodes and slices;
+- controls;
+- bounded output;
+- the independent reader.
+
+`replay.same_venue_complement:build` is the first such strategy
+([`SAME_VENUE_COMPLEMENT_V1.md`](../docs/SAME_VENUE_COMPLEMENT_V1.md)).
+`replay.market_profile:build` writes per-book trading data points: state time,
+spread, depth and cost to fill, activity, quote survival, self-crossing, and pair
+consistency. It can run as its own group, or inside any SDK strategy that enables
+it.
+
 The package is included in the installed distribution, including the frozen
 terminal policy. Storage adapters provide bytes through `ByteStreamer`; none of
 the replay, trust, economics, or execution code changes.

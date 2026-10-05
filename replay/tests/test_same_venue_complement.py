@@ -12,7 +12,7 @@ from replay.fees.artifacts import build_catalog, source_from_bytes
 from replay.fees.domain import Asset, AssetAmount, AssetKind, Component, Fixed, InstrumentEconomics, Product, Venue, canonical
 from replay.fees.schedules import Catalog, Schedule, Scope, ZeroFee
 from replay.preparation import encoded, load_snapshot
-from replay.complement_contract import layouts
+from replay.complement_contract import baskets
 from replay.same_venue_complement import build
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_bundle_coverage import Harness as CoverageHarness
@@ -290,10 +290,9 @@ class EconomicRuntimeUnitTests(unittest.TestCase):
             {"instrument": "polymarket:a", "orientation": "outcome", "price_scale": "2", "quantity_scale": "0"},
             {"instrument": "polymarket:b", "orientation": "outcome", "price_scale": "3", "quantity_scale": "0"},
         ]
-        resolved = layouts({"plans": plans, "scopes": [{"members": members}]},
-                           {"sizes_contracts": ["1"]}, 0)
-        admissions = {d["market_id"]: d["admission"] for d in resolved.values()
-                      if not d["placebo"]}
+        resolved = baskets({"plans": plans, "scopes": [{"members": members}]},
+                           {"version": 1, "sizes_contracts": ["1"]}, 0)
+        admissions = {b.descriptor["market_id"]: b.admission for b in resolved}
         self.assertEqual(admissions, {
             "polymarket:uncaptured": "NOT_CAPTURED",
             "polymarket:shape": "UNSUPPORTED_SHAPE",

@@ -1,0 +1,58 @@
+{
+ "single_unknown": {
+  "measurements.ndjson": "c80981d959e8e505f57d87fac36358713188b05bb42557895f9c80d01611a99a",
+  "episodes.ndjson": "bf778467c32a7c928bcbbbf1069c6a7c53485c315e7428dae9b3981375debd0f",
+  "placebo_episodes.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "slices.ndjson": "4cb1dbfa15108021877458149361d7b5b992527f7a008259653df6609afcc817",
+  "summary.json": "6c150ddd4ec6b8e9b4bdf9f7cbf585bb6e7f2426243d6423b79a61d996cb7920",
+  "manifest.json": "ed62921fd67bfb2671cf7eaa75cd0076431aca49dc4fc3aa8d720268568033bb"
+ },
+ "single_known_slices": {
+  "measurements.ndjson": "315492aaeb19d54f0de36f5f6ccf85ba5eb89fbee45c6a219b14c07ec803ed1f",
+  "episodes.ndjson": "4bc45105ce984fa9c3707e235fa195d7b4c31f698e001ab4af23cd9c639f3429",
+  "placebo_episodes.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "slices.ndjson": "55c7440c148926a3b4ff8c249284cb074351365dbf87971256a0368d50a2befd",
+  "summary.json": "39b7fa07c812d5dfb0b2670ba9e0c9e363e531e3f19b66e98f56d1af6c7a5496",
+  "manifest.json": "089f2b4f1b82eb88864b10acfd24a82550976ccc53b78e8a958a7cce6b91faf4"
+ },
+ "pairs_rich_known": {
+  "measurements.ndjson": "df30c4271fb069e8bf0d7ddd1dfdddfa23f325589fcbb62bd6a0907b785386be",
+  "episodes.ndjson": "2a3850cb2add4fc727c99b238ac7f85032a527dd253ef35352aba355a5bfb0cc",
+  "placebo_episodes.ndjson": "06442a99c2f5e0f46b0eb272a8f3837b2f94089c73e2067f20b70af008019eeb",
+  "slices.ndjson": "2d41fd836d73ad1782f06f423ba4e8721345589a0ea93d9983a9cc45ef1407c7",
+  "summary.json": "07f334307aebf12e484230407259a007876cc2c005e23015c9ca2984cc681f76",
+  "manifest.json": "c9962c4556c54e016ece5bbe826a56d62d046f8403c8b5922c9805d5fa9a2466"
+ },
+ "pairs_rich_partial": {
+  "measurements.ndjson": "91b3cbb89fe57e003b0eceeea2434e9e5d9da587790b439346d607696e85a04f",
+  "episodes.ndjson": "a532ee236715badab3bff9b004ceb3b808bda7f540485d2952b914aed60b3182",
+  "placebo_episodes.ndjson": "24769faa879820805272a5608f04ccb69444b1ce7ab87db959afc8b92bab675c",
+  "slices.ndjson": "de8cd16d60577c3b9a8b7da2ca8a7e9adafb59217fc314a1594cdd1f33833aa3",
+  "summary.json": "46910ca95861bcb2b102994f95e3476daa348ff528c1ac0de95498bce36da643",
+  "manifest.json": "572814ec3d468cf109f970d9b7fd05a3fc85a9756b77206745dcca9e9832c00a"
+ },
+ "scopes_known": {
+  "measurements.ndjson": "89bcc4b206e750eb5e409921dca2457d21c38cc126cd7b30fde7d5ca487ee16e",
+  "episodes.ndjson": "fdcabc0ef36da6b74c8c85e0baa2dff92f482b15d26db307faec86fbe810ecd8",
+  "placebo_episodes.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "slices.ndjson": "245171c3cf6d83550b256906772bfa181841637604d8c7438d5a18a45d82b83d",
+  "summary.json": "6797d5986f1040fefaacc58f41c14b6aa09c5db4b234b7cca45d8eeb9e83678f",
+  "manifest.json": "51f8d45b5fb2768f76786310f8d028a1a74a96acc56b1533a1fff22ad49cac46"
+ },
+ "prologue": {
+  "measurements.ndjson": "344c3d9f83c54fefade138ac1b08b99674f90b9bbbc75da66c46ddce3060697d",
+  "episodes.ndjson": "12da1fc1566ace1c2511529cf861943886559d96588ed3e5fa47b42b53d2ecb3",
+  "placebo_episodes.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "slices.ndjson": "8dd6f1e8530e88e5e1df939a8eca983a8833008bf689763bbb141a41b5c9b78c",
+  "summary.json": "6eaae6fd0a02105e3b1af58b0e426973b83bea179cd9768cc1e5d4be997765ee",
+  "manifest.json": "6a5f6cb3cf0ebc0323a57b902f04a90bf1e2a60bc1318dfd377748465189ccfa"
+ },
+ "limitless": {
+  "measurements.ndjson": "9717f5a857d124292459c599bf422b1418a523f8b27b033b826e18ab4979c6c8",
+  "episodes.ndjson": "c049059df553ef4c50753c26f118e2c9fb1c596869dd9ff7fca8f41d4044b13f",
+  "placebo_episodes.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "slices.ndjson": "30fc93584c442b2750e229fd141fab04fcfd39f23affc87a9f0ebfd4d23185a2",
+  "summary.json": "e87e0dd334b8c445c47605172f1fae07438f0ed75f6a81c47df0a79b58a9ad42",
+  "manifest.json": "2123da3b7629eb77b174377227ca56cafcc9a902602d55a81f5271bd1aa4df92"
+ }
+}
