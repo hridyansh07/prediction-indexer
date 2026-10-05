@@ -116,6 +116,50 @@ class SharedViewTests(Base):
             self.assertGreater(evaluate.call_count, 0)
         h.finish()
 
+    def test_cached_positive_updates_skew_without_evaluation_or_slice_changes(self):
+        # A pure gross-only evaluator: no fee assessment or context-dependent identity.
+        def gross_only(entity, views, context):
+            if any(view.validity != "usable" for view in views):
+                return Observation("UNUSABLE", context_free=True)
+            size = int(entity.descriptor["size_contracts"])
+            side = "ask" if entity.descriptor["direction"] == "long" else "bid"
+            fills = tuple(view.fills[side][size] for view in views)
+            unit = size * 10**9  # harness price scale 3, quantity scale 6
+            cost = sum(fill.cost for fill in fills)
+            gross = unit - cost if side == "ask" else cost - unit
+            if gross <= 0:
+                return Observation(EVALUATED, value_class="GROSS_NONPOSITIVE", context_free=True)
+            payload = {"gap_gross": str(gross), "gap_net": None, "gross_scale": 9,
+                       "net_scale": 18, "fee_status": "UNKNOWN", "assessments": [[], []],
+                       "assumptions": [], "evidence": []}
+            return Observation(EVALUATED, value_class="FEE_UNKNOWN", predicates=frozenset({"gross"}),
+                               payload=payload, quotes=tuple(fill.consumed for fill in fills),
+                               context_free=True)
+
+        for restore in (False, True):
+            with self.subTest(same_time_restore=restore), tempfile.TemporaryDirectory() as tmp:
+                h = Harness(Path(tmp), policy=v2_policy())
+                with patch.object(h.strategy.strategy, "evaluate", side_effect=gross_only) as evaluate:
+                    h.window(); h.quote(12, 0); h.quote(12, 1); h.group(13)
+                    evaluate.reset_mock()
+                    operations(h, 20, "polymarket:987", "outcome", "bid", 100, M)
+                    if restore:
+                        operations(h, 20, "polymarket:123", "outcome", "bid", 100, M)
+                    h.group(21)
+                    self.assertEqual(evaluate.call_count, 0)
+                    h.finish()
+                index = entity_index(h, direction="long", size_contracts="1")
+                episode = next(e for e in rows(h, "episodes.ndjson") if e["entity"] == index)
+                self.assertEqual(episode["qualified_ns"], {"1": "27", "5": "23", "10": "18"})
+                expected = ({"1": {"0": "27"}, "5": {"0": "23"}, "10": {"0": "18"}}
+                            if restore else {"1": {"0": "8", "2": "19"},
+                                             "5": {"0": "8", "2": "15"},
+                                             "10": {"0": "8", "2": "10"}})
+                self.assertEqual(episode["qualified_by_skew_ns"], expected)
+                self.assertEqual(h.strategy.instantaneous, {})
+                self.assertEqual([(s["start_ns"], s["end_ns"]) for s in rows(h, "slices.ndjson")
+                                  if s["episode_id"] == episode["episode_id"]], [("12", "40")])
+
     def test_predicates_contradicting_the_class_map_are_rejected(self):
         h = self.harness()
         h.window()
@@ -364,6 +408,51 @@ class ControlTests(Base):
         real = entity_index(h, direction="long", size_contracts="1")
         real_episode = [e for e in rows(h, "episodes.ndjson") if e["entity"] == real][0]
         self.assertEqual(real_episode["open"]["leg_skew_ns"], "0")
+
+    def test_time_shift_control_updates_live_skew_before_the_shift_timer(self):
+        for consumed_change in (False, True):
+            with self.subTest(consumed_change=consumed_change), tempfile.TemporaryDirectory() as tmp:
+                h = Harness(Path(tmp), policy=v2_policy(
+                    controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                    controls_episodes=True, controls_slices=True))
+                for writer in h.strategy.writers.values():
+                    self.addCleanup(writer.stream.close)
+                h.window(); h.quote(12, 0); h.quote(12, 1); h.group(18)
+                entity = self.entity(h, direction="long", size_contracts="1",
+                                     control={"kind": "time_shift", "leg": 1, "shift_ns": "5"})
+                observation = h.strategy.current[entity.id][0]
+                evaluations = []
+                original = h.strategy.strategy.evaluate
+
+                def record(entity, views, context):
+                    evaluations.append((entity.id, context.time))
+                    return original(entity, views, context)
+
+                with patch.object(h.strategy.strategy, "evaluate", side_effect=record):
+                    if consumed_change:
+                        h.quote(20, 1, ask=700)
+                    else:
+                        operations(h, 20, "polymarket:987", "outcome", "bid", 100, M)
+                    h.group(21)
+                    self.assertEqual(h.strategy.current[entity.id][1], (8, 2))
+                    self.assertIs(h.strategy.current[entity.id][0], observation)
+                    self.assertNotIn((entity.id, 20), evaluations)
+                    h.finish()
+                group = "controls/time_shift_5/"
+                index = entity_index(h, group, direction="long", size_contracts="1")
+                episode = next(e for e in rows(h, group + "episodes.ndjson") if e["entity"] == index)
+                qualified = ({"1": "7", "5": "3", "10": "0"} if consumed_change
+                             else {"1": "22", "5": "18", "10": "13"})
+                skew = ({"1": {"0": "3", "2": "4"}, "5": {"0": "3"}, "10": {}}
+                        if consumed_change else {"1": {"0": "3", "2": "19"},
+                                                  "5": {"0": "3", "2": "15"},
+                                                  "10": {"0": "3", "2": "10"}})
+                self.assertEqual(episode["qualified_ns"], qualified)
+                self.assertEqual(episode["qualified_by_skew_ns"], skew)
+                # Consumed changes affect the control at 20 + 5, never at 20.
+                self.assertEqual([(s["start_ns"], s["end_ns"]) for s in rows(h, group + "slices.ndjson")
+                                  if s["episode_id"] == episode["episode_id"]],
+                                 [("17", "25" if consumed_change else "40")])
 
     def test_time_shift_history_without_a_staged_entity_keeps_its_exact_time(self):
         h = self.harness(policy=v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}]))

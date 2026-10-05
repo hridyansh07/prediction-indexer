@@ -253,23 +253,29 @@ class Runtime:
                         self.staged_books.add(key)
             if self.profile is not None:
                 self.profile.cut(cut, raw, time, changed)
+            skew_only = set()
             for key, sides in changed.items():
-                self._select(key, sides, time, affected)
+                self._select(key, sides, time, affected, skew_only)
             # A changed time-shift book must reach its ring at this exact time,
             # even when no entity is staged now.
             if affected or self.staged_books:
                 self._stage(time, affected)
+            # Resolve every economic dependency first: another changed leg in
+            # this cut may require evaluation rather than a skew-only refresh.
+            for entity_id in sorted(skew_only - affected):
+                self._stage_skew(entity_id, time)
         except Exception:
             self.poisoned = True
             raise
 
-    def _select(self, key, sides, time, affected):
+    def _select(self, key, sides, time, affected, skew_only):
         """Add the entities a change to ``key`` can change to ``affected``.
 
         An entity whose current observation is context-free and whose declared
         inputs on ``key`` were not touched would re-derive the same observation.
-        In layout 2 it is skipped; in layout 1 skew is a measurement dimension,
-        so it is staged when its skew bucket moves.
+        In layout 2 its observation is reused, while positive episodes still
+        track live skew. In layout 1 skew is a measurement dimension, so the
+        entity is staged when its skew bucket moves.
         """
         reads, staged, current = self.reads, self.staged, self.current
         for entity_id in self.reverse.get(key, ()):
@@ -291,6 +297,33 @@ class Runtime:
                 entity = self.entities[entity_id]
                 if self._skew(entity, value[0].skew_legs)[1] != value[1]:
                     affected.add(entity_id)
+            if not self.legacy and entity_id not in affected and value[0].predicates:
+                skew_only.add(entity_id)
+
+        if self.legacy or not self.experiment.controls_episodes:
+            return
+        # Shifted inputs change only at their timer, but their *live* books
+        # also define skew. Reuse the observation until the timer fires.
+        for shift in self.shifts.get(key, ()):
+            for entity_id in self.shift_reverse.get((key, shift), ()):
+                if entity_id in affected:
+                    continue
+                value = staged.get(entity_id)
+                value = value[0] if value is not None else current.get(entity_id)
+                if value is not None and value[0].predicates:
+                    skew_only.add(entity_id)
+
+    def _stage_skew(self, entity_id, time):
+        entity = self.entities[entity_id]
+        if entity.cls == CONTROL and not self.experiment.controls_episodes:
+            return  # aggregate-only controls have no skew output
+        value = self.staged.get(entity_id)
+        value = value[0] if value is not None else self.current[entity_id]
+        observation, previous_skew = value
+        skew = self._skew(entity, observation.skew_legs)
+        if skew != previous_skew:
+            self._begin_stage(time)
+            self._retain_staged(entity_id, (observation, skew), count_instantaneous=False)
 
     # -- views and history ---------------------------------------------------
     def _set_view(self, key, view):
@@ -526,22 +559,27 @@ class Runtime:
         return cost
 
     def _stage(self, time, entities):
+        self._begin_stage(time)
+        for entity in sorted(entities):
+            self._retain_staged(entity, self._evaluate(entity))
+
+    def _begin_stage(self, time):
         if self.staged_time is None:
             self.staged_time = time
         require(self.staged_time == time, "staging time")
-        for entity in sorted(entities):
-            previous = self.staged.get(entity)
-            value = self._evaluate(entity)
-            cost = self._observation_cost(value[0])
-            if previous is not None:
-                if previous[0][0].predicates and previous[0] != value:
-                    self.instantaneous[entity] = self.instantaneous.get(entity, 0) + 1
-                    if self.instantaneous[entity] == 1:
-                        self.budget.charge(bounds.SLOT + bounds.STR + 64 + bounds.INT)
-                self.budget.replace(previous[1], cost)
-            else:
-                self.budget.charge(cost)
-            self.staged[entity] = (value, cost)
+
+    def _retain_staged(self, entity, value, *, count_instantaneous=True):
+        previous = self.staged.get(entity)
+        cost = self._observation_cost(value[0])
+        if previous is not None:
+            if count_instantaneous and previous[0][0].predicates and previous[0] != value:
+                self.instantaneous[entity] = self.instantaneous.get(entity, 0) + 1
+                if self.instantaneous[entity] == 1:
+                    self.budget.charge(bounds.SLOT + bounds.STR + 64 + bounds.INT)
+            self.budget.replace(previous[1], cost)
+        else:
+            self.budget.charge(cost)
+        self.staged[entity] = (value, cost)
 
     def _flush_stage(self):
         if self.staged_time is None:

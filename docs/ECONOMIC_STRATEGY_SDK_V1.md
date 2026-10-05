@@ -209,6 +209,14 @@ hold:
 A staged entity whose fingerprint still matches reuses its observation without
 calling `evaluate`.
 
+In layout 2, skipping economic evaluation does not skip live skew tracking
+inside positive episodes. A skew-only change stages the cached observation with
+the new skew, without another walk or evaluation, without splitting a slice, and
+without counting a new `instantaneous_positive` observation. Same-time staging
+still commits only the final skew. For a time-shift control, changes to its shifted
+leg's live book refresh skew immediately; its economic inputs advance only at the
+shift timer.
+
 ## 4. Runtime semantics
 
 These rules move from the complement spec (§§3, 5, 7 there) into the SDK, and are
@@ -518,7 +526,7 @@ The profiled runs took 151.5 s (complement policy 2, 98.8 s profiled) and 105.4 
 | `walk` | 18.8 | Untouched and beyond-depth sides are reused, unwalked |
 | `_evaluate` (4.79 M calls) | 35.0 | Unchanged inputs are never staged, and staged matches skip `evaluate` |
 | `_fingerprint` (9.59 M calls) | 9.0 | Flat identity tuples: no rebuilt structures, no equality calls |
-| skew staging | — | Layout 2 no longer stages on skew-only changes |
+| skew staging | — | Layout 2 reuses cached observations for skew-only changes inside positive episodes |
 | profile `_derive`, `walk` | 44.1, 29.5 | Per-side facts, horizon skips, shared economic walks |
 
 **Synthetic dense tape** (150-level books, 8 sizes from 1 to 1,000 contracts, about
@@ -534,6 +542,93 @@ The profiled runs took 151.5 s (complement policy 2, 98.8 s profiled) and 105.4 
 **Profiling harness.** `replay/economic_sdk/profiling.py` wraps a factory with
 cProfile around callbacks only. It dumps periodically and at finish, outside the
 output directory.
+
+**Skew correction recheck (2026-10-05).** The same 2,008,580-entry bench corpus was
+run in fresh direct-supervisor attempts beside coverage. Two Docker images copied
+the pre-fix `07a50c2` replay sources and the corrected sources onto the same
+`prediction-complement-v1-local` runtime image (`b4ad5fca3b0f`); the Rust publisher
+was unchanged. Redis 8.2 was dedicated, disposable, limited to 150 MB, and used
+`noeviction`. Progress was sampled once per second using bounded `HMGET` fields.
+The fixture context and derivative directories were mounted read-only.
+
+| Run | Before fix s | After fix s | After-fix group output | Result |
+|---|---:|---:|---:|---|
+| Coverage alone | — | 53.2 | — | Reference hashes preserved |
+| Complement policy 2 default | 65.9 | 71.2 | 1,080,827 bytes | ≤ 81.2 s; < 5 MB |
+| Complement policy 2 + `time_shift` aggregates | 130.5 | 131.7 | 3,531,842 bytes; controls 2,424,864 bytes | Completes; controls < 5 MB; > 81.2 s before and after |
+| Market profile | — | 64.1 | 7,487,727 bytes | ≤ 81.2 s; reference identity preserved |
+| Complement policy 1 compat | — | 174.4 | 372,725,852 bytes | Byte-identical V1 semantic output |
+
+Every run reached terminal entry 2,008,580 and passed the strict completed readers.
+Coverage retained semantic `87cb094d…` and intervals `41be6ad8…`; the economic and
+profile semantic identities remained `e4281dc4…`, `51a69b90…`, `6ffead22…`, and
+`2d85b833…`. Default and control output files were byte-identical before and after,
+apart from the run-bound content receipt. The profile retained coverage's 1,617
+trade observations and the nine crossed Polymarket market intervals (18 native
+token incident rows); locked-only intervals are separate diagnostics.
+
+The paired default attempts correspond to about 30,479 and 28,210 entries/s,
+including setup and finalization. This is a single paired measurement, not an
+isolated estimate of the skew bookkeeping cost. The economic group trailed
+coverage in 62 of 63 default progress samples and 115 of 117 control samples.
+The existing control speed-target miss remains visible; no acceptance limit was
+changed.
+
+**Callback profile of the correction.** The SDK's cProfile wrapper measured
+callbacks and `finish`, excluding the decoder, Redis transport, and supervisor.
+Profiled default attempts took 160.8 s before and 165.6 s after; these are
+instrumented timings, separate from the ordinary attempts above. Cumulative
+function times include children and overlap; they must not be added together.
+
+| Default cost centre | Before cumulative s | After cumulative s | Calls after |
+|---|---:|---:|---:|
+| SDK `_select` | 30.36 | 31.05 | 598,278 |
+| `ViewBuilder.build` | 22.20 | 22.23 | 598,296 |
+| SDK `_evaluate` | 21.99 | 21.85 | 1,252,278 |
+| SDK `_fingerprint` (inside selection and evaluation) | 12.28 | 12.54 | 8,920,784 |
+| `walk` (inside view construction) | 8.93 | 8.98 | 272,261 |
+| Complement `evaluate` (inside SDK evaluation) | 8.70 | 8.66 | 1,251,934 |
+
+The counts of view builds, walks, fingerprints, and strategy evaluations were
+identical. No `_stage_skew` call was needed by the default corpus; its targeted
+positive-cache case is covered by the failing-before-fix regressions. The new
+`_retain_staged` helper took 0.74 s of self time and 1.89 s cumulatively over
+1,252,278 calls, but most of that work was previously inline in `_stage`.
+`_begin_stage` took 0.06 s of self time over 183,444 calls. Shared selection and
+view construction remain the largest independent cost centres; the measurements
+do not attribute the entire ordinary-run 5.3 s difference to the correction.
+
+The corrected time-shift attempt took 336.4 s with instrumentation. Its main
+costs were:
+
+| Control cost centre | Cumulative s | Self s | Calls |
+|---|---:|---:|---:|
+| SDK `_stage` (includes evaluation and retention) | 133.43 | 4.15 | 925,017 |
+| SDK `_evaluate` | 107.98 | 12.90 | 10,703,160 |
+| SDK `_advance` (includes timer-driven staging) | 87.96 | 2.46 | 2,008,578 |
+| SDK `_select` | 71.49 | 20.02 | 598,278 |
+| SDK `_fingerprint` (inside selection and evaluation) | 36.65 | 26.94 | 26,366,124 |
+| Complement `evaluate` (inside SDK evaluation) | 35.39 | 12.32 | 4,159,031 |
+| SDK `_views` (live and delayed-view lookup) | 26.55 | 12.98 | 26,366,124 |
+| `ViewBuilder.build` | 22.26 | 3.40 | 598,296 |
+| `walk` (inside view construction) | 8.79 | 4.75 | 272,261 |
+
+Controls kept exactly the default's view-build and walk counts. The larger cost
+is repeated dependency/fingerprint checks, delayed-view lookup, and timer-driven
+staging in the shared SDK; 10.70 million SDK evaluation checks resulted in 4.16
+million actual strategy evaluations. Fingerprinting had the largest production
+function self time. `_stage_skew` was not invoked with aggregate-only controls.
+All three profiled outputs retained their ordinary-run semantic identities;
+their strict provisional content readers and supervisor success readers passed,
+with the wrapped factory's inner configuration and receipt bindings checked
+separately.
+
+Focused Linux verification against disposable Redis ran 139 tests: 138 passed;
+`test_waiting_publisher_with_progressing_consumer_is_not_a_stall` failed its
+supervisor deadline check and also failed on the pre-fix image. The two new skew
+regressions and V1 golden checks passed. The earlier host run passed 126 tests
+with 13 Redis-dependent tests skipped. Full root, Rust, and deployment gates were
+not rerun for this Python runtime correction.
 
 ## 10. Requirements for corpus runs
 
