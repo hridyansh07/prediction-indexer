@@ -13,7 +13,12 @@ re-resolves every scoped entity, then streams each file once and checks:
 - slices partition their episodes; tiers, ``Q`` and opening survival recompute;
   skew-attributed entry time sums to ``Q``;
 - with ``audit_intervals``, the full interval partition recomputes the
-  denominators exactly and its maximal predicate runs equal the episodes.
+  denominators exactly and its maximal predicate runs equal the episodes;
+- in fill mode (SDK spec §13): every fill re-checks from the levels it carries
+  (taken against consumed, cost, ``after``, impact, steps times units), the
+  strategy's value hook re-checks values and kill prices, fill episodes are
+  single-slice and lie inside trigger-positive time, and live plus no-fill
+  time equals trigger-positive time exactly.
 
 Denominators are writer-attested without the audit: the reader proves their
 internal arithmetic and their agreement with the episodes, not each interval.
@@ -25,8 +30,10 @@ from array import array
 from bisect import bisect_right
 from pathlib import Path
 
+from replay.economic_fills import Fill
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
+from replay.economic_sdk.fills import FILL_LIVE, FILL_STATES, KILL_PRICE, check_experiment
 from replay.economic_sdk.entity_tables import entity_rows
 from replay.economic_sdk.output import aggregate_files, file_list, group_of
 from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
@@ -59,10 +66,12 @@ class GroupFacts:
 
     __slots__ = ("status_ns", "class_ns", "episodes", "episode_count", "slice_count", "q",
                  "q_by_skew", "lifetimes", "survival", "censored_episodes", "censored_slices",
-                 "qualifying", "slice_ns_by_skew")
+                 "qualifying", "slice_ns_by_skew", "fill_ns", "fill_ends")
 
     def __init__(self, kinds, tiers, episodes):
         self.status_ns, self.class_ns, self.episodes = {}, {}, episodes
+        # Fill mode only: trigger-positive time by fill state, fill episodes by end reason.
+        self.fill_ns, self.fill_ends = {}, {}
         self.episode_count = {k: 0 for k in kinds}
         self.slice_count = {k: 0 for k in kinds}
         self.q = {k: {t: 0 for t in tiers} for k in kinds}
@@ -83,8 +92,130 @@ class Aggregates:
         return quantiles(values, self.budget)
 
 
+def _natural(value):
+    require(type(value) is str and 0 < len(value) <= 80 and value.isascii() and value.isdigit()
+            and (value == "0" or value[0] != "0"), "canonical natural number")
+    return int(value)
+
+
+def _level(value):
+    if value is None:
+        return None
+    require(type(value) is list and len(value) == 2, "fill level")
+    price, quantity = _natural(value[0]), _natural(value[1])
+    require(quantity > 0, "fill level quantity")
+    return price, quantity
+
+
+def _check_fill(value, entity, end_reason, policy, strategy, maxima):
+    """Re-check one carried fill from its own levels and the strategy's value hook."""
+    value = obj(value, "sources units results kill_prices kill_leg kill_best")
+    spec = strategy.fill_spec(entity)
+    legs = len(entity.legs)
+    require(value["sources"] == list(spec.sources) and value["units"] == [str(u) for u in spec.units]
+            and len(spec.units) == legs, "fill spec")
+    modes = [("target", str(steps)) for steps in policy.target_steps]
+    if policy.edge:
+        modes.append(("edge", None))
+    require(type(value["results"]) is list and len(value["results"]) == len(modes), "fill results")
+    effective, live = [None] * legs, False
+    for (mode, target), result in zip(modes, value["results"]):
+        result = obj(result, "mode target_steps steps stop value legs before after impact_ppm "
+                             "tradeable kill_prices")
+        require(result["mode"] == mode and result["target_steps"] == target, "fill result mode")
+        steps, stop = _natural(result["steps"]), result["stop"]
+        if mode == "target":
+            require(stop == "target" and steps == int(target)
+                    or stop in ("book_exhausted", "level_cap") and steps < int(target), "fill stop")
+        else:
+            require(stop in ("edge", "book_exhausted", "level_cap", "value_unknown"), "fill stop")
+        for field in ("legs", "before", "after", "impact_ppm"):
+            require(type(result[field]) is list and len(result[field]) == legs, "fill leg count")
+        fills, befores = [], []
+        for i, leg in enumerate(result["legs"]):
+            leg = obj(leg, "atoms cost taken consumed")
+            atoms, cost = _natural(leg["atoms"]), _natural(leg["cost"])
+            require(atoms == steps * spec.units[i], "fill atoms are steps times units")
+            require(type(leg["taken"]) is list and type(leg["consumed"]) is list, "fill levels")
+            taken = tuple(_level(level) for level in leg["taken"])
+            consumed = tuple(_level(level) for level in leg["consumed"])
+            require(len(taken) == len(consumed) <= policy.max_levels and None not in consumed,
+                    "fill levels")
+            previous = None
+            for j, ((taken_price, taken_quantity), (price, quantity)) in enumerate(zip(taken, consumed)):
+                require(taken_price == price and taken_quantity <= quantity and price <= maxima[i]
+                        and (previous is None or price > previous), "fill taken/consumed levels")
+                require(taken_quantity == quantity or j == len(taken) - 1, "fill taken/consumed levels")
+                previous = price
+            require(sum(q for _, q in taken) == atoms, "fill taken quantity")
+            require(cost == sum(p * q for p, q in taken), "fill cost")
+            before, after = _level(result["before"][i]), _level(result["after"][i])
+            if consumed:
+                require(before == consumed[0], "fill before level")
+                price, quantity = consumed[-1]
+                if taken[-1][1] < quantity:
+                    require(after == (price, quantity - taken[-1][1]), "fill after level")
+                else:
+                    require(after is None or after[0] > price, "fill after level")
+            else:
+                require(atoms == 0 and after == before, "fill after level")
+            impact = (None if before is None or after is None or before[0] == 0
+                      else abs(after[0] - before[0]) * 10**6 // before[0])
+            require(result["impact_ppm"][i] == (None if impact is None else str(impact)),
+                    "fill impact")
+            fills.append(Fill(atoms, cost, False, taken, consumed))
+            befores.append(before)
+        fills = tuple(fills)
+        recorded = None if result["value"] is None else signed(result["value"])
+        if steps:
+            computed = strategy.fill_value(entity, steps, fills)
+            require(computed is None or type(computed) is int, "fill value type")
+            require(computed == recorded, "fill value")
+        else:
+            require(recorded is None, "fill value")
+
+        def positive(leg, price):
+            quantity = fills[leg].filled_atoms
+            single = Fill(quantity, price * quantity, False, ((price, quantity),), ((price, quantity),))
+            computed = strategy.fill_value(entity, steps, fills[:leg] + (single,) + fills[leg + 1:])
+            require(computed is None or type(computed) is int, "fill value type")
+            return computed is not None and computed > 0
+
+        tradeable = False
+        if steps and recorded is not None and recorded > 0:
+            kills = result["kill_prices"]
+            require(type(kills) is list and len(kills) == legs, "fill kill prices")
+            kills = [None if kill is None else _natural(kill) for kill in kills]
+            for leg, kill in enumerate(kills):
+                # The defining property: not positive at the kill price, positive one atom below.
+                if kill is None:
+                    require(positive(leg, maxima[leg]), "fill kill price")
+                else:
+                    require(kill <= maxima[leg] and not positive(leg, kill)
+                            and (kill == 0 or positive(leg, kill - 1)), "fill kill price")
+            tradeable = all(kill is None or before[0] < kill for kill, before in zip(kills, befores))
+            if tradeable:
+                live = True
+                effective = [kill if current is None else current if kill is None else min(current, kill)
+                             for current, kill in zip(effective, kills)]
+        else:
+            require(result["kill_prices"] is None, "fill kill prices")
+        require(result["tradeable"] is tradeable, "fill tradeable")
+    require(live, "fill episode without a tradeable sizing")
+    require(value["kill_prices"] == [None if k is None else str(k) for k in effective],
+            "fill kill prices")
+    if end_reason == KILL_PRICE:
+        leg = value["kill_leg"]
+        require(type(leg) is int and 0 <= leg < legs and effective[leg] is not None, "fill kill leg")
+        best = _level(value["kill_best"])
+        require(best is not None and best[0] >= effective[leg], "fill kill crossing")
+    else:
+        require(value["kill_leg"] is None and value["kill_best"] is None, "fill kill fields")
+
+
 def validate(directory, snapshot, manifest, strategy):
     experiment = strategy.experiment
+    check_experiment(experiment)
     snapshot = plain(snapshot)
     root = Path(directory)
     files = manifest["files"]
@@ -136,7 +267,7 @@ def validate(directory, snapshot, manifest, strategy):
         require(stored["scopes"] == [entity_rows({e.id: e for e in members}, group) for members in entities], "entity table")
         aggregates[group] = _group(
             root, group, names, files, entities, scopes, run_end, experiment, strategy, statuses,
-            end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget)
+            end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget, plans)
 
     budget.reserve(bounds.MAX_METADATA)
     return strategy.summarize_aggregate(
@@ -144,8 +275,10 @@ def validate(directory, snapshot, manifest, strategy):
 
 
 def _group(root, group, names, files, entities, scopes, run_end, experiment, strategy, statuses,
-           end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget):
+           end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget, plans):
     facts = {}
+    fill = experiment.fills
+    fill_live = {}
     episodes_present = group + "episodes.ndjson" in files
 
     def facts_for(entity):
@@ -160,7 +293,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
                                        for i in range(len(members))]
     position = 0
     for row in lines(root, group + "denominators.ndjson", files[group + "denominators.ndjson"]):
-        _closed(row, ("scope", "entity", "status_ns"), ("class_ns", "reason_ns"))
+        _closed(row, ("scope", "entity", "status_ns"),
+                ("class_ns", "reason_ns") + (("fill_ns",) if fill is not None else ()))
         require(position < len(expected_next) and (row["scope"], row["entity"]) == expected_next[position],
                 "denominator order/coverage")
         position += 1
@@ -185,6 +319,15 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         budget.reserve(256)
         denominators[scope, index] = (status, classes, reasons)
         target = facts_for(entity)
+        if fill is not None:
+            # Trigger-positive time is partitioned exactly into live and no-fill time.
+            trigger = sum(classes.get(name, 0) for name in experiment.episode_classes[fill.kind])
+            partition = _ns_map(row.get("fill_ns", {}), FILL_STATES)
+            require(("fill_ns" in row) == (trigger > 0) and sum(partition.values()) == trigger,
+                    "fill time partitions trigger-positive time")
+            fill_live[scope, index] = partition.get(FILL_LIVE, 0)
+            for name, amount in partition.items():
+                target.fill_ns[name] = target.fill_ns.get(name, 0) + amount
         for name, amount in status.items():
             target.status_ns[name] = target.status_ns.get(name, 0) + amount
         for name, amount in classes.items():
@@ -196,14 +339,15 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
 
     # -- episodes ----------------------------------------------------------------
     index_of, eps = {}, []
-    lifetime_by_class = {}
+    lifetime_by_class, fill_lifetime = {}, {}
     last_end, last = {}, None
     maxima_fields = experiment.maxima
     for row in lines(root, group + "episodes.ndjson", files[group + "episodes.ndjson"]):
+        is_fill = fill is not None and type(row) is dict and row.get("kind") == fill.kind
         _closed(row, ("scope", "entity", "episode_id", "kind", "start_ns", "end_ns", "end_reason",
                       "censored", "opening_slice_survival_ns", "viable_tiers", "qualified_ns",
                       "qualified_by_skew_ns", "class_ns", "qualifying_class_ns", "open", "maxima",
-                      "at_max"))
+                      "at_max") + (("fill",) if is_fill else ()))
         scope, index, kind = row["scope"], row["entity"], row["kind"]
         require(type(scope) is int and 0 <= scope < len(entities) and type(index) is int
                 and 0 <= index < len(entities[scope]), "episode entity")
@@ -221,7 +365,12 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         elif end == scope_end:
             require(row["end_reason"] == "SCOPE_END", "episode end reason/scope")
         else:
-            require(row["end_reason"] in end_reasons, "episode end reason/scope")
+            require(row["end_reason"] in end_reasons or is_fill and row["end_reason"] == KILL_PRICE,
+                    "episode end reason/scope")
+        if is_fill:
+            _check_fill(row["fill"], entity, row["end_reason"], fill, strategy,
+                        [10 ** int(plans[key]["price_scale"]) for key in entity.legs])
+            fill_lifetime[scope, index] = fill_lifetime.get((scope, index), 0) + end - start
         order = (end, scope) + entity.order + (kind, start)
         require(last is None or last <= order, "episode close order")
         last = order
@@ -274,9 +423,11 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
                     "end": end, "reason": row["end_reason"], "opening": uint(row["opening_slice_survival_ns"]),
                     "skew": opening_skew, "tiers": row["viable_tiers"],
                     "q": [uint(qualified[t]) for t in tiers], "seen_q": [0] * len(tiers), "reached": 0,
-                    "last": start, "slices": [], "open": opening})
+                    "last": start, "slices": [], "open": opening, "fill": is_fill})
         target = facts_for(entity)
         target.episode_count[kind] += 1
+        if is_fill:
+            target.fill_ends[row["end_reason"]] = target.fill_ends.get(row["end_reason"], 0) + 1
         target.lifetimes[kind].append(end - start)
         if row["censored"]:
             target.censored_episodes[kind] += 1
@@ -287,14 +438,22 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
             for c, v in qualifying[t].items():
                 target.qualifying[kind][t][c] = target.qualifying[kind][t].get(c, 0) + uint(v)
 
-    # Each kind's positive-class time is exactly its episodes' lifetimes.
+    # Each kind's positive-class time is exactly its episodes' lifetimes. Fill
+    # episodes lie inside the trigger kind's positive-class time and add up to
+    # exactly its live share.
     for (scope, index), (status, classes, _) in denominators.items():
         if entities[scope][index].admission is not None:
             continue
         for kind in kinds:
             for name in experiment.episode_classes[kind]:
-                require(lifetime_by_class.get((scope, index, kind, name), 0) == classes.get(name, 0),
-                        "episode lifetimes/denominator class time")
+                lifetime = lifetime_by_class.get((scope, index, kind, name), 0)
+                if fill is not None and kind == fill.kind:
+                    require(lifetime <= classes.get(name, 0), "fill episodes inside trigger time")
+                else:
+                    require(lifetime == classes.get(name, 0), "episode lifetimes/denominator class time")
+        if fill is not None:
+            require(fill_lifetime.get((scope, index), 0) == fill_live.get((scope, index), 0),
+                    "fill episode lifetimes/live fill time")
 
     # -- slices ------------------------------------------------------------------
     if group + "slices.ndjson" in files:
@@ -306,6 +465,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
             ep = eps[index_of[row["episode_id"]]]
             start, end = uint(row["start_ns"]), uint(row["end_ns"])
             require(start == ep["last"] and start < end <= ep["end"], "slice partition/order")
+            require(not ep["fill"] or (start == ep["start"] and end == ep["end"]),
+                    "fill episodes have a single slice")
             require(row["end_reason"] == (ep["reason"] if end == ep["end"] else "CONSUMED_CHANGED"),
                     "slice end reason/parent")
             require(row["censored"] == (row["end_reason"] == "RUN_END"), "slice censor reason")
@@ -388,7 +549,10 @@ def _audit(root, files, entities, scopes, experiment, strategy, statuses, kinds,
                     "audit/denominator mismatch")
 
     # Maximal predicate runs are exactly the episodes, with their end reasons.
-    expected = set()
+    # A fill kind's episodes instead lie inside its runs: one ending at a run's
+    # end carries the run's trigger-false reason, one ending inside it is killed.
+    fill_kind = experiment.fills.kind if experiment.fills is not None else None
+    expected, fill_runs = set(), {}
     for (scope, index), runs in intervals.items():
         for kind in kinds:
             allowed = experiment.episode_classes[kind]
@@ -401,11 +565,21 @@ def _audit(root, files, entities, scopes, experiment, strategy, statuses, kinds,
                     stop = end if active else start
                     after = None if active else (
                         "PREDICATE_FALSE" if status == EVALUATED else status)
-                    expected.add((scope, index, kind, opened, stop, after))
+                    if kind == fill_kind:
+                        fill_runs.setdefault((scope, index), []).append((opened, stop, after))
+                    else:
+                        expected.add((scope, index, kind, opened, stop, after))
                     opened = None
     found = set()
     for ep in eps:
         after = None if ep["reason"] in ("SCOPE_END", "RUN_END") else ep["reason"]
+        if ep["kind"] == fill_kind:
+            runs = fill_runs.get((ep["scope"], ep["index"]), [])
+            i = bisect_right([run[0] for run in runs], ep["start"]) - 1
+            require(i >= 0 and ep["end"] <= runs[i][1], "audit fill episode inside trigger run")
+            require(after == runs[i][2] if ep["end"] == runs[i][1] else after == KILL_PRICE,
+                    "audit fill episode end reason")
+            continue
         found.add((ep["scope"], ep["index"], ep["kind"], ep["start"], ep["end"], after))
     require(found == expected, "audit maximal runs/episodes")
 

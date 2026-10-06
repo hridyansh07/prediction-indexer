@@ -7,14 +7,16 @@ slices, controls, bounded output and the independent reader.
 
 from replay.economic_sdk.types import (
     ADMISSIONS, CONTROL, DEPTH_LIMITED, EVALUATED, ONE_SIDED, REAL, SDK_STATUSES, UNUSABLE,
-    Basket, BookRequirement, Context, Control, Experiment, Observation, Requirements,
+    Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSpec, Observation,
+    Requirements,
 )
 from replay.economic_sdk.views import BookView
 
 __all__ = [
     "ADMISSIONS", "CONTROL", "DEPTH_LIMITED", "EVALUATED", "ONE_SIDED", "REAL",
     "SDK_STATUSES", "UNUSABLE", "Basket", "BookRequirement", "BookView", "Context",
-    "Control", "Experiment", "Observation", "Requirements", "Strategy", "factory",
+    "Control", "Experiment", "FillPolicy", "FillSpec", "Observation", "Requirements", "Strategy",
+    "factory",
 ]
 
 
@@ -49,6 +51,20 @@ class Strategy:
         raise NotImplementedError
 
     def evaluate(self, entity, views, context):
+        raise NotImplementedError
+
+    # -- fill mode (spec §13), runtime and reader -------------------------------
+    def fill_spec(self, entity):
+        """Static ``FillSpec`` of an admitted entity: per-leg ladder source and units."""
+        raise NotImplementedError
+
+    def fill_value(self, entity, steps, legs):
+        """Pure value of ``steps`` basket steps on per-leg ``Fill`` objects, or ``None``.
+
+        It must be an integer that falls as any leg's price rises, and depend
+        only on the entity and the fills (never on time or context): the
+        reader recomputes it from the fill the episode carries.
+        """
         raise NotImplementedError
 
     def manifest(self, files, instantaneous):

@@ -229,3 +229,39 @@ def walk_basket(
             best, best_value, best_legs = steps, current, legs
         results.append(priced(best, best_legs, stop, best_value if best else None))
     return tuple(results)
+
+
+def kill_price(value, steps, legs, leg, maximum):
+    """Lowest integer price at which leg ``leg``'s whole fill stops being worth taking.
+
+    The leg's fill quantity is bought at that single price, the other legs are
+    unchanged, and ``value(steps, legs)`` (fees recomputed by the caller's
+    value) is no longer a known positive integer. The search is binary over
+    ``[0, maximum]`` and assumes value falls as the price rises; whatever the
+    value does, the result ``k`` satisfies: not positive at ``k``, and
+    positive at ``k - 1`` when ``k > 0``. ``None`` when value stays positive
+    even at ``maximum``.
+    """
+    if type(steps) is not int or steps <= 0 or type(maximum) is not int or maximum < 0:
+        raise ValueError("positive steps and a nonnegative maximum price required")
+    quantity = legs[leg].filled_atoms
+    if quantity <= 0:
+        raise ValueError("the leg must have filled atoms")
+
+    def positive(price):
+        single = Fill(quantity, price * quantity, False, ((price, quantity),), ((price, quantity),))
+        result = value(steps, legs[:leg] + (single,) + legs[leg + 1:])
+        if result is not None and type(result) is not int:
+            raise TypeError("value must return an int or None")
+        return result is not None and result > 0
+
+    if positive(maximum):
+        return None
+    low, high = -1, maximum  # positive(low) is assumed; positive(high) is false
+    while high - low > 1:
+        middle = (low + high) // 2
+        if positive(middle):
+            low = middle
+        else:
+            high = middle
+    return high

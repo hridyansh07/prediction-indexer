@@ -24,6 +24,9 @@ class BookRequirement:
     sizes_contracts: tuple[int, ...]
     consumed: bool = True
     transforms: tuple[str, ...] = ()
+    # Fill mode (spec §13): sides or transforms whose full best-first ladder
+    # the view retains, from the read it already makes.
+    ladders: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +59,35 @@ class Basket:
     peer_group: object = None
     peer_order: object = None
     inputs: tuple | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FillSpec:
+    """Static per-entity fill shape (spec §13), from ``Strategy.fill_spec``.
+
+    ``sources[i]`` names the ladder leg ``i`` buys from: ``"ask"`` or a
+    transform that projects to asks; the leg's book must retain that ladder
+    (``BookRequirement.ladders``). ``units[i]`` is the atoms leg ``i`` takes
+    per basket step: the leg ratio times one step in that book's quantity atoms.
+    """
+
+    sources: tuple[str, ...]
+    units: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FillPolicy:
+    """Closed fill-check policy, parsed by ``economic_sdk.fills.fill_policy``.
+
+    ``kind`` is the single episode kind whose predicate triggers fills.
+    """
+
+    kind: str
+    targets_contracts: tuple[str, ...]
+    target_steps: tuple[int, ...]
+    edge: bool
+    step_contracts: str
+    max_levels: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,3 +161,5 @@ class Experiment:
     ring_entries: int = 0
     static_reservation: int = 0
     profile: object = None
+    # Fill mode (spec §13): ``None`` keeps every episode a quote-slice episode.
+    fills: FillPolicy | None = None

@@ -31,6 +31,8 @@ ENTITY = 600        # entity record and its map/reverse-map slots
 MEASUREMENT = 400   # open measurement tuple and its start time
 EPISODE = 1600      # open-episode record, tiers and qualified-time slots
 RING_ENTRY = 160    # one (time, view) ring slot, excluding the view
+LIVE_FILL = 160     # a live fill record (spec §13), excluding its JSON and kill prices
+FILL_STATE = 240    # one entity's open fill state: start, state and ladder epochs
 
 
 def json_cost(value):
@@ -69,9 +71,21 @@ def fingerprint_cost(fingerprint):
 
 
 def view_cost(view, sizes):
+    """A view; ``levels`` counts fill pairs and, in fill mode, retained ladder pairs."""
     sides = len(view.fills) + len(view.transformed)
     return (VIEW + sides * CONTAINER + fills_cost(sides * sizes, view.levels)
-            + (json_cost(view.reason) if view.reason is not None else 0) + 2 * PAIR)
+            + (json_cost(view.reason) if view.reason is not None else 0) + 2 * PAIR
+            + len(view.ladders) * (CONTAINER + SLOT))
+
+
+def live_fill_cost(priced):
+    """A live fill: its episode ``fill`` object and per-leg kill prices."""
+    return (LIVE_FILL + json_cost(priced.json) + CONTAINER
+            + len(priced.kill) * (SLOT + INT))
+
+
+def fill_state_cost(legs):
+    return FILL_STATE + CONTAINER + legs * (SLOT + INT)
 
 
 def quotes_cost(quotes):

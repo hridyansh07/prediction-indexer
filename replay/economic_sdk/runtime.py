@@ -11,7 +11,10 @@ owns everything else (complement spec §§3, 5, 7 and SDK spec §4):
 - per-key status/value-class time, episodes and slices with zero-length
   suppression, ``SCOPE_END`` closure and censoring at run end;
 - controls, including the bounded view ring of ``time_shift``;
-- count-based retained-state bounds and bounded output in close order.
+- count-based retained-state bounds and bounded output in close order;
+- opt-in fill checks (SDK spec §13): one priced fill per episode of the
+  trigger kind, priced once at open and ended by a per-leg kill price or by
+  the trigger turning false.
 
 Layout 1 (complement policy 1) writes the frozen V1 interval partition, with
 skew as a measurement dimension. Layout 2 never splits time on skew: skew is
@@ -32,6 +35,8 @@ from replay.economic_intervals import CutClock, EpisodeMath
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table
+from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, check_spec,
+                                       crossed, price)
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, Observation
 from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
@@ -72,7 +77,7 @@ def _view_fills(view):
 class _Episode:
     __slots__ = ("entity", "kind", "start", "open_values", "open_quotes", "maxima",
                  "opening_skew", "slice_start", "slice_skew", "slice_values",
-                 "quotes", "qualified", "viable", "opening_survival", "cost",
+                 "quotes", "qualified", "viable", "opening_survival", "cost", "fill",
                  # layout 2 only
                  "open_class", "open_reasons", "class_now", "class_since", "slice_classes",
                  "class_ns", "qualifying", "skew_points", "by_skew", "at_max")
@@ -114,6 +119,9 @@ class Runtime:
         self.strategy = strategy
         experiment = self.experiment = strategy.experiment
         self.legacy = experiment.layout == 1
+        check_experiment(experiment)
+        # Fill mode (spec §13): the trigger kind's episodes are priced fills.
+        self.fill = experiment.fills
         self.snapshot = strategy.snapshot
         self.root = Path(context["output_directory"])
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
@@ -195,6 +203,12 @@ class Runtime:
         self.staged = {}
         self.staged_books = set()
         self.episode_rows = 0
+        # Fill mode: per-entity static spec, open fill state (trigger-positive
+        # time: live or a no-fill reason) and its denominator partition.
+        self.fill_specs, self.fill_specs_cost = {}, 0
+        self.fill_state = {}
+        self.fill_ns = {}
+        self.epochs = {}
         self.terminal = self.finished = self.poisoned = False
 
     @property
@@ -280,8 +294,14 @@ class Runtime:
         entity is staged when its skew bucket moves.
         """
         reads, staged, current = self.reads, self.staged, self.current
+        fill_state = self.fill_state if self.fill is not None else None
         for entity_id in self.reverse.get(key, ()):
             if entity_id in affected:
+                continue
+            if fill_state is not None and entity_id in fill_state:
+                # A live fill checks its kill prices, and a trigger-positive
+                # entity without one retries, on every committed leg update.
+                affected.add(entity_id)
                 continue
             value = staged.get(entity_id)
             value = value[0] if value is not None else current.get(entity_id)
@@ -329,6 +349,12 @@ class Runtime:
 
     # -- views and history ---------------------------------------------------
     def _set_view(self, key, view):
+        if self.fill is not None and view.ladders:
+            prior = self.views.get(key)
+            if prior is None or any(ladder is not prior.ladders.get(source)
+                                    for source, ladder in view.ladders.items()):
+                # Ladders are interned, so an unchanged epoch means identical ladders.
+                self.epochs[key] = self.epochs.get(key, 0) + 1
         cost = bounds.view_cost(view, len(self.builders[key].sizes))
         self.budget.replace(self.view_costs.get(key, 0), cost)
         self.views[key] = view
@@ -430,6 +456,21 @@ class Runtime:
                 else:
                     self.reverse.setdefault(key, set()).add(entity.id)
         require(all(key in self.builders for key in self.reverse), "unrequired basket book")
+        if self.fill is not None:
+            specs, cost = {}, 0
+            for entity in entities.values():
+                if entity.admission is not None:
+                    continue
+                spec = self.strategy.fill_spec(entity)
+                check_spec(spec, entity)
+                for key, source in zip(entity.legs, spec.sources):
+                    require(source in self.builders[key].ladders, "fill ladder not retained")
+                maxima = tuple(10 ** int(self.plans[key]["price_scale"]) for key in entity.legs)
+                specs[entity.id] = (spec, maxima)
+                cost += bounds.SLOT + bounds.json_cost([list(spec.sources), list(spec.units),
+                                                        list(maxima)])
+            self.budget.replace(self.fill_specs_cost, cost)
+            self.fill_specs, self.fill_specs_cost = specs, cost
 
     def _advance(self, time):
         """Process scope boundaries and shift timers up to ``time`` in order."""
@@ -616,9 +657,12 @@ class Runtime:
             self.open_measurements[entity.id] = (time, fields, cost)
         if not self.legacy and entity.cls == CONTROL and not self.experiment.controls_episodes:
             return
+        fill_kind = self.fill.kind if self.fill is not None else None
         for kind in self.experiment.kinds:
             key = (entity.id, kind)
-            if kind in observation.predicates:
+            if kind == fill_kind:
+                self._commit_fill(entity, key, time, observation, skew)
+            elif kind in observation.predicates:
                 if key not in self.episodes:
                     self._open_episode(key, time, observation, skew)
                 else:
@@ -626,6 +670,74 @@ class Runtime:
             elif key in self.episodes:
                 reason = observation.status if observation.status != EVALUATED else "PREDICATE_FALSE"
                 self._close_episodes([(key, time, reason, False)])
+
+    def _commit_fill(self, entity, key, time, observation, skew):
+        """Fill mode: kill check, trigger closure, and at most one pricing per instant.
+
+        Commit runs before the next cut refreshes any view, so ``self.views``
+        is the final state at ``time`` (spec §13, timing).
+        """
+        trigger = key[1] in observation.predicates
+        episode = self.episodes.get(key)
+        if episode is not None:
+            if not trigger:
+                reason = observation.status if observation.status != EVALUATED else "PREDICATE_FALSE"
+                self._close_episodes([(key, time, reason, False)])
+            else:
+                hit = crossed(episode.fill.kill, self.fill_specs[entity.id][0].sources,
+                              self._views(entity, time))
+                if hit is None:
+                    self._update_episode(episode, time, observation, skew)
+                    return
+                episode.fill.json["kill_leg"] = hit[0]
+                episode.fill.json["kill_best"] = [str(hit[1][0]), str(hit[1][1])]
+                self._close_episodes([(key, time, KILL_PRICE, False)])
+        if not trigger:
+            self._fill_state(entity.id, time, None, None)
+            return
+        epochs = tuple(self.epochs.get(leg, 0) for leg in entity.legs)
+        state = self.fill_state.get(entity.id)
+        if state is not None and state[1] != FILL_LIVE and state[2] == epochs:
+            return  # identical ladders give the identical no-fill result
+        spec, maxima = self.fill_specs[entity.id]
+        views = self._views(entity, time)
+        strategy = self.strategy
+        priced = price(self.fill, spec,
+                       tuple(view.ladders[source] for view, source in zip(views, spec.sources)),
+                       maxima, lambda steps, legs: strategy.fill_value(entity, steps, legs))
+        if priced.state == FILL_LIVE:
+            self._open_episode(key, time, observation, skew, priced)
+        self._fill_state(entity.id, time, priced.state, epochs)
+
+    def _fill_state(self, entity_id, time, state, epochs):
+        """Move one entity's trigger-positive state; ``None`` is trigger-off."""
+        current = self.fill_state.get(entity_id)
+        if current is None:
+            if state is not None:
+                cost = bounds.fill_state_cost(len(epochs))
+                self.budget.charge(cost)
+                self.fill_state[entity_id] = [time, state, epochs, cost]
+            return
+        if current[1] == state:
+            current[2] = epochs
+            return
+        self._charge_fill(entity_id, current[1], time - current[0])
+        if state is None:
+            del self.fill_state[entity_id]
+            self.budget.release(current[3])
+        else:
+            current[0], current[1], current[2] = time, state, epochs
+
+    def _charge_fill(self, entity_id, state, duration):
+        if duration <= 0:
+            return
+        table = self.fill_ns.get(entity_id)
+        if table is None:
+            table = self.fill_ns[entity_id] = {}
+            self._charge_denominator(bounds.CONTAINER + bounds.SLOT)
+        if state not in table:
+            self._charge_denominator(bounds.SLOT + bounds.STR + bounds.INT)
+        table[state] = table.get(state, 0) + duration
 
     def _maxima(self, payload, current=None):
         result = {}
@@ -642,9 +754,12 @@ class Runtime:
         require(len(encoded({"consumed": quotes_json(quotes), "open_values": payload}))
                 + 1024 <= bounds.MAX_LINE, "slice retained line budget")
 
-    def _open_episode(self, key, time, observation, skew):
+    def _open_episode(self, key, time, observation, skew, priced=None):
         self._check_retained_slice(observation.quotes, observation.payload)
+        if priced is not None:
+            require(len(encoded(priced.json)) + 1024 <= bounds.MAX_LINE, "fill retained line budget")
         episode = _Episode()
+        episode.fill = priced
         episode.entity, episode.kind, episode.start = key[0], key[1], time
         episode.open_values = episode.slice_values = observation.payload
         episode.open_quotes = episode.quotes = observation.quotes
@@ -665,6 +780,8 @@ class Runtime:
             episode.skew_points = [(time, skew)]
             episode.at_max = (observation.payload, observation.quotes)
             episode.cost *= 2  # opening, maximum and current slice payloads
+            if priced is not None:
+                episode.cost += bounds.live_fill_cost(priced)
         require(len(self.episodes) < len(self.entities) * len(self.experiment.kinds),
                 "open episode bound")
         self.budget.charge(episode.cost)
@@ -675,7 +792,7 @@ class Runtime:
         if not self.legacy and observation.value_class != episode.class_now:
             self._charge_class(episode, time)
             episode.class_now = observation.value_class
-        if observation.quotes != episode.quotes:
+        if episode.fill is None and observation.quotes != episode.quotes:
             self._check_retained_slice(observation.quotes, payload)
             cost = bounds.episode_cost(observation, len(self.tiers)) * (1 if self.legacy else 2)
             self.budget.replace(episode.cost, cost)
@@ -815,6 +932,8 @@ class Runtime:
                 "maxima": episode.maxima,
                 "at_max": {"values": episode.at_max[0], "quotes": quotes_json(episode.at_max[1])},
             }
+            if episode.fill is not None:
+                row["fill"] = episode.fill.json
             self.writers[group_of(entity) + "episodes.ndjson"].append(row)
 
     # -- measurements and denominators ---------------------------------------
@@ -888,10 +1007,14 @@ class Runtime:
                 row["class_ns"] = {k: str(v) for k, v in sorted(classes.items())}
             if reasons:
                 row["reason_ns"] = [[s, list(i), str(v)] for (s, i), v in sorted(reasons.items())]
+            fill = self.fill_ns.get(entity_id)
+            if fill:
+                row["fill_ns"] = {k: str(v) for k, v in sorted(fill.items())}
             rows.append((group_of(entity), self.index[entity_id], row))
         for group, _, row in sorted(rows, key=lambda item: (item[0], item[1])):
             self.writers[group + "denominators.ndjson"].append(row)
         self.denominators = {}
+        self.fill_ns = {}
         self.budget.release(self.denominator_cost)
         self.denominator_cost = 0
 
@@ -904,6 +1027,8 @@ class Runtime:
         self.budget.release(sum(p[2] for p in self.open_measurements.values()))
         self.open_measurements.clear()
         self._close_episodes([(key, time, reason, censored) for key in sorted(self.episodes)])
+        for entity_id in sorted(self.fill_state):
+            self._fill_state(entity_id, time, None, None)
         if not self.legacy:
             self._write_denominators()
 

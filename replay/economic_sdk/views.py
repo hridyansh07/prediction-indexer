@@ -4,19 +4,32 @@ from __future__ import annotations
 
 from replay.economic_fills import Fill, walk
 from replay.strategy_sdk import plain
+from replay.streams.protocol import require
+
+# The book side each retainable ladder is read from.
+_LADDER_SIDES = {"ask": "ask", "bid": "bid", "kalshi_complement_ask": "bid"}
+
+_NO_LADDERS = {}
+
 
 class BookView:
-    """Immutable detached state of one book; never references decoder objects."""
+    """Immutable detached state of one book; never references decoder objects.
+
+    ``ladders`` holds, in fill mode only (spec §13), the full best-first ladder
+    of each retained side or transform, from the read the view already made.
+    """
 
     __slots__ = ("validity", "reason", "last_change", "bid_present", "ask_present",
-                 "best_bid", "best_ask", "fills", "transformed", "levels", "crossed")
+                 "best_bid", "best_ask", "fills", "transformed", "levels", "crossed",
+                 "ladders")
 
     def __init__(self, validity, reason, last_change, bid_present, ask_present,
-                 best_bid, best_ask, fills, transformed, levels):
+                 best_bid, best_ask, fills, transformed, levels, ladders=_NO_LADDERS):
         self.validity, self.reason, self.last_change = validity, reason, last_change
         self.bid_present, self.ask_present = bid_present, ask_present
         self.best_bid, self.best_ask = best_bid, best_ask
         self.fills, self.transformed, self.levels = fills, transformed, levels
+        self.ladders = ladders
         # The book's own best bid strictly above its best ask.
         self.crossed = (best_bid is not None and best_ask is not None
                         and best_bid[0] > best_ask[0])
@@ -48,6 +61,11 @@ def _same(old, new):
             and old.taken == new.taken)
 
 
+def complement_ladder(levels, unit):
+    """Project best-first bids to best-first asks at ``unit - p``."""
+    return tuple((unit - price, quantity) for price, quantity in levels)
+
+
 def complement_ask(fill, unit):
     """Project a bid fill to the opposite orientation's ask at ``unit - p``."""
     return Fill(fill.filled_atoms, unit * fill.filled_atoms - fill.cost, fill.depth_limited,
@@ -58,7 +76,8 @@ def complement_ask(fill, unit):
 class ViewBuilder:
     """Builds views for one book key from its static union requirement."""
 
-    __slots__ = ("sides", "sizes", "sizes_atoms", "transforms", "unit")
+    __slots__ = ("sides", "sizes", "sizes_atoms", "transforms", "unit", "ladders",
+                 "ladder_sides")
 
     def __init__(self, requirement, plan):
         quantity_unit = 10 ** int(plan["quantity_scale"])
@@ -67,6 +86,14 @@ class ViewBuilder:
         self.sizes_atoms = tuple(size * quantity_unit for size in self.sizes)
         self.transforms = requirement.transforms
         self.unit = 10 ** int(plan["price_scale"])
+        self.ladders = requirement.ladders
+        # A retained ladder depends on every level of its side, so that side is
+        # never reused merely because a touched price lies beyond consumed depth.
+        self.ladder_sides = frozenset(_LADDER_SIDES[source] for source in self.ladders)
+        require(type(self.ladders) is tuple and len(set(self.ladders)) == len(self.ladders)
+                and all(source in _LADDER_SIDES for source in self.ladders)
+                and all(source in self.sides or source in self.transforms for source in self.ladders)
+                and self.ladder_sides <= set(self.sides), "retained ladder requirement")
 
     def build(self, book, last_change, prior=None, sides=None):
         """Detached view; with ``prior`` and ``sides``, untouched sides are reused.
@@ -77,13 +104,21 @@ class ViewBuilder:
         reuse = (prior is not None and sides is not None and book.validity == "usable"
                  and prior.validity == "usable")
         fills, presence, best, levels = {}, {}, {}, 0
+        retained = {} if self.ladders else _NO_LADDERS
         for side in self.sides:
-            if reuse and (side not in sides or beyond(prior.fills[side], side, sides[side])):
+            if reuse and (side not in sides or (side not in self.ladder_sides
+                                                and beyond(prior.fills[side], side, sides[side]))):
                 fills[side] = prior.fills[side]
                 presence[side] = prior.present(side)
                 best[side] = prior.best_bid if side == "bid" else prior.best_ask
+                if side in self.ladder_sides:
+                    retained[side] = prior.ladders[side]
             else:
                 side_levels, side_fills = read_side(book, side, self.sizes_atoms)
+                if side in self.ladder_sides:
+                    old = prior.ladders.get(side) if prior is not None else None
+                    # Keep the prior object for an equal ladder (identity checks downstream).
+                    retained[side] = old if old == side_levels else side_levels
                 previous = prior.fills.get(side) if prior is not None else None
                 if previous:
                     # Keep the prior object for an equal fill so downstream
@@ -110,9 +145,17 @@ class ViewBuilder:
                 transformed["kalshi_complement_ask"] = {
                     size: complement_ask(fill, unit) for size, fill in fills["bid"].items()}
             levels *= 2
+        if "kalshi_complement_ask" in self.ladders:
+            # Reused while its source bid ladder is the identical object.
+            previous = prior.ladders.get("kalshi_complement_ask") if prior is not None else None
+            retained["kalshi_complement_ask"] = (
+                previous if previous is not None and prior.ladders["bid"] is retained["bid"]
+                else complement_ladder(retained["bid"], self.unit))
+        for ladder in retained.values():
+            levels += len(ladder)
         return BookView(book.validity, plain(book.reason), last_change,
                         presence.get("bid", False), presence.get("ask", False),
-                        best.get("bid"), best.get("ask"), fills, transformed, levels)
+                        best.get("bid"), best.get("ask"), fills, transformed, levels, retained)
 
 
 def touched_sides(cut):
