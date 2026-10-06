@@ -35,6 +35,7 @@ declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns
 - shared detached book views;
 - per-key denominators, episodes and slices;
 - controls;
+- opt-in fill checks: one priced fill per episode, ended by a per-leg kill price;
 - bounded output;
 - the independent reader.
 
