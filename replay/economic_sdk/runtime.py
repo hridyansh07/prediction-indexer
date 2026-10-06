@@ -31,6 +31,7 @@ from replay.economic_fills import Fill  # noqa: F401  (re-exported for strategie
 from replay.economic_intervals import CutClock, EpisodeMath
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
+from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, Observation
 from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
@@ -124,6 +125,8 @@ class Runtime:
             self.groups = aggregate_files(experiment)
             names = tuple(group + name for group, files in self.groups.items()
                           for name in files if name.endswith(".ndjson"))
+        self.plans = {(p["instrument"], p["orientation"]): plain(p) for p in self.snapshot["plans"]}
+        self.entity_table_bytes = preflight(strategy, self.snapshot, self.plans)
         self.writers = {}
         for name in names:
             path = self.root / name
@@ -132,7 +135,6 @@ class Runtime:
                                             max_records=bounds.MAX_ROWS,
                                             max_line_bytes=bounds.MAX_LINE)
         self.clock = CutClock(self.snapshot)
-        self.plans = {(p["instrument"], p["orientation"]): plain(p) for p in self.snapshot["plans"]}
         self.budget = bounds.StateBudget()
         self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
                            + bounds.json_cost(experiment.policy))
@@ -671,9 +673,8 @@ class Runtime:
     def _update_episode(self, episode, time, observation, skew):
         payload = observation.payload
         if not self.legacy and observation.value_class != episode.class_now:
-            classes = episode.slice_classes
-            classes[episode.class_now] = classes.get(episode.class_now, 0) + time - episode.class_since
-            episode.class_now, episode.class_since = observation.value_class, time
+            self._charge_class(episode, time)
+            episode.class_now = observation.value_class
         if observation.quotes != episode.quotes:
             self._check_retained_slice(observation.quotes, payload)
             cost = bounds.episode_cost(observation, len(self.tiers)) * (1 if self.legacy else 2)
@@ -731,11 +732,23 @@ class Runtime:
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
             self.writers["audit/slices.ndjson"].append(row)
 
+    @staticmethod
+    def _charge_class(episode, until):
+        """Charge [class_since, until) to the current class; an empty interval writes nothing.
+
+        A class change and a slice close can share one instant, so charging a
+        zero-length interval would create a 0 ns entry the reader rejects.
+        """
+        elapsed = until - episode.class_since
+        if elapsed:
+            classes = episode.slice_classes
+            classes[episode.class_now] = classes.get(episode.class_now, 0) + elapsed
+        episode.class_since = until
+
     def _close_slice_facts(self, episode, start, end, survival):
         """Fold one closed slice into its episode's class and skew facts."""
+        self._charge_class(episode, end)
         classes = episode.slice_classes
-        classes[episode.class_now] = classes.get(episode.class_now, 0) + end - episode.class_since
-        episode.class_since = end
         for value_class, amount in classes.items():
             episode.class_ns[value_class] = episode.class_ns.get(value_class, 0) + amount
         points = episode.skew_points
@@ -904,17 +917,11 @@ class Runtime:
     def _tables(self):
         """Entity tables (once per scope, per group) and the reason table."""
         tables = {}
-        scopes = {group: [] for group in self.groups}
-        for index in range(len(self.snapshot["scopes"])):
-            entities = resolve(self.strategy, self.snapshot, index, self.plans)
-            members = {group: [] for group in self.groups}
-            for entity in sorted(entities.values(), key=lambda e: e.order):
-                members[group_of(entity)].append({"hash": entity.id, "descriptor": entity.descriptor})
-            for group in self.groups:
-                scopes[group].append(members[group])
         for group in self.groups:
-            tables[group + "entities.json"] = self._write_table(group + "entities.json",
-                                                                {"scopes": scopes[group]})
+            name = group + "entities.json"
+            tables[name] = write_table(self.root, name, table_chunks(
+                self.strategy, self.snapshot, self.plans, group),
+                expected_size=self.entity_table_bytes[name])
         tables["reasons.json"] = self._write_table("reasons.json", {"reasons": self.reason_list})
         return tables
 

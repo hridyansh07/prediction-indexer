@@ -229,6 +229,9 @@ the contract for every strategy:
 - pre-start prologue cuts, which initialize state only;
 - half-open, exact-nanosecond time;
 - zero-length suppression;
+- class time is charged only for positive-length intervals; a class flip at a
+  quote-slice boundary never inserts a zero-duration class into episode or
+  latency-qualified maps;
 - `SCOPE_END` closure;
 - censoring at run end;
 - `instantaneous_positive` as a writer-attested diagnostic: a count of superseded
@@ -322,6 +325,24 @@ Both cover real entities only. The audit is off by default.
 complete measurement partition with skew buckets, real and placebo rows mixed,
 full slices, and `placebo_episodes.ndjson`. It is pinned byte for byte by
 `replay/tests/fixtures/complement_v1_golden.json` (§11).
+
+**Static metadata admission.** Before any stream callback or output `.open`
+file/profile initialization, layout-2 construction runs
+`replay.economic_sdk.entity_tables.preflight(strategy)`. It returns exact canonical
+bytes per real/control `entities.json`, including wrappers, scope/row separators,
+empty scopes, UTF-8 encoding and the final LF. Each table must fit the unchanged
+8 MiB `MAX_METADATA` limit; an oversized table names itself, its exact required
+bytes and the limit in a construction error. Preflight and final streaming commit
+share the row/chunk encoder and resolve one scope at a time, without a new global
+descriptor cache. The final writer also verifies preflight length before rename.
+Layout 1 has no entity table and preserves the frozen complement V1 behavior.
+
+A strategy may represent a statically rejected, size-independent basket with a
+null size in its own descriptor and a deterministic numeric ordering sentinel.
+Admission bypasses evaluation and declared input compilation; it still receives
+one full scoped denominator. The strategy reader/summary must make this contract
+explicit. Cross-venue format 2 uses null rejection rows; existing complement rows
+and default numeric summary sorting are unchanged.
 
 **Independent reader.** The layout-2 reader is `aggregate_reader`. It re-resolves
 every entity from the manifest's policy and the snapshot, then checks the
@@ -751,3 +772,19 @@ Structural strategies remain a separate implementation.
   net economics (complement spec §12).
 - **Coverage.** Porting `bundle_coverage` onto the SDK is optional, and it has not
   been done. If attempted, it must keep coverage's reference hashes.
+
+## Native-scale strategy admission
+
+`Strategy.native_scales` defaults to `False`. A strategy that handles native
+price and quantity scales exactly may explicitly set it to `True`; `entities.resolve`
+applies this opt-in to real baskets, substituted controls and independent reader
+resolution. It changes no reconstruction scales. Complement policies keep their
+existing admission and V1 bytes. The first consumer is
+[CROSS_VENUE_ARBITRAGE_V1.md](CROSS_VENUE_ARBITRAGE_V1.md).
+
+The reusable `FeeBridge.assess_orders` exposes per-leg native economics and
+`FeeEngine.assess_many` assessments without basket accounting. The existing
+`assess` wrapper retains complement accounting and its legacy order identities.
+`FeeEconomicsUnavailable` preserves the existing ValueError text for a native
+notional that cannot fit its pinned Fee SDK quote scale; the cross-venue strategy
+records that as FEE_UNKNOWN without rounding.

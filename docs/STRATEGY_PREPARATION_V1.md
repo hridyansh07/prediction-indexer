@@ -215,3 +215,20 @@ reviewed limit change, not truncation.
 
 Live Universe/S3/GCS and Redis execution are not required for these offline
 tests and were not used to validate this preparation stage.
+
+## Local CLI and dotenv setting
+
+Set `UNIVERSE_BASE_URL` in `.env` to your current Universe HTTP(S) endpoint.
+The existing runner JSON names the same setting `universe_base_url`. The CLI
+loads only this dotenv key; exported environment takes priority. Literal quoted
+values and `export KEY=value` are supported, shell expansion is not. Missing,
+duplicate or invalid values fail before requesting evidence; values are not logged.
+
+```bash
+.venv/bin/python -m replay.prepare_context /research/prepare.json /research/context \
+  --env-file /absolute/project/.env
+```
+
+This invokes the same `UniverseHTTP` for selections and outcomes and the existing
+strict preparation writer/reader. No archive fallback is selected implicitly.
+Offline replay consumes the pinned context; it does not load this setting.

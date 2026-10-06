@@ -27,6 +27,7 @@ from pathlib import Path
 
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
+from replay.economic_sdk.entity_tables import entity_rows
 from replay.economic_sdk.output import aggregate_files, file_list, group_of
 from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES
@@ -132,8 +133,7 @@ def validate(directory, snapshot, manifest, strategy):
             for entity in members:
                 all_entities.setdefault(group, {})[entity.id] = entity
         stored = obj(_table(root, group + "entities.json", files), "scopes")
-        require(stored["scopes"] == [[{"hash": e.id, "descriptor": e.descriptor} for e in members]
-                                     for members in entities], "entity table")
+        require(stored["scopes"] == [entity_rows({e.id: e for e in members}, group) for members in entities], "entity table")
         aggregates[group] = _group(
             root, group, names, files, entities, scopes, run_end, experiment, strategy, statuses,
             end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget)

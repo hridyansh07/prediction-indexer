@@ -316,9 +316,9 @@ def _verdict(policy, venue, E, Q, X):
             "basis": "PINNED_FEE_MODEL_AND_DISPLAYED_DEPTH_POLICY"}
 
 
-def _aggregate_rows(aggregates, facts, latency):
+def _aggregate_rows(aggregates, facts, latency, *, size_order=int):
     rows = []
-    for key, g in sorted(facts.items(), key=lambda x: (x[0][0], x[0][1], x[0][2], int(x[0][3]))):
+    for key, g in sorted(facts.items(), key=lambda x: (x[0][0], x[0][1], x[0][2], size_order(x[0][3]))):
         venue, bkind, direction, size, _ = key
         c = g.class_ns
         row = {"venue": venue, "basket_kind": bkind, "direction": direction, "size_contracts": size,

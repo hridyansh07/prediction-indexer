@@ -48,6 +48,10 @@ def _unsigned(value, name):
     return int(value)
 
 
+class FeeEconomicsUnavailable(ValueError):
+    """Native notional cannot be represented by the Fee SDK at its pinned scale."""
+
+
 class FeeBridge:
     def __init__(self, fees_config: dict, plans: list[dict]):
         if type(fees_config) is not dict or set(fees_config) != _FEE_FIELDS:
@@ -139,8 +143,12 @@ class FeeBridge:
         """Semantic fee configuration suitable for the parent's experiment hash."""
         return self.semantic_config
 
-    def assess(self, *, experiment: str, scope: int, basket: dict, direction: str,
-               size: int, time: int, sequence: int, legs: tuple) -> dict:
+    def assess_orders(self, *, experiment: str, scope: int, basket: dict, direction: str,
+               size: int, time: int, sequence: int, legs: tuple, account="same_venue_complement_v1") -> tuple:
+        """Return native per-order assessments; the caller owns basket payout.
+
+        Missing bindings retain a None slot and a visible reason per leg.
+        """
         if direction not in {"BUY", "SELL"} or type(legs) is not tuple or not legs:
             raise ValueError("invalid fee scenario")
         expected_side = direction
@@ -156,6 +164,7 @@ class FeeBridge:
             economics = self._bindings.get(key)
             venue_name = key[0].partition(":")[0]
             if economics is None or venue_name not in self._assets:
+                prepared.append(None)
                 reasons.append(f"missing_fee_binding_or_asset:{key[0]}:{key[1]}")
                 continue
             if (leg["price_scale"], leg["quantity_scale"]) != (
@@ -184,11 +193,11 @@ class FeeBridge:
                 try:
                     notional = Notional(economics.quote, fixed(notional_value, economics.quote_scale))
                 except ValueError as error:
-                    raise ValueError("fill notional is not exactly representable") from error
+                    raise FeeEconomicsUnavailable("fill notional is not exactly representable") from error
                 fills.append(HypotheticalFill(
                     f"{order_key}:{fill_index}",
                     Context(venue, Product.CLOB, native_market, None, None, None,
-                            native_instrument, key[1], "same_venue_complement_v1",
+                            native_instrument, key[1], account,
                             "hypothetical"),
                     economics, Side[direction], price,
                     Probability(price_atoms, economics.price_scale), quantity, notional,
@@ -196,6 +205,17 @@ class FeeBridge:
                     counterfactual_revision=order_key,
                 ))
             prepared.append((economics, self._engine.assess_many(tuple(fills))))
+        return tuple(prepared), tuple(reasons)
+
+    def economics(self, key):
+        """Return the configured native economics, or None when required input is absent."""
+        return self._bindings.get(key) if key[0].partition(":")[0] in self._assets else None
+
+    def assess(self, *, experiment: str, scope: int, basket: dict, direction: str,
+               size: int, time: int, sequence: int, legs: tuple) -> dict:
+        prepared, reasons = self.assess_orders(
+            experiment=experiment, scope=scope, basket=basket, direction=direction,
+            size=size, time=time, sequence=sequence, legs=legs)
         if reasons:
             return self._unknown(reasons, [[] for _ in legs])
 

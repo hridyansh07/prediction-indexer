@@ -23,7 +23,10 @@ class Entity:
         self.cls, self.control, self.shift, self.basket = cls, control, shift, basket
 
 
-def scale_admission(legs, plans):
+def scale_admission(legs, plans, *, native_scales=False):
+    require(type(native_scales) is bool, "native scale opt-in")
+    if native_scales:
+        return None
     scales = {(plans[key]["price_scale"], plans[key]["quantity_scale"]) for key in legs}
     return None if len(scales) == 1 else "UNSUPPORTED_SCALE"
 
@@ -42,7 +45,7 @@ def resolve(strategy, snapshot, scope_index, plans):
         reasons = basket.admission_reasons
         if admission is None:
             require(all(key in plans for key in basket.legs), "basket leg not planned")
-            admission = scale_admission(basket.legs, plans)
+            admission = scale_admission(basket.legs, plans, native_scales=getattr(strategy, "native_scales", False))
             reasons = ()
         real.append((basket, admission, reasons))
 
@@ -77,7 +80,7 @@ def resolve(strategy, snapshot, scope_index, plans):
                         index = basket.control_leg
                         replacement = other.descriptor["legs"][index]
                         legs = basket.legs[:index] + (other.legs[index],) + basket.legs[index + 1:]
-                        control_admission = scale_admission(legs, plans)
+                        control_admission = scale_admission(legs, plans, native_scales=getattr(strategy, "native_scales", False))
                     control_reasons = ()
                 order = (True, 0)
             else:

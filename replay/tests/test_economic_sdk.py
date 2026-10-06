@@ -242,6 +242,27 @@ class AggregateOutputTests(Base):
         self.assertEqual([(e["start_ns"], e["end_ns"]) for e in net], [("12", "30")])
         self.assertEqual(dens[0, long]["class_ns"]["NET_POSITIVE"], "18")
 
+    def test_class_flip_at_a_slice_boundary_writes_no_zero_duration_entry(self):
+        # Gap .02 opens below the .025 net threshold. Each later ask move changes the
+        # consumed quotes and the class at the same instant: NET_POSITIVE at 20, back
+        # at 22. The 2 ns NET_POSITIVE slice is shorter than the 5 ns tier, so a zero
+        # charged to it at 20 would be the tier's only NET_POSITIVE entry.
+        h = self.harness(known=True, policy=v2_policy(
+            minimum_net_gap_per_contract_e18="25000000000000000"))
+        h.window(); h.quote(12, 0); h.quote(12, 1)
+        h.quote(20, 0, ask=480); h.quote(22, 0, ask=488)
+        h.finish()
+        long = entity_index(h, direction="long", size_contracts="1")
+        gross = [e for e in rows(h, "episodes.ndjson") if e["entity"] == long and e["kind"] == "gross"]
+        self.assertEqual([(e["start_ns"], e["end_ns"]) for e in gross], [("12", "40")])
+        episode = gross[0]
+        self.assertEqual(episode["class_ns"], {"NET_NONPOSITIVE": "26", "NET_POSITIVE": "2"})
+        self.assertEqual(episode["qualifying_class_ns"], {
+            "1": {"NET_NONPOSITIVE": "26", "NET_POSITIVE": "2"},
+            "5": {"NET_NONPOSITIVE": "26"},
+            "10": {"NET_NONPOSITIVE": "18"},
+        })
+
     def test_reader_rejects_an_episode_outside_positive_time(self):
         h = self.harness(known=True, policy=v2_policy())
         h.window(); h.quote(12, 0); h.quote(12, 1); h.quote(30, 0, ask=700)

@@ -26,6 +26,8 @@ class Strategy:
     filesystem paths. Neither keeps state between callbacks.
     """
 
+    # Explicit opt-in for strategies that price every leg in its native scales.
+    native_scales = False
     experiment = None
     snapshot = None
 

@@ -120,3 +120,13 @@ Execution uses the named `DISPLAYED_DEPTH_SURVIVAL_100MS` estimator. It measures
 how long the exact ladder slice required for the ticket remains unchanged. It
 does not observe queue position, order acknowledgements, trades, or fills, and
 cannot label a quote as captured or filled.
+
+`replay.cross_venue_arbitrage:build` measures two-leg all-BUY complete sets across
+venues using the pinned static mask API, native-scale fills, Fee SDK assessments
+and an explicit parity valuation scenario. Results are normal-resolution research
+detections. Output format 2 keeps size-independent rejection denominators once
+per scope with a null size. The SDK checks exact real/control entity-table bytes
+before opening outputs; admitted size-specific route identities are preserved.
+See [CROSS_VENUE_ARBITRAGE_V1.md](../docs/CROSS_VENUE_ARBITRAGE_V1.md)
+for configuration, preparation from `UNIVERSE_BASE_URL`, independent reading and
+the bounded pilot recipe.
