@@ -1,14 +1,16 @@
 """Independent cross-venue result reader; never imports the runtime evaluator."""
 
+from fractions import Fraction
 from pathlib import Path
 
 from replay.cross_venue_contract import (
-    STRATEGY, SETTLEMENT, SCALE, UNIT, Inputs, asset_row, asset_value, baskets,
-    economics_by_key, experiment, experiment_identity, policy_config, valuation_config,
+    STRATEGY, SETTLEMENT, SCALE, UNIT, Inputs, asset_row, asset_value, assess_net, baskets,
+    economics_by_key, experiment, experiment_identity, net_of, policy_config, valuation_config,
 )
 from replay.complement_contract import control_descriptor, control_label
 from replay.complement_output import _aggregate_rows
-from replay.economic_sdk import Strategy, aggregate_reader
+from replay.economic_sdk import FillSpec, Strategy, aggregate_reader
+from replay.economic_sdk.fills import step_atoms
 from replay.fees import Policy
 from replay.fees.domain import AccountClass, Component, Evidence, Venue
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
@@ -20,10 +22,15 @@ from replay.streams.protocol import freeze, obj, require, uint
 class CrossVenueReader(Strategy):
     native_scales = True
 
-    def __init__(self, policy, identity, valuation, fees, snapshot):
+    def __init__(self, policy, identity, valuation, fees, snapshot, bridge=None):
         self.policy = policy_config(policy)
         self.valuation = valuation_config(valuation)
         self.experiment = experiment(self.policy, identity)
+        # Fill checks price fees through the bridge in the runtime and the reader alike.
+        self.bridge = bridge
+        if self.experiment.fills is not None:
+            require(bridge is not None, "cross-venue fill checks require the fee catalog")
+            require(bridge.semantic_config == fees, "fee bridge/manifest fee configuration")
         self.threshold = int(self.policy["minimum_net_gap_per_contract_e18"])
         self.plans = {(p["instrument"], p["orientation"]): p for p in snapshot["plans"]}
         require(type(fees["assets"]) is dict, "fee assets")
@@ -46,6 +53,39 @@ class CrossVenueReader(Strategy):
 
     def baskets(self, snapshot, policy, scope_index):
         return baskets(snapshot, policy, scope_index)
+
+    # -- fill checks (policy 3) --------------------------------------------------
+    def fill_spec(self, entity):
+        """Each leg buys from its ask ladder; Kalshi's is the projected opposite bids."""
+        fills = self.experiment.fills
+        return FillSpec(tuple("kalshi_complement_ask" if key[0].startswith("kalshi:") else "ask"
+                              for key in entity.legs),
+                        tuple(step_atoms(fills, self.plans[key]["quantity_scale"]) for key in entity.legs))
+
+    def fill_value(self, entity, steps, legs, time):
+        """Exact net of ``steps`` contracts above the configured minimum, at scale 36.
+
+        The fees are the same single-order assessment per leg as the trigger's, at
+        the fill's open time. ``None`` when any fee, economics or valuation input
+        is unknown.
+        """
+        d = entity.descriptor
+        acquired = tuple((leg["instrument"], leg["orientation"]) for leg in d["legs"])
+        economics = tuple(self.bridge.economics(key) for key in acquired)
+        if any(e is None for e in economics) or any(
+                asset_row(e.quote) not in self.valuation["assets"] for e in economics):
+            return None
+        fee_legs = tuple({"market_id": leg["market_id"], "key": key, "fill": fill,
+                          "price_scale": e.price_scale, "quantity_scale": e.quantity_scale, "side": "BUY"}
+                         for leg, key, fill, e in zip(d["legs"], acquired, legs, economics))
+        native, unknown, _, _ = assess_net(
+            self.bridge, experiment=self.experiment.experiment_sha256, scope=0, basket=d,
+            size=steps, time=time, sequence=0, fee_legs=fee_legs)
+        if unknown:
+            return None
+        minimum = steps * Fraction(self.experiment.fills.step_contracts) * self.threshold * 10 ** 18
+        require(minimum.denominator == 1, "minimum net gap is not exact at the fill step")
+        return net_of(native) - int(minimum)
 
     def control_descriptor(self, basket, control, replacement, admission):
         return control_descriptor(self.policy, basket, control, replacement, admission)
@@ -208,10 +248,13 @@ def check_manifest(value, snapshot, complete):
         require(type(amount) is int and 0 <= amount <= 2 ** 64 - 1, "instantaneous positive count")
 
 
-def validate_content(directory, snapshot, manifest):
+def validate_content(directory, snapshot, manifest, bridge=None):
+    """Read one output; a policy 3 (fill checks) output needs the configured fee ``bridge``."""
     check_manifest(manifest, snapshot, "summary_sha256" in manifest)
+    if bridge is not None:
+        require(bridge.engine_identity == manifest["fee_engine_identity"], "fee engine identity")
     strategy = CrossVenueReader(manifest["policy"], manifest["experiment_sha256"], manifest["valuation"],
-                                manifest["fee_config"], snapshot)
+                                manifest["fee_config"], snapshot, bridge)
     if strategy.experiment.profile is not None:
         from replay.economic_sdk.profile_reader import validate_profile
         strategy.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"], strategy.experiment.profile,
@@ -219,7 +262,7 @@ def validate_content(directory, snapshot, manifest):
     return aggregate_reader.validate(directory, snapshot, manifest, strategy)
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256):
+def read_provisional(directory, snapshot_directory, *, expected_sha256, bridge=None):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = read_json(root / "manifest.json")
@@ -232,7 +275,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256):
     for field in ("run_id", "attempt_id", "group"):
         require(type(receipt[field]) is str and 0 < len(receipt[field]) <= 128, "receipt identifiers")
     require(type(receipt["terminal"]) is int and receipt["terminal"] >= 2, "terminal sequence")
-    summary = validate_content(root, snapshot, manifest)
+    summary = validate_content(root, snapshot, manifest, bridge)
     require(encoded(summary) == encoded(read_json(root / "summary.json")) and digest(summary) == manifest["summary_sha256"],
             "summary identity/schema")
     return {"receipt": receipt, "manifest": manifest, "summary": summary}
@@ -250,7 +293,7 @@ def read_completed(run_directory, group):
     inputs = Inputs(spec["config"])
     inputs.prepared.bind(freeze(initial(config)))
     result = read_provisional(root / success["outputs"][group], spec["config"]["snapshot_directory"],
-                              expected_sha256=spec["config"]["snapshot_sha256"])
+                              expected_sha256=spec["config"]["snapshot_sha256"], bridge=inputs.bridge)
     require(result["manifest"]["experiment_sha256"] == inputs.identity and
             result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity, "configured identity")
     require({k: result["receipt"][k] for k in ("identity", "attempt_id", "group", "run_id", "terminal")} ==

@@ -84,6 +84,56 @@ Q(L) and time-shift controls are retrospective diagnostics. No atomic execution,
 realized profit, dynamic masks, void branches, source/settlement compatibility,
 shorts, makers, inventory simulation, conversion or optimizer is implemented.
 
+## Fill checks (policy 3)
+
+Policy 3 replaces the fixed size sweep with the SDK's fill checks
+([ECONOMIC_STRATEGY_SDK_V1.md](ECONOMIC_STRATEGY_SDK_V1.md) §13). Its closed
+fields are policy 2's, without `sizes_contracts`, `headline_size_contracts` and
+the control fields, plus `fills`, the SDK's closed fill policy. Controls are not
+supported with fill checks.
+
+- **Trigger.** Unchanged: each admitted route is one entity at a 1-contract
+  trigger size (`size_contracts: "1"`), and the `net` predicate (exact fees, net
+  positive and at least the configured minimum) is the trigger. `gross` episodes
+  stay ordinary quote-slice episodes.
+- **Fill.** When the trigger turns on, the SDK walks both legs' full ask ladders
+  once (Kalshi's is the opposite orientation's bids, projected) and prices the
+  declared sizings. The default is one governing `edge` sizing: walk while the net
+  strictly increases. A strategy that needs a fixed amount declares a governing
+  `{"name": ..., "role": "governs", "target_contracts": "1000"}` instead; no fill
+  opens unless the book serves the whole target.
+- **Value.** `fill_value` is the exact net of the walked contracts at scale 36,
+  less the minimum net gap for that many contracts, with fees from the same
+  single-order assessment per leg that the trigger uses, at the fill's open time
+  and the configured fee catalog. It is unknown (`None`) when any fee, economics
+  or valuation input is. Kalshi's per-order fee rounding makes the net only nearly
+  concave, so edge optimality stays writer-attested, as in the SDK.
+- **End.** A fill ends at its per-leg kill price, when the trigger turns off,
+  or when a book becomes unusable; `end_books` records each leg's book at the end.
+  Two routes may walk the same book side at once; fills measure apparent edge,
+  not executable trades, so no route's depth is reduced by another's.
+- **Reading.** The reader re-prices every fill through the fee engine, so
+  `validate_content`, `read_provisional` and `read_completed` take the configured
+  fee bridge for a policy 3 output and fail visibly without it. Summary rows add
+  `fill_ns` and `fill_ends`.
+
+Policy 2 remains readable and runnable for the fixed-size sweep.
+
+**Retained fixture (2026-10-07).** One Linux supervisor run of the re-prepared
+Procyon context with current published fees and one governing `edge` sizing
+succeeded in 79 s (the eight-size sweep takes several minutes), and the completed
+reader re-priced every fill. An independent check against the published fee
+formulas, not the fee SDK, found:
+
+- 42 fills on 7 routes; every value recomputes exactly, and all 84 kill prices
+  have their defining property;
+- on every route, trigger-positive time equals the policy 2 run's 1-contract
+  net-positive time, and the 225 gross episodes are identical to its 1-contract
+  episodes apart from fee assessment identities (which hash the experiment);
+- in 30 edge stops one more contract from the carried `after` level is not worth
+  more; the other 12 need depth beyond the carried level and stay writer-attested;
+- ends: 35 trigger-false, 4 kill price, 3 self-crossed leg; all fill time was live.
+
 ## Preparation endpoint
 
 Use UNIVERSE_BASE_URL, the existing jobs universe_base_url naming convention.
@@ -128,8 +178,9 @@ PYCODE
    `valuation.assets`, sorted by canonical JSON. Empty bindings or valuation
    coverage produce explicit unknown economics, not a net research result.
    The template deliberately contains no invented catalog, native asset or timestamp.
-   Policy uses the existing 1/10/25/50/100/250/500/1000-contract sweep. Start with a
-   small pinned interval, then preregister any size/latency changes before the corpus.
+   The template uses policy 3 (fill checks, below) with one governing `edge`
+   sizing. Start with a small pinned interval, then preregister any sizing or
+   latency changes before the corpus.
 
 3. Build a direct supervisor config `/research/cross-run.json` under
    [REPLAY_SUPERVISOR_V1.md](REPLAY_SUPERVISOR_V1.md), with absolute Python/publisher

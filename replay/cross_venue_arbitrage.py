@@ -1,15 +1,11 @@
 """Two-leg taker complete-set census on the shared economic SDK."""
 
-from replay.cross_venue_contract import Inputs, SCALE, UNIT, asset_row, SETTLEMENT
+from replay.cross_venue_contract import (Inputs, SCALE, UNIT, SETTLEMENT, asset_row, assess_net, native_amount,
+                                         net_of, sizes)
 from replay.cross_venue_output import CrossVenueReader, validate_content
 from replay.complement_contract import reason
-from replay.complement_fees import FeeEconomicsUnavailable
 from replay.economic_sdk import (BookRequirement, Requirements, Observation, factory,
                                  EVALUATED, UNUSABLE, ONE_SIDED, DEPTH_LIMITED)
-
-
-def native_amount(atoms, scale):
-    return atoms * 10 ** (SCALE - scale)
 
 
 class CrossVenueArbitrage(CrossVenueReader):
@@ -20,9 +16,8 @@ class CrossVenueArbitrage(CrossVenueReader):
         self.snapshot = self.inputs.snapshot
         self.snapshot_sha256 = self.inputs.prepared.sha256
         super().__init__(self.inputs.policy, self.inputs.identity, self.inputs.valuation,
-                         self.inputs.bridge.semantic_config, self.snapshot)
-        self.bridge = self.inputs.bridge
-        self.sizes = tuple(int(s) for s in self.policy["sizes_contracts"])
+                         self.inputs.bridge.semantic_config, self.snapshot, self.inputs.bridge)
+        self.sizes = tuple(int(s) for s in sizes(self.policy))
 
     def bind(self, initial):
         self.inputs.prepared.bind(initial)
@@ -33,9 +28,13 @@ class CrossVenueArbitrage(CrossVenueReader):
         return self.inputs.prepared.bound
 
     def requirements(self, snapshot, policy):
+        # Fill checks walk each leg's full ask ladder (Kalshi: the projected bids).
+        fills = self.experiment.fills is not None
         return Requirements({key: (
-            BookRequirement(("bid",), self.sizes, True, ("kalshi_complement_ask",))
-            if plan["venue"] == "kalshi" else BookRequirement(("bid", "ask"), self.sizes))
+            BookRequirement(("bid",), self.sizes, True, ("kalshi_complement_ask",),
+                            ("kalshi_complement_ask",) if fills else ())
+            if plan["venue"] == "kalshi" else
+            BookRequirement(("bid", "ask"), self.sizes, ladders=("ask",) if fills else ()))
             for key, plan in self.plans.items()}, self.experiment.profile)
 
     def evaluate(self, entity, views, context):
@@ -89,49 +88,17 @@ class CrossVenueArbitrage(CrossVenueReader):
         if gross <= 0:
             return Observation(EVALUATED, value_class="GROSS_NONPOSITIVE", payload=payload,
                                quotes=quotes, context_free=True)
-        try:
-            orders, missing = self.bridge.assess_orders(
-                experiment=context.experiment_sha256, scope=context.scope, basket=d,
-                direction="BUY", size=size, time=context.time, sequence=context.sequence,
-                legs=tuple(fee_legs), account="cross_venue_arbitrage_v1")
-        except FeeEconomicsUnavailable as error:
-            orders, missing = (None,) * len(fee_legs), ("fee_economics_unavailable:" + str(error),)
-        unknown, assumptions, evidence = list(missing), {"PER_LEVEL_DECLARED_PARTITION_ESTIMATE"}, set()
-        for i, order in enumerate(orders):
-            if order is None:
-                continue
-            e, results = order
-            rows[i]["assessment_ids"] = [r.identity for r in results]
-            cash, received = 0, 0
-            known = True
-            for r in results:
-                assumptions.update(r.assumptions)
-                evidence.add(r.evidence.value)
-                unknown.extend(f"fee_sdk:{u.component.value}:{u.reason.value}" for u in r.unknowns)
-                for charge in r.charges:
-                    rows[i]["charges"].append({"asset": asset_row(charge.amount.asset),
-                        "amount_e36": str(native_amount(charge.amount.amount.atoms, charge.amount.amount.scale)),
-                        "component": charge.component.value})
-                if r.net_deltas is None:
-                    known = False
-                    unknown.append("fee_sdk:missing_net_deltas")
-                    continue
-                for delta in r.net_deltas:
-                    amount = native_amount(delta.atoms, delta.scale)
-                    if delta.asset == e.quote:
-                        cash += amount
-                    elif delta.asset == e.outcome:
-                        received += amount
-                    else:
-                        known = False
-                        unknown.append("unexpected_asset_delta")
-            if known:
-                rows[i]["quote_delta_e36"], rows[i]["received_e36"] = str(cash), str(received)
+        legs, unknown, assumptions, evidence = assess_net(
+            self.bridge, experiment=context.experiment_sha256, scope=context.scope, basket=d,
+            size=size, time=context.time, sequence=context.sequence, fee_legs=fee_legs)
+        for row, leg in zip(rows, legs):
+            row["assessment_ids"], row["charges"] = leg["assessment_ids"], leg["charges"]
+            if leg["cash"] is not None:
+                row["quote_delta_e36"], row["received_e36"] = str(leg["cash"]), str(leg["received"])
         net = None
         if not unknown:
-            floor = min(int(row["received_e36"]) for row in rows)
-            payload["payout_floor_net_e36"] = str(floor)
-            net = floor + sum(int(row["quote_delta_e36"]) for row in rows)
+            payload["payout_floor_net_e36"] = str(min(leg["received"] for leg in legs))
+            net = net_of(legs)
             payload["gap_net"] = str(net)
         payload.update(fee_status="UNKNOWN" if unknown else "KNOWN",
                        assumptions=sorted(assumptions), evidence=sorted(evidence))
@@ -155,7 +122,7 @@ class CrossVenueArbitrage(CrossVenueReader):
     def validate(self, directory, snapshot, manifest):
         from replay.streams.protocol import require
         require(self.bound, "missing initial")
-        return validate_content(directory, snapshot, manifest)
+        return validate_content(directory, snapshot, manifest, self.bridge)
 
 
 build = factory(CrossVenueArbitrage)

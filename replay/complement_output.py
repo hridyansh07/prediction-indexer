@@ -343,6 +343,10 @@ def _aggregate_rows(aggregates, facts, latency, *, size_order=int):
                 "fee_unknown_in_qualifying_gross_slices_ns":
                     str(g.qualifying["gross"][latency].get("FEE_UNKNOWN", 0)),
                 "gross_slice_ns_by_skew": {b: str(v) for b, v in sorted(g.slice_ns_by_skew["gross"].items())}}
+        if g.fill_ns:
+            # Fill checks only (SDK spec §13): trigger-positive time by fill state.
+            row["fill_ns"] = {k: str(v) for k, v in sorted(g.fill_ns.items())}
+            row["fill_ends"] = dict(sorted(g.fill_ends.items()))
         rows.append(row)
     return rows
 

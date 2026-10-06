@@ -5,6 +5,8 @@ from itertools import combinations, product
 import json
 
 from replay.complement_contract import policy_config as sdk_policy, reason, experiment as sdk_experiment
+from replay.complement_fees import FeeEconomicsUnavailable
+from replay.economic_sdk.fills import fill_policy
 from replay.economic_sdk.types import Basket
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.fees.domain import Asset, AssetKind, InstrumentEconomics
@@ -19,6 +21,13 @@ MAX_PAIRS = 4096
 SCALE = 36
 UNIT = 10 ** SCALE
 DIAGNOSTICS = ("SELF_CROSSED_LEG", "ECONOMICS_UNKNOWN", "VALUATION_UNKNOWN")
+ACCOUNT = "cross_venue_arbitrage_v1"
+# Policy 3 (fill checks, SDK spec §13): the 1-contract net check triggers one
+# priced fill per episode; ``fills`` is the SDK's closed fill policy.
+FILL_KIND = "net"
+TRIGGER_SIZE = "1"
+_V3_FIELDS = ("version fills latency_tiers_ns headline_latency_ns minimum_net_gap_per_contract_e18 "
+              "leg_skew_buckets_ns verdict audit_intervals profile")
 
 
 def asset_row(asset):
@@ -45,12 +54,35 @@ def valuation_config(value):
     return value
 
 
+def _sweep(policy):
+    """Policy 3 as the SDK policy 2 it measures with: one trigger size, no controls."""
+    if policy.get("version") != 3:
+        return policy
+    sweep = {k: v for k, v in policy.items() if k != "fills"}
+    sweep.update(version=2, sizes_contracts=[TRIGGER_SIZE], headline_size_contracts=TRIGGER_SIZE,
+                 controls=[], controls_episodes=False, controls_slices=False,
+                 time_shift_ring_entries="0")
+    return sweep
+
+
 def policy_config(value):
+    """Policy 2 (the fixed-size sweep) or policy 3 (fill checks at a 1-contract trigger)."""
+    value = plain(value)
+    if type(value) is dict and value.get("version") == 3:
+        obj(value, _V3_FIELDS)
+        sdk_policy(_sweep(value))
+        fill_policy(value["fills"], FILL_KIND)
+        return value
     policy = sdk_policy(value)
-    require(policy["version"] == 2, "cross-venue requires SDK policy 2")
+    require(policy["version"] == 2, "cross-venue requires SDK policy 2 or 3")
     require(all(c["kind"] == "time_shift" for c in policy["controls"]),
             "cross-venue supports time_shift controls only")
     return policy
+
+
+def sizes(policy):
+    """Requested sizes: the policy 2 sweep, or policy 3's single trigger size."""
+    return _sweep(policy)["sizes_contracts"]
 
 
 def experiment_identity(snapshot_sha, policy, fees, valuation):
@@ -60,8 +92,69 @@ def experiment_identity(snapshot_sha, policy, fees, valuation):
 
 
 def experiment(policy, identity):
-    return replace(sdk_experiment(policy, identity), strategy=STRATEGY,
-                   diagnostic_statuses=DIAGNOSTICS)
+    fills = fill_policy(policy["fills"], FILL_KIND) if policy["version"] == 3 else None
+    return replace(sdk_experiment(_sweep(policy), identity), strategy=STRATEGY, policy=policy,
+                   policy_sha256=digest(policy), diagnostic_statuses=DIAGNOSTICS, fills=fills)
+
+
+def assess_net(bridge, *, size, time, fee_legs, **identity):
+    """Fee-assess one all-BUY complete set of ``size`` contracts; one order per leg.
+
+    Shared by the trigger and the fill value so both price fees identically.
+    Returns per-leg ``{assessment_ids, charges, cash, received}`` (``cash`` and
+    ``received`` are ``None`` unless that leg's deltas are known), the sorted
+    unknown reasons, the assumptions and the evidence. Order identities never
+    change an amount.
+    """
+    try:
+        orders, missing = bridge.assess_orders(direction="BUY", size=size, time=time,
+                                               legs=tuple(fee_legs), account=ACCOUNT, **identity)
+    except FeeEconomicsUnavailable as error:
+        orders, missing = (None,) * len(fee_legs), ("fee_economics_unavailable:" + str(error),)
+    unknown, assumptions, evidence = list(missing), {"PER_LEVEL_DECLARED_PARTITION_ESTIMATE"}, set()
+    legs = []
+    for order in orders:
+        leg = {"assessment_ids": [], "charges": [], "cash": None, "received": None}
+        legs.append(leg)
+        if order is None:
+            continue
+        e, results = order
+        leg["assessment_ids"] = [r.identity for r in results]
+        cash, received = 0, 0
+        known = True
+        for r in results:
+            assumptions.update(r.assumptions)
+            evidence.add(r.evidence.value)
+            unknown.extend(f"fee_sdk:{u.component.value}:{u.reason.value}" for u in r.unknowns)
+            for charge in r.charges:
+                leg["charges"].append({"asset": asset_row(charge.amount.asset),
+                    "amount_e36": str(native_amount(charge.amount.amount.atoms, charge.amount.amount.scale)),
+                    "component": charge.component.value})
+            if r.net_deltas is None:
+                known = False
+                unknown.append("fee_sdk:missing_net_deltas")
+                continue
+            for delta in r.net_deltas:
+                amount = native_amount(delta.atoms, delta.scale)
+                if delta.asset == e.quote:
+                    cash += amount
+                elif delta.asset == e.outcome:
+                    received += amount
+                else:
+                    known = False
+                    unknown.append("unexpected_asset_delta")
+        if known:
+            leg["cash"], leg["received"] = cash, received
+    return legs, unknown, assumptions, evidence
+
+
+def net_of(legs):
+    """Net at scale 36: collateral deltas plus the minimum received payout."""
+    return min(leg["received"] for leg in legs) + sum(leg["cash"] for leg in legs)
+
+
+def native_amount(atoms, scale):
+    return atoms * 10 ** (SCALE - scale)
 
 
 def economics_by_key(fee_config):
@@ -121,7 +214,7 @@ def baskets(snapshot, policy, scope_index):
         route = digest(legs if missing_market is None else missing_market)
         # Admission is independent of requested depth. A null size records its
         # scoped denominator once, including in each enabled pair control.
-        for size in ([None] if admission is not None else policy["sizes_contracts"]):
+        for size in ([None] if admission is not None else sizes(policy)):
             descriptor = {"venue": venues, "basket_kind": "CROSS_VENUE_COMPLETE_SET",
                           "market_id": missing_market or route, "route_id": route, "legs": legs,
                           "mask_legs": [{"status": masks.status(k)[0], "reason": masks.status(k)[1],

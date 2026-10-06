@@ -19,18 +19,19 @@
     "assets": []
   },
   "policy": {
-    "version": 2,
-    "sizes_contracts": [
-      "1",
-      "10",
-      "25",
-      "50",
-      "100",
-      "250",
-      "500",
-      "1000"
-    ],
-    "headline_size_contracts": "100",
+    "version": 3,
+    "fills": {
+      "version": 1,
+      "step_contracts": "1",
+      "max_levels": 64,
+      "sizings": [
+        {
+          "name": "edge",
+          "role": "governs",
+          "edge": true
+        }
+      ]
+    },
     "latency_tiers_ns": [
       "250000000",
       "1000000000",
@@ -49,11 +50,7 @@
       "maximum_positive_time_fraction_ppm": "0",
       "minimum_evaluated_ns": "3600000000000"
     },
-    "controls": [],
-    "controls_episodes": false,
-    "controls_slices": false,
     "audit_intervals": false,
-    "time_shift_ring_entries": "100000",
     "profile": null
   }
 }

@@ -40,8 +40,22 @@ def fixture_detail(limitless=False):
     return d
 
 
+EDGE = {"name": "edge", "role": "governs", "edge": True}
+
+
+def fill_policy_v3(policy, sizings, step="1"):
+    """Policy 3: the policy 2 fields without the size sweep or controls, plus fills."""
+    value = {k: v for k, v in policy.items() if k not in (
+        "sizes_contracts", "headline_size_contracts", "controls", "controls_episodes",
+        "controls_slices", "time_shift_ring_entries")}
+    value.update(version=3, fills={"version": 1, "step_contracts": step, "max_levels": 64,
+                                   "sizings": list(sizings)})
+    return value
+
+
 class Harness(BaseHarness):
-    def __init__(self, root, *, doc=True, native=True, fees="zero", limitless=False, policy=None, valuation=True, scales=None, **kwargs):
+    def __init__(self, root, *, doc=True, native=True, fees="zero", limitless=False, policy=None, valuation=True, scales=None,
+                 fills=None, **kwargs):
         self.root = root
         d = fixture_detail(limitless)
         def prep_config():
@@ -67,6 +81,8 @@ class Harness(BaseHarness):
             cfg["policy"].update(v2_policy())
             if policy:
                 cfg["policy"].update(policy)
+            if fills is not None:
+                cfg["policy"] = fill_policy_v3(cfg["policy"], fills)
             from replay.fees.artifacts import load_catalog, source_from_bytes
             cat = load_catalog(Path(cfg["fees"]["catalog_directory"]))
             # Synthetic evidenced multiplier zero is supported; ZeroFee is not a Kalshi model.
@@ -122,7 +138,8 @@ class Harness(BaseHarness):
 
     def finish(self):
         self.terminal(); self.decoder.finish(); self.strategy.finish()
-        return read_provisional(self.output, self.root/"context", expected_sha256=self.sha)
+        return read_provisional(self.output, self.root/"context", expected_sha256=self.sha,
+                                bridge=self.strategy.strategy.bridge)
 
     def close(self):
         for writer in self.strategy.writers.values():
@@ -416,3 +433,99 @@ class CrossVenueTests(unittest.TestCase):
             receipt=json.loads(path.read_bytes()); receipt["attempt_id"]="b"*32; path.write_bytes(encoded(receipt))
             with self.assertRaisesRegex(ProtocolError,"supervisor/content binding"):
                 read_completed(run,"coverage")
+
+
+class CrossVenueFillTests(unittest.TestCase):
+    """Policy 3: the 1-contract net check triggers one priced fill per episode."""
+
+    YES_THEN_PM = (("kalshi:series", "outcome"), ("polymarket:987", "outcome"))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def harness(self, *sizings, **kw):
+        h = Harness(self.root, fills=sizings or (EDGE,), **kw)
+        self.addCleanup(h.close)
+        return h
+
+    def fills(self, h):
+        return [r for r in h.records("episodes.ndjson") if r["kind"] == "net"]
+
+    def test_one_entity_per_route_and_the_edge_walk_stops_where_the_edge_is_gone(self):
+        h = self.harness()
+        h.populate()
+        # Kalshi YES asks 0.40 x 3 then 0.50 x 10; Polymarket 0.580 x 1 then 0.595 x 5.
+        ladder(h, 12, "kalshi:series", "complement", bids=((60, 3), (50, 10)))
+        ladder(h, 12, "polymarket:987", bids=((100, 3 * 10**6),), asks=((580, 10**6), (595, 5 * 10**6)))
+        # Kalshi's projected ask reaches the 0.41 kill price; the 1-contract trigger
+        # (0.41 + 0.58) stays on, so the fill ends on its kill price.
+        ladder(h, 20, "kalshi:series", "complement", bids=((59, 3), (50, 10)))
+        result = h.finish()
+        admitted = [e for e in h.strategy.entities.values() if e.admission is None and e.cls == "real"]
+        self.assertEqual({e.descriptor["size_contracts"] for e in admitted}, {"1"})
+        self.assertEqual(len(admitted), 2)   # the two partitions of this fixture's masks
+        first = next(r for r in self.fills(h) if r["start_ns"] == "12"
+                     and r["fill"]["results"][0]["legs"][1]["taken"][0] == ["580", "1000000"])
+        (edge,) = first["fill"]["results"]
+        # Marginal sets: 0.40 + 0.580, then 0.40 + 0.595 twice; 0.50 + 0.595 loses.
+        self.assertEqual((edge["steps"], edge["stop"], edge["value"]), ("3", "edge", str(UNIT * 3 // 100)))
+        self.assertEqual(edge["legs"][0]["taken"], [["40", "3"]])
+        self.assertEqual(edge["after"], [["50", "10"], ["595", "3000000"]])
+        # Three contracts at one price: 3k + 1.77 <= 3 on Kalshi, 3k + 1.20 <= 3 on Polymarket.
+        self.assertEqual(edge["kill_prices"], ["41", "600"])
+        self.assertEqual((first["end_ns"], first["end_reason"]), ("20", "KILL_PRICE"))
+        self.assertEqual(first["fill"]["kill_leg"], 0)
+        self.assertTrue(any("fill_ns" in row for row in result["summary"]["rows"]))
+
+    def test_fill_value_prices_fees_like_the_trigger(self):
+        h = self.harness({"name": "one", "role": "governs", "target_contracts": "1"}, fees="collateral")
+        h.populate(pm_away=570, kalshi_no=60)
+        strategy = h.strategy.strategy
+        entity = next(e for e in h.strategy.entities.values() if e.cls == "real" and e.admission is None
+                      and tuple((d["instrument"], d["orientation"]) for d in e.descriptor["legs"])
+                      == self.YES_THEN_PM)
+        obs = strategy.evaluate(entity, tuple(h.strategy.views[k] for k in entity.legs),
+                                Context(12, 8, 0, h.strategy.experiment.experiment_sha256))
+        # 0.40 BUY pays 0.02 Kalshi fee: the trigger's net and the fill's value agree.
+        self.assertEqual(int(obs.payload["gap_net"]), UNIT // 100)
+        h.finish()
+        (row,) = [r for r in self.fills(h) if r["fill"]["results"][0]["legs"][1]["taken"][0][0] == "570"]
+        self.assertEqual(row["fill"]["results"][0]["value"], str(UNIT // 100))
+
+    def test_a_governing_target_the_book_cannot_serve_opens_no_fill(self):
+        h = self.harness({"name": "t5", "role": "governs", "target_contracts": "5"})
+        h.populate()   # three contracts of depth everywhere
+        result = h.finish()
+        self.assertEqual(self.fills(h), [])
+        rows = [r for r in result["summary"]["rows"] if "fill_ns" in r]
+        self.assertTrue(rows and all(set(r["fill_ns"]) == {"FILL_DEPTH_SHORT"} for r in rows))
+
+    def test_reader_needs_the_fee_catalog_and_rechecks_fill_values(self):
+        h = self.harness()
+        h.populate()
+        result = h.finish()
+        manifest = result["manifest"]
+        self.assertEqual(manifest["policy"]["version"], 3)
+        with self.assertRaisesRegex(ProtocolError, "require the fee catalog"):
+            read_provisional(h.output, h.root / "context", expected_sha256=h.sha)
+        import hashlib
+        rows = h.records("episodes.ndjson")
+        net = next(r for r in rows if r["kind"] == "net")
+        net["fill"]["results"][0]["value"] = str(int(net["fill"]["results"][0]["value"]) + 1)
+        raw = b"".join(encoded(row) + b"\n" for row in rows)
+        (h.output / "episodes.ndjson").write_bytes(raw)
+        m = copy.deepcopy(manifest)
+        m["files"]["episodes.ndjson"] = {"sha256": hashlib.sha256(raw).hexdigest(),
+                                         "byte_length": len(raw), "records": len(rows)}
+        with self.assertRaisesRegex(ProtocolError, "fill value"):
+            validate_content(h.output, h.strategy.snapshot, m, h.strategy.strategy.bridge)
+
+    def test_policy_3_is_closed_and_rejects_controls_and_the_size_sweep(self):
+        h = self.harness()
+        policy = h.cross_config["policy"]
+        for bad in ({**policy, "sizes_contracts": ["1"]}, {**policy, "controls": []},
+                    {**policy, "fills": {**policy["fills"], "sizings": []}}):
+            with self.subTest(bad=sorted(set(bad) ^ set(policy))), self.assertRaises(ProtocolError):
+                policy_config(bad)
