@@ -11,7 +11,7 @@
     },
     {
       "path": "docs/ECONOMIC_STRATEGY_SDK_V1.md",
-      "sha256": "d6f610122ddf3439bf0c1e12e9307258471d188476ca592b2de372c8cd1d7308"
+      "sha256": "0acf460c69a9cbce54da4da42e6b239eb9e771d60653577ecfb276b7acdff488"
     },
     {
       "path": "docs/STRATEGY_PREPARATION_V1.md",
@@ -19,7 +19,7 @@
     },
     {
       "path": "replay/README.md",
-      "sha256": "66b2bfcf0c946f62ad9043fd74f031cf4ddd0529099bf169196683fbf8d0358a"
+      "sha256": "39d3ff32c6f8a0b99e2ad991c8a93e3488efe15e53836199d2c6d4f693628d9e"
     },
     {
       "path": "replay/complement_fees.py",
@@ -43,11 +43,11 @@
     },
     {
       "path": "replay/economic_sdk/__init__.py",
-      "sha256": "6b1829029f9aba2969be5bd703caedf94ca020a7cfa2386068b6163d4bbd54c8"
+      "sha256": "c6b3328fa5ea4fa111003b08b37e14ce3081817a0f3a07ddaa7681e937b5348a"
     },
     {
       "path": "replay/economic_sdk/aggregate_reader.py",
-      "sha256": "1c7fdbba65806217795e494e9f6ff9ec04e56cfd0f76d821eb4da6071a248570"
+      "sha256": "43647a83bad106dd231caa71f257d95f3e8ca57b9317c1933a760d38da8ece67"
     },
     {
       "path": "replay/economic_sdk/entities.py",
@@ -59,7 +59,7 @@
     },
     {
       "path": "replay/economic_sdk/runtime.py",
-      "sha256": "912ad45d4335fb1d9527ab40095ea4abb1fe6e2aa80a2389c55ac732eafdc198"
+      "sha256": "8d8ab96e4728f1d3fb4ecb2223a62b430eb769dbacd78dc7895bca6a530d497d"
     },
     {
       "path": "replay/prepare_context.py",
@@ -82,5 +82,5 @@
       "sha256": "8de3a769d82c34e436e4c262458c3c94ef6d0ae2dbe83ae8227f9668bce898d3"
     }
   ],
-  "source_sha256": "1368acd249c0cb612be4de4c8c2800d4a325ea193aff9b8014d0fad159af7952"
+  "source_sha256": "ee6af42a52bced2bc903492d39864fdc134bacf53209db26a1db33a70b22bb8c"
 }

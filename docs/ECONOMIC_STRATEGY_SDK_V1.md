@@ -801,61 +801,94 @@ the V1 goldens, is byte-identical.
 
 **Model.** The strategy's pure `evaluate` stays the cheap **trigger**: from best
 prices it decides whether a tradeable opportunity exists, through the
-predicates of one declared episode kind. When that kind is active and the
-entity has no live fill, the SDK prices **one fill** with
+predicates of one declared episode kind. The **strategy decides which fills
+matter** by declaring sizings; the SDK supplies the mechanism and enforces the
+declaration. When the trigger kind is active and the entity has no live fill,
+the SDK prices the strategy's **governing** sizings with
 `replay.economic_fills.walk_basket` against the ladders the views hold at that
-committed instant. The fill is never re-walked or re-sized. It is not priced
-"throughout" the episode: that would assume either no fill or infinite depth.
+committed instant. When every governing sizing is tradeable, **one fill**
+opens; its recording sizings are priced at the same instant. The fill is never
+re-walked or re-sized. It is not priced "throughout" the episode: that would
+assume either no fill or infinite depth.
 
+### Sizings
+
+Each sizing has a unique `name`, a `role`, and exactly **one mode**:
+
+- `target`: price a fixed quantity, `target_contracts`, and return what the book
+  can serve (stop `target`, or `book_exhausted`/`level_cap` when it cannot);
+- `edge`: walk while the value strictly increases and stop at the smallest step
+  count that maximizes it (stop `edge`, `book_exhausted`, `level_cap` or
+  `value_unknown`).
+
+Every sizing returns the same result shape. Roles:
+
+- **`governs`**: the fill opens, and lives, only while every governing sizing is
+  tradeable. A governing `target` is tradeable only when the **full target is
+  served** (`steps == target`), its value is a known positive integer, and no
+  leg's best walked price is already at or above its kill price. A target the
+  book cannot fully serve is not tradeable: a strategy that wants 1,000
+  contracts gets no episode when 1,000 are not available. A governing `edge` is
+  tradeable when it took steps, its value is positive, and no leg is at its kill
+  price. The fill's **effective kill price** per leg is the lowest over the
+  governing sizings, so the fill ends as soon as any governing sizing stops
+  being worth taking.
+- **`records`**: priced once when a fill opens and written to the episode
+  **whatever its value**, including not positive or unknown, so optimizers can
+  read payoff curves. It never opens, ends or blocks a fill. It carries its own
+  kill prices when its value is positive, and `null` otherwise. Recording sizings
+  are priced only when a fill opens.
+
+At least one sizing governs; there are at most eight.
+
+**No-fill reasons.** Trigger-positive time without a live fill takes a closed
+reason from the governing sizings. A sizing is **short** when it is a target the
+book cannot fully serve, or an edge walk that depth (not value) left at zero
+steps. When several governing sizings fail for different reasons, the first
+in this precedence wins:
+
+1. `FILL_DEPTH_SHORT`: a governing sizing is short. This is a fact about the
+   book, independent of value.
+2. `FILL_VALUE_UNKNOWN`: a governing sizing took steps and its value is unknown.
+   It could be positive, so it ranks above a known nonpositive value.
+3. `FILL_NONPOSITIVE`: a governing value is at most zero, an edge found no
+   positive first step, or a leg was already at its kill price.
+
+### Kill prices, ending and reopening
+
+- **Kill prices.** For each positive sizing, each leg gets a kill price: the lowest
+  integer price at which buying that leg's whole fill quantity at that single
+  price, with the other legs unchanged and fees recomputed by the strategy's
+  value function, leaves the value not positive. A binary search over
+  `[0, 10^price_scale]` finds it (`replay.economic_fills.kill_price`); it is `null`
+  when even the maximum price keeps the value positive. An unknown value (`None`)
+  counts as not positive. Value must fall as a price rises; whatever it does,
+  the result `k` satisfies "not positive at `k`, positive at `k − 1`", which is
+  what the reader checks.
 - **Episode = fill lifetime.** A fill episode has exactly one slice; consumed
   quote changes never split it. Its opening survival is its duration, latency
   tiers are viable when the fill survived at least `L`, and `Q`, censoring and
   `SCOPE_END` keep their meaning.
-- **Kill prices.** At open, each leg gets a kill price: the lowest integer price
-  at which buying that leg's whole fill quantity at that single price, with the
-  other legs unchanged and fees recomputed by the strategy's value function,
-  leaves the value not positive. A binary search over `[0, 10^price_scale]`
-  finds it (`replay.economic_fills.kill_price`); it is `null` when even the
-  maximum price keeps the value positive. An unknown value (`None`) counts as
-  not positive. Value must fall as a price rises; whatever it does, the result
-  `k` satisfies "not positive at `k`, positive at `k − 1`", which is what the
-  reader checks.
 - **Ending.** On every committed update of a live fill's leg books, the SDK makes
   one comparison per leg: the fill ends (`end_reason: "KILL_PRICE"`) at the first
   update where a leg's best price on its walked ladder (asks, or Kalshi's
-  projected asks) is at or above its kill price. This check runs even when
-  `evaluate` is skipped because its input fingerprint is unchanged: an entity
-  with a live fill, or with trigger-positive time and no fill, is staged on every
-  change to one of its leg books. Every other book change "just eats into the
-  fill" and is ignored. The fill also ends when the trigger turns false: the
-  predicate goes off (`PREDICATE_FALSE`) or the status leaves `DEPTH_SUFFICIENT`
-  (the status is the end reason, for example `UNUSABLE`). The trigger check runs
-  first, so a fill whose trigger and kill price fail at one instant ends as
-  trigger-false.
+  projected asks) is at or above its effective kill price. This check runs even
+  when `evaluate` is skipped because its input fingerprint is unchanged: an
+  entity with a live fill, or with trigger-positive time and no fill, is staged
+  on every change to one of its leg books. Every other book change "just eats
+  into the fill" and is ignored. The fill also ends when the trigger turns
+  false: the predicate goes off (`PREDICATE_FALSE`) or the status leaves
+  `DEPTH_SUFFICIENT` (the status is the end reason, for example `UNUSABLE`). The
+  trigger check runs first, so a fill whose trigger and kill price fail at one
+  instant ends as trigger-false.
 - **Reopening.** When a fill is killed and the trigger is still on, the SDK prices
-  a new fill at that same committed instant, against the same final views. When
-  it is tradeable, the next episode opens at that time; otherwise the time goes
-  to a no-fill reason.
-- **No fill.** When the trigger is on but the priced fill is not tradeable, no
-  episode opens. Trigger-positive time is partitioned exactly into
-  `FILL_LIVE`, `FILL_NONPOSITIVE` and `FILL_VALUE_UNKNOWN`. While the trigger
-  stays on, a new fill is attempted at each later committed update whose
-  retained ladders changed; identical ladders give the identical result, so
-  they are not re-walked.
-
-**Sizings.** Every configured sizing is priced by the one `walk_basket` call:
-each fixed target (price `N` contracts and return what the book can serve),
-then the edge walk (add depth while the marginal value is positive). Targets
-and edge can be combined, and every sizing has the same result shape. A sizing
-is **positive** when it took steps and its value is a known positive integer;
-only positive sizings get kill prices. It is **tradeable** when, in addition, no
-leg's best walked price is already at or above its kill price. The fill is live
-when any sizing is tradeable. Its effective kill price per leg is the lowest over
-its tradeable sizings, so the fill ends as soon as any tradeable sizing stops
-being worth taking, and the next pricing decides what is still tradeable. The
-no-fill reason is `FILL_VALUE_UNKNOWN` when any sizing that took steps has an
-unknown value, and otherwise `FILL_NONPOSITIVE` (no steps, or a value of at most
-zero).
+  the governing sizings again at that same committed instant, against the same
+  final views. When all are tradeable, the next episode opens at that time;
+  otherwise the time goes to a no-fill reason.
+- **Retrying.** While the trigger stays on without a fill, the governing sizings
+  are priced again at each later committed update whose retained ladders
+  changed; identical ladders give the identical result, so they are not
+  re-walked.
 
 **Timing.** A same-time stage is committed only when a greater time, a scope
 boundary or the terminal arrives (§4), and every commit runs before the next
@@ -868,18 +901,21 @@ deterministically, and a superseded intermediate is never priced.
 
 ### Opt-in surface
 
-- **Policy** (closed, parsed by `replay.economic_sdk.fills.fill_policy(value,
-  kind)` into `FillPolicy`):
+- **Policy** (closed, version 1, parsed by
+  `replay.economic_sdk.fills.fill_policy(value, kind)` into `FillPolicy` with
+  `FillSizing` entries):
 
   ```json
-  {"version": 1, "targets_contracts": ["1", "10"], "edge": true,
-   "step_contracts": "0.01", "max_levels": 64}
+  {"version": 1, "step_contracts": "0.01", "max_levels": 64,
+   "sizings": [{"name": "edge", "role": "governs", "edge": true},
+               {"name": "t1000", "role": "records", "target_contracts": "1000"}]}
   ```
 
-  Contract counts are canonical decimal strings. Each target must be a whole
-  number of steps; targets are sorted and unique, with at most 8. At least one
-  target or `edge` is required. `max_levels` (1 to 1,024) bounds the levels any
-  leg may consume. A strategy embeds this object in its own closed policy.
+  Each sizing is `{name, role}` plus exactly one of `target_contracts` (a
+  canonical decimal string, a whole number of steps) or `edge: true`. Names
+  match `[A-Za-z0-9_.-]{1,64}` and are unique. `max_levels` (1 to 1,024) is a
+  global bound on the levels any leg may consume. A strategy embeds this object
+  in its own closed policy.
 - **Experiment.** `Experiment.fills` is the `FillPolicy`; its `kind` is the one
   declared episode kind whose predicate triggers fills. V1 supports a single
   fill kind per strategy. Other declared kinds keep ordinary quote-slice
@@ -897,10 +933,11 @@ deterministically, and a superseded intermediate is never priced.
     one basket step takes (the leg ratio times one step in that book's quantity
     atoms; `fills.step_atoms` converts exactly). It is static per entity, and
     each source must be a retained ladder of that leg's book.
-  - `fill_value(entity, steps, legs) -> int | None`: the pure value of `steps`
-    basket steps on per-leg `Fill` objects, including fees. It depends only on
-    the entity and the fills, never on time, sequence or scope, because the
-    reader recomputes it from the carried fill.
+  - `fill_value(entity, steps, legs, time) -> int | None`: the pure value of
+    `steps` basket steps on per-leg `Fill` objects, including fees. `time` is the
+    fill's open time, so a dated fee schedule can resolve. It depends only on
+    these arguments, never on sequence or scope, because the reader recomputes it
+    from the carried fill with the episode's `start_ns`.
 
 ### Output (layout 2)
 
@@ -908,13 +945,12 @@ A fill episode row has the ordinary episode fields plus a closed `fill`
 object, so consumers never need the book again:
 
 - `sources`, `units`;
-- `results`, one per sizing (targets in policy order, then edge), each with
-  `mode` (`target` or `edge`), `target_steps` (`null` for edge), `steps`,
-  `stop`, `value` (signed, or `null`), per-leg `legs`
+- `results`, one per sizing in declared order, each with `name`, `role`, `mode`,
+  `steps`, `stop`, `value` (signed, or `null`), per-leg `legs`
   (`{atoms, cost, taken, consumed}`), `before`, `after` and `impact_ppm` per leg,
   `tradeable`, and `kill_prices` (per leg, or `null` for a sizing that is not
   positive);
-- `kill_prices`: the effective per-leg kill prices;
+- `kill_prices`: the effective per-leg kill prices, from governing sizings only;
 - `kill_leg` and `kill_best`: the crossing leg and its best level at the
   crossing, present only when `end_reason` is `KILL_PRICE`.
 
@@ -923,26 +959,29 @@ quotes at open; the single slice row is the compact slice of §5. Episode end
 reasons add `KILL_PRICE`; trigger-false ends keep `PREDICATE_FALSE` or the
 status; `SCOPE_END` and `RUN_END` (censored) are unchanged.
 
-Denominator rows add `fill_ns`, a map from `FILL_LIVE`, `FILL_NONPOSITIVE` and
-`FILL_VALUE_UNKNOWN` to exact nanoseconds. It is present exactly when the
-trigger kind's positive-class time is nonzero, and sums to it exactly. Zero
-entries are never written.
+Denominator rows add `fill_ns`, a map from `FILL_LIVE`, `FILL_DEPTH_SHORT`,
+`FILL_VALUE_UNKNOWN` and `FILL_NONPOSITIVE` to exact nanoseconds. It is present
+exactly when the trigger kind's positive-class time is nonzero, and sums to it
+exactly. Zero entries are never written.
 
 ### Reader
 
 `aggregate_reader` additionally checks:
 
-- the closed `fill` object, its spec against the strategy's `fill_spec`, and the
-  sizings and stops against the policy;
-- each sizing from its own carried levels: taken prices equal consumed prices,
-  strictly ascending, every level but the last fully taken, at most
-  `max_levels`; taken quantity is `steps × units`; cost is `Σ p·q` of taken;
-  `before` is the first consumed level; `after` is the remainder of a partly
-  taken last level, or else `null` or a strictly worse level; `impact_ppm`
-  recomputes from `before` and `after`;
-- the value, through the strategy's `fill_value`, and each kill price by its
-  defining property (two value calls per leg), and the tradeable flags and
-  effective kill prices;
+- the closed `fill` object, its spec against the strategy's `fill_spec`, and each
+  result's name, role and mode against the declared sizings, in order;
+- every sizing, governing or recording, from its own carried levels: taken
+  prices equal consumed prices, strictly ascending, every level but the last
+  fully taken, at most `max_levels`; taken quantity is `steps × units`; cost is
+  `Σ p·q` of taken; `before` is the first consumed level; `after` is the
+  remainder of a partly taken last level, or else `null` or a strictly worse
+  level; `impact_ppm` recomputes from `before` and `after`; a target's stop is
+  `target` exactly when it took the full target;
+- each value, through the strategy's `fill_value` at the episode's `start_ns`,
+  and each kill price by its defining property (two value calls per leg);
+- each `tradeable` flag, recomputed from steps, value, the target and the kill
+  prices; that every governing sizing is tradeable; and that the effective kill
+  prices are the per-leg minimum over governing sizings;
 - that a `KILL_PRICE` end names a leg with a kill price and a best level at or
   above it;
 - that fill episodes have exactly one slice; tiers and `Q` recompute as for any
@@ -954,21 +993,28 @@ entries are never written.
   ending at the run's end with its trigger-false reason, or inside it with
   `KILL_PRICE`.
 
-`fill_ns`, like every denominator, is writer-attested: the reader proves its
-arithmetic and its agreement with the episodes, but cannot tell
-`FILL_NONPOSITIVE` from `FILL_VALUE_UNKNOWN` time without the ladders.
+**Writer-attested.** `fill_ns`, like every denominator, is writer-attested: the
+reader proves its arithmetic and its agreement with the episodes, but no-fill
+time carries no fill, so the split between `FILL_DEPTH_SHORT`,
+`FILL_VALUE_UNKNOWN` and `FILL_NONPOSITIVE`, and the precedence that chose it,
+cannot be re-proved without the ladders. Edge optimality is writer-attested,
+and so is a `book_exhausted` or `level_cap` stop when the levels that bound it
+lie beyond `after`: the reader cannot re-walk depth the fill does not carry.
 
 ### Bounds
 
 Retained ladders count toward the view's levels, plus one container per
 ladder (`bounds.view_cost`). A live fill is charged by `bounds.live_fill_cost`
-(its `fill` object and kill prices) for its episode's lifetime. Each open fill
-state is charged by `bounds.fill_state_cost`. A fill object that would not fit
-the 64 KiB row line fails the attempt at open. The conservativeness tests cover
-all three.
+(its `fill` object, including recording sizings, and kill prices) for its
+episode's lifetime. Each open fill state is charged by
+`bounds.fill_state_cost`. A fill object that would not fit the 64 KiB row line
+fails the attempt at open. The conservativeness tests cover all three.
 
 ### Deferred and not implemented
 
+- **Price-move sizings:** depth measured as price movement: stop before taking
+  any price beyond X ppm of the leg's pre-fill best (worst taken price, not
+  post-fill impact).
 - **Controls.** Any control (`time_shift` or `cyclic_neighbor`) with fill checks
   is rejected at construction. A time-shifted leg would need its historical
   ladders in the ring, and control kill checks would run on delayed views.
@@ -977,5 +1023,3 @@ all three.
 - **Several fill kinds** per strategy.
 - **Not wanted:** minimum order size or venue lot rules, trust or anchor checks
   (those live upstream), and display work.
-- **Edge optimality** is writer-attested: the reader cannot re-walk depth beyond
-  the levels a fill carries.
