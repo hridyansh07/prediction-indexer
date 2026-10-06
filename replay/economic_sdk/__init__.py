@@ -7,16 +7,16 @@ slices, controls, bounded output and the independent reader.
 
 from replay.economic_sdk.types import (
     ADMISSIONS, CONTROL, DEPTH_LIMITED, EVALUATED, ONE_SIDED, REAL, SDK_STATUSES, UNUSABLE,
-    Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSpec, Observation,
-    Requirements,
+    Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSizing, FillSpec,
+    Observation, Requirements,
 )
 from replay.economic_sdk.views import BookView
 
 __all__ = [
     "ADMISSIONS", "CONTROL", "DEPTH_LIMITED", "EVALUATED", "ONE_SIDED", "REAL",
     "SDK_STATUSES", "UNUSABLE", "Basket", "BookRequirement", "BookView", "Context",
-    "Control", "Experiment", "FillPolicy", "FillSpec", "Observation", "Requirements", "Strategy",
-    "factory",
+    "Control", "Experiment", "FillPolicy", "FillSizing", "FillSpec", "Observation",
+    "Requirements", "Strategy", "factory",
 ]
 
 
@@ -58,12 +58,14 @@ class Strategy:
         """Static ``FillSpec`` of an admitted entity: per-leg ladder source and units."""
         raise NotImplementedError
 
-    def fill_value(self, entity, steps, legs):
+    def fill_value(self, entity, steps, legs, time):
         """Pure value of ``steps`` basket steps on per-leg ``Fill`` objects, or ``None``.
 
-        It must be an integer that falls as any leg's price rises, and depend
-        only on the entity and the fills (never on time or context): the
-        reader recomputes it from the fill the episode carries.
+        ``time`` is the fill's open time (the episode's ``start_ns``), so a
+        dated fee schedule can resolve. The value must be an integer that falls
+        as any leg's price rises and depend only on these arguments (never on
+        sequence, scope or other context): the reader recomputes it from the
+        fill the episode carries and its start time.
         """
         raise NotImplementedError
 

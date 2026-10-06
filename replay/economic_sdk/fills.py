@@ -1,12 +1,15 @@
-"""Fill checks: one priced basket fill per episode, with per-leg kill prices.
+"""Fill checks: one priced fill per episode, with per-leg kill prices.
 
 SDK spec §13. In fill mode the strategy's pure ``evaluate`` stays the cheap
 trigger: it decides from best prices whether an opportunity exists. When the
-trigger kind is active and the entity has no live fill, the runtime prices one
-fill with ``walk_basket`` against the ladders the views already hold at that
-committed instant, computes one kill price per leg, and never re-walks it. The
-fill ends at the first committed update where a leg's best walked price is at
-or above its kill price, or when the trigger turns false.
+trigger kind is active and the entity has no live fill, the runtime prices the
+strategy's *governing* sizings with ``walk_basket`` against the ladders the
+views already hold at that committed instant. When every governing sizing is
+tradeable a fill opens: its *recording* sizings are priced once too, kill
+prices are computed per leg, and nothing is ever re-walked. The fill ends at
+the first committed update where a leg's best walked price is at or above its
+effective kill price (the lowest over governing sizings), or when the trigger
+turns false.
 
 This module holds the closed policy, the static per-entity spec check, the
 runtime pricing and the episode's ``fill`` object. The independent reader in
@@ -21,18 +24,23 @@ from fractions import Fraction
 
 from replay.economic_fills import kill_price, walk_basket
 from replay.economic_sdk import bounds
-from replay.economic_sdk.types import TRANSFORMS, FillPolicy, FillSpec
+from replay.economic_sdk.types import TRANSFORMS, FillPolicy, FillSizing, FillSpec
 from replay.streams.protocol import obj, require
 
-FILL_LIVE, FILL_NONPOSITIVE, FILL_VALUE_UNKNOWN = (
-    "FILL_LIVE", "FILL_NONPOSITIVE", "FILL_VALUE_UNKNOWN")
+FILL_LIVE, FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE = (
+    "FILL_LIVE", "FILL_DEPTH_SHORT", "FILL_VALUE_UNKNOWN", "FILL_NONPOSITIVE")
 # Closed partition of trigger-positive time (denominator ``fill_ns`` keys).
-FILL_STATES = (FILL_LIVE, FILL_NONPOSITIVE, FILL_VALUE_UNKNOWN)
+FILL_STATES = (FILL_LIVE, FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE)
+# When governing sizings fail for different reasons, the first of these wins.
+NO_FILL_PRECEDENCE = (FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE)
 KILL_PRICE = "KILL_PRICE"
+GOVERNS, RECORDS = "governs", "records"
+MODES = ("target", "edge")
 # V1 fills buy: an ascending ask ladder, or a transform that projects to asks.
 FILL_SOURCES = ("ask",) + TRANSFORMS
-MAX_TARGETS = 8
+MAX_SIZINGS = 8
 _DECIMAL = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]*[1-9])?")
+_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 def contracts(text):
@@ -44,31 +52,44 @@ def contracts(text):
     return value
 
 
+def _sizing(value, step):
+    require(type(value) is dict and "name" in value and "role" in value, "fill sizing")
+    modes = [field for field in ("target_contracts", "edge") if field in value]
+    require(len(modes) == 1, "a fill sizing has exactly one mode")
+    (field,) = modes
+    value = obj(value, "name role " + field)
+    require(type(value["name"]) is str and _NAME.fullmatch(value["name"]) is not None,
+            "fill sizing name")
+    require(value["role"] in (GOVERNS, RECORDS), "fill sizing role")
+    if field == "target_contracts":
+        ratio = contracts(value[field]) / step
+        require(ratio.denominator == 1, "fill target must be a whole number of steps")
+        return FillSizing(value["name"], value["role"], "target", target_contracts=value[field],
+                          target_steps=int(ratio))
+    require(value[field] is True, "fill edge sizing must be true")
+    return FillSizing(value["name"], value["role"], "edge")
+
+
 def fill_policy(value, kind):
     """Parse the closed fill policy; ``kind`` is the strategy's trigger kind.
 
-    ``{version: 1, targets_contracts: [..], edge, step_contracts, max_levels}``.
-    Every target must be a whole number of steps; targets are sorted and
-    unique by size; at least one target or the edge walk is required.
+    ``{version: 1, step_contracts, max_levels, sizings: [..]}``; each sizing is
+    ``{name, role}`` plus exactly one of ``target_contracts`` (a whole number of
+    steps) or ``edge: true``. Names are unique, there are at most eight
+    sizings, and at least one governs.
     """
-    value = obj(value, "version targets_contracts edge step_contracts max_levels")
+    value = obj(value, "version step_contracts max_levels sizings")
     require(type(value["version"]) is int and value["version"] == 1, "fill policy version")
     step = contracts(value["step_contracts"])
-    targets = value["targets_contracts"]
-    require(type(targets) is list and len(targets) <= MAX_TARGETS, "fill targets")
-    steps = []
-    for target in targets:
-        ratio = contracts(target) / step
-        require(ratio.denominator == 1, "fill target must be a whole number of steps")
-        steps.append(int(ratio))
-    require(steps == sorted(set(steps)), "fill targets must be sorted and unique")
-    require(type(value["edge"]) is bool and (steps or value["edge"]),
-            "fill policy needs a target or the edge walk")
     levels = value["max_levels"]
     require(type(levels) is int and 1 <= levels <= bounds.MAX_CONSUMED_LEVELS, "fill max_levels")
+    sizings = value["sizings"]
+    require(type(sizings) is list and 1 <= len(sizings) <= MAX_SIZINGS, "fill sizings")
+    sizings = tuple(_sizing(sizing, step) for sizing in sizings)
+    require(len({sizing.name for sizing in sizings}) == len(sizings), "fill sizing names must be unique")
+    require(any(sizing.role == GOVERNS for sizing in sizings), "a fill sizing must govern")
     require(type(kind) is str and kind, "fill trigger kind")
-    return FillPolicy(kind, tuple(targets), tuple(steps), value["edge"], value["step_contracts"],
-                      levels)
+    return FillPolicy(kind, value["step_contracts"], levels, sizings)
 
 
 def step_atoms(policy, quantity_scale, ratio=1):
@@ -118,53 +139,91 @@ def _optional(value):
     return None if value is None else str(value)
 
 
-def price(policy, spec, ladders, maxima, value):
-    """Price every configured sizing once, on ``ladders``, and derive kill prices.
+def walk_sizing(sizing, ladders, units, value, max_levels):
+    """The one ``walk_basket`` call that prices ``sizing``."""
+    if sizing.mode == "target":
+        (result,) = walk_basket(ladders, units, targets=(sizing.target_steps,), value=value,
+                                max_levels=max_levels)
+    else:
+        (result,) = walk_basket(ladders, units, value=value, edge=True, max_levels=max_levels)
+    return result
 
-    A sizing is *positive* when it took steps and its value is a known
-    positive integer; its kill prices are then computed per leg. It is
-    *tradeable* when, in addition, no leg's best walked price is already at or
-    above its kill price. The fill is live when any sizing is tradeable; its
-    effective kill price per leg is the lowest over tradeable sizings (``None``
-    when no tradeable sizing can be killed on that leg). Otherwise the time is
-    ``FILL_VALUE_UNKNOWN`` when any sizing with steps has an unknown value, or
-    ``FILL_NONPOSITIVE``.
+
+def assess(sizing, result, value, maxima):
+    """``(kill prices or None, no-fill reason or None)`` for one priced sizing.
+
+    A target is short unless the full target is served; an edge walk is short
+    when depth (not value) left it at zero steps. A sizing that took steps is
+    *positive* when its value is a known positive integer; only positive
+    sizings get kill prices. A sizing is tradeable (reason ``None``) when it is
+    not short, it is positive, and no leg's best walked price is already at or
+    above its kill price.
     """
-    results = walk_basket(ladders, spec.units, targets=policy.target_steps, value=value,
-                          edge=policy.edge, max_levels=policy.max_levels)
-    modes = [("target", str(steps)) for steps in policy.target_steps]
-    if policy.edge:
-        modes.append(("edge", None))
+    short = (result.steps < sizing.target_steps if sizing.mode == "target"
+             else not result.steps and result.stop != "edge")
+    if short and sizing.role == GOVERNS:
+        return None, FILL_DEPTH_SHORT  # no fill opens: its kill prices are never written
+    kills = None
+    if result.steps and result.value is not None and result.value > 0:
+        kills = tuple(kill_price(value, result.steps, result.legs, leg, maxima[leg])
+                      for leg in range(len(result.legs)))
+    if short:
+        return kills, FILL_DEPTH_SHORT
+    if result.steps and result.value is None:
+        return kills, FILL_VALUE_UNKNOWN
+    if kills is None or any(kill is not None and before[0] >= kill
+                            for kill, before in zip(kills, result.before)):
+        return kills, FILL_NONPOSITIVE
+    return kills, None
+
+
+def _row(sizing, result, kills, reason):
+    return {
+        "name": sizing.name, "role": sizing.role, "mode": sizing.mode,
+        "steps": str(result.steps), "stop": result.stop, "value": _optional(result.value),
+        "legs": [{"atoms": str(leg.filled_atoms), "cost": str(leg.cost),
+                  "taken": _pairs(leg.taken), "consumed": _pairs(leg.consumed)}
+                 for leg in result.legs],
+        "before": [_level(level) for level in result.before],
+        "after": [_level(level) for level in result.after],
+        "impact_ppm": [_optional(impact) for impact in result.impact_ppm],
+        "tradeable": reason is None,
+        "kill_prices": None if kills is None else [_optional(kill) for kill in kills],
+    }
+
+
+def price(policy, spec, ladders, maxima, value):
+    """Price the governing sizings; when all are tradeable, open with the records too.
+
+    The fill is live only when every governing sizing is tradeable; otherwise
+    the time takes the first no-fill reason of ``NO_FILL_PRECEDENCE`` that any
+    governing sizing has, and recording sizings are not priced. A live fill's
+    effective kill price per leg is the lowest over governing sizings (``None``
+    when none of them can be killed on that leg). Recording sizings are priced
+    once, written whatever their value, and carry kill prices only when
+    positive; they never open, end or block a fill.
+    """
+    governing, reasons = {}, set()
+    for index, sizing in enumerate(policy.sizings):
+        if sizing.role == GOVERNS:
+            result = walk_sizing(sizing, ladders, spec.units, value, policy.max_levels)
+            kills, reason = assess(sizing, result, value, maxima)
+            governing[index] = (result, kills, reason)
+            if reason is not None:
+                reasons.add(reason)
+    if reasons:
+        return Priced(next(r for r in NO_FILL_PRECEDENCE if r in reasons), None, None)
     effective = [None] * len(ladders)
-    live = unknown = False
     rows = []
-    for (mode, target), result in zip(modes, results):
-        if result.steps and result.value is None:
-            unknown = True
-        kills, tradeable = None, False
-        if result.steps and result.value is not None and result.value > 0:
-            kills = tuple(kill_price(value, result.steps, result.legs, leg, maxima[leg])
-                          for leg in range(len(ladders)))
-            tradeable = all(kill is None or before[0] < kill
-                            for kill, before in zip(kills, result.before))
-        if tradeable:
-            live = True
+    for index, sizing in enumerate(policy.sizings):
+        if index in governing:
+            result, kills, reason = governing[index]
             effective = [kill if current is None else current if kill is None else min(current, kill)
                          for current, kill in zip(effective, kills)]
-        rows.append({
-            "mode": mode, "target_steps": target, "steps": str(result.steps), "stop": result.stop,
-            "value": _optional(result.value),
-            "legs": [{"atoms": str(leg.filled_atoms), "cost": str(leg.cost),
-                      "taken": _pairs(leg.taken), "consumed": _pairs(leg.consumed)}
-                     for leg in result.legs],
-            "before": [_level(level) for level in result.before],
-            "after": [_level(level) for level in result.after],
-            "impact_ppm": [_optional(impact) for impact in result.impact_ppm],
-            "tradeable": tradeable,
-            "kill_prices": None if kills is None else [_optional(kill) for kill in kills],
-        })
-    if not live:
-        return Priced(FILL_VALUE_UNKNOWN if unknown else FILL_NONPOSITIVE, None, None)
+        else:
+            result = walk_sizing(sizing, ladders, spec.units, value, policy.max_levels)
+            kills, reason = assess(sizing, result, value, maxima)
+        rows.append(_row(sizing, result, kills, reason))
     kill = tuple(effective)
     return Priced(FILL_LIVE, kill, {
         "sources": list(spec.sources), "units": [str(unit) for unit in spec.units],

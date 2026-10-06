@@ -36,12 +36,14 @@ LEG0, LEG1 = "polymarket:123", "polymarket:987"
 KIND = "gross"
 
 
-def policy(**overrides):
-    fills = {"version": 1, "targets_contracts": ["1"], "edge": False, "step_contracts": "1",
-             "max_levels": 8}
+ONE = {"name": "one", "role": "governs", "target_contracts": "1"}
+
+
+def policy(*sizings, **overrides):
+    fills = {"version": 1, "step_contracts": "1", "max_levels": 8, "sizings": list(sizings or (ONE,))}
     fills.update(overrides.pop("fills", {}))
-    value = {"version": 1, "fills": fills, "fee_per_contract": "10", "unknown_at": None,
-             "trigger": "best", "audit_intervals": False, "controls": []}
+    value = {"version": 1, "fills": fills, "fee_per_contract": "10", "fee_from_ns": None,
+             "unknown_at": None, "trigger": "best", "audit_intervals": False, "controls": []}
     value.update(overrides)
     return value
 
@@ -61,9 +63,12 @@ class PairFills(Strategy):
                                                                "snapshot_sha256")})
         self.snapshot = plain(self.prepared.snapshot)
         self.snapshot_sha256 = self.prepared.sha256
-        self.policy = obj(config["policy"], "version fills fee_per_contract unknown_at trigger "
-                                            "audit_intervals controls")
+        self.policy = obj(config["policy"], "version fills fee_per_contract fee_from_ns unknown_at "
+                                            "trigger audit_intervals controls")
         self.fee = int(self.policy["fee_per_contract"])
+        # A dated fee: one more price atom per contract for fills opened from this time.
+        dated = self.policy["fee_from_ns"]
+        self.fee_from = None if dated is None else int(dated)
         unknown = self.policy["unknown_at"]
         self.unknown_at = None if unknown is None else int(unknown)
         self.plans = {(p["instrument"], p["orientation"]): p for p in self.snapshot["plans"]}
@@ -121,11 +126,12 @@ class PairFills(Strategy):
     def fill_spec(self, entity):
         return FillSpec(("ask", "ask"), self.units)
 
-    def fill_value(self, entity, steps, legs):
+    def fill_value(self, entity, steps, legs, time):
         if self.unknown_at is not None and any(price >= self.unknown_at
                                                for leg in legs for price, _ in leg.taken):
             return None
-        return steps * self.units[0] * (P - self.fee) - sum(leg.cost for leg in legs)
+        fee = self.fee + (self.fee_from is not None and time >= self.fee_from)
+        return steps * self.units[0] * (P - fee) - sum(leg.cost for leg in legs)
 
     # -- completion and reader hooks --------------------------------------------
     def manifest(self, files, instantaneous):
@@ -208,11 +214,11 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.count = 0
 
-    def harness(self, scopes=False, **overrides):
+    def harness(self, *sizings, scopes=False, **overrides):
         self.count += 1
         root = Path(self.tmp.name) / str(self.count)
         root.mkdir()
-        h = FillHarness(root, policy(**overrides), scopes=scopes)
+        h = FillHarness(root, policy(*sizings, **overrides), scopes=scopes)
         for writer in h.strategy.writers.values():
             self.addCleanup(writer.stream.close)
         h.window()
@@ -375,22 +381,93 @@ class FillEpisodeTests(Base):
         self.assertEqual([r["fill_ns"] for r in h.rows("denominators.ndjson")],
                          [{"FILL_LIVE": "11"}, {"FILL_LIVE": "17"}])
 
-    def test_target_and_edge_results_share_one_shape(self):
-        h = self.harness(fills={"targets_contracts": ["1", "3"], "edge": True})
-        h.asks(12, LEG0, (400, M), (420, M), (470, 5 * M))
-        h.asks(12, LEG1, (450, 2 * M), (530, 5 * M))
-        h.finish()
+    def test_sizings_share_one_shape_and_records_are_written_whatever_their_value(self):
+        h = self.harness({"name": "edge", "role": "governs", "edge": True},
+                         {"name": "t6", "role": "records", "target_contracts": "6"},
+                         {"name": "t1", "role": "records", "target_contracts": "1"})
+        with self.walks() as walks:
+            h.asks(12, LEG0, (400, M), (420, M), (470, 5 * M))
+            h.asks(12, LEG1, (450, 2 * M), (600, 5 * M))
+            h.finish()
+        self.assertEqual(walks.call_count, 3)   # one walk per sizing, once, at open
         (episode,) = h.rows("episodes.ndjson")
-        results = episode["fill"]["results"]
-        self.assertEqual([(r["mode"], r["target_steps"], r["steps"], r["stop"]) for r in results],
-                         [("target", "1", "1", "target"), ("target", "3", "3", "target"),
-                          ("edge", None, "2", "edge")])
-        self.assertEqual(len({tuple(sorted(r)) for r in results}), 1)
-        self.assertTrue(all(r["tradeable"] for r in results[:2]))
-        # Three contracts: 3 x 990 - (400 + 420 + 470) - 3p > 0 exactly while p < 560.
-        self.assertEqual(results[1]["kill_prices"][1], "560")
-        self.assertEqual(episode["fill"]["kill_prices"],
-                         [str(min(int(r["kill_prices"][leg]) for r in results)) for leg in (0, 1)])
+        edge, t6, t1 = episode["fill"]["results"]
+        self.assertEqual(len({tuple(sorted(r)) for r in (edge, t6, t1)}), 1)
+        self.assertEqual([(r["name"], r["role"], r["mode"], r["steps"], r["stop"]) for r in (edge, t6, t1)],
+                         [("edge", "governs", "edge", "2", "edge"),
+                          ("t6", "records", "target", "6", "target"),
+                          ("t1", "records", "target", "1", "target")])
+        # Six contracts cost 2,700 + 3,300 against a 5,940 payout: written although not positive.
+        self.assertEqual((t6["value"], t6["tradeable"], t6["kill_prices"]), ("-60000000", False, None))
+        self.assertEqual((edge["value"], t1["value"], t1["tradeable"]), ("260000000", "140000000", True))
+        # A recording sizing's kill prices are its own: t1's leg-0 kill (540) is not the fill's.
+        self.assertEqual(t1["kill_prices"], ["540", "590"])
+        # Only governing sizings set the effective kill prices.
+        self.assertEqual(episode["fill"]["kill_prices"], edge["kill_prices"])
+
+    def test_recording_sizings_never_end_or_block_the_episode(self):
+        h = self.harness(ONE, {"name": "t3", "role": "records", "target_contracts": "3"},
+                         {"name": "t9", "role": "records", "target_contracts": "9"})
+        h.asks(12, LEG0, (400, M), (480, 5 * M))
+        h.asks(12, LEG1, (450, 5 * M))
+        h.asks(20, LEG1, (540, 5 * M))   # past t3's leg-1 kill price (537), below one's (590)
+        h.finish()
+        self.assertEqual(self.spans(h), [("12", "40", "RUN_END")])
+        one, t3, t9 = h.rows("episodes.ndjson")[0]["fill"]["results"]
+        self.assertEqual((one["kill_prices"], t3["kill_prices"]), (["540", "590"], ["540", "537"]))
+        self.assertEqual(h.rows("episodes.ndjson")[0]["fill"]["kill_prices"], ["540", "590"])
+        # Leg 1 serves five of nine contracts: a short record, still written.
+        self.assertEqual((t9["steps"], t9["stop"], t9["tradeable"]), ("5", "book_exhausted", False))
+
+    def test_two_governing_sizings_take_the_lower_kill_and_either_one_ends_the_fill(self):
+        h = self.harness(ONE, {"name": "t3", "role": "governs", "target_contracts": "3"})
+        h.asks(12, LEG0, (400, M), (480, 5 * M))
+        h.asks(12, LEG1, (450, 5 * M))
+        h.asks(20, LEG1, (537, 5 * M))   # one is still worth taking; t3 is not
+        h.finish()
+        self.assertEqual(self.spans(h), [("12", "20", "KILL_PRICE")])
+        fill = h.rows("episodes.ndjson")[0]["fill"]
+        self.assertEqual(fill["kill_prices"], ["540", "537"])
+        self.assertEqual((fill["kill_leg"], fill["kill_best"]), (1, ["537", "5000000"]))
+        self.assertEqual(self.denominator(h)["fill_ns"], {"FILL_LIVE": "8", "FILL_NONPOSITIVE": "20"})
+
+    def test_a_governing_target_the_book_cannot_serve_is_depth_short(self):
+        h = self.harness(ONE, {"name": "t3", "role": "governs", "target_contracts": "3"})
+        h.asks(12, LEG0, (495, 2 * M))
+        h.asks(12, LEG1, (500, 5 * M))   # one is not positive and t3 is short: short wins
+        h.asks(16, LEG0, (495, 5 * M))   # t3 is served, neither is positive
+        h.asks(20, LEG1, (450, 5 * M))   # both tradeable
+        h.finish()
+        self.assertEqual(self.spans(h), [("20", "40", "RUN_END")])
+        self.assertEqual(self.denominator(h)["fill_ns"],
+                         {"FILL_DEPTH_SHORT": "4", "FILL_LIVE": "20", "FILL_NONPOSITIVE": "4"})
+
+    def test_fill_value_receives_the_open_time_in_the_runtime_and_the_reader(self):
+        times = []
+        original = PairFills.fill_value
+
+        def recording(strategy, entity, steps, legs, time):
+            times.append(time)
+            return original(strategy, entity, steps, legs, time)
+
+        with patch.object(PairFills, "fill_value", recording):
+            h = self.harness(fee_from_ns="20")
+            h.asks(12, LEG0, (450, 5 * M))
+            h.asks(12, LEG1, (500, 5 * M))
+            h.asks(22, LEG0, (490, 5 * M))   # kill (fee 10 at open); repriced at fee 11
+            h.asks(25, LEG1, (480, 5 * M))   # opens under the dated fee
+            runtime = set(times[:])
+            h.finish()
+            self.assertEqual(runtime, {12, 22})
+            self.assertTrue({12, 22, 25} <= set(times))
+            times.clear()
+            manifest = json.loads((h.output / "manifest.json").read_bytes())
+            snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+            aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+            self.assertEqual(set(times), {12, 25})   # each episode's start_ns
+        first, second = h.rows("episodes.ndjson")
+        self.assertEqual(first["fill"]["kill_prices"], ["490", "540"])    # 1000 - 10 - ...
+        self.assertEqual(second["fill"]["kill_prices"], ["509", "499"])   # 1000 - 11 - ...
 
 
 class FillConstructionTests(Base):
@@ -401,19 +478,32 @@ class FillConstructionTests(Base):
             FillHarness(root, policy(controls=["5"]))
         self.assertEqual(list((root / "output").iterdir()), [])
 
-    def test_policy_is_closed_and_targets_are_whole_steps(self):
-        base = {"version": 1, "targets_contracts": ["1"], "edge": False, "step_contracts": "0.5",
-                "max_levels": 4}
-        self.assertEqual(fill_policy(base, KIND).target_steps, (2,))
-        for bad in ({**base, "extra": 1}, {**base, "version": 2}, {**base, "targets_contracts": ["0.25"]},
-                    {**base, "targets_contracts": ["2", "1"]}, {**base, "targets_contracts": [], "edge": False},
-                    {**base, "step_contracts": "1.50"}, {**base, "max_levels": 0},
-                    {**base, "max_levels": bounds.MAX_CONSUMED_LEVELS + 1}):
+    def test_policy_is_closed_with_one_mode_per_sizing_and_a_governing_sizing(self):
+        edge = {"name": "edge", "role": "governs", "edge": True}
+        base = {"version": 1, "step_contracts": "0.5", "max_levels": 4,
+                "sizings": [edge, {"name": "t1", "role": "records", "target_contracts": "1"}]}
+        parsed = fill_policy(base, KIND)
+        self.assertEqual([(z.name, z.role, z.mode, z.target_steps) for z in parsed.sizings],
+                         [("edge", "governs", "edge", None), ("t1", "records", "target", 2)])
+        sizings = lambda *z: {**base, "sizings": list(z)}
+        for bad in ({**base, "extra": 1}, {**base, "version": 2}, {**base, "step_contracts": "1.50"},
+                    {**base, "max_levels": 0}, {**base, "max_levels": bounds.MAX_CONSUMED_LEVELS + 1},
+                    sizings(), sizings(*[{**edge, "name": f"e{i}"} for i in range(9)]),
+                    sizings({**edge, "role": "records"}),                          # nothing governs
+                    sizings(edge, {**edge}),                                       # duplicate name
+                    sizings({**edge, "role": "observes"}),
+                    sizings({**edge, "name": ""}),
+                    sizings({**edge, "target_contracts": "1"}),                    # two modes
+                    sizings({"name": "x", "role": "governs"}),                     # no mode
+                    sizings({**edge, "edge": False}),
+                    sizings({**edge, "extra": 1}),
+                    sizings({"name": "t", "role": "governs", "target_contracts": "0.25"}),
+                    sizings({"name": "t", "role": "governs", "target_contracts": 1}),
+                    sizings({"name": "m", "role": "governs", "max_price_move_ppm": "50000"})):
             with self.subTest(bad=bad), self.assertRaises(ProtocolError):
                 fill_policy(bad, KIND)
         with self.assertRaisesRegex(ProtocolError, "whole number of quantity atoms"):
-            step_atoms(fill_policy({**base, "step_contracts": "0.0000001", "targets_contracts": [],
-                                    "edge": True}, KIND), 6)
+            step_atoms(fill_policy({**base, "step_contracts": "0.0000001", "sizings": [edge]}, KIND), 6)
 
     def test_views_retain_the_ladder_they_read_including_the_kalshi_projection(self):
         class Book:
@@ -465,8 +555,9 @@ def rewrite(h, manifest, name, mutate):
 
 class FillReaderTests(Base):
     def fixture(self, audit=False):
-        h = self.harness(audit_intervals=audit)
-        h.asks(12, LEG0, (450, 2 * M), (460, M))
+        h = self.harness(ONE, {"name": "t4", "role": "records", "target_contracts": "4"},
+                         audit_intervals=audit)
+        h.asks(12, LEG0, (450, 2 * M), (460, M), (480, M))
         h.asks(12, LEG1, (500, 5 * M))
         h.asks(20, LEG0, (495, 5 * M))
         h.asks(26, LEG0, (450, 2 * M))
@@ -489,6 +580,23 @@ class FillReaderTests(Base):
                 self.assertEqual(self.spans(h), [("12", "20", "KILL_PRICE"), ("26", "40", "RUN_END")])
                 self.assertEqual(summary["fill_ns"], {"FILL_LIVE": "22", "FILL_NONPOSITIVE": "6"})
                 self.assertEqual(summary["fill_ends"], {"KILL_PRICE": 1, "RUN_END": 1})
+
+    def test_reader_rejects_a_tampered_record_and_a_wrong_record_stop(self):
+        def record_cost(rows):
+            leg = rows[0]["fill"]["results"][1]["legs"][1]
+            leg["cost"] = str(int(leg["cost"]) + 1)
+        self.reject(record_cost, pattern="fill cost")
+
+        def record_value(rows):
+            record = rows[0]["fill"]["results"][1]
+            record["value"] = str(int(record["value"]) + 1)
+        self.reject(record_value, pattern="fill value")
+
+        def stop(rows):
+            record = rows[0]["fill"]["results"][1]
+            self.assertEqual((record["steps"], record["stop"], record["value"]), ("4", "target", "120000000"))
+            record["stop"] = "book_exhausted"   # the full target was served
+        self.reject(stop, pattern="fill stop")
 
     def test_reader_rejects_a_tampered_fill_cost(self):
         def mutate(rows):
@@ -614,8 +722,10 @@ class FillBoundTests(unittest.TestCase):
         self.assertGreaterEqual(bounds.view_cost(view, 1), deep_size(view))
 
         deep = tuple(tuple((100 + i, 10**12 + i) for i in range(64)) for _ in range(2))
-        policy_value = {"version": 1, "targets_contracts": ["1", "2", "3"], "edge": True,
-                        "step_contracts": "1", "max_levels": 64}
+        policy_value = {"version": 1, "step_contracts": "1", "max_levels": 64, "sizings": [
+            {"name": "edge", "role": "governs", "edge": True},
+            {"name": "t2", "role": "governs", "target_contracts": "2"},
+            {"name": "t3", "role": "records", "target_contracts": "3"}]}
         priced = fill_mode.price(
             fill_policy(policy_value, KIND), FillSpec(("ask", "kalshi_complement_ask"), (10**12, 10**12)),
             deep, (10**18, 10**18), lambda steps, legs: steps * 10**18 - sum(l.cost for l in legs))

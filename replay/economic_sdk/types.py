@@ -76,18 +76,34 @@ class FillSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class FillSizing:
+    """One declared sizing of a fill: exactly one mode, and a role.
+
+    ``mode`` is ``target`` (``target_steps`` steps) or ``edge`` (walk while the
+    value strictly increases). ``role`` ``governs`` decides whether a fill
+    opens and lives; ``records`` is priced once at open and written, but never
+    opens, ends or blocks one.
+    """
+
+    name: str
+    role: str
+    mode: str
+    target_contracts: str | None = None
+    target_steps: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FillPolicy:
     """Closed fill-check policy, parsed by ``economic_sdk.fills.fill_policy``.
 
     ``kind`` is the single episode kind whose predicate triggers fills.
+    ``sizings`` are in declared order; at least one governs.
     """
 
     kind: str
-    targets_contracts: tuple[str, ...]
-    target_steps: tuple[int, ...]
-    edge: bool
     step_contracts: str
     max_levels: int
+    sizings: tuple[FillSizing, ...]
 
 
 @dataclass(frozen=True, slots=True)

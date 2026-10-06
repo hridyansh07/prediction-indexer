@@ -13,8 +13,8 @@ owns everything else (complement spec §§3, 5, 7 and SDK spec §4):
 - controls, including the bounded view ring of ``time_shift``;
 - count-based retained-state bounds and bounded output in close order;
 - opt-in fill checks (SDK spec §13): one priced fill per episode of the
-  trigger kind, priced once at open and ended by a per-leg kill price or by
-  the trigger turning false.
+  trigger kind, opened when every governing sizing is tradeable, priced once
+  at open and ended by a per-leg kill price or by the trigger turning false.
 
 Layout 1 (complement policy 1) writes the frozen V1 interval partition, with
 skew as a measurement dimension. Layout 2 never splits time on skew: skew is
@@ -704,7 +704,7 @@ class Runtime:
         strategy = self.strategy
         priced = price(self.fill, spec,
                        tuple(view.ladders[source] for view, source in zip(views, spec.sources)),
-                       maxima, lambda steps, legs: strategy.fill_value(entity, steps, legs))
+                       maxima, lambda steps, legs: strategy.fill_value(entity, steps, legs, time))
         if priced.state == FILL_LIVE:
             self._open_episode(key, time, observation, skew, priced)
         self._fill_state(entity.id, time, priced.state, epochs)

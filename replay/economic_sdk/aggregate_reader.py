@@ -14,11 +14,13 @@ re-resolves every scoped entity, then streams each file once and checks:
   skew-attributed entry time sums to ``Q``;
 - with ``audit_intervals``, the full interval partition recomputes the
   denominators exactly and its maximal predicate runs equal the episodes;
-- in fill mode (SDK spec §13): every fill re-checks from the levels it carries
-  (taken against consumed, cost, ``after``, impact, steps times units), the
-  strategy's value hook re-checks values and kill prices, fill episodes are
-  single-slice and lie inside trigger-positive time, and live plus no-fill
-  time equals trigger-positive time exactly.
+- in fill mode (SDK spec §13): every governing and recording sizing re-checks
+  from the levels it carries (taken against consumed, cost, ``after``, impact,
+  steps times units, the target's stop), the strategy's value hook
+  re-checks values and kill prices at the episode's start, every governing
+  sizing is tradeable, fill episodes are single-slice and lie inside
+  trigger-positive time, and live plus no-fill time equals trigger-positive
+  time exactly.
 
 Denominators are writer-attested without the audit: the reader proves their
 internal arithmetic and their agreement with the episodes, not each interval.
@@ -107,28 +109,34 @@ def _level(value):
     return price, quantity
 
 
-def _check_fill(value, entity, end_reason, policy, strategy, maxima):
-    """Re-check one carried fill from its own levels and the strategy's value hook."""
+_STOPS = {"target": ("target", "book_exhausted", "level_cap"),
+          "edge": ("edge", "book_exhausted", "level_cap", "value_unknown")}
+
+
+def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
+    """Re-check one carried fill from its own levels and the strategy's value hook.
+
+    Every sizing, governing or recording, is checked; values and kill prices use
+    the episode's open time ``start``.
+    """
     value = obj(value, "sources units results kill_prices kill_leg kill_best")
     spec = strategy.fill_spec(entity)
     legs = len(entity.legs)
     require(value["sources"] == list(spec.sources) and value["units"] == [str(u) for u in spec.units]
             and len(spec.units) == legs, "fill spec")
-    modes = [("target", str(steps)) for steps in policy.target_steps]
-    if policy.edge:
-        modes.append(("edge", None))
-    require(type(value["results"]) is list and len(value["results"]) == len(modes), "fill results")
-    effective, live = [None] * legs, False
-    for (mode, target), result in zip(modes, value["results"]):
-        result = obj(result, "mode target_steps steps stop value legs before after impact_ppm "
+    require(type(value["results"]) is list and len(value["results"]) == len(policy.sizings),
+            "fill results")
+    effective = [None] * legs
+    for sizing, result in zip(policy.sizings, value["results"]):
+        result = obj(result, "name role mode steps stop value legs before after impact_ppm "
                              "tradeable kill_prices")
-        require(result["mode"] == mode and result["target_steps"] == target, "fill result mode")
+        require((result["name"], result["role"], result["mode"]) == (sizing.name, sizing.role, sizing.mode),
+                "fill result sizing")
         steps, stop = _natural(result["steps"]), result["stop"]
-        if mode == "target":
-            require(stop == "target" and steps == int(target)
-                    or stop in ("book_exhausted", "level_cap") and steps < int(target), "fill stop")
-        else:
-            require(stop in ("edge", "book_exhausted", "level_cap", "value_unknown"), "fill stop")
+        require(stop in _STOPS[sizing.mode], "fill stop")
+        if sizing.mode == "target":
+            require(steps == sizing.target_steps if stop == "target" else steps < sizing.target_steps,
+                    "fill stop")
         for field in ("legs", "before", "after", "impact_ppm"):
             require(type(result[field]) is list and len(result[field]) == legs, "fill leg count")
         fills, befores = [], []
@@ -168,7 +176,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima):
         fills = tuple(fills)
         recorded = None if result["value"] is None else signed(result["value"])
         if steps:
-            computed = strategy.fill_value(entity, steps, fills)
+            computed = strategy.fill_value(entity, steps, fills, start)
             require(computed is None or type(computed) is int, "fill value type")
             require(computed == recorded, "fill value")
         else:
@@ -177,11 +185,11 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima):
         def positive(leg, price):
             quantity = fills[leg].filled_atoms
             single = Fill(quantity, price * quantity, False, ((price, quantity),), ((price, quantity),))
-            computed = strategy.fill_value(entity, steps, fills[:leg] + (single,) + fills[leg + 1:])
+            computed = strategy.fill_value(entity, steps, fills[:leg] + (single,) + fills[leg + 1:], start)
             require(computed is None or type(computed) is int, "fill value type")
             return computed is not None and computed > 0
 
-        tradeable = False
+        kills = None
         if steps and recorded is not None and recorded > 0:
             kills = result["kill_prices"]
             require(type(kills) is list and len(kills) == legs, "fill kill prices")
@@ -193,15 +201,18 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima):
                 else:
                     require(kill <= maxima[leg] and not positive(leg, kill)
                             and (kill == 0 or positive(leg, kill - 1)), "fill kill price")
-            tradeable = all(kill is None or before[0] < kill for kill, before in zip(kills, befores))
-            if tradeable:
-                live = True
-                effective = [kill if current is None else current if kill is None else min(current, kill)
-                             for current, kill in zip(effective, kills)]
         else:
             require(result["kill_prices"] is None, "fill kill prices")
+        short = (steps < sizing.target_steps if sizing.mode == "target"
+                 else not steps and stop != "edge")
+        tradeable = (not short and kills is not None
+                     and all(kill is None or before[0] < kill for kill, before in zip(kills, befores)))
         require(result["tradeable"] is tradeable, "fill tradeable")
-    require(live, "fill episode without a tradeable sizing")
+        if sizing.role == "governs":
+            # A fill opens only when every governing sizing is tradeable.
+            require(tradeable, "fill governing sizing not tradeable")
+            effective = [kill if current is None else current if kill is None else min(current, kill)
+                         for current, kill in zip(effective, kills)]
     require(value["kill_prices"] == [None if k is None else str(k) for k in effective],
             "fill kill prices")
     if end_reason == KILL_PRICE:
@@ -369,7 +380,7 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
                     "episode end reason/scope")
         if is_fill:
             _check_fill(row["fill"], entity, row["end_reason"], fill, strategy,
-                        [10 ** int(plans[key]["price_scale"]) for key in entity.legs])
+                        [10 ** int(plans[key]["price_scale"]) for key in entity.legs], start)
             fill_lifetime[scope, index] = fill_lifetime.get((scope, index), 0) + end - start
         order = (end, scope) + entity.order + (kind, start)
         require(last is None or last <= order, "episode close order")
