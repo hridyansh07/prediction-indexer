@@ -125,8 +125,10 @@ def walk_basket(
     step count that maximizes it, the point where the marginal edge is gone.
 
     ``value`` must be concave in ``steps`` for the edge result to be the
-    maximum: true whenever each leg's marginal cost per unit (price plus fee)
-    rises with price, as it does for best-first asks. Candidates are the step
+    maximum: true whenever each leg's marginal value per unit falls as the
+    walk deepens, as it does for best-first asks (cost plus fee rises) and
+    best-first bids (proceeds less fee fall). ``Fill.cost`` is ``sum(p * q)``
+    in either direction; for a sold leg it is the proceeds. Candidates are the step
     counts on either side of every leg level boundary, where a piecewise
     linear concave value attains its maximum. ``max_levels`` bounds the levels
     any leg may consume.
@@ -231,19 +233,26 @@ def walk_basket(
     return tuple(results)
 
 
-def kill_price(value, steps, legs, leg, maximum):
-    """Lowest integer price at which leg ``leg``'s whole fill stops being worth taking.
+def kill_price(value, steps, legs, leg, maximum, sell=False):
+    """The single price at which leg ``leg``'s whole fill stops being worth taking.
 
-    The leg's fill quantity is bought at that single price, the other legs are
+    The leg's fill quantity trades at that one price, the other legs are
     unchanged, and ``value(steps, legs)`` (fees recomputed by the caller's
     value) is no longer a known positive integer. The search is binary over
-    ``[0, maximum]`` and assumes value falls as the price rises; whatever the
-    value does, the result ``k`` satisfies: not positive at ``k``, and
-    positive at ``k - 1`` when ``k > 0``. ``None`` when value stays positive
-    even at ``maximum``.
+    ``[0, maximum]``.
+
+    A bought leg (``sell`` false) is assumed to lose value as its price rises:
+    the result is the *lowest* such price ``k``, so that value is not positive
+    at ``k`` and positive at ``k - 1`` when ``k > 0``; ``None`` when value stays
+    positive even at ``maximum``. A sold leg gains value as its price rises:
+    the result is the *highest* such price ``k``, not positive at ``k`` and
+    positive at ``k + 1`` when ``k < maximum``; ``None`` when value stays
+    positive even at 0. Whatever the value does, the result has that property.
     """
     if type(steps) is not int or steps <= 0 or type(maximum) is not int or maximum < 0:
         raise ValueError("positive steps and a nonnegative maximum price required")
+    if type(sell) is not bool:
+        raise TypeError("sell must be a bool")
     quantity = legs[leg].filled_atoms
     if quantity <= 0:
         raise ValueError("the leg must have filled atoms")
@@ -255,6 +264,17 @@ def kill_price(value, steps, legs, leg, maximum):
             raise TypeError("value must return an int or None")
         return result is not None and result > 0
 
+    if sell:
+        if positive(0):
+            return None
+        low, high = 0, maximum + 1  # positive(low) is false; positive(high) is assumed
+        while high - low > 1:
+            middle = (low + high) // 2
+            if positive(middle):
+                high = middle
+            else:
+                low = middle
+        return low
     if positive(maximum):
         return None
     low, high = -1, maximum  # positive(low) is assumed; positive(high) is false

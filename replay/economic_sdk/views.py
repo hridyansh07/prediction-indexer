@@ -7,7 +7,8 @@ from replay.strategy_sdk import plain
 from replay.streams.protocol import require
 
 # The book side each retainable ladder is read from.
-_LADDER_SIDES = {"ask": "ask", "bid": "bid", "kalshi_complement_ask": "bid"}
+_LADDER_SIDES = {"ask": "ask", "bid": "bid", "kalshi_complement_ask": "bid",
+                 "kalshi_complement_bid": "ask"}
 
 _NO_LADDERS = {}
 
@@ -62,12 +63,19 @@ def _same(old, new):
 
 
 def complement_ladder(levels, unit):
-    """Project best-first bids to best-first asks at ``unit - p``."""
+    """Project a best-first side to the opposite orientation's other side at ``unit - p``.
+
+    Best-first bids become best-first asks and best-first asks best-first bids.
+    """
     return tuple((unit - price, quantity) for price, quantity in levels)
 
 
 def complement_ask(fill, unit):
-    """Project a bid fill to the opposite orientation's ask at ``unit - p``."""
+    """Project a fill to the opposite orientation's other side at ``unit - p``.
+
+    A bid fill becomes an ask fill and an ask fill a bid fill; ``cost`` maps to
+    ``unit * filled - cost`` either way.
+    """
     return Fill(fill.filled_atoms, unit * fill.filled_atoms - fill.cost, fill.depth_limited,
                 tuple((unit - price, quantity) for price, quantity in fill.taken),
                 tuple((unit - price, quantity) for price, quantity in fill.consumed))
@@ -145,12 +153,23 @@ class ViewBuilder:
                 transformed["kalshi_complement_ask"] = {
                     size: complement_ask(fill, unit) for size, fill in fills["bid"].items()}
             levels *= 2
-        if "kalshi_complement_ask" in self.ladders:
-            # Reused while its source bid ladder is the identical object.
-            previous = prior.ladders.get("kalshi_complement_ask") if prior is not None else None
-            retained["kalshi_complement_ask"] = (
-                previous if previous is not None and prior.ladders["bid"] is retained["bid"]
-                else complement_ladder(retained["bid"], self.unit))
+        if "kalshi_complement_bid" in self.transforms:
+            previous = prior.transformed.get("kalshi_complement_bid") if prior is not None else None
+            if previous and prior.fills.get("ask") is not None and all(
+                    fills["ask"][size] is prior.fills["ask"][size] for size in self.sizes):
+                transformed["kalshi_complement_bid"] = previous
+            else:
+                unit = self.unit
+                transformed["kalshi_complement_bid"] = {
+                    size: complement_ask(fill, unit) for size, fill in fills["ask"].items()}
+            levels += sum(len(f.taken) + len(f.consumed) for f in fills["ask"].values())
+        for transform, side in (("kalshi_complement_ask", "bid"), ("kalshi_complement_bid", "ask")):
+            if transform in self.ladders:
+                # Reused while its source ladder is the identical object.
+                previous = prior.ladders.get(transform) if prior is not None else None
+                retained[transform] = (
+                    previous if previous is not None and prior.ladders[side] is retained[side]
+                    else complement_ladder(retained[side], self.unit))
         for ladder in retained.values():
             levels += len(ladder)
         return BookView(book.validity, plain(book.reason), last_change,

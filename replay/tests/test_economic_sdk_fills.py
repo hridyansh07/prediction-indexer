@@ -43,7 +43,8 @@ def policy(*sizings, **overrides):
     fills = {"version": 1, "step_contracts": "1", "max_levels": 8, "sizings": list(sizings or (ONE,))}
     fills.update(overrides.pop("fills", {}))
     value = {"version": 1, "fills": fills, "fee_per_contract": "10", "fee_from_ns": None,
-             "unknown_at": None, "trigger": "best", "audit_intervals": False, "controls": []}
+             "unknown_at": None, "trigger": "best", "audit_intervals": False, "controls": [],
+             "side": "buy"}
     value.update(overrides)
     return value
 
@@ -53,7 +54,12 @@ def reason(value):
 
 
 class PairFills(Strategy):
-    """Buys one contract of each token per step; trigger: best asks sum below one unit."""
+    """Buys one contract of each token per step; trigger: best asks sum below one unit.
+
+    With policy ``side: "sell"`` it instead sells one contract of each token per
+    step, against the unit payout one complete set costs; trigger: best bids sum
+    above one unit.
+    """
 
     name = "synthetic_pair_fills"
 
@@ -64,7 +70,8 @@ class PairFills(Strategy):
         self.snapshot = plain(self.prepared.snapshot)
         self.snapshot_sha256 = self.prepared.sha256
         self.policy = obj(config["policy"], "version fills fee_per_contract fee_from_ns unknown_at "
-                                            "trigger audit_intervals controls")
+                                            "trigger audit_intervals controls side")
+        self.side = "ask" if self.policy["side"] == "buy" else "bid"
         self.fee = int(self.policy["fee_per_contract"])
         # A dated fee: one more price atom per contract for fills opened from this time.
         dated = self.policy["fee_from_ns"]
@@ -94,7 +101,7 @@ class PairFills(Strategy):
         return self.prepared.bound
 
     def requirements(self, snapshot, policy):
-        return Requirements({key: BookRequirement(("ask",), (1,), ladders=("ask",))
+        return Requirements({key: BookRequirement((self.side,), (1,), ladders=(self.side,))
                              for key in self.plans})
 
     def baskets(self, snapshot, policy, scope_index):
@@ -112,10 +119,12 @@ class PairFills(Strategy):
             return Observation(UNUSABLE, tuple(reason({"leg": i, "validity": v.validity})
                                                for i, v in enumerate(views) if v.validity != "usable"),
                                context_free=True)
-        if any(not view.ask_present for view in views):
+        if any(not view.present(self.side) for view in views):
             return Observation(ONE_SIDED, context_free=True)
-        asks = tuple(view.best_ask for view in views)
+        asks = tuple(view.best_ask if self.side == "ask" else view.best_bid for view in views)
         edge = P - sum(ask[0] for ask in asks)
+        if self.side == "bid":
+            edge = -edge
         if edge <= 0 and self.policy["trigger"] == "best":
             return Observation(EVALUATED, value_class="NONPOSITIVE", context_free=True)
         return Observation(EVALUATED, value_class="POSITIVE", predicates=frozenset({KIND}),
@@ -124,13 +133,15 @@ class PairFills(Strategy):
 
     # -- fill hooks ------------------------------------------------------------
     def fill_spec(self, entity):
-        return FillSpec(("ask", "ask"), self.units)
+        return FillSpec((self.side, self.side), self.units)
 
     def fill_value(self, entity, steps, legs, time):
         if self.unknown_at is not None and any(price >= self.unknown_at
                                                for leg in legs for price, _ in leg.taken):
             return None
         fee = self.fee + (self.fee_from is not None and time >= self.fee_from)
+        if self.side == "bid":
+            return sum(leg.cost for leg in legs) - steps * self.units[0] * (P + fee)
         return steps * self.units[0] * (P - fee) - sum(leg.cost for leg in legs)
 
     # -- completion and reader hooks --------------------------------------------
@@ -150,7 +161,8 @@ class PairFills(Strategy):
 
     def check_quotes(self, quotes, values, entity):
         require(type(quotes) is list and len(quotes) == 2, "synthetic quotes")
-        require(P - sum(int(leg[0][0]) for leg in quotes) == int(values["edge"]), "synthetic edge")
+        edge = P - sum(int(leg[0][0]) for leg in quotes)
+        require((edge if self.side == "ask" else -edge) == int(values["edge"]), "synthetic edge")
 
     def summary_key(self, entity):
         return ("pair",)
@@ -658,6 +670,180 @@ class FillReaderTests(Base):
             aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
 
 
+class SellFillTests(Base):
+    """Sold legs walk bids downward and are killed at or below their kill price."""
+
+    def bids(self, h, time, instrument, *levels):
+        return ladder(h, time, instrument, bids=levels)
+
+    def test_a_sold_leg_is_killed_when_its_best_bid_falls_to_its_kill_price(self):
+        for leg, instrument, price in ((0, LEG0, 510), (1, LEG1, 460)):
+            with self.subTest(leg=leg):
+                h = self.harness(side="sell")
+                self.bids(h, 12, LEG0, (550, 5 * M))
+                self.bids(h, 12, LEG1, (500, 5 * M))
+                self.bids(h, 15, LEG1 if leg == 0 else LEG0, (600, 5 * M))   # a better bid
+                self.bids(h, 20, instrument, (price + 1, 5 * M))   # one atom above: still live
+                self.bids(h, 23, instrument, (price, 5 * M))       # at the kill price
+                h.finish()
+                # The better bid on the other leg keeps the repriced basket positive at
+                # the kill, so a new fill opens at that same instant.
+                self.assertEqual(self.spans(h), [("12", "23", "KILL_PRICE"), ("23", "40", "RUN_END")])
+                fill = h.rows("episodes.ndjson")[0]["fill"]
+                # Kill prices: 1000 + 10 - 500 = 510 on leg 0; 1000 + 10 - 550 = 460 on leg 1.
+                self.assertEqual(fill["kill_prices"], ["510", "460"])
+                self.assertEqual((fill["kill_leg"], fill["kill_best"]), (leg, [str(price), "5000000"]))
+                self.assertEqual(fill["end_books"][leg]["best"], [str(price), "5000000"])
+                (result,) = fill["results"]
+                self.assertEqual((result["steps"], result["value"]), ("1", "40000000"))
+                self.assertEqual(self.denominator(h)["fill_ns"], {"FILL_LIVE": "28"})
+                manifest = json.loads((h.output / "manifest.json").read_bytes())
+                snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+                aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+    def test_the_edge_walk_sells_down_the_bids_until_the_marginal_edge_is_gone(self):
+        h = self.harness({"name": "edge", "role": "governs", "edge": True}, side="sell")
+        self.bids(h, 12, LEG0, (600, M), (560, M), (500, 5 * M))
+        self.bids(h, 12, LEG1, (520, 2 * M), (450, 5 * M))
+        h.finish()
+        (result,) = h.rows("episodes.ndjson")[0]["fill"]["results"]
+        # Marginal sets: 600 + 520 and 560 + 520 beat 1,010; 500 + 450 does not.
+        self.assertEqual((result["steps"], result["stop"], result["value"]), ("2", "edge", "180000000"))
+        self.assertEqual(result["legs"][0]["taken"], [["600", "1000000"], ["560", "1000000"]])
+        self.assertEqual(result["after"], [["500", "5000000"], ["450", "5000000"]])
+        self.assertEqual(result["impact_ppm"], ["166666", "134615"])
+        # Selling both contracts of a leg at one price k: 2k + 1,040 (or 1,160) <= 2,020.
+        self.assertEqual(result["kill_prices"], ["490", "430"])
+        manifest = json.loads((h.output / "manifest.json").read_bytes())
+        snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+        aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+    def test_two_governing_sell_sizings_take_the_higher_kill(self):
+        h = self.harness(ONE, {"name": "t3", "role": "governs", "target_contracts": "3"}, side="sell")
+        self.bids(h, 12, LEG0, (600, M), (520, 5 * M))
+        self.bids(h, 12, LEG1, (550, 5 * M))
+        self.bids(h, 20, LEG1, (463, 5 * M))   # one is still worth selling; t3 is not
+        h.finish()
+        fill = h.rows("episodes.ndjson")[0]["fill"]
+        one, t3 = fill["results"]
+        # one: 1,010 - 600 = 410 on leg 1; t3: 3k + 1,640 <= 3,030, so k = 463.
+        self.assertEqual((one["kill_prices"][1], t3["kill_prices"][1]), ("410", "463"))
+        self.assertEqual(fill["kill_prices"], [t3["kill_prices"][0], "463"])
+        self.assertEqual(self.spans(h), [("12", "20", "KILL_PRICE")])
+
+    def test_reader_rejects_a_tampered_sell_kill_price_and_crossing(self):
+        def fixture():
+            h = self.harness(side="sell")
+            self.bids(h, 12, LEG0, (550, 5 * M))
+            self.bids(h, 12, LEG1, (500, 5 * M))
+            self.bids(h, 23, LEG0, (505, 5 * M))
+            h.finish()
+            manifest = json.loads((h.output / "manifest.json").read_bytes())
+            return h, load_snapshot(h.root / "context", expected_sha256=h.sha), manifest
+
+        def kill(rows):
+            for target in (rows[0]["fill"]["results"][0]["kill_prices"], rows[0]["fill"]["kill_prices"]):
+                target[0] = str(int(target[0]) - 1)
+
+        def crossing(rows):
+            rows[0]["fill"]["kill_best"] = ["511", "5000000"]
+            rows[0]["fill"]["end_books"][0]["best"] = ["511", "5000000"]
+
+        def ascending(rows):
+            # A sold leg's taken levels must descend.
+            leg = rows[0]["fill"]["results"][0]["legs"][0]
+            leg["taken"] = leg["consumed"] = [["550", "500000"], ["560", "500000"]]
+            leg["cost"] = str(550 * 500000 + 560 * 500000)
+
+        for mutate, pattern in ((kill, "fill kill price"), (crossing, "fill kill crossing"),
+                                (ascending, "fill taken/consumed levels")):
+            with self.subTest(pattern=pattern):
+                h, snapshot, manifest = fixture()
+                aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+                rewrite(h, manifest, "episodes.ndjson", mutate)
+                with self.assertRaisesRegex(ProtocolError, pattern):
+                    aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+    def test_views_project_kalshi_asks_to_complement_bids(self):
+        class Book:
+            validity, reason = "usable", None
+
+            def levels(self, side):
+                return {"bid": (), "ask": ((400, M), (450, 3 * M))}[side]
+
+        plan = {"price_scale": "3", "quantity_scale": "6"}
+        builder = ViewBuilder(BookRequirement(("ask",), (1,), True, ("kalshi_complement_bid",),
+                                              ladders=("kalshi_complement_bid",)), plan)
+        view = builder.build(Book(), 12)
+        self.assertEqual(view.ladders["kalshi_complement_bid"], ((600, M), (550, 3 * M)))
+        projected = view.transformed["kalshi_complement_bid"][1]
+        self.assertEqual((projected.cost, projected.taken), (600 * M, ((600, M),)))
+        again = builder.build(Book(), 13, view, {"ask": 900})
+        self.assertIs(again.ladders["kalshi_complement_bid"], view.ladders["kalshi_complement_bid"])
+        self.assertIs(again.transformed["kalshi_complement_bid"], view.transformed["kalshi_complement_bid"])
+
+    def test_a_basket_may_buy_one_leg_and_sell_another(self):
+        spec = FillSpec(("ask", "bid"), (M, M))
+        ladders = (((400, M), (450, 5 * M)), ((520, M), (480, 5 * M)))
+
+        def value(steps, legs):   # buy leg 0, sell leg 1, ten atoms of fee per contract each
+            return legs[1].cost - legs[0].cost - steps * M * 20
+
+        priced = fill_mode.price(fill_policy({"version": 1, "step_contracts": "1", "max_levels": 8,
+                                              "sizings": [ONE]}, KIND),
+                                 spec, ladders, (P, P), value)
+        self.assertEqual(priced.state, fill_mode.FILL_LIVE)
+        # Buy kill: 520 - 20 = 500, the price where buying leg 0 stops paying; sell kill:
+        # 400 + 20 = 420, the price where selling leg 1 stops paying.
+        self.assertEqual(priced.kill, (500, 420))
+        live = BookView("usable", None, 0, True, True, None, None, {}, {}, 0,
+                        {"ask": ((499, M),), "bid": ((421, M),)})
+        self.assertIsNone(fill_mode.crossed(priced.kill, spec.sources, (live, live)))
+        dropped = BookView("usable", None, 0, True, True, None, None, {}, {}, 0,
+                           {"ask": ((499, M),), "bid": ((420, M),)})
+        self.assertEqual(fill_mode.crossed(priced.kill, spec.sources, (live, dropped)), (1, (420, M)))
+
+
+class FillEndBookTests(Base):
+    def test_every_fill_end_records_each_legs_book_and_a_dropped_book_says_why(self):
+        h = self.harness()
+        h.asks(12, LEG0, (450, 5 * M))
+        h.asks(12, LEG1, (500, 5 * M))
+        ladder(h, 20, LEG1, why={"kind": "connection_closed"})
+        h.asks(25, LEG1, (500, 5 * M))
+        h.asks(30, LEG0, (490, 5 * M))
+        h.finish()
+        self.assertEqual(self.spans(h), [("12", "20", UNUSABLE), ("25", "30", "KILL_PRICE")])
+        dropped, killed = (row["fill"]["end_books"] for row in h.rows("episodes.ndjson"))
+        self.assertEqual(dropped[0], {"validity": "usable", "reason": None, "crossed": False,
+                                      "best": ["450", "5000000"]})
+        self.assertNotEqual(dropped[1]["validity"], "usable")
+        self.assertEqual((dropped[1]["reason"], dropped[1]["best"]), ("connection_closed", None))
+        self.assertEqual(killed[0]["best"], ["490", "5000000"])
+        manifest = json.loads((h.output / "manifest.json").read_bytes())
+        snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+        aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+        def best_on_dropped(rows):
+            rows[0]["fill"]["end_books"][1]["best"] = ["500", "5000000"]
+
+        def kill_level(rows):
+            rows[1]["fill"]["end_books"][0]["best"] = ["491", "5000000"]
+
+        def missing(rows):
+            del rows[0]["fill"]["end_books"]
+
+        for mutate, pattern in ((best_on_dropped, "fill end book best"),
+                                (kill_level, "fill end book kill level"), (missing, "closed schema")):
+            with self.subTest(pattern=pattern):
+                manifest = json.loads((h.output / "manifest.json").read_bytes())
+                original = (h.output / "episodes.ndjson").read_bytes()
+                rewrite(h, manifest, "episodes.ndjson", mutate)
+                with self.assertRaisesRegex(ProtocolError, pattern):
+                    aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+                (h.output / "episodes.ndjson").write_bytes(original)
+
+
 class KillPriceTests(unittest.TestCase):
     @staticmethod
     def value(fee):
@@ -693,6 +879,65 @@ class KillPriceTests(unittest.TestCase):
 
                 expected = next((p for p in range(P + 1) if not positive(p)), None)
                 self.assertEqual(kill_price(value, fill.steps, fill.legs, leg, P), expected)
+
+    def test_sell_binary_search_matches_brute_force_on_the_price_grid(self):
+        rng = random.Random(17)
+        checked = 0
+        for _ in range(150):
+            units = (rng.choice((1, 2, 5)), rng.choice((1, 3)))
+            ladders = []
+            for _ in units:
+                price, levels = rng.randrange(500, 900), []
+                for _ in range(rng.randrange(1, 4)):
+                    price -= rng.randrange(0, 80)
+                    levels.append((max(price, 0), rng.randrange(1, 30)))
+                ladders.append(tuple(levels))
+            fee = rng.choice((0, 7, 70))
+
+            def value(steps, legs):   # sell a complete set: proceeds less fees, less the payout
+                charge = sum(fee * q * p * (P - p) for leg in legs for p, q in leg.taken)
+                return sum(leg.cost for leg in legs) * P - charge // P - steps * P * P
+
+            (fill,) = walk_basket(tuple(ladders), units, targets=(rng.randrange(1, 6),), value=value)
+            if not fill.steps:
+                continue
+            for leg in range(2):
+                quantity = fill.legs[leg].filled_atoms
+
+                def positive(price):
+                    single = Fill(quantity, price * quantity, False, ((price, quantity),),
+                                  ((price, quantity),))
+                    return value(fill.steps, fill.legs[:leg] + (single,) + fill.legs[leg + 1:]) > 0
+
+                expected = next((p for p in range(P, -1, -1) if not positive(p)), None)
+                self.assertEqual(kill_price(value, fill.steps, fill.legs, leg, P, sell=True), expected)
+                checked += 1
+        self.assertGreater(checked, 100)
+
+    def test_sell_edge_walk_matches_brute_force_on_descending_bids(self):
+        rng = random.Random(23)
+        for _ in range(200):
+            units = (rng.choice((1, 2)), rng.choice((1, 3)))
+            ladders = []
+            for _ in units:
+                price, levels = rng.randrange(450, 800), []
+                for _ in range(rng.randrange(1, 5)):
+                    levels.append((price, rng.randrange(1, 20)))
+                    price -= rng.randrange(1, 60)
+                ladders.append(tuple(levels))
+            fee = rng.choice((0, 7, 70))
+
+            def value(steps, legs):
+                charge = sum(fee * q * p * (P - p) for leg in legs for p, q in leg.taken)
+                return sum(leg.cost for leg in legs) * P - charge // P - steps * P * P
+
+            (edge,) = walk_basket(tuple(ladders), units, value=value, edge=True)
+            limit = min(sum(q for _, q in ladder) // unit for ladder, unit in zip(ladders, units))
+            values = [0] + [walk_basket(tuple(ladders), units, targets=(n,), value=value)[0].value
+                            for n in range(1, limit + 1)]
+            best = max(values)
+            self.assertEqual(edge.steps, values.index(best))
+            self.assertEqual(edge.value, best if edge.steps else None)
 
     def test_result_satisfies_the_threshold_property_even_when_value_is_not_monotone(self):
         legs = (Fill(3, 1_500, False, ((500, 3),), ((500, 3),)), Fill(3, 900, False, ((300, 3),), ((300, 3),)))

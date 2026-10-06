@@ -109,8 +109,9 @@ Strategies write no files, track no time, and keep no state between callbacks.
 
 - the sides needed;
 - the ticket sizes, in contracts;
-- an optional SDK view transform. V1 has one, `kalshi_complement_ask`: the other
-  orientation's bids, projected to asks at `P − p` (complement spec §4.2).
+- optional SDK view transforms. `kalshi_complement_ask` projects the other
+  orientation's bids to asks at `P − p` (complement spec §4.2), and
+  `kalshi_complement_bid` projects its asks to bids at `P − p`, for selling.
 
 It may also request the market profile (§7). Requirements are static for the run.
 
@@ -806,7 +807,8 @@ matter** by declaring sizings; the SDK supplies the mechanism and enforces the
 declaration. When the trigger kind is active and the entity has no live fill,
 the SDK prices the strategy's **governing** sizings with
 `replay.economic_fills.walk_basket` against the ladders the views hold at that
-committed instant. When every governing sizing is tradeable, **one fill**
+committed instant. Each leg either **buys**, walking its asks upward, or
+**sells**, walking its bids downward; a basket may mix the two. When every governing sizing is tradeable, **one fill**
 opens; its recording sizings are priced at the same instant. The fill is never
 re-walked or re-sized. It is not priced "throughout" the episode: that would
 assume either no fill or infinite depth.
@@ -856,23 +858,33 @@ in this precedence wins:
 
 ### Kill prices, ending and reopening
 
-- **Kill prices.** For each positive sizing, each leg gets a kill price: the lowest
-  integer price at which buying that leg's whole fill quantity at that single
-  price, with the other legs unchanged and fees recomputed by the strategy's
-  value function, leaves the value not positive. A binary search over
-  `[0, 10^price_scale]` finds it (`replay.economic_fills.kill_price`); it is `null`
-  when even the maximum price keeps the value positive. An unknown value (`None`)
-  counts as not positive. Value must fall as a price rises; whatever it does,
-  the result `k` satisfies "not positive at `k`, positive at `k − 1`", which is
-  what the reader checks.
+- **Kill prices.** For each positive sizing, each leg gets a kill price: the
+  single price at which trading that leg's whole fill quantity, with the other
+  legs unchanged and fees recomputed by the strategy's value function, leaves
+  the value not positive. A binary search over `[0, 10^price_scale]` finds it
+  (`replay.economic_fills.kill_price`). An unknown value (`None`) counts as not
+  positive.
+  - A **bought** leg's value must fall as its price rises. Its kill price is the
+    *lowest* such price, `null` when even the maximum keeps the value positive,
+    and the result `k` satisfies "not positive at `k`, positive at `k − 1`".
+  - A **sold** leg's value must rise with its price. Its kill price is the
+    *highest* such price, `null` when even price 0 keeps the value positive,
+    and the result `k` satisfies "not positive at `k`, positive at `k + 1`".
+
+  Whatever the value does, the result has its property, which is what the
+  reader checks. A governing sizing's leg is already at its kill price when its
+  best walked level is at or above it (bought) or at or below it (sold). The
+  fill's effective kill price per leg is the tightest over governing sizings:
+  the lowest for a bought leg, the highest for a sold one.
 - **Episode = fill lifetime.** A fill episode has exactly one slice; consumed
   quote changes never split it. Its opening survival is its duration, latency
   tiers are viable when the fill survived at least `L`, and `Q`, censoring and
   `SCOPE_END` keep their meaning.
 - **Ending.** On every committed update of a live fill's leg books, the SDK makes
   one comparison per leg: the fill ends (`end_reason: "KILL_PRICE"`) at the first
-  update where a leg's best price on its walked ladder (asks, or Kalshi's
-  projected asks) is at or above its effective kill price. This check runs even
+  update where a leg's best price on its walked ladder has reached its effective
+  kill price: a best ask (or Kalshi projected ask) at or above it for a bought
+  leg, a best bid (or projected bid) at or below it for a sold leg. This check runs even
   when `evaluate` is skipped because its input fingerprint is unchanged: an
   entity with a live fill, or with trigger-positive time and no fill, is staged
   on every change to one of its leg books. Every other book change "just eats
@@ -880,7 +892,10 @@ in this precedence wins:
   false: the predicate goes off (`PREDICATE_FALSE`) or the status leaves
   `DEPTH_SUFFICIENT` (the status is the end reason, for example `UNUSABLE`). The
   trigger check runs first, so a fill whose trigger and kill price fail at one
-  instant ends as trigger-false.
+  instant ends as trigger-false. A dropped book (disconnected, gapped, reset or
+  otherwise not usable) therefore ends the fill with the strategy's status for
+  it, normally `UNUSABLE`, and every fill end records each leg's book as it
+  ended (`end_books`, below), so the reason is visible without the book.
 - **Reopening.** When a fill is killed and the trigger is still on, the SDK prices
   the governing sizings again at that same committed instant, against the same
   final views. When all are tradeable, the next episode opens at that time;
@@ -923,13 +938,15 @@ deterministically, and a superseded intermediate is never priced.
 - **Views.** `BookRequirement.ladders` names the sides or transforms whose full
   best-first ladder the view retains in `BookView.ladders`, from the one full
   side read it already makes (§3). `kalshi_complement_ask` retains the
-  projection of the bids to asks at `P − p`, reused while the bid ladder is the
+  projection of the bids to asks at `P − p`, and `kalshi_complement_bid` the
+  projection of the asks to bids, each reused while its source ladder is the
   identical object. A side with a retained ladder is never reused merely
   because a touched price lies beyond consumed depth, and equal ladders keep
   the prior object. Without `ladders`, views are unchanged.
 - **Strategy hooks** (used by both the runtime and the reader):
-  - `fill_spec(entity) -> FillSpec(sources, units)`: per leg, the ladder it buys
-    from (`"ask"` or a transform projecting to asks) and its units, the atoms
+  - `fill_spec(entity) -> FillSpec(sources, units)`: per leg, the ladder it trades
+    against (it buys from `"ask"` or `kalshi_complement_ask`, and sells into
+    `"bid"` or `kalshi_complement_bid`) and its units, the atoms
     one basket step takes (the leg ratio times one step in that book's quantity
     atoms; `fills.step_atoms` converts exactly). It is static per entity, and
     each source must be a retained ladder of that leg's book.
@@ -952,7 +969,11 @@ object, so consumers never need the book again:
   positive);
 - `kill_prices`: the effective per-leg kill prices, from governing sizings only;
 - `kill_leg` and `kill_best`: the crossing leg and its best level at the
-  crossing, present only when `end_reason` is `KILL_PRICE`.
+  crossing, present only when `end_reason` is `KILL_PRICE`;
+- `end_books`: per leg, the book as the fill ended, for every end reason:
+  `validity`, the book's reason `kind` (for example `connection_closed`; at most
+  128 characters), `crossed` (self-crossed), and `best`, the best level of the
+  walked ladder, `null` when that side is empty or the book is not usable.
 
 `open.values` and `open.quotes` remain the trigger observation's values and
 quotes at open; the single slice row is the compact slice of §5. Episode end
@@ -971,7 +992,8 @@ exactly. Zero entries are never written.
 - the closed `fill` object, its spec against the strategy's `fill_spec`, and each
   result's name, role and mode against the declared sizings, in order;
 - every sizing, governing or recording, from its own carried levels: taken
-  prices equal consumed prices, strictly ascending, every level but the last
+  prices equal consumed prices, strictly worse level by level (ascending for a
+  bought leg, descending for a sold one), every level but the last
   fully taken, at most `max_levels`; taken quantity is `steps × units`; cost is
   `Σ p·q` of taken; `before` is the first consumed level; `after` is the
   remainder of a partly taken last level, or else `null` or a strictly worse
@@ -982,8 +1004,10 @@ exactly. Zero entries are never written.
 - each `tradeable` flag, recomputed from steps, value, the target and the kill
   prices; that every governing sizing is tradeable; and that the effective kill
   prices are the per-leg minimum over governing sizings;
-- that a `KILL_PRICE` end names a leg with a kill price and a best level at or
-  above it;
+- that a `KILL_PRICE` end names a leg with a kill price and a best level that
+  has reached it, and that the leg's `end_books` best is that level;
+- that `end_books` has one closed entry per leg and only a usable book has a best
+  level; the rest of `end_books` is writer-attested;
 - that fill episodes have exactly one slice; tiers and `Q` recompute as for any
   episode;
 - that per class, fill episode lifetimes lie inside the trigger kind's class
@@ -1018,8 +1042,9 @@ fails the attempt at open. The conservativeness tests cover all three.
 - **Controls.** Any control (`time_shift` or `cyclic_neighbor`) with fill checks
   is rejected at construction. A time-shifted leg would need its historical
   ladders in the ring, and control kill checks would run on delayed views.
-- **Sell-side fills.** Sources are buy-side only (`"ask"` and ask-projecting
-  transforms), because the kill price assumes value falls as price rises.
 - **Several fill kinds** per strategy.
 - **Not wanted:** minimum order size or venue lot rules, trust or anchor checks
-  (those live upstream), and display work.
+  (those live upstream), display work, and cross-route depth accounting. Fills
+  measure apparent edge, not executable trades, so two routes that walk the same
+  book side at the same time each keep the whole ladder; overlapping fills show
+  an opportunity live on several markets at once.

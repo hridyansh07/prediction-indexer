@@ -35,11 +35,12 @@ from pathlib import Path
 from replay.economic_fills import Fill
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
-from replay.economic_sdk.fills import FILL_LIVE, FILL_STATES, KILL_PRICE, check_experiment
+from replay.economic_sdk.fills import (FILL_LIVE, FILL_STATES, KILL_PRICE, MAX_END_REASON,
+                                       check_experiment)
 from replay.economic_sdk.entity_tables import entity_rows
 from replay.economic_sdk.output import aggregate_files, file_list, group_of
 from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
-from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES
+from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES, SELL_SOURCES
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
 from replay.streams.protocol import obj, require, uint
@@ -117,13 +118,22 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
     """Re-check one carried fill from its own levels and the strategy's value hook.
 
     Every sizing, governing or recording, is checked; values and kill prices use
-    the episode's open time ``start``.
+    the episode's open time ``start``. A bought leg walks asks upward and is
+    killed at or above its kill price; a sold leg walks bids downward and is
+    killed at or below it.
     """
-    value = obj(value, "sources units results kill_prices kill_leg kill_best")
+    value = obj(value, "sources units results kill_prices kill_leg kill_best end_books")
     spec = strategy.fill_spec(entity)
     legs = len(entity.legs)
     require(value["sources"] == list(spec.sources) and value["units"] == [str(u) for u in spec.units]
             and len(spec.units) == legs, "fill spec")
+    sell = [source in SELL_SOURCES for source in spec.sources]
+
+    def reached(best, kill, leg):
+        return kill is not None and (best <= kill if sell[leg] else best >= kill)
+
+    def worse(price, than, leg):
+        return price < than if sell[leg] else price > than
     require(type(value["results"]) is list and len(value["results"]) == len(policy.sizings),
             "fill results")
     effective = [None] * legs
@@ -152,7 +162,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
             previous = None
             for j, ((taken_price, taken_quantity), (price, quantity)) in enumerate(zip(taken, consumed)):
                 require(taken_price == price and taken_quantity <= quantity and price <= maxima[i]
-                        and (previous is None or price > previous), "fill taken/consumed levels")
+                        and (previous is None or worse(price, previous, i)), "fill taken/consumed levels")
                 require(taken_quantity == quantity or j == len(taken) - 1, "fill taken/consumed levels")
                 previous = price
             require(sum(q for _, q in taken) == atoms, "fill taken quantity")
@@ -164,7 +174,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
                 if taken[-1][1] < quantity:
                     require(after == (price, quantity - taken[-1][1]), "fill after level")
                 else:
-                    require(after is None or after[0] > price, "fill after level")
+                    require(after is None or worse(after[0], price, i), "fill after level")
             else:
                 require(atoms == 0 and after == before, "fill after level")
             impact = (None if before is None or after is None or before[0] == 0
@@ -195,9 +205,13 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
             require(type(kills) is list and len(kills) == legs, "fill kill prices")
             kills = [None if kill is None else _natural(kill) for kill in kills]
             for leg, kill in enumerate(kills):
-                # The defining property: not positive at the kill price, positive one atom below.
+                # The defining property: not positive at the kill price, and positive
+                # one atom further toward the fill (below a bought leg, above a sold one).
                 if kill is None:
-                    require(positive(leg, maxima[leg]), "fill kill price")
+                    require(positive(leg, 0 if sell[leg] else maxima[leg]), "fill kill price")
+                elif sell[leg]:
+                    require(kill <= maxima[leg] and not positive(leg, kill)
+                            and (kill == maxima[leg] or positive(leg, kill + 1)), "fill kill price")
                 else:
                     require(kill <= maxima[leg] and not positive(leg, kill)
                             and (kill == 0 or positive(leg, kill - 1)), "fill kill price")
@@ -206,22 +220,38 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
         short = (steps < sizing.target_steps if sizing.mode == "target"
                  else not steps and stop != "edge")
         tradeable = (not short and kills is not None
-                     and all(kill is None or before[0] < kill for kill, before in zip(kills, befores)))
+                     and not any(reached(before[0], kill, leg)
+                                 for leg, (kill, before) in enumerate(zip(kills, befores))))
         require(result["tradeable"] is tradeable, "fill tradeable")
         if sizing.role == "governs":
             # A fill opens only when every governing sizing is tradeable.
             require(tradeable, "fill governing sizing not tradeable")
-            effective = [kill if current is None else current if kill is None else min(current, kill)
-                         for current, kill in zip(effective, kills)]
+            effective = [kill if current is None else current if kill is None
+                         else max(current, kill) if sell[leg] else min(current, kill)
+                         for leg, (current, kill) in enumerate(zip(effective, kills))]
     require(value["kill_prices"] == [None if k is None else str(k) for k in effective],
             "fill kill prices")
     if end_reason == KILL_PRICE:
         leg = value["kill_leg"]
         require(type(leg) is int and 0 <= leg < legs and effective[leg] is not None, "fill kill leg")
         best = _level(value["kill_best"])
-        require(best is not None and best[0] >= effective[leg], "fill kill crossing")
+        require(best is not None and reached(best[0], effective[leg], leg), "fill kill crossing")
     else:
         require(value["kill_leg"] is None and value["kill_best"] is None, "fill kill fields")
+    # Each leg's book at the end: writer-attested, except its shape, that only a
+    # usable book has a walked best level, and that a kill names that level.
+    books = value["end_books"]
+    require(type(books) is list and len(books) == legs, "fill end books")
+    for leg, book in enumerate(books):
+        book = obj(book, "validity reason crossed best")
+        require(type(book["validity"]) is str and book["validity"]
+                and (book["reason"] is None or (type(book["reason"]) is str
+                                                and len(book["reason"]) <= MAX_END_REASON))
+                and type(book["crossed"]) is bool, "fill end book")
+        best = _level(book["best"])
+        require(best is None or book["validity"] == "usable", "fill end book best")
+        if end_reason == KILL_PRICE and leg == value["kill_leg"]:
+            require(best == _level(value["kill_best"]), "fill end book kill level")
 
 
 def validate(directory, snapshot, manifest, strategy):

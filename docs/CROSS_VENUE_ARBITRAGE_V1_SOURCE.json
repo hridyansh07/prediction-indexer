@@ -11,7 +11,7 @@
     },
     {
       "path": "docs/ECONOMIC_STRATEGY_SDK_V1.md",
-      "sha256": "0acf460c69a9cbce54da4da42e6b239eb9e771d60653577ecfb276b7acdff488"
+      "sha256": "9149f63632fe49a4a85e0f09550e44f290a9eade6cac7e8178a61c93347e3c53"
     },
     {
       "path": "docs/STRATEGY_PREPARATION_V1.md",
@@ -47,7 +47,7 @@
     },
     {
       "path": "replay/economic_sdk/aggregate_reader.py",
-      "sha256": "43647a83bad106dd231caa71f257d95f3e8ca57b9317c1933a760d38da8ece67"
+      "sha256": "26da9fc55d0cec39fb6769d20dd3beb950b08e93091c38272a921243ccddb684"
     },
     {
       "path": "replay/economic_sdk/entities.py",
@@ -59,7 +59,7 @@
     },
     {
       "path": "replay/economic_sdk/runtime.py",
-      "sha256": "8d8ab96e4728f1d3fb4ecb2223a62b430eb769dbacd78dc7895bca6a530d497d"
+      "sha256": "5ddf825739851f870b338011aef0b459fc4ff2bf4323f6d7bf4fb1d196d01151"
     },
     {
       "path": "replay/prepare_context.py",

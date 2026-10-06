@@ -7,9 +7,11 @@ strategy's *governing* sizings with ``walk_basket`` against the ladders the
 views already hold at that committed instant. When every governing sizing is
 tradeable a fill opens: its *recording* sizings are priced once too, kill
 prices are computed per leg, and nothing is ever re-walked. The fill ends at
-the first committed update where a leg's best walked price is at or above its
-effective kill price (the lowest over governing sizings), or when the trigger
-turns false.
+the first committed update where a leg's best walked price reaches its
+effective kill price, or when the trigger turns false. A bought leg walks asks
+and is killed when its best ask is at or above its kill price (the lowest over
+governing sizings); a sold leg walks bids and is killed when its best bid is at
+or below it (the highest over governing sizings).
 
 This module holds the closed policy, the static per-entity spec check, the
 runtime pricing and the episode's ``fill`` object. The independent reader in
@@ -24,7 +26,8 @@ from fractions import Fraction
 
 from replay.economic_fills import kill_price, walk_basket
 from replay.economic_sdk import bounds
-from replay.economic_sdk.types import TRANSFORMS, FillPolicy, FillSizing, FillSpec
+from replay.economic_sdk.types import (BUY_SOURCES, SELL_SOURCES, FillPolicy, FillSizing,
+                                       FillSpec)
 from replay.streams.protocol import obj, require
 
 FILL_LIVE, FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE = (
@@ -36,8 +39,9 @@ NO_FILL_PRECEDENCE = (FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE)
 KILL_PRICE = "KILL_PRICE"
 GOVERNS, RECORDS = "governs", "records"
 MODES = ("target", "edge")
-# V1 fills buy: an ascending ask ladder, or a transform that projects to asks.
-FILL_SOURCES = ("ask",) + TRANSFORMS
+# A leg buys from an ascending ask ladder or sells into a descending bid
+# ladder, natively or through a transform that projects to that side.
+FILL_SOURCES = BUY_SOURCES + SELL_SOURCES
 MAX_SIZINGS = 8
 _DECIMAL = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]*[1-9])?")
 _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -118,6 +122,49 @@ def check_spec(spec, entity):
     require(all(type(unit) is int and unit > 0 for unit in spec.units), "fill units")
 
 
+def sells(sources):
+    """Per leg: ``True`` when it sells (walks bids), from its fill source."""
+    return tuple(source in SELL_SOURCES for source in sources)
+
+
+def reached(best, kill, sell):
+    """Whether best walked price ``best`` has reached kill price ``kill``."""
+    return kill is not None and (best <= kill if sell else best >= kill)
+
+
+def tighter(current, kill, sell):
+    """The effective kill price of two: the first one a move away from the fill reaches."""
+    if current is None:
+        return kill
+    if kill is None:
+        return current
+    return max(current, kill) if sell else min(current, kill)
+
+
+# Bounds one leg's ``end_books`` entry; a longer book reason kind fails the attempt.
+MAX_END_REASON = 128
+END_BOOK_LINE = 192 + 4 * MAX_END_REASON
+
+
+def end_books(sources, views):
+    """Each leg's book as the fill ended: why a fill stopped, without the book.
+
+    Per leg: the view's ``validity`` and its reason ``kind`` (a disconnected,
+    gapped or reset book is not ``usable``), whether the book is self-crossed,
+    and the best level of the walked ladder (``None`` when that side is empty
+    or the book is not usable).
+    """
+    rows = []
+    for source, view in zip(sources, views):
+        kind = view.reason.get("kind") if type(view.reason) is dict else None
+        require(kind is None or (type(kind) is str and len(kind) <= MAX_END_REASON),
+                "fill end book reason")
+        ladder = view.ladders.get(source) if view.validity == "usable" else None
+        rows.append({"validity": view.validity, "reason": kind, "crossed": view.crossed,
+                     "best": _level(ladder[0]) if ladder else None})
+    return rows
+
+
 class Priced:
     """One pricing at one committed instant: the fill state and, when live, the fill."""
 
@@ -149,15 +196,15 @@ def walk_sizing(sizing, ladders, units, value, max_levels):
     return result
 
 
-def assess(sizing, result, value, maxima):
+def assess(sizing, result, value, maxima, sell):
     """``(kill prices or None, no-fill reason or None)`` for one priced sizing.
 
     A target is short unless the full target is served; an edge walk is short
     when depth (not value) left it at zero steps. A sizing that took steps is
     *positive* when its value is a known positive integer; only positive
     sizings get kill prices. A sizing is tradeable (reason ``None``) when it is
-    not short, it is positive, and no leg's best walked price is already at or
-    above its kill price.
+    not short, it is positive, and no leg's best walked price has already
+    reached its kill price. ``sell[i]`` says leg ``i`` sells.
     """
     short = (result.steps < sizing.target_steps if sizing.mode == "target"
              else not result.steps and result.stop != "edge")
@@ -165,14 +212,14 @@ def assess(sizing, result, value, maxima):
         return None, FILL_DEPTH_SHORT  # no fill opens: its kill prices are never written
     kills = None
     if result.steps and result.value is not None and result.value > 0:
-        kills = tuple(kill_price(value, result.steps, result.legs, leg, maxima[leg])
+        kills = tuple(kill_price(value, result.steps, result.legs, leg, maxima[leg], sell[leg])
                       for leg in range(len(result.legs)))
     if short:
         return kills, FILL_DEPTH_SHORT
     if result.steps and result.value is None:
         return kills, FILL_VALUE_UNKNOWN
-    if kills is None or any(kill is not None and before[0] >= kill
-                            for kill, before in zip(kills, result.before)):
+    if kills is None or any(reached(before[0], kill, side)
+                            for kill, before, side in zip(kills, result.before, sell)):
         return kills, FILL_NONPOSITIVE
     return kills, None
 
@@ -198,16 +245,18 @@ def price(policy, spec, ladders, maxima, value):
     The fill is live only when every governing sizing is tradeable; otherwise
     the time takes the first no-fill reason of ``NO_FILL_PRECEDENCE`` that any
     governing sizing has, and recording sizings are not priced. A live fill's
-    effective kill price per leg is the lowest over governing sizings (``None``
-    when none of them can be killed on that leg). Recording sizings are priced
+    effective kill price per leg is the tightest over governing sizings: the
+    lowest for a bought leg, the highest for a sold one (``None`` when none of
+    them can be killed on that leg). Recording sizings are priced
     once, written whatever their value, and carry kill prices only when
     positive; they never open, end or block a fill.
     """
+    sell = sells(spec.sources)
     governing, reasons = {}, set()
     for index, sizing in enumerate(policy.sizings):
         if sizing.role == GOVERNS:
             result = walk_sizing(sizing, ladders, spec.units, value, policy.max_levels)
-            kills, reason = assess(sizing, result, value, maxima)
+            kills, reason = assess(sizing, result, value, maxima, sell)
             governing[index] = (result, kills, reason)
             if reason is not None:
                 reasons.add(reason)
@@ -218,24 +267,24 @@ def price(policy, spec, ladders, maxima, value):
     for index, sizing in enumerate(policy.sizings):
         if index in governing:
             result, kills, reason = governing[index]
-            effective = [kill if current is None else current if kill is None else min(current, kill)
-                         for current, kill in zip(effective, kills)]
+            effective = [tighter(current, kill, side)
+                         for current, kill, side in zip(effective, kills, sell)]
         else:
             result = walk_sizing(sizing, ladders, spec.units, value, policy.max_levels)
-            kills, reason = assess(sizing, result, value, maxima)
+            kills, reason = assess(sizing, result, value, maxima, sell)
         rows.append(_row(sizing, result, kills, reason))
     kill = tuple(effective)
     return Priced(FILL_LIVE, kill, {
         "sources": list(spec.sources), "units": [str(unit) for unit in spec.units],
         "results": rows, "kill_prices": [_optional(k) for k in kill],
-        "kill_leg": None, "kill_best": None})
+        "kill_leg": None, "kill_best": None, "end_books": None})
 
 
 def crossed(kill, sources, views):
-    """First leg whose best walked price is at or above its kill price, with that level."""
+    """First leg whose best walked price has reached its kill price, with that level."""
     for leg, (limit, source, view) in enumerate(zip(kill, sources, views)):
         if limit is not None:
             ladder = view.ladders[source]
-            if ladder and ladder[0][0] >= limit:
+            if ladder and reached(ladder[0][0], limit, source in SELL_SOURCES):
                 return leg, ladder[0]
     return None

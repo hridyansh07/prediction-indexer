@@ -36,6 +36,7 @@ from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table
 from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, check_spec,
+                                       END_BOOK_LINE, end_books,
                                        crossed, price)
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, Observation
@@ -47,7 +48,8 @@ from replay.supervisor import write_json_durable
 
 # Book sides each declared input source reads.
 _SOURCE_SIDES = {"best": frozenset(("bid", "ask")), "crossed": frozenset(("bid", "ask")),
-                 "kalshi_complement_ask": frozenset(("bid",))}
+                 "kalshi_complement_ask": frozenset(("bid",)),
+                 "kalshi_complement_bid": frozenset(("ask",))}
 _FILL, _TRANSFORM, _BEST, _CROSSED = 0, 1, 2, 3
 
 
@@ -757,7 +759,9 @@ class Runtime:
     def _open_episode(self, key, time, observation, skew, priced=None):
         self._check_retained_slice(observation.quotes, observation.payload)
         if priced is not None:
-            require(len(encoded(priced.json)) + 1024 <= bounds.MAX_LINE, "fill retained line budget")
+            # The end adds ``kill_best`` and one ``end_books`` entry per leg.
+            require(len(encoded(priced.json)) + 1024 + len(priced.kill) * END_BOOK_LINE
+                    <= bounds.MAX_LINE, "fill retained line budget")
         episode = _Episode()
         episode.fill = priced
         episode.entity, episode.kind, episode.start = key[0], key[1], time
@@ -933,6 +937,8 @@ class Runtime:
                 "at_max": {"values": episode.at_max[0], "quotes": quotes_json(episode.at_max[1])},
             }
             if episode.fill is not None:
+                episode.fill.json["end_books"] = end_books(
+                    self.fill_specs[episode.entity][0].sources, self._views(entity, end))
                 row["fill"] = episode.fill.json
             self.writers[group_of(entity) + "episodes.ndjson"].append(row)
 

@@ -11,7 +11,11 @@ UNUSABLE, ONE_SIDED, DEPTH_LIMITED, EVALUATED = (
 SDK_STATUSES = (UNUSABLE, ONE_SIDED, DEPTH_LIMITED, EVALUATED)
 # Admission statuses never reach ``evaluate``. NO_MATCH is control-only.
 ADMISSIONS = ("NOT_CAPTURED", "UNSUPPORTED_SHAPE", "UNSUPPORTED_SCALE", "NO_MATCH")
-TRANSFORMS = ("kalshi_complement_ask",)
+TRANSFORMS = ("kalshi_complement_ask", "kalshi_complement_bid")
+# Fill ladder sources (spec §13): a leg buys from an ask ladder, or sells into
+# a bid ladder; the Kalshi transforms project the opposite side at ``P - p``.
+BUY_SOURCES = ("ask", "kalshi_complement_ask")
+SELL_SOURCES = ("bid", "kalshi_complement_bid")
 CONTROLS = ("cyclic_neighbor", "time_shift")
 REAL, CONTROL = "real", "control"
 
@@ -65,8 +69,9 @@ class Basket:
 class FillSpec:
     """Static per-entity fill shape (spec §13), from ``Strategy.fill_spec``.
 
-    ``sources[i]`` names the ladder leg ``i`` buys from: ``"ask"`` or a
-    transform that projects to asks; the leg's book must retain that ladder
+    ``sources[i]`` names the ladder leg ``i`` trades against: one of
+    ``BUY_SOURCES`` (it buys, walking asks upward) or ``SELL_SOURCES`` (it
+    sells, walking bids downward); the leg's book must retain that ladder
     (``BookRequirement.ladders``). ``units[i]`` is the atoms leg ``i`` takes
     per basket step: the leg ratio times one step in that book's quantity atoms.
     """
