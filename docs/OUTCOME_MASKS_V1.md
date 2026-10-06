@@ -285,9 +285,9 @@ Rules:
 
 1. Find the member's market in the document by `market_id`. Absent →
    `status: "NOT_IN_MODEL"`.
-2. The market's `subscription_ids` must equal the scope target's
-   `subscription_ids` from the pinned context. Different →
-   `status: "SUBSCRIPTION_MISMATCH"`.
+2. The market's `subscription_ids` must contain exactly the same ids as the
+   scope target's `subscription_ids` from the pinned context, in any order
+   (compared as sorted lists). Different → `status: "SUBSCRIPTION_MISMATCH"`.
 3. The market's `mask_status` is not `MASKED` → copy it and its `reason`.
 4. Otherwise find the token whose `subscription_id` is the book's native ID (the
    instrument after `venue:`). Its `claim_key` gives the `claim_id`; its

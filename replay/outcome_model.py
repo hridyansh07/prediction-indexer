@@ -246,7 +246,9 @@ def outcome_books(scope, detail, outcomes):
             if doc is not None:
                 if market is None:
                     status = "NOT_IN_MODEL"
-                elif market["subscription_ids"] != targets[mid]["subscription_ids"]:
+                elif sorted(market["subscription_ids"]) != sorted(
+                    targets[mid]["subscription_ids"]
+                ):
                     status = "SUBSCRIPTION_MISMATCH"
                 elif market["mask_status"] != "MASKED":
                     status, reason = market["mask_status"], market["reason"]

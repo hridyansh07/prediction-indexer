@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 from analysis.claims import claim_id, space_shape_id
 from analysis.outcome_space import build_series_space
-from replay.outcome_model import validate_document
+from replay.outcome_model import outcome_books, validate_document
 from replay.preparation import (
     SourceUnavailable,
     UniverseHTTP,
@@ -156,6 +156,38 @@ class PreparationOutcomeTests(unittest.TestCase):
             self.assertTrue(
                 all(e["status"] == status and e["negated"] is None for e in entries)
             )
+
+    def test_subscription_ids_compare_independent_of_order(self):
+        # Universe and the Targeter may list the same Polymarket tokens in a
+        # different order; only a different id multiset is a mismatch.
+        scope = {
+            "members": [
+                {
+                    "market_id": "polymarket:series",
+                    "books": [
+                        {"instrument": "polymarket:" + s, "orientation": "outcome"}
+                        for s in ("123", "987")
+                    ],
+                }
+            ]
+        }
+        doc = document()
+        market = next(m for m in doc["markets"] if m["market_id"] == "polymarket:series")
+        outcomes = {"provider": "universe", "document": doc}
+        for target_ids, status in (
+            (["987", "123"], "MASKED"),
+            (["987", "456"], "SUBSCRIPTION_MISMATCH"),
+            (["123"], "SUBSCRIPTION_MISMATCH"),
+        ):
+            d = detail()
+            d["context"]["targets"][1]["subscription_ids"] = target_ids
+            entries = outcome_books(scope, d, outcomes)
+            self.assertEqual([e["status"] for e in entries], [status, status])
+            if status == "MASKED":
+                self.assertEqual(
+                    [e["claim_id"] for e in entries],
+                    [ref["claim_id"] for ref in market["claims"]],
+                )
 
     def test_unavailable_and_fatal_errors(self):
         for i, source in enumerate(
