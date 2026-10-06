@@ -89,12 +89,22 @@ class BasketFill:
     ``steps`` basket steps took ``legs[i].filled_atoms == steps * units[i]``
     atoms from each leg. ``value`` is the caller's valuation at ``steps``, or
     ``None`` for zero steps, no valuation, or an unknown value.
+
+    The fill carries its own view of each book: ``before[i]`` is leg ``i``'s
+    best level as walked and ``after[i]`` the best level left once this fill
+    executed (the remainder of a partly taken level, or the next level), or
+    ``None`` when the side is empty. ``impact_ppm[i]`` is how far the fill
+    moves that leg's best price, ``|after - before| / before`` in parts per
+    million, floored; ``None`` when either side is empty or ``before`` is 0.
     """
 
     steps: int
     legs: tuple[Fill, ...]
     stop: str
     value: int | None
+    before: tuple[tuple[int, int] | None, ...]
+    after: tuple[tuple[int, int] | None, ...]
+    impact_ppm: tuple[int | None, ...]
 
 
 def walk_basket(
@@ -169,6 +179,22 @@ def walk_basket(
             return tuple(empty for _ in ladders)
         return tuple(walk(ladder, (steps * unit,))[0] for ladder, unit in zip(ladders, units))
 
+    def priced(steps, legs, stop, result):
+        before, after, impact = [], [], []
+        for ladder, leg in zip(ladders, legs):
+            first = ladder[0] if ladder else None
+            left, cumulative = None, 0
+            for price, quantity in ladder:
+                cumulative += quantity
+                if cumulative > leg.filled_atoms:
+                    left = (price, min(quantity, cumulative - leg.filled_atoms))
+                    break
+            before.append(first)
+            after.append(left)
+            impact.append(None if first is None or left is None or first[0] == 0
+                          else abs(left[0] - first[0]) * 10**6 // first[0])
+        return BasketFill(steps, legs, stop, result, tuple(before), tuple(after), tuple(impact))
+
     def valued(steps, legs):
         if value is None or steps == 0:
             return None
@@ -181,7 +207,7 @@ def walk_basket(
     for target in targets:
         steps, stop = (target, "target") if target <= limit else (limit, exhausted)
         legs = legs_at(steps)
-        results.append(BasketFill(steps, legs, stop, valued(steps, legs)))
+        results.append(priced(steps, legs, stop, valued(steps, legs)))
     if edge:
         candidates = {limit}
         for points, unit in zip(boundaries, units):
@@ -201,5 +227,5 @@ def walk_basket(
                 stop = "edge"
                 break
             best, best_value, best_legs = steps, current, legs
-        results.append(BasketFill(best, best_legs, stop, best_value if best else None))
+        results.append(priced(best, best_legs, stop, best_value if best else None))
     return tuple(results)

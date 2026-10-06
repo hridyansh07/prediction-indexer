@@ -39,8 +39,8 @@ class WalkBasketTests(unittest.TestCase):
 
     def test_target_prices_each_leg_at_its_own_ladder(self):
         (fill,) = walk_basket((self.a, self.b), (1, 1), targets=(400,))
-        self.assertEqual(fill, BasketFill(400, (walk(self.a, (400,))[0], walk(self.b, (400,))[0]),
-                                          "target", None))
+        self.assertEqual(fill.legs, (walk(self.a, (400,))[0], walk(self.b, (400,))[0]))
+        self.assertEqual((fill.steps, fill.stop, fill.value), (400, "target", None))
         self.assertEqual(fill.legs[0].cost, 300 * 3_800 + 100 * 3_900)
 
     def test_targets_and_edge_share_one_result_shape(self):
@@ -50,6 +50,20 @@ class WalkBasketTests(unittest.TestCase):
         self.assertEqual(results[1].steps, 1_500)
         self.assertTrue(all(type(r) is BasketFill for r in results))
         self.assertEqual(results[0].value, value(100, results[0].legs))
+
+    def test_fill_carries_its_book_before_and_after_and_its_price_impact(self):
+        (fill,) = walk_basket((self.a, self.b), (1, 1), targets=(400,))
+        self.assertEqual(fill.before, ((3_800, 300), (5_500, 200)))
+        # Leg 0 took 100 of 500 at 0.39; leg 1 took 200 of 400 at 0.56.
+        self.assertEqual(fill.after, ((3_900, 400), (5_600, 200)))
+        self.assertEqual(fill.impact_ppm, (100 * 10**6 // 3_800, 100 * 10**6 // 5_500))
+        (whole,) = walk_basket((self.a, self.b), (1, 1), targets=(800,))
+        self.assertEqual(whole.after, ((4_600, 1_000), (6_000, 700)))
+        (empty,) = walk_basket((((3_800, 5),), ((5_500, 5),)), (1, 1), targets=(5,))
+        self.assertEqual((empty.after, empty.impact_ppm), ((None, None), (None, None)))
+        (none,) = walk_basket((((6_000, 10),), ((5_000, 10),)), (1, 1),
+                              value=concave_value(P), edge=True)
+        self.assertEqual((none.after, none.impact_ppm), (none.before, (0, 0)))
 
     def test_edge_stops_where_the_marginal_level_turns_negative(self):
         # With ~3.4c of fees per set, every segment to 600 costs under $1;
