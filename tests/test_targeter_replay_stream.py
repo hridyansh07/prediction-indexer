@@ -26,7 +26,7 @@ from encoder import (
     stored_identity_of,
 )
 from replay.catalog import canonical_sha256
-from replay.gate1 import Gate1Auditor
+from replay.legacy.gate1 import Gate1Auditor
 from replay.stream import CompositeByteStreamer, MemoryByteStreamer
 from targeter.v2.replay_stream import (
     ArchivedTargetRecordByteStreamer,

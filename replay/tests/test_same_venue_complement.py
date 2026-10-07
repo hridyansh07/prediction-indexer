@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 from replay.economic_fills import walk
 from replay.economic_intervals import EpisodeMath
-from replay.complement_output import read_provisional, validate_content
+from replay.strategies.same_venue_complement.output import read_provisional, validate_content
 from replay.fees.artifacts import build_catalog, source_from_bytes
 from replay.fees.domain import Asset, AssetAmount, AssetKind, Component, Fixed, InstrumentEconomics, Product, Venue, canonical
 from replay.fees.schedules import Catalog, Schedule, Scope, ZeroFee
 from replay.preparation import encoded, load_snapshot
-from replay.complement_contract import baskets
-from replay.same_venue_complement import build
+from replay.strategies.same_venue_complement.contract import baskets
+from replay.strategies.same_venue_complement.strategy import build
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_bundle_coverage import Harness as CoverageHarness
 from replay.tests.test_preparation import config as preparation_config, detail as preparation_detail

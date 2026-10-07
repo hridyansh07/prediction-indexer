@@ -5,12 +5,12 @@ following are implemented on `feat/economic-strategy-sdk`:
 
 - the SDK (`replay/economic_sdk/`);
 - the same-venue complement on it (policies 1 and 2, §11);
-- the market profile (`replay.market_profile:build`, §7);
+- the market profile (`replay.strategies.market_profile:build`, §7);
 - opt-in fill checks (§13), proven by synthetic offline tests only.
 
 The bench-corpus acceptance in §11 runs outside the repository and has not yet
 been run against this revision. The document builds on the same-venue complement
-strategy ([SAME_VENUE_COMPLEMENT_V1.md](SAME_VENUE_COMPLEMENT_V1.md)).
+strategy ([SAME_VENUE_COMPLEMENT_V1.md](../replay/strategies/same_venue_complement/SPEC.md)).
 
 Every economic strategy needs the same machinery:
 
@@ -404,7 +404,7 @@ Isolation rules:
 
 ## 7. Market profile
 
-`replay.market_profile:build` runs beside any strategy and needs no fee
+`replay.strategies.market_profile:build` runs beside any strategy and needs no fee
 configuration. Its closed configuration is
 `{version, snapshot_directory, snapshot_sha256, policy}`. It can instead run inside
 an SDK strategy through `Requirements.profile`; complement policy 2 exposes this as
@@ -782,7 +782,7 @@ price and quantity scales exactly may explicitly set it to `True`; `entities.res
 applies this opt-in to real baskets, substituted controls and independent reader
 resolution. It changes no reconstruction scales. Complement policies keep their
 existing admission and V1 bytes. The first consumer is
-[CROSS_VENUE_ARBITRAGE_V1.md](CROSS_VENUE_ARBITRAGE_V1.md).
+[CROSS_VENUE_ARBITRAGE_V1.md](../replay/strategies/cross_venue_arbitrage/SPEC.md).
 
 The reusable `FeeBridge.assess_orders` exposes per-leg native economics and
 `FeeEngine.assess_many` assessments without basket accounting. The existing

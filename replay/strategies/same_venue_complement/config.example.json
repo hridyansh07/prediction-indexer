@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "snapshot_directory": "/research/context",
+  "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "fees": {
+    "catalog_directory": "/research/reviewed-fee-catalog",
+    "catalog_identity": "REPLACE_WITH_REVIEWED_CATALOG_IDENTITY",
+    "reference_ns": "REPLACE_WITH_REVIEWED_REFERENCE_NS",
+    "limitless_buy_bps": 300,
+    "limitless_sell_bps": 150,
+    "kalshi_member_class": "NON_DIRECT",
+    "assets": {},
+    "instrument_bindings": []
+  },
+  "policy": {
+    "version": 2,
+    "latency_tiers_ns": [
+      "250000000",
+      "1000000000",
+      "5000000000"
+    ],
+    "headline_latency_ns": "1000000000",
+    "minimum_net_gap_per_contract_e18": "0",
+    "leg_skew_buckets_ns": [
+      "100000000",
+      "1000000000",
+      "5000000000",
+      "15000000000",
+      "60000000000"
+    ],
+    "verdict": {
+      "maximum_positive_time_fraction_ppm": "0",
+      "minimum_evaluated_ns": "3600000000000"
+    },
+    "audit_intervals": false,
+    "profile": null,
+    "sizes_contracts": [
+      "1",
+      "10",
+      "25",
+      "50",
+      "100",
+      "250",
+      "500",
+      "1000"
+    ],
+    "headline_size_contracts": "100",
+    "controls": [],
+    "controls_episodes": false,
+    "controls_slices": false,
+    "time_shift_ring_entries": "0"
+  }
+}

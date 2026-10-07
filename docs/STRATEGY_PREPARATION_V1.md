@@ -1,7 +1,7 @@
 # Strategy scope preparation V1
 
 This document specifies preparation only. The separately implemented coverage
-algorithm and output writer are documented in [BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md).
+algorithm and output writer are documented in [BUNDLE_COVERAGE_V1.md](../replay/strategies/bundle_coverage/SPEC.md).
 No economic strategy, scheduler, query language, or new reconstruction policy is included.
 `replay.preparation` resolves one historical bundle or an explicit market subset
 before replay starts. Runtime consumes a saved immutable snapshot without network
@@ -171,7 +171,7 @@ Stage-2 strategies receive Replay stream cuts under the zero-copy hook contract 
 [REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md): `cut.books` and `cut.body` are live
 views valid only while `__call__(cut)` runs. Books are updated in place, so state
 needed later — for example the prior book state at a scope boundary — must be
-copied during the hook (`replay.bundle_coverage` keeps a detached
+copied during the hook (`replay.strategies.bundle_coverage.strategy` keeps a detached
 `(validity, reason, source)` per book). Use `Book.levels(side, n=None)`,
 `Book.best_bid()`, and `Book.best_ask()`; their returned tuples are copies.
 

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from replay.complement_output import _quantiles, _signed, read_completed, validate_content
+from replay.strategies.same_venue_complement.output import _quantiles, _signed, read_completed, validate_content
 from replay.preparation import digest, load_snapshot
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_same_venue_complement import Harness as ComplementHarness

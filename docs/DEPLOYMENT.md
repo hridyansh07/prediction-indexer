@@ -215,7 +215,7 @@ touched. The gate, the reason strings, and the rollout are normative in
 Publication records a first sighting for every asset it subscribes, into
 `<live-root>/coverage.json`. This is the coverage-from-inception measure of
 `docs/CAPTURE_SPEC.md` §6.1 — how much of a market's life the tape actually
-contains — and `replay/gate1.py`'s `discovery_coverage` check reads it. No
+contains — and `replay/legacy/gate1.py`'s `discovery_coverage` check reads it. No
 service or cron entry is needed; it is written inside `publish_run`.
 
 **A deployment that captured before this existed must backfill once, before

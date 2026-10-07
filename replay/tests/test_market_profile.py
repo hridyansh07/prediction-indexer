@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from replay.bundle_coverage import Coverage
-from replay.market_profile import MarketProfile, read_provisional, validate_content
+from replay.strategies.bundle_coverage.strategy import Coverage
+from replay.strategies.market_profile.strategy import MarketProfile, read_provisional, validate_content
 from replay.preparation import load_snapshot
 from replay.streams.protocol import Book, ProtocolError, freeze
 from replay.tests.economic_scenarios import PROFILE_POLICY, M, ladder, operations, v2_policy

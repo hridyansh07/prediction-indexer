@@ -3,13 +3,13 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from replay.execution import (
+from replay.legacy.execution import (
     ESTIMATOR_NAME,
     MINIMUM_SURVIVAL_NS,
     DepthEpisode,
     estimate_candidates,
 )
-from replay.trust import Verdict
+from replay.legacy.trust import Verdict
 
 
 class ExecutionEstimatorTests(unittest.TestCase):

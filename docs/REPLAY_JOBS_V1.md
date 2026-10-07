@@ -6,7 +6,7 @@ The production runtime (§8) is also implemented. UI work (§9) is not implement
 
 Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md),
-[`BUNDLE_COVERAGE_V1.md`](BUNDLE_COVERAGE_V1.md),
+[`BUNDLE_COVERAGE_V1.md`](../replay/strategies/bundle_coverage/SPEC.md),
 [`REPLAY_STREAMS_V1.md`](REPLAY_STREAMS_V1.md),
 [`engine/README.md`](../engine/README.md) (composite normalizer,
 `materialize_range`),
@@ -400,8 +400,8 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
   "authorities": {"kalshi": "kalshi", "limitless": "limitless", "polymarket": "polymarket"},
   "strategies": {
     "bundle_coverage": {
-      "factory": "replay.bundle_coverage:build",
-      "reader": "replay.coverage_output:read_completed",
+      "factory": "replay.strategies.bundle_coverage:build",
+      "reader": "replay.strategies.bundle_coverage:read_completed",
       "config_schema": "bundle_coverage_v1",
       "label": "Bundle coverage",
       "description": "Evaluates historical coverage for the selected bundle.",

@@ -5,7 +5,7 @@
 schema, then a staged plan with an interim filter. Both optimised the storage of a
 relation set that should not be materialised per run at all. The segment design is
 retained only as the fallback (Part E).
-**Owns:** [`UNIVERSE_RELATION_OBSERVATION_WRITE_AMPLIFICATION.md`](./UNIVERSE_RELATION_OBSERVATION_WRITE_AMPLIFICATION.md).
+**Owns:** [`UNIVERSE_RELATION_OBSERVATION_WRITE_AMPLIFICATION.md`](UNIVERSE_RELATION_OBSERVATION_WRITE_AMPLIFICATION.md).
 **Blocks:** the schema v5 rollout. universe-server serves `v0.11.0` on schema v2;
 nothing is deployed on v5.
 
@@ -263,7 +263,7 @@ the ratio improves on the full 1,202-run backfill rather than degrading.
 `dead_weight_fraction` and `run_detail_already_unservable` recomputed identically
 across both runs, so the case for the change never rested on the checker fix.
 
-**Next:** [`UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md`](./UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md)
+**Next:** [`UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md`](UNIVERSE_SCHEMA_V6_CHANGE_OUTLINE.md)
 carries the file-by-file change list.
 
 1. Recompute claims for archived runs via Path A. Enumerate distinct

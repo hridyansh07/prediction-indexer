@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from replay.catalog import canonical_sha256
-from replay.gate1 import (
+from replay.legacy.gate1 import (
     Gate1Auditor,
     gate1_object,
     generation_metadata_object,

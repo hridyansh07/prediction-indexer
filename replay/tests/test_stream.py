@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from replay.envelope import EnvelopeError, parse_envelope
+from replay.legacy.envelope import EnvelopeError, parse_envelope
 from replay.stream import (
     CompositeByteStreamer,
     MemoryByteStreamer,

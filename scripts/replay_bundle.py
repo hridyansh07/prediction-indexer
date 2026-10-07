@@ -2,7 +2,7 @@
 """Narrow Replay runner over materialization, Risk transport, and supervisor.
 
 This runner does not yet use replay.preparation, replay.strategy_sdk,
-replay.bundle_coverage, or the completed-result reader. The request therefore
+replay.strategies.bundle_coverage.strategy, or the completed-result reader. The request therefore
 pins immutable book plans without scales, invokes one existing strategy factory,
 and returns validated supervisor completion only.
 """

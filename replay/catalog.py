@@ -1,4 +1,9 @@
-"""Content-addressed market metadata read through the byte-stream boundary."""
+"""Content-addressed market metadata read through the byte-stream boundary.
+
+Targeter v2 uses this module's target-record projections and fee-evidence
+checks. The legacy gates also use its MetadataCatalogue; both consumers share
+the same captured-record contract, so this module stays outside replay.legacy.
+"""
 
 from __future__ import annotations
 

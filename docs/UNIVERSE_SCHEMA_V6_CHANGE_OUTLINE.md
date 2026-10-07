@@ -3,7 +3,7 @@
 **Status:** implemented, server and UI. The UI landed on its own branch stacked
 on the server one, per §4.4's deferral.
 **Gate:** passed. See
-[`UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md`](./UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md)
+[`UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md`](UNIVERSE_RELATION_SCHEMA_REMEDIATION_PLAN.md)
 for the model and the archive run that validated it.
 
 ## 1. What the gate established

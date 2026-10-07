@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from replay import supervisor
-from replay.bundle_coverage import build
-from replay.coverage_output import (
+from replay.strategies.bundle_coverage.strategy import build
+from replay.strategies.bundle_coverage.output import (
     book_id,
     read_completed,
     read_provisional,
@@ -550,7 +550,7 @@ class CoverageTests(unittest.TestCase):
             real(path, value)
 
         with (
-            patch("replay.bundle_coverage.write_json_durable", side_effect=fail),
+            patch("replay.strategies.bundle_coverage.strategy.write_json_durable", side_effect=fail),
             self.assertRaises(OSError),
         ):
             h.strategy.finish()
@@ -692,7 +692,7 @@ class CoverageTests(unittest.TestCase):
             target = (
                 "replay.strategy_sdk.os.fsync"
                 if failure == "fsync"
-                else "replay.bundle_coverage.validate_content"
+                else "replay.strategies.bundle_coverage.strategy.validate_content"
             )
             with (
                 patch(target, side_effect=OSError("injected failure")),
@@ -718,7 +718,7 @@ class CoverageTests(unittest.TestCase):
         )
         c["strategies"] = {
             "coverage": {
-                "factory": "replay.bundle_coverage:build",
+                "factory": "replay.strategies.bundle_coverage:build",
                 "revision": "test",
                 "config": h.cfg,
             }

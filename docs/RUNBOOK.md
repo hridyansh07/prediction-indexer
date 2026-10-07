@@ -208,7 +208,7 @@ Limitless produces a lot of these — it is a low-volume venue and a quiet
 30-minute window is expected. **Gate 1 reports an empty segment as
 `"<segment>: sealed but the segment is absent"`**, which is a wording bug, not
 data loss: `segments_seen` is only populated per parsed record
-(`replay/gate1.py:190`), so a segment with no records is never marked seen. Check
+(`replay/legacy/gate1.py:190`), so a segment with no records is never marked seen. Check
 before worrying:
 
 ```bash
@@ -282,7 +282,7 @@ sudo python3 -m json.tool $DATA/ops/last_finalizer_sweep.json | head -30
 
 ```bash
 dc run --rm --no-deps targeter \
-  python -u -m replay.gate1 /var/lib/prediction-indexer \
+  python -u -m replay.legacy.gate1 /var/lib/prediction-indexer \
     --output /var/lib/prediction-indexer/ops/gate1.json
 ```
 

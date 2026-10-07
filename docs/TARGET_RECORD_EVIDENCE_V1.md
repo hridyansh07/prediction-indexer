@@ -121,7 +121,7 @@ so the row cannot carry one. This costs nothing.
 `metadata_digest` exists so a tape record can name the subscription version it was
 captured under. Terms lookup does not use it: `by_asset` takes an optional digest
 and is called with one in exactly **one** place across all of `replay/`
-(`replay/economics.py:208`, polymarket), falling through to `latest_by_asset`
+(`replay/legacy/economics.py:208`, polymarket), falling through to `latest_by_asset`
 everywhere else. Under §5, `run_id` + `observed_at` gives a time-indexed lookup —
 "what were this market's terms at time T" — which is *strictly better* than the
 latest-wins fallback it replaces.
@@ -320,7 +320,7 @@ coverage is a number rather than a boolean.
 
 A gate's product is that its verdict is a deterministic function of its dataset:
 `report_sha256` is a hash over the report body including the input manifest
-(`replay/gate1.py:79-85`). An HTTP call inside a gate means the same window
+(`replay/legacy/gate1.py:79-85`). An HTTP call inside a gate means the same window
 audited tomorrow yields a different answer, the digest stops meaning anything,
 and a venue 429 becomes a capture-audit failure. It also breaks the boundary
 every other part of replay respects — *"it does not open paths, call S3, or know
@@ -396,7 +396,7 @@ in `missing_references` and fail a tape that is fine.
 Give it its own name, `metadata_snapshot_references`, with the resolution scoped
 to what the dataset actually carries: `FAIL` when the dataset holds snapshots and
 some referenced digest is absent; `ADVISORY` when it holds none, which is what
-`ADVISORY` is already for (`replay/gate1.py:33-37`). The guarantee is preserved
+`ADVISORY` is already for (`replay/legacy/gate1.py:33-37`). The guarantee is preserved
 wherever it is checkable, and a dataset is not failed for lacking something that
 was never in it.
 

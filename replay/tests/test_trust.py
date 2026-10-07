@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from replay.events import ConnectionClosed, ConnectionOpened, FullBook
-from replay.output import encode_analysis_output
-from replay.trust import Verdict, audit_trust
+from replay.legacy.events import ConnectionClosed, ConnectionOpened, FullBook
+from replay.legacy.output import encode_analysis_output
+from replay.legacy.trust import Verdict, audit_trust
 
 
 def _base(index: int) -> dict[str, object]:

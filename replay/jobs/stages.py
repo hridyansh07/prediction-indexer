@@ -8,7 +8,6 @@ tests use bounded fakes without retained data or live services.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import io
 import os
 import signal
@@ -71,6 +70,7 @@ from replay.preparation import (
     prepare,
 )
 from replay.strategy_sdk import plain
+from replay.strategies import load_entrypoint
 from replay.streams.protocol import ProtocolError, choice, decode, obj, require
 from replay.supervisor import read as read_supervisor_json
 from replay.supervisor import read_success, validate as validate_supervisor
@@ -593,8 +593,7 @@ def prepare_stage(root: Path, request: Request, resolved: ResolvedJob, receipt: 
 
 
 def _import_callable(specification: str):
-    module, name = specification.split(":", 1)
-    return getattr(importlib.import_module(module), name)
+    return load_entrypoint(specification)
 
 
 def snapshot_sha256(context: Path) -> str:

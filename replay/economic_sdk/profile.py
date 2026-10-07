@@ -1,6 +1,6 @@
 """Market profile: time-weighted per-book trading data points (SDK spec §7).
 
-The collector runs either as the standalone ``replay.market_profile`` group or
+The collector runs either as the standalone ``replay.strategies.market_profile.strategy`` group or
 inside any SDK strategy that requests it through ``Requirements.profile``. It
 records no economic judgement. Every duration is exact visible nanoseconds;
 every price statistic is an exact integer in plan price atoms (scale carried

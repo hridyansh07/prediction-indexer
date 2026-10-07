@@ -16,7 +16,7 @@ class PackagingTests(unittest.TestCase):
         package_data = project["tool"]["setuptools"]["package-data"]
 
         self.assertIn("replay*", includes)
-        self.assertIn("policy.json", package_data["replay"])
+        self.assertIn("policy.json", package_data["replay.legacy"])
 
 
 if __name__ == "__main__":

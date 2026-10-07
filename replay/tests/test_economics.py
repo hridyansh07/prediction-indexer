@@ -4,7 +4,7 @@ import unittest
 from decimal import Decimal
 
 from replay.catalog import FeeTerms
-from replay.economics import (
+from replay.legacy.economics import (
     conservative_fee,
     solve_cover_lp,
     walk_ladder,

@@ -12,8 +12,9 @@ global: `delivery_index` is dense within one lane because each splice runs its
 own counter, and the k-way merge needs exactly one iterator per lane.
 
 This module exists because the resolver used to be duplicated byte-for-byte in
-`replay/order.py` and `replay/gate1.py`. Neither imported the other, so when the
-partition key changed both were wrong in the same way at the same time — which
+`replay/legacy/order.py` and `replay/legacy/gate1.py`. Neither imported the
+other, so when the partition key changed both were wrong in the same way at the
+same time — which
 is precisely the failure a second copy is for.
 """
 

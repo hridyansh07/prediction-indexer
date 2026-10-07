@@ -1333,7 +1333,7 @@ with unittest.mock.patch("time.time", blocked), unittest.mock.patch("time.time_n
     fees = FeeEngine(resolver=Resolver(Catalog.build([schedule(fill())]), reference_time=50))
     fees.assess(fill())
     fees.assess_many((fill(),))
-for prefix in ("replay.books", "replay.economics", "targeter", "splices", "redis", "engine", "analysis", "archive"):
+for prefix in ("replay.legacy", "targeter", "splices", "redis", "engine", "analysis", "archive"):
     assert not any(n == prefix or n.startswith(prefix + ".") for n in sys.modules), prefix
 """
         completed = subprocess.run(
