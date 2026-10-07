@@ -1,8 +1,7 @@
 # Same-venue multi-market complete sets V1
 
-Status: **implemented offline.** Synthetic contract tests cover enumeration,
-admission, pricing, fills and the reader. A run on retained data is recorded
-below when one is made.
+Status: **implemented.** Synthetic contract tests cover enumeration, admission,
+pricing, fills and the reader; one retained fixture run is recorded in §7.
 
 This is the first structural strategy from
 [ECONOMIC_STRATEGY_RESEARCH_V2.md](ECONOMIC_STRATEGY_RESEARCH_V2.md) §1. Several
@@ -123,3 +122,22 @@ and add `fill_ns` and `fill_ends`.
 - Depth shared between sets: fills measure apparent edge, so two sets that
   share a book each see its whole ladder.
 - Cross-venue sets (the cross-venue strategy covers two-leg ones).
+
+## 7. Retained fixture (2026-10-07)
+
+One `python -m replay.bench` run of the re-prepared Procyon context (CS2 Bo3,
+14 scopes) with current published fees, Kalshi direct member class, and the
+template policy (governing `edge`, `0.01` steps). It succeeded in 54 s; the
+completed reader re-priced every fill, and bench cleanup reported no errors.
+
+- **Sets.** Each scope admits four Kalshi sets: YES on both teams' series
+  markets, NO on both, and the same two pairs on the map-2 winner markets.
+  Polymarket's only captured market is the series, so it has a visible
+  `no_multi_market_set` row; one uncaptured member has a `NOT_CAPTURED` row.
+- **Opportunity.** The series YES pair was gross-positive for 29.2 s of 3,772 s
+  evaluated and net-positive for 0.02 s, in three fills of 2–14 ms: 7, 20 and
+  150.59 sets, worth $0.11, $0.29 and $2.01 net. Each ended when the 1-set
+  trigger turned off. The other three sets were never net-positive.
+- **Independent check** against the published fee formulas, not the fee SDK:
+  all 29 opening payloads (1-set gross and net), all 3 fill values, all 6 kill
+  prices, and all 3 edge stops' next steps (from `beyond`) agree.
