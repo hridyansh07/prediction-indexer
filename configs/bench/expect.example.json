@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "groups": {
+    "<group-name>": {
+      "added": [
+        [
+          "<row-key-value>"
+        ]
+      ],
+      "removed": [],
+      "changed": []
+    }
+  }
+}

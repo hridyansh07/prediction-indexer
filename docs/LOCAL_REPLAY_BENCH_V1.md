@@ -1,7 +1,8 @@
 # Local replay bench V1
 
-Status: **proposed.** This document specifies the bench. None of it is
-implemented yet.
+Status: **implemented.** `replay.bench` provides the V1 command surface.
+Offline contracts and retained-input Docker runs are verified; fresh Universe
+preparation still requires an operator-provided exported endpoint.
 
 The local replay bench is a reusable, agent-agnostic workflow for preparing a
 pinned bundle context, running one or more replay strategy groups over it in a
@@ -29,8 +30,8 @@ In scope:
 - completed reading through each group's own reader, followed by declared
   independent checks;
 - a structured diff between two runs;
-- guaranteed cleanup of the Docker containers, networks and images the bench
-  created.
+- cleanup of the Docker containers, networks and images the bench created,
+  with any cleanup failure reported in retained orchestration evidence.
 
 Out of scope:
 
@@ -91,6 +92,9 @@ Exit codes are the same for every command:
      path, on every exit, including failures and interrupts.
    - An image the bench built is removed after the run unless `--keep-image`
      is given.
+   - Ownership labels are verified before collecting logs or removing a resource;
+     ambiguous creation or name collisions cannot authorize unrelated cleanup.
+     Cleanup failures give exit 3 and remain in `orchestration.json`.
    - Build-cache pruning affects other builds, so it is opt-in only, with
      `--prune-build-cache`.
    - The bench never removes containers, images or volumes it did not create.
@@ -154,7 +158,25 @@ prints the identity and writes `OUT_DIR/bench_fees.json`.
 
 There is one validation rule here because it has already caused a failure: a
 model that needs a particular `fee_scale` for its rounding must declare it, and a
-mismatch is rejected at spec validation, not discovered at run time.
+mismatch is rejected at spec validation, not discovered at run time. PM
+`pm_declared_fill_ceil5_scenario` requires scale 5; Kalshi and Limitless CLOB
+models require scale 6.
+
+The closed fee spec is `{"version": 1, "schedules": [...]}`. Each schedule uses
+the Fee SDK's tagged `Schedule` encoding, with exactly these fields: `type`
+(`"Schedule"`), `component`, `scope`, `economics`, `fee_asset`, `fee_scale`,
+`model`, `sources`, `effective_from`, `effective_to`, `effective_evidence`,
+`extractor_version`, `model_version`, and `supersedes`. Nested tagged objects and
+enums retain the SDK's closed encoding and validation; there is no parallel fee
+schema or inferred default rate. The one substitution is each source, whose
+closed bench fields are `path`, `sha256`, `url`, and `retrieved_at`. `path` is an
+absolute existing local file; `sha256` pins its bytes; `url` is the public HTTPS
+source attribution; `retrieved_at` is a nonnegative integer Unix-ns timestamp.
+The SDK derives byte length. Unknown fields are rejected. Bounds are 10,000
+schedules, 32 sources per schedule, and 16 MiB per source/spec artifact.
+
+The identity-named catalog is written under `OUT_DIR/<catalog_identity>/`.
+Supply that selected directory as `fee_catalog_directory`, not `OUT_DIR`.
 
 ### 4.4 `run SPEC OUT_DIR [--keep-image] [--prune-build-cache] [--label L]`
 
@@ -174,8 +196,8 @@ mismatch is rejected at spec validation, not discovered at run time.
 5. Inside the container, `inside` does the following:
    1. Build the supervisor config from `base_run_config`. Set `strategies` to
       the declared groups and `transport.groups` to their names in order. Set a
-      unique `transport.run_id`. Force `limits.attempts = 1`, then apply
-      `limits` overrides.
+      unique `transport.run_id`. Apply `limits` overrides, then force
+      `limits.attempts = 1` (an override cannot enable retries).
    2. Write `OUT_DIR/input.json`.
    3. Call `replay.supervisor.run(config, OUT_DIR/run, redis_url)`.
    4. For each group, call its `reader(OUT_DIR/run, name)`, which must require
@@ -203,7 +225,30 @@ This command reads only. For each group present in both runs it reports:
 
 `--expect` is a closed file that declares the expected added, removed and
 changed row keys per group. Any unexpected difference exits 2. The default
-expects identical rows.
+expects identical rows and checks, with equal semantic hashes. Attempt-bound
+receipt hashes may differ. A semantic difference with no declared row changes
+is unexpected. Both groups without summaries produce an explicit `NO_SUMMARY`
+row report and still compare hashes/checks; a summary missing on just one side
+is unexpected. A missing summary cannot satisfy nonempty row expectations.
+
+The expectation file is closed version 1:
+
+```json
+{"version": 1, "groups": {"<group>": {
+  "added": [["<key-field-1>", "<key-field-2>"]],
+  "removed": [], "changed": []
+}}}
+```
+
+Every group entry requires `added`, `removed`, and `changed` arrays of composite
+row keys, in the declared `compare.key` order. Keys are nonempty arrays of JSON
+string/integer/boolean/null scalars; arity must match, and duplicate keys fail.
+Unknown groups or fields fail. Omitted groups expect no row changes. Group
+membership, check differences and one-sided summary absence cannot be waived by
+this row-only expectation schema. Comparison reads completed bench results and
+validates their pins, group/factory bindings, and copied receipt/check artifacts
+against `result.json`; it does not rerun strategy readers or import private checks
+on the host.
 
 ## 5. Run spec (version 1, closed)
 
@@ -234,8 +279,11 @@ expects identical rows.
 **Paths.**
 
 - Host paths must be absolute and must exist.
-- The context and fee catalog are mounted at fixed container paths,
-  `/bench/context` and `/bench/fees`.
+- The context is mounted at `/bench/context`. Only the selected fee catalog
+  is mounted at `/bench/fees/<catalog_identity>`, preserving the identity-named
+  directory required by the Fee SDK reader. `{fees}` remains `/bench/fees`; a
+  strategy catalog path must use `{fees}/{catalog_identity}`. No SDK validation
+  is weakened.
 - `mounts` exist so that paths inside `base_run_config` (derivative inputs,
   for example) resolve inside the container unchanged.
 
@@ -263,8 +311,9 @@ to.
 - Group configs are passed unmodified, apart from token substitution. The bench
   has no knowledge of any strategy's configuration schema.
 
-**Examples.** Committed under `configs/bench/*.example.json`, with placeholder
-paths only.
+**Examples.** `configs/bench/*.example.json` and its README contain placeholder
+paths and identities only. Replace every `<...>` value with reviewed inputs.
+Strategy-owned config schemas remain the strategy author's responsibility.
 
 ## 6. Checks
 
@@ -291,6 +340,7 @@ adds them in its own module.
 - **Run identity:** `version: 1`, `label`, `status` (`SUCCESS`,
   `CHECKS_FAILED` or `FAILED`), `started_at`, `run_seconds`.
 - **`image`:** `{id, built: bool, source_commit, source_dirty, dockerfile}`.
+  `id` is `null` only when a failed build never established an image identity.
 - **`context`:** `{snapshot_sha256, outcomes_provider}`.
 - **`fee_catalog_identity`** or `null`.
 - **`groups`:** one entry per group, `{name, factory, receipt, checks: {name:
