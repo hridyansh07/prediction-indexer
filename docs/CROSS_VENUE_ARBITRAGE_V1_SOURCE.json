@@ -19,7 +19,7 @@
     },
     {
       "path": "replay/README.md",
-      "sha256": "39d3ff32c6f8a0b99e2ad991c8a93e3488efe15e53836199d2c6d4f693628d9e"
+      "sha256": "33039f662adaea7d67b040fc3ad7dc54bce2bfd462d9f0fc443e0fb7b0023b65"
     },
     {
       "path": "replay/complement_fees.py",
@@ -35,7 +35,7 @@
     },
     {
       "path": "replay/cross_venue_contract.py",
-      "sha256": "7500702bc17f6306e931811edf9207d350c6ee3e7caf87a47b0dd0aa8eb9b4ba"
+      "sha256": "a46efac440a4d32fa7444948f0f7cfee068a29ee29b78d7c45d603a1cb43d947"
     },
     {
       "path": "replay/cross_venue_output.py",
@@ -98,5 +98,5 @@
       "sha256": "8de3a769d82c34e436e4c262458c3c94ef6d0ae2dbe83ae8227f9668bce898d3"
     }
   ],
-  "source_sha256": "576f5c2752e4b9e5380248f4734b46fca1ffb169dac1dbf70a08d809d62d1c7f"
+  "source_sha256": "8634f20138381458f5a783bf74b71958f54331b55c12e3a6999bbfc778425a5b"
 }
