@@ -20,37 +20,27 @@ from __future__ import annotations
 
 from replay.economic_fills import walk
 from replay.economic_sdk import bounds
+from replay.economic_sdk.availability import IntervalEngine
+from replay.economic_sdk.availability_reader import MAX_BYTES as AVAILABILITY_BYTES
+from replay.economic_sdk.availability_reader import MAX_LINE as AVAILABILITY_LINE
+from replay.economic_sdk.availability_reader import MAX_RECORDS as AVAILABILITY_RECORDS
+from replay.economic_sdk.availability_reader import entities
+from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
+    AVAILABILITY_FILE,
+    DISPOSITIONS,
+    FILES,
+    GROUPS,
+    MAX_PROFILE_ROWS,
+    STRATEGY,
+    V2_GROUPS,
+    pairs_of,
+    profile_files,
+    profile_identity,
+    profile_policy,
+)
 from replay.economic_sdk.views import touched_sides
-from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
-from replay.streams.protocol import obj, require, uint
-
-STRATEGY = "market_profile_v1"
-GROUPS = ("activity", "depth", "pair_consistency", "quote_stability", "self_crossing", "top_of_book")
-FILES = ("incidents.ndjson", "pair_profile.ndjson", "profile.ndjson")
-DISPOSITIONS = ("applied", "duplicate", "invalidated", "not_authority", "observed")
-MAX_PROFILE_ROWS = 2_000_000
-
-
-def profile_policy(value):
-    value = obj(plain(value), "version bucket_ns groups sizes_contracts tick_atoms depth_ticks survival_edges_ns")
-    require(type(value["version"]) is int and value["version"] == 1, "profile policy version")
-    require(uint(value["bucket_ns"]) > 0, "profile bucket width")
-    groups = value["groups"]
-    require(type(groups) is list and groups == sorted(set(groups)) and set(groups) <= set(GROUPS),
-            "profile groups")
-    for name, cap in (("sizes_contracts", 16), ("depth_ticks", 8), ("survival_edges_ns", 32)):
-        entries = value[name]
-        require(type(entries) is list and 1 <= len(entries) <= cap, "profile list budget")
-        numbers = [uint(v) for v in entries]
-        require(numbers == sorted(set(numbers)) and numbers[0] > 0, "profile list order/positive")
-    ticks = value["tick_atoms"]
-    require(type(ticks) is dict and ticks and all(uint(v) > 0 for v in ticks.values()), "tick atoms")
-    return value
-
-
-def profile_identity(snapshot_sha256, policy):
-    return digest({"strategy": STRATEGY, "policy": policy, "snapshot_sha256": snapshot_sha256})
+from replay.streams.protocol import require
 
 
 def _weighted_rank(histogram, percent):
@@ -65,24 +55,6 @@ def _weighted_rank(histogram, percent):
         if running >= rank:
             return str(value)
     return str(histogram[-1][0])
-
-
-def pairs_of(scope):
-    """Two-book members with a complement structure: PM token pairs, Kalshi YES/NO."""
-    result = []
-    for member in scope["members"]:
-        if not member["capture_selected"]:
-            continue
-        venue = member["market_id"].split(":", 1)[0]
-        books = sorted((b["instrument"], b["orientation"]) for b in member["books"])
-        if len(books) != 2:
-            continue
-        if venue == "polymarket" and all(o == "outcome" for _, o in books):
-            result.append((member["market_id"], tuple(books)))
-        elif venue == "kalshi" and books[0][0] == books[1][0] == member["market_id"] \
-                and {o for _, o in books} == {"complement", "outcome"}:
-            result.append((member["market_id"], tuple(books)))
-    return sorted(result)
 
 
 class _State:
@@ -110,8 +82,8 @@ class Collector:
     """Per-book profile over one stream; scope-, bucket- and staging-aware."""
 
     def __init__(self, policy, snapshot, snapshot_sha256, root, experiment_sha256, budget=None,
-                 views=None):
-        self.policy = profile_policy(policy)
+                 views=None, standalone=False):
+        self.policy = profile_policy(policy, standalone=standalone)
         # Embedded in an SDK strategy, ``views(key)`` returns that group's
         # detached view, whose walked fills are reused when they cover our sizes.
         self.views = views
@@ -138,9 +110,18 @@ class Collector:
                 other = (instrument, "complement" if orientation == "outcome" else "outcome")
                 if other in self.plans:
                     self.counterpart[instrument, orientation] = other
+        self.availability = None
+        if "availability" in self.groups:
+            entities(snapshot)  # fail the context budget before opening output
         self.writers = {name: LineWriter(root / name, max_bytes=bounds.MAX_BYTES,
                                          max_records=MAX_PROFILE_ROWS, max_line_bytes=bounds.MAX_LINE)
                         for name in FILES}
+        if "availability" in self.groups:
+            # The same limits and engine as bundle coverage's intervals.ndjson.
+            self.writers[AVAILABILITY_FILE] = LineWriter(
+                root / AVAILABILITY_FILE, max_bytes=AVAILABILITY_BYTES,
+                max_records=AVAILABILITY_RECORDS, max_line_bytes=AVAILABILITY_LINE)
+            self.availability = IntervalEngine(snapshot, self.writers[AVAILABILITY_FILE])
         self.scopes = snapshot["scopes"]
         self.start = int(snapshot["config"]["start_ns"])
         self.end = int(snapshot["config"]["end_ns"])
@@ -157,6 +138,8 @@ class Collector:
         self.incidents = {}     # key -> open incident
         self.next_edge = None
         self.budget.charge(len(self.plans) * 4096, "profile state budget")
+        if self.availability is not None:
+            self.budget.charge(len(entities(snapshot)) * 2048, "profile state budget")
 
     # -- inputs ------------------------------------------------------------------
     def _read(self, key, book, sides):
@@ -244,8 +227,12 @@ class Collector:
             self.state[key] = self._derive(key)
             self.since[key] = start
         self._open_scope(0, start)
+        if self.availability is not None:
+            self.availability.initial(cut)
 
     def cut(self, cut, raw, time, changed=None):
+        if self.availability is not None:
+            self.availability.cut(cut, raw, time)
         if self.staged is not None and time > self.staged:
             self._commit()
         self._advance(time)
@@ -304,6 +291,8 @@ class Collector:
             self._commit()
         self._advance(end)
         self._close_scope(end, "RUN_END")
+        if self.availability is not None:
+            self.availability.terminal(end)
 
     # -- trades ------------------------------------------------------------------
     def _trade(self, key, row, value):

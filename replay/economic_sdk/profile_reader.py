@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from replay.economic_sdk.profile import DISPOSITIONS, FILES, GROUPS, pairs_of, profile_policy
+from replay.economic_sdk.availability_reader import book_id, duration_rows, validate_intervals
+from replay.economic_sdk.profile_policy import (
+    AVAILABILITY_FILE,
+    DISPOSITIONS,
+    FILES,
+    GROUPS,
+    pairs_of,
+    profile_policy,
+)
 from replay.economic_sdk.reader import lines, signed
 from replay.streams.protocol import obj, require, uint  # noqa: F401
 
@@ -56,8 +64,9 @@ def _bucketed(start, end, width, scope_start, scope_end):
     require(end == scope_end or end % width == 0, "row end alignment")
 
 
-def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_sha256):
-    policy = profile_policy(policy)
+def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_sha256, *,
+                     standalone=False):
+    policy = profile_policy(policy, standalone=standalone)
     root = Path(root)
     groups = set(policy["groups"])
     width = int(policy["bucket_ns"])
@@ -268,12 +277,28 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         for market, _ in scope_pairs:
             require(cursor.get((index, market)) == int(scopes[index]["end_ns"]), "incomplete pair rows")
 
-    return {"version": 1, "experiment_sha256": experiment_sha256, "policy": policy,
-            "books": [{"scope": scope, "instrument": key[0], "orientation": key[1],
-                       **{k: (v if type(v) is not int or k == "rows" else str(v)) for k, v in total.items()}}
-                      for (scope, key), total in sorted(totals.items())],
-            "pairs": [{"scope": scope, "market_id": market, **{k: str(v) for k, v in total.items()}}
-                      for (scope, market), total in sorted(pair_totals.items())]}
+    availability = None
+    if "availability" in groups:
+        # The shared coverage reader, then one profile-only cross-check: a book's
+        # usable time in availability rows is the sum of its profile rows' usable time.
+        durations = validate_intervals(root / AVAILABILITY_FILE, snapshot, files[AVAILABILITY_FILE])
+        for index in range(len(scopes)):
+            for key in books[index]:
+                entity = book_id({"instrument": key[0], "orientation": key[1]})
+                require((index, entity) in durations, "availability book missing")
+                require(durations[index, entity].get("usable", 0) == totals[index, key]["usable_ns"],
+                        "availability/profile usable time")
+        availability = duration_rows(durations)
+
+    result = {"version": 1, "experiment_sha256": experiment_sha256, "policy": policy,
+              "books": [{"scope": scope, "instrument": key[0], "orientation": key[1],
+                         **{k: (v if type(v) is not int or k == "rows" else str(v)) for k, v in total.items()}}
+                        for (scope, key), total in sorted(totals.items())],
+              "pairs": [{"scope": scope, "market_id": market, **{k: str(v) for k, v in total.items()}}
+                        for (scope, market), total in sorted(pair_totals.items())]}
+    if availability is not None:
+        result["availability_durations"] = availability
+    return result
 
 
 __all__ = ["FILES", "validate_profile"]
