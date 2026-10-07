@@ -27,6 +27,14 @@ policy, not vendor completeness or opportunities. Its strict completed reader
 requires both content identity and supervisor success; see
 [`BUNDLE_COVERAGE_V1.md`](../docs/BUNDLE_COVERAGE_V1.md). No shared cache is included.
 
+`python -m replay.bench` provides reusable local preparation with outcomes warm-up,
+context comparison, declarative fee catalogs, disposable single-attempt Docker
+runs, strategy-owned readers/checks, and run comparison. Inputs are mounted read-only;
+failed evidence is retained and writing commands require a new output directory.
+Preparation consumes only exported `UNIVERSE_BASE_URL`. See
+[LOCAL_REPLAY_BENCH_V1.md](../docs/LOCAL_REPLAY_BENCH_V1.md) and the placeholder
+examples in [configs/bench](../configs/bench/README.md).
+
 Economic strategies build on `replay.economic_sdk`
 ([`ECONOMIC_STRATEGY_SDK_V1.md`](../docs/ECONOMIC_STRATEGY_SDK_V1.md)). A strategy
 declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns:
