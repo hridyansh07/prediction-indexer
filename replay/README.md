@@ -140,3 +140,10 @@ before opening outputs; admitted size-specific route identities are preserved.
 See [CROSS_VENUE_ARBITRAGE_V1.md](../docs/CROSS_VENUE_ARBITRAGE_V1.md)
 for configuration, preparation from `UNIVERSE_BASE_URL`, independent reading and
 the bounded pilot recipe.
+
+`replay.same_venue_multi_market:build` measures all-BUY complete sets of two to
+four books across one venue's markets, enumerated from the pinned masks, priced
+with native-scale SDK fill checks and exact Fee SDK assessments. Sets inside one
+market are the complement's domain and are excluded; unmasked books and venues
+without a set stay visible as rejected rows. See
+[SAME_VENUE_MULTI_MARKET_V1.md](../docs/SAME_VENUE_MULTI_MARKET_V1.md).

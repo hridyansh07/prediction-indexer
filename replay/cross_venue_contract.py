@@ -97,10 +97,11 @@ def experiment(policy, identity):
                    policy_sha256=digest(policy), diagnostic_statuses=DIAGNOSTICS, fills=fills)
 
 
-def assess_net(bridge, *, size, time, fee_legs, **identity):
+def assess_net(bridge, *, size, time, fee_legs, account=ACCOUNT, **identity):
     """Fee-assess one all-BUY complete set of ``size`` contracts; one order per leg.
 
-    Shared by the trigger and the fill value so both price fees identically.
+    Shared by the trigger and the fill value so both price fees identically,
+    and by every all-BUY complete-set strategy (``account`` labels its orders).
     Returns per-leg ``{assessment_ids, charges, cash, received}`` (``cash`` and
     ``received`` are ``None`` unless that leg's deltas are known), the sorted
     unknown reasons, the assumptions and the evidence. Order identities never
@@ -108,7 +109,7 @@ def assess_net(bridge, *, size, time, fee_legs, **identity):
     """
     try:
         orders, missing = bridge.assess_orders(direction="BUY", size=size, time=time,
-                                               legs=tuple(fee_legs), account=ACCOUNT, **identity)
+                                               legs=tuple(fee_legs), account=account, **identity)
     except FeeEconomicsUnavailable as error:
         orders, missing = (None,) * len(fee_legs), ("fee_economics_unavailable:" + str(error),)
     unknown, assumptions, evidence = list(missing), {"PER_LEVEL_DECLARED_PARTITION_ESTIMATE"}, set()
