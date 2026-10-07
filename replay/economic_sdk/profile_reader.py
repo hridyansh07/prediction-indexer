@@ -17,10 +17,13 @@ from replay.economic_sdk.profile_policy import (
     DISPOSITIONS,
     FILES,
     GROUPS,
+    TRANSITIONS_FILE,
+    TRANSITIONS_PLAIN,
     pairs_of,
     profile_policy,
 )
 from replay.economic_sdk.reader import lines, signed
+from replay.economic_sdk.transitions_reader import validate_transitions
 from replay.streams.protocol import obj, require, uint  # noqa: F401
 
 _STATE = ("usable_ns", "not_initialized_ns", "unusable_ns", "bid_empty_ns", "ask_empty_ns",
@@ -94,6 +97,12 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
     fields = ("version experiment_sha256 snapshot_sha256 bundle_id scope scope_run_id instrument "
               "orientation venue market_id price_scale quantity_scale start_ns end_ns tick_atoms "
               "ask_source groups state " + " ".join(g for g in GROUPS if g in groups and g != "pair_consistency"))
+    # Version-2 outputs that the policy did not ask for must not exist beside the others.
+    for name, wanted in ((AVAILABILITY_FILE, "availability"), (TRANSITIONS_FILE, "transitions")):
+        require(wanted in groups or not (root / name).exists(), "unexpected output file " + name)
+    require(not (root / TRANSITIONS_PLAIN).exists() and not (root / (TRANSITIONS_PLAIN + ".open")).exists(),
+            "unexpected provisional transitions file")
+    facts = {"state": {}, "open": {}, "buckets": {}} if "transitions" in groups else None
     last, cursor, totals = None, {}, {}
     for row in lines(root, "profile.ndjson", files["profile.ndjson"]):
         obj(row, fields)
@@ -134,12 +143,14 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         total["rows"] += 1
         for name in _STATE:
             total[name] += d[name]
+        opened = activity_counts = None
 
         if "top_of_book" in groups:
             top = obj(row["top_of_book"], "open close spread_atoms_ns spread_histogram spread_p50_atoms "
                                           "spread_p90_atoms mid2_atoms_ns bid_top_quantity_ns ask_top_quantity_ns")
             _quotes(top["open"])
             _quotes(top["close"])
+            opened = top["open"]
             histogram = []
             for entry in top["spread_histogram"]:
                 require(type(entry) is list and len(entry) == 2, "spread histogram entry")
@@ -200,6 +211,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                     and sum(activity["aggressor"].values()) == nonduplicate, "aggressor partition")
             _big(activity["traded_quantity_atoms"])
             signed(activity["trade_mid2_deviation_atoms"])
+            activity_counts = (activity["transitions"], nonduplicate)
         if "quote_stability" in groups:
             stability = obj(row["quote_stability"], "edges_ns bid ask censored")
             require(stability["edges_ns"] == policy["survival_edges_ns"])
@@ -208,6 +220,14 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                 require(type(counts) is list and len(counts) == len(policy["survival_edges_ns"]) + 1
                         and all(type(c) is int and c >= 0 for c in counts), "survival histogram")
             obj(stability["censored"], "bid ask")
+        if facts is not None:
+            held = facts["state"].setdefault((scope, key), {})
+            for name, value in (("usable", d["usable_ns"]), ("not_initialized", d["not_initialized_ns"]),
+                                *(("unusable:" + why, _big(ns)) for why, ns in reasons.items())):
+                held[name] = held.get(name, 0) + value
+            facts["buckets"].setdefault((scope, key), []).append((start, end, activity_counts))
+            if opened is not None and start == scope_start:
+                facts["open"][scope, key] = opened
 
     for index in range(len(scopes)):
         for key in books[index]:
@@ -290,6 +310,10 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         "availability/profile usable time")
         availability = duration_rows(durations)
 
+    transitions = None
+    if "transitions" in groups:
+        transitions = validate_transitions(root, snapshot, files[TRANSITIONS_FILE], policy, facts, groups)
+
     result = {"version": 1, "experiment_sha256": experiment_sha256, "policy": policy,
               "books": [{"scope": scope, "instrument": key[0], "orientation": key[1],
                          **{k: (v if type(v) is not int or k == "rows" else str(v)) for k, v in total.items()}}
@@ -298,6 +322,8 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         for (scope, market), total in sorted(pair_totals.items())]}
     if availability is not None:
         result["availability_durations"] = availability
+    if transitions is not None:
+        result.update(transitions)
     return result
 
 

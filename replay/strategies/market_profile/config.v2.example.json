@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "snapshot_directory": "/research/context",
+  "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "policy": {
+    "version": 2,
+    "bucket_ns": "1000000000",
+    "groups": [
+      "activity",
+      "availability",
+      "depth",
+      "pair_consistency",
+      "quote_stability",
+      "self_crossing",
+      "top_of_book",
+      "transitions"
+    ],
+    "sizes_contracts": [
+      "1",
+      "100"
+    ],
+    "tick_atoms": {
+      "kalshi": "1",
+      "polymarket": "1",
+      "limitless": "1"
+    },
+    "depth_ticks": [
+      "1",
+      "5",
+      "10"
+    ],
+    "survival_edges_ns": [
+      "250000000",
+      "1000000000",
+      "5000000000"
+    ]
+  }
+}

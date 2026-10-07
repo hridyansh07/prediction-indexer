@@ -12,9 +12,17 @@ from replay.strategies import canonical_reference
 
 from replay.economic_intervals import CutClock
 from replay.economic_sdk.bounds import MAX_METADATA
-from replay.economic_sdk.profile import STRATEGY, Collector, profile_files, profile_identity, profile_policy
+from replay.economic_sdk.profile import (
+    STRATEGY,
+    TRANSITIONS_FILE,
+    Collector,
+    profile_files,
+    profile_identity,
+    profile_policy,
+)
 from replay.economic_sdk.profile_reader import validate_profile
 from replay.economic_sdk.reader import check_files, read_json
+from replay.economic_sdk.transitions_reader import identity_record
 from replay.preparation import digest, encoded, load_snapshot, sha
 from replay.strategy_sdk import PreparedInput, plain
 from replay.streams.protocol import freeze, obj, require
@@ -100,7 +108,12 @@ def _manifest(value, complete):
             "profile manifest version")
     require(value["experiment_sha256"] == profile_identity(value["snapshot_sha256"], value["policy"]),
             "profile experiment identity")
-    check_files(value["files"], profile_files(policy))
+    names, files = profile_files(policy), value["files"]
+    require(type(files) is dict and set(files) == set(names), "output file set")
+    check_files({k: v for k, v in files.items() if k != TRANSITIONS_FILE},
+                tuple(n for n in names if n != TRANSITIONS_FILE))
+    if TRANSITIONS_FILE in files:
+        identity_record(files[TRANSITIONS_FILE])
     if complete:
         sha(value["summary_sha256"])
 

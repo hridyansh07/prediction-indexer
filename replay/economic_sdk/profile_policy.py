@@ -17,9 +17,13 @@ from replay.streams.protocol import obj, require, uint
 
 STRATEGY = "market_profile_v1"
 GROUPS = ("activity", "depth", "pair_consistency", "quote_stability", "self_crossing", "top_of_book")
-V2_GROUPS = ("availability",)
+V2_GROUPS = ("availability", "transitions")
 FILES = ("incidents.ndjson", "pair_profile.ndjson", "profile.ndjson")
 AVAILABILITY_FILE = "availability.ndjson"
+TRANSITIONS_FILE = "transitions.ndjson.zst"
+TRANSITIONS_PLAIN = "transitions.ndjson"  # provisional; deleted once the frame is committed
+TRANSITIONS_MAX_ROWS = 50_000_000
+TRANSITIONS_MAX_BYTES = 16 * 1024**3
 DISPOSITIONS = ("applied", "duplicate", "invalidated", "not_authority", "observed")
 MAX_PROFILE_ROWS = 2_000_000
 
@@ -56,7 +60,8 @@ def profile_identity(snapshot_sha256, policy):
 def profile_files(policy):
     """The exact file set a policy produces; manifests and readers use this."""
     groups = set(policy["groups"])
-    return FILES + ((AVAILABILITY_FILE,) if "availability" in groups else ())
+    return (FILES + ((AVAILABILITY_FILE,) if "availability" in groups else ())
+            + ((TRANSITIONS_FILE,) if "transitions" in groups else ()))
 
 
 def pairs_of(scope):

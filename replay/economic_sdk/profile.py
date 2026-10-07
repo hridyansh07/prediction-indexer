@@ -32,12 +32,14 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     GROUPS,
     MAX_PROFILE_ROWS,
     STRATEGY,
+    TRANSITIONS_FILE,
     V2_GROUPS,
     pairs_of,
     profile_files,
     profile_identity,
     profile_policy,
 )
+from replay.economic_sdk.transitions import TransitionRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
@@ -138,6 +140,10 @@ class Collector:
         self.incidents = {}     # key -> open incident
         self.next_edge = None
         self.budget.charge(len(self.plans) * 4096, "profile state budget")
+        self.transitions = None
+        if "transitions" in self.groups:
+            self.transitions = TransitionRecorder(snapshot, self.plans, self.policy, self.counterpart,
+                                                  root, self.budget)
         if self.availability is not None:
             self.budget.charge(len(entities(snapshot)) * 2048, "profile state budget")
 
@@ -229,6 +235,8 @@ class Collector:
         self._open_scope(0, start)
         if self.availability is not None:
             self.availability.initial(cut)
+        if self.transitions is not None:
+            self.transitions.initial(cut)
 
     def cut(self, cut, raw, time, changed=None):
         if self.availability is not None:
@@ -236,6 +244,8 @@ class Collector:
         if self.staged is not None and time > self.staged:
             self._commit()
         self._advance(time)
+        if self.transitions is not None:
+            self.transitions.cut(cut, raw, time, self.rows, self.scope)
         transitions = cut.body["book_transitions"]
         scope_books = self.rows
         if raw >= self.start and "activity" in self.groups:
@@ -640,4 +650,7 @@ class Collector:
         self.writers["profile.ndjson"].append(out)
 
     def finish_files(self):
-        return {name: writer.finish() for name, writer in self.writers.items()}
+        files = {name: writer.finish() for name, writer in self.writers.items()}
+        if self.transitions is not None:
+            files[TRANSITIONS_FILE] = self.transitions.finish()
+        return files

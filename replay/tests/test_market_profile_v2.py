@@ -8,13 +8,12 @@ import unittest
 from pathlib import Path
 
 from replay.economic_sdk.profile import Collector, profile_files, profile_policy
-from replay.economic_sdk.reader import check_files
 from replay.preparation import load_snapshot
 from replay.streams.protocol import ProtocolError
 from replay.strategies.market_profile.strategy import validate_content
 from replay.tests.economic_scenarios import M, PROFILE_POLICY, ladder, v2_policy
 from replay.tests.test_same_venue_complement import Harness as ComplementHarness
-from replay.tests.test_market_profile import Harness, book_rows
+from replay.tests.test_market_profile import Harness
 
 V1_GROUPS = list(PROFILE_POLICY["groups"])
 
@@ -143,6 +142,14 @@ class AvailabilityParityTests(Case):
 
 
 class PolicyVersionTests(Case):
+    def test_the_version_two_example_turns_every_group_on(self):
+        path = Path(__file__).parent.parent / "strategies" / "market_profile" / "config.v2.example.json"
+        policy = json.loads(path.read_text())["policy"]
+        self.assertEqual(policy["version"], 2)
+        self.assertEqual(set(policy["groups"]), set(V1_GROUPS) | {"availability", "transitions"})
+        profile_policy(policy, standalone=True)
+
+
     def test_version_one_keeps_its_files_and_manifest_version(self):
         h = Harness(self.sub("v1"))
         h.window()
@@ -188,6 +195,39 @@ class PolicyVersionTests(Case):
         snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
         with self.assertRaisesRegex(ProtocolError, "manifest version"):
             validate_content(h.profile_output, snapshot, manifest)
+
+
+# Recorded from commit 063bd5e, before the shared engine and policy version 2 existed.
+V1_DIGESTS = {
+    "content_receipt.json": "e16b597873546ac8db3ce12305d9808817cdc733195d8aea407d9a943b1ddc01",
+    "coverage/content_receipt.json": "4ff12672b4563f6a208750b2efcd60d3658437b56e2de8e5e4bbdda8473fdd4e",
+    "coverage/intervals.ndjson": "22bf42f7bb969e59958dcc86956afad7e8d51a038455d63542284344eb973633",
+    "coverage/manifest.json": "66adb26b3babfcab372bbe8a1df7dbd0779c447bff54a5c927170ea40b026fb0",
+    "coverage/summary.json": "67218b6b22e82116a4334bedd22872c217aa409ac22c53bb7c23577c6871fdf1",
+    "incidents.ndjson": "8f3cca1bcb95b8ba9111dce356ec6158f545bc79d21da71a2bf6482247ce772a",
+    "manifest.json": "d73562d9066e9fdc8c62b5e3c26dae011b1ab763b25c62d168cc94f257fc182b",
+    "pair_profile.ndjson": "1f1e6aded6ed199c71bd70197b42d49bdf920d69bd517d9a9e8a91b0a6f10749",
+    "profile.ndjson": "dec117f92622101badde904dcfa2ce25f986fad6e1681971510b6b931a8fbec2",
+    "summary.json": "a859d52cc20255d8dd36a9e67e00ed6f6c74256f867864ee2d92b38a86f2b7b6",
+}
+
+
+class VersionOneByteIdentityTests(Case):
+    def test_version_one_profile_and_coverage_outputs_are_unchanged(self):
+        h = Harness(self.sub("id"), mixed=True, scopes=True, with_coverage=True)
+        h.window()
+        ladder(h, 12, "polymarket:123", bids=((400, 2 * M),), asks=((450, M),))
+        ladder(h, 12, "kalshi:series", "outcome", bids=((560, 2 * M),))
+        ladder(h, 12, "kalshi:series", "complement", bids=((400, M),))
+        h.group(14, trades=("applied", "observed", "duplicate"))
+        ladder(h, 16, "polymarket:123", bids=(), asks=((450, M),))
+        ladder(h, 19, "polymarket:123", why={"kind": "connection_closed"})
+        ladder(h, 24, "polymarket:123", bids=((450, M),), asks=((440, M),))
+        h.finish()
+        digests = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(h.profile_output.iterdir())}
+        digests.update({"coverage/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted(h.output.iterdir())})
+        self.assertEqual(digests, V1_DIGESTS)
 
 
 if __name__ == "__main__":

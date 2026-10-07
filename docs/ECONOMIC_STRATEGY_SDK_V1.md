@@ -477,6 +477,23 @@ slippage, so it needs no extra walk.
 - the trade and aggressor partitions;
 - close order.
 
+**Policy version 2.** The standalone profile also accepts policy `version: 2`, with the
+same closed fields, whose `groups` may add `availability` and `transitions`
+([`docs/specs/MARKET_PROFILE_V2.md`](specs/MARKET_PROFILE_V2.md)). An embedded profile
+(`Requirements.profile`) that requests either fails at construction, and a version-1
+policy is unchanged. Files follow the policy (`availability.ndjson`,
+`transitions.ndjson.zst` beyond the three above) and the manifest `version` is 2.
+
+| Group | Data points |
+|---|---|
+| availability | Book, member and bundle intervals from the interval engine shared with `bundle_coverage`; `availability.ndjson` is byte-identical to coverage's `intervals.ndjson`, and the summary's `availability_durations` equals its `durations`. The reader adds that a book's usable time equals the sum of its profile rows' `usable_ns` |
+| transitions | One row per (cut, scoped planned book) transition: best quotes before and after (a Kalshi ask projected as above), exact quantity entering and leaving each native side and at the pre-cut best level, depletion, moves in atoms and ticks, a reason limited to `snapshot`/`invalidation`/`insert`/`unknown`, the non-duplicate trades and the venue times of the same cut. Stored as one Zstandard frame; the summary carries `transition_books`, `transition_scopes`, `transition_rows` and `transition_trades` |
+
+The collector's level mirror is checked against the decoder on every cut and a mismatch
+fails the run. The transitions reader does not import the collector and checks quote
+continuity per (scope, book), arithmetic, and agreement with the profile's activity
+counts and state durations.
+
 ## 8. Retained-state bounds
 
 Recursive size accounting is replaced by **count-based bounds**.
