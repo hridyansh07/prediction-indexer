@@ -67,6 +67,13 @@ and verifies the decoded logical identity, and only then yields bytes.
 
 `replay.economic_sdk.outcomes.outcome_scope` exposes frozen normal-resolution masks, payoffs, implications, and exhaustive complete sets during basket construction; see [OUTCOME_MASKS_V1.md](../docs/OUTCOME_MASKS_V1.md).
 
+`replay.same_venue_implication_cover:build` and
+`replay.cross_venue_implication_cover:build` share one core for buying a superset
+and the complement of its strict subset. They report the normal-resolution
+payout floor separately from the extra middle payout, with exact fee-adjusted
+outcome vectors and completed bench readers; see
+[IMPLICATION_COVERS_V1.md](../docs/IMPLICATION_COVERS_V1.md).
+
 ## Ordered exit gates
 
 Work advances only after the preceding gate is demonstrated against real venue
