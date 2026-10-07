@@ -22,7 +22,7 @@
     "version": 3,
     "fills": {
       "version": 1,
-      "step_contracts": "1",
+      "step_contracts": "0.01",
       "max_levels": 64,
       "sizings": [
         {

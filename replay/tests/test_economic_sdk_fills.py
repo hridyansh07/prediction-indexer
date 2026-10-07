@@ -593,6 +593,68 @@ class FillReaderTests(Base):
                 self.assertEqual(summary["fill_ns"], {"FILL_LIVE": "22", "FILL_NONPOSITIVE": "6"})
                 self.assertEqual(summary["fill_ends"], {"KILL_PRICE": 1, "RUN_END": 1})
 
+    def edge_fixture(self):
+        h = self.harness({"name": "edge", "role": "governs", "edge": True},
+                         {"name": "t9", "role": "records", "target_contracts": "9"})
+        h.asks(12, LEG0, (400, M), (420, M), (470, 5 * M))
+        h.asks(12, LEG1, (450, 2 * M), (600, 5 * M))
+        h.finish()
+        manifest = json.loads((h.output / "manifest.json").read_bytes())
+        snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+        return h, snapshot, manifest
+
+    def test_beyond_carries_one_more_step_and_proves_why_each_walk_stopped(self):
+        h, snapshot, manifest = self.edge_fixture()
+        edge, t9 = h.rows("episodes.ndjson")[0]["fill"]["results"]
+        # Edge took two steps: one more would take 470 and 600, worth less.
+        self.assertEqual((edge["steps"], edge["stop"]), ("2", "edge"))
+        self.assertEqual(edge["beyond"], [[["470", "5000000"]], [["600", "5000000"]]])
+        # Nine contracts: leg 1 holds seven, so the record stopped short at seven
+        # and its beyond shows leg 1's ladder ending.
+        self.assertEqual((t9["steps"], t9["stop"]), ("7", "book_exhausted"))
+        self.assertEqual(t9["beyond"][1], [])
+        aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+        def cheaper_next(rows):
+            # A next step this cheap would have been worth taking: the stop is wrong.
+            rows[0]["fill"]["results"][0]["beyond"][1] = [["460", "5000000"]]
+        def extra_level(rows):
+            rows[0]["fill"]["results"][0]["beyond"][0].append(["480", "5000000"])
+        def deeper_book(rows):
+            rows[0]["fill"]["results"][1]["beyond"][1] = [["600", "1000000"]]
+        def wrong_label(rows):
+            rows[0]["fill"]["results"][1]["stop"] = "level_cap"
+        for mutate, pattern in ((cheaper_next, "fill beyond levels|fill edge next step"),
+                                (extra_level, "fill beyond levels"),
+                                (deeper_book, "fill exhausted next step|fill beyond levels"),
+                                (wrong_label, "fill exhausted next step")):
+            with self.subTest(pattern=pattern):
+                h, snapshot, manifest = self.edge_fixture()
+                rewrite(h, manifest, "episodes.ndjson", mutate)
+                with self.assertRaisesRegex(ProtocolError, pattern):
+                    aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
+
+    def test_next_step_check_rejects_an_edge_stop_whose_next_step_is_worth_more(self):
+        fill = Fill(M, 400 * M, False, ((400, M),), ((400, M),))
+        nexts = aggregate_reader._one_more(fill, ((470, 5 * M),), M, 8)
+        self.assertEqual((nexts[0].filled_atoms, nexts[0].cost, nexts[1]), (2 * M, 870 * M, "fits"))
+        sizing = fill_policy({"version": 1, "step_contracts": "1", "max_levels": 8,
+                              "sizings": [{"name": "edge", "role": "governs", "edge": True}]}, KIND).sizings[0]
+
+        class Worth:
+            def __init__(self, more):
+                self.more = more
+
+            def fill_value(self, entity, steps, legs, time):
+                return 10 + self.more
+
+        aggregate_reader._check_next(sizing, "edge", 1, [nexts], None, Worth(0), None, 0, 10)
+        with self.assertRaisesRegex(ProtocolError, "fill edge next step"):
+            aggregate_reader._check_next(sizing, "edge", 1, [nexts], None, Worth(1), None, 0, 10)
+        partial = Fill(M, 400 * M, False, ((400, M),), ((400, 3 * M),))
+        more, state = aggregate_reader._one_more(partial, ((400, 2 * M),), M, 8)
+        self.assertEqual((more.taken, more.consumed, state), (((400, 2 * M),), ((400, 3 * M),), "fits"))
+
     def test_reader_rejects_a_tampered_record_and_a_wrong_record_stop(self):
         def record_cost(rows):
             leg = rows[0]["fill"]["results"][1]["legs"][1]
@@ -842,6 +904,35 @@ class FillEndBookTests(Base):
                 with self.assertRaisesRegex(ProtocolError, pattern):
                     aggregate_reader.validate(h.output, snapshot, manifest, h.strategy.strategy)
                 (h.output / "episodes.ndjson").write_bytes(original)
+
+
+class EdgeWalkTests(unittest.TestCase):
+    def test_an_edge_stop_climbs_past_a_boundary_when_rounding_makes_the_next_step_worth_more(self):
+        ladders = (((100, 3), (110, 7)), ((100, 10),))
+        values = {1: 5, 2: 10, 3: 15, 4: 16, 5: 17, 6: 16, 10: 0}
+        calls = []
+
+        def value(steps, legs):
+            calls.append(steps)
+            return values.get(steps, -1)
+
+        (fill,) = walk_basket(ladders, (1, 1), value=value, edge=True)
+        # Boundaries give candidates 3 and 10; 10 is worth less than 3, so the walk
+        # checks 4, 5 and 6 and stops at 5, the step after which value falls.
+        self.assertEqual((fill.steps, fill.stop, fill.value), (5, "edge", 17))
+        self.assertEqual(sorted(calls), [3, 4, 5, 6, 10])   # each step priced once
+        # Each beyond level carries its whole remaining displayed quantity.
+        self.assertEqual(fill.beyond, (((110, 5),), ((100, 5),)))
+
+    def test_beyond_stops_at_one_step_or_the_ladder_end_or_past_the_level_cap(self):
+        ladder = tuple((100 + i, 1) for i in range(10))
+        (one,) = walk_basket((ladder,), (3,), targets=(1,))
+        self.assertEqual(one.beyond, (((103, 1), (104, 1), (105, 1)),))
+        (end,) = walk_basket((ladder,), (4,), targets=(2,))
+        self.assertEqual(end.beyond, (((108, 1), (109, 1)),))   # the ladder ends first
+        (capped,) = walk_basket((ladder,), (4,), targets=(1,), max_levels=2)
+        self.assertEqual((capped.steps, capped.stop), (0, "level_cap"))
+        self.assertEqual(capped.beyond, (((100, 1), (101, 1), (102, 1)),))   # max_levels + 1
 
 
 class KillPriceTests(unittest.TestCase):

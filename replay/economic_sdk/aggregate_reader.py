@@ -114,6 +114,67 @@ _STOPS = {"target": ("target", "book_exhausted", "level_cap"),
           "edge": ("edge", "book_exhausted", "level_cap", "value_unknown")}
 
 
+def _beyond(value, after, unit, max_levels, maximum, worse):
+    """One leg's carried ``beyond`` levels: closed, best-first from ``after``, minimal."""
+    require(type(value) is list and len(value) <= max_levels + 1, "fill beyond levels")
+    levels = tuple(_level(level) for level in value)
+    require(None not in levels and (levels[0] if levels else None) == after, "fill beyond levels")
+    for previous, level in zip(levels, levels[1:]):
+        require(worse(level[0], previous[0]), "fill beyond levels")
+    require(all(price <= maximum for price, _ in levels), "fill beyond levels")
+    # They stop as soon as they hold one step, so every level but the last is needed.
+    require(sum(q for _, q in levels[:-1]) < unit, "fill beyond levels")
+    return levels
+
+
+def _one_more(fill, beyond, unit, max_levels):
+    """``(fill at one more step or None, state)`` from one leg's carried levels.
+
+    ``state`` is ``fits`` (servable within ``max_levels`` levels), ``capped``
+    (depth serves it, but only past the level cap), ``short`` (the ladder ends
+    first), or ``unknown`` (``beyond`` was truncated at ``max_levels + 1`` levels:
+    past the cap, deeper depth not carried).
+    """
+    if sum(q for _, q in beyond) < unit:
+        return None, "short" if len(beyond) <= max_levels else "unknown"
+    taken, consumed = list(fill.taken), list(fill.consumed)
+    need, cost = unit, fill.cost
+    for index, (price, quantity) in enumerate(beyond):
+        amount = min(quantity, need)
+        need -= amount
+        cost += price * amount
+        if index == 0 and consumed and consumed[-1][0] == price:
+            taken[-1] = (price, taken[-1][1] + amount)   # the rest of a partly taken level
+        else:
+            taken.append((price, amount))
+            consumed.append((price, quantity))
+        if not need:
+            break
+    return (Fill(fill.filled_atoms + unit, cost, False, tuple(taken), tuple(consumed)),
+            "capped" if len(consumed) > max_levels else "fits")
+
+
+def _check_next(sizing, stop, steps, nexts, fills, strategy, entity, start, recorded):
+    """What one more step proves: why the walk stopped where it did.
+
+    An ``edge`` stop's next step is servable and not worth more (a zero-step
+    walk compares with zero). A ``book_exhausted`` or ``level_cap`` stop's next
+    step cannot be served within ``max_levels``; the label is ``level_cap``
+    exactly when depth past the cap would serve it on every leg.
+    """
+    states = [state for _, state in nexts]
+    if stop == "edge":
+        require(all(state == "fits" for state in states), "fill edge next step")
+        trial = strategy.fill_value(entity, steps + 1, tuple(fill for fill, _ in nexts), start)
+        require(type(trial) is int and trial <= (recorded if steps else 0), "fill edge next step")
+    elif stop in ("book_exhausted", "level_cap"):
+        require(not all(state == "fits" for state in states), "fill exhausted next step")
+        if "short" in states:
+            require(stop == "book_exhausted", "fill exhausted next step")
+        elif "unknown" not in states:
+            require(stop == "level_cap", "fill exhausted next step")
+
+
 def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
     """Re-check one carried fill from its own levels and the strategy's value hook.
 
@@ -139,7 +200,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
     effective = [None] * legs
     for sizing, result in zip(policy.sizings, value["results"]):
         result = obj(result, "name role mode steps stop value legs before after impact_ppm "
-                             "tradeable kill_prices")
+                             "beyond tradeable kill_prices")
         require((result["name"], result["role"], result["mode"]) == (sizing.name, sizing.role, sizing.mode),
                 "fill result sizing")
         steps, stop = _natural(result["steps"]), result["stop"]
@@ -147,9 +208,9 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
         if sizing.mode == "target":
             require(steps == sizing.target_steps if stop == "target" else steps < sizing.target_steps,
                     "fill stop")
-        for field in ("legs", "before", "after", "impact_ppm"):
+        for field in ("legs", "before", "after", "impact_ppm", "beyond"):
             require(type(result[field]) is list and len(result[field]) == legs, "fill leg count")
-        fills, befores = [], []
+        fills, befores, nexts = [], [], []
         for i, leg in enumerate(result["legs"]):
             leg = obj(leg, "atoms cost taken consumed")
             atoms, cost = _natural(leg["atoms"]), _natural(leg["cost"])
@@ -183,7 +244,12 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
                     "fill impact")
             fills.append(Fill(atoms, cost, False, taken, consumed))
             befores.append(before)
+            beyond = _beyond(result["beyond"][i], after, spec.units[i], policy.max_levels,
+                             maxima[i], lambda p, q, leg=i: worse(p, q, leg))
+            nexts.append(_one_more(fills[-1], beyond, spec.units[i], policy.max_levels))
         fills = tuple(fills)
+        _check_next(sizing, stop, steps, nexts, fills, strategy, entity, start,
+                    None if result["value"] is None else signed(result["value"]))
         recorded = None if result["value"] is None else signed(result["value"])
         if steps:
             computed = strategy.fill_value(entity, steps, fills, start)

@@ -99,7 +99,11 @@ supported with fill checks.
 - **Fill.** When the trigger turns on, the SDK walks both legs' full ask ladders
   once (Kalshi's is the opposite orientation's bids, projected) and prices the
   declared sizings. The default is one governing `edge` sizing: walk while the net
-  strictly increases. A strategy that needs a fixed amount declares a governing
+  strictly increases, in steps of `step_contracts` (the template uses `0.01`, so
+  a partly displayed contract is not left behind; it divides Kalshi's 0.01 and
+  Polymarket's 0.000001 quantity units exactly, and a step finer than any leg's
+  quantity unit fails at construction instead of rounding). The trigger stays
+  one whole contract. A strategy that needs a fixed amount declares a governing
   `{"name": ..., "role": "governs", "target_contracts": "1000"}` instead; no fill
   opens unless the book serves the whole target.
 - **Value.** `fill_value` is the exact net of the walked contracts at scale 36,
@@ -119,19 +123,21 @@ supported with fill checks.
 
 Policy 2 remains readable and runnable for the fixed-size sweep.
 
-**Retained fixture (2026-10-07).** One Linux supervisor run of the re-prepared
+**Retained fixture (2026-10-07).** Linux supervisor runs of the re-prepared
 Procyon context with current published fees and one governing `edge` sizing
-succeeded in 79 s (the eight-size sweep takes several minutes), and the completed
-reader re-priced every fill. An independent check against the published fee
-formulas, not the fee SDK, found:
+succeed in about 90 s (the eight-size sweep takes several minutes), and the
+completed reader re-prices every fill and checks every stop from `beyond`. An
+independent check against the published fee formulas, not the fee SDK, found:
 
-- 42 fills on 7 routes; every value recomputes exactly, and all 84 kill prices
-  have their defining property;
+- 42 fills on 7 routes; every value recomputes exactly, all 84 kill prices have
+  their defining property, and every edge stop's next step (priced from `beyond`)
+  is worth no more;
 - on every route, trigger-positive time equals the policy 2 run's 1-contract
   net-positive time, and the 225 gross episodes are identical to its 1-contract
   episodes apart from fee assessment identities (which hash the experiment);
-- in 30 edge stops one more contract from the carried `after` level is not worth
-  more; the other 12 need depth beyond the carried level and stay writer-attested;
+- with `0.01` steps, the 12 fills that whole-contract steps stopped short of a
+  partly displayed contract go deeper, and the deepest fill is 1,158.43
+  contracts;
 - ends: 35 trigger-false, 4 kill price, 3 self-crossed leg; all fill time was live.
 
 ## Preparation endpoint

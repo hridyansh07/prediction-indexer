@@ -7,11 +7,11 @@
     },
     {
       "path": "configs/cross_venue_arbitrage_v1.example.json",
-      "sha256": "1eda50a707cb7931f73c38676784b010db3dd2dc53bddb9b38fe7b01b7f5e82e"
+      "sha256": "889fd49295a56fe148cc4b6d2f4ec94325805bbdf760489712a1bca204645a43"
     },
     {
       "path": "docs/ECONOMIC_STRATEGY_SDK_V1.md",
-      "sha256": "9149f63632fe49a4a85e0f09550e44f290a9eade6cac7e8178a61c93347e3c53"
+      "sha256": "2dd44023ff700e8242ea1bb7240c0bbe5b35c24619e0df7c11e15a0f7f4f1b45"
     },
     {
       "path": "docs/STRATEGY_PREPARATION_V1.md",
@@ -43,7 +43,7 @@
     },
     {
       "path": "replay/economic_fills.py",
-      "sha256": "72d8cbc665e4d49f632da308338f79d4ecf0a28582a1e2fe4cb8b1c334484bda"
+      "sha256": "43d495d7dd632e965dffd9a4144ae97251b725ae0a4d62e21481594b71bf6b76"
     },
     {
       "path": "replay/economic_sdk/__init__.py",
@@ -51,7 +51,7 @@
     },
     {
       "path": "replay/economic_sdk/aggregate_reader.py",
-      "sha256": "26da9fc55d0cec39fb6769d20dd3beb950b08e93091c38272a921243ccddb684"
+      "sha256": "af08cae8d7ca3705ec61a7f6bf0071a9fc1b3cc6d7a3cba1f269df85c1194d91"
     },
     {
       "path": "replay/economic_sdk/entities.py",
@@ -63,7 +63,7 @@
     },
     {
       "path": "replay/economic_sdk/fills.py",
-      "sha256": "e77c985b933dadf82afc0271e1e0e0f8959e34f5ead3148545a5b4f45d9c20ff"
+      "sha256": "55f452e347b3bd049d50c86e289b6b317af7fceb9b6045203d2e1878428df1d9"
     },
     {
       "path": "replay/economic_sdk/runtime.py",
@@ -83,7 +83,7 @@
     },
     {
       "path": "replay/tests/test_cross_venue_arbitrage.py",
-      "sha256": "30ee57a8cb46fee1cae139c69d1f6f7965efa55a36b1d89cc5d9c08d7210dc4c"
+      "sha256": "f6f7ca77e329368b98cd8cbb23f575e6399bf26b0558f7caf8ead72edf92a32b"
     },
     {
       "path": "replay/tests/test_cross_venue_metadata.py",
@@ -98,5 +98,5 @@
       "sha256": "8de3a769d82c34e436e4c262458c3c94ef6d0ae2dbe83ae8227f9668bce898d3"
     }
   ],
-  "source_sha256": "7bda9c8377ba32303cf2657306f5ace2261c51d619f52c8dd65f5ad89b93c120"
+  "source_sha256": "576f5c2752e4b9e5380248f4734b46fca1ffb169dac1dbf70a08d809d62d1c7f"
 }

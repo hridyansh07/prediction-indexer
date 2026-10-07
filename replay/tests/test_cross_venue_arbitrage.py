@@ -55,7 +55,7 @@ def fill_policy_v3(policy, sizings, step="1"):
 
 class Harness(BaseHarness):
     def __init__(self, root, *, doc=True, native=True, fees="zero", limitless=False, policy=None, valuation=True, scales=None,
-                 fills=None, **kwargs):
+                 fills=None, step="1", **kwargs):
         self.root = root
         d = fixture_detail(limitless)
         def prep_config():
@@ -82,7 +82,7 @@ class Harness(BaseHarness):
             if policy:
                 cfg["policy"].update(policy)
             if fills is not None:
-                cfg["policy"] = fill_policy_v3(cfg["policy"], fills)
+                cfg["policy"] = fill_policy_v3(cfg["policy"], fills, step)
             from replay.fees.artifacts import load_catalog, source_from_bytes
             cat = load_catalog(Path(cfg["fees"]["catalog_directory"]))
             # Synthetic evidenced multiplier zero is supported; ZeroFee is not a Kalshi model.
@@ -521,6 +521,28 @@ class CrossVenueFillTests(unittest.TestCase):
                                          "byte_length": len(raw), "records": len(rows)}
         with self.assertRaisesRegex(ProtocolError, "fill value"):
             validate_content(h.output, h.strategy.snapshot, m, h.strategy.strategy.bridge)
+
+    def test_a_fractional_step_takes_a_partly_displayed_contract(self):
+        h = self.harness(scales={"kalshi": ("2", "2")}, step="0.01")
+        h.window()
+        # Kalshi YES asks 0.40 x 3.16 contracts; Polymarket 0.580 x 5.
+        ladder(h, 12, "kalshi:series", "complement", bids=((60, 316),))
+        ladder(h, 12, "kalshi:series", "outcome", bids=((70, 300),))
+        ladder(h, 12, "polymarket:987", bids=((100, 5 * 10**6),), asks=((580, 5 * 10**6),))
+        ladder(h, 12, "polymarket:123", bids=((100, 5 * 10**6),), asks=((650, 5 * 10**6),))
+        h.finish()
+        (row,) = [r for r in self.fills(h) if r["fill"]["sources"] == ["kalshi_complement_ask", "ask"]
+                  and r["fill"]["results"][0]["legs"][1]["taken"][0][0] == "580"]
+        (edge,) = row["fill"]["results"]
+        self.assertEqual((edge["steps"], edge["stop"]), ("316", "book_exhausted"))
+        self.assertEqual(edge["legs"][0]["taken"], [["40", "316"]])
+        # Gross 3.16 x 0.02; Kalshi's non-direct cash rounding takes 1.264 to 1.27.
+        self.assertEqual(edge["value"], str(UNIT * (2 * 316 - 60) // 10_000))
+        self.assertEqual(edge["beyond"][0], [])
+
+    def test_a_step_finer_than_a_legs_quantity_unit_fails_at_construction(self):
+        with self.assertRaisesRegex(ProtocolError, "whole number of quantity atoms"):
+            self.harness(step="0.01")   # Kalshi quantities are whole contracts here
 
     def test_policy_3_is_closed_and_rejects_controls_and_the_size_sweep(self):
         h = self.harness()

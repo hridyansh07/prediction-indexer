@@ -821,7 +821,12 @@ Each sizing has a unique `name`, a `role`, and exactly **one mode**:
   can serve (stop `target`, or `book_exhausted`/`level_cap` when it cannot);
 - `edge`: walk while the value strictly increases and stop at the smallest step
   count that maximizes it (stop `edge`, `book_exhausted`, `level_cap` or
-  `value_unknown`).
+  `value_unknown`). Candidates are the step counts either side of each level
+  boundary; when a candidate is not worth more than the best so far, the walk
+  also prices the step right after the best and keeps climbing while that
+  increases the value. An `edge` stop therefore always has
+  `value(steps + 1) <= value(steps)`, even where fee rounding makes the value only
+  nearly concave.
 
 Every sizing returns the same result shape. Roles:
 
@@ -965,8 +970,11 @@ object, so consumers never need the book again:
 - `results`, one per sizing in declared order, each with `name`, `role`, `mode`,
   `steps`, `stop`, `value` (signed, or `null`), per-leg `legs`
   (`{atoms, cost, taken, consumed}`), `before`, `after` and `impact_ppm` per leg,
-  `tradeable`, and `kill_prices` (per leg, or `null` for a sizing that is not
-  positive);
+  `beyond` per leg (the depth one more step would take: the levels left after
+  the fill, best-first from `after`, each with its remaining displayed quantity,
+  until they hold one step's units or the ladder ends, and at most
+  `max_levels + 1` levels), `tradeable`, and `kill_prices` (per leg, or `null` for
+  a sizing that is not positive);
 - `kill_prices`: the effective per-leg kill prices, from governing sizings only;
 - `kill_leg` and `kill_best`: the crossing leg and its best level at the
   crossing, present only when `end_reason` is `KILL_PRICE`;
@@ -999,6 +1007,12 @@ exactly. Zero entries are never written.
   remainder of a partly taken last level, or else `null` or a strictly worse
   level; `impact_ppm` recomputes from `before` and `after`; a target's stop is
   `target` exactly when it took the full target;
+- each sizing's `beyond` from its own levels (closed, best-first from `after`,
+  every level but the last needed for one step), and what one more step proves:
+  after an `edge` stop it is servable within `max_levels` and, through
+  `fill_value`, worth no more than the recorded value (zero for a zero-step walk);
+  after a `book_exhausted` or `level_cap` stop it is not servable, and the label is
+  `level_cap` exactly when depth past the cap would serve it;
 - each value, through the strategy's `fill_value` at the episode's `start_ns`,
   and each kill price by its defining property (two value calls per leg);
 - each `tradeable` flag, recomputed from steps, value, the target and the kill
@@ -1021,9 +1035,11 @@ exactly. Zero entries are never written.
 reader proves its arithmetic and its agreement with the episodes, but no-fill
 time carries no fill, so the split between `FILL_DEPTH_SHORT`,
 `FILL_VALUE_UNKNOWN` and `FILL_NONPOSITIVE`, and the precedence that chose it,
-cannot be re-proved without the ladders. Edge optimality is writer-attested,
-and so is a `book_exhausted` or `level_cap` stop when the levels that bound it
-lie beyond `after`: the reader cannot re-walk depth the fill does not carry.
+cannot be re-proved without the ladders. Global edge optimality is
+writer-attested: the reader proves the stop is a local maximum (one more step
+is not worth more), which is the global maximum when the value is concave. A
+`level_cap` label after a `beyond` truncated at `max_levels + 1` levels is
+writer-attested too, because deeper depth is not carried.
 
 ### Bounds
 

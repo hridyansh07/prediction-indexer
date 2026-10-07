@@ -234,6 +234,7 @@ def _row(sizing, result, kills, reason):
         "before": [_level(level) for level in result.before],
         "after": [_level(level) for level in result.after],
         "impact_ppm": [_optional(impact) for impact in result.impact_ppm],
+        "beyond": [_pairs(levels) for levels in result.beyond],
         "tradeable": reason is None,
         "kill_prices": None if kills is None else [_optional(kill) for kill in kills],
     }
