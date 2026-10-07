@@ -17,7 +17,6 @@ book from the tape.
 
 from __future__ import annotations
 
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -348,42 +347,75 @@ def validate_transitions(root, snapshot, identity, policy, facts, groups):
             require(prev_ask in allowed if prior_usable else prev_ask is None,
                     "projected prior ask differs from the counterpart bid")
 
-    with tempfile.TemporaryDirectory(prefix="transitions-read-") as scratch:
-        plain = Path(scratch) / "transitions.ndjson"
-        try:
-            with path.open("rb") as source, plain.open("xb") as sink:
-                decode_stream(source, sink,
-                              expected_logical=LogicalIdentity(logical["sha256"], logical["byte_length"],
-                                                               logical["records"]),
-                              expected_stored=StoredIdentity(stored["sha256"], stored["byte_length"]),
-                              max_decoded_bytes=logical["byte_length"])
-        except CodecError as error:
-            require(False, f"transitions codec: {error}")
-        with plain.open("rb") as stream:
-            while payload := stream.readline(bounds.MAX_LINE + 1):
-                require(len(payload) <= bounds.MAX_LINE and payload.endswith(b"\n"), "transition line/truncation")
-                count += 1
-                require(count <= logical["records"], "transition count")
-                r = _row(decode(payload, bounds.MAX_LINE), books, scopes, memberships, bounds_by_scope, start)
-                order = (r["scope"], r["t"])
-                require(last is None or last <= order, "transition time order")
-                if last is not None and order != last:
-                    settle(group)
-                    group = []
-                last = order
-                group.append(r)
-                require(len(group) <= GROUP_ROWS, "transition group budget")
-                kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
-                reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
-                attached += r["trades"]
-                held = facts["buckets"].get((r["scope"], keys[r["book"]]))
-                if held is not None and "activity" in groups:
-                    pointer = buckets.setdefault((r["scope"], r["book"]), [0, [[0, 0] for _ in held]])
-                    while r["t"] >= held[pointer[0]][1]:
-                        pointer[0] += 1
-                    require(held[pointer[0]][0] <= r["t"], "transition outside its profile bucket")
-                    pointer[1][pointer[0]][0] += 1
-                    pointer[1][pointer[0]][1] += r["trades"]
+    expected = dict(expected_logical=LogicalIdentity(logical["sha256"], logical["byte_length"], logical["records"]),
+                    expected_stored=StoredIdentity(stored["sha256"], stored["byte_length"]),
+                    max_decoded_bytes=logical["byte_length"])
+
+    def take(payload):
+        nonlocal count, last, group, attached
+        require(len(payload) <= bounds.MAX_LINE and payload.endswith(b"\n"), "transition line/truncation")
+        count += 1
+        require(count <= logical["records"], "transition count")
+        r = _row(decode(payload, bounds.MAX_LINE), books, scopes, memberships, bounds_by_scope, start)
+        order = (r["scope"], r["t"])
+        require(last is None or last <= order, "transition time order")
+        if last is not None and order != last:
+            settle(group)
+            group = []
+        last = order
+        group.append(r)
+        require(len(group) <= GROUP_ROWS, "transition group budget")
+        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+        attached += r["trades"]
+        held = facts["buckets"].get((r["scope"], keys[r["book"]]))
+        if held is not None and "activity" in groups:
+            pointer = buckets.setdefault((r["scope"], r["book"]), [0, [[0, 0] for _ in held]])
+            while r["t"] >= held[pointer[0]][1]:
+                pointer[0] += 1
+            require(held[pointer[0]][0] <= r["t"], "transition outside its profile bucket")
+            pointer[1][pointer[0]][0] += 1
+            pointer[1][pointer[0]][1] += r["trades"]
+
+    class Lines:
+        """Splits decoded bytes into lines for ``take``; nothing is stored beyond one partial line."""
+
+        def __init__(self):
+            self.partial = b""
+
+        def write(self, data):
+            view = bytes(data)
+            start = 0
+            while (end := view.find(b"\n", start)) >= 0:
+                line, self.partial = self.partial + view[start:end + 1], b""
+                take(line)
+                start = end + 1
+            self.partial += view[start:]
+            require(len(self.partial) <= bounds.MAX_LINE, "transition line/truncation")
+            return len(data)
+
+        def flush(self):
+            pass
+
+    class Digest:
+        def write(self, data):
+            return len(data)
+
+        def flush(self):
+            pass
+
+    # Decoded bytes are never written anywhere. Pass one verifies both identities with a
+    # sink that keeps nothing, so no row is validated from an unverified frame; pass two
+    # decodes the same frame again into a line splitter that validates each row as it forms.
+    try:
+        with path.open("rb") as source:
+            decode_stream(source, Digest(), **expected)
+        lines = Lines()
+        with path.open("rb") as source:
+            decode_stream(source, lines, **expected)
+    except CodecError as error:
+        require(False, f"transitions codec: {error}")
+    require(not lines.partial, "transition line/truncation")
     require(count == logical["records"], "transition count")
     if group:
         settle(group)

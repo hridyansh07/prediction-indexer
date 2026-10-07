@@ -371,6 +371,29 @@ class ReaderTests(Case):
         self.assertFalse((h.profile_output / "transitions.ndjson.open").exists())
         validate_content(h.profile_output, self.snapshot, self.manifest)
 
+    def test_reading_never_creates_a_temporary_file(self):
+        # The replay container mounts a small tmpfs at /tmp; decoded rows must not land there.
+        h = self.harness(policy=v2("transitions"), mixed=True)
+        ladder(h, 12, PM[0], bids=((400, 5 * M),), asks=((450, 2 * M),))
+        send(h, 13, (PM, operations(op(PM, "bid", 400, "increase", M))))
+        h.finish()
+        snapshot = load_snapshot(h.root / "context", expected_sha256=h.sha)
+        manifest = json.loads((h.profile_output / "manifest.json").read_bytes())
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("temporary file requested")
+
+        with patch("tempfile.TemporaryDirectory", forbidden), patch("tempfile.mkdtemp", forbidden), \
+                patch("tempfile.mkstemp", forbidden), patch("tempfile.TemporaryFile", forbidden), \
+                patch("tempfile.NamedTemporaryFile", forbidden), patch("tempfile.SpooledTemporaryFile", forbidden):
+            summary = validate_content(h.profile_output, snapshot, manifest)
+        self.assertEqual(summary["transition_rows"]["total"], 2)
+        # Identities are still verified before any row: a wrong digest fails without reading rows.
+        manifest["files"]["transitions.ndjson.zst"]["logical"]["sha256"] = "0" * 64
+        with patch("replay.economic_sdk.transitions_reader._row", forbidden):
+            with self.assertRaisesRegex(ProtocolError, "codec"):
+                validate_content(h.profile_output, snapshot, manifest)
+
     def test_rejects_a_tampered_row(self):
         h = self.build()
         for name, edit, message in (
