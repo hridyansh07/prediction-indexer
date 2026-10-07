@@ -914,7 +914,8 @@ fn address_binds_every_version_and_policy_input() {
         certified: true,
         document: None,
     };
-    let base = spec();
+    let mut base = spec();
+    base.normalized_schema_version = replay_domain::SEGMENT_SCHEMA_V3;
     let base_address = derivative_address_versions(&source, &base, 1, 1, 1).unwrap();
     assert_eq!(
         base_address,
@@ -2069,13 +2070,132 @@ fn noncanonical_spelling_reads_identically_but_fails_the_audit() {
     }
 }
 
+#[test]
+fn schema3_profile2_derivative_coexists_and_keeps_exact_old_event_bytes() {
+    struct Books(FakeNormalizer);
+    impl Normalize for Books {
+        fn descriptor(&self) -> &NormalizerDescriptor {
+            self.0.descriptor()
+        }
+        fn normalize(
+            &mut self,
+            _: &indexer_finalize::JoinedCanonicalRecord,
+        ) -> Result<Normalization, NormalizerError> {
+            Ok(Normalization::Events(vec![SegmentEvent::Book(
+                replay_domain::BookEvent::Full(
+                    replay_domain::FullBook::new(
+                        replay_domain::InstrumentId::new("kalshi:OLD").unwrap(),
+                        replay_domain::ContractOrientation::Outcome,
+                        vec![],
+                        vec![],
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            )]))
+        }
+        fn finish(&mut self) -> Result<(), NormalizerError> {
+            Ok(())
+        }
+    }
+    let canonical = TempDir::new("schema3-profile2-source").unwrap();
+    let output = TempDir::new("schema3-profile2-output").unwrap();
+    canonical_fixture(canonical.path());
+    let current = build_window(
+        canonical.path(),
+        output.path(),
+        0,
+        10,
+        &spec(),
+        &mut Books(FakeNormalizer::new(FakeMode::Normal)),
+    )
+    .unwrap()
+    .derivative;
+    let old_text = decoded_text(&current, "events.ndjson.zst")
+        .replace("\"schema_version\":4", "\"schema_version\":3")
+        .replace(",\"venue_time\":null", "");
+    let mut old_spec = spec();
+    old_spec.normalized_schema_version = replay_domain::SEGMENT_SCHEMA_V3;
+    let address =
+        derivative_address_versions(&current.manifest.source_receipt, &old_spec, 1, 1, 2).unwrap();
+    assert_ne!(address, current.pin.derivative_address);
+    let directory = current.directory.parent().unwrap().join(&address);
+    fs::create_dir(&directory).unwrap();
+    for file in ["rejects.ndjson.zst", "sources.ndjson.zst"] {
+        fs::copy(current.directory.join(file), directory.join(file)).unwrap();
+    }
+    let mut stored = Vec::new();
+    let encoded = encode_stream(
+        Cursor::new(old_text.as_bytes()),
+        &mut stored,
+        DEFAULT_ZSTD_LEVEL,
+    )
+    .unwrap();
+    fs::write(directory.join("events.ndjson.zst"), stored).unwrap();
+    let mut manifest = current.manifest.clone();
+    manifest.derivative_address = address.clone();
+    manifest.normalized_schema_version = replay_domain::SEGMENT_SCHEMA_V3;
+    manifest.events.logical = LogicalIdentity {
+        sha256: Sha256::from_hex(&encoded.logical.sha256).unwrap(),
+        byte_length: encoded.logical.byte_length,
+        line_count: encoded.logical.line_count,
+    };
+    manifest.events.stored = StoredIdentity {
+        sha256: Sha256::from_hex(&encoded.stored.sha256).unwrap(),
+        byte_length: encoded.stored.byte_length,
+    };
+    let manifest_bytes = canonical_document(&manifest).unwrap();
+    fs::write(directory.join("manifest.json"), &manifest_bytes).unwrap();
+    let mut receipt = current.receipt.clone();
+    receipt.derivative_address = address.clone();
+    receipt.normalized_schema_version = replay_domain::SEGMENT_SCHEMA_V3;
+    receipt.events = manifest.events.clone();
+    receipt.manifest.sha256 = Sha256::digest(&manifest_bytes);
+    receipt.manifest.byte_length = manifest_bytes.len() as u64;
+    let receipt_bytes = canonical_document(&receipt).unwrap();
+    fs::write(directory.join("receipt.json"), &receipt_bytes).unwrap();
+    let old = verify_derivative(&directory).unwrap();
+    assert_eq!(old.manifest.normalized_schema_version, 3);
+    assert_eq!(old.manifest.materializer_version, 2);
+    let mut reader = open_pinned(&pinned(&old), &ReadLimits::default()).unwrap();
+    let mut reconstructed = String::new();
+    while let Some(delivery) = reader.next_delivery().unwrap() {
+        for record in delivery.records() {
+            assert_eq!(record.schema_version(), 3);
+            reconstructed.push_str(&String::from_utf8(record.to_canonical_json()).unwrap());
+            reconstructed.push('\n');
+        }
+    }
+    reader.finish().unwrap();
+    assert_eq!(reconstructed, old_text);
+    assert_eq!(
+        fs::read(directory.join("receipt.json")).unwrap(),
+        receipt_bytes
+    );
+    assert_eq!(
+        verify_derivative(&current.directory).unwrap().pin,
+        current.pin
+    );
+}
+
 /// What the single-pass read must still reject, after every outer identity
 /// has been rebound so that only the read's own checks can catch it.
 #[test]
 fn pinned_read_still_rejects_malformed_unsupported_reordered_and_bad_frames() {
     /// (output file, expected error fragment, line rewrite)
     type Case = (&'static str, &'static str, fn(&mut String));
-    let cases: [Case; 7] = [
+    let cases: [Case; 8] = [
+        (
+            "events.ndjson.zst",
+            "normalized event schema disagrees with manifest",
+            |text| {
+                let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+                let last =
+                    text[start..].replacen("\"schema_version\":4", "\"schema_version\":3", 1);
+                text.replace_range(start.., &last);
+            },
+        ),
         (
             "events.ndjson.zst",
             "normalized events are not in canonical child order",
@@ -2084,7 +2204,7 @@ fn pinned_read_still_rejects_malformed_unsupported_reordered_and_bad_frames() {
             },
         ),
         ("events.ndjson.zst", "invalid normalized event", |text| {
-            *text = text.replacen("{\"schema_version\":3", "{\"schema_version\":3,", 1);
+            *text = text.replacen("{\"schema_version\":4", "{\"schema_version\":4,", 1);
         }),
         (
             "events.ndjson.zst",
@@ -2092,7 +2212,7 @@ fn pinned_read_still_rejects_malformed_unsupported_reordered_and_bad_frames() {
             |text| {
                 let start = text[..text.len() - 1].rfind('\n').unwrap() + 1;
                 let last =
-                    text[start..].replacen("\"schema_version\":3", "\"schema_version\":99", 1);
+                    text[start..].replacen("\"schema_version\":4", "\"schema_version\":99", 1);
                 text.replace_range(start.., &last);
             },
         ),
@@ -2109,8 +2229,8 @@ fn pinned_read_still_rejects_malformed_unsupported_reordered_and_bad_frames() {
         ),
         ("events.ndjson.zst", "invalid normalized event", |text| {
             *text = text.replacen(
-                "{\"schema_version\":3",
-                "{\"unknown\":0,\"schema_version\":3",
+                "{\"schema_version\":4",
+                "{\"unknown\":0,\"schema_version\":4",
                 1,
             );
         }),
@@ -2132,6 +2252,8 @@ fn pinned_read_still_rejects_malformed_unsupported_reordered_and_bad_frames() {
         let reader = open_pinned(&input, &ReadLimits::default()).unwrap();
         let (_, error) = fails_without_completion(reader);
         assert!(error.contains(expected), "{file}: {error}");
+        let audit = verify_derivative(&input.directory).unwrap_err();
+        assert!(audit.contains(expected), "{file}: {audit}");
     }
 
     // Frame damage rebound to its stored identity still fails at the frame.

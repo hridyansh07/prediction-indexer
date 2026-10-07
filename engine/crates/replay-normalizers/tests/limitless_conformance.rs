@@ -63,10 +63,14 @@ fn frozen_baseline_canonical_bytes_and_reject_order() {
                         replay_domain::SegmentRecord::from_json(&json).unwrap(),
                         record
                     );
-                    bytes.extend(json);
+                    bytes.extend(crate::schema3_projection(&record));
                 }
             }
-            outcome => bytes.extend(format!("{outcome:?}").as_bytes()),
+            outcome => bytes.extend(
+                format!("{outcome:?}")
+                    .replace("parser_version: 3", "parser_version: 2")
+                    .as_bytes(),
+            ),
         }
         bytes.push(b'\n');
     }
@@ -174,7 +178,7 @@ fn reject(value: Normalization) -> canonical_normalizer::ParseReject {
 #[test]
 fn descriptor_binds_bundle_and_every_config_variable() {
     let default = Normalizer::new(Limitless::default()).unwrap();
-    assert_eq!(PARSER_VERSION, 2);
+    assert_eq!(PARSER_VERSION, 3);
     let identity = serde_json::to_vec(&json!({
         "schema_version":1,
         "variables":{

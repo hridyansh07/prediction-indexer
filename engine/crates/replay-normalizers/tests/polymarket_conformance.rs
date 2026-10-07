@@ -14,6 +14,71 @@ const REST_BOOK: &str = include_str!("fixtures/polymarket/rest_book.json");
 const TICK_SIZE: &str = include_str!("fixtures/polymarket/tick_size_change.json");
 
 #[test]
+fn venue_times_label_book_updates_trade_reports_and_book_as_of() {
+    use replay_domain::{EventKind, Resolution};
+    for (payload, kind, count) in [
+        (PRICE_CHANGE, EventKind::BookUpdate, 2),
+        (TRADE, EventKind::TradeReport, 1),
+        (BOOK, EventKind::BookAsOf, 1),
+    ] {
+        let value: Value = serde_json::from_str(payload).unwrap();
+        let ms = value["timestamp"].as_str().unwrap().parse::<u64>().unwrap();
+        let children = events(normalize(&ws(payload)));
+        assert_eq!(children.len(), count);
+        for child in children {
+            let time = match child {
+                SegmentEvent::Book(BookEvent::Full(v)) => v.venue_time().unwrap(),
+                SegmentEvent::Book(BookEvent::Delta(v)) => v.venue_time().unwrap(),
+                SegmentEvent::Trade(v) => v.venue_time().unwrap(),
+                _ => panic!(),
+            };
+            assert_eq!(time.event_ns(), Some(ms * 1_000_000));
+            assert_eq!(time.event_kind(), Some(kind));
+            assert_eq!(time.event_resolution(), Some(Resolution::Millisecond));
+            assert_eq!(time.sent_ns(), None);
+        }
+    }
+    let children = events(normalize(&rest(REST_BOOK)));
+    let SegmentEvent::AuditAnchor(anchor) = &children[0] else {
+        panic!("REST retains audit semantics")
+    };
+    let ms = serde_json::from_str::<Value>(REST_BOOK).unwrap()["timestamp"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(anchor.source_observed_ns(), Some(ms * 1_000_000));
+    assert!(
+        serde_json::to_value(anchor)
+            .unwrap()
+            .get("venue_time")
+            .is_none()
+    );
+}
+
+#[test]
+fn missing_timestamps_remain_rejected_without_inference() {
+    for fixture in [BOOK, PRICE_CHANGE, TRADE, REST_BOOK] {
+        let mut value: Value = serde_json::from_str(fixture).unwrap();
+        value.as_object_mut().unwrap().remove("timestamp");
+        let input = if fixture == REST_BOOK {
+            source(
+                &value.to_string(),
+                "public_snapshot",
+                json!({"type":"snapshot","source_time_ms":1}),
+                "venue_frame",
+            )
+        } else {
+            ws(&value.to_string())
+        };
+        assert_eq!(
+            reject(normalize(&input)).error_code,
+            "missing_required_field"
+        );
+    }
+}
+
+#[test]
 fn delivery_cursor_errors_preserve_prefix_and_level_precedence() {
     for (fixture, stream, cursor_code) in [
         (BOOK, "public_book", "unexpected_sequence_cursor"),
@@ -130,10 +195,14 @@ fn frozen_branch_behavior_corpus() {
                                 replay_domain::SegmentRecord::from_json(&json).unwrap(),
                                 record
                             );
-                            transcript.extend(json);
+                            transcript.extend(crate::schema3_projection(&record));
                         }
                     }
-                    other => transcript.extend(format!("{other:?}").bytes()),
+                    other => transcript.extend(
+                        format!("{other:?}")
+                            .replace("parser_version: 4", "parser_version: 3")
+                            .bytes(),
+                    ),
                 }
                 transcript.push(b'\n');
             }
@@ -248,7 +317,7 @@ fn reject(value: Normalization) -> canonical_normalizer::ParseReject {
 #[test]
 fn descriptor_binds_every_behavior_variable_and_bundle_version() {
     let default = Normalizer::new(Polymarket::default()).unwrap();
-    assert_eq!(PARSER_VERSION, 3);
+    assert_eq!(PARSER_VERSION, 4);
     let canonical = serde_json::to_vec(&json!({
         "schema_version":1,
         "variables":{

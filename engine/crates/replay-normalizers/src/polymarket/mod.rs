@@ -11,5 +11,5 @@ mod wire;
 pub use adapter::Polymarket;
 pub use config::Config;
 
-pub const PARSER_VERSION: u32 = 3;
-pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/polymarket-normalizer/v3";
+pub const PARSER_VERSION: u32 = 4;
+pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/polymarket-normalizer/v4";

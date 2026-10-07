@@ -28,8 +28,7 @@ impl SegmentEvent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentRecord {
     schema_version: u16,
     header: EventHeader,
@@ -123,13 +122,17 @@ impl SegmentRecord {
     }
 
     fn from_wire(wire: SegmentRecordWire) -> Result<Self, DomainError> {
-        if wire.schema_version != crate::SEGMENT_SCHEMA_V3 {
+        if !supported_schema(wire.schema_version) {
             return Err(DomainError::UnsupportedSchemaVersion(wire.schema_version));
         }
         let header: EventHeader = serde_json::from_str(wire.header.get())
             .map_err(|error| DomainError::Json(error.to_string()))?;
-        let event: SegmentEvent = serde_json::from_str(wire.event.get())
-            .map_err(|error| DomainError::Json(error.to_string()))?;
+        let mut deserializer = serde_json::Deserializer::from_str(wire.event.get());
+        let event = serde::de::DeserializeSeed::deserialize(
+            EventSeed(wire.schema_version),
+            &mut deserializer,
+        )
+        .map_err(|error| DomainError::Json(error.to_string()))?;
         header.validate()?;
         event.validate()?;
         Ok(Self {
@@ -187,14 +190,14 @@ impl<'de> serde::de::Visitor<'de> for SinglePass<'_> {
             "schema_version",
         )?;
         let schema_version: u16 = map.next_value()?;
-        if schema_version != crate::SEGMENT_SCHEMA_V3 {
+        if !supported_schema(schema_version) {
             *self.unsupported = Some(schema_version);
             return Err(A::Error::custom("unsupported segment schema version"));
         }
         next_field(&mut map, SegmentRecordField::Header, "header")?;
         let header: EventHeader = map.next_value()?;
         next_field(&mut map, SegmentRecordField::Event, "event")?;
-        let event: SegmentEvent = map.next_value()?;
+        let event = map.next_value_seed(EventSeed(schema_version))?;
         if map.next_key::<SegmentRecordField>()?.is_some() {
             return Err(A::Error::custom("duplicate segment record field"));
         }
@@ -228,5 +231,41 @@ impl<'de> Deserialize<'de> for SegmentRecord {
     {
         Self::from_wire(SegmentRecordWire::deserialize(deserializer)?)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+fn supported_schema(version: u16) -> bool {
+    matches!(version, crate::SEGMENT_SCHEMA_V3 | crate::SEGMENT_SCHEMA_V4)
+}
+
+struct EventSeed(u16);
+impl<'de> serde::de::DeserializeSeed<'de> for EventSeed {
+    type Value = SegmentEvent;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        if self.0 == crate::SEGMENT_SCHEMA_V3 {
+            super::schema3::Event::deserialize(deserializer)?
+                .try_into()
+                .map_err(serde::de::Error::custom)
+        } else {
+            SegmentEvent::deserialize(deserializer)
+        }
+    }
+}
+
+impl Serialize for SegmentRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("SegmentRecord", 3)?;
+        record.serialize_field("schema_version", &self.schema_version)?;
+        record.serialize_field("header", &self.header)?;
+        if self.schema_version == crate::SEGMENT_SCHEMA_V3 {
+            record.serialize_field("event", &super::schema3::Event::from(&self.event))?;
+        } else {
+            record.serialize_field("event", &self.event)?;
+        }
+        record.end()
     }
 }

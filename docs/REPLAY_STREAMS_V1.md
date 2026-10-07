@@ -74,6 +74,17 @@ ephemeral, so no cross-version reading is provided.
   Original domain BookEvent/TradeEvent serialization is retained, except all
   integers become strings. Fulls, repeated deltas and trades remain ordered and
   uncoalesced, including invalidated/duplicate observations and uninterpreted hashes.
+  Full, delta and trade market values include required `venue_time`, either null
+  or the closed `{event_ns,event_resolution,event_kind,sent_ns}` object. Clocks
+  are u64 decimal strings or null. Event time, resolution and kind are present
+  together; resolution is `millisecond` or `microsecond`, and kind is
+  `exchange_event`, `book_update`, `trade_report` or `book_as_of`. At least
+  event_ns or sent_ns is non-null. These are observations only. Transition
+  operations keep their existing BookDelta key set without venue_time, and the
+  consumer pairs them with the ordered market event in the same cut. Publishing
+  a schema-3 pin adds null annotations to book/trade observations. REST
+  AuditAnchor evidence retains its previous derivative format and does not enter
+  market_events.
 - `control_events`, when present, contains referenced non-market observations.
   V1 currently admits only `metadata_changed {from,to}`. It changes no local book;
   legacy cuts that omit this field remain valid. The canonical encoding omits
@@ -303,9 +314,9 @@ Strict config is ≤1 MiB, with fields:
 {
   "run_id":"run-1", "attempt_id":"attempt-1", "scope":"research",
   "normalizer":{"identity_version":1,"venues":[
-    {"venue":"kalshi","bundle_id":"prediction-indexer/kalshi-normalizer/v5","parser_version":5,"config":{"schema_version":2,"variables":{"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":2}}}},
-    {"venue":"limitless","bundle_id":"prediction-indexer/limitless-normalizer/v2","parser_version":2,"config":{"schema_version":1,"variables":{"price_scale":{"type":"unsigned","value":3},"quantity_scale":{"type":"unsigned","value":6}}}},
-    {"venue":"polymarket","bundle_id":"prediction-indexer/polymarket-normalizer/v3","parser_version":3,"config":{"schema_version":1,"variables":{"accept_additive_fields":{"type":"boolean","value":true},"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":6}}}}
+    {"venue":"kalshi","bundle_id":"prediction-indexer/kalshi-normalizer/v6","parser_version":6,"config":{"schema_version":2,"variables":{"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":2}}}},
+    {"venue":"limitless","bundle_id":"prediction-indexer/limitless-normalizer/v3","parser_version":3,"config":{"schema_version":1,"variables":{"price_scale":{"type":"unsigned","value":3},"quantity_scale":{"type":"unsigned","value":6}}}},
+    {"venue":"polymarket","bundle_id":"prediction-indexer/polymarket-normalizer/v4","parser_version":4,"config":{"schema_version":1,"variables":{"accept_additive_fields":{"type":"boolean","value":true},"price_scale":{"type":"unsigned","value":4},"quantity_scale":{"type":"unsigned","value":6}}}}
   ]},
   "inputs":[{"directory":"/pinned/derivative-address","derivative_address":"<64 lowercase hex>","receipt_sha256":"<64 lowercase hex>"}],
   "start_ns":"0", "end_ns":"100", "lower_bound":"clip",

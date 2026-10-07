@@ -60,7 +60,7 @@ def normalizer():
 _METADATA = tempfile.TemporaryDirectory()
 
 
-def metadata_pin():
+def metadata_pin(schema_version=3, *, manifest_schema_version=None):
     directory = Path(_METADATA.name)
     descriptor = s._normalizer_descriptor(normalizer())
     address = "d" * 64
@@ -72,7 +72,9 @@ def metadata_pin():
         "requested_end_ns": 100,
         "effective_start_ns": 0,
         "effective_end_ns": 100,
-        "normalized_schema_version": 3,
+        "normalized_schema_version": (
+            schema_version if manifest_schema_version is None else manifest_schema_version
+        ),
         "event_serialization_version": 1,
         "reject_serialization_version": 1,
         "materializer_version": 2,
@@ -90,7 +92,7 @@ def metadata_pin():
         "receipt_version": 2,
         "derivative_address": address,
         "source_receipt_sha256": "a" * 64,
-        "normalized_schema_version": 3,
+        "normalized_schema_version": schema_version,
         "materializer_version": 2,
         "normalizer_bundle_sha256": descriptor["bundle_sha256"],
         "normalizer_config_sha256": descriptor["config_sha256"],
@@ -174,6 +176,22 @@ class BudgetTests(unittest.TestCase):
         preflight.start()
         self.addCleanup(preflight.stop)
 
+    def test_source_evidence_profile_accepts_both_supported_event_schemas(self):
+        descriptor = s.normalizer_descriptor(normalizer())
+        for version in (3, 4):
+            with self.subTest(schema_version=version):
+                s._validate_input_binding(metadata_pin(version), descriptor)
+
+    def test_source_evidence_profile_rejects_unknown_or_mismatched_event_schemas(self):
+        descriptor = s.normalizer_descriptor(normalizer())
+        for receipt_version, manifest_version in ((5, 5), (4.0, 4.0), (3, 4), (4, 3)):
+            with self.subTest(receipt=receipt_version, manifest=manifest_version):
+                with self.assertRaisesRegex(ProtocolError, "source-evidence profile 2"):
+                    s._validate_input_binding(
+                        metadata_pin(receipt_version, manifest_schema_version=manifest_version),
+                        descriptor,
+                    )
+
     def test_unsupported_profile_serialization_fails_preflight(self):
         c = config()
         pin = c["transport"]["inputs"][0]
@@ -195,28 +213,28 @@ class BudgetTests(unittest.TestCase):
     def test_normalizer_hash_parity_and_closed_scale_binding(self):
         value = normalizer()
         value["venues"][0].update(
-            bundle_id="prediction-indexer/kalshi-normalizer/v5", parser_version=5
+            bundle_id="prediction-indexer/kalshi-normalizer/v6", parser_version=6
         )
         value["venues"][0]["config"]["variables"]["price_scale"]["value"] = 4
         value["venues"][0]["config"]["variables"]["quantity_scale"]["value"] = 2
         value["venues"][1].update(
-            bundle_id="prediction-indexer/limitless-normalizer/v2", parser_version=2
+            bundle_id="prediction-indexer/limitless-normalizer/v3", parser_version=3
         )
         value["venues"][1]["config"]["variables"]["price_scale"]["value"] = 3
         value["venues"][1]["config"]["variables"]["quantity_scale"]["value"] = 6
         value["venues"][2].update(
-            bundle_id="prediction-indexer/polymarket-normalizer/v3", parser_version=3
+            bundle_id="prediction-indexer/polymarket-normalizer/v4", parser_version=4
         )
         value["venues"][2]["config"]["variables"]["price_scale"]["value"] = 4
         value["venues"][2]["config"]["variables"]["quantity_scale"]["value"] = 6
         descriptor = s._normalizer_descriptor(value)
         self.assertEqual(
             descriptor["bundle_sha256"],
-            "632f1297913f97a1d27fdd89c1f889b0a2333eafb8149cced8e17f546a48039b",
+            "6fa12a0c7470dfa66781f0c6c07e12f5be07d888fb998566977dc124e287bae0",
         )
         self.assertEqual(
             descriptor["config_sha256"],
-            "744419d787b8d14340f043608bf894778e7f3862d177e864a6feee1ec2c033ba",
+            "20b1b079f90561e41e26f052e9e543f121838f1c6b36a0ea4ac17527d2bf7a5a",
         )
 
         valid = config()

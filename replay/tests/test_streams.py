@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from replay.streams import Consumer, Decoder, ProtocolError
 from replay.streams.protocol import books_sha256
+from replay.streams.protocol import delta, event, venue_time
 
 FIXTURE = (
     Path(__file__).resolve().parents[2]
@@ -110,6 +111,60 @@ def apply_all(test, values):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_venue_time_closed_schema_and_exact_wire_integers(self):
+        valid = {
+            "event_ns": "1669149841123456000",
+            "event_resolution": "microsecond",
+            "event_kind": "exchange_event",
+            "sent_ns": "1669149841130000000",
+        }
+        for value in [None, valid, {**valid, "event_ns": None,
+                "event_resolution": None, "event_kind": None},
+                {**valid, "sent_ns": None}, {**valid, "event_ns": "0"}]:
+            venue_time(value)
+        for kind in ("exchange_event", "book_update", "trade_report", "book_as_of"):
+            venue_time({**valid, "event_kind": kind, "event_resolution": "millisecond"})
+        malformed = [
+            {}, [], False,
+            {**valid, "unknown": "1"},
+            {key: value for key, value in valid.items() if key != "sent_ns"},
+            {**valid, "event_ns": None},
+            {**valid, "event_resolution": None},
+            {**valid, "event_kind": None},
+            {"event_ns": None, "event_resolution": None, "event_kind": None, "sent_ns": None},
+            {**valid, "event_resolution": "nanosecond"},
+            {**valid, "event_kind": "match"},
+        ]
+        for key in ("event_ns", "sent_ns"):
+            for bad in (1, True, 1.0, "-1", "01", "1e3", str(2**64), ""):
+                malformed.append({**valid, key: bad})
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(ProtocolError):
+                venue_time(value)
+
+    def test_golden_annotations_are_market_observations_only(self):
+        observed = set()
+        for record in records():
+            if record["kind"] != "cut":
+                continue
+            for market in record["body"]["market_events"]:
+                value = market["event"]
+                event(value)
+                body = value["value"] if value["kind"] == "trade" else value["value"]["value"]
+                if body["venue_time"] is not None:
+                    observed.add(value["kind"] if value["kind"] == "trade" else value["value"]["kind"])
+                missing = copy.deepcopy(value)
+                target = missing["value"] if missing["kind"] == "trade" else missing["value"]["value"]
+                del target["venue_time"]
+                with self.assertRaises(ProtocolError):
+                    event(missing)
+            for transition in record["body"]["book_transitions"]:
+                if transition["decision"]["kind"] == "operations":
+                    for operation in transition["decision"]["operations"]:
+                        self.assertNotIn("venue_time", operation)
+                        delta(operation)
+        self.assertEqual(observed, {"full", "delta", "trade"})
+
     @unittest.skipUnless(importlib.util.find_spec("redis"), "optional redis SDK")
     def test_consumer_rejects_initial_shape_before_creating_client(self):
         initial = records()[0]["body"]

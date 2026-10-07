@@ -7,6 +7,8 @@ mod fault;
 mod identity;
 mod provenance;
 mod record;
+mod schema3;
+mod time;
 mod trade;
 
 pub use book::{
@@ -19,6 +21,7 @@ pub use fault::{FaultImpact, NormalizationFault};
 pub use identity::{InstrumentId, LaneId};
 pub use provenance::{CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader};
 pub use record::{SegmentEvent, SegmentRecord};
+pub use time::{EventKind, Resolution, VenueTime};
 pub use trade::TradeEvent;
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), DomainError> {

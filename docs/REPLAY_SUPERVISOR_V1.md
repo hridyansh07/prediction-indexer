@@ -48,6 +48,9 @@ Validation independently recomputes the typed composite normalizer descriptor,
 checks pinned profile-2 receipt/manifest metadata, and derives the only accepted
 price/quantity scales for each plan venue. Invalid identity, pin, profile, venue,
 or scale combinations fail before any participant is launched.
+Profile 2 accepts normalized event schemas 3 and 4; receipt and manifest must
+declare the same supported schema. After changing the normalizer, materialize
+fresh pins and bind their returned descriptor in the bench's base run config.
 After the Python binding checks, `validate` invokes the pinned publisher's
 read-only `--validate-only` mode with a bounded stdin configuration. This reuses
 the authoritative Rust `inspect_pinned` reader for closed nested schemas, source

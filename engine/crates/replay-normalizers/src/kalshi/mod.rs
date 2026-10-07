@@ -6,11 +6,12 @@ mod error;
 mod event;
 mod message;
 mod process;
+mod time;
 mod value;
 mod wire;
 
 pub use adapter::Kalshi;
 pub use config::Config;
 
-pub const PARSER_VERSION: u32 = 5;
-pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/kalshi-normalizer/v5";
+pub const PARSER_VERSION: u32 = 6;
+pub const NORMALIZER_BUNDLE_ID: &str = "prediction-indexer/kalshi-normalizer/v6";

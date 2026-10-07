@@ -208,6 +208,7 @@ pub(crate) fn parse_event(
     previous: &mut Option<(i64, u32)>,
     counts: &mut VerificationCounts,
     mode: ReadMode,
+    schema_version: u16,
 ) -> Result<SegmentRecord, String> {
     let record = match mode {
         ReadMode::Audit => {
@@ -218,6 +219,9 @@ pub(crate) fn parse_event(
         ReadMode::PinnedReplay => SegmentRecord::from_json(line),
     }
     .map_err(|error| format!("invalid normalized event: {error}"))?;
+    if record.schema_version() != schema_version {
+        return Err("normalized event schema disagrees with manifest".into());
+    }
     let current = (
         record.header().address().canonical_seq(),
         record.header().address().event_index(),
@@ -534,7 +538,9 @@ pub(crate) fn decode_receipt_document(
             let (wire, bytes) = decode_canonical_document::<crate::profile1::Receipt>(bytes, path)?;
             Ok((wire.into(), bytes))
         }
-        (2, replay_domain::SEGMENT_SCHEMA_V3, 2) => decode_canonical_document(bytes, path),
+        (2, replay_domain::SEGMENT_SCHEMA_V3 | replay_domain::SEGMENT_SCHEMA_V4, 2) => {
+            decode_canonical_document(bytes, path)
+        }
         _ => Err("unsupported derivative receipt/schema/materializer profile".into()),
     }
 }

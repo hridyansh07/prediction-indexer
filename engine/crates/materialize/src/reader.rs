@@ -270,7 +270,13 @@ impl Deliveries {
     fn read_event(&mut self) -> Result<(), String> {
         self.event = match self.events.next_line()? {
             Some(line) => Some((
-                parse_event(line, &mut self.previous_event, &mut self.counts, self.mode)?,
+                parse_event(
+                    line,
+                    &mut self.previous_event,
+                    &mut self.counts,
+                    self.mode,
+                    self.manifest.normalized_schema_version,
+                )?,
                 line.len() as u64 + 1,
             )),
             None => None,

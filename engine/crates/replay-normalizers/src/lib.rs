@@ -50,6 +50,34 @@ mod polymarket_materializer;
 const BUNDLE_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/bundle/v1\0";
 const CONFIG_DOMAIN: &[u8] = b"prediction-indexer/replay-normalizers/config/v1\0";
 
+/// Test-only projection onto the frozen schema-3 bytes. Used to prove that
+/// annotations and the version bump do not change the existing interpretation.
+#[cfg(test)]
+fn schema3_projection(record: &replay_domain::SegmentRecord) -> Vec<u8> {
+    use replay_domain::{BookEvent, SegmentEvent};
+    let time = match record.event() {
+        SegmentEvent::Book(BookEvent::Full(v)) => Some(v.venue_time()),
+        SegmentEvent::Book(BookEvent::Delta(v)) => Some(v.venue_time()),
+        SegmentEvent::Trade(v) => Some(v.venue_time()),
+        _ => None,
+    };
+    let mut json = String::from_utf8(record.to_canonical_json()).unwrap();
+    if let Some(time) = time {
+        json = json.replace(
+            &format!(",\"venue_time\":{}", serde_json::to_string(&time).unwrap()),
+            "",
+        );
+    }
+    json = json.replacen("\"schema_version\":4", "\"schema_version\":3", 1);
+    let old = replay_domain::SegmentRecord::from_canonical_json(json.as_bytes()).unwrap();
+    assert_eq!(old.to_canonical_json(), json.as_bytes());
+    assert_eq!(
+        replay_domain::SegmentRecord::from_json(json.as_bytes()).unwrap(),
+        old
+    );
+    json.into_bytes()
+}
+
 /// Complete typed semantic identity for the production normalizer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -397,11 +425,11 @@ mod composite_tests {
         );
         assert_eq!(
             default.descriptor().bundle_sha256.as_hex(),
-            "632f1297913f97a1d27fdd89c1f889b0a2333eafb8149cced8e17f546a48039b"
+            "6fa12a0c7470dfa66781f0c6c07e12f5be07d888fb998566977dc124e287bae0"
         );
         assert_eq!(
             default.descriptor().config_sha256.as_hex(),
-            "744419d787b8d14340f043608bf894778e7f3862d177e864a6feee1ec2c033ba"
+            "20b1b079f90561e41e26f052e9e543f121838f1c6b36a0ea4ac17527d2bf7a5a"
         );
         let changed = CanonicalNormalizer::new(
             kalshi::Kalshi::default(),
