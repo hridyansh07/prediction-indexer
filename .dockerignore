@@ -18,3 +18,19 @@ ingester/target
 encoder/rust/target
 engine/target
 secrets
+
+# Local bench evidence and project-contained agent worktrees never enter builds.
+.bench
+**/.bench
+.claude
+**/.claude
+.codex
+**/.codex
+**/.git
+**/.venv
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/secrets
+**/credentials

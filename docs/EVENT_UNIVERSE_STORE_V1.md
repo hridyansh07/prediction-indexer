@@ -280,6 +280,7 @@ limits are 1–100 and list cursors are opaque and query-specific.
 | `GET /v1/markets/<market_id>` | Canonical market, venue instances, selections, claims, claim relations |
 | `GET /v1/claims/<claim_id>` | Claim, how far it reaches, and its claim relations |
 | `GET /v1/claims/<claim_id>/markets?limit=&cursor=` | The markets expressing one claim, paged |
+| `GET /v1/bundles/<bundle_id>/outcomes` | Read-only normal-resolution spaces, claim keys, statuses and token alignment; [OUTCOME_MASKS_V1.md](OUTCOME_MASKS_V1.md), no schema change |
 | `GET /v1/relationship-types` | Closed relationship-type catalogue |
 | `GET /v1/runs`, `/v1/selections`, `/v1/bundles` | Historical compatibility APIs |
 

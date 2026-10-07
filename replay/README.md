@@ -27,6 +27,34 @@ policy, not vendor completeness or opportunities. Its strict completed reader
 requires both content identity and supervisor success; see
 [`BUNDLE_COVERAGE_V1.md`](../docs/BUNDLE_COVERAGE_V1.md). No shared cache is included.
 
+`python -m replay.bench` provides reusable local preparation with outcomes warm-up,
+context comparison, declarative fee catalogs, disposable single-attempt Docker
+runs, strategy-owned readers/checks, and run comparison. Inputs are mounted read-only;
+failed evidence is retained and writing commands require a new output directory.
+Preparation consumes only exported `UNIVERSE_BASE_URL`. See
+[LOCAL_REPLAY_BENCH_V1.md](../docs/LOCAL_REPLAY_BENCH_V1.md) and the placeholder
+examples in [configs/bench](../configs/bench/README.md).
+
+Economic strategies build on `replay.economic_sdk`
+([`ECONOMIC_STRATEGY_SDK_V1.md`](../docs/ECONOMIC_STRATEGY_SDK_V1.md)). A strategy
+declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns:
+
+- time and same-time staging;
+- shared detached book views;
+- per-key denominators, episodes and slices;
+- controls;
+- opt-in fill checks: strategy-declared governing and recording sizings, one priced
+  fill per episode, ended by a per-leg kill price;
+- bounded output;
+- the independent reader.
+
+`replay.same_venue_complement:build` is the first such strategy
+([`SAME_VENUE_COMPLEMENT_V1.md`](../docs/SAME_VENUE_COMPLEMENT_V1.md)).
+`replay.market_profile:build` writes per-book trading data points: state time,
+spread, depth and cost to fill, activity, quote survival, self-crossing, and pair
+consistency. It can run as its own group, or inside any SDK strategy that enables
+it.
+
 The package is included in the installed distribution, including the frozen
 terminal policy. Storage adapters provide bytes through `ByteStreamer`; none of
 the replay, trust, economics, or execution code changes.
@@ -36,6 +64,8 @@ and the latest run strictly before it. Production run archive receipts remain
 the authority: prefix listings are not accepted as commit evidence. Each read
 freshly verifies the receipted remote manifest and selected object, fully stages
 and verifies the decoded logical identity, and only then yields bytes.
+
+`replay.economic_sdk.outcomes.outcome_scope` exposes frozen normal-resolution masks, payoffs, implications, and exhaustive complete sets during basket construction; see [OUTCOME_MASKS_V1.md](../docs/OUTCOME_MASKS_V1.md).
 
 ## Ordered exit gates
 
@@ -100,3 +130,13 @@ Execution uses the named `DISPLAYED_DEPTH_SURVIVAL_100MS` estimator. It measures
 how long the exact ladder slice required for the ticket remains unchanged. It
 does not observe queue position, order acknowledgements, trades, or fills, and
 cannot label a quote as captured or filled.
+
+`replay.cross_venue_arbitrage:build` measures two-leg all-BUY complete sets across
+venues using the pinned static mask API, native-scale fills, Fee SDK assessments
+and an explicit parity valuation scenario. Results are normal-resolution research
+detections. Output format 2 keeps size-independent rejection denominators once
+per scope with a null size. The SDK checks exact real/control entity-table bytes
+before opening outputs; admitted size-specific route identities are preserved.
+See [CROSS_VENUE_ARBITRAGE_V1.md](../docs/CROSS_VENUE_ARBITRAGE_V1.md)
+for configuration, preparation from `UNIVERSE_BASE_URL`, independent reading and
+the bounded pilot recipe.

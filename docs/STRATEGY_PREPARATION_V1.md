@@ -31,10 +31,16 @@ snapshot = load_snapshot(Path("/research/run-1/context"),
 ```
 
 The Universe URL is directly configurable, HTTP(S), with no proxy requirement or
-proxy-environment use. The client requests only
-`GET /v1/runs/{run_id}/selections/{bundle_id}`; it never uses current-era market or
-claim membership as historical evidence. For an in-process read, supply
-`universe=lambda occurrence, bundle: store.selection_detail(occurrence['run_id'], bundle)`.
+proxy-environment use. The client requests historical details through
+`GET /v1/runs/{run_id}/selections/{bundle_id}` and freezes the normal-resolution
+outcome model through `GET /v1/bundles/{bundle_id}/outcomes`. Current market rows
+provide semantic masks only; they never supply historical membership evidence.
+For an in-process read, supply
+`universe=lambda occurrence, bundle: store.selection_detail(occurrence['run_id'], bundle)`
+and `outcomes=lambda bundle: store.bundle_outcomes(bundle)`. The optional
+`outcomes` source is called once after occurrence reads; when omitted, preparation
+uses `universe.outcomes` if available. Absence/transport unavailability is recorded
+and does not fail coverage-only preparation; malformed models and HTTP 409 abort.
 
 All fields below are required; unknown fields and duplicate JSON keys fail. Version
 is integer 1. Times/scales use the existing Replay unsigned decimal **strings**;
@@ -125,12 +131,13 @@ Mapping follows the current normalizers, independently of sport/product:
 | Listed but unselected market | retained member with `uncaptured_mapping_unknown`, no guessed books |
 
 Missing/duplicate subscriptions on selected targets, one native book mapped to
-multiple listed markets, or malformed IDs fail even when probing a subset. No implicit 1−p ladder, economic
-complement projection, outcome masks, or fee inference is performed.
+multiple listed markets, or malformed IDs fail even when probing a subset. No
+implicit 1−p ladder, economic complement projection, or fee inference is performed. Semantic outcome masks and token alignment are frozen under
+[OUTCOME_MASKS_V1.md](OUTCOME_MASKS_V1.md).
 
 ## Snapshot and stage-2 consumption contract
 
-`context.json` is closed schema version 1 with:
+`context.json` is closed schema version 2 with:
 
 - `config`: the full pinned configuration above;
 - `evidence`: one `{provider: "universe"|"targeter", detail: <selection-detail>}`
@@ -139,8 +146,11 @@ complement projection, outcome masks, or fee inference is performed.
   `lane`, `venue`, `price_scale`, and `quantity_scale`;
 - `scopes`: ordered half-open expectation intervals. Each contains `start_ns`,
   `end_ns`, `run_id`, `bundle_id`, `context_sha256`, `listed_market_ids`,
-  `capture_selected_market_ids`, `members`, `required_books`, and
-  `unresolved_market_ids`;
+  `capture_selected_market_ids`, `members`, `required_books`,
+  `unresolved_market_ids`, and `outcome_books` (one status/mask mapping per
+  native book);
+- `outcomes`: `{provider: "universe", document}` or
+  `{provider: null, unavailable: "universe_outcomes_unavailable"}`;
 - `membership_basis` and `history_complete` as described above.
 
 Each member is `{market_id, capture_selected, mapping_status, books}`. Each book
@@ -172,7 +182,10 @@ compact separators, no ASCII escaping). `context_sha256` uses the same canonical
 encoding for the historical context, matching Universe's context hashing.
 `load_snapshot` verifies hashes and the closed schema and independently resolves
 the evidence again, rejecting altered plans/scopes even with a rehashed receipt.
-It returns deeply immutable mappings/tuples. For an externally pinned identity,
+It accepts legacy version-1 snapshots without outcomes fields, rebuilding their
+original shape, and version-2 snapshots with strictly validated identities and
+book mappings. It returns deeply immutable mappings/tuples. For an externally
+pinned identity,
 pass `expected_sha256`; a colocated receipt alone is not an authenticity signature.
 
 The same directory/config loads without source calls. Changed config fails; a
@@ -202,3 +215,20 @@ reviewed limit change, not truncation.
 
 Live Universe/S3/GCS and Redis execution are not required for these offline
 tests and were not used to validate this preparation stage.
+
+## Local CLI and dotenv setting
+
+Set `UNIVERSE_BASE_URL` in `.env` to your current Universe HTTP(S) endpoint.
+The existing runner JSON names the same setting `universe_base_url`. The CLI
+loads only this dotenv key; exported environment takes priority. Literal quoted
+values and `export KEY=value` are supported, shell expansion is not. Missing,
+duplicate or invalid values fail before requesting evidence; values are not logged.
+
+```bash
+.venv/bin/python -m replay.prepare_context /research/prepare.json /research/context \
+  --env-file /absolute/project/.env
+```
+
+This invokes the same `UniverseHTTP` for selections and outcomes and the existing
+strict preparation writer/reader. No archive fallback is selected implicitly.
+Offline replay consumes the pinned context; it does not load this setting.

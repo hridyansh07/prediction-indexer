@@ -1,0 +1,102 @@
+{
+  "base": "a11bbf0ba4f78af7b27b382b913dbd71a41ea3f4",
+  "files": [
+    {
+      "path": ".env.example",
+      "sha256": "455c69da0980ca46e2b06cbee3b21ca0bdc4adb759ebcf1483fdf30d6bbc2fce"
+    },
+    {
+      "path": "configs/cross_venue_arbitrage_v1.example.json",
+      "sha256": "889fd49295a56fe148cc4b6d2f4ec94325805bbdf760489712a1bca204645a43"
+    },
+    {
+      "path": "docs/ECONOMIC_STRATEGY_SDK_V1.md",
+      "sha256": "2dd44023ff700e8242ea1bb7240c0bbe5b35c24619e0df7c11e15a0f7f4f1b45"
+    },
+    {
+      "path": "docs/STRATEGY_PREPARATION_V1.md",
+      "sha256": "8b3df50b1af7cbdf8d00877ee0f372e8f24fe4818cb307caa7da4e291a62ac88"
+    },
+    {
+      "path": "replay/README.md",
+      "sha256": "39d3ff32c6f8a0b99e2ad991c8a93e3488efe15e53836199d2c6d4f693628d9e"
+    },
+    {
+      "path": "replay/complement_fees.py",
+      "sha256": "8d5e2589f26df345083ffab965c7a6bc4ae5a3683236795d6b557d0eee034b76"
+    },
+    {
+      "path": "replay/complement_output.py",
+      "sha256": "09e027b61f15b7689c8dbe9d462312cdbcfe76ce1f990c8e3a0713a7321c52fd"
+    },
+    {
+      "path": "replay/cross_venue_arbitrage.py",
+      "sha256": "ef405a1de4dafd9306d19ada0457665db6d177a2ab7cf208d88b813eaed14a05"
+    },
+    {
+      "path": "replay/cross_venue_contract.py",
+      "sha256": "7500702bc17f6306e931811edf9207d350c6ee3e7caf87a47b0dd0aa8eb9b4ba"
+    },
+    {
+      "path": "replay/cross_venue_output.py",
+      "sha256": "7878607ef98f2335bbce0478a32a8f7712b9d8daebf50968b37ef5c33a9d61c6"
+    },
+    {
+      "path": "replay/economic_fills.py",
+      "sha256": "43d495d7dd632e965dffd9a4144ae97251b725ae0a4d62e21481594b71bf6b76"
+    },
+    {
+      "path": "replay/economic_sdk/__init__.py",
+      "sha256": "c6b3328fa5ea4fa111003b08b37e14ce3081817a0f3a07ddaa7681e937b5348a"
+    },
+    {
+      "path": "replay/economic_sdk/aggregate_reader.py",
+      "sha256": "af08cae8d7ca3705ec61a7f6bf0071a9fc1b3cc6d7a3cba1f269df85c1194d91"
+    },
+    {
+      "path": "replay/economic_sdk/entities.py",
+      "sha256": "13c2aa6dc234fcddb4758ea957320455da2457a0f7ec7197839aacf5303e5531"
+    },
+    {
+      "path": "replay/economic_sdk/entity_tables.py",
+      "sha256": "00490f3839f3305e217eeaba31373223feabb6f7482ff36b6fd860d2d6b0b0c9"
+    },
+    {
+      "path": "replay/economic_sdk/fills.py",
+      "sha256": "55f452e347b3bd049d50c86e289b6b317af7fceb9b6045203d2e1878428df1d9"
+    },
+    {
+      "path": "replay/economic_sdk/runtime.py",
+      "sha256": "5ddf825739851f870b338011aef0b459fc4ff2bf4323f6d7bf4fb1d196d01151"
+    },
+    {
+      "path": "replay/economic_sdk/types.py",
+      "sha256": "f4811e0277d3906318bbe6cbc01c6d0c8f8c9ac92bfd3770b0fb36e9290a1011"
+    },
+    {
+      "path": "replay/economic_sdk/views.py",
+      "sha256": "97f8dfc3827132c2560bf500a539a8d538fbe638424270abf762ab76372fd459"
+    },
+    {
+      "path": "replay/prepare_context.py",
+      "sha256": "05827830c318e9f9fecf5bd8a8c0575dbe5024c95dfcc4fa24882dd539c164a2"
+    },
+    {
+      "path": "replay/tests/test_cross_venue_arbitrage.py",
+      "sha256": "f6f7ca77e329368b98cd8cbb23f575e6399bf26b0558f7caf8ead72edf92a32b"
+    },
+    {
+      "path": "replay/tests/test_cross_venue_metadata.py",
+      "sha256": "8fef075085213b6497674b5f9cb2ca72a695b323114d8032d6e454e547ba95d5"
+    },
+    {
+      "path": "replay/tests/test_economic_sdk.py",
+      "sha256": "66ea949239d9de39d18518d400b85b81c96f9526093559d8c04cdce16e3694d3"
+    },
+    {
+      "path": "replay/tests/test_prepare_context.py",
+      "sha256": "8de3a769d82c34e436e4c262458c3c94ef6d0ae2dbe83ae8227f9668bce898d3"
+    }
+  ],
+  "source_sha256": "576f5c2752e4b9e5380248f4734b46fca1ffb169dac1dbf70a08d809d62d1c7f"
+}

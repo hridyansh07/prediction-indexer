@@ -30,6 +30,10 @@ DETAIL_ROW_LIMIT = 1000
 
 class DetailTooLarge(ValueError):
     """A detail document would require more child rows than the API permits."""
+class BundleEventConflict(ValueError):
+    """A bundle cannot be resolved to one umbrella event."""
+
+
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 SCHEMA_PATH = Path(__file__).with_name("schema") / "schema.sql"
 REBUILD_INSTRUCTION = (
@@ -1609,6 +1613,67 @@ class UniverseStore:
                 (*parameters, bounded + 1),
             ).fetchall()
         return [_event_record(row) for row in rows[:bounded]], len(rows) > bounded
+
+    def bundle_outcomes(self, bundle_id: str) -> dict[str, Any] | None:
+        """One read transaction; semantic masks never alter catalogue evidence."""
+        from universe.outcomes import bundle_document
+
+        with closing(self.connect(readonly=True)) as connection:
+            connection.execute("BEGIN")
+            # Resolve through selections, never event_observations: that table
+            # holds every candidate of every run and has no bundle_id index, so
+            # a cold scan outlasts the edge's upstream timeout. Each selection's
+            # origin run decided the bundle, and the decision row names its
+            # umbrella event by primary key. Only selected bundles resolve,
+            # which is every bundle preparation can pin.
+            ids = connection.execute(
+                """SELECT DISTINCT decision.event_id
+                   FROM selection_occurrences occurrence
+                   JOIN candidate_decisions decision
+                     ON decision.run_id = occurrence.origin_run_id
+                    AND decision.bundle_id = occurrence.bundle_id
+                   WHERE occurrence.bundle_id = ?
+                   LIMIT 2""",
+                (bundle_id,),
+            ).fetchall()
+            if not ids:
+                return None
+            if len(ids) != 1:
+                raise BundleEventConflict("bundle maps to multiple events")
+            event_id = ids[0]["event_id"]
+            event = dict(connection.execute(
+                "SELECT * FROM umbrella_events WHERE event_id = ?", (event_id,)
+            ).fetchone())
+            event["source_bundle_id"] = bundle_id
+            for field in ("participants", "participant_keys"):
+                event[field] = json.loads(event.pop(field + "_json"))
+            venue_events = [dict(row) for row in connection.execute(
+                "SELECT * FROM venue_events WHERE event_id = ? ORDER BY venue, venue_event_id LIMIT ?",
+                (event_id, DETAIL_ROW_LIMIT + 1),
+            )]
+            markets = [dict(row) for row in connection.execute(
+                "SELECT * FROM venue_markets WHERE event_id = ? ORDER BY venue, venue_market_id LIMIT ?",
+                (event_id, DETAIL_ROW_LIMIT + 1),
+            )]
+            _ensure_detail_rows((venue_events, markets), "bundle outcomes")
+            for market in markets:
+                for field in ("parameters", "subscription_ids", "outcome_labels"):
+                    market[field] = json.loads(market.pop(field + "_json"))
+                market["accepting_orders"] = bool(market["accepting_orders"])
+
+            def matches(venue, native, claim_key, claim_id):
+                # EXISTS is indexed and bounded even when a market has many eras.
+                row = connection.execute(
+                    """SELECT
+                       EXISTS(SELECT 1 FROM market_claims WHERE venue=? AND venue_market_id=? AND claim_key=?) AS recorded,
+                       EXISTS(SELECT 1 FROM market_claims WHERE venue=? AND venue_market_id=? AND claim_key=? AND claim_id=?) AS matches""",
+                    (venue, native, claim_key, venue, native, claim_key, claim_id),
+                ).fetchone()
+                return not row["recorded"] or bool(row["matches"])
+
+            return _bounded_detail(bundle_document(
+                event, venue_events, markets, recorded_claim_matches=matches,
+            ), "bundle outcomes")
 
     def event_detail(self, event_id: str) -> dict[str, Any] | None:
         with closing(self.connect(readonly=True)) as connection:

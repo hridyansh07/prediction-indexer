@@ -368,6 +368,7 @@ def _publish_run(
     *,
     compressed: bool = False,
     manifest_version: int = 2,
+    catalog_rows: tuple[list[dict], list[dict]] | None = None,
 ) -> dict[str, str | int]:
     run_id = report["run_id"]
     date = report["generated_at"].split("T", 1)[0]
@@ -472,6 +473,11 @@ def _publish_run(
                     "classification_evidence": None,
                 }
             )
+    if catalog_rows is not None:
+        events_by_venue, markets_by_venue = {}, {}
+        for rows, grouped in zip(catalog_rows, (events_by_venue, markets_by_venue)):
+            for row in rows:
+                grouped.setdefault(row["venue"], []).append(row)
     for venue in sorted(set(events_by_venue) | set(markets_by_venue)):
         for kind, rows in (
             ("events", events_by_venue.get(venue, [])),

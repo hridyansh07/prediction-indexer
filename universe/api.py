@@ -26,6 +26,7 @@ from universe.rate_limit import RateLimiter
 from universe.store import (
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     DetailTooLarge,
+    BundleEventConflict,
     UniverseStore,
 )
 
@@ -154,6 +155,18 @@ class UniverseApplication:
             detail = self.database.claim_detail(claim_id)
             if detail is None:
                 return HTTPStatus.NOT_FOUND, {"error": "claim not found"}
+            return HTTPStatus.OK, detail
+        if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/outcomes"):
+            _only(query, set())
+            bundle_id = _path_value(
+                parsed.path.removeprefix("/v1/bundles/").removesuffix("/outcomes"), "bundle id"
+            )
+            try:
+                detail = self.database.bundle_outcomes(bundle_id)
+            except BundleEventConflict as error:
+                return HTTPStatus.CONFLICT, {"error": str(error)}
+            if detail is None:
+                return HTTPStatus.NOT_FOUND, {"error": "bundle not found"}
             return HTTPStatus.OK, detail
         if parsed.path.startswith("/v1/bundles/") and parsed.path.endswith("/history"):
             bundle_id = _path_value(

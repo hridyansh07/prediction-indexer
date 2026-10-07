@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "schedules": [
+    {
+      "type": "Schedule",
+      "component": {
+        "enum": "Component",
+        "value": "platform"
+      },
+      "scope": {
+        "type": "Scope",
+        "venue": {
+          "enum": "Venue",
+          "value": "polymarket"
+        },
+        "product": {
+          "enum": "Product",
+          "value": "prediction_clob"
+        },
+        "market": "<native-market-id>",
+        "event": null,
+        "series": null,
+        "category": null,
+        "account": null,
+        "subaccount": null,
+        "builder": null,
+        "instrument": "<native-instrument-id>",
+        "orientation": null
+      },
+      "economics": {
+        "type": "InstrumentEconomics",
+        "quote": {
+          "type": "Asset",
+          "kind": {
+            "enum": "AssetKind",
+            "value": "USDC"
+          },
+          "chain": "<ledger>",
+          "token": "<collateral-token>"
+        },
+        "outcome": {
+          "type": "Asset",
+          "kind": {
+            "enum": "AssetKind",
+            "value": "outcome"
+          },
+          "chain": "<ledger>",
+          "token": "<outcome-token>"
+        },
+        "payout": {
+          "type": "AssetAmount",
+          "asset": {
+            "type": "Asset",
+            "kind": {
+              "enum": "AssetKind",
+              "value": "USDC"
+            },
+            "chain": "<ledger>",
+            "token": "<collateral-token>"
+          },
+          "amount": {
+            "type": "Fixed",
+            "atoms": 1,
+            "scale": 0
+          }
+        },
+        "quote_scale": 18,
+        "quantity_scale": 6,
+        "price_scale": 4
+      },
+      "fee_asset": {
+        "type": "Asset",
+        "kind": {
+          "enum": "AssetKind",
+          "value": "USDC"
+        },
+        "chain": "<ledger>",
+        "token": "<collateral-token>"
+      },
+      "fee_scale": 5,
+      "model": {
+        "type": "Polymarket",
+        "rate": {
+          "type": "Rate",
+          "atoms": "<reviewed-rate-atoms>",
+          "scale": "<reviewed-rate-scale>"
+        },
+        "exponent": "<reviewed-exponent>",
+        "taker_only": true,
+        "rounding": {
+          "enum": "Rounding",
+          "value": "pm_declared_fill_ceil5_scenario"
+        }
+      },
+      "sources": [
+        {
+          "path": "/absolute/<public-source-file>",
+          "sha256": "<64-lowercase-hex>",
+          "url": "https://<public-source-host>/<source-path>",
+          "retrieved_at": "<unix-ns-integer>"
+        }
+      ],
+      "effective_from": null,
+      "effective_to": null,
+      "effective_evidence": null,
+      "extractor_version": "<reviewed-extractor-version>",
+      "model_version": "<reviewed-model-version>",
+      "supersedes": []
+    }
+  ]
+}
