@@ -1,7 +1,9 @@
-# Production opt-in for Targeter v2 phases 6--10.
+# Targeter v2 phases 6--10 deployment layer.
 #
-# Apply together with compose.yaml.  This file intentionally leaves the v1
-# service definition untouched unless an operator names the override:
+# Apply together with compose.yaml, which defines the scheduled one-shot
+# `targeter` service and points every subscription-driven splice at the atomic
+# v2 generation pointer.  This file adds only the opt-in `ops` services (run
+# archiver, run reaper, integrity audit):
 #
 #   docker compose -f compose.yaml -f compose.targeter-v2.yaml run --rm targeter
 
@@ -25,13 +27,7 @@ x-targeter-v2-runtime: &targeter-v2-runtime
     ARCHIVE_ROOT: /var/lib/prediction-archive
     ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
     ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
-    ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
-    ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
-    ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
     ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
-    AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-    AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-    AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
   volumes: &targeter-v2-volumes
     - type: bind
       source: ${CAPTURE_DATA_ROOT:-./data}
@@ -45,149 +41,6 @@ x-targeter-v2-runtime: &targeter-v2-runtime
         create_host_path: true
 
 services:
-  # One discovery/archive/publication transaction.  Cron or a systemd timer
-  # starts another container for the next run; this process owns no timer.
-  targeter:
-    # Runtime hardening and image/build settings are inherited from the base
-    # targeter service. Repeating cap_drop/security_opt here would make the
-    # Compose merge contain duplicate unique-sequence entries.
-    environment: *targeter-v2-archive-environment
-    volumes: *targeter-v2-volumes
-    restart: "no"
-    command:
-      - python
-      - -u
-      - targeter/run_v2.py
-      - --mode
-      - publish
-      - --strategy
-      - /app/configs/targeter_v2.json
-      - --cache-root
-      - /var/lib/prediction-indexer/targeter-v2-cache
-      # The cache root still holds rate-limit state, which is read every run.
-      # Raw HTTP response bodies are not: a publish run always refreshes live
-      # (`--reuse-cache` is the only thing that would read them back), so
-      # persisting them wrote ~230 MB per run that nothing could ever open.
-      - --no-response-cache
-      - --output-root
-      - /var/lib/prediction-indexer/targeter-v2-runs
-      - --live-root
-      - /var/lib/prediction-indexer/live
-
-  # All subscription-driven lanes resolve one atomic generation pointer.  A
-  # splice keeps its last valid TargetSet if a future pointer fails validation.
-  splice-polymarket:
-    command:
-      - python
-      - -u
-      - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --
-      - python
-      - -u
-      - splices/run.py
-      - polymarket
-      - --targets
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --spool-root
-      - /var/lib/prediction-indexer/spool
-      - --target-poll-seconds
-      - "${TARGET_POLL_SECONDS:-30}"
-      - --fsync-interval-seconds
-      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
-      - --backoff-max-seconds
-      - "${BACKOFF_MAX_SECONDS:-60}"
-      - --segment-seconds
-      - "${SEGMENT_SECONDS:-1800}"
-      - --writer-queue-capacity
-      - "${WRITER_QUEUE_CAPACITY:-20000}"
-
-  splice-limitless:
-    command:
-      - python
-      - -u
-      - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --
-      - python
-      - -u
-      - splices/run.py
-      - limitless
-      - --targets
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --spool-root
-      - /var/lib/prediction-indexer/spool
-      - --target-poll-seconds
-      - "${TARGET_POLL_SECONDS:-30}"
-      - --fsync-interval-seconds
-      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
-      - --backoff-max-seconds
-      - "${BACKOFF_MAX_SECONDS:-60}"
-      - --segment-seconds
-      - "${SEGMENT_SECONDS:-1800}"
-      - --writer-queue-capacity
-      - "${WRITER_QUEUE_CAPACITY:-20000}"
-
-  splice-polymarket-snapshots:
-    command:
-      - python
-      - -u
-      - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --
-      - python
-      - -u
-      - splices/run.py
-      - polymarket-snapshots
-      - --targets
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --spool-root
-      - /var/lib/prediction-indexer/spool
-      - --poll-seconds
-      - "${SNAPSHOT_POLL_SECONDS:-60}"
-      - --fsync-interval-seconds
-      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
-      - --backoff-max-seconds
-      - "${BACKOFF_MAX_SECONDS:-60}"
-      - --segment-seconds
-      - "${SEGMENT_SECONDS:-1800}"
-      - --writer-queue-capacity
-      - "${WRITER_QUEUE_CAPACITY:-20000}"
-
-  splice-kalshi:
-    command:
-      - python
-      - -u
-      - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --
-      - python
-      - -u
-      - splices/run.py
-      - kalshi
-      - --targets
-      - /var/lib/prediction-indexer/live/targeter-v2/current.json
-      - --spool-root
-      - /var/lib/prediction-indexer/spool
-      - --target-poll-seconds
-      - "${TARGET_POLL_SECONDS:-30}"
-      - --fsync-interval-seconds
-      - "${FSYNC_INTERVAL_SECONDS:-0.25}"
-      - --backoff-max-seconds
-      - "${BACKOFF_MAX_SECONDS:-60}"
-      - --segment-seconds
-      - "${SEGMENT_SECONDS:-1800}"
-      - --writer-queue-capacity
-      - "${WRITER_QUEUE_CAPACITY:-20000}"
-      # Must be repeated here. Compose replaces `command` wholesale rather than
-      # merging it, so every flag the base service carries has to be restated by
-      # any override that names a command at all — and one that is merely
-      # forgotten fails silently, as a default, with no error anywhere. This one
-      # was: the flag was added to `compose.yaml` and dropped on the floor here,
-      # so the poller read zero and reported "never fired" while looking armed.
-      - --snapshot-max-age-seconds
-      - "${KALSHI_SNAPSHOT_MAX_AGE_SECONDS:-0}"
-
   # Archives complete run directories that hold no receipt yet — the ones a
   # failed upload or a shadow-only deployment left behind.  It never deletes
   # anything and has no flag that could: archival and deletion are separate

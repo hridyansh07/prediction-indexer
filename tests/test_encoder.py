@@ -1,7 +1,7 @@
 """§9.1 — the shared Zstandard codec.
 
 Every rejection test builds the unsafe object first and asserts the codec
-refuses it. `archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md` §9 is explicit that a
+refuses it. `AGENTS.md` is explicit that a
 production change begins with a test demonstrating the missing or unsafe
 behaviour, and for a decoder that means the corrupt frame has to exist.
 """

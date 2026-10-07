@@ -1,8 +1,8 @@
 """Whole-buffer conveniences for tests and probes. **Not a production path.**
 
-`ZSTD_MATERIALIZATION_PIPELINE_V1.md` §2.3 keeps these "only as small
+`encoder/README.md` (Streaming only) keeps these "only as small
 test/convenience wrappers implemented on top of the streaming path, never as
-production file APIs", and `PHASE_4_RAW_ARCHIVE_REAPER_V1.md` §4.2 states the
+production file APIs", and `archive/README.md` (Safety model) states the
 rule as a prohibition: no archiver, finalizer, replay, or deployment path may
 call an API whose source or result is one complete `bytes` object.
 

@@ -6,7 +6,7 @@
 //! ```
 //!
 //! A **separate command** from `indexer-ingest`, per
-//! `docs/SEALED_CAPTURE_PIPELINE_V1.md` §8.3. The two assign different global
+//! `ingester/README.md` (Orderings). The two assign different global
 //! orders over the same bytes and both remain available:
 //!
 //! ```text
@@ -499,7 +499,7 @@ fn sweep_once(arguments: &Arguments) -> Result<(), String> {
         return Err(format!(
             "{} window(s) start before the watermark at {}: {behind:?}; nothing was \
              written for them. A window behind the sequence cannot be inserted into \
-             it — see the correction policy in SEALED_CAPTURE_PIPELINE_V1 §5.",
+             it — see the correction policy in ingester/README.md (Finalization).",
             behind.len(),
             mark.as_ref()
                 .map(|mark| mark.last_window_end_ns)

@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from replay.gate5 import POLICY_PATH, freeze_policy
+from replay.legacy.gate5 import POLICY_PATH, freeze_policy
 
 
 class FrozenPolicyTests(unittest.TestCase):

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from analysis.claims import claim_id
-from replay.cross_venue_contract import UNIT
+from replay.strategies.cross_venue_arbitrage.contract import UNIT
 from replay.preparation import build_snapshot, encoded
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import ladder
@@ -18,10 +18,10 @@ from replay.tests.test_cross_venue_arbitrage import (
 )
 from replay.tests.test_preparation import config
 
-from replay.implication_contract import baskets
-from replay.implication_output import read_provisional, read_completed, validate_content
-from replay.same_venue_implication_cover import build as same_build
-from replay.cross_venue_implication_cover import build as cross_build
+from replay.strategies._shared.implication_cover.contract import baskets
+from replay.strategies._shared.implication_cover.output import read_provisional, read_completed, validate_content
+from replay.strategies.same_venue_implication_cover.strategy import build as same_build
+from replay.strategies.cross_venue_implication_cover.strategy import build as cross_build
 
 
 def implication_detail(limitless=False):
@@ -158,7 +158,7 @@ class ImplicationTests(unittest.TestCase):
                 self.assertFalse(any(b.admission is None for b in bs))
                 self.assertTrue(all(b.descriptor["size_contracts"] is None for b in bs))
                 self.assertTrue(any(b.admission == "NOT_CAPTURED" for b in bs))
-        with patch("replay.implication_contract.MAX_PAIRS", 1), self.assertRaisesRegex(ProtocolError, "pair limit"):
+        with patch("replay.strategies._shared.implication_cover.contract.MAX_PAIRS", 1), self.assertRaisesRegex(ProtocolError, "pair limit"):
             baskets(h.strategy.snapshot, h.cross_config["policy"], 0, "same_venue")
 
     def test_token_fee_recomputes_each_state_and_removes_floor_edge(self):
@@ -275,7 +275,7 @@ class ImplicationTests(unittest.TestCase):
 
     def test_both_completed_readers_bind_real_success_and_factory(self):
         from replay import supervisor
-        from replay.implication_contract import FACTORIES
+        from replay.strategies._shared.implication_cover.contract import FACTORIES
         from replay.tests.test_supervisor import config as supervisor_config, metadata_pin
         for mode in ("same_venue", "cross_venue"):
             pin = metadata_pin()

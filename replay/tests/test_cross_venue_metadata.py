@@ -8,8 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from analysis.claims import claim_id
-from replay.cross_venue_arbitrage import build
-from replay.cross_venue_output import read_provisional
+from replay.strategies.cross_venue_arbitrage.strategy import build
+from replay.strategies.cross_venue_arbitrage.output import read_provisional
 from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.bounds import MAX_METADATA
 from replay.preparation import encoded, prepare
@@ -191,7 +191,7 @@ class MetadataRegressionTests(unittest.TestCase):
             finally: h.close()
 
     def test_deterministic_order_and_admitted_descriptors_are_unchanged(self):
-        from replay.cross_venue_contract import baskets
+        from replay.strategies.cross_venue_arbitrage.contract import baskets
         from replay.preparation import build_snapshot,digest
         d,doc,c=wide_fixture()
         s=build_snapshot(c,[{"provider":"universe","detail":d}]*14,{"provider":"universe","document":doc})
@@ -212,7 +212,7 @@ class MetadataRegressionTests(unittest.TestCase):
 
     def test_completed_reader_and_old_contract_is_rejected(self):
         from replay import supervisor
-        from replay.cross_venue_output import read_completed,check_manifest
+        from replay.strategies.cross_venue_arbitrage.output import read_completed,check_manifest
         from replay.tests.test_supervisor import config as supervisor_config,metadata_pin
         from replay.streams.protocol import ProtocolError
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,7 +221,7 @@ class MetadataRegressionTests(unittest.TestCase):
                 c=supervisor_config()
                 c["transport"].update(run_id="coverage-test",groups=["coverage"],plans=h.initial["plans"],
                                       start_ns="10",end_ns="40",inputs=[pin])
-                c["strategies"]={"coverage":{"factory":"replay.cross_venue_arbitrage:build",
+                c["strategies"]={"coverage":{"factory":"replay.strategies.cross_venue_arbitrage:build",
                                "revision":"synthetic-test","config":h.cross_config}}
                 identity=supervisor.identity(c); h.strategy.binding["identity"]=identity
                 h.populate(); result=h.finish()

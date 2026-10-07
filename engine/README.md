@@ -1,126 +1,124 @@
-# Replay normalized derivative boundary
+# Replay engine
 
-This workspace contains the stable, venue-independent Replay domain, the
-generic boundary that turns one Phase 0 canonical window into one immutable,
-verified normalized derivative, the Kalshi, Polymarket, and Limitless normalizers,
-a pull-based verified derivative walker, and the `replay-risk` reconstruction
-engine, plus the `replay-transport` Redis publisher. It contains no strategy,
-deployment, or scheduler.
+A Rust workspace (`engine/Cargo.toml`) holding the venue-independent Replay
+domain, the normalizers that turn one canonical window into an immutable,
+verified normalized derivative, the pull-based derivative walker, the
+reconstruction risk engine, and the Redis publisher. It contains no strategy,
+fee logic, deployment or scheduler.
+
+| Crate (package) | Path | Role |
+|---|---|---|
+| `replay-domain` | `crates/domain` | Exact numerics, closed event schema, canonical JSON, prepared mutation |
+| `canonical-normalizer` | `crates/normalize` | Canonical envelope decode and the `VenueAdapter` lifecycle |
+| `replay-normalizers` | `crates/replay-normalizers` | Kalshi, Polymarket and Limitless adapters; `materialize_range` example binary |
+| `replay-materialize` | `crates/materialize` | Immutable derivative build, strict audit, pinned verified reader |
+| `replay-tape` | `crates/tape` | `DerivativeWalker`: window selection, scope filter, atomic groups |
+| `replay-risk` | `crates/risk` | `RiskEngine`: book reconstruction and immutable `RiskCut`s |
+| `replay-transport` | `crates/transport` | `replay-publish` binary and Redis stream delivery ([`docs/REPLAY_STREAMS_V1.md`](../docs/REPLAY_STREAMS_V1.md)) |
+
+The walker and risk contracts are in [`DERIVATIVES.md`](DERIVATIVES.md). Canonical
+inputs come from the ingester ([`ingester/README.md`](../ingester/README.md)).
+
+```bash
+cargo fmt --manifest-path engine/Cargo.toml --all --check
+cargo test --manifest-path engine/Cargo.toml --workspace
+cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+```
 
 ## Representation contract
 
-- `Magnitude` is unit-free unsigned exact arithmetic (`u64` atoms plus scale).
-  It is not serialized alone and has no financial meaning.
-- `Qty` wraps `Magnitude` with `QuantityUnit::Contracts` and is always
-  nonnegative. Its storage is `u64`, but V1 deliberately caps persisted atoms at
-  `i64::MAX`; constructors, parsing, arithmetic, rescaling, and deserialization
-  all enforce that logical maximum. `PositiveQty` additionally makes zero
-  unrepresentable for levels, trades, and level changes.
-- `Px` remains the general nonnegative `i64` fixed-point price primitive in
-  `10^-scale` quote units per contract. `ConditionalMarketPrice` wraps it for
-  current market events and rejects values outside the inclusive `[0, 1]`
-  interval; it never clamps or rounds.
-- `DecimalScale` is the inclusive range 0–18. Decimal input is plain ASCII
-  `[0-9]+(.[0-9]+)?`. Whitespace, either lexical sign, exponent notation,
-  missing whole/fractional digits, and binary floats are not accepted by the
-  domain quantities. A venue adapter may consume a directional wire sign before
-  constructing domain values.
-- Extra fractional zeroes are exact and accepted. A non-zero discarded digit is
-  inexact. Checked rescaling distinguishes a non-zero value below the coarser
-  quantum (`Underflow`), other discarded remainder (`InexactRescale`), and
-  width failure (`Overflow`). There is no rounding policy.
-- Representation equality includes atoms, scale, and unit. Callers must rescale
-  explicitly before comparing values expressed at different scales.
-- `Side::{Bid, Ask}` is order-book side.
-  `ContractOrientation::{Outcome, Complement}` independently records whether a
-  price refers to the named outcome or its logical complement. The Replay domain performs no
-  implicit `1 - p` conversion.
-- `LevelChange::{Set, Delete, Increase, Decrease}` carries operation semantics
-  explicitly. Every quantity-bearing variant contains `PositiveQty`; no signed
-  or zero relative change can enter the persisted domain.
-- `BookStateHash` records the algorithm with the digest. Its current `Sha1`
-  variant is a strict lowercase 40-hex newtype for Polymarket full-state
-  evidence and cannot be confused with the typed SHA-256 identities used for
-  canonical and derivative content.
+- `Magnitude` is unit-free unsigned exact arithmetic (`u64` atoms plus scale),
+  never serialized alone.
+- `Qty` wraps `Magnitude` with `QuantityUnit::Contracts` and is nonnegative.
+  Persisted atoms are capped at `i64::MAX`; constructors, parsing, arithmetic,
+  rescaling and deserialization all enforce it. `PositiveQty` makes zero
+  unrepresentable for levels, trades and level changes.
+- `Px` is the nonnegative `i64` fixed-point price primitive in `10^-scale` quote
+  units per contract. `ConditionalMarketPrice` wraps it and rejects values
+  outside `[0, 1]`; it never clamps or rounds.
+- `DecimalScale` is 0 to 18 inclusive. Decimal input is plain ASCII
+  `[0-9]+(.[0-9]+)?`: no whitespace, sign, exponent, missing whole/fractional
+  digits or binary floats. A venue adapter may consume a directional wire sign
+  before constructing domain values.
+- Extra fractional zeroes are exact and accepted; a non-zero discarded digit is
+  inexact. Checked rescaling distinguishes `Underflow` (non-zero below the
+  coarser quantum), `InexactRescale` and `Overflow`. There is no rounding policy.
+  Representation equality includes atoms, scale and unit, so callers rescale
+  explicitly before comparing.
+- `Side::{Bid, Ask}` is book side. `ContractOrientation::{Outcome, Complement}`
+  independently records whether a price refers to the named outcome or its
+  logical complement; the domain performs no implicit `1 - p` conversion.
+- `LevelChange::{Set, Delete, Increase, Decrease}` is direction-explicit and every
+  quantity-bearing variant holds a `PositiveQty`.
+- `BookStateHash` records its algorithm; the `Sha1` variant is a strict
+  lowercase 40-hex newtype for Polymarket full-state evidence, distinct from the
+  typed SHA-256 identities used for canonical and derivative content (all
+  `indexer_types::Sha256`, canonical lowercase hex).
 
-Currency identity, venue-specific price bands, tick/lot schedules, payout
-denomination, currency conversion, fee arithmetic, and strategy rounding are
-economic/product choices deferred to their owning later phases. A future
-segment manifest must bind currency and the scales expected for each instrument;
-the Replay domain does not guess them from a venue.
+Currency, price bands, tick/lot schedules, payout denomination, conversion, fee
+arithmetic and strategy rounding are not decided here.
 
-## Book identity preserves venue-native ladders
+## Book identity
 
-`BookKey { instrument, orientation }` identifies the captured ladder used by
-future book stores and book dependencies. `FullBook`, `BookDelta`, and
-`AuditAnchor` expose `book_key()` without changing their persisted fields.
-A full snapshot resets only that key, never every orientation of an instrument.
+`BookKey { instrument, orientation }` identifies a captured venue-native ladder.
+`FullBook`, `BookDelta` and `AuditAnchor` expose `book_key()`. A full snapshot
+resets only its key.
 
-- [Kalshi](https://docs.kalshi.com/getting_started/orderbook_responses) exposes
-  two bid ladders for one market ticker. YES bids use `(kalshi:TICKER, Outcome)`;
-  NO bids use `(kalshi:TICKER, Complement)`. These are complementary views of
-  one binary market, not independent liquidity: a NO bid at 0.56 implies a YES
-  ask at 0.44. Normalization preserves both bid ladders without that conversion.
-  Empty `asks` means no explicit ask ladder was emitted, not no implied asks.
-  An `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg`,
-  and an optional positive `id` that Kalshi echoes when the snapshot answers a
-  `subscribe` or `get_snapshot` command. A snapshot `msg` may carry
-  `market_id: ""`, which is treated as absent; a snapshot with no level arrays
-  is a valid empty book and yields both orientations as empty Full books.
-  Bundle `kalshi-normalizer/v5` (parser 5) introduced both acceptances; v4
-  rejected those frames as `unknown_field` / `invalid_market_id`.
-- [Polymarket](https://docs.polymarket.com/market-data/overview) gives each
-  outcome its own token ID. YES and NO remain different `polymarket:TOKEN_ID`
-  instruments, both with `Outcome` orientation relative to their own token.
-  Never collapse token IDs to a shared condition ID or reinterpret the NO
-  token as `Complement` of the YES token during normalization.
-  Bundle `polymarket-normalizer/v3` (parser 3) treats an exact empty
-  `last_trade_price` in a book or snapshot as absent/no trade yet; nonnumeric,
-  null, and wrong-type values still reject. A `tick_size_change` is intentionally
-  ignored only after its asset, market, timestamp, old tick, and new tick all
-  validate. Ignored members of a batched delivery do not suppress ordered events
-  or validation of later members; the whole delivery is ignored only when every
-  member is a valid ignore.
+- Kalshi exposes two bid ladders per market ticker. YES bids use
+  `(kalshi:TICKER, Outcome)` and NO bids `(kalshi:TICKER, Complement)`; they are
+  complementary views, not independent liquidity, and normalization does not
+  convert between them. Empty `asks` means no explicit ask ladder was emitted. An
+  `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg` and an
+  optional positive `id` echoing a `subscribe`/`get_snapshot` command. A `msg`
+  with `market_id: ""` treats it as absent, and a snapshot with no level arrays
+  is a valid empty book (both orientations empty Fulls).
+- Polymarket gives each outcome its own token: `polymarket:TOKEN_ID` instruments,
+  all `Outcome` orientation. Token IDs are never collapsed to a condition ID and
+  the NO token is never a `Complement` of the YES token. An exact empty
+  `last_trade_price` is treated as absent; nonnumeric, null or wrong-type values
+  reject. A `tick_size_change` is ignored only after its asset, market,
+  timestamp, old tick and new tick all validate; ignored members of a batched
+  delivery do not suppress ordered events or validation of later members, and the
+  whole delivery is ignored only when every member is a valid ignore.
+- Limitless full books replace, never merge, and retain original ordering and
+  provenance.
 
-The key distinguishes stored evidence; it does not assert cross-book economic
-independence. Any complementary-price view belongs in an explicit later consumer.
-`replay-risk` reconstructs native books without an implied-ask projection.
+Normalizer bundles: `prediction-indexer/kalshi-normalizer/v5`,
+`polymarket-normalizer/v3`, `limitless-normalizer/v2` (parser versions in each
+module's `mod.rs`).
 
 ## Closed event contract
 
 `SegmentRecord` schema version 3 owns `EventHeader`, `EventAddress`, complete
-downstream canonical provenance, and a closed `SegmentEvent`. Book events use
-validated constructors, canonical bid-descending/ask-ascending level ordering,
-one scale per full book, positive level quantities, conditional-market prices,
-direction-explicit level changes, and no duplicate prices. This is an undeployed
-contract; no legacy signed schema exists. `NormalizationFault` carries a closed
-impact classification selected before book state. Exact rejected bytes
-and parser error codes live in the committed reject sidecar, not this event.
+canonical provenance and a closed `SegmentEvent`. Book events use validated
+constructors, bid-descending/ask-ascending ordering, one scale per full book,
+positive quantities, conditional-market prices and no duplicate prices.
+`NormalizationFault` carries a closed impact classification chosen before book
+state; exact rejected bytes and parser error codes live in the reject sidecar.
 
-Canonical JSON is compact UTF-8 emitted by `SegmentRecord::to_canonical_json`.
-Struct field order and adjacent enum tags are schema. The strict reader
-(`SegmentRecord::from_canonical_json`, used by writers, audits and tests) rejects
-unknown fields/variants, unsupported versions, invalid domain states, alternate
-field order, and insignificant whitespace by decode/validate/re-encode equality.
-`SegmentRecord::from_json` is the pinned replay read's single-pass decode: it
-deserializes header and event directly into their final types, checks the
-version first, and rejects the same malformed, unknown, duplicate, reordered,
-unsupported and invalid inputs, but does not prove the canonical spelling; the
-pin's install-time SHA-256 binding does.
-Callers add an LF only when framing records as NDJSON; the LF is not part of one
-record's canonical JSON bytes.
+Canonical JSON is compact UTF-8 from `SegmentRecord::to_canonical_json`; struct
+field order and adjacent enum tags are schema. `from_canonical_json` (writers,
+audits, tests) rejects unknown fields/variants, unsupported versions, invalid
+domain states, alternate field order and whitespace by decode/validate/re-encode
+equality. `SegmentRecord::from_json` is the single-pass pinned-read decode: it
+checks the version first and rejects the same malformed, unknown, duplicate,
+reordered, unsupported and invalid inputs but does not prove canonical spelling
+(the install-time SHA-256 binding does). An LF is added only when framing NDJSON.
 
-`EventAddress.event_index` is zero-based venue-array order. `child(index)` changes
-only that index, preserving canonical sequence, lane, and delivery index. Segment
-position and event index remain serialization order, never event time.
+`EventAddress.event_index` is zero-based venue-array order; `child(index)` changes
+only that index and preserves canonical sequence, lane and delivery index.
+Position and event index are serialization order, never event time.
 
-## Phase 0 stacking boundary
+`Revisioned<T>::prepare` validates against immutable state and returns an opaque,
+owned `PreparedMutation<T>`; `apply` checks that the current revision equals
+`prepared_from` (a stale mutation writes nothing), then performs only the
+complete replacement and revision advance.
 
-Phase 0 continues to own `CanonicalSelection`, `AuditedCanonicalReader`,
-`JoinedCanonicalRecord`, canonical receipt identities, and its finished-audit
-capability in `indexer-finalize`. Replay deliberately duplicates none of them.
-`canonical-normalizer` performs one exhaustive conversion from each audited joined
-record into:
+## Canonical to normalized
+
+The ingester owns `CanonicalSelection`, `AuditedCanonicalReader`,
+`JoinedCanonicalRecord` and canonical receipt identities; Replay duplicates none
+of them. `canonical-normalizer` converts each audited joined record exhaustively:
 
 ```text
 JoinedCanonicalRecord                    replay-domain
@@ -133,269 +131,120 @@ record_id ------------------------------> EventHeader.record_id
 source digest/line/content/continuity ---> CanonicalProvenance
 ```
 
-The conversion stages records while streaming, but derivative publication still
-requires Phase 0's `CanonicalSelection`, whose reader yields its audited result
-only at verified EOF.
-The Replay continuity enum intentionally has the same ten closed labels; the
-conversion uses an exhaustive match, not string fallback.
+The continuity enum has the same ten closed labels (exhaustive match, no string
+fallback). Derivative publication requires a `CanonicalSelection`, whose reader
+yields its audited result only at verified EOF.
 
-## Normalization and materialization
-
-Production builds use `replay-normalizers::CanonicalNormalizer::default()`:
-one derivative contains the decisions and source evidence of every Kalshi,
-Limitless, and Polymarket delivery in its canonical window. The three former
-venue crates are consolidated into private modules; their adapters cannot be
-wrapped in a public single-venue `Normalizer<A>`. Original adapter conformance
-tests remain crate-local. Bundle selection belongs to the walker, never the
-materializer. Internal deliveries remain explicit ignores; unknown envelope
-venues fail closed. All three finish hooks run in that order, returning the
-first error.
-
-`canonical-normalizer::Normalizer<A>` implements the normalization lifecycle once.
-It decodes each canonical envelope and raw JSON payload, routes by venue, hashes
-the adapter's closed, key-sorted canonical configuration, and delegates venue wire semantics
-through `VenueAdapter`. Its `Normalize` implementation returns zero/many closed
-`SegmentEvent` children, an explicit ignored reason, or an expected
-`ParseReject`, and has a final consistency `finish()`.
-`serde_json` arbitrary-precision number retention is enabled at this shared decode
-seam because Limitless publishes financial values as JSON numbers. Adapters read
-the original decimal number lexeme into fixed point; they never round-trip it
-through binary floating point. Kalshi continues to require its documented decimal
-strings or exact integers, so this seam does not change its accepted shapes.
+`Normalizer<A>` decodes each canonical envelope and raw JSON payload, routes by
+venue, hashes the adapter's closed key-sorted configuration, and delegates wire
+semantics through `VenueAdapter`. It returns zero or more closed `SegmentEvent`
+children, an explicit ignored reason, or an expected `ParseReject`, and has a
+final consistency `finish()`. `serde_json` arbitrary-precision numbers are
+enabled at this seam because Limitless publishes financial values as JSON
+numbers; adapters read the original lexeme into fixed point and never go through
+binary floating point (Kalshi still requires decimal strings or exact integers).
 The seam rejects serde_json's private `Number`/`RawValue` object keys before
-deserialization so captured objects cannot be coerced into accepted scalar values.
-Every SHA-256 identity crossing this boundary uses `indexer_types::Sha256`, an
-invariant-preserving 32-byte value whose unchanged JSON representation is
-canonical lowercase hex. Domain-separated derivative and reject addresses remain
-distinct string identifiers rather than being conflated with source digests.
-Zero children are also an intentional ignore. The materializer records that
-source in the sidecar so ignored evidence remains provenance-addressable. An
-expected reject produces both an exact-envelope sidecar record and one paired
-closed `NormalizationFault`; a normalizer error, panic, invalid domain value,
-audit failure, serialization failure, or sink failure is fatal and publishes no
-receipt.
+deserialization.
 
-`replay-materialize::build_window` intentionally accepts the exact bounds of one
-canonical receipt. This is the smallest composition with Phase 0's selected-run
-API: selecting exact receipt bounds yields one window and one post-EOF capability,
-so no canonical input is reopened and no selector/audit lifecycle changes. The
-derivative manifest owns a closed `SourceReceipt` projection converted explicitly
-from Phase 0's evolving `ReceiptIdentity`. A caller
-wanting a range builds each canonical receipt independently and pins the
-resulting `DerivativePin` values.
+Production uses `replay-normalizers::CanonicalNormalizer::default()`: one
+derivative holds the decisions and source evidence of every Kalshi, Limitless and
+Polymarket delivery in its window. The venue adapters are private modules and
+cannot be wrapped as a public single-venue normalizer. Internal deliveries are
+explicit ignores, unknown envelope venues fail closed, and all three finish hooks
+run in order returning the first error. Zero children is an intentional ignore
+recorded in the sidecar. An expected reject produces both an exact-envelope
+sidecar record and one paired `NormalizationFault`; a normalizer error, panic,
+invalid domain value, audit failure, serialization failure or sink failure is
+fatal and publishes no receipt.
 
-The immutable layout is:
+## Derivative layout and materialization
+
+`replay-materialize::build_window` takes the exact bounds of one canonical
+receipt. A caller wanting a range builds each canonical receipt independently and
+pins the resulting `DerivativePin` values.
 
 ```text
 window=<window-start-ns>/<derivative-address>/
   events.ndjson.zst
   rejects.ndjson.zst
-  sources.ndjson.zst      # profile 2: one transport record per source delivery
+  sources.ndjson.zst      # one transport record per source delivery
   manifest.json
   receipt.json            # sole commit marker, written last
 ```
 
 The domain-separated address binds the complete source receipt identity and
 bounds, normalized schema version, normalizer bundle and config digests, policy
-digest/effective interval, event/reject serialization versions, and materializer
-version. There is no mutable `latest`. Corrected versions coexist under new
-addresses.
+digest and effective interval, event/reject serialization versions and
+materializer version. There is no mutable `latest`; corrected versions coexist
+under new addresses.
 
-The first supported reader profile is frozen independently of writer selection:
-normalized schema 3, receipt/manifest/event/reject serialization/materializer 1.
-Address verification uses the recorded, validated versions, never current writer
-constants. Future formats must add explicit closed readers while retaining this
-profile's wire types and exact serialization. Experimental schemas 1/2 and unknown
-profiles are unsupported; there is no migration or readdressing. Explicitly pinned
-bundle/config revisions can coexist without loading historical normalizers.
+**Current writer profile 2**: normalized schema 3, receipt/manifest/materializer
+version 2, event/reject serialization 1, reject record 1. The source projection
+embeds the exact UTF-8 canonical receipt document (its bytes must match the
+source SHA-256 and length) and its independently checked coverage:
+expected/present/missing/invalid lanes and clock faults. `sources.ndjson.zst`
+holds one closed record per source in source-union order,
+`{"source_version":1,"header":<child-0 EventHeader>,"connection_epoch":"..."}`,
+bound by logical and stored identities in manifest and receipt, with a count equal
+to `input_records`. The `connection_epoch` is the splice connection identity of
+the delivery, not a venue cursor or version. Reject IDs bind the derivative
+address.
 
-New writers use profile 2: receipt/manifest/materializer 2, with schema 3 and
-event/reject serialization 1 unchanged. The source projection additionally binds
-the exact canonical receipt document; its independently checked coverage gives
-expected/present/missing/invalid lanes and clock faults without opening raw
-evidence. A third stream binds each delivery's child-zero header to the exact
-splice `connection_epoch`. The epoch belongs to the source delivery, shared by
-all accepted children and retained for rejects/ignores; it is not a venue version.
-Profile 1 has separate frozen metadata readers and never invents these fields.
-See the walker's [profile-2 contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#implemented-source-evidence-profile-2)
-for address inputs, independent validation, and compatibility limits.
+**Frozen profile 1** (manifest/receipt/materializer 1) keeps separate closed
+metadata readers (`materialize/src/profile1.rs`), canonical byte verification
+before conversion, and its original address algorithm; it never invents
+coverage or epoch fields. Address verification uses the receipt's recorded
+versions, never current writer constants. Unknown profile tuples and
+experimental schemas 1/2 are unsupported; there is no migration or readdressing.
 
 All NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
-and carry logical and stored identities. The strict audit verifier
-(`verify_derivative`) checks canonical JSON, closed versions and fields, frame
-EOF and both identities, event/child order, exact reject-envelope provenance,
-and one-to-one reject/fault pairing. The pinned replay read runs the same pass
-without the two SHA-256 identities and the canonical re-encode comparison; see
-[Read-time integrity contract](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md#read-time-integrity-contract).
+with logical and stored identities. `verify_derivative` (strict audit) checks
+canonical JSON, closed versions and fields, frame EOF and both identities,
+event/child order, exact reject-envelope provenance and one-to-one reject/fault
+pairing.
 
-Builds use unique private staging directories. While writing, a build applies
-the default reader's delivery-level checks to every source delivery it emits:
-line, group, tie-run, and lane limits; dense sequence, time order, and per-lane
-delivery order; equal-time tie tags; and, at EOF, the derivative window and
-agreement with the upstream receipt's coverage and clock claims. A fault event
-is only ever written paired with its parse reject. After EOF and both `finish()`
-calls, builds finish and fsync frames, rename and fsync data, write and fsync the
-manifest, check metadata-document limits, and re-hash every staged file against
-the stored identities the receipt records. They do not decode and re-parse their
-own output: the bytes are the ones the writer just produced under those checks.
-Only then do they atomically publish the uncommitted directory and
-write/fsync/rename the receipt last.
+Builds use unique private staging directories and apply the default reader's
+delivery-level checks to every emitted delivery (line, group, tie-run and lane
+limits; dense sequence, time order, per-lane delivery order; equal-time tie tags;
+at EOF the window and agreement with the receipt's coverage and clock claims). A
+fault event is only written paired with its reject. After EOF and both `finish()`
+calls a build finishes and fsyncs frames, renames and fsyncs data, writes and
+fsyncs the manifest, checks metadata-document limits, re-hashes every staged file
+against the receipt's stored identities, atomically publishes the uncommitted
+directory, then writes/fsyncs/renames the receipt last. It does not decode its own
+output.
 
-The full strict audit verifier runs on an existing committed address
-(verify/no-op) and through `materialize_range --inspect-pin`, which Replay's
-archive download path calls and an operator can run on demand. Replay's bundle cache binds a derivative already
-installed in its local derivatives root to its pin by receipt hash and per-file
-stored SHA-256 identities rather than re-inspecting it. The walker's
-`open_pinned` relies on that binding: it re-hashes the receipt and manifest,
-then checks every frame, length, LF count, ordering, pairing and line schema in
-one streaming pass during traversal, without re-hashing data bytes or
-re-encoding lines (see below).
-The test suite runs it over writer output, so a writer defect fails CI. Each build holds its per-address OS advisory
-lock from before stage creation through publication and cleanup; process death
-releases it. Builds of the same address serialize, while different addresses can
-run concurrently. Before writing a new stage, every run scans directory names
-under its normalized output root for `window=*/.{address}.{pid}.{nonce}.open`
-directories. It prunes only unreceipted stages whose address lock it owns or can
-acquire without waiting. Busy stages, directory symlinks, unrelated paths,
-committed derivatives, and persistent lock files are preserved. This reads
-directory metadata, not compressed payloads; deletion traverses the abandoned
-directory and fsyncs its parent. Cleanup failures abort before new stage writes.
+The strict audit runs on an existing committed address (verify/no-op) and through
+`materialize_range --inspect-pin`, which Replay's archive download path calls.
+Replay's bundle cache binds a locally installed derivative to its pin by receipt
+hash and per-file stored SHA-256 (`replay/jobs/bundle.py::_check_pinned_files`).
 
-Stop all older materializer binaries before upgrading: older binaries lock only
-during publication and cannot safely run alongside automatic stage cleanup.
-Use a dedicated normalized output root on a filesystem with working OS advisory
-locks. No raw/canonical input or archive object is pruned.
+Each build holds a per-address OS advisory lock from before stage creation through
+publication and cleanup. Before writing, every run scans its output root for
+`window=*/.{address}.{pid}.{nonce}.open` stages and prunes only unreceipted ones
+whose lock it can acquire without waiting; busy stages, directory symlinks,
+unrelated paths, committed derivatives and lock files are preserved, and cleanup
+failures abort before new writes. Use a dedicated output root on a filesystem
+with working advisory locks, and stop older materializer binaries before
+upgrading (they lock only during publication). An unreceipted final address
+directory is crash debris and is rebuilt: identical receipt bytes verify/no-op,
+different bytes at the same address are an immutable conflict. No raw, canonical
+or archive object is pruned.
 
-An unreceipted final address directory is crash debris and
-is rebuilt. A retry rebuilds the candidate: identical receipt bytes verify/no-op;
-different bytes at the same address are an immutable conflict.
+## `materialize_range`
 
-## Verified derivative traversal
-
-[`VERIFIED_DERIVATIVE_WALKER_V1.md`](../docs/VERIFIED_DERIVATIVE_WALKER_V1.md)
-defines the reviewed contract and acceptance cases.
-
-- `replay-materialize::{inspect_pinned, open_pinned}` binds the caller's exact
-  `DerivativePin` to receipt and manifest by SHA-256, and to the addressed
-  directory and the receipt's stored lengths. Open copies a private bounded
-  per-window snapshot, checking each file's exact stored length as it is
-  copied, and decodes nothing. Traversal then decodes each file once with the
-  codec's structural decoder (one checksummed frame, no trailing bytes, exact
-  stored/decoded lengths and LF count; no SHA-256), parses each line once into
-  its final typed record, and applies every semantic check to the records it
-  reads, so records may stream before the window's verification completes;
-  any violation poisons the attempt, and nothing is complete until `finish()`.
-  Source replacement cannot change the snapshotted stream. Data-byte digests
-  and canonical encoding are proved at install and by `verify_derivative`.
-- `replay-tape::DerivativeWalker::open` takes explicit pins, requested bounds,
-  `ScopeFilter { instruments, lanes }`, `ReadLimits`, and a required
-  `LowerBoundPolicy` with no default. It orders adjacent windows and validates
-  source sequence and per-lane delivery order, including excluded data.
-- `next_item()` yields a verified `WindowStatus` and immutable `AtomicGroup`s.
-  A group contains a whole source delivery or complete cross-lane visible tie.
-  Filtering retains original child indexes, source spans, provenance, relevant
-  controls/faults, and every selected instrument orientation. `book_keys()` keeps
-  Kalshi Outcome/Complement distinct; it performs no projection or mutation.
-- Both reader and walker require explicit clean EOF, which is reached only after
-  every check of every selected window has passed, before consuming `finish()`
-  can mint a completion capability. Errors poison the attempt, including after
-  records from the failing window were returned; such an attempt has failed as
-  a whole. `replay-risk` applies every complete group even when its consumer
-  skips evaluation, and the publisher's terminal record requires its `finish()`.
-
-RAM is bounded by metadata, lane/scope, line, group, and codec limits; scratch disk
-holds one bounded compressed window. Oversized groups fail rather than split.
-Set `ReadLimits { snapshot_root: Some(data_volume_scratch), ..Default::default() }`
-to place `tempfile` snapshots on the data volume. The root must already exist;
-failure never falls back to system temporary storage. `None` uses the system
-temporary directory. The 8 GiB per-reader cap does not reserve free space or
-budget concurrent readers. Ordinary drop/error removes the owned snapshot only.
-
-The default 16 MiB NDJSON-line limit (including LF), 1 MiB metadata-document
-limit, and group/lane limits also deliberately apply to builds, which enforce
-them while writing: oversized candidates fail before publication, rather than
-produce artifacts rejected by the default verifier. These are operational limits, not
-wire-format changes. Verification is one decode pass per file, shared by pinned
-reads and `verify_derivative`, which drains it for a standalone verdict; typed
-error categories are deferred.
-Do not infer retryability from error strings; an error invalidates the attempt,
-and any fresh retry must retain the explicit pins.
-
-The private `replay-normalizers/examples/materialize_range.rs` operator helper
-selects the minimal adjacent locally committed canonical windows, builds one
-profile-2 composite derivative per exact window, and emits only verified ordered
-pins. It is an example target, not a stable CLI, archive restorer, or indexer.
-The existing 4096-window read limit is unchanged; with half-hour canonical
-windows, one initial materialization request can span at most 85 days 8 hours.
-The helper builds windows concurrently, in-process, with up to
-`std::thread::available_parallelism()` workers (which honors a Linux cgroup CPU
-quota), each window with its own fresh normalizer. Pins and the response stay in
-window order and are byte-identical to a sequential build. Once a window fails,
-no new window starts; in-flight windows finish and the earliest failing
-window's error is reported, the same error a sequential build reports first.
-Windows committed before the failure remain valid, and a retry takes their
-verify/no-op path.
-Transport and Python supervisor preflight bind every selected profile-2 manifest
-to the helper's typed composite identity and derive plan scales from it before any
-Redis command or child process. The initial Redis wire record remains V1.
-
-Window status includes uncertified/empty evidence. Profile 2 reports
-`ReceiptBoundV2` and `coverage() -> Option<&CoverageEvidence>` with typed lane
-states and interval-bearing upstream faults, before any groups. It retains
-out-of-scope faults without guessing lane roles. Delivery `connection_epoch()`
-survives clipping and filtering. Old profile 1 reports
-`NotRecordedInDerivativeV1`, with `None` for coverage and epoch.
-`FinishedWalk::supports_source_evidence()` is true only when every selected
-window has profile 2; `replay-risk` requires it, plus planned lane
-coverage, rather than gate on `certified` alone.
-No production interval policy, scope resolver, projector, strategy, or audit
-overlay is implemented or approved by this generic traversal boundary.
-
-## Reconstruction risk
-
-[`RISK_RECONSTRUCTION_V1.md`](../docs/RISK_RECONSTRUCTION_V1.md) specifies
-`RiskEngine::{open, next_cut, view, finish}`, explicit primary-lane `BookPlan`s,
-and the transport-independent immutable `RiskCut` boundary. It separates ordered
-original Book/Trade observations (including duplicate disposition), non-market
-target-metadata change observations, and scoped book decisions. Metadata changes
-retain both publication digests without changing books. Only affected books advance
-revision; failures latch per key, receipt faults block their entire intervals, and
-later valid Fulls recover.
-Views retain exact initialization/epoch dependencies and remain immutable after
-later cuts. Profile 1 cannot open a strong risk attempt. There is no transport,
-remote query, audit overlay, checkpoint, strategy, or fee change in this crate.
-
-## Prepared mutation boundary
-
-`Revisioned<T>::prepare` runs all fallible validation against immutable state and
-returns an opaque, owned, non-cloneable `PreparedMutation<T>`. `apply` first
-checks that the current revision equals `prepared_from`; a stale mutation writes
-nothing. After that check it performs only the complete replacement and revision
-advance. Future books can use this boundary without giving venue adapters or
-strategies mutation authority. The risk engine instead stages affected books
-privately under its exclusive writer and publishes the whole group together.
-
-## Concepts adapted from Bitfrost
-
-The implementation is original. The reference repository
-`github.com/hridyansh07/bitfrost-prime-take-home` has no discovered license file
-or Cargo license metadata, so no code was copied. The Replay domain adapts these concepts:
-
-- temporary decode followed by a closed, owned normalized domain;
-- distinct financial newtypes, exact decimal lexemes, checked rescaling, and no
-  implicit rounding;
-- closed persisted schemas with validating decode/re-encode;
-- canonical provenance retained beside normalized values;
-- complete prepared mutations and stale-before-write atomic publication.
-
-Unlike the reference, the Replay domain adds the canonical lane/delivery/child
-address, visible tie group, source segment identity, exact continuity vocabulary,
-direction-explicit level changes, and explicit contract orientation.
-
-## Checks
-
-```bash
-cargo fmt --manifest-path engine/Cargo.toml --all --check
-cargo test --manifest-path engine/Cargo.toml --workspace
-cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets --all-features -- -D warnings
-```
+`replay-normalizers/examples/materialize_range.rs` is the operator helper (an
+example target, not a stable CLI, restorer or indexer). It reads a JSON request of
+at most 1 MiB on stdin; `--describe` prints the producer identity (policy digest, materializer version, normalizer identity) and
+`--inspect-pin` audits a pin. A request selects the minimal adjacent locally
+committed canonical windows, builds one profile-2 composite derivative per exact
+window, and emits only verified ordered pins. At most 4096 windows are read; with
+half-hour canonical windows one request spans at most 85 days 8 hours. Windows
+build concurrently in-process on up to `available_parallelism()` workers (honoring
+a Linux cgroup CPU quota), each with a fresh normalizer; pins and response stay in
+window order and are byte-identical to a sequential build. After a failure no new
+window starts, in-flight windows finish, the earliest failing window's error is
+reported, and already committed windows verify/no-op on retry.
+Transport and Python supervisor preflight bind every selected manifest to the
+helper's typed composite identity and derive plan scales from it before any Redis
+command or child process.

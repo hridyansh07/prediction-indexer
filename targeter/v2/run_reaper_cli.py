@@ -107,7 +107,7 @@ def sweep_once(arguments: argparse.Namespace, store) -> int:
         raise SystemExit(
             "refusing delete mode against a local conformance store. The local run "
             "directory is the recovery authority until an independently durable "
-            "archive backend is configured; see docs/TARGETER_V2_PHASES_6_10.md."
+            "archive backend is configured; see targeter/v2/DELIVERY.md."
         )
 
     reaper = TargetRunReaper(

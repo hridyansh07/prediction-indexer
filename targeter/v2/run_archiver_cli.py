@@ -7,7 +7,7 @@ python -m targeter.v2.run_archiver_cli \
     --output-root /var/lib/prediction-indexer/targeter-v2-runs
 ```
 
-S3 and GCS use the same environment-configured store factory as the raw archive
+GCS uses the same environment-configured store factory as the raw archive
 commands.
 
 This command **never deletes anything**, and there is no flag that makes it.

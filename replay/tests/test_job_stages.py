@@ -214,7 +214,7 @@ class SupervisorStageTests(unittest.TestCase):
                 )
             validate.assert_called_once_with(document)
             strategy = document["strategies"]["bundle_coverage"]
-            self.assertEqual(strategy["factory"], "replay.bundle_coverage:build")
+            self.assertEqual(strategy["factory"], "replay.strategies.bundle_coverage:build")
             self.assertEqual(
                 set(strategy["config"]),
                 {"version", "snapshot_directory", "snapshot_sha256"},

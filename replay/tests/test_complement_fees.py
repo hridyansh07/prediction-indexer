@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from replay.complement_fees import FeeBridge
+from replay.strategies._shared.fee_bridge import FeeBridge
 from replay.economic_fills import Fill, walk
 from replay.fees.artifacts import build_catalog, source_from_bytes
 from replay.fees.domain import (

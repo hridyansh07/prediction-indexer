@@ -12,8 +12,9 @@ global: `delivery_index` is dense within one lane because each splice runs its
 own counter, and the k-way merge needs exactly one iterator per lane.
 
 This module exists because the resolver used to be duplicated byte-for-byte in
-`replay/order.py` and `replay/gate1.py`. Neither imported the other, so when the
-partition key changed both were wrong in the same way at the same time — which
+`replay/legacy/order.py` and `replay/legacy/gate1.py`. Neither imported the
+other, so when the partition key changed both were wrong in the same way at the
+same time — which
 is precisely the failure a second copy is for.
 """
 
@@ -28,7 +29,7 @@ __all__ = ["LANE_RANK", "PARTITION_PREFIXES", "LaneError", "lane_of", "lane_rank
 PARTITION_PREFIXES = ("lane=", "venue=")
 
 #: Tie-break order for records sharing an exact `visible_ns`, from
-#: `docs/SEALED_CAPTURE_PIPELINE_V1.md` §1. Lower wins.
+#: `ingester/README.md` (Orderings). Lower wins.
 #:
 #: **This is a serialization rule, not evidence that one venue moved first.** The
 #: canonical file needs a total order so its bytes and `EvidenceSeq` are

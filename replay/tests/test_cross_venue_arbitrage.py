@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from replay.cross_venue_arbitrage import build
-from replay.cross_venue_contract import baskets, Inputs, UNIT, SCALE, asset_row, policy_config
-from replay.cross_venue_output import read_provisional, read_completed, validate_content
+from replay.strategies.cross_venue_arbitrage.strategy import build
+from replay.strategies.cross_venue_arbitrage.contract import baskets, Inputs, UNIT, SCALE, asset_row, policy_config
+from replay.strategies.cross_venue_arbitrage.output import read_provisional, read_completed, validate_content
 from replay.economic_sdk.entities import resolve, scale_admission
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.fees.artifacts import build_catalog
@@ -283,7 +283,7 @@ class CrossVenueTests(unittest.TestCase):
         legs=(("kalshi:series","outcome"),("polymarket:987","outcome"))
         self.assertEqual(scale_admission(legs,plans),"UNSUPPORTED_SCALE")
         self.assertIsNone(scale_admission(legs,plans,native_scales=True))
-        with patch("replay.cross_venue_contract.MAX_PAIRS",1), self.assertRaisesRegex(ProtocolError,"pair limit"):
+        with patch("replay.strategies.cross_venue_arbitrage.contract.MAX_PAIRS",1), self.assertRaisesRegex(ProtocolError,"pair limit"):
             baskets(h.strategy.snapshot,h.cross_config["policy"],0)
         p=copy.deepcopy(h.cross_config["policy"]); p["controls"]=[{"kind":"cyclic_neighbor"}]
         with self.assertRaisesRegex(ProtocolError,"time_shift"):
@@ -408,7 +408,7 @@ class CrossVenueTests(unittest.TestCase):
         c=supervisor_config()
         c["transport"].update(run_id="coverage-test",groups=["coverage"],plans=h.initial["plans"],
                                start_ns="10",end_ns="40",inputs=[pin])
-        c["strategies"]={"coverage":{"factory":"replay.cross_venue_arbitrage:build","revision":"synthetic-test",
+        c["strategies"]={"coverage":{"factory":"replay.strategies.cross_venue_arbitrage:build","revision":"synthetic-test",
                                         "config":h.cross_config}}
         identity=supervisor.identity(c)
         h.strategy.binding["identity"]=identity

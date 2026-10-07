@@ -13,7 +13,6 @@ dependencies = [
   "python-socketio[asyncio_client]>=5",
   "cryptography>=42",
   "zstandard>=0.23",
-  "boto3>=1.43,<2",
   "google-cloud-storage>=3.4,<4",
   "eth-account>=0.13,<0.14"
 ]
@@ -26,6 +25,17 @@ replay-redis = ["redis>=6.4,<7"]
 include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*"]
 
 [tool.setuptools.package-data]
-replay = ["policy.json"]
+replay = ["README.md"]
+"replay.legacy" = ["README.md", "GATE1_FAILURES.md", "policy.json"]
+"replay.strategies" = ["README.md"]
+"replay.strategies.bundle_coverage" = ["README.md", "SPEC.md", "config.example.json", "bench.example.json"]
+"replay.strategies.same_venue_complement" = ["README.md", "SPEC.md", "config.example.json"]
+"replay.strategies.cross_venue_arbitrage" = ["README.md", "SPEC.md", "SOURCE.json", "config.example.json"]
+"replay.strategies.same_venue_multi_market" = ["README.md", "SPEC.md", "config.example.json"]
+"replay.strategies.same_venue_implication_cover" = ["README.md", "config.example.json"]
+"replay.strategies.cross_venue_implication_cover" = ["README.md", "config.example.json"]
+"replay.strategies.market_profile" = ["README.md", "config.example.json"]
+"replay.strategies._shared" = ["README.md"]
+"replay.strategies._shared.implication_cover" = ["SPEC.md"]
 "replay.streams" = ["*.lua"]
 universe = ["schema/*.sql", "schema/*.md"]

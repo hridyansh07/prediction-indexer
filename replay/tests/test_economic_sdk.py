@@ -8,13 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from replay.complement_output import _skew_artifact, validate_content
+from replay.strategies.same_venue_complement.output import _skew_artifact, validate_content
 from replay.economic_fills import Fill, walk
 from replay.economic_intervals import CutClock
 from replay.economic_sdk import EVALUATED, Observation, bounds
 from replay.economic_sdk.views import BookView, unavailable_view
 from replay.preparation import load_snapshot
-from replay.same_venue_complement import SameVenueComplement, build
+from replay.strategies.same_venue_complement.strategy import SameVenueComplement, build
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import M, ladder, operations, v2_policy
 from replay.tests.test_same_venue_complement import Harness

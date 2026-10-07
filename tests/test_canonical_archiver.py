@@ -17,9 +17,9 @@ from archive.archiver.canonical import (
     verify_canonical_archive,
 )
 from archive.storage import INDEPENDENT, LocalObjectStore, ObjectStoreError
-from archive.storage.s3 import S3ObjectStore
+from archive.storage.gcs import GCSObjectStore
 from tests.archive_fixtures import write_canonical_receipt
-from tests.test_s3store import BUCKET, OWNER, REGION, FakeS3Client
+from tests.test_gcsstore import FakeClient as FakeGCSClient
 
 
 class CanonicalArchiverCase(unittest.TestCase):
@@ -176,19 +176,19 @@ class ProductionCanonicalArchiverTests(CanonicalArchiverCase):
             self.assertTrue(document[field]["provider_checksum_algorithm"])
 
 
-class CanonicalArchivalThroughS3Tests(unittest.TestCase):
-    def test_canonical_window_archives_through_the_real_s3_adapter(self) -> None:
+class CanonicalArchivalThroughGCSTests(unittest.TestCase):
+    def test_canonical_window_archives_through_the_real_gcs_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             canonical = root / "canonical"
             source_receipt = write_canonical_receipt(canonical, evidence_lines=1)
-            store = S3ObjectStore(BUCKET, REGION, OWNER, client=FakeS3Client())
+            store = GCSObjectStore("archive-bucket", client=FakeGCSClient())
 
             outcome = CanonicalArchiver(canonical, store).archive_window(source_receipt)
             self.assertEqual(outcome.status, ARCHIVED, outcome.detail)
             marker = source_receipt.with_name("canonical_archive_receipt.json")
             receipt = read_canonical_archive_receipt(marker)
-            self.assertEqual(receipt.location, BUCKET)
+            self.assertEqual(receipt.location, "archive-bucket")
             verify_canonical_archive(store, receipt)
 
 

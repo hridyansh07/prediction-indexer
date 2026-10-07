@@ -64,8 +64,7 @@ x-archive-volume: &archive-volume
   bind:
     create_host_path: true
 
-# Credentials remain outside `.env`: AWS credentials are exported only when a
-# host lacks an instance/task role; GCS uses Application Default Credentials.
+# Credentials remain outside `.env`: GCS uses Application Default Credentials.
 # Only archive services receive cloud archive configuration; venue capture has
 # no archive authority.
 x-cloud-archive-environment: &cloud-archive-environment
@@ -73,35 +72,37 @@ x-cloud-archive-environment: &cloud-archive-environment
   ARCHIVE_ROOT: /var/lib/prediction-archive
   ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-local-archive}"
   ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
-  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
-  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
-  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
-  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-  AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
   ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
 
 services:
+  # One discovery/archive/publication transaction.  Cron or a systemd timer
+  # starts another container for the next run; this process owns no timer.
   targeter:
     <<: *capture-service
+    restart: "no"
+    environment: *cloud-archive-environment
     command:
       - python
       - -u
-      - targeter/run.py
-      - --manifest
-      - /etc/prediction-indexer/capture_manifest.json
-      - --live-dir
+      - targeter/run_v2.py
+      - --mode
+      - publish
+      - --strategy
+      - /app/configs/targeter_v2.json
+      - --cache-root
+      - /var/lib/prediction-indexer/targeter-v2-cache
+      # The cache root still holds rate-limit state, which is read every run.
+      # Raw HTTP response bodies are not: a publish run always refreshes live
+      # (`--reuse-cache` is the only thing that would read them back), so
+      # persisting them wrote ~230 MB per run that nothing could ever open.
+      - --no-response-cache
+      - --output-root
+      - /var/lib/prediction-indexer/targeter-v2-runs
+      - --live-root
       - /var/lib/prediction-indexer/live
-      - --tick-seconds
-      - "${TARGETER_TICK_SECONDS:-5}"
     volumes:
       - *data-volume
-      - type: bind
-        source: ./configs/capture_manifest.json
-        target: /etc/prediction-indexer/capture_manifest.json
-        read_only: true
-        bind:
-          create_host_path: false
+      - *archive-volume
 
   splice-polymarket:
     <<: *capture-service
@@ -112,14 +113,14 @@ services:
       - python
       - -u
       - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --
       - python
       - -u
       - splices/run.py
       - polymarket
       - --targets
-      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --spool-root
       - /var/lib/prediction-indexer/spool
       - --target-poll-seconds
@@ -144,14 +145,14 @@ services:
       - python
       - -u
       - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targets_limitless.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --
       - python
       - -u
       - splices/run.py
       - limitless
       - --targets
-      - /var/lib/prediction-indexer/live/targets_limitless.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --spool-root
       - /var/lib/prediction-indexer/spool
       - --target-poll-seconds
@@ -176,14 +177,14 @@ services:
       - python
       - -u
       - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --
       - python
       - -u
       - splices/run.py
       - polymarket-snapshots
       - --targets
-      - /var/lib/prediction-indexer/live/targets_polymarket.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --spool-root
       - /var/lib/prediction-indexer/spool
       - --poll-seconds
@@ -214,14 +215,14 @@ services:
       - python
       - -u
       - docker/wait_for_target.py
-      - /var/lib/prediction-indexer/live/targets_kalshi.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --
       - python
       - -u
       - splices/run.py
       - kalshi
       - --targets
-      - /var/lib/prediction-indexer/live/targets_kalshi.json
+      - /var/lib/prediction-indexer/live/targeter-v2/current.json
       - --spool-root
       - /var/lib/prediction-indexer/spool
       - --target-poll-seconds
@@ -340,7 +341,7 @@ services:
       - *data-volume
 
   # Merges sealed windows into canonical evidence. A separate command from the
-  # ingester per SEALED_CAPTURE_PIPELINE_V1 §8.3 — the two assign different
+  # ingester per ingester/README.md (Orderings) — the two assign different
   # global orders over the same spool and both stay available.
   #
   # `--expect-lane` must list exactly the splices this deployment runs. §3: "The
@@ -415,7 +416,7 @@ services:
   # Publishes each sealed segment and each receipt-committed canonical window
   # through immutable object writes, then writes a separate local archive receipt
   # that is the archive commit marker.
-  # Never deletes anything: PHASE_4_RAW_ARCHIVE_REAPER_V1 §2 makes archival and
+  # Never deletes anything: archive/README.md (Safety model) makes archival and
   # deletion separate authorities, and this is the archival one.
   #
   # `ARCHIVE_DURABILITY` stays `conformance` until the archive destination is

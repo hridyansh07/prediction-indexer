@@ -311,7 +311,9 @@ to.
 - Group configs are passed unmodified, apart from token substitution. The bench
   has no knowledge of any strategy's configuration schema.
 
-**Examples.** `configs/bench/*.example.json` and its README contain placeholder
+**Examples.** Generic templates live in `configs/bench/`; strategy-owned configs
+and the [coverage run example](../replay/strategies/bundle_coverage/bench.example.json)
+live under [replay/strategies](../replay/strategies/README.md). They contain placeholder
 paths and identities only. Replace every `<...>` value with reviewed inputs.
 Strategy-owned config schemas remain the strategy author's responsibility.
 

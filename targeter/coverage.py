@@ -1,6 +1,6 @@
 """Discovery latency: how long a market existed before we started watching it.
 
-docs/CAPTURE_SPEC.md §6.1 asks for coverage-from-inception to be *a measurable number rather
+The capture design asks for coverage-from-inception to be *a measurable number rather
 than an assumption*, and this is where the measurement lives. For short-dated
 markets it is the difference between a usable dataset and a misleading one: a
 five-minute market found a minute late has lost a fifth of its life, and the

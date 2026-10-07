@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from replay.books import BookReplay
-from replay.events import BookDelta, FullBook, Level
+from replay.legacy.books import BookReplay
+from replay.legacy.events import BookDelta, FullBook, Level
 
 
 def _base(index: int) -> dict[str, object]:

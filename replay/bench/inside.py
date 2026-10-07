@@ -3,13 +3,13 @@
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
-import importlib
 from pathlib import Path
 import sys
 import time
 
 from replay.preparation import load_snapshot
 from replay.fees.artifacts import load_catalog
+from replay.strategies import load_entrypoint
 from replay.streams.protocol import obj, require
 from replay.strategy_sdk import plain
 from replay import supervisor
@@ -18,8 +18,7 @@ from .specs import supervisor_config, validate_image, validate_resolved
 
 
 def import_callable(reference):
-    module, attribute = reference.split(':')
-    function = getattr(importlib.import_module(module), attribute)
+    function = load_entrypoint(reference)
     require(callable(function), 'import must resolve to a callable')
     return function
 

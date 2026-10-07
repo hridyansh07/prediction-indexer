@@ -1,152 +1,86 @@
 # Targeter
 
-The targeter decides **which event families are worth recording**. It is the
-bridge between a very large venue catalogue and a deliberately small, durable
-capture set.
+The targeter decides which event families are worth recording and hands that
+set to the venue splices. Capture is irreversible (an order book that was never
+recorded cannot be rebuilt), so target selection is a resource allocation
+decision: every unnecessary subscription costs network, disk and review time,
+and every missed event leaves a hole no later model can repair.
 
-The project can analyze historical data after the fact, but it cannot recreate
-an order book that was never recorded. That makes target selection an
-irreversible resource-allocation decision: every unnecessary subscription
-costs network, disk, and review time, while every missed event leaves a hole no
-later model can repair.
+Targeter v2 is the only targeter. It is a scheduled one-shot transaction, not a
+daemon: each invocation starts from fresh vendor state, takes a filesystem
+lease, and writes one timestamped run. A host scheduler (cron or a systemd
+timer) owns cadence.
 
-## Motivation
+Detailed contracts:
 
-The first analysis pass did not find a robust tradable edge. It did reveal why
-collecting more of the same data would be a poor response:
+| File | Contents |
+|---|---|
+| [`v2/SELECTION.md`](v2/SELECTION.md) | strategy configuration, venue adapters, esports game families, matching, relationships, rule templates, admission and ranking, report shape |
+| [`v2/DELIVERY.md`](v2/DELIVERY.md) | run artifacts, target records, run archive, atomic publication, splice handoff, continuity and terminal eviction, scheduling, run archiver and reaper |
 
-- heavily traded short-duration crypto ladders are already efficient and give
-  us little time to observe market structure;
-- a single-venue anomaly has been studied extensively and is difficult to
-  distinguish from stale data, fees, or settlement details;
-- scanning every listed contract spends most of the pipeline on illiquid or
-  analytically isolated markets;
-- newly created markets usually have neither mature prices nor the sibling
-  structure needed for combinatorial analysis.
+## What it selects
 
-The working hypothesis is narrower: **mature, liquid sports events represented
-on multiple venues are the best first search space for reusable combinatorial
-relationships**. Sports outcomes have a compact normal path, and the same event
-often exposes moneyline, spread, total, correct-score, and map/series products.
-Those products can imply, exclude, or replicate one another without requiring
-event-specific code.
+The unit of admission is an event, not a sibling market. Selection is
+sports-first (soccer and esports) because sports have conservative event keys
+(participants and a scheduled time), enumerable normal outcomes and product
+families that repeat across venues. An event is admitted when:
 
-The targeter does not claim that such a relationship is an arbitrage. It finds
-event families for which collecting synchronized evidence is worth the cost.
+1. the same participants (and, for esports, the same game) and a compatible
+   start time match on at least two venues (three rank ahead of two);
+2. its series or three-way moneyline anchors carry at least USD/USDC 25,000 of
+   known combined lifetime volume;
+3. at least one modeled cross-venue structural relationship survives
+   (`IDENTITY`, either implication, or `MUTUAL_EXCLUSION`; plain `OVERLAP` is
+   evidence only);
+4. it is inside the capture window, which opens one hour before the scheduled
+   start; and
+5. it has not passed the post-start retention window.
 
-## What the targeter selects
+Venue coverage, relationship quality, market-class breadth and activity then
+rank admitted events under explicit per-venue subscription budgets. Allocation
+is bundle-atomic.
 
-The unit of admission is an **event**, not an individual sibling market.
+Conservative rules the code enforces:
 
-For the current sports strategy, an event is worth considering when:
+- **A moneyline anchors the event.** Only a series winner (esports) or
+  three-way moneyline (soccer) can establish an event. Sibling markets (maps,
+  totals, handicaps, spreads, correct score) attach afterwards and widen the
+  capture surface but never create an event.
+- **A sibling is not a veto.** Each market is judged independently. A closed,
+  too-new, contradictory or unmodeled sibling lands in `market_exclusions`; the
+  event fails only if the survivors can no longer satisfy an event-level gate.
+- **Two venues minimum.** A third venue that conflicts or is malformed cannot
+  stop two agreeing venues forming a bundle.
+- **Dollar volume only.** Native contract counts and activity fields never
+  enter the hard gate; only `volume_total_usd` does. Kalshi publishes a
+  contract count, so its dollar figure is an adapter estimate
+  (`volume_fp * last_price_dollars`); unknown dollar volume contributes zero
+  and is reported as unknown coverage. See `v2/SELECTION.md`.
+- **Fail closed on unknown shapes.** Unknown games, products, series formats
+  and ambiguous times are visible false negatives with stable diagnostic codes,
+  not guesses. A configured anchor-shaped record that cannot be classified
+  makes that venue's catalogue incomplete.
+- **Semantics come from configuration, not prose.** `configs/targeter_v2.json`
+  maps reusable vendor product shapes to canonical classes
+  (`soccer.moneyline_3way`, `soccer.spread`, `soccer.total_goals`,
+  `soccer.both_teams_to_score`, `soccer.correct_score`,
+  `esports.series_moneyline`, `esports.map_winner`, `esports.total_maps`,
+  `esports.map_handicap`). No event IDs, team names or dates appear in
+  production configuration. Rule text is normalized into content-addressed
+  templates for drift review; only narrow contradictions of the configured
+  normal scope block a market.
+- **Relationships are conditional evidence.** Soccer uses a bounded score space
+  and always carries `INCOMPLETE_COVERAGE`; esports series spaces are
+  exhaustive only for normal BO1, BO3, BO5, BO7 and BO9 first-to-clinch series.
+  Other formats (such as BO2) are preserved in reports and rejected as
+  `unsupported_series_format`. No finding is an unconditional arbitrage claim.
 
-1. the same participants and start time match across at least two venues;
-2. trusted moneyline anchors have at least USD/USDC 25,000 of known combined
-   lifetime volume;
-3. at least one useful modeled relationship survives across venues;
-4. the event is inside the capture window, beginning one hour before its
-   scheduled start; and
-5. it has not passed the configured post-start retention window.
+Configured esports games: League of Legends, Counter-Strike 2, Dota 2 and
+Valorant, on all three venues where the venue lists reviewed products
+(Valorant has no Kalshi total-maps series). Honor of Kings is not configured
+because no second venue publishes reviewable match products.
 
-Three venues rank ahead of two. Venue coverage, relationship quality, market
-class breadth, and activity then rank admitted events under explicit
-subscription budgets.
-
-Once published, a qualifying bundle has continuity priority over newcomers. The
-targeter directly probes every market in the committed bundle because terminal
-markets disappear from live discovery. It retains the entire prior subscription
-set while any venue remains open or has unknown state, then retires the bundle
-atomically when every market is terminal or the configurable eight-hour clamp
-elapses. This preserves the interval where one venue has concluded while another
-still trades. See
-[`../docs/TARGETER_CONTINUITY_V1.md`](../docs/TARGETER_CONTINUITY_V1.md) for the
-normative contract.
-
-The dollar gate intentionally excludes values whose units are not dollars.
-Polymarket `volumeNum` and Limitless formatted USDC volume can contribute.
-Kalshi `volume_fp` is a contract count and cannot contribute unless the API
-also supplies an explicit dollar-volume field. A contract trading at $0.20 is
-not one dollar of turnover merely because its maximum settlement value is one
-dollar.
-
-## Siblings are capture surface, not a veto
-
-Once an event is admitted, its markets are evaluated independently. A sibling
-is excluded when it is closed, too new, semantically contradictory, or absent
-from any relationship the engine can currently model.
-
-That exclusion is recorded under `market_exclusions`; it does **not** reject
-the event or every other sibling. The event is rejected only if the surviving
-set can no longer satisfy an event-level invariant, such as minimum venue
-coverage or any useful cross-venue relationship.
-
-This distinction matters. Real venue groups contain halftime markets, unusual
-settlement scopes, malformed metadata, and products we have not modeled yet.
-Requiring every sibling to pass would make one irrelevant contract erase a
-valuable event. Accepting every sibling would spend capture capacity on data we
-cannot interpret. Independent market filtering gives us the useful middle.
-
-## Why sports first
-
-Sports are not the final limit of the system. They are the first domain where
-autonomous matching is ambitious but still testable:
-
-- participant identities and scheduled times provide conservative event keys;
-- normal settlement outcomes are enumerable;
-- product families repeat across matches and seasons;
-- rules can be reduced into reusable venue/product templates;
-- the same logical event is commonly traded on two or three platforms.
-
-Macro, political, and bespoke markets can be added as separate strategies
-later. The intended long-term architecture is a targeter that orchestrates
-independent discovery strategies behind the same event, report, archive, and
-publication contracts.
-
-## Semantic boundary
-
-The targeter does not infer contract meaning from arbitrary prose at runtime.
-`configs/targeter_v2.json` maps reusable vendor product shapes to canonical
-classes such as:
-
-- `soccer.moneyline_3way`;
-- `soccer.spread`;
-- `soccer.total_goals`;
-- `soccer.correct_score`;
-- `esports.series_moneyline`;
-- `esports.map_winner`; and
-- `esports.map_handicap`.
-
-Rule text is normalized into content-addressed templates for drift and review.
-Only narrow contradictions to the configured happy path block a market, such
-as a regulation-time class whose rules explicitly include extra time. New or
-changed templates are surfaced as evidence; a future reviewer UI can approve
-or deny them without putting a language model in the live selection path.
-
-Relationships are likewise conditional discovery evidence. Soccer uses a
-bounded score space, so its findings carry incomplete-coverage metadata and
-must not be presented as unconditional executable baskets.
-
-### Reviewed esports families
-
-The shipped registry configures League of Legends, Counter-Strike 2, Dota 2,
-and Valorant. Reviewed products are series winner, numbered map/game winner,
-total maps/games, and series map/game handicap. Classification requires venue
-metadata and exact configured product mappings; similar tournament tickers and
-within-map props are not guessed.
-
-Honor of Kings is not configured. The game-family machinery is generic and
-would carry it, but no reviewed Kalshi match product exists, so it could never
-clear the two-venue minimum — discovering it would only spend vendor budget on
-events that can never be selected. `docs/TARGETER_V2_MULTI_GAME_ESPORTS_V1.md`
-keeps the design record; adding the family back is a config change once a
-second venue publishes reviewable products. Relationship construction is
-exhaustive only
-for normal BO1, BO3, BO5, BO7, and BO9 first-to-clinch series. Even formats such
-as BO2 are preserved in reports and rejected as `unsupported_series_format`.
-
-## Process shape
-
-Targeter v2 is a scheduled one-shot transaction, not a long-lived daemon.
+## Pipeline
 
 ```mermaid
 flowchart LR
@@ -160,113 +94,119 @@ flowchart LR
     H --> I["Venue splices"]
 ```
 
-Each invocation starts from fresh vendor state, acquires a filesystem lease,
-and writes one timestamped run. A scheduler owns cadence. This design gives
-every decision a finite input snapshot, prevents overlapping discoveries, and
-avoids carrying stale in-memory state from one run to the next.
-
-The four modes are:
-
-| Mode | Effect |
-|---|---|
-| `shadow` | Fetch, normalize, match, and write a local report only |
-| `archive` | Shadow run plus immutable object-store archival |
-| `publish` | Archive, verify, and atomically replace the live target generation |
-| `audit` | Verify the current generation and archive without discovery |
-
-Publication is deliberately harder than discovery. An incomplete vendor run,
-unrelated empty selection, archive verification failure, or partial local
+Publication is deliberately harder than discovery. An incomplete vendor run, an
+unrelated empty selection, an archive verification failure or a partial local
 generation cannot replace the last valid target pointer. The only automatic
 empty generation is one proving retirement of every prior continuity bundle.
 
-## Running locally
+Once published, a bundle has continuity priority over newcomers: each run
+directly probes every committed market for terminal state, retains the whole
+bundle while any venue is open or unknown, and retires it only when every
+market is terminal or the eight-hour clamp from activation elapses.
 
-Run one fresh shadow pass:
+## Modes
+
+| Mode | Effect |
+|---|---|
+| `shadow` | fetch, normalize, match, write a local run (default) |
+| `archive` | shadow plus immutable object-store archival |
+| `publish` | archive, verify, atomically replace the live target generation |
+| `audit` | verify the current generation and archive without discovery |
+
+Exit `0` completed, `1` input incomplete (evidence preserved, nothing
+published), `2` configuration, durability, archive, publication or integrity
+failure.
+
+## Running
+
+One fresh shadow pass:
 
 ```bash
-.venv/bin/python targeter/run_v2.py \
-  --mode shadow \
-  --strategy configs/targeter_v2.json
+.venv/bin/python targeter/run_v2.py --mode shadow --strategy configs/targeter_v2.json
 ```
 
-For repeated observation without retaining large raw HTTP bodies:
+Repeated observation without retaining raw HTTP bodies:
 
 ```bash
 .venv/bin/python targeter/run_v2.py \
-  --mode shadow \
-  --no-response-cache \
+  --mode shadow --no-response-cache \
   --strategy configs/targeter_v2.json \
   --cache-root data/targeter-v2-monitor-state \
   --output-root data/targeter-v2-shadow
 ```
 
-`--no-response-cache` still makes live API requests and retains durable
-per-host rate-limit state. It keeps the normalized catalogue and report for
-each run, which are the artifacts needed to compare targeter behavior over
-time. `--reuse-cache` is the explicit offline/debug option and is mutually
-exclusive with this mode. When response caching is enabled, Targeter v2 stores
-each canonical JSON body as one checksummed Zstandard frame (`.json.zst`) and
-keeps its decoded/stored identities in the adjacent metadata file.
+`--no-response-cache` still makes live requests and keeps durable per-host
+rate-limit state and the normalized artifacts. `--reuse-cache` is the explicit
+offline/debug option and is mutually exclusive with it; do not use it to claim
+live discovery. `--artifact-format ndjson` writes plain `.ndjson` artifacts and
+`selection_report.json` for direct inspection (default: one Zstandard frame per
+file with the shared `encoder` profile). `--max-kalshi-series`,
+`--max-kalshi-pages`, `--max-polymarket-pages` and `--max-limitless-pages`
+bound a probe and make the input incomplete.
 
-Every successful or incomplete run writes:
+A run directory (`<output-root>/<run-id>/`) holds
+`catalog_<venue>_{events,markets}`, `target_records_<venue>`, `rule_templates`
+and `rule_drift` NDJSON artifacts plus `selection_report.json.zst` and its
+`selection_report.meta.json` commit marker. Review a run by decoding the report
+and reading:
 
-```text
-data/targeter-v2-shadow/<run-id>/
-  catalog_<venue>_events.ndjson.zst
-  catalog_<venue>_markets.ndjson.zst
-  rule_templates.ndjson.zst
-  rule_drift.ndjson.zst
-  selection_report.json.zst
-  selection_report.meta.json
-```
+- `input_complete` and `discovery_failures`: whether every catalogue completed;
+- `candidates`: one record per matched bundle, with `event_status`,
+  `rejection_reasons`, `admission` (volume, threshold, known/unknown coverage),
+  `market_exclusions` and `relationship_analysis`;
+- `match_rejections`: events that never formed a bundle, with reasons;
+- `selection.targets` and `selection.allocation_rejections`: the proposed
+  subscription set and what budget dropped.
 
-The `.zst` files use the shared `encoder` profile: exact NDJSON, level 3, frame
-checksum enabled, one frame, and no dictionary. Their decoded and stored
-identities are committed in the report, while `selection_report.meta.json`
-commits the report frame itself. All identities are carried through the run
-manifest and archive receipt. For a directly inspectable shadow run, pass
-`--artifact-format ndjson`; this emits the normalized artifacts as `.ndjson`
-and the report as plain `selection_report.json`, without changing selection
-semantics or the raw-response cache format.
+Shadow mode never changes a splice subscription and never uploads. Report
+incomplete venue discovery as incomplete; do not retry within an acceptance
+cycle in a way that hides the failed input snapshot.
 
-Start with the decoded `selection_report.json.zst` (or the plain
-`selection_report.json` override) when reviewing a run:
-
-- `input_complete` proves whether all expected catalogues completed;
-- `candidates` contains one record per matched event bundle;
-- `event_status` and `rejection_reasons` explain event admission;
-- `admission` records known volume, the threshold, and missing-volume coverage;
-- `market_exclusions` explains individually discarded siblings; and
-- `selection.targets` is the proposed subscription set.
-
-Shadow mode never changes a splice subscription and never uploads to S3.
-
-## Code map
+## Layout
 
 | Path | Responsibility |
 |---|---|
-| `v2/adapters.py` | Public venue API boundary and normalization |
-| `v2/domain.py` | Venue-independent events, markets, bundles, and reports |
-| `v2/matching.py` | Conservative cross-venue event matching |
-| `v2/relationships.py` | Outcome masks and structural relationships |
-| `v2/rules.py` | Rule normalization, drift, and explicit contradictions |
-| `v2/selection.py` | Event admission, market exclusion, ranking, and budgets |
-| `v2/run.py` | One-shot discovery and report materialization |
-| `v2/run_archive.py` | Immutable target-run archival |
-| `v2/publication.py` | Verified atomic multi-venue target publication |
-| `targets.py` | Splice-side committed-generation reader |
-| `TARGETER.md` | Legacy v1 crypto-ladder target protocol |
+| `run_v2.py` | launcher for `v2/run.py` |
+| `v2/adapters/` | the only vendor boundary: Kalshi, Polymarket, Limitless catalogues and terminal probes |
+| `v2/parsing/` | bounded text, esports label, best-of, product-parameter and traditional-fixture grammars |
+| `v2/registry.py` | strict strategy and game-family loading |
+| `v2/models.py` | canonical events, markets, snapshots, bundles, relationships |
+| `v2/matching.py` | conservative cross-venue event matching |
+| `v2/relationships.py` | outcome spaces, masks, structural relationships (uses `analysis/`) |
+| `v2/rules.py` | rule templates, drift, explicit contradictions |
+| `v2/selection.py` | admission, market exclusion, ranking, budgets, continuity allocation |
+| `v2/continuity.py` | committed-generation bundles and terminal probe model |
+| `v2/run.py` | one-shot discovery, report materialization, CLI |
+| `v2/target_records.py` | verbatim venue records for selected markets |
+| `v2/run_archive.py`, `v2/manifest.py` | immutable run archive, manifest and receipts |
+| `v2/publication.py`, `v2/publication_validation.py` | verified atomic multi-venue publication and audit |
+| `v2/replay_stream.py` | receipt-driven archived run and target-record streamers for replay |
+| `v2/run_archiver.py`, `v2/run_archiver_cli.py` | sweep that archives unreceipted runs |
+| `v2/run_reaper.py`, `v2/run_reaper_cli.py` | local run reclamation (audit by default) |
+| `v2/lease.py` | `<output-root>/.targeter-v2.lock` overlap guard |
+| `targets.py` | splice-side committed-generation reader and target writer |
+| `coverage.py` | first-sighting ledger written after a publication commits |
 
-The normative implementation contracts live in
-[`../docs/TARGETER_V2_PHASES_1_5.md`](../docs/TARGETER_V2_PHASES_1_5.md) and
-[`../docs/TARGETER_V2_PHASES_6_10.md`](../docs/TARGETER_V2_PHASES_6_10.md).
+Dependencies run one way: `targeter/` uses `archive/` (object-store protocol,
+store factory, durable filesystem primitives) and `analysis/`; nothing under
+`archive/` imports `targeter`.
 
-## Current rollout rule
+## Tests
+
+```bash
+.venv/bin/python -m unittest tests.test_targeter_v2 tests.test_targeter_v2_lol \
+  tests.test_targeter_v2_esports_games tests.test_targeter_v2_delivery \
+  tests.test_targeter_v2_retention tests.test_targeter_replay_stream \
+  tests.test_targets tests.test_masks
+```
+
+Tests are offline and use small hand-authored vendor shapes; do not freeze live
+responses or volatile totals as fixtures.
+
+## Rollout
 
 Run shadow monitoring until the selector repeatedly finds complete, liquid,
-multi-venue event bundles and its rejection evidence looks credible. Only then
-enable S3-backed `publish`, audit the committed generation, and point the
-splices at it.
-
-The order is intentional: first prove that the targeter chooses useful work,
-then pay the operational cost of recording it.
+multi-venue bundles and its rejection evidence looks credible. Then enable
+`publish` against an independent archive, audit the committed generation with
+`--mode audit` (Compose `targeter-v2-integrity`), and point the splices at the
+pointer. Deployment is described in `v2/DELIVERY.md` and `docs/DEPLOYMENT.md`.

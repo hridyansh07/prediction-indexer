@@ -1,7 +1,7 @@
 //! The merge order §8 requires, and the inputs it must refuse.
 //!
 //! These are the "required false/failure tests" of
-//! `docs/SEALED_CAPTURE_PIPELINE_V1.md` §8, written against the merge itself
+//! `ingester/README.md` (Orderings), written against the merge itself
 //! rather than the binary, so a failure names the comparison that went wrong
 //! instead of a diff between two large files.
 //!

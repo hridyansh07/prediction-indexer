@@ -5,16 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from analysis.storage import decoded_zstd_file, stable_job_id, write_json_zstd
+from analysis.storage import decoded_zstd_file, write_json_zstd
 
 
 class StorageTests(unittest.TestCase):
-    def test_job_id_is_independent_of_dictionary_order(self) -> None:
-        self.assertEqual(
-            stable_job_id({"venue": "kalshi", "status": "settled"}),
-            stable_job_id({"status": "settled", "venue": "kalshi"}),
-        )
-
     def test_decoded_zstd_staging_uses_the_source_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             frame = Path(directory) / "selection_report.json.zst"

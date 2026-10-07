@@ -31,9 +31,9 @@
 //! **Never use `EvidenceSeq` as time.** Cross-venue analysis must sort on
 //! `visible_ns`, which every record carries.
 //!
-//! `docs/SEALED_CAPTURE_PIPELINE_V1.md` is the design that replaces this: sealed
+//! `ingester/README.md` describes the design that replaces this: sealed
 //! UTC-aligned lane segments merged on `(visible_ns, lane_rank, delivery_index)`.
-//! Its §1 also settles a question this comment previously got wrong — it
+//! It also settles a question this comment previously got wrong — it
 //! recommended `monotonic_ns` for lead-lag, and V1 orders on `visible_ns`
 //! instead, with `monotonic_ns` kept for diagnostics. Monotonic time resets per
 //! boot and is comparable across processes only within one Linux boot scope,

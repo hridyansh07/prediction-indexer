@@ -1,6 +1,5 @@
 """Strategy process entry point; factory(context) returns callable + finish()."""
 
-import importlib
 import os
 import signal
 import sys
@@ -9,6 +8,7 @@ from pathlib import Path
 
 from replay.streams import Consumer, TransportError
 from replay.streams.consumer import DEFAULT_BATCH_BYTES
+from replay.strategies import load_entrypoint
 from replay.streams.protocol import freeze, require
 from replay.supervisor import identity, initial, read, validate, write_json_durable
 
@@ -22,8 +22,7 @@ def execute(root, attempt, group):
     t = config["transport"]
     spec = config["strategies"][group]
     directory = root / attempt / group
-    module, name = spec["factory"].split(":")
-    factory = getattr(importlib.import_module(module), name)
+    factory = load_entrypoint(spec["factory"])
     context = freeze(
         {
             "run_id": t["run_id"],

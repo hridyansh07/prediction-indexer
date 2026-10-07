@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from replay import supervisor as s
-from replay.coverage_output import book_id, read_completed
+from replay.strategies.bundle_coverage.output import book_id, read_completed
 from replay.preparation import prepare
 from replay.tests.test_preparation import G2, R1, R2, config, detail
 from replay.tests.test_supervisor import config as supervisor_config
@@ -89,7 +89,7 @@ def acceptance(config_path, publisher):
         c["transport"] = transport
         c["strategies"] = {
             "coverage": {
-                "factory": "replay.bundle_coverage:build",
+                "factory": "replay.strategies.bundle_coverage:build",
                 "revision": "synthetic-acceptance-v1",
                 "config": {
                     "version": 1,

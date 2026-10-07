@@ -120,10 +120,9 @@ RATE_LIMIT_ERROR_CODE = 27
 def get_snapshot_command(command_id: int, sid: int, market_tickers: list[str]) -> str:
     """The `update_subscription` that asks for snapshots without changing anything.
 
-    Module level, and public, so the live exit gate in
-    `scripts/kalshi_live_get_snapshot_gate.py` sends the exact bytes capture will
-    send. A gate that proved a *copy* of this command works would have proved
-    nothing about the command that actually reaches production.
+    Module level, and public, so any live gate sends the exact bytes capture
+    will send. A gate that proved a *copy* of this command works would have
+    proved nothing about the command that actually reaches production.
 
     `action: get_snapshot` returns an `orderbook_snapshot` for the named markets
     and does not modify the subscription, so no new `sid` appears and the single

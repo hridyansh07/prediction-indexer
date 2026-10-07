@@ -107,25 +107,6 @@ def target_metadata_digest(venue: str, targets: tuple[Target, ...]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def raw_resolution_evidence(venue: str, catalogue_record: dict[str, Any]) -> dict[str, Any]:
-    """Preserve one decoded venue record without pretending to understand it yet."""
-    canonical = json.dumps(
-        catalogue_record,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-        allow_nan=False,
-    )
-    return {
-        "version": 1,
-        "venue": venue,
-        "catalogue_record_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        # Round-tripping makes a detached copy: a source may continue sorting or
-        # annotating its local object after the Target has been constructed.
-        "catalogue_record": json.loads(canonical),
-    }
-
-
 def load_targets(path: Path, *, venue: str) -> TargetSet:
     """Reads a targets manifest, refusing anything the splice could misread.
 

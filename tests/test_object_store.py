@@ -1,6 +1,6 @@
 """§9.2 — the immutable object boundary.
 
-These are the tests an S3 adapter will have to pass unchanged. That is the point
+These are the tests a cloud adapter will have to pass unchanged. That is the point
 of `LocalObjectStore`: if immutability, idempotent retry, conflict detection and
 crash-window behaviour are only ever exercised against a real bucket, they are
 exercised in code review.

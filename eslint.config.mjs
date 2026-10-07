@@ -26,7 +26,6 @@ export default tseslint.config(
   },
   {
     files: [
-      'archive/node/**/*.ts',
       'api/**/*.ts',
       'encoder/node/**/*.ts',
       'targeter-ui/src/server/**/*.ts',

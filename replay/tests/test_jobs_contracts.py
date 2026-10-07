@@ -757,8 +757,8 @@ class RunnerConfigTest(unittest.TestCase):
         self.assertEqual(
             config.strategies["bundle_coverage"],
             c.StrategyEntry(
-                factory="replay.bundle_coverage:build",
-                reader="replay.coverage_output:read_completed",
+                factory="replay.strategies.bundle_coverage:build",
+                reader="replay.strategies.bundle_coverage:read_completed",
                 config_schema="bundle_coverage_v1",
                 label="Bundle coverage",
                 description="Evaluates historical coverage for the selected bundle.",

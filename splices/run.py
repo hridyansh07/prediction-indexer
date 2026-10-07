@@ -168,8 +168,8 @@ def main() -> int:
             arguments.targets = PROJECT_ROOT / "data" / "live" / f"targets_{targets_venue}.json"
         if not arguments.targets.exists():
             print(f"targets file not found: {arguments.targets}", file=sys.stderr)
-            print("run: python3 targeter/run.py --once "
-                  f"--venue {targets_venue}", file=sys.stderr)
+            print("run: python3 targeter/run_v2.py --mode publish "
+                  f"(publishes the {targets_venue} targets)", file=sys.stderr)
             return 2
     elif arguments.targets is not None:
         # Refused rather than ignored. A reference feed broadcasts everything, so

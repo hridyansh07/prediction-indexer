@@ -1207,7 +1207,7 @@ class CoverageLedgerTests(unittest.TestCase):
     """Coverage-from-inception must survive the v1 to v2 move.
 
     v1 kept this ledger from its discovery loop; v2 shipped without it, so
-    `discovery_coverage` in `replay/gate1.py` read 453 subscribed assets and
+    `discovery_coverage` in `replay/legacy/gate1.py` read 453 subscribed assets and
     zero covered against a real 19-hour capture. The number it protects —
     how much of a market's life the tape contains — cannot be recovered later
     from the frames, which all look healthy whether or not the open was missed.
@@ -1260,7 +1260,7 @@ class CoverageLedgerTests(unittest.TestCase):
     def test_the_ledger_is_where_gate_one_looks_and_carries_the_fields_it_reads(
         self,
     ) -> None:
-        # `_AuditState.observe_coverage` (replay/gate1.py:414-423) rejects a
+        # `_AuditState.observe_coverage` (replay/legacy/gate1.py:414-423) rejects a
         # document without `sightings` and keys each entry on venue + asset_id;
         # `gate1_object` admits it only at exactly this path.
         self.publish()

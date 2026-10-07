@@ -18,7 +18,7 @@ sockets or venues; `splices/common/writer.py` owns the concurrency and hands it
 batches. That split is what makes the five-step seal testable by asserting a
 syscall order rather than by inspection.
 
-See `docs/SEALED_CAPTURE_PIPELINE_V1.md` §3.
+See `splices/README.md` (Durable append: segments and seals).
 """
 
 from __future__ import annotations

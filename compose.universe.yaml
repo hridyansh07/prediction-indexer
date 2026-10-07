@@ -9,16 +9,10 @@ x-universe-config-environment: &universe-config-environment
   ARCHIVE_ROOT: /var/lib/archive
   ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-}"
   ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
-  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
-  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
-  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
   ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
 
 x-universe-job-environment: &universe-job-environment
   <<: *universe-config-environment
-  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
-  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-  AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
 
 x-universe-volume: &universe-volume
   type: bind
@@ -62,9 +56,6 @@ x-replay-archive-environment: &replay-archive-environment
   ARCHIVE_ROOT: /var/lib/archive
   ARCHIVE_STORE_ID: "${ARCHIVE_STORE_ID:-}"
   ARCHIVE_DURABILITY: "${ARCHIVE_DURABILITY:-conformance}"
-  ARCHIVE_S3_BUCKET: "${ARCHIVE_S3_BUCKET:-}"
-  ARCHIVE_S3_REGION: "${ARCHIVE_S3_REGION:-}"
-  ARCHIVE_S3_EXPECTED_OWNER: "${ARCHIVE_S3_EXPECTED_OWNER:-}"
   ARCHIVE_GCS_BUCKET: "${ARCHIVE_GCS_BUCKET:-}"
 
 x-replay-environment: &replay-environment

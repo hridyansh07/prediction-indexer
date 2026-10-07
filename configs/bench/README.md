@@ -6,7 +6,7 @@ be replaced with JSON integers. Review economics, scales, applicability and sour
 claims under the [Fee SDK](../../replay/fees/README.md); null effective dates assert
 current evidence, and do not establish historical applicability.
 
-- `coverage.example.json` runs the existing coverage factory/reader. In the base
+- [coverage bench example](../../replay/strategies/bundle_coverage/bench.example.json) runs the existing coverage factory/reader. In the base
   supervisor config, derivative paths must resolve under `/bench/in/derivatives`,
   matching the readonly mount. Use image executable paths, normally
   `/usr/local/bin/replay-publish` and `/usr/local/bin/python`.

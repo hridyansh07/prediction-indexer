@@ -19,15 +19,15 @@ from unittest.mock import patch
 
 from analysis.claims import claim_id, space_shape_id
 from analysis.outcome_space import build_series_space
-from replay.cross_venue_contract import UNIT
+from replay.strategies.cross_venue_arbitrage.contract import UNIT
 from replay.economic_sdk.types import Context
 from replay.fees.artifacts import build_catalog, load_catalog, source_from_bytes
 from replay.fees.domain import Multiplier
 from replay.fees.schedules import Catalog, Kalshi, KalshiKind
 from replay.preparation import encoded, prepare
-from replay.same_venue_multi_market import build
-from replay.same_venue_multi_market_contract import baskets, policy_config
-from replay.same_venue_multi_market_output import read_provisional, validate_content
+from replay.strategies.same_venue_multi_market.strategy import build
+from replay.strategies.same_venue_multi_market.contract import baskets, policy_config
+from replay.strategies.same_venue_multi_market.output import read_provisional, validate_content
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import ladder
 from replay.tests.test_bundle_coverage import Harness as BaseHarness

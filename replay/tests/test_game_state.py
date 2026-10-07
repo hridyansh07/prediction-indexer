@@ -16,9 +16,9 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
-from replay.envelope import parse_envelope
-from replay.events import GameState, RawEvent, normalize
-from replay.order import OrderedEnvelope
+from replay.legacy.envelope import parse_envelope
+from replay.legacy.events import GameState, RawEvent, normalize
+from replay.legacy.order import OrderedEnvelope
 
 FIXTURE = Path(__file__).parent / "fixtures" / "polymarket_sports_20260730.ndjson"
 
@@ -146,7 +146,7 @@ class GameStateNormalisationTests(unittest.TestCase):
 
     def test_a_price_tick_is_still_a_price_tick(self):
         """The discriminator must not capture the other feed on this stream."""
-        from replay.events import ReferenceTick
+        from replay.legacy.events import ReferenceTick
 
         event = _one({
             "topic": "crypto_prices", "type": "update", "timestamp": 1785348545138,

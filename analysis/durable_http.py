@@ -23,9 +23,6 @@ from encoder import CodecError, LogicalIdentity, StoredIdentity
 
 
 DEFAULT_MIN_INTERVAL_SECONDS = {
-    # Oddpool's free tier allows one request per second. The small buffer avoids
-    # boundary jitter between our clock and the API gateway's clock.
-    "api.oddpool.com": 1.10,
     "external-api.kalshi.com": 0.25,
     "gamma-api.polymarket.com": 0.25,
     "clob.polymarket.com": 0.25,

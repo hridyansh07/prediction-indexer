@@ -1,53 +1,23 @@
 # Event Universe schema
 
-Runtime schema version 5 applies the single canonical [`schema.sql`](schema.sql)
-package resource. It contains both the historical run/bundle API tables and the
-event/market view: umbrella and venue events, canonical and venue markets,
-candidate decisions, selected-market occurrences, and market claims.
+Three SQL resources, owned by [`universe/`](../README.md):
 
-Replay authentication and jobs are intentionally separate component schemas.
-[`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql) are
-initialized additively in the durable `replay.database_path` (`jobs.sqlite3`).
-They contain bearer-session digests, the member allowlist, append-only allowlist
-events, W0 job rows, durable idempotency mappings, component metadata, and
-append-only job transition events.
-SIWE nonces are deliberately not persisted: they live in the server process's
-memory with a TTL and are lost on restart. The durable Replay database does not
-use `PRAGMA user_version`; each component validates only the objects it owns so
-the auth and jobs schemas coexist. Replay jobs records a SHA-256 over its
-ordered, whitespace-normalized owned `sqlite_master` definitions rather than
-the formatting of the source SQL file. Never place these durable records in the
-rebuildable Event Universe projection database or remove them during a Universe
-projection rebuild.
+- [`schema.sql`](schema.sql): the Event Universe projection database,
+  `PRAGMA user_version = 6`. It is a rebuildable query index with no in-place
+  migration; startup compares the stored schema object-for-object against this
+  file and fails with a rebuild instruction (stop Universe, remove the SQLite
+  file and its WAL/SHM siblings, run an oldest-first backfill) for any other
+  version or modification.
+- [`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql):
+  additive component schemas initialized in the durable Replay database
+  (`replay.database_path`, `jobs.sqlite3`). They hold bearer-session digests, the
+  member allowlist, append-only allowlist events, job rows, idempotency
+  mappings, component metadata and append-only job transition events. The file
+  does not use `user_version`; each component validates only its own objects
+  (replay jobs via a SHA-256 over its ordered, whitespace-normalized
+  `sqlite_master` definitions). SIWE nonces are not persisted. These records are
+  not rebuildable: never place them in the projection database or remove them
+  during a projection rebuild.
 
-The database is a rebuildable query index, not another evidence archive:
-
-- `targeter_runs` binds every run to exact manifest/report identities;
-- `universe_run_projections` binds its deterministic market projection;
-- `umbrella_events` hold versioned domain identity coordinates and an immutable
-  same-day ordinal; `venue_events` are the durable native-alias edges used to
-  resolve later observations to that identity;
-- `event_observations` retain every observed activation while the identity's
-  activation date remains frozen at first allocation;
-- `event_identity_lineage` binds the one canonical oldest-first backfill range
-  and blocks incremental allocation only while that range scan is incomplete;
-- `universe_sync_failures` durably records manifests omitted from ingestion so
-  one invalid run cannot pin the scan and missing evidence remains visible and
-  retryable;
-- `canonical_markets` group venue markets under explicit market-template and
-  outcome-space versions;
-- `claim_classes`, `claim_relations` and `market_claims` record the outcome
-  subset each market expresses and how those subsets relate, keyed by neither
-  run nor event; and
-- the v1 occurrence/context tables preserve historical bundle APIs and exact
-  continuity/retirement provenance.
-
-There is no cadence cache, active snapshot, raw report/catalogue, raw segment,
-control, connection-epoch, venue-delivery, or replay-plan table. Exact evidence
-remains in the immutable configured ObjectStore.
-
-Schema v5 deliberately has no in-place migration. Stop Universe, remove an
-existing v1/v2/v3/v4 SQLite file and its WAL/SHM siblings, then run an
-oldest-first backfill from the immutable archive. Runtime retains
-`PRAGMA user_version = 5` and rejects any older or modified schema with that
-rebuild instruction.
+The table inventory and the meaning of each group (identity, claims, bundle
+history, sync ledger) is in [`../README.md`](../README.md).

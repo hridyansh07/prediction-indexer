@@ -398,7 +398,7 @@ impl Store {
     ///
     /// The sealed-window finalizer displaces this call site — it must assign
     /// positions from a merge over sealed segments rather than from read order.
-    /// See `docs/SEALED_CAPTURE_PIPELINE_V1.md` §5.
+    /// See `ingester/README.md` (Finalization).
     pub fn capture_raw(
         &mut self,
         venue: &str,

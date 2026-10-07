@@ -77,7 +77,7 @@ run directory, override signal handlers, or use exit codes to disguise hook
 exceptions. Factories/callbacks/finalizers that raise are **nonretryable**, even
 if they raise a transport exception. Strategies must not perform irreversible
 external side effects. The offline coverage-only factory is documented in
-[BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md); no economic strategy is supplied.
+[BUNDLE_COVERAGE_V1.md](../replay/strategies/bundle_coverage/SPEC.md); no economic strategy is supplied.
 The tiny supervisor test strategy is deliberately not an economic model.
 
 The run identity binds pins, configuration, groups, executable paths, and strategy
@@ -185,9 +185,9 @@ Canonical catalogue discovery still scans retained receipt metadata before the
 4096 selected-window check; that limit is not a bound on total catalogue size.
 
 This entry point does not yet use `replay.preparation`, `replay.strategy_sdk`,
-`replay.bundle_coverage`, or `replay.coverage_output.read_completed`, although
+`replay.strategies.bundle_coverage.strategy`, or `replay.strategies.bundle_coverage.output.read_completed`, although
 they exist in this tree. Preparation and bundle coverage currently run through
-the manual walkthrough in [BUNDLE_COVERAGE_V1.md](BUNDLE_COVERAGE_V1.md), with
+the manual walkthrough in [BUNDLE_COVERAGE_V1.md](../replay/strategies/bundle_coverage/SPEC.md), with
 caller-supplied pins. The narrow request therefore carries immutable plan
 keys/lanes (never scales), one existing strategy factory/revision/config, capture
 roots, and runtime binary paths. Its result attests validated supervisor

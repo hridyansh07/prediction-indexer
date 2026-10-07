@@ -27,9 +27,9 @@ from archive.reaper.canonical import (
 from archive.reaper.canonical_cli import build_parser as canonical_reaper_parser
 from archive.reaper.canonical_cli import main as canonical_reaper_main
 from archive.storage import INDEPENDENT, LocalObjectStore
-from archive.storage.s3 import S3ObjectStore
+from archive.storage.gcs import GCSObjectStore
 from tests.archive_fixtures import BASE_NS, WINDOW_SECONDS, write_canonical_receipt
-from tests.test_s3store import BUCKET, OWNER, REGION, FakeS3Client
+from tests.test_gcsstore import FakeClient as FakeGCSClient
 
 NANOSECONDS = 1_000_000_000
 HOUR_NS = 3600 * NANOSECONDS
@@ -204,9 +204,6 @@ class CanonicalReaperCommandTests(unittest.TestCase):
                 "ARCHIVE_BACKEND": "local",
                 "ARCHIVE_DURABILITY": "conformance",
                 "ARCHIVE_STORE_ID": "local-archive",
-                "ARCHIVE_S3_BUCKET": "",
-                "ARCHIVE_S3_REGION": "",
-                "ARCHIVE_S3_EXPECTED_OWNER": "",
                 "ARCHIVE_GCS_BUCKET": "",
             },
         )
@@ -265,13 +262,13 @@ class CanonicalReaperCommandTests(unittest.TestCase):
         self.assertIn("is not a directory", index.faults[0])
 
 
-class CanonicalReapingThroughS3Tests(unittest.TestCase):
-    def test_real_s3_adapter_heads_authorize_local_frame_reaping(self) -> None:
+class CanonicalReapingThroughGCSTests(unittest.TestCase):
+    def test_real_gcs_adapter_heads_authorize_local_frame_reaping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             canonical = root / "canonical"
             source_receipt = write_canonical_receipt(canonical, evidence_lines=1)
-            store = S3ObjectStore(BUCKET, REGION, OWNER, client=FakeS3Client())
+            store = GCSObjectStore("archive-bucket", client=FakeGCSClient())
             archive_ns = BASE_NS + WINDOW_SECONDS * NANOSECONDS + HOUR_NS
             archived = CanonicalArchiver(
                 canonical, store, now_ns=lambda: archive_ns
