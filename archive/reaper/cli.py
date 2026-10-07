@@ -82,7 +82,7 @@ def sweep_once(arguments: argparse.Namespace, store) -> int:
         raise SystemExit(
             "refusing delete mode against a local conformance store. Raw local data is the "
             "recovery authority until an independently durable archive backend is "
-            "configured; see archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md §5.3."
+            "configured; see archive/README.md (Raw reaper)."
         )
 
     reaper = Reaper(

@@ -1,7 +1,7 @@
 """The one Zstandard boundary shared by every Python producer and consumer.
 
 Zstandard-only, streaming-only, NDJSON-only. There is no message framing layer
-here and no whole-file API: `ZSTD_MATERIALIZATION_PIPELINE_V1.md` §2.1
+here and no whole-file API: `encoder/README.md` (Streaming only)
 requires that no production path hold a complete source, frame, or decoded
 object in memory, and the way to guarantee that is to not offer the shape at
 all. `encoder.whole_buffer` exists for tests and is built on these functions.
@@ -300,7 +300,7 @@ def encode_stream(
     if buffer_bytes > DEFAULT_BUFFER_BYTES:
         raise ValueError(
             f"buffer_bytes {buffer_bytes} is above the {DEFAULT_BUFFER_BYTES}-byte"
-            " streaming ceiling in ZSTD_MATERIALIZATION_PIPELINE_V1 §2.1"
+            " streaming ceiling in encoder/README.md (Streaming only)"
         )
     if int(level) != DEFAULT_ZSTD_LEVEL:
         raise ValueError(

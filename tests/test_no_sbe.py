@@ -43,8 +43,7 @@ SKIP_DIRECTORIES = {"__pycache__", "target", ".venv", "node_modules", ".git"}
 #: Named individually rather than exempted by directory: both now live beside
 #: the code they specify, inside directories this scan otherwise covers.
 SBE_RATIONALE_DOCUMENTS = {
-    "archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md",
-    "encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md",
+    "encoder/README.md",
 }
 
 #: Identifier-shaped, so `misbehaving` does not match. Two alternatives because

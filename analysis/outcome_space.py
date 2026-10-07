@@ -14,7 +14,7 @@ one they are a function of, and the two are never mixed.
 Per the current spec decision, uncovered scorelines are **not** members of
 Omega. A space assembled from a listed correct-score ladder is therefore marked
 ``INCOMPLETE_COVERAGE`` and must not be used to claim a basket is locked.
-Resolution-failure branches are handled separately in ``void_policy``.
+Resolution-failure branches are handled separately from this module.
 """
 
 from __future__ import annotations

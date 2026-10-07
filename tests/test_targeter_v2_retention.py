@@ -156,9 +156,6 @@ class TargetRunCase(unittest.TestCase):
                 "ARCHIVE_ROOT": str(self.root / "object-store"),
                 "ARCHIVE_DURABILITY": "conformance",
                 "ARCHIVE_STORE_ID": "targeter-test-bucket",
-                "ARCHIVE_S3_BUCKET": "",
-                "ARCHIVE_S3_REGION": "",
-                "ARCHIVE_S3_EXPECTED_OWNER": "",
                 "ARCHIVE_GCS_BUCKET": "",
             },
         )
@@ -768,7 +765,6 @@ class SeparationTests(unittest.TestCase):
                         "--archive-root",
                         "--archive-durability",
                         "--store-id",
-                        "--s3-bucket",
                         "--gcs-bucket",
                     }
                 )

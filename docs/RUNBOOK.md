@@ -3,23 +3,26 @@
 Commands for the deployed host, and how to read what they produce without
 needing to ask anyone what a field means.
 
-`docs/DEPLOYMENT.md` is the reference for *why* the deployment is shaped this
-way. This file is for the day-to-day: run a thing, read its report, decide.
+[`DEPLOYMENT.md`](DEPLOYMENT.md) is the reference for how the deployment is
+shaped. This file is for the day-to-day: run a thing, read its report, decide.
 
 ---
 
 ## 0. Two things that will bite you
 
-**Always pass both compose files.** The v2 override is what points the splices at
-`live/targeter-v2/current.json`. Omit it and Compose silently gives you the v1
-service definitions instead — no error, just the wrong targets path.
+**Pass both compose files for the Targeter v2 ops services.**
+`targeter-v2-run-archiver`, `targeter-v2-run-reaper` and `targeter-v2-integrity`
+are defined only in `compose.targeter-v2.yaml`; without it Compose reports no such
+service. Passing both files is harmless for everything else, so use one alias:
 
 ```bash
 alias dc='docker compose -f compose.yaml -f compose.targeter-v2.yaml'
 ```
 
 **Profiles are not optional decoration.** A service behind a profile is invisible
-without it — `dc ps` will not show it, and `dc up -d` will not start it.
+without it — `dc ps` will not show it, and `dc up -d` will not start it. A bare
+`dc up -d` therefore leaves the finalizer and archiver stopped while capture keeps
+running; nothing errors, and canonical evidence and archival silently stop.
 
 | Service | Profile | Image |
 |---|---|---|
@@ -27,16 +30,19 @@ without it — `dc ps` will not show it, and `dc up -d` will not start it.
 | `targeter` | *(none)* | capture |
 | `ingester` | *(none)* | ingester |
 | `splice-kalshi` | `kalshi` | capture |
+| `splice-polymarket-sports`, `splice-polymarket-rtds` | `reference` | capture |
 | `finalizer`, `finalizer-once` | `ops` | ingester |
 | `ingester-integrity` | `ops` | ingester |
 | `ingest-store-reaper` | `ops` | ingester |
 | `archiver`, `archiver-once` | `ops` | capture |
 | `reaper`, `reaper-once` | `ops` | capture |
-| `canonical-integrity` | `ops` | capture |
+| `canonical-reaper`, `canonical-reaper-once` | `ops` | capture |
+| `canonical-integrity` | `ops` | ingester |
 | `targeter-v2-run-archiver`, `targeter-v2-run-reaper`, `targeter-v2-integrity` | `ops` | capture |
 
-`targeter` is never `up -d`. It is a one-shot transaction started by cron, so it
-picks up a new image or command on its next firing with no action from you.
+`targeter` is a one-shot transaction started by cron (`dc run --rm targeter`), so
+it picks up a new image or command on its next firing with no action from you.
+`dc up -d` starts it once as a dependency of the splices.
 
 ---
 
@@ -44,8 +50,8 @@ picks up a new image or command on its next firing with no action from you.
 
 ```bash
 # .env
-IMAGE_REGISTRY=hridyansh07/
-IMAGE_TAG=v0.2.0
+IMAGE_REGISTRY=registry.example/namespace/
+IMAGE_TAG=<immutable tag>
 ```
 
 ```bash
@@ -59,11 +65,11 @@ dc up -d splice-polymarket-snapshots
 dc --profile kalshi up -d splice-kalshi
 
 dc up -d ingester
-dc --profile ops up -d finalizer archiver
+dc --profile ops up -d finalizer archiver reaper canonical-reaper
 ```
 
 A restart does **not** break `delivery_index`. `resume_state`
-(`splices/common/spool.py:253`) rebuilds the next index from the seals, because
+(`splices/common/spool.py`) rebuilds the next index from the seals, because
 the index is dense across a splice's lifetime rather than per connection. A new
 `connection_epoch` is minted and `local_counter` restarts inside it, which is
 what gate 1 expects to see.
@@ -85,6 +91,7 @@ That matters: a cleanly sealed segment means the next start resumes from seals
 | Published generations | `data/live/targeter-v2/generations/<run_id>/` |
 | Coverage ledger | `data/live/coverage.json` |
 | Targeter runs | `data/targeter-v2-runs/<run_id>/` |
+| Canonical reaper report | `data/archive-manifests/last_canonical_reaper_sweep.json` |
 | Finalizer report | `data/ops/last_finalizer_sweep.json` |
 | Run archiver report | `data/ops/last_targeter_v2_archive_sweep.json` |
 | Run reaper report | `data/ops/last_targeter_v2_reaper_sweep.json` |
@@ -92,11 +99,11 @@ That matters: a cleanly sealed segment means the next start resumes from seals
 | Raw reaper report | `data/archive-manifests/last_reaper_sweep.json` |
 | Ingest-store reaper report | `data/ops/last_ingest_store_reaper_sweep.json` |
 
-The raw archive pair write to `archive-manifests/`, not `ops/` — they predate
-that directory. Both the long-lived service and its `-once` variant write the
-same filename, so a manual `reaper-once` overwrites the scheduled sweep's report.
+The archiver and both reapers write to `archive-manifests/`, not `ops/`. A
+long-lived service and its `-once` variant write the same filename, so a manual
+`reaper-once` overwrites the scheduled sweep's report.
 
-Everything below assumes `DATA=/srv/prediction-indexer/data`.
+Everything below assumes `DATA` is the host path of `CAPTURE_DATA_ROOT`.
 
 ---
 
@@ -159,12 +166,17 @@ segment and is long; you rarely need it except to chase a specific reason.
 |---|---|---|
 | `audit_mode` | Every condition holds; only the mode stops deletion | None. This is the healthy state. |
 | `canonical_receipt_missing` | Archived, but the finalizer has not committed its window yet | None if it is a recent window. See below. |
-| `durability_gate` | Archive is not an independent durability domain | Check `ARCHIVE_BACKEND=s3`. Nothing can ever be deleted while this shows. |
+| `durability_gate` | Archive is not an independent durability domain | Check `ARCHIVE_BACKEND=gcs` (or, for a local backend, `ARCHIVE_DURABILITY=independent` on separate storage). Nothing can ever be deleted while this shows. |
 | `archive_receipt_invalid` | Receipt unreadable or self-inconsistent | Investigate. Never expected. |
-| `archive_object_unverified` | The S3 object does not match its receipt | Investigate immediately — the archive is not what it claims. |
+| `archive_object_unverified` | The archived object does not match its receipt | Investigate immediately — the archive is not what it claims. |
 | `canonical_segment_mismatch` | Canonical window disagrees with the segment | Investigate. |
 | `local_source_changed` | The local file changed after it was archived | Investigate. A sealed segment is immutable. |
 | `io_error` | Could not read something | Usually permissions or a full disk. |
+
+The canonical reaper (`last_canonical_reaper_sweep.json`) uses the same shape with
+`canonical_archive_receipt_missing`, `canonical_archive_receipt_invalid`,
+`unexpected_window_artifact`, `retention_floor` (18 h), `local_window_changed` and
+`canonical_artifacts_absent`.
 
 A handful of `canonical_receipt_missing` is normal and self-resolving: it is the
 window currently in flight. Healthy looks like **one per running lane, all naming
@@ -205,11 +217,10 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 ```
 
 Limitless produces a lot of these — it is a low-volume venue and a quiet
-30-minute window is expected. **Gate 1 reports an empty segment as
-`"<segment>: sealed but the segment is absent"`**, which is a wording bug, not
-data loss: `segments_seen` is only populated per parsed record
-(`replay/legacy/gate1.py:190`), so a segment with no records is never marked seen. Check
-before worrying:
+30-minute window is expected. **Gate 1 can report an empty segment as
+`"<segment>: sealed but the segment is absent"`**, which is a wording issue, not
+data loss: its seen-segment set is populated per parsed record, so a segment with
+no records is never marked seen. Check before worrying:
 
 ```bash
 sudo python3 -c "
@@ -232,7 +243,7 @@ for seal in glob.glob('$DATA/spool/lane=*/date=*/*.seal.json'):
 sudo python3 -m json.tool $DATA/ops/last_targeter_v2_reaper_sweep.json | head -40
 ```
 
-Different command, different gate, **different retention semantics** — see §7.
+Different command, different gate, **different retention semantics** — see §8.
 
 | Reason | Means |
 |---|---|
@@ -247,6 +258,7 @@ Different command, different gate, **different retention semantics** — see §7
 | `run_clock_unreadable` | Could not establish the run's age |
 | `archive_object_unverified` | A remote object does not verify |
 | `local_run_changed` | Local artifacts no longer match the receipt |
+| `io_error` | Could not read something |
 | `run_artifacts_absent` | Already reaped; the receipt tombstone remains |
 
 The two numbers to watch:
@@ -272,9 +284,10 @@ sudo python3 -m json.tool $DATA/ops/last_finalizer_sweep.json | head -30
   `polymarket`, `polymarket_snapshots`, `limitless`, `kalshi`.
 - `unexpected_lanes` should be empty. A lane here is being merged into canonical
   but never counted toward completeness — its outage would be invisible and every
-  window would still read complete. Add it to `--expect-lane` in `compose.yaml`.
+  window would still read complete. Add it to `--expect-lane` on `finalizer` and `finalizer-once` in `compose.yaml`.
 - A lane listed in `expected_lanes` that is *not* running is the opposite error:
-  every window sits out its deadline and commits incomplete forever.
+  every window sits out its deadline and commits incomplete forever. If the
+  `kalshi` profile is off, remove `kalshi` from both finalizer services.
 
 ---
 
@@ -307,24 +320,15 @@ invitation to filter until it passes. Two checks matter more than the rest:
   are the ones that cannot be repaired after the fact. If they pass, the tape is
   sound and everything else is metadata or configuration.
 
-Known-failing and why:
-
-| Check | Cause |
-|---|---|
-| `reference_price_observability`, `game_event_observability` | The `reference` profile is off — no splice produces those records |
-| `closed_capture_fixture` | Capture is running; the unclosed connections are the live ones, one per lane |
-| `market_rules_and_metadata`, `fee_model_evidence` | v2's `resolution` carries an archive pointer where v1 embedded the catalogue record, so `rules_records` and `fee_records` stay 0 |
-
-Gate 1 reads **only** `spool/**/*.ndjson`, `*.seal.json`, the metadata snapshots
-and `coverage.json`. It cannot read `.ndjson.zst` — `iter_ndjson_lines` skips any
-key not ending `.ndjson` with a silent `continue` (`replay/stream.py:171`). This
-is why the ordering in §7 matters.
+The other checks, why each currently fails or passes, and what clears it are in
+[`replay/legacy/GATE1_FAILURES.md`](../replay/legacy/GATE1_FAILURES.md). Gate 1 reads only
+`spool/**/*.ndjson`, `*.seal.json`, the metadata snapshots and `coverage.json`; it
+cannot read `.ndjson.zst`, which is why the ordering in §8 matters.
 
 **If it aborts with `object changed after stream snapshot: .../coverage.json`:**
-the targeter rewrote the ledger mid-run. `DirectoryByteStreamer` snapshots inode
-and mtime and re-checks around every read, and `save()` goes through an atomic
-replace, so the inode changes every 10 minutes. Pause the targeter cron for the
-duration of a gate run.
+the targeter rewrote the ledger mid-run (every publish replaces it atomically, so
+its inode changes every 10 minutes). Pause the targeter cron for the duration of a
+gate run.
 
 ---
 
@@ -347,7 +351,7 @@ not delete raw or canonical evidence.
 hourly sweep, however recent. It is not a rolling window.
 
 Because gate 1 reads exactly those files and cannot read the `.ndjson.zst` copies
-in S3, run the analysis you want **before** flipping it:
+in the archive, run the analysis you want **before** flipping it:
 
 1. Backfill coverage (reads run directories the run reaper reclaims)
 2. Run gate 1 to completion (reads the spool the raw reaper deletes)
@@ -366,7 +370,8 @@ sudo du -sh $DATA/* | sort -h
 df -h /srv
 ```
 
-Rough daily rates at the current configuration:
+Daily rates measured at the last production configuration (re-measure after a
+configuration change):
 
 | Tier | Per day |
 |---|---|
@@ -387,15 +392,15 @@ The completed time and count appear in the ingester log and in
 `store_migration` in its JSON report.
 
 For a large legacy store whose old derived history is not needed, the documented
-fresh-store cutover in `docs/DEPLOYMENT.md` avoids this migration. It starts a new
+fresh-store cutover in [`DEPLOYMENT.md`](DEPLOYMENT.md) avoids this migration. It starts a new
 `file_order` lineage and re-ingests every sealed segment still in the local spool;
 it does not reconstruct segments the raw reaper already removed. Move any backup
 to another filesystem if the purpose is to recover capacity.
 
-Compression on the archive path measures ~12.7x, so S3 growth is far below the
-local spool rate. `targeter-v2-cache` should stay near zero now that
+Compression on the archive path measured ~12.7x, so archive growth is far below
+the local spool rate. `targeter-v2-cache` should stay near zero now that
 `--no-response-cache` is set; if it grows, the flag is not reaching the container
-— check that both `-f` files are being passed.
+— check that the running `targeter` is the current compose definition.
 
 With `INGEST_STORE_REAPER_MODE=delete`, ingest-store usage is bounded to the
 active partition plus closed partitions still inside the configured 24-hour

@@ -48,8 +48,6 @@ Governing documents:
   `SUCCESS`.
 - [`replay/fees/README.md`](../../fees/README.md): the fee SDK.
 - [`replay/README.md`](../../README.md): ordered gates 2–5.
-- [`analysis/PARTITION_SUM_TEST_SPEC.md`](../../../analysis/PARTITION_SUM_TEST_SPEC.md):
-  share matching, size sweep, staleness.
 - [BUNDLE_COVERAGE_V1.md](../bundle_coverage/SPEC.md): time, scope, and output
   conventions, which this document follows unless it states otherwise.
 

@@ -17,16 +17,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def stable_job_id(specification: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        specification,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:16]
-
-
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -39,11 +29,6 @@ def parse_iso8601(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def iso_to_unix_seconds(value: str | None) -> int | None:
-    parsed = parse_iso8601(value)
-    return int(parsed.timestamp()) if parsed else None
 
 
 def fsync_directory(path: Path) -> None:
@@ -216,16 +201,3 @@ def read_json_zstd(
         expected_stored=expected_stored,
     ) as decoded:
         return json.load(decoded)
-
-
-def in_time_window(
-    value: str | None,
-    minimum: datetime | None,
-    maximum: datetime | None,
-) -> bool:
-    parsed = parse_iso8601(value)
-    if minimum is not None and (parsed is None or parsed < minimum):
-        return False
-    if maximum is not None and (parsed is None or parsed > maximum):
-        return False
-    return True

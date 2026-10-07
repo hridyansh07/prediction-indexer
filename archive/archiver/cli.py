@@ -7,11 +7,10 @@ python -m archive.archiver.cli --spool-root  /var/lib/prediction-indexer/spool \
                                --manifest-root /var/lib/prediction-indexer/manifests
 ```
 
-Or configure S3 in the environment (`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`):
+Or configure GCS in the environment (`archive/README.md`, Backend selection):
 
 ```sh
-ARCHIVE_BACKEND=s3 ARCHIVE_S3_BUCKET=my-archive-bucket \
-ARCHIVE_S3_REGION=us-east-1 ARCHIVE_S3_EXPECTED_OWNER=123456789012 \
+ARCHIVE_BACKEND=gcs ARCHIVE_GCS_BUCKET=my-archive-bucket \
 python -m archive.archiver.cli --spool-root /var/lib/prediction-indexer/spool
 ```
 

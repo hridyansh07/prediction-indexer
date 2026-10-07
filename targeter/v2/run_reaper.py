@@ -1,7 +1,7 @@
 """Local deletion of Targeter v2 run directories that are provably archived.
 
 A separate module and a separate command from anything that writes runs, for
-the reason ``archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`` §7.1 gives: a pipeline
+the reason ``archive/README.md`` (Safety model) gives: a pipeline
 in which uploading is the last step before deleting is one refactor away from
 deleting on an upload that only looked like it worked.
 

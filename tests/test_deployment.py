@@ -30,9 +30,6 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
             "x-cloud-archive-environment: &cloud-archive-environment", self.compose
         )
         for variable in (
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
             "ARCHIVE_BACKEND",
             "ARCHIVE_ROOT",
             "ARCHIVE_STORE_ID",
@@ -40,6 +37,8 @@ class ComposeArchiveCredentialTests(unittest.TestCase):
             "ARCHIVE_GCS_BUCKET",
         ):
             self.assertIn(variable, self.compose)
+        self.assertNotIn("ARCHIVE_S3_", self.compose)
+        self.assertNotIn("AWS_", self.compose)
         for service in (
             "archiver",
             "archiver-once",
@@ -86,16 +85,39 @@ class TargeterV2DeploymentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.override_path = ROOT / "compose.targeter-v2.yaml"
 
-    def test_production_override_is_one_shot_and_switches_every_targeted_splice(
-        self,
-    ) -> None:
+    def test_base_targeter_is_the_v2_one_shot(self) -> None:
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        start = compose.index("\n  targeter:\n")
+        end = compose.index("\n  splice-polymarket:\n")
+        service = compose[start:end]
+        self.assertIn("targeter/run_v2.py", service)
+        self.assertIn("--mode", service)
+        self.assertIn("publish", service)
+        self.assertIn('restart: "no"', service)
+        self.assertIn("environment: *cloud-archive-environment", service)
+        self.assertNotIn("targeter/run.py", compose)
+        self.assertNotIn("capture_manifest", compose)
+        self.assertNotIn("--interval-seconds", service)
+        self.assertNotIn("--tick-seconds", service)
+
+    def test_base_splices_resolve_the_v2_generation_pointer(self) -> None:
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("targets_polymarket.json", compose)
+        self.assertNotIn("targets_limitless.json", compose)
+        self.assertNotIn("targets_kalshi.json", compose)
+        self.assertGreaterEqual(compose.count("/live/targeter-v2/current.json"), 8)
+
+    def test_override_holds_only_the_ops_services(self) -> None:
         document = self.override_path.read_text(encoding="utf-8")
-        self.assertIn("targeter/run_v2.py", document)
-        self.assertIn("--mode", document)
-        self.assertIn("publish", document)
-        self.assertIn('restart: "no"', document)
+        for service in ("targeter", "splice-polymarket", "splice-kalshi", "splice-limitless"):
+            self.assertNotIn(f"\n  {service}:\n", document)
         self.assertNotIn("--interval-seconds", document)
-        self.assertGreaterEqual(document.count("/live/targeter-v2/current.json"), 8)
+        for service in (
+            "targeter-v2-run-archiver",
+            "targeter-v2-run-reaper",
+            "targeter-v2-integrity",
+        ):
+            self.assertIn(f"\n  {service}:\n", document)
 
     def test_archive_provider_configuration_is_environment_only(self) -> None:
         document = self.override_path.read_text(encoding="utf-8")
@@ -106,15 +128,15 @@ class TargeterV2DeploymentTests(unittest.TestCase):
             "ARCHIVE_BACKEND",
             "ARCHIVE_ROOT",
             "ARCHIVE_DURABILITY",
-            "ARCHIVE_S3_BUCKET",
             "ARCHIVE_GCS_BUCKET",
         ):
             self.assertIn(variable, document)
+        self.assertNotIn("ARCHIVE_S3_", document)
+        self.assertNotIn("AWS_", document)
         for option in (
             "--archive-backend",
             "--archive-root",
             "--archive-durability",
-            "--s3-bucket",
             "--gcs-bucket",
         ):
             self.assertNotIn(option, document)
@@ -122,7 +144,7 @@ class TargeterV2DeploymentTests(unittest.TestCase):
     def test_documentation_supplies_a_periodic_one_shot_command_and_audit_gate(
         self,
     ) -> None:
-        deployment = (ROOT / "docs" / "TARGETER_V2_PHASES_6_10.md").read_text(
+        deployment = (ROOT / "targeter" / "v2" / "DELIVERY.md").read_text(
             encoding="utf-8"
         )
         self.assertIn("docker compose", deployment)

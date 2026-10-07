@@ -26,25 +26,21 @@ Use this order when instructions overlap:
 5. the root architecture documents;
 6. implementation comments.
 
-Important known supersessions:
+Settled decisions that older material may contradict:
 
-- [`docs/SEALED_CAPTURE_PIPELINE_V1.md`](docs/SEALED_CAPTURE_PIPELINE_V1.md)
-  supersedes the normal merge-key recommendation in
-  [`Architecture_refinments.md`](Architecture_refinments.md): V1 orders by
-  `(visible_ns, lane_rank, delivery_index)`. `monotonic_ns` is diagnostic and
-  boot-scoped, not the V1 cross-lane merge key.
-- [`encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md`](encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md)
-  is the approved compression addendum to the sealed-capture design. V1 uses
-  exact NDJSON inside one Zstandard frame and no SBE or custom binary schema.
-- [`docs/TARGETER_V2_PHASES_1_5.md`](docs/TARGETER_V2_PHASES_1_5.md) and
-  [`docs/TARGETER_V2_PHASES_6_10.md`](docs/TARGETER_V2_PHASES_6_10.md) control
-  Targeter v2. [`targeter/TARGETER.md`](targeter/TARGETER.md) describes legacy
-  Targeter v1 only.
-- [`docs/TARGETER_V2_LEAGUE_OF_LEGENDS_V1.md`](docs/TARGETER_V2_LEAGUE_OF_LEGENDS_V1.md)
-  is the structured LoL contract. The newer
-  [`docs/TARGETER_V2_MULTI_GAME_ESPORTS_V1.md`](docs/TARGETER_V2_MULTI_GAME_ESPORTS_V1.md)
-  extends that design to CS2, Dota 2, Honor of Kings, and Valorant; it is still
-  a proposed implementation contract until its code and tests land.
+- Canonical windows order records by `(visible_ns, lane_rank, delivery_index)`
+  ([`ingester/README.md`](ingester/README.md)). `monotonic_ns` is diagnostic
+  and boot-scoped, not a cross-lane merge key.
+- Compressed artifacts are exact NDJSON inside one Zstandard frame, with no SBE
+  or custom binary schema ([`encoder/README.md`](encoder/README.md)).
+- Targeter v2 is the only targeter
+  ([`targeter/README.md`](targeter/README.md),
+  [`targeter/v2/SELECTION.md`](targeter/v2/SELECTION.md),
+  [`targeter/v2/DELIVERY.md`](targeter/v2/DELIVERY.md)). Targeter v1 was
+  removed.
+- Pending, not yet implemented work is specified under
+  [`docs/specs/`](docs/specs/). A component README describes what the code does
+  today.
 
 If two still-current specifications genuinely conflict, stop and surface the
 conflict instead of inventing compatibility behavior.
@@ -189,22 +185,18 @@ Read only the rows relevant to the task, but read those documents completely.
 
 | Work area | Read first | Then read when applicable |
 |---|---|---|
-| Repository architecture or component boundaries | [`README.md`](README.md), [`ARCHITECTURE.md`](ARCHITECTURE.md) | [`docs/CAPTURE_SPEC.md`](docs/CAPTURE_SPEC.md), [`Architecture_refinments.md`](Architecture_refinments.md) for design history; newer normative specs win |
-| Envelope fields, clocks, counters, source cursors | [`splices/common/ENVELOPE.md`](splices/common/ENVELOPE.md) | [`docs/SEALED_CAPTURE_PIPELINE_V1.md`](docs/SEALED_CAPTURE_PIPELINE_V1.md), clock tests in `tests/test_capture_clock.py` and `tests/test_envelope.py` |
-| Splice connection/auth/subscription/reconnect/writer behavior | [`splices/SPLICE.md`](splices/SPLICE.md), [`splices/common/ENVELOPE.md`](splices/common/ENVELOPE.md) | [`docs/SEALED_CAPTURE_PIPELINE_V1.md`](docs/SEALED_CAPTURE_PIPELINE_V1.md), venue tests under `tests/test_*_splice.py`, `tests/test_spool.py`, and `tests/test_writer_queue.py` |
-| Sealed segments, k-way merge, canonical sequencing, continuity, finalizer | [`docs/SEALED_CAPTURE_PIPELINE_V1.md`](docs/SEALED_CAPTURE_PIPELINE_V1.md), [`ingester/INGESTER.md`](ingester/INGESTER.md) | [`encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md`](encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md), Rust crate-local tests, `tests/test_sealed_capture_failure_proofs.py` |
-| Python/Rust Zstd codec or canonical compressed output | [`encoder/README.md`](encoder/README.md), [`encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md`](encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md) | [`archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md), `tests/test_encoder.py`, `tests/test_no_sbe.py` |
-| Raw archiver, receipts, manifests, or reaper | [`archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md) | [`encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md`](encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md), [`docs/SEALED_CAPTURE_PIPELINE_V1.md`](docs/SEALED_CAPTURE_PIPELINE_V1.md), archive/reaper tests |
-| AWS S3 object-store adapter | [`archive/S3_RAW_ARCHIVE_ADAPTER_V1.md`](archive/S3_RAW_ARCHIVE_ADAPTER_V1.md) | [`archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md), [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), `tests/test_s3store.py` and `tests/test_s3_pipeline.py` |
-| Docker Compose, Linux deployment, profiles, storage, operations | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), `.env.example`, `compose.yaml` | `compose.targeter-v2.yaml` and [`docs/TARGETER_V2_PHASES_6_10.md`](docs/TARGETER_V2_PHASES_6_10.md) for Targeter v2 rollout; `tests/test_deployment.py` |
-| Targeter motivation and current event-selection semantics | [`targeter/README.md`](targeter/README.md), [`docs/TARGETER_V2_PHASES_1_5.md`](docs/TARGETER_V2_PHASES_1_5.md) | `configs/targeter_v2.json`, `tests/test_targeter_v2.py` |
-| Targeter v2 archive, atomic publication, splice handoff, scheduler, audit | [`docs/TARGETER_V2_PHASES_6_10.md`](docs/TARGETER_V2_PHASES_6_10.md) | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), `tests/test_targeter_v2_delivery.py` |
-| Targeter v2 run retention, the run archiver sweep, or the run reaper | [`docs/TARGETER_V2_PHASES_6_10.md`](docs/TARGETER_V2_PHASES_6_10.md) §7 | [`archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`](archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md) for the shared separation rule, [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), `tests/test_targeter_v2_retention.py` |
-| Structured League of Legends targeting | [`docs/TARGETER_V2_LEAGUE_OF_LEGENDS_V1.md`](docs/TARGETER_V2_LEAGUE_OF_LEGENDS_V1.md) | Targeter v2 phase docs, `tests/test_targeter_v2_lol.py` |
-| CS2, Dota 2, Honor of Kings, or Valorant targeting | [`docs/TARGETER_V2_MULTI_GAME_ESPORTS_V1.md`](docs/TARGETER_V2_MULTI_GAME_ESPORTS_V1.md) | LoL spec for inherited mechanics, Targeter v2 phase docs; remember the multi-game document is proposed until implemented |
-| Legacy crypto-ladder targeter | [`targeter/TARGETER.md`](targeter/TARGETER.md), `configs/capture_manifest.json` | [`docs/CAPTURE_SPEC.md`](docs/CAPTURE_SPEC.md); do not apply legacy daemon behavior to Targeter v2 |
-| Legacy replay, book reconstruction, trust, economic gates | [`replay/legacy/README.md`](replay/legacy/README.md) | envelope, sealed-capture, and codec specs; relevant `replay/legacy/gate*.py` and replay tests |
-| Replay derivative materialization, normalizers, walker, risk reconstruction | [`engine/README.md`](engine/README.md), [`docs/VERIFIED_DERIVATIVE_WALKER_V1.md`](docs/VERIFIED_DERIVATIVE_WALKER_V1.md), [`docs/RISK_RECONSTRUCTION_V1.md`](docs/RISK_RECONSTRUCTION_V1.md) | Rust crate-local tests under `engine/crates/` |
+| Repository architecture or component boundaries | [`README.md`](README.md), [`ARCHITECTURE.md`](ARCHITECTURE.md) | the component README for each layer touched |
+| Envelope fields, clocks, counters, source cursors | [`splices/README.md`](splices/README.md) | [`ingester/FORMATS.md`](ingester/FORMATS.md), clock tests in `tests/test_capture_clock.py` and `tests/test_envelope.py` |
+| Splice connection/auth/subscription/reconnect/writer behavior | [`splices/README.md`](splices/README.md) | venue tests under `tests/test_*_splice.py`, `tests/test_spool.py`, `tests/test_writer_queue.py` |
+| Sealed segments, k-way merge, canonical sequencing, continuity, finalizer | [`ingester/README.md`](ingester/README.md), [`ingester/FORMATS.md`](ingester/FORMATS.md) | [`encoder/README.md`](encoder/README.md), Rust crate-local tests, `tests/test_sealed_capture_failure_proofs.py` |
+| Python/Rust Zstd codec or canonical compressed output | [`encoder/README.md`](encoder/README.md) | [`archive/FORMATS.md`](archive/FORMATS.md), `tests/test_encoder.py`, `tests/test_no_sbe.py` |
+| Raw/canonical archiver, object stores, receipts, manifests, reapers | [`archive/README.md`](archive/README.md), [`archive/FORMATS.md`](archive/FORMATS.md) | [`ingester/FORMATS.md`](ingester/FORMATS.md), `tests/test_archive*.py`, `tests/test_canonical_*.py`, `tests/test_gcsstore.py`, `tests/test_reaper.py` |
+| Docker Compose, Linux deployment, profiles, storage, operations | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), [`docs/RUNBOOK.md`](docs/RUNBOOK.md), `.env.example`, `compose.yaml` | `compose.targeter-v2.yaml`, `compose.universe.yaml`, `tests/test_deployment.py` |
+| Targeter motivation, discovery, matching, event selection, esports games | [`targeter/README.md`](targeter/README.md), [`targeter/v2/SELECTION.md`](targeter/v2/SELECTION.md) | `configs/targeter_v2.json`, `tests/test_targeter_v2.py`, `tests/test_targeter_v2_lol.py`, `tests/test_targeter_v2_esports_games.py` |
+| Targeter v2 archive, atomic publication, splice handoff, continuity, target records, audit | [`targeter/v2/DELIVERY.md`](targeter/v2/DELIVERY.md) | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), `tests/test_targeter_v2_delivery.py` |
+| Targeter v2 run retention, the run archiver sweep, or the run reaper | [`targeter/v2/DELIVERY.md`](targeter/v2/DELIVERY.md) | [`archive/README.md`](archive/README.md) for the shared separation rule, `tests/test_targeter_v2_retention.py` |
+| Legacy replay, book reconstruction, trust, economic gates | [`replay/legacy/README.md`](replay/legacy/README.md) | [`splices/README.md`](splices/README.md), [`ingester/README.md`](ingester/README.md), [`encoder/README.md`](encoder/README.md); relevant `replay/legacy/gate*.py` and replay tests |
+| Replay derivative materialization, normalizers, walker, risk reconstruction | [`engine/README.md`](engine/README.md), [`engine/DERIVATIVES.md`](engine/DERIVATIVES.md) | Rust crate-local tests under `engine/crates/` |
 | Replay Redis delivery, supervisor, bundle runner | [`docs/REPLAY_STREAMS_V1.md`](docs/REPLAY_STREAMS_V1.md), [`docs/REPLAY_SUPERVISOR_V1.md`](docs/REPLAY_SUPERVISOR_V1.md) | `replay/tests/test_streams*.py`, `test_supervisor.py`, `test_bundle_runner.py`; Redis tests need a disposable Redis ≥8.2 |
 | Local replay bench, fixture runs, run comparison | [`docs/LOCAL_REPLAY_BENCH_V1.md`](docs/LOCAL_REPLAY_BENCH_V1.md) | [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md), [`docs/REPLAY_SUPERVISOR_V1.md`](docs/REPLAY_SUPERVISOR_V1.md), [`replay/fees/README.md`](replay/fees/README.md), `replay/tests/test_bench.py` |
 | Replay jobs production runtime, preflight, backup, restore, audit | [`docs/REPLAY_JOBS_V1.md`](docs/REPLAY_JOBS_V1.md) §8, [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | `compose.universe.yaml`, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `tests/test_replay_operations.py`, `tests/test_deployment.py`; never use retained/live production data |
@@ -214,10 +206,10 @@ Read only the rows relevant to the task, but read those documents completely.
 | Same-venue multi-market complete sets | [`replay/strategies/same_venue_multi_market/SPEC.md`](replay/strategies/same_venue_multi_market/SPEC.md) | [`docs/ECONOMIC_STRATEGY_SDK_V1.md`](docs/ECONOMIC_STRATEGY_SDK_V1.md) §13, [`docs/OUTCOME_MASKS_V1.md`](docs/OUTCOME_MASKS_V1.md), [`replay/strategies/cross_venue_arbitrage/SPEC.md`](replay/strategies/cross_venue_arbitrage/SPEC.md); `replay/tests/test_same_venue_multi_market.py` |
 | Replay strategy preparation, strategy SDK, bundle coverage output | [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md), [`replay/strategies/bundle_coverage/SPEC.md`](replay/strategies/bundle_coverage/SPEC.md) | `replay/tests/test_preparation.py`, `test_bundle_coverage.py` |
 | Replay fee SDK | [`replay/fees/README.md`](replay/fees/README.md) | `tests/test_fee_sdk.py` |
-| Outcome masks for replay strategies | [`docs/OUTCOME_MASKS_V1.md`](docs/OUTCOME_MASKS_V1.md) | [`analysis/MARKET_RELATIONSHIP_GRAPH.md`](analysis/MARKET_RELATIONSHIP_GRAPH.md), [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md) |
-| Outcome spaces, masks, void policy, event relationships | [`analysis/MARKET_RELATIONSHIP_GRAPH.md`](analysis/MARKET_RELATIONSHIP_GRAPH.md) | [`analysis/PIPELINE_SPEC.md`](analysis/PIPELINE_SPEC.md), [`analysis/PARTITION_SUM_TEST_SPEC.md`](analysis/PARTITION_SUM_TEST_SPEC.md), outcome/mask/void tests |
-| Historical discovery and pull scripts | Root [`README.md`](README.md) historical sections, [`scripts/GAME_DISCOVERY.md`](scripts/GAME_DISCOVERY.md) | Analysis pipeline specs and the matching script's tests |
-| Correlation research | [`analysis/CORRELATION_PIPELINE_REVIEW_V1.md`](analysis/CORRELATION_PIPELINE_REVIEW_V1.md) | [`analysis/MARKET_RELATIONSHIP_GRAPH.md`](analysis/MARKET_RELATIONSHIP_GRAPH.md); do not let exploratory statistics alter capture evidence |
+| Outcome masks for replay strategies | [`docs/OUTCOME_MASKS_V1.md`](docs/OUTCOME_MASKS_V1.md) | [`analysis/README.md`](analysis/README.md), [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md) |
+| Outcome spaces, masks, claims, event relationships | [`analysis/README.md`](analysis/README.md) | [`universe/README.md`](universe/README.md) for claim storage, `tests/test_outcome_space.py`, `tests/test_masks.py`, `tests/test_claims.py` |
+| Universe event store, API, bundle history, outcomes, Replay job control plane | [`universe/README.md`](universe/README.md) | `tests/test_event_universe_store.py`, `tests/test_universe_outcomes.py`, `tests/test_replay_jobs*.py` |
+| Pending specifications | [`docs/specs/`](docs/specs/) | the component README the spec extends |
 
 ## 5. Component boundaries
 
@@ -230,12 +222,14 @@ Keep new code in the layer that owns the decision:
 | `ingester/` | raw durability, sealed-segment validation, deterministic evidence order, continuity facts, canonical receipts | venue networking, book interpretation, economics |
 | `encoder/` | one strict streaming Zstd contract in Python and Rust | event schemas, archive policy, full-buffer production helpers |
 | `archive/` | immutable object storage, archive verification/receipts, manifests, deletion eligibility, durable filesystem primitives | canonical event meaning, direct splice control, any knowledge of `targeter/` |
-| `replay/` | decoding, book reconstruction, trust/recovery, ordered gates | mutation of raw/canonical evidence |
-| `analysis/` | outcome spaces, masks, equivalence, void/economic policy | irreversible capture filtering |
+| `universe/` | the event store, bundle history, outcomes, auth, Replay job control plane | capture, book reconstruction, economics |
+| `engine/` | venue normalizers, verified derivatives, risk reconstruction, Redis transport | strategies, scheduling, deployment |
+| `replay/` | decoding, book reconstruction, trust/recovery, ordered gates, strategies | mutation of raw/canonical evidence |
+| `analysis/` | outcome spaces, masks, claims | irreversible capture filtering |
 
 Vendor-specific raw fields stop at the adapter boundary. Downstream targeter
-matching/selection consumes canonical records. S3-specific calls stop inside
-`S3ObjectStore`; archiver and reaper depend on the generic object-store
+matching/selection consumes canonical records. GCS-specific calls stop inside
+`GCSObjectStore`; archiver and reaper depend on the generic object-store
 protocol.
 
 The dependency between `targeter/` and `archive/` runs one way. Targeter v2's
@@ -287,6 +281,17 @@ For standalone codec work, also run:
 cargo test --manifest-path encoder/rust/Cargo.toml
 ```
 
+For normalizer, derivative or risk work:
+
+```bash
+cargo test --manifest-path engine/Cargo.toml --workspace
+```
+
+### TypeScript
+
+`yarn install && yarn test` runs the UI and Node decoder tests. The UI tests
+spawn `.venv/bin/python` and assume a UTC clock (`TZ=UTC`).
+
 ### Deployment
 
 At minimum:
@@ -294,10 +299,11 @@ At minimum:
 ```bash
 docker compose config --quiet
 docker compose -f compose.yaml -f compose.targeter-v2.yaml config --quiet
+docker compose -f compose.universe.yaml config --quiet
 ```
 
 Build only the affected images unless the task or rollout gate requires the
-full build. Do not start services, publish targets, contact S3, or enable reaper
+full build. Do not start services, publish targets, contact the object store, or enable reaper
 deletion merely to validate configuration.
 
 ### Live targeter acceptance

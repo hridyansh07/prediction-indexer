@@ -12,10 +12,10 @@ from archive.common.receipts import read_archive_receipt
 from archive.storage.base import ObjectExpectation, ObjectKeyError, VerificationFailure
 from archive.storage.local import LocalObjectStore
 from encoder import encode_stream, stored_identity_of
-from archive.storage.s3 import S3ObjectStore
+from archive.storage.gcs import GCSObjectStore
 from encoder import CodecError
 from tests.archive_fixtures import write_sealed_segment
-from tests.test_s3store import BUCKET, OWNER, REGION, FakeS3Client
+from tests.test_gcsstore import FakeClient as FakeGCSClient
 
 
 class ArchivedSegmentByteStreamerTests(unittest.TestCase):
@@ -28,8 +28,8 @@ class ArchivedSegmentByteStreamerTests(unittest.TestCase):
         self.seal = self.segment.with_name(
             self.segment.name[: -len(".ndjson")] + ".seal.json"
         )
-        self.client = FakeS3Client()
-        self.store = S3ObjectStore(BUCKET, REGION, OWNER, client=self.client)
+        self.client = FakeGCSClient()
+        self.store = GCSObjectStore("archive-bucket", client=self.client)
         outcome = Archiver(self.spool, self.store).sweep()
         self.assertEqual(outcome.counts["archived"], 1, outcome.as_record())
         receipt_path = self.segment.with_name(
@@ -53,8 +53,8 @@ class ArchivedSegmentByteStreamerTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("archive-replay-*")))
 
     def test_corrupt_compressed_bytes_are_not_partially_exposed(self) -> None:
-        stored = self.client.objects[self.receipt.data_key]["bytes"]
-        self.client.objects[self.receipt.data_key]["bytes"] = stored[:-1] + bytes([stored[-1] ^ 1])
+        stored = self.client.objects[self.receipt.data_key]["data"]
+        self.client.objects[self.receipt.data_key]["data"] = stored[:-1] + bytes([stored[-1] ^ 1])
         streamer = ArchivedSegmentByteStreamer(self.store, [self.receipt], temp_root=self.root)
         data_key = next(key for key in streamer.object_keys() if key.endswith(".ndjson"))
         iterator = streamer.iter_bytes(data_key)

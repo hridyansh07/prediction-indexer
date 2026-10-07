@@ -27,7 +27,7 @@ file was byte-identical to an open one.
 
 `Spool` is a thin facade. `segment.py` owns one file and its seal, `writer.py`
 owns the queue and the thread that touches disk. See
-`docs/SEALED_CAPTURE_PIPELINE_V1.md` §3 and §4.
+`splices/README.md` (Durable append: segments and seals).
 """
 
 from __future__ import annotations

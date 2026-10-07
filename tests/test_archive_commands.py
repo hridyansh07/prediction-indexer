@@ -57,9 +57,6 @@ class CommandCase(unittest.TestCase):
                 "ARCHIVE_ROOT": str(self.archive_root),
                 "ARCHIVE_DURABILITY": "conformance",
                 "ARCHIVE_STORE_ID": "local-archive",
-                "ARCHIVE_S3_BUCKET": "",
-                "ARCHIVE_S3_REGION": "",
-                "ARCHIVE_S3_EXPECTED_OWNER": "",
                 "ARCHIVE_GCS_BUCKET": "",
             },
         )
@@ -97,9 +94,6 @@ class ArchiverCommandTests(CommandCase):
                 "--archive-root",
                 "--archive-durability",
                 "--store-id",
-                "--s3-bucket",
-                "--s3-region",
-                "--s3-expected-owner",
                 "--gcs-bucket",
             }
         )
@@ -187,23 +181,23 @@ class ArchiverCommandTests(CommandCase):
             run(run_archiver.main, self.archiver_arguments())
         self.assertIn("same filesystem", str(raised.exception))
 
-    def test_the_s3_backend_requires_its_environment(self) -> None:
+    def test_the_gcs_backend_requires_its_environment(self) -> None:
         with (
-            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "s3"}),
+            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "gcs"}),
             self.assertRaises(SystemExit) as raised,
         ):
             run(run_archiver.main, self.archiver_arguments())
-        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
+        self.assertIn("ARCHIVE_GCS_BUCKET", str(raised.exception))
 
-    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(
+    def test_a_live_gcs_option_is_refused_while_the_local_backend_is_selected(
         self,
     ) -> None:
         with (
-            mock.patch.dict(os.environ, {"ARCHIVE_S3_BUCKET": "oops"}),
+            mock.patch.dict(os.environ, {"ARCHIVE_GCS_BUCKET": "oops"}),
             self.assertRaises(SystemExit) as raised,
         ):
             run(run_archiver.main, self.archiver_arguments())
-        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
+        self.assertIn("ARCHIVE_GCS_BUCKET", str(raised.exception))
 
 
 class ReaperCommandTests(CommandCase):
@@ -221,7 +215,7 @@ class ReaperCommandTests(CommandCase):
             for option in action.option_strings
         }
         self.assertFalse(
-            options & {"--archive-backend", "--archive-root", "--s3-bucket"}
+            options & {"--archive-backend", "--archive-root", "--gcs-bucket"}
         )
 
     def test_the_default_run_deletes_nothing_and_reports_the_durability_gate(
@@ -292,23 +286,23 @@ class ReaperCommandTests(CommandCase):
         self.assertEqual(len(record["decisions"]), 1)
         self.assertEqual(record["decisions"][0]["decision"], "retained")
 
-    def test_the_s3_backend_requires_its_fields_through_the_real_cli(self) -> None:
+    def test_the_gcs_backend_requires_its_fields_through_the_real_cli(self) -> None:
         with (
-            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "s3"}),
+            mock.patch.dict(os.environ, {"ARCHIVE_BACKEND": "gcs"}),
             self.assertRaises(SystemExit) as raised,
         ):
             run(run_reaper.main, self.reaper_arguments())
-        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
+        self.assertIn("ARCHIVE_GCS_BUCKET", str(raised.exception))
 
-    def test_a_live_s3_option_is_refused_while_the_local_backend_is_selected(
+    def test_a_live_gcs_option_is_refused_while_the_local_backend_is_selected(
         self,
     ) -> None:
         with (
-            mock.patch.dict(os.environ, {"ARCHIVE_S3_BUCKET": "oops"}),
+            mock.patch.dict(os.environ, {"ARCHIVE_GCS_BUCKET": "oops"}),
             self.assertRaises(SystemExit) as raised,
         ):
             run(run_reaper.main, self.reaper_arguments())
-        self.assertIn("ARCHIVE_S3_BUCKET", str(raised.exception))
+        self.assertIn("ARCHIVE_GCS_BUCKET", str(raised.exception))
 
 
 if __name__ == "__main__":

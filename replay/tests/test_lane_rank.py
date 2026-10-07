@@ -52,7 +52,7 @@ class LaneRankParityTests(unittest.TestCase):
         )
 
     def test_the_table_is_the_one_the_spec_states(self):
-        # §1 of docs/SEALED_CAPTURE_PIPELINE_V1.md, transcribed independently of
+        # ingester/README.md (Orderings), transcribed independently of
         # either implementation so a matching pair of wrong tables still fails.
         self.assertEqual(
             LANE_RANK,

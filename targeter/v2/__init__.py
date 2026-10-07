@@ -1,6 +1,6 @@
 """Targeter v2: event-family discovery for cross-venue sports capture.
 
-Venue catalogues become a reviewed, scored shadow selection, which durable S3
+Venue catalogues become a reviewed, scored shadow selection, which durable
 archival and atomic publication then turn into the live splice target files.
 Field decoding lives in :mod:`targeter.v2.parsing`, grouped by grammar:
 ``esports`` for configured best-of game families, ``traditional`` for

@@ -3,7 +3,7 @@
 //! A capture lane writes UTC-aligned segments and commits each one with a
 //! checksummed sidecar. **The sidecar is the commit marker, not the `.ndjson`
 //! suffix** — a renamed data file with no seal is a crash between two steps of
-//! `docs/SEALED_CAPTURE_PIPELINE_V1.md` §3, and the writer's own recovery closes
+//! `splices/README.md` (Durable append: segments and seals), and the writer's own recovery closes
 //! that window. Until it does, the bytes are not evidence.
 //!
 //! This crate exists because two binaries need the same answers and must not

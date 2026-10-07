@@ -1,4 +1,4 @@
-//! The sealed-window finalizer: `docs/SEALED_CAPTURE_PIPELINE_V1.md` §5.
+//! The sealed-window finalizer: `ingester/README.md` (Finalization).
 //!
 //! `indexer-ingest` assigns positions in the order it reads files, which is
 //! capture order *within* a lane and meaningless *across* lanes — whole files are

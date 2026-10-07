@@ -26,7 +26,7 @@ python scripts/build_codec_fixtures.py            # records the Rust identity
 ```
 
 The payload is generated rather than captured: a fixture committed to a public
-repository must not carry venue payloads, and PHASE_4_RAW_ARCHIVE_REAPER_V1 §9.5
+repository must not carry venue payloads, and archive/README.md (Safety model)
 keeps real segments out of the tree. Its *shape* is an envelope so the
 compression ratio is representative.
 """

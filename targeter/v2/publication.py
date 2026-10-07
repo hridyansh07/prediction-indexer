@@ -106,10 +106,10 @@ def record_coverage(
 ) -> dict[str, int]:
     """First sightings for everything this generation subscribes.
 
-    v1 kept this ledger from its discovery loop (`targeter/run.py:236`) and v2
+    The legacy v1 targeter kept this ledger from its discovery loop and v2
     did not carry it across, which left `discovery_coverage` in `replay/legacy/gate1.py`
     with nothing to read: every subscribed asset reported uncovered. The measure
-    is coverage-from-inception (`docs/CAPTURE_SPEC.md` §6.1) — how much of a
+    is coverage-from-inception — how much of a
     market's life the tape actually contains — and for short-dated markets it is
     the difference between a usable dataset and a misleading one.
 

@@ -3,7 +3,7 @@
 `Spool.append` used to write, flush and sometimes `os.fsync` inline in the frame
 receive loop. An fsync there stalls the event loop, so the socket stops being
 read for its duration — and the whole reason for a fixed fsync interval is that
-fsync is slow. §4 of `docs/SEALED_CAPTURE_PIPELINE_V1.md` asks for the socket to
+fsync is slow. `splices/README.md` (Durable append) asks for the socket to
 keep receiving *during* an fsync, which an asyncio-only writer cannot provide:
 a coroutine calling `os.fsync` blocks the loop just as surely as the producer
 did. Hence a real thread.

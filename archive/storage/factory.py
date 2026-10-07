@@ -9,12 +9,10 @@ from typing import Iterable, Mapping
 from archive.storage.base import CONFORMANCE, INDEPENDENT, ObjectStore, ObjectStoreError
 from archive.storage.gcs import GCSObjectStore
 from archive.storage.local import LocalObjectStore
-from archive.storage.s3 import S3ObjectStore
 
-__all__ = ["GCS_BACKEND", "LOCAL_BACKEND", "S3_BACKEND", "build_store"]
+__all__ = ["GCS_BACKEND", "LOCAL_BACKEND", "build_store"]
 
 LOCAL_BACKEND = "local"
-S3_BACKEND = "s3"
 GCS_BACKEND = "gcs"
 
 
@@ -26,12 +24,10 @@ def build_store(
     """Build the configured backend or refuse an unsafe or ambiguous one."""
     configuration = os.environ if environ is None else environ
     backend = configuration.get("ARCHIVE_BACKEND", LOCAL_BACKEND)
-    if backend == S3_BACKEND:
-        return _build_s3_store(configuration)
     if backend == GCS_BACKEND:
         return _build_gcs_store(configuration)
     if backend != LOCAL_BACKEND:
-        raise SystemExit(f"ARCHIVE_BACKEND must be local, s3, or gcs; got {backend!r}")
+        raise SystemExit(f"ARCHIVE_BACKEND must be local or gcs; got {backend!r}")
     return _build_local_store(
         configuration, tuple(Path(path) for path in primary_roots)
     )
@@ -41,77 +37,15 @@ def _build_gcs_store(configuration: Mapping[str, str]) -> GCSObjectStore:
     bucket = configuration.get("ARCHIVE_GCS_BUCKET", "")
     if not bucket:
         raise SystemExit("ARCHIVE_BACKEND=gcs requires ARCHIVE_GCS_BUCKET")
-    live_s3_options = [
-        name
-        for name, value in (
-            ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
-            ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
-            (
-                "ARCHIVE_S3_EXPECTED_OWNER",
-                configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
-            ),
-        )
-        if value
-    ]
-    if live_s3_options:
-        raise SystemExit(
-            "ARCHIVE_BACKEND=gcs cannot be combined with " + ", ".join(live_s3_options)
-        )
     try:
         return GCSObjectStore(bucket)
     except (ValueError, ObjectStoreError) as error:
         raise SystemExit(f"invalid GCS archive configuration: {error}") from error
 
 
-def _build_s3_store(configuration: Mapping[str, str]) -> S3ObjectStore:
-    if configuration.get("ARCHIVE_GCS_BUCKET", ""):
-        raise SystemExit(
-            "ARCHIVE_BACKEND=s3 cannot be combined with ARCHIVE_GCS_BUCKET"
-        )
-    required = (
-        ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
-        ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
-        (
-            "ARCHIVE_S3_EXPECTED_OWNER",
-            configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
-        ),
-    )
-    missing = [name for name, value in required if not value]
-    if missing:
-        raise SystemExit(
-            f"ARCHIVE_BACKEND=s3 requires {', '.join(missing)}; the S3 adapter never infers "
-            "bucket, region, or account configuration."
-        )
-    try:
-        return S3ObjectStore(required[0][1], required[1][1], required[2][1])
-    except ValueError as error:
-        raise SystemExit(f"invalid S3 archive configuration: {error}") from error
-
-
 def _build_local_store(
     configuration: Mapping[str, str], primary_roots: tuple[Path, ...]
 ) -> LocalObjectStore:
-    live_s3_options = {
-        name: value
-        for name, value in (
-            ("ARCHIVE_S3_BUCKET", configuration.get("ARCHIVE_S3_BUCKET", "")),
-            ("ARCHIVE_S3_REGION", configuration.get("ARCHIVE_S3_REGION", "")),
-            (
-                "ARCHIVE_S3_EXPECTED_OWNER",
-                configuration.get("ARCHIVE_S3_EXPECTED_OWNER", ""),
-            ),
-        )
-        if value
-    }
-    if live_s3_options:
-        offered = ", ".join(
-            f"{name}={value!r}" for name, value in live_s3_options.items()
-        )
-        raise SystemExit(
-            f"ARCHIVE_BACKEND=local was selected but {offered} was also set. Refusing to "
-            "guess which backend is really wanted: set ARCHIVE_BACKEND=s3, or clear the "
-            "S3 options."
-        )
     if configuration.get("ARCHIVE_GCS_BUCKET", ""):
         raise SystemExit(
             "ARCHIVE_BACKEND=local was selected but ARCHIVE_GCS_BUCKET was also set. Set "

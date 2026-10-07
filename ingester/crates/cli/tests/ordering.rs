@@ -5,7 +5,7 @@
 //! constrains ordering at all — the sealed-pipeline work could have silently
 //! changed the global sequence with every suite still green.
 //!
-//! Phase 1 of `docs/SEALED_CAPTURE_PIPELINE_V1.md` §8 requires the defect be
+//! The sealed-capture design (`ingester/README.md`) requires the defect be
 //! demonstrated before the fix is accepted. Demonstrating it is pinning it: a
 //! test left failing until the phase 3 finalizer lands would sit red through the
 //! whole of phase 2 and hide anything else that broke in the meantime.

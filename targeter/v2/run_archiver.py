@@ -8,7 +8,7 @@ what authorizes deletion and there is none — so without this sweep those runs
 accumulate forever and local disk is not actually bounded.
 
 **This module cannot delete anything and must never learn how.**
-``archive/PHASE_4_RAW_ARCHIVE_REAPER_V1.md`` §7.1 keeps archival and deletion in
+``archive/README.md`` (Safety model) keeps archival and deletion in
 separate commands precisely so that uploading can never become the last step
 before deleting; ``AGENTS.md`` states the same rule.  A test asserts that this
 file imports no removal primitive.

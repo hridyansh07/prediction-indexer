@@ -17,7 +17,7 @@ decided by the backend's declared durability class, never by a flag at the call
 site.
 
 The production shape is normative and comes from
-`ZSTD_MATERIALIZATION_PIPELINE_V1.md` §3.3. Field names, lowercase hex digests,
+`encoder/README.md` (Two identities) and `archive/FORMATS.md`. Field names, lowercase hex digests,
 integer byte counts and UTC Unix nanoseconds are all part of the contract, so
 this module both writes and re-validates it rather than trusting the writer.
 

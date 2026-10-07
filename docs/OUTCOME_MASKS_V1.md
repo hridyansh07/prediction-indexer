@@ -397,13 +397,13 @@ provider. Strategies must not describe a payoff as locked without that label.
 - [`STRATEGY_PREPARATION_V1.md`](STRATEGY_PREPARATION_V1.md): replace "No …
   outcome masks … is performed" with a pointer here; document snapshot version 2
   and the `outcomes` source.
-- [`EVENT_UNIVERSE_STORE_V1.md`](EVENT_UNIVERSE_STORE_V1.md) §8: add the
+- [`universe/README.md`](../universe/README.md): add the
   endpoint row.
 - [`ECONOMIC_STRATEGY_SDK_V1.md`](ECONOMIC_STRATEGY_SDK_V1.md) §12: close the
   outcome-mask open item with a pointer here.
 - [`AGENTS.md`](../AGENTS.md) §4: add a row: "Outcome masks for replay
   strategies" → this document, then
-  `analysis/MARKET_RELATIONSHIP_GRAPH.md` and the preparation spec.
+  `analysis/README.md` and the preparation spec.
 - `replay/README.md`: one line on `outcome_scope`.
 
 ## 7. Tests

@@ -49,14 +49,14 @@ sequence!(
      and **not event order**: whole files are consumed atomically, so a record \
      received between two records of another lane sequences after both. Never \
      read it as time; sort on `visible_ns` for that. \
-     `docs/SEALED_CAPTURE_PIPELINE_V1.md` §5 defines the merged order that \
+     `ingester/README.md` (Orderings) defines the merged order that \
      replaces it."
 );
 
 sequence!(
     CanonicalSeq,
     "Global position of one captured line in the **merged** order — the \
-     `EvidenceSeq` of `docs/SEALED_CAPTURE_PIPELINE_V1.md` §5, assigned by the \
+     `EvidenceSeq` of `ingester/README.md` (Orderings), assigned by the \
      finalizer from `(visible_ns, lane_rank, delivery_index)` and equal to the \
      line ordinal of the canonical evidence file. \
      \

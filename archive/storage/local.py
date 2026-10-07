@@ -1,7 +1,7 @@
 """The immutable local object-store implementation.
 
 The write-side protocol is deliberately much smaller than an S3 client
-(`PHASE_4_RAW_ARCHIVE_REAPER_V1.md` §5.1):
+(`archive/README.md`, Object-store contract):
 
 ```text
 put_immutable(key, reader, expected_identity) -> ObjectMetadata

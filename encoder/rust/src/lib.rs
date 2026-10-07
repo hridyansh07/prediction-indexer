@@ -3,7 +3,7 @@
 //! The mirror of `encoder/compression.py`, field for field and rule for rule.
 //! Two implementations exist because the archiver is Python and the finalizer is
 //! Rust; they are *not* required to emit identical bytes, and
-//! `encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md` §2.1 says so explicitly. What they
+//! `encoder/README.md` (The format) says so explicitly. What they
 //! are required to do is decode one another's frames to byte-identical NDJSON,
 //! which the committed `roundtrip_v1` fixtures prove in both directions without
 //! either test suite shelling out to the other toolchain.

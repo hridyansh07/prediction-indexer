@@ -29,7 +29,7 @@ __all__ = ["LANE_RANK", "PARTITION_PREFIXES", "LaneError", "lane_of", "lane_rank
 PARTITION_PREFIXES = ("lane=", "venue=")
 
 #: Tie-break order for records sharing an exact `visible_ns`, from
-#: `docs/SEALED_CAPTURE_PIPELINE_V1.md` §1. Lower wins.
+#: `ingester/README.md` (Orderings). Lower wins.
 #:
 #: **This is a serialization rule, not evidence that one venue moved first.** The
 #: canonical file needs a total order so its bytes and `EvidenceSeq` are

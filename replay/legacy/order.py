@@ -163,7 +163,7 @@ def _sort_key(item: OrderedEnvelope) -> tuple[object, ...]:
     canonical evidence resolve an exact timestamp collision the same way.
 
     This used to sort ties on `(venue, lane)` as plain ascending strings, which
-    disagreed with `docs/SEALED_CAPTURE_PIPELINE_V1.md` §1 in two places. The
+    disagreed with `ingester/README.md` (Orderings) in two places. The
     obvious one is venue order: alphabetically Polymarket sorts last where §1
     ranks it first. The quieter one is inside Polymarket — all four of its lanes
     carry `venue: polymarket`, so the `venue` term never separated them and the

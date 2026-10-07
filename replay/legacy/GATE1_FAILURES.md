@@ -180,8 +180,8 @@ complete. That is the same footgun already fixed for kalshi.
 Observed: `subscribed_assets: 453`, `covered_assets: 0`.
 
 Targeter v1 maintained a coverage ledger from its discovery loop
-(`targeter/run.py:236`); v2 shipped without one, so coverage-from-inception —
-`docs/CAPTURE_SPEC.md` §6.1, how much of a market's life the tape contains — was not
+(in the since-removed v1 loop); v2 shipped without one, so coverage-from-inception —
+how much of a market's life the tape contains — was not
 being measured at all.
 
 `publish_run` now records first sightings, and `scripts/backfill_coverage.py`

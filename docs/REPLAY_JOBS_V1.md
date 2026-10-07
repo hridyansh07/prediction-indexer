@@ -10,7 +10,7 @@ Builds on [`REPLAY_SUPERVISOR_V1.md`](REPLAY_SUPERVISOR_V1.md),
 [`REPLAY_STREAMS_V1.md`](REPLAY_STREAMS_V1.md),
 [`engine/README.md`](../engine/README.md) (composite normalizer,
 `materialize_range`),
-[`ZSTD_MATERIALIZATION_PIPELINE_V1.md`](../encoder/ZSTD_MATERIALIZATION_PIPELINE_V1.md)
+[`encoder/README.md`](../encoder/README.md)
 (canonical archive), and the `ObjectStore` contract in
 `archive/storage/base.py`.
 
@@ -751,7 +751,7 @@ the bundle cache's pin-inspection API.
    read-time integrity root: the walker's `open_pinned` re-hashes only the
    receipt and manifest and checks frames, lengths, LF counts, ordering and
    line semantics without re-hashing data bytes or re-encoding lines (see
-   `VERIFIED_DERIVATIVE_WALKER_V1.md`, "Read-time integrity contract"). Return
+   `engine/DERIVATIVES.md`, "Read-time integrity"). Return
    `BundleReady` with the ordered pins. A warm hit never invokes
    materialization.
 
