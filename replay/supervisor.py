@@ -300,12 +300,15 @@ def validate(config):
         require(type(s["revision"]) is str and bool(s["revision"]))
     limits = obj(
         config["limits"],
-        "attempts no_progress progress_margin stall_seconds attempt_seconds run_seconds poll_seconds stop_seconds",
+        "attempts no_progress progress_margin stall_seconds attempt_seconds run_seconds poll_seconds stop_seconds"
+        + (" state_bytes" if "state_bytes" in config["limits"] else ""),
     )
     for k, v in limits.items():
         require(type(v) in (int, float) and math.isfinite(v) and v > 0)
         if k in ("attempts", "no_progress", "progress_margin"):
             require(type(v) is int)
+        if k == "state_bytes":
+            require(type(v) is int and v <= 1024**3, "state_bytes bound")
     require(
         limits["poll_seconds"]
         < limits["stall_seconds"]

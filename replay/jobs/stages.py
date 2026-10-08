@@ -681,6 +681,8 @@ def supervisor_config(
             )
         },
     }
+    if "state_bytes" in preset:
+        document["limits"]["state_bytes"] = preset["state_bytes"]
     try:
         validate_supervisor(document)
     except OSError as error:

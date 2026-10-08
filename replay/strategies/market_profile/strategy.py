@@ -12,6 +12,7 @@ from replay.strategies import canonical_reference
 
 from replay.economic_intervals import CutClock
 from replay.economic_sdk.bounds import MAX_METADATA
+from replay.economic_sdk import bounds
 from replay.economic_sdk.profile import (
     STRATEGY,
     TRANSITIONS_FILE,
@@ -43,8 +44,10 @@ class MarketProfile:
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
         self.clock = CutClock(self.snapshot)
+        budget = bounds.StateBudget(context.get("limits", {}).get("state_bytes", bounds.MAX_STATE))
+        budget.charge(bounds.json_cost(self.snapshot) + bounds.json_cost(self.policy))
         self.collector = Collector(self.policy, self.snapshot, self.input.sha256, self.root,
-                                   self.experiment_sha256, standalone=True)
+                                   self.experiment_sha256, budget=budget, standalone=True)
         self.sequence = -1
         self.terminal = self.finished = self.poisoned = False
 

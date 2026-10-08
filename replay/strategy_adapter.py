@@ -30,6 +30,7 @@ def execute(root, attempt, group):
             "group": group,
             "identity": identity(config),
             "config": spec["config"],
+            "limits": config["limits"],
             "output_directory": str(directory / "output"),
         }
     )

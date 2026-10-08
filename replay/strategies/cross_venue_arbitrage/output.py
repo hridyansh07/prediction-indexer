@@ -254,7 +254,7 @@ def check_manifest(value, snapshot, complete):
         require(type(amount) is int and 0 <= amount <= 2 ** 64 - 1, "instantaneous positive count")
 
 
-def validate_content(directory, snapshot, manifest, bridge=None):
+def validate_content(directory, snapshot, manifest, bridge=None, *, state_bytes=128 * 1024**2):
     """Read one output; a policy 3 (fill checks) output needs the configured fee ``bridge``."""
     check_manifest(manifest, snapshot, "summary_sha256" in manifest)
     if bridge is not None:
@@ -265,10 +265,10 @@ def validate_content(directory, snapshot, manifest, bridge=None):
         from replay.economic_sdk.profile_reader import validate_profile
         strategy.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"], strategy.experiment.profile,
                                                     manifest["experiment_sha256"], manifest["snapshot_sha256"])
-    return aggregate_reader.validate(directory, snapshot, manifest, strategy)
+    return aggregate_reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256, bridge=None):
+def read_provisional(directory, snapshot_directory, *, expected_sha256, bridge=None, state_bytes=128 * 1024**2):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = read_json(root / "manifest.json")
@@ -281,7 +281,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256, bridge=N
     for field in ("run_id", "attempt_id", "group"):
         require(type(receipt[field]) is str and 0 < len(receipt[field]) <= 128, "receipt identifiers")
     require(type(receipt["terminal"]) is int and receipt["terminal"] >= 2, "terminal sequence")
-    summary = validate_content(root, snapshot, manifest, bridge)
+    summary = validate_content(root, snapshot, manifest, bridge, state_bytes=state_bytes)
     require(encoded(summary) == encoded(read_json(root / "summary.json")) and digest(summary) == manifest["summary_sha256"],
             "summary identity/schema")
     return {"receipt": receipt, "manifest": manifest, "summary": summary}
@@ -299,7 +299,8 @@ def read_completed(run_directory, group):
     inputs = Inputs(spec["config"])
     inputs.prepared.bind(freeze(initial(config)))
     result = read_provisional(root / success["outputs"][group], spec["config"]["snapshot_directory"],
-                              expected_sha256=spec["config"]["snapshot_sha256"], bridge=inputs.bridge)
+                              expected_sha256=spec["config"]["snapshot_sha256"], bridge=inputs.bridge,
+                              state_bytes=config["limits"].get("state_bytes", 128 * 1024**2))
     require(result["manifest"]["experiment_sha256"] == inputs.identity and
             result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity, "configured identity")
     require({k: result["receipt"][k] for k in ("identity", "attempt_id", "group", "run_id", "terminal")} ==

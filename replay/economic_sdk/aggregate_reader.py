@@ -321,7 +321,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
             require(best == _level(value["kill_best"]), "fill end book kill level")
 
 
-def validate(directory, snapshot, manifest, strategy):
+def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_STATE):
     experiment = replace(strategy.experiment, layout=manifest_layout(manifest))
     check_experiment(experiment)
     snapshot = plain(snapshot)
@@ -336,7 +336,7 @@ def validate(directory, snapshot, manifest, strategy):
     edges = experiment.skew_edges_ns
     statuses = set(SDK_STATUSES + ADMISSIONS + experiment.diagnostic_statuses)
     end_reasons = (set(SDK_STATUSES + experiment.diagnostic_statuses) - {EVALUATED}) | {"PREDICATE_FALSE"}
-    budget = Budget(snapshot, manifest, experiment.policy)
+    budget = Budget(snapshot, manifest, experiment.policy, limit=state_bytes)
 
     def bucket_of(spread):
         return next((i for i, edge in enumerate(edges) if spread < edge), len(edges))

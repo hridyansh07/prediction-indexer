@@ -119,10 +119,10 @@ class CrossVenueArbitrage(CrossVenueReader):
                 "outcomes_provider": self.snapshot.get("outcomes", {}).get("provider"),
                 "valuation": self.valuation}
 
-    def validate(self, directory, snapshot, manifest):
+    def validate(self, directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
         from replay.streams.protocol import require
         require(self.bound, "missing initial")
-        return validate_content(directory, snapshot, manifest, self.bridge)
+        return validate_content(directory, snapshot, manifest, self.bridge, state_bytes=state_bytes)
 
 
 build = factory(CrossVenueArbitrage)

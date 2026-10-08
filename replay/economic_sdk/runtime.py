@@ -125,6 +125,10 @@ class Runtime:
         # Fill mode (spec §13): the trigger kind's episodes are priced fills.
         self.fill = experiment.fills
         self.snapshot = strategy.snapshot
+        self.state_bytes = context.get("limits", {}).get("state_bytes", bounds.MAX_STATE)
+        self.budget = bounds.StateBudget(self.state_bytes)
+        self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
+                           + bounds.json_cost(experiment.policy))
         self.root = Path(context["output_directory"])
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
@@ -137,7 +141,7 @@ class Runtime:
                           for name in files if name.endswith(".ndjson")
                           and name not in ("descriptors.ndjson", "entities.ndjson", "reasons.ndjson"))
         self.plans = {(p["instrument"], p["orientation"]): plain(p) for p in self.snapshot["plans"]}
-        self.entity_table_bytes = preflight(strategy, self.snapshot, self.plans)
+        self.entity_table_bytes = preflight(strategy, self.snapshot, self.plans, state_bytes=self.state_bytes)
         self.writers = {}
         for name in names:
             path = self.root / name
@@ -146,9 +150,6 @@ class Runtime:
                                             max_records=bounds.MAX_ROWS,
                                             max_line_bytes=bounds.MAX_LINE)
         self.clock = CutClock(self.snapshot)
-        self.budget = bounds.StateBudget()
-        self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
-                           + bounds.json_cost(experiment.policy))
 
         requirements = strategy.requirements(self.snapshot, experiment.policy)
         self.builders = {}
@@ -1054,7 +1055,7 @@ class Runtime:
                 for leaf in ("descriptors.ndjson", "entities.ndjson"):
                     name = group + leaf
                     tables[name] = write_rows(self.root, name, table3_rows(
-                        self.strategy, self.snapshot, self.plans, group, leaf),
+                        self.strategy, self.snapshot, self.plans, group, leaf, state_bytes=self.state_bytes),
                         expected_size=self.entity_table_bytes[name])
                 continue
             name = group + "entities.json"
@@ -1086,7 +1087,7 @@ class Runtime:
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
             self.memo.clear(); self.reasons.clear()
             self.budget = None
-            summary = strategy.validate(self.root, snapshot, manifest)
+            summary = strategy.validate(self.root, snapshot, manifest, state_bytes=self.state_bytes)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")
             if not self.legacy:
                 for name, control in summary.get("controls", {}).items():

@@ -552,7 +552,9 @@ Recursive size accounting is replaced by **count-based bounds**.
   - entities × kinds open episodes;
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
-  - the 128 MiB detached-state limit;
+  - per-run `limits.state_bytes` (default 128 MiB, at most 1 GiB), passed
+    to collectors, table preflight and aggregate readers; it is not part
+    of the experiment or semantic identity;
   - the file, line and row limits of the complement spec.
 
   Exceeding any cap fails the attempt. Nothing is truncated.

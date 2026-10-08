@@ -11,7 +11,7 @@ from replay.strategy_sdk import plain
 from .common import import_name, name, path, positive, read_json, sha
 
 LIMITS = {'attempts', 'no_progress', 'progress_margin', 'stall_seconds',
-          'attempt_seconds', 'run_seconds', 'poll_seconds', 'stop_seconds'}
+          'attempt_seconds', 'run_seconds', 'poll_seconds', 'stop_seconds', 'state_bytes'}
 TOKEN = re.compile(r'\{([^{}]*)\}')
 TOKENS = {'context', 'snapshot_sha256', 'fees', 'catalog_identity', 'output'}
 FIELDS = 'version image redis base_run_config context_directory fee_catalog_directory mounts limits groups'
@@ -71,8 +71,10 @@ def validate_run_spec(spec, *, check_paths=True):
     require(type(spec['limits']) is dict and not set(spec['limits']) - LIMITS, 'closed limits overrides')
     for key, value in spec['limits'].items():
         positive(value)
-        if key in {'attempts', 'no_progress', 'progress_margin'}:
+        if key in {'attempts', 'no_progress', 'progress_margin', 'state_bytes'}:
             require(type(value) is int, 'integer limit required')
+        if key == 'state_bytes':
+            require(value <= 1024**3, 'state_bytes bound')
     require(type(spec['groups']) is list and 0 < len(spec['groups']) <= 128, 'groups required')
     names = []
     for group in spec['groups']:
@@ -99,11 +101,13 @@ def base_config(value):
     obj(value, 'version publisher python transport strategies limits')
     require(type(value['version']) is int and value['version'] == 1, 'base run version')
     require(type(value['transport']) is dict and type(value['strategies']) is dict, 'base run objects required')
-    obj(value['limits'], ' '.join(sorted(LIMITS)))
+    obj(value['limits'], ' '.join(sorted(LIMITS if 'state_bytes' in value['limits'] else LIMITS - {'state_bytes'})))
     for key, val in value['limits'].items():
         positive(val)
-        if key in {'attempts', 'no_progress', 'progress_margin'}:
+        if key in {'attempts', 'no_progress', 'progress_margin', 'state_bytes'}:
             require(type(val) is int, 'integer limit required')
+        if key == 'state_bytes':
+            require(val <= 1024**3, 'state_bytes bound')
     return value
 
 

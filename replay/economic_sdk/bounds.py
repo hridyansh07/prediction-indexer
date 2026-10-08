@@ -112,6 +112,7 @@ class StateBudget:
     """Running total of retained detached bytes, checked before retention."""
 
     def __init__(self, limit=MAX_STATE):
+        require(type(limit) is int and 0 < limit <= 1024**3, "state_bytes must be 1..1073741824")
         self.limit = limit
         self.used = 0
 

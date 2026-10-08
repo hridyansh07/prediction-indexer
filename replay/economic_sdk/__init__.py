@@ -72,7 +72,7 @@ class Strategy:
     def manifest(self, files, instantaneous):
         raise NotImplementedError
 
-    def validate(self, directory, snapshot, manifest):
+    def validate(self, directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
         raise NotImplementedError
 
     # -- reader hooks ----------------------------------------------------------

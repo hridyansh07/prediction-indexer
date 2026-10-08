@@ -159,9 +159,9 @@ class SameVenueComplement(ComplementReader):
                 "instantaneous_positive": instantaneous,
                 "payout_assumption": "unit_complement_assumption_not_resolution_proof"}
 
-    def validate(self, directory, snapshot, manifest):
+    def validate(self, directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
         require(self.bound, "missing initial")
-        return validate_content(directory, snapshot, manifest)
+        return validate_content(directory, snapshot, manifest, state_bytes=state_bytes)
 
 
 def _opposite(leg):

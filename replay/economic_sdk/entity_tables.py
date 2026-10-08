@@ -47,9 +47,9 @@ def indexed_rows(strategy, snapshot, plans, group):
             yield {"scope": scope, "entity": index, "hash": row["hash"]}
 
 
-def descriptor_rows(strategy, snapshot, plans, group):
+def descriptor_rows(strategy, snapshot, plans, group, *, state_bytes=bounds.MAX_STATE):
     """One bounded descriptor cache, not one descriptor copy per scope."""
-    distinct, budget = {}, bounds.StateBudget()
+    distinct, budget = {}, bounds.StateBudget(state_bytes)
     for scope in range(len(snapshot["scopes"])):
         entities = resolve(strategy, snapshot, scope, plans)
         for row in entity_rows(entities, group):
@@ -64,9 +64,10 @@ def descriptor_rows(strategy, snapshot, plans, group):
         yield distinct[key]
 
 
-def table3_rows(strategy, snapshot, plans, group, name):
-    return (descriptor_rows if name == "descriptors.ndjson" else indexed_rows)(
-        strategy, snapshot, plans, group)
+def table3_rows(strategy, snapshot, plans, group, name, *, state_bytes=bounds.MAX_STATE):
+    if name == "descriptors.ndjson":
+        return descriptor_rows(strategy, snapshot, plans, group, state_bytes=state_bytes)
+    return indexed_rows(strategy, snapshot, plans, group)
 
 
 def write_rows(root, name, rows, *, expected_size=None):
@@ -82,7 +83,7 @@ def write_rows(root, name, rows, *, expected_size=None):
         writer.stream.close()
 
 
-def preflight(strategy, snapshot=None, plans=None):
+def preflight(strategy, snapshot=None, plans=None, *, state_bytes=bounds.MAX_STATE):
     """Return exact bytes per table; fail before creating any output file.
 
     Layout 1 has no entity table and keeps its frozen output behavior.
@@ -97,7 +98,7 @@ def preflight(strategy, snapshot=None, plans=None):
         if strategy.experiment.layout == 3:
             for leaf in ("descriptors.ndjson", "entities.ndjson"):
                 size = count = 0
-                for row in table3_rows(strategy, snapshot, plans, group, leaf):
+                for row in table3_rows(strategy, snapshot, plans, group, leaf, state_bytes=state_bytes):
                     length = len(encoded(row)) + 1
                     require(length <= bounds.MAX_LINE, "entity table line budget")
                     count += 1
