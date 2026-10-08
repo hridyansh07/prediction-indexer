@@ -22,14 +22,45 @@ fn cli_config_io_is_nonretryable() {
 }
 
 fn fixture() -> Fixture {
+    fn timed(event: SegmentEvent) -> SegmentEvent {
+        let time = Some(
+            VenueTime::new(
+                Some(1),
+                Some(Resolution::Microsecond),
+                Some(EventKind::ExchangeEvent),
+                Some(2),
+            )
+            .unwrap(),
+        );
+        match event {
+            SegmentEvent::Book(BookEvent::Full(v)) => {
+                SegmentEvent::Book(BookEvent::Full(v.with_venue_time(time)))
+            }
+            SegmentEvent::Book(BookEvent::Delta(v)) => {
+                SegmentEvent::Book(BookEvent::Delta(v.with_venue_time(time)))
+            }
+            _ => panic!(),
+        }
+    }
     let trade = |q| {
-        SegmentEvent::Trade(TradeEvent::new(
-            id("kalshi:A"),
-            ContractOrientation::Outcome,
-            ConditionalMarketPrice::from_atoms(37, scale(2)).unwrap(),
-            qty(q),
-            Some(Side::Ask),
-        ))
+        SegmentEvent::Trade(
+            TradeEvent::new(
+                id("kalshi:A"),
+                ContractOrientation::Outcome,
+                ConditionalMarketPrice::from_atoms(37, scale(2)).unwrap(),
+                qty(q),
+                Some(Side::Ask),
+            )
+            .with_venue_time(Some(
+                VenueTime::new(
+                    Some(9007199254740993),
+                    Some(Resolution::Millisecond),
+                    Some(EventKind::ExchangeEvent),
+                    None,
+                )
+                .unwrap(),
+            )),
+        )
     };
     Fixture::new(
         0,
@@ -40,7 +71,7 @@ fn fixture() -> Fixture {
                 "x",
                 1,
                 vec![
-                    full("kalshi:A", &[(17, 3), (37, 11)], &[(83, 2)]),
+                    timed(full("kalshi:A", &[(17, 3), (37, 11)], &[(83, 2)])),
                     full("kalshi:B", &[(21, 6)], &[]),
                 ],
             ),
@@ -48,7 +79,7 @@ fn fixture() -> Fixture {
                 "x",
                 2,
                 vec![
-                    delta("kalshi:A", 37, LevelChange::Increase(qty(3))),
+                    timed(delta("kalshi:A", 37, LevelChange::Increase(qty(3)))),
                     trade(5),
                     delta("kalshi:A", 37, LevelChange::Decrease(qty(7))),
                     trade(9),

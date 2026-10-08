@@ -165,7 +165,8 @@ def _validate_input_binding(pin, descriptor):
     )
     require(
         receipt["receipt_version"] == 2
-        and receipt["normalized_schema_version"] == 3
+        and type(receipt["normalized_schema_version"]) is int
+        and receipt["normalized_schema_version"] in (3, 4)
         and receipt["materializer_version"] == 2,
         "pinned derivative is not source-evidence profile 2",
     )
@@ -179,7 +180,8 @@ def _validate_input_binding(pin, descriptor):
     )
     require(
         manifest["manifest_version"] == 2
-        and manifest["normalized_schema_version"] == 3
+        and type(manifest["normalized_schema_version"]) is int
+        and manifest["normalized_schema_version"] == receipt["normalized_schema_version"]
         and manifest["materializer_version"] == 2
         and type(manifest["event_serialization_version"]) is int
         and manifest["event_serialization_version"] == 1

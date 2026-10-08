@@ -1,7 +1,7 @@
 //! Validated venue events. Delivery and envelope checks belong in message.rs.
 use replay_domain::{
-    AuditAnchor, BookDelta, BookEvent, BookStateHash, ContractOrientation, FullBook, InstrumentId,
-    Level, LevelChange, SegmentEvent, Sha1, Side, TradeEvent,
+    AuditAnchor, BookDelta, BookEvent, BookStateHash, ContractOrientation, EventKind, FullBook,
+    InstrumentId, Level, LevelChange, Resolution, SegmentEvent, Sha1, Side, TradeEvent, VenueTime,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -74,7 +74,8 @@ impl Snapshot {
             hash,
             Some(observed_ns),
         )
-        .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?;
+        .map_err(|_| Reject::for_instrument("invalid_snapshot_levels", instrument))?
+        .with_venue_time(millisecond_time(timestamp_ms, EventKind::BookAsOf));
         Ok(Self { event })
     }
 }
@@ -197,12 +198,13 @@ impl PriceChange {
         object.fields(wire::CHANGE_FIELDS, config.accept_additive_fields)?;
         expect_event_type(object, "price_change")?;
         validate_market(object.required("market")?).map_err(Reject::new)?;
-        timestamp(object.required("timestamp")?).map_err(Reject::new)?;
+        let timestamp_ms = timestamp(object.required("timestamp")?).map_err(Reject::new)?;
         let changes = object
             .required("price_changes")?
             .as_array()
             .ok_or_else(|| Reject::new("invalid_price_changes"))?;
         let mut events = Vec::with_capacity(changes.len());
+        let venue_time = millisecond_time(timestamp_ms, EventKind::BookUpdate);
         for value in changes {
             let change = value.object("price_change_not_object")?;
             change.fields(wire::CHILD_FIELDS, config.accept_additive_fields)?;
@@ -241,7 +243,8 @@ impl PriceChange {
                     level_change,
                     Some(hash),
                 )
-                .map_err(|_| Reject::for_instrument("invalid_delta", instrument))?,
+                .map_err(|_| Reject::for_instrument("invalid_delta", instrument))?
+                .with_venue_time(venue_time),
             );
         }
         Ok(Self { events })
@@ -289,7 +292,7 @@ impl Trade {
         let instrument = instrument(object.required("asset_id")?)?;
         validate_market(object.required("market")?)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
-        timestamp(object.required("timestamp")?)
+        let timestamp_ms = timestamp(object.required("timestamp")?)
             .map_err(|code| Reject::for_instrument(code, instrument.clone()))?;
         optional_unsigned_decimal(object.get("fee_rate_bps"), "invalid_fee_rate")?;
         optional_hash256(object.get("transaction_hash"), "invalid_transaction_hash")?;
@@ -322,7 +325,8 @@ impl Trade {
                 price,
                 quantity,
                 Some(aggressor),
-            ),
+            )
+            .with_venue_time(millisecond_time(timestamp_ms, EventKind::TradeReport)),
         })
     }
 }
@@ -427,6 +431,19 @@ pub(crate) fn timestamp(value: &Value) -> Result<u64, &'static str> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or("invalid_source_time")
+}
+
+fn millisecond_time(ms: u64, kind: EventKind) -> Option<VenueTime> {
+    match ms.checked_mul(1_000_000) {
+        Some(ns) => Some(
+            VenueTime::new(Some(ns), Some(Resolution::Millisecond), Some(kind), None)
+                .expect("validated millisecond annotation"),
+        ),
+        None => {
+            eprintln!("polymarket-normalizer/v4: diagnostic=event_time_overflow");
+            None
+        }
+    }
 }
 
 fn optional_price(

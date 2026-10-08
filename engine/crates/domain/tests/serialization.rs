@@ -101,7 +101,7 @@ fn record() -> SegmentRecord {
 #[test]
 fn canonical_json_matches_the_golden_vector_and_round_trips() {
     let expected = concat!(
-        "{\"schema_version\":3,\"header\":{\"order_ns\":1785409600000000000,",
+        "{\"schema_version\":4,\"header\":{\"order_ns\":1785409600000000000,",
         "\"visible_ns\":1785409600000000000,\"visible_tie_group\":7,",
         "\"address\":{\"canonical_seq\":42,\"lane\":\"lane-book-a\",",
         "\"delivery_index\":9001,\"event_index\":3},\"record_id\":\"record-42\",",
@@ -113,12 +113,122 @@ fn canonical_json_matches_the_golden_vector_and_round_trips() {
         "\"side\":\"bid\",\"price\":{\"atoms\":5100,\"scale\":4,",
         "\"unit\":\"quote_per_contract\"},\"change\":{\"kind\":\"decrease\",",
         "\"value\":{\"atoms\":250,\"scale\":2,\"unit\":\"contracts\"}},",
-        "\"book_hash\":{\"algorithm\":\"sha1\",\"digest\":\"0123456789abcdef0123456789abcdef01234567\"}}}}}"
+        "\"book_hash\":{\"algorithm\":\"sha1\",\"digest\":\"0123456789abcdef0123456789abcdef01234567\"},\"venue_time\":null}}}}"
     );
     assert_eq!(record().to_canonical_json(), expected.as_bytes());
     assert_eq!(
         SegmentRecord::from_canonical_json(expected.as_bytes()).unwrap(),
         record()
+    );
+}
+
+#[test]
+fn schema3_book_and_trade_records_preserve_their_closed_canonical_bytes() {
+    let original = record();
+    let events = [
+        original.event().clone(),
+        SegmentEvent::Book(BookEvent::Full(
+            FullBook::new(
+                InstrumentId::new("kalshi:OLD").unwrap(),
+                ContractOrientation::Outcome,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .unwrap(),
+        )),
+        SegmentEvent::Trade(replay_domain::TradeEvent::new(
+            InstrumentId::new("kalshi:OLD").unwrap(),
+            ContractOrientation::Outcome,
+            ConditionalMarketPrice::parse("0.5", scale(1)).unwrap(),
+            PositiveQty::parse("1", scale(0)).unwrap(),
+            None,
+        )),
+    ];
+    for event in events {
+        let new = SegmentRecord::new(original.header().clone(), event).unwrap();
+        let old = String::from_utf8(new.to_canonical_json())
+            .unwrap()
+            .replace("\"schema_version\":4", "\"schema_version\":3")
+            .replace(",\"venue_time\":null", "");
+        for decoded in [
+            SegmentRecord::from_json(old.as_bytes()).unwrap(),
+            SegmentRecord::from_canonical_json(old.as_bytes()).unwrap(),
+        ] {
+            assert_eq!(decoded.schema_version(), 3);
+            assert_eq!(decoded.header(), new.header());
+            assert_eq!(decoded.event(), new.event());
+            assert_eq!(decoded.to_canonical_json(), old.as_bytes());
+        }
+        let invalid_old = String::from_utf8(new.to_canonical_json())
+            .unwrap()
+            .replace("\"schema_version\":4", "\"schema_version\":3");
+        assert!(SegmentRecord::from_json(invalid_old.as_bytes()).is_err());
+        assert!(SegmentRecord::from_canonical_json(invalid_old.as_bytes()).is_err());
+        let missing_new = String::from_utf8(new.to_canonical_json())
+            .unwrap()
+            .replace(",\"venue_time\":null", "");
+        assert!(SegmentRecord::from_json(missing_new.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn venue_time_roundtrips_and_rejects_invalid_annotations_in_both_readers() {
+    use replay_domain::{EventKind, Resolution, VenueTime};
+    let SegmentEvent::Book(BookEvent::Delta(delta)) = record().event().clone() else {
+        panic!()
+    };
+    let time = VenueTime::new(
+        Some(1669149841123456000),
+        Some(Resolution::Microsecond),
+        Some(EventKind::ExchangeEvent),
+        Some(1669149841130000000),
+    )
+    .unwrap();
+    let annotated = SegmentRecord::new(
+        record().header().clone(),
+        SegmentEvent::Book(BookEvent::Delta(delta.with_venue_time(Some(time)))),
+    )
+    .unwrap();
+    let canonical = String::from_utf8(annotated.to_canonical_json()).unwrap();
+    assert!(canonical.contains("\"event_ns\":1669149841123456000,\"event_resolution\":\"microsecond\",\"event_kind\":\"exchange_event\",\"sent_ns\":1669149841130000000"));
+    assert_eq!(
+        SegmentRecord::from_canonical_json(canonical.as_bytes()).unwrap(),
+        annotated
+    );
+    assert_eq!(
+        SegmentRecord::from_json(canonical.as_bytes()).unwrap(),
+        annotated
+    );
+    let plain = String::from_utf8(record().to_canonical_json()).unwrap();
+    for invalid in [
+        r#"{"event_ns":null,"event_resolution":null,"event_kind":null,"sent_ns":null}"#,
+        r#"{"event_ns":null,"event_resolution":"millisecond","event_kind":null,"sent_ns":1}"#,
+        r#"{"event_ns":1,"event_resolution":null,"event_kind":"book_update","sent_ns":null}"#,
+        r#"{"event_ns":1,"event_resolution":"millisecond","event_kind":null,"sent_ns":null}"#,
+        r#"{"event_ns":1,"event_resolution":"nanosecond","event_kind":"book_update","sent_ns":null}"#,
+        r#"{"event_ns":1,"event_resolution":"millisecond","event_kind":"match","sent_ns":null}"#,
+        r#"{"event_ns":1,"event_resolution":"millisecond","event_kind":"book_update","sent_ns":null,"unknown":1}"#,
+        r#"{"event_ns":1,"event_resolution":"millisecond","event_kind":"book_update"}"#,
+        r#"{"event_ns":1,"event_ns":2,"event_resolution":"millisecond","event_kind":"book_update","sent_ns":null}"#,
+        r#"{"event_ns":18446744073709551616,"event_resolution":"millisecond","event_kind":"book_update","sent_ns":null}"#,
+        r#"{"event_ns":"1","event_resolution":"millisecond","event_kind":"book_update","sent_ns":null}"#,
+    ] {
+        let invalid = plain.replace("\"venue_time\":null", &format!("\"venue_time\":{invalid}"));
+        assert!(
+            SegmentRecord::from_json(invalid.as_bytes()).is_err(),
+            "{invalid}"
+        );
+        assert!(
+            SegmentRecord::from_canonical_json(invalid.as_bytes()).is_err(),
+            "{invalid}"
+        );
+    }
+    let sent_only = VenueTime::new(None, None, None, Some(7)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<VenueTime>(&serde_json::to_string(&sent_only).unwrap()).unwrap(),
+        sent_only
     );
 }
 
@@ -166,8 +276,8 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     let canonical = String::from_utf8(record().to_canonical_json()).unwrap();
     let cases = [
         canonical.replacen(
-            "{\"schema_version\":3",
-            "{\"unknown\":0,\"schema_version\":3",
+            "{\"schema_version\":4",
+            "{\"unknown\":0,\"schema_version\":4",
             1,
         ),
         canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
@@ -183,10 +293,10 @@ fn unknown_fields_variants_and_versions_are_rejected() {
     for invalid in cases {
         assert!(SegmentRecord::from_canonical_json(invalid.as_bytes()).is_err());
     }
-    let future = canonical.replacen("\"schema_version\":3", "\"schema_version\":4", 1);
+    let future = canonical.replacen("\"schema_version\":4", "\"schema_version\":5", 1);
     assert_eq!(
         SegmentRecord::from_canonical_json(future.as_bytes()),
-        Err(DomainError::UnsupportedSchemaVersion(4))
+        Err(DomainError::UnsupportedSchemaVersion(5))
     );
 }
 
@@ -301,11 +411,11 @@ fn invariant_bearing_composites_validate_when_deserialized_directly() {
 fn unsupported_segment_version_precedes_nested_invariant_failure() {
     let invalid = String::from_utf8(record().to_canonical_json())
         .unwrap()
-        .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
+        .replacen("\"schema_version\":4", "\"schema_version\":5", 1)
         .replacen("\"canonical_seq\":42", "\"canonical_seq\":0", 1);
     assert_eq!(
         SegmentRecord::from_canonical_json(invalid.as_bytes()),
-        Err(DomainError::UnsupportedSchemaVersion(4))
+        Err(DomainError::UnsupportedSchemaVersion(5))
     );
 }
 
@@ -362,17 +472,17 @@ fn single_pass_decode_rejects_malformed_unknown_and_invalid_records() {
         String::new(),
         // unknown, reordered, duplicate and missing top-level fields
         canonical.replacen(
-            "{\"schema_version\":3",
-            "{\"unknown\":0,\"schema_version\":3",
+            "{\"schema_version\":4",
+            "{\"unknown\":0,\"schema_version\":4",
             1,
         ),
-        canonical.replacen("}}}}}", "}}}},\"unknown\":0}", 1),
+        canonical.replacen("}}}}", "}}},\"unknown\":0}", 1),
         canonical.replacen(
-            &format!("\"schema_version\":3,{header_field}"),
-            &format!("{header_field},\"schema_version\":3"),
+            &format!("\"schema_version\":4,{header_field}"),
+            &format!("{header_field},\"schema_version\":4"),
             1,
         ),
-        canonical.replacen("}}}}}", &(String::from("}}}},") + header_field + "}"), 1),
+        canonical.replacen("}}}}", &(String::from("}}},") + header_field + "}"), 1),
         canonical[..event_start].to_owned() + "}",
         // unknown nested fields and variants, duplicate nested field
         canonical.replacen("\"side\":\"bid\"", "\"side\":\"offer\"", 1),
@@ -409,13 +519,13 @@ fn single_pass_decode_rejects_malformed_unknown_and_invalid_records() {
     }
     // The version is checked before the header or event is interpreted.
     let future = canonical
-        .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
+        .replacen("\"schema_version\":4", "\"schema_version\":5", 1)
         .replacen("\"canonical_seq\":42", "\"canonical_seq\":0", 1);
     assert_eq!(
         SegmentRecord::from_json(future.as_bytes()),
-        Err(DomainError::UnsupportedSchemaVersion(4))
+        Err(DomainError::UnsupportedSchemaVersion(5))
     );
-    let future = canonical.replacen("\"schema_version\":3", "\"schema_version\":99", 1);
+    let future = canonical.replacen("\"schema_version\":4", "\"schema_version\":99", 1);
     assert_eq!(
         SegmentRecord::from_json(future.as_bytes()),
         Err(DomainError::UnsupportedSchemaVersion(99))

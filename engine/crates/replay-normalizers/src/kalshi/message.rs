@@ -1,6 +1,6 @@
 use canonical_normalizer::CheckedValue;
 use indexer_types::{EnvelopeView, SourceCursor, Stream};
-use replay_domain::SegmentEvent;
+use replay_domain::{BookEvent, SegmentEvent};
 use serde_json::{Map, Value};
 
 use super::{
@@ -30,7 +30,7 @@ pub(crate) fn normalize_message(
         .checked_required("type")?
         .checked_text()
         .map_err(|_| Reject::new("invalid_message_type"))?;
-    match kind {
+    let outcome = match kind {
         "orderbook_snapshot" => snapshot(envelope, object, config, batched),
         "orderbook_delta" => delta(envelope, object, config, batched),
         "trade" => trade(envelope, object, config, batched),
@@ -40,7 +40,43 @@ pub(crate) fn normalize_message(
         "ok" => ok_response(envelope, object, batched),
         "error" => error_response(envelope, object, batched),
         _ => Err(Reject::new("unsupported_message_type")),
+    }?;
+    let sent_ms = object
+        .get("sending_ts_ms")
+        .map(|value| {
+            value
+                .checked_positive_u64()
+                .map_err(|_| Reject::new("invalid_source_time"))
+        })
+        .transpose()?;
+    let annotation =
+        super::time::extract(kind, object.get("msg").and_then(Value::as_object), sent_ms);
+    for code in annotation.diagnostics {
+        eprintln!(
+            "kalshi-normalizer/v6: delivery_index={} message_type={kind} diagnostic={code}",
+            envelope.delivery_index
+        );
     }
+    Ok(match outcome {
+        MessageOutcome::Events(children) => MessageOutcome::Events(
+            children
+                .into_iter()
+                .map(|event| match event {
+                    SegmentEvent::Book(BookEvent::Full(book)) => {
+                        SegmentEvent::Book(BookEvent::Full(book.with_venue_time(annotation.time)))
+                    }
+                    SegmentEvent::Book(BookEvent::Delta(delta)) => {
+                        SegmentEvent::Book(BookEvent::Delta(delta.with_venue_time(annotation.time)))
+                    }
+                    SegmentEvent::Trade(trade) => {
+                        SegmentEvent::Trade(trade.with_venue_time(annotation.time))
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    })
 }
 
 fn snapshot(
@@ -50,9 +86,9 @@ fn snapshot(
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
     // A snapshot answering a command (`subscribe` or `get_snapshot`) echoes that
-    // command's `id` at the top level. It is the only optional field here and is
-    // validated like every other echoed command id; it carries no book meaning.
-    outer.checked_fields(&["id", "type", "sid", "seq", "msg"])?;
+    // command's `id` at the top level. The optional send timestamp is handled
+    // after wire validation; neither field carries book mutation semantics.
+    outer.checked_fields(&["sending_ts_ms", "id", "type", "sid", "seq", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     sequence(outer, envelope, batched)?;
     optional_positive_u64(outer.get("id"), "invalid_command_id")?;
@@ -70,7 +106,7 @@ fn delta(
     config: Config,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["type", "sid", "seq", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "type", "sid", "seq", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     sequence(outer, envelope, batched)?;
     outer
@@ -87,7 +123,7 @@ fn trade(
     config: Config,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["type", "sid", "seq", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "type", "sid", "seq", "msg"])?;
     if !batched {
         expect_stream(envelope, Stream::PublicTrade)?;
     }
@@ -106,7 +142,7 @@ fn ticker(
     config: Config,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["type", "sid", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "type", "sid", "msg"])?;
     if !batched {
         expect_stream(envelope, Stream::PublicQuote)?;
     }
@@ -176,7 +212,7 @@ fn subscribed(
     envelope: &EnvelopeView<'_>,
     outer: &Map<String, Value>,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["id", "type", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "id", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     expect_unsequenced(envelope)?;
     optional_positive_u64(outer.get("id"), "invalid_command_id")?;
@@ -201,7 +237,7 @@ fn unsubscribed(
     outer: &Map<String, Value>,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["id", "sid", "seq", "type"])?;
+    outer.checked_fields(&["sending_ts_ms", "id", "sid", "seq", "type"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     sequence(outer, envelope, batched)?;
     optional_positive_u64(outer.get("id"), "invalid_command_id")?;
@@ -219,7 +255,7 @@ fn ok_response(
     outer: &Map<String, Value>,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["id", "sid", "seq", "type", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "id", "sid", "seq", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     optional_positive_u64(outer.get("sid"), "invalid_sid")?;
@@ -264,7 +300,7 @@ fn error_response(
     outer: &Map<String, Value>,
     batched: bool,
 ) -> Result<MessageOutcome, Failure> {
-    outer.checked_fields(&["id", "sid", "seq", "type", "msg"])?;
+    outer.checked_fields(&["sending_ts_ms", "id", "sid", "seq", "type", "msg"])?;
     expect_stream(envelope, Stream::PublicBook)?;
     optional_positive_u64(outer.get("id"), "invalid_command_id")?;
     optional_positive_u64(outer.get("sid"), "invalid_sid")?;

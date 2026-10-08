@@ -56,6 +56,166 @@ fn reject(lane: &'static str, time: u64, impact: FaultImpact) -> Row {
 }
 
 #[test]
+fn venue_annotations_never_change_cut_boundaries_revisions_or_book_state() {
+    fn rows(annotated: bool) -> Vec<Row> {
+        let annotate = |event: SegmentEvent| {
+            if !annotated {
+                return event;
+            }
+            // Deliberately opposite to receipt order, with a future send time:
+            // annotation must never become an ordering or usability input.
+            let time = Some(
+                VenueTime::new(
+                    Some(9007199254740993),
+                    Some(Resolution::Millisecond),
+                    Some(EventKind::BookUpdate),
+                    Some(u64::MAX),
+                )
+                .unwrap(),
+            );
+            match event {
+                SegmentEvent::Book(BookEvent::Full(v)) => {
+                    SegmentEvent::Book(BookEvent::Full(v.with_venue_time(time)))
+                }
+                SegmentEvent::Book(BookEvent::Delta(v)) => {
+                    SegmentEvent::Book(BookEvent::Delta(v.with_venue_time(time)))
+                }
+                SegmentEvent::Trade(v) => SegmentEvent::Trade(v.with_venue_time(time)),
+                _ => panic!(),
+            }
+        };
+        vec![
+            row("x", 1, vec![annotate(full("kalshi:A", &[(37, 11)], &[]))]),
+            row(
+                "y",
+                1,
+                vec![annotate(full("polymarket:T", &[(37, 5)], &[]))],
+            ),
+            row(
+                "x",
+                2,
+                vec![
+                    annotate(delta("kalshi:A", 37, LevelChange::Increase(qty(3)))),
+                    annotate(trade("kalshi:A", 5)),
+                ],
+            ),
+            row(
+                "y",
+                2,
+                vec![
+                    annotate(delta("polymarket:T", 37, LevelChange::Set(qty(7)))),
+                    annotate(trade("polymarket:T", 2)),
+                ],
+            ),
+            Row {
+                continuity: "duplicate",
+                ..row(
+                    "x",
+                    3,
+                    vec![annotate(delta(
+                        "kalshi:A",
+                        37,
+                        LevelChange::Increase(qty(99)),
+                    ))],
+                )
+            },
+            row(
+                "x",
+                4,
+                vec![annotate(delta(
+                    "kalshi:A",
+                    37,
+                    LevelChange::Decrease(qty(20)),
+                ))],
+            ),
+            row(
+                "y",
+                4,
+                vec![annotate(delta("polymarket:T", 37, LevelChange::Delete))],
+            ),
+            row("x", 5, vec![annotate(full("kalshi:A", &[(17, 2)], &[]))]),
+        ]
+    }
+    fn origin(mut origin: CutOrigin, pin: &replay_tape::DerivativePin) -> CutOrigin {
+        match &mut origin {
+            CutOrigin::Window { pin: p, .. } | CutOrigin::Group { pin: p, .. } => *p = pin.clone(),
+        }
+        origin
+    }
+    fn decision(mut decision: Decision) -> Decision {
+        if let Decision::Operations(ops) = &mut decision {
+            for op in ops {
+                *op = op.clone().with_venue_time(None);
+            }
+        }
+        decision
+    }
+    fn market(mut market: MarketRecord, pin: &replay_tape::DerivativePin) -> MarketRecord {
+        market.reference.pin = pin.clone();
+        market.event = match market.event {
+            MarketEvent::Book(BookEvent::Full(v)) => {
+                MarketEvent::Book(BookEvent::Full(v.with_venue_time(None)))
+            }
+            MarketEvent::Book(BookEvent::Delta(v)) => {
+                MarketEvent::Book(BookEvent::Delta(v.with_venue_time(None)))
+            }
+            MarketEvent::Trade(v) => MarketEvent::Trade(v.with_venue_time(None)),
+        };
+        market
+    }
+    let plain = Fixture::new(0, 100, 1, rows(false), |_| {});
+    let annotated = Fixture::new(0, 100, 1, rows(true), |_| {});
+    let plans = vec![plan("kalshi:A", "x"), plan("polymarket:T", "y")];
+    let before = collect(open(&plain, plans.clone()));
+    let after = collect(open(&annotated, plans));
+    assert_eq!(before.len(), after.len());
+    let pin = &plain.pin.pin;
+    for (a, b) in before.iter().zip(&after) {
+        assert_eq!(a.sequence(), b.sequence());
+        assert_eq!(
+            origin(a.origin().clone(), pin),
+            origin(b.origin().clone(), pin)
+        );
+        assert_eq!(
+            a.market_events()
+                .iter()
+                .cloned()
+                .map(|v| market(v, pin))
+                .collect::<Vec<_>>(),
+            b.market_events()
+                .iter()
+                .cloned()
+                .map(|v| market(v, pin))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(a.book_transitions().len(), b.book_transitions().len());
+        for (a, b) in a.book_transitions().iter().zip(b.book_transitions()) {
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.previous_revision, b.previous_revision);
+            assert_eq!(a.view.revision(), b.view.revision());
+            assert_eq!(a.view.validity(), b.view.validity());
+            assert_eq!(a.view.ladder(), b.view.ladder());
+            assert_eq!(decision(a.decision.clone()), decision(b.decision.clone()));
+            assert_eq!(
+                a.view.as_of().cloned().map(|v| origin(v, pin)),
+                b.view.as_of().cloned().map(|v| origin(v, pin))
+            );
+            let normalize_dependency = |dependency: Option<&Dependency>| {
+                dependency.cloned().map(|mut d| {
+                    d.anchor.pin = pin.clone();
+                    d.through.pin = pin.clone();
+                    d
+                })
+            };
+            assert_eq!(
+                normalize_dependency(a.view.dependency()),
+                normalize_dependency(b.view.dependency())
+            );
+        }
+    }
+}
+
+#[test]
 fn whole_deliveries_ties_ordered_updates_trades_views_and_repeatability() {
     let f = Fixture::new(
         0,

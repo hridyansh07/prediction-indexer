@@ -12,9 +12,9 @@ mod numeric;
 
 pub use event::{
     AuditAnchor, BookDelta, BookEvent, BookKey, CanonicalProvenance, ContinuityVerdict,
-    ContractOrientation, ControlEvent, DomainError, EventAddress, EventHeader, FaultImpact,
-    FullBook, InstrumentId, LaneId, Level, LevelChange, NormalizationFault, SegmentEvent,
-    SegmentRecord, Side, TradeEvent,
+    ContractOrientation, ControlEvent, DomainError, EventAddress, EventHeader, EventKind,
+    FaultImpact, FullBook, InstrumentId, LaneId, Level, LevelChange, NormalizationFault,
+    Resolution, SegmentEvent, SegmentRecord, Side, TradeEvent, VenueTime,
 };
 pub use hash::{BookStateHash, Sha1, Sha1Error};
 pub use indexer_types::Sha256;
@@ -30,4 +30,5 @@ pub use numeric::{
 /// future writer schema is introduced; never retarget this constant.
 pub const SEGMENT_SCHEMA_V3: u16 = 3;
 /// Current writer selection, independent of historical reader dispatch.
-pub const SEGMENT_SCHEMA_VERSION: u16 = SEGMENT_SCHEMA_V3;
+pub const SEGMENT_SCHEMA_V4: u16 = 4;
+pub const SEGMENT_SCHEMA_VERSION: u16 = SEGMENT_SCHEMA_V4;

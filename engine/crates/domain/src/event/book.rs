@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BookStateHash, ConditionalMarketPrice, PositiveQty};
 
-use super::{DomainError, InstrumentId};
+use super::{DomainError, InstrumentId, VenueTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +60,7 @@ pub struct FullBook {
     asks: Vec<Level>,
     snapshot_hash: Option<BookStateHash>,
     source_observed_ns: Option<u64>,
+    venue_time: Option<VenueTime>,
 }
 
 impl<'de> Deserialize<'de> for FullBook {
@@ -76,6 +77,8 @@ impl<'de> Deserialize<'de> for FullBook {
             asks: Vec<Level>,
             snapshot_hash: Option<BookStateHash>,
             source_observed_ns: Option<u64>,
+            #[serde(deserialize_with = "super::time::required_option")]
+            venue_time: Option<VenueTime>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let book = Self {
@@ -85,6 +88,7 @@ impl<'de> Deserialize<'de> for FullBook {
             asks: wire.asks,
             snapshot_hash: wire.snapshot_hash,
             source_observed_ns: wire.source_observed_ns,
+            venue_time: wire.venue_time,
         };
         book.validate().map_err(serde::de::Error::custom)?;
         Ok(book)
@@ -112,6 +116,7 @@ impl FullBook {
             asks,
             snapshot_hash,
             source_observed_ns,
+            venue_time: None,
         })
     }
 
@@ -146,6 +151,15 @@ impl FullBook {
         self.source_observed_ns
     }
 
+    pub fn with_venue_time(mut self, time: Option<VenueTime>) -> Self {
+        self.venue_time = time;
+        self
+    }
+
+    pub const fn venue_time(&self) -> Option<VenueTime> {
+        self.venue_time
+    }
+
     pub(super) fn validate(&self) -> Result<(), DomainError> {
         validate_level_scales(&self.bids, &self.asks)?;
         validate_order(&self.bids, Side::Bid)?;
@@ -175,6 +189,8 @@ pub struct BookDelta {
     price: ConditionalMarketPrice,
     change: LevelChange,
     book_hash: Option<BookStateHash>,
+    #[serde(deserialize_with = "super::time::required_option")]
+    venue_time: Option<VenueTime>,
 }
 
 impl BookDelta {
@@ -193,6 +209,7 @@ impl BookDelta {
             price,
             change,
             book_hash,
+            venue_time: None,
         })
     }
 
@@ -225,6 +242,15 @@ impl BookDelta {
 
     pub const fn book_hash(&self) -> Option<BookStateHash> {
         self.book_hash
+    }
+
+    pub fn with_venue_time(mut self, time: Option<VenueTime>) -> Self {
+        self.venue_time = time;
+        self
+    }
+
+    pub const fn venue_time(&self) -> Option<VenueTime> {
+        self.venue_time
     }
 
     pub(super) fn validate(&self) -> Result<(), DomainError> {
@@ -351,7 +377,7 @@ impl AuditAnchor {
     }
 }
 
-fn validate_level_scales(bids: &[Level], asks: &[Level]) -> Result<(), DomainError> {
+pub(super) fn validate_level_scales(bids: &[Level], asks: &[Level]) -> Result<(), DomainError> {
     let mut levels = bids.iter().chain(asks);
     let Some(first) = levels.next() else {
         return Ok(());
@@ -377,7 +403,7 @@ fn reject_duplicate_prices(levels: &[Level]) -> Result<(), DomainError> {
     }
 }
 
-fn validate_order(levels: &[Level], side: Side) -> Result<(), DomainError> {
+pub(super) fn validate_order(levels: &[Level], side: Side) -> Result<(), DomainError> {
     reject_duplicate_prices(levels)?;
     if levels.windows(2).any(|pair| match side {
         Side::Bid => pair[0].price.atoms() <= pair[1].price.atoms(),

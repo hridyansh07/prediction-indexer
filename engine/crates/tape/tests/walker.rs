@@ -956,14 +956,14 @@ fn rehashed_semantic_corruption_poisons_before_completion() {
                     text.replacen("\"visible_tie_group\":5", "\"visible_tie_group\":null", 2)
                 }
                 "tie_wrong" => text.replace("\"visible_tie_group\":5", "\"visible_tie_group\":4"),
-                "version" => text.replace("\"schema_version\":3", "\"schema_version\":99"),
+                "version" => text.replace("\"schema_version\":4", "\"schema_version\":99"),
                 "continuity" => text.replace(
                     "\"continuity\":\"continuous\"",
                     "\"continuity\":\"guessed\"",
                 ),
                 "unknown_field" => text.replacen(
-                    "{\"schema_version\":3",
-                    "{\"unknown\":true,\"schema_version\":3",
+                    "{\"schema_version\":4",
+                    "{\"unknown\":true,\"schema_version\":4",
                     1,
                 ),
                 _ => unreachable!(),
@@ -1118,7 +1118,7 @@ fn distinct_bundle_versions_keep_old_pins_readable_and_unknown_profiles_fail() {
         let original = fs::read(&path).unwrap();
         let text = String::from_utf8(original.clone()).unwrap();
         let value = if field == "normalized_schema_version" {
-            3
+            4
         } else {
             2
         };

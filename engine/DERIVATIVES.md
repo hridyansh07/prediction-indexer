@@ -296,6 +296,12 @@ later fault get an `Invalidated` disposition; `NotAuthority` marks observations
 without planned authority. Trades are observations, not mutations. Consumers
 install every transition of a cut before evaluating.
 
+Book/trade observations preserve schema-4 venue_time. Reconstruction never
+consults it: order, references, revisions, validity and cut boundaries still use
+canonical evidence. Redis transition operations retain their previous wire
+shape; consumers find venue annotations in the corresponding market_events.
+Schema-3 derivatives remain readable and yield absent venue annotations.
+
 `BookView` carries revision, validity, `as_of()` cut and, when usable,
 `Dependency { epoch, anchor, through }`: references retaining pin, address and both
 clocks for the last initializing Full and the last accepted book operation. Age

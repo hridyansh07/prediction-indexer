@@ -14,6 +14,7 @@ pub const MATERIALIZER_VERSION: u16 = 2;
 fn validate_profile(schema: u16, materializer: u16) -> Result<(), String> {
     match (schema, materializer) {
         (replay_domain::SEGMENT_SCHEMA_V3, 1 | 2) => Ok(()),
+        (replay_domain::SEGMENT_SCHEMA_V4, 2) => Ok(()),
         _ => Err("unsupported derivative schema/materializer profile".to_owned()),
     }
 }

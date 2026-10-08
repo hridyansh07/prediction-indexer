@@ -19,6 +19,14 @@ pub fn exact(mut value: Value) -> Value {
 pub fn key(k: &BookKey) -> Value {
     json!({"instrument": k.instrument, "orientation": k.orientation})
 }
+
+// Transition operations retain their existing wire schema. Venue clocks are
+// observations attached to market_events, not reconstruction instructions.
+fn operation(delta: &replay_domain::BookDelta) -> Value {
+    json!({"instrument":delta.instrument(), "orientation":delta.orientation(),
+        "side":delta.side(), "price":delta.price(), "change":delta.change(),
+        "book_hash":delta.book_hash()})
+}
 pub fn pin(p: &DerivativePin) -> Value {
     json!({"derivative_address": p.derivative_address, "receipt_sha256": p.receipt_sha256})
 }
@@ -101,7 +109,7 @@ pub fn cut(c: &RiskCut) -> Value {
     let transitions: Vec<_> = c.book_transitions().iter().map(|t| {
         let decision = match &t.decision {
             Decision::Snapshot(l) => json!({"kind":"snapshot", "bids":l.bids().iter().collect::<Vec<_>>(), "asks":l.asks().iter().collect::<Vec<_>>()}),
-            Decision::Operations(ops) => json!({"kind":"operations", "operations":ops}),
+            Decision::Operations(ops) => json!({"kind":"operations", "operations":ops.iter().map(operation).collect::<Vec<_>>()}),
             Decision::Invalidation(r) => json!({"kind":"invalidation", "reason":reason(r)}),
         };
         let dependency = t.view.dependency().map(|d| json!({"epoch":d.epoch,"anchor":reference(&d.anchor),"through":reference(&d.through)}));

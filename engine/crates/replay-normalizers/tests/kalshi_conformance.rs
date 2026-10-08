@@ -77,6 +77,223 @@ fn reject_code(value: Normalization) -> String {
     }
 }
 
+#[test]
+fn sending_timestamp_does_not_reject_an_otherwise_valid_book_delivery() {
+    let mut payload: Value = serde_json::from_str(DELTA).unwrap();
+    payload["sending_ts_ms"] = json!(1669149841007_u64);
+    let normalized = normalize(&sequenced(&payload.to_string(), "public_book", 3));
+    assert!(
+        matches!(&normalized, Normalization::Events(children) if children.len() == 1),
+        "sending_ts_ms must preserve the book delta; got {normalized:?}"
+    );
+}
+
+#[test]
+fn sending_timestamp_is_accepted_on_every_supported_venue_message_type() {
+    for (payload, stream, seq) in [
+        (SNAPSHOT, "public_book", Some(2)),
+        (DELTA, "public_book", Some(3)),
+        (TRADE, "public_trade", Some(2)),
+        (TICKER, "public_quote", None),
+        (
+            r#"{"id":1,"type":"subscribed","msg":{"channel":"trade","sid":2}}"#,
+            "public_book",
+            None,
+        ),
+        (
+            r#"{"id":2,"sid":2,"seq":4,"type":"unsubscribed"}"#,
+            "public_book",
+            Some(4),
+        ),
+        (
+            r#"{"id":2,"type":"ok","msg":{"market_tickers":["A"]}}"#,
+            "public_book",
+            None,
+        ),
+        (
+            r#"{"id":2,"type":"error","msg":{"code":27,"msg":"slow down"}}"#,
+            "public_book",
+            None,
+        ),
+    ] {
+        let input = |payload: &str| {
+            if let Some(seq) = seq {
+                sequenced(payload, stream, seq)
+            } else {
+                source(payload, stream, json!({"type":"unsequenced","counter":9}))
+            }
+        };
+        let original = normalize(&input(payload));
+        let mut value: Value = serde_json::from_str(payload).unwrap();
+        value["sending_ts_ms"] = json!(1669149841007_u64);
+        let updated = normalize(&input(&value.to_string()));
+        match (&original, &updated) {
+            (Normalization::Events(a), Normalization::Events(b)) => assert_eq!(a.len(), b.len()),
+            (Normalization::Ignored { .. }, Normalization::Ignored { .. }) => {
+                assert_eq!(original, updated)
+            }
+            _ => panic!("unexpected sending timestamp result: {updated:?}"),
+        }
+        value["sending_ts_ms"] = json!("1669149841007");
+        assert_eq!(
+            reject_code(normalize(&input(&value.to_string()))),
+            "invalid_source_time"
+        );
+    }
+}
+
+#[test]
+fn delta_times_are_exact_and_optional_times_do_not_change_operations() {
+    use replay_domain::{EventKind, Resolution};
+    for (ts, ms, ns, resolution) in [
+        (
+            "2022-11-22T20:44:01.123456Z",
+            1669149841123_u64,
+            1669149841123456000_u64,
+            Resolution::Microsecond,
+        ),
+        (
+            "2022-11-22T20:44:01.123Z",
+            1669149841123,
+            1669149841123000000,
+            Resolution::Millisecond,
+        ),
+        (
+            "2022-11-22T20:44:01.12Z",
+            1669149841120,
+            1669149841120000000,
+            Resolution::Millisecond,
+        ),
+        (
+            "2022-11-22T20:44:01Z",
+            1669149841000,
+            1669149841000000000,
+            Resolution::Millisecond,
+        ),
+        (
+            "2022-11-22T22:44:01.123456+02:00",
+            1669149841123,
+            1669149841123456000,
+            Resolution::Microsecond,
+        ),
+    ] {
+        let mut payload: Value = serde_json::from_str(DELTA).unwrap();
+        payload["msg"]["ts"] = json!(ts);
+        payload["msg"]["ts_ms"] = json!(ms);
+        let children = events(normalize(&sequenced(
+            &payload.to_string(),
+            "public_book",
+            3,
+        )));
+        let SegmentEvent::Book(BookEvent::Delta(delta)) = &children[0] else {
+            panic!()
+        };
+        let time = delta.venue_time().unwrap();
+        assert_eq!(time.event_ns(), Some(ns));
+        assert_eq!(time.event_resolution(), Some(resolution));
+        assert_eq!(time.event_kind(), Some(EventKind::ExchangeEvent));
+        assert_eq!(time.sent_ns(), None);
+    }
+    let mut payload: Value = serde_json::from_str(DELTA).unwrap();
+    payload["msg"].as_object_mut().unwrap().remove("ts");
+    let children = events(normalize(&sequenced(
+        &payload.to_string(),
+        "public_book",
+        3,
+    )));
+    let SegmentEvent::Book(BookEvent::Delta(delta)) = &children[0] else {
+        panic!()
+    };
+    assert_eq!(
+        delta.venue_time().unwrap().event_ns(),
+        Some(1669149841000000000)
+    );
+    assert_eq!(
+        delta.venue_time().unwrap().event_resolution(),
+        Some(Resolution::Millisecond)
+    );
+    payload["msg"].as_object_mut().unwrap().remove("ts_ms");
+    let children = events(normalize(&sequenced(
+        &payload.to_string(),
+        "public_book",
+        3,
+    )));
+    let SegmentEvent::Book(BookEvent::Delta(delta)) = &children[0] else {
+        panic!()
+    };
+    assert_eq!(delta.venue_time(), None);
+}
+
+#[test]
+fn snapshot_children_share_send_time_and_trade_has_exchange_event_time() {
+    use replay_domain::{EventKind, Resolution};
+    let mut snapshot: Value = serde_json::from_str(SNAPSHOT).unwrap();
+    snapshot["sending_ts_ms"] = json!(1669149841007_u64);
+    let children = events(normalize(&sequenced(
+        &snapshot.to_string(),
+        "public_book",
+        2,
+    )));
+    assert_eq!(children.len(), 2);
+    for child in children {
+        let SegmentEvent::Book(BookEvent::Full(book)) = child else {
+            panic!()
+        };
+        let time = book.venue_time().unwrap();
+        assert_eq!(time.event_ns(), None);
+        assert_eq!(time.event_kind(), None);
+        assert_eq!(time.event_resolution(), None);
+        assert_eq!(time.sent_ns(), Some(1669149841007000000));
+    }
+    let children = events(normalize(&sequenced(TRADE, "public_trade", 2)));
+    let SegmentEvent::Trade(trade) = &children[0] else {
+        panic!()
+    };
+    let time = trade.venue_time().unwrap();
+    assert_eq!(time.event_ns(), Some(1669149841000000000));
+    assert_eq!(time.event_resolution(), Some(Resolution::Millisecond));
+    assert_eq!(time.event_kind(), Some(EventKind::ExchangeEvent));
+}
+
+#[test]
+fn inconsistent_times_retain_the_exact_book_or_trade_interpretation() {
+    for (payload, stream, seq) in [(DELTA, "public_book", 3), (TRADE, "public_trade", 2)] {
+        let mut value: Value = serde_json::from_str(payload).unwrap();
+        let original = events(normalize(&sequenced(payload, stream, seq)));
+        value["msg"]["ts_ms"] = json!(1669149842000_u64);
+        value["sending_ts_ms"] = json!(1669149842010_u64);
+        let changed = events(normalize(&sequenced(&value.to_string(), stream, seq)));
+        assert_eq!(changed.len(), original.len());
+        for (before, after) in original.into_iter().zip(changed) {
+            let (before, after, time) = match (before, after) {
+                (
+                    SegmentEvent::Book(BookEvent::Delta(a)),
+                    SegmentEvent::Book(BookEvent::Delta(b)),
+                ) => {
+                    let time = b.venue_time().unwrap();
+                    (
+                        serde_json::to_value(a.with_venue_time(None)).unwrap(),
+                        serde_json::to_value(b.with_venue_time(None)).unwrap(),
+                        time,
+                    )
+                }
+                (SegmentEvent::Trade(a), SegmentEvent::Trade(b)) => {
+                    let time = b.venue_time().unwrap();
+                    (
+                        serde_json::to_value(a.with_venue_time(None)).unwrap(),
+                        serde_json::to_value(b.with_venue_time(None)).unwrap(),
+                        time,
+                    )
+                }
+                _ => panic!(),
+            };
+            assert_eq!(before, after);
+            assert_eq!(time.event_ns(), None);
+            assert_eq!(time.sent_ns(), Some(1669149842010000000));
+        }
+    }
+}
+
 fn canonical_event_hashes(payload: &str, stream: &str, seq: u64) -> Vec<String> {
     let source = sequenced(payload, stream, seq);
     events(normalize(&source))
@@ -94,7 +311,7 @@ fn canonical_event_hashes(payload: &str, stream: &str, seq: u64) -> Vec<String> 
                 replay_domain::SegmentRecord::from_json(&json).unwrap(),
                 record
             );
-            Sha256::digest(&json).as_hex()
+            Sha256::digest(&crate::schema3_projection(&record)).as_hex()
         })
         .collect()
 }
@@ -244,7 +461,7 @@ fn multiply_invalid_messages_preserve_reject_precedence() {
 #[test]
 fn descriptor_is_versioned_and_config_changes_identity() {
     let default = Normalizer::new(Kalshi::default()).unwrap();
-    assert_eq!(PARSER_VERSION, 5);
+    assert_eq!(PARSER_VERSION, 6);
     let default_config = serde_json::to_vec(&json!({
         "schema_version": 2,
         "variables": {

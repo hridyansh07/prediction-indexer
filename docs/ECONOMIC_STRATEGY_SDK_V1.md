@@ -477,6 +477,49 @@ slippage, so it needs no extra walk.
 - the trade and aggressor partitions;
 - close order.
 
+**Policy version 2.** The standalone profile also accepts policy `version: 2`, with the
+same closed fields, whose `groups` may add `availability`, `levels` and `transitions`
+([`docs/specs/MARKET_PROFILE_V2.md`](specs/MARKET_PROFILE_V2.md)). An embedded profile
+(`Requirements.profile`) that requests any of them fails at construction, and a
+version-1 policy is unchanged. Files follow the policy (`availability.ndjson`,
+`transitions.ndjson.zst` and `levels.ndjson.zst` beyond the three above) and the manifest
+`version` is 2.
+
+| Group | Data points |
+|---|---|
+| availability | Book, member and bundle intervals from the interval engine shared with `bundle_coverage`; `availability.ndjson` is byte-identical to coverage's `intervals.ndjson`, and the summary's `availability_durations` equals its `durations`. The reader adds that a book's usable time equals the sum of its profile rows' `usable_ns` |
+| transitions | `top` rows (best quotes and validity after the cut, written only when `(bid, ask, validity)` changes or on a snapshot or invalidation) and `trade` rows (one per non-duplicate observed trade). Kalshi is written only as its Yes (`outcome`) book, whose ask is projected from the `complement` bid. Rows carry `cut`, `t_ns` and optional flat venue-time keys. One Zstandard frame |
+| levels | Opt-in depth: `ladder` rows (the full ladder at scope entry and on every snapshot or invalidation) and `diff` rows (signed level changes per cut, in the Yes book's terms for Kalshi). One Zstandard frame |
+
+The summary adds `transition_books` and `transition_scopes` (both files), `transition_rows`,
+`transition_trades_skipped` (`scale_mismatch` and `unwritten_book`, derived from the
+profile's `activity`, so `null` when `activity` is off) and `level_rows`. The `levels`
+collector's level mirror is checked against the decoder on every cut and a mismatch
+fails the run. The reader does not import the collector. It streams each file in two
+passes (identities first, rows second), checks schemas, order, the opening row and
+top chain per (scope, book), the ladder replay, agreement with the profile's activity
+counts, bucket opens and state durations, and, with both files, that replaying
+`levels` gives each book's latest `top`.
+
+Research code reads the files with two iterators in
+`replay.economic_sdk.profile_streams`. Each takes the path of the `.ndjson.zst` file
+inside a completed output directory (its `manifest.json` and `summary.json` are read
+beside it), verifies both identities through the shared codec, and writes no decoded
+byte to disk.
+
+```python
+from replay.economic_sdk.profile_streams import iter_levels, iter_transitions
+
+# top rows gain prev_bid/prev_ask and bid/ask_move_atoms and _move_ticks (ints or None)
+for row in iter_transitions(out / "transitions.ndjson.zst"):
+    if row["type"] == "top" and row["bid_move_ticks"]:
+        print(row["t_ns"], row["book"], row["bid_move_ticks"])
+
+# each levels row with the book's (bids, asks) after it: lists of (price, quantity) ints
+for row, (bids, asks) in iter_levels(out / "levels.ndjson.zst"):
+    depth = sum(q for _, q in bids[:3])
+```
+
 ## 8. Retained-state bounds
 
 Recursive size accounting is replaced by **count-based bounds**.

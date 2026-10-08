@@ -116,8 +116,26 @@ def book_hash(value):
         )
 
 
-def delta(value):
-    obj(value, "instrument orientation side price change book_hash")
+def venue_time(value):
+    if value is None:
+        return
+    obj(value, "event_ns event_resolution event_kind sent_ns")
+    has_event = value["event_ns"] is not None
+    require(has_event or value["sent_ns"] is not None)
+    require(has_event == (value["event_resolution"] is not None))
+    require(has_event == (value["event_kind"] is not None))
+    if has_event:
+        uint(value["event_ns"])
+        choice(value["event_resolution"], "millisecond microsecond")
+        choice(value["event_kind"], "exchange_event book_update trade_report book_as_of")
+    if value["sent_ns"] is not None:
+        uint(value["sent_ns"])
+
+
+def delta(value, *, annotated=False):
+    obj(value, "instrument orientation side price change book_hash" + (" venue_time" if annotated else ""))
+    if annotated:
+        venue_time(value["venue_time"])
     k = key({k: value[k] for k in ("instrument", "orientation")})
     choice(value["side"], "bid ask")
     p, ps = number(value["price"])
@@ -133,7 +151,8 @@ def delta(value):
 def event(value):
     obj(value, "kind value")
     if value["kind"] == "trade":
-        v = obj(value["value"], "instrument orientation price quantity aggressor")
+        v = obj(value["value"], "instrument orientation price quantity aggressor venue_time")
+        venue_time(v["venue_time"])
         key({k: v[k] for k in ("instrument", "orientation")})
         number(v["price"])
         number(v["quantity"], True)
@@ -143,13 +162,14 @@ def event(value):
         require(value["kind"] == "book")
         v = obj(value["value"], "kind value")
         if v["kind"] == "delta":
-            delta(v["value"])
+            delta(v["value"], annotated=True)
         else:
             require(v["kind"] == "full")
             b = obj(
                 v["value"],
-                "instrument orientation bids asks snapshot_hash source_observed_ns",
+                "instrument orientation bids asks snapshot_hash source_observed_ns venue_time",
             )
+            venue_time(b["venue_time"])
             key({k: b[k] for k in ("instrument", "orientation")})
             scales = set()
             for side in ("bids", "asks"):

@@ -12,6 +12,7 @@ pub enum DomainError {
     NonCanonicalLevelOrder,
     UnsupportedSchemaVersion(u16),
     NonCanonicalEncoding,
+    InvalidVenueTime,
     Json(String),
 }
 
@@ -38,6 +39,8 @@ impl fmt::Display for DomainError {
                 write!(formatter, "unsupported segment schema version {version}")
             }
             Self::NonCanonicalEncoding => formatter.write_str("JSON is valid but not canonical"),
+            Self::InvalidVenueTime => formatter
+                .write_str("venue time requires an event with resolution and kind, or a send time"),
             Self::Json(error) => write!(formatter, "invalid segment JSON: {error}"),
         }
     }

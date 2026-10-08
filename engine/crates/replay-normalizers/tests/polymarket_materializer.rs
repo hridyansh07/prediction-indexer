@@ -283,7 +283,7 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
     );
     let verified = verify_derivative(&first.derivative.directory).unwrap();
     assert_eq!(verified.pin, first.derivative.pin);
-    // Parser V3 with materializer profile 2. Local paths are not addressed.
+    // Parser V4 with materializer profile 2. Local paths are not addressed.
     assert_eq!(
         format!(
             "{}:{}:{}",
@@ -291,7 +291,7 @@ fn materializes_verifies_and_idempotently_retries_polymarket_derivative() {
             verified.manifest.events.logical.sha256.as_hex(),
             verified.manifest.rejects.logical.sha256.as_hex()
         ),
-        "951da731d88fb50b22f1c45a3b686bbb7ab59749b3a68a0c1cf7bf8486195386:7b5a08878e9bcbb65cf527eb80fbe91a90565c714bafca210a1e4b5f1d85fd0b:cc2d0f86d197d1393dad52de77f175b04513456ced88906915f871c320fe0da7"
+        "0d6cd02c2031ef2f27c9bae5046fdc73f7d88407005c3fc67bd7e4fef7390d90:76cef502be6462648b8c1b87f0d0b357aa1addc83d2797eb50a0f0268cedc24d:7d1942038bcdc7096e1d613830de8556b075150483207273c5af2f1e76f1cc25"
     );
     let records = read_events(&verified);
     let malformed_fault = records

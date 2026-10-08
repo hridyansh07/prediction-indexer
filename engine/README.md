@@ -68,7 +68,8 @@ resets only its key.
   `(kalshi:TICKER, Outcome)` and NO bids `(kalshi:TICKER, Complement)`; they are
   complementary views, not independent liquidity, and normalization does not
   convert between them. Empty `asks` means no explicit ask ladder was emitted. An
-  `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg` and an
+  `orderbook_snapshot` top level is closed to `type`, `sid`, `seq`, `msg`, optional
+  `sending_ts_ms`, and an
   optional positive `id` echoing a `subscribe`/`get_snapshot` command. A `msg`
   with `market_id: ""` treats it as absent, and a snapshot with no level arrays
   is a valid empty book (both orientations empty Fulls).
@@ -83,18 +84,40 @@ resets only its key.
 - Limitless full books replace, never merge, and retain original ordering and
   provenance.
 
-Normalizer bundles: `prediction-indexer/kalshi-normalizer/v5`,
-`polymarket-normalizer/v3`, `limitless-normalizer/v2` (parser versions in each
+Normalizer bundles: `prediction-indexer/kalshi-normalizer/v6`,
+`polymarket-normalizer/v4`, `limitless-normalizer/v3` (parser versions in each
 module's `mod.rs`).
 
 ## Closed event contract
 
-`SegmentRecord` schema version 3 owns `EventHeader`, `EventAddress`, complete
+`SegmentRecord` writer schema version 4 owns `EventHeader`, `EventAddress`, complete
 canonical provenance and a closed `SegmentEvent`. Book events use validated
 constructors, bid-descending/ask-ascending ordering, one scale per full book,
 positive quantities, conditional-market prices and no duplicate prices.
 `NormalizationFault` carries a closed impact classification chosen before book
 state; exact rejected bytes and parser error codes live in the reject sidecar.
+
+FullBook, BookDelta and TradeEvent carry nullable `venue_time` with closed fields
+`event_ns`, `event_resolution`, `event_kind`, and `sent_ns`. Event time requires
+both resolution (millisecond/microsecond) and meaning (exchange_event,
+book_update, trade_report, book_as_of); at least event time or send time is
+present. Kalshi deltas use exact RFC3339 time with microsecond-or-coarser
+precision (trimmed fractions retain their exact value), falling back to optional
+ts_ms only when ts is absent. Trades use ts_ms, snapshots send time only. All
+supported Kalshi venue messages accept sending_ts_ms. Polymarket WebSocket
+changes, trades and books use their required timestamp. Limitless annotations
+are null. REST snapshots retain AuditAnchor and source_observed_ns without a
+new annotation.
+
+Newly discovered inconsistent, unparseable or unrepresentable annotations emit
+stable diagnostics to stderr for manual review and omit the affected timestamp;
+valid book/trade events remain accepted. Existing wire-shape rejection rules
+and REST cursor checks remain strict. No clock is inferred or substituted.
+Readers accept closed schema 3 and 4. Schema-3 records preserve their exact
+original serialization without venue_time; schema 4 requires the explicit
+null/object field. Each record's version must agree with its manifest.
+Annotations never affect receipt clocks, event order/indexes, atomic groups,
+Risk validity, book state, revisions or cut boundaries.
 
 Canonical JSON is compact UTF-8 from `SegmentRecord::to_canonical_json`; struct
 field order and adjacent enum tags are schema. `from_canonical_json` (writers,
@@ -178,7 +201,7 @@ digest and effective interval, event/reject serialization versions and
 materializer version. There is no mutable `latest`; corrected versions coexist
 under new addresses.
 
-**Current writer profile 2**: normalized schema 3, receipt/manifest/materializer
+**Current writer profile 2**: normalized schema 4, receipt/manifest/materializer
 version 2, event/reject serialization 1, reject record 1. The source projection
 embeds the exact UTF-8 canonical receipt document (its bytes must match the
 source SHA-256 and length) and its independently checked coverage:
@@ -196,6 +219,9 @@ before conversion, and its original address algorithm; it never invents
 coverage or epoch fields. Address verification uses the receipt's recorded
 versions, never current writer constants. Unknown profile tuples and
 experimental schemas 1/2 are unsupported; there is no migration or readdressing.
+Profile-2 readers also accept existing normalized schema-3 derivatives. New
+normalizer identities and schema-4 addresses coexist with those old pins;
+receipt/manifest fields and commit ordering are unchanged.
 
 All NDJSON files use the shared level-3, checksummed, one-frame Zstandard codec
 with logical and stored identities. `verify_derivative` (strict audit) checks
