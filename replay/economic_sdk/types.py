@@ -156,8 +156,8 @@ class Experiment:
     """Everything the SDK needs from a configured strategy, fixed before callbacks.
 
     ``layout`` 1 is the frozen V1 wire (complete interval partition, placebo
-    rows beside real rows); 2 is the SDK default: denominators, real episodes,
-    and opt-in controls and audit (see ``output``).
+    rows beside real rows); 3 is the SDK default: indexed NDJSON tables,
+    denominators, real episodes and opt-in controls/audit. Layout 2 is readable.
     """
 
     strategy: str
@@ -175,7 +175,7 @@ class Experiment:
     maxima: tuple[str, ...]
     slice_invariant: tuple[str, ...]
     controls: tuple[Control, ...] = ()
-    layout: int = 2
+    layout: int = 3
     audit_intervals: bool = False
     controls_episodes: bool = False
     controls_slices: bool = False

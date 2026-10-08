@@ -16,7 +16,7 @@ from .contract import (
 )
 from replay.economic_sdk import Strategy, aggregate_reader, reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
-from replay.economic_sdk.output import Layout
+from replay.economic_sdk.output import Layout, manifest_layout
 from replay.economic_sdk.reader import quantiles as _quantiles  # noqa: F401  (stable test surface)
 from replay.economic_sdk.reader import read_json as _json
 from replay.economic_sdk.reader import signed as _signed
@@ -35,6 +35,9 @@ SKEW_ARTIFACT_EDGE_NS = 1_000_000_000
 def check_manifest(value, complete=True):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive payout_assumption")
+    manifest_layout(value, legacy=value.get("version") == 1)
+    if "layout" in value:
+        fields += " layout"
     if complete:
         fields += " summary_sha256"
     obj(value, fields)

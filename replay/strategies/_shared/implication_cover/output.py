@@ -7,6 +7,7 @@ from replay.strategies import canonical_reference
 from replay.strategies.cross_venue_arbitrage.contract import UNIT, SETTLEMENT, policy_config, valuation_config
 from replay.strategies.cross_venue_arbitrage.output import CrossVenueReader
 from replay.economic_sdk import aggregate_reader
+from replay.economic_sdk.output import manifest_layout
 from replay.economic_sdk.reader import read_json, signed
 from replay.strategies._shared.implication_cover.contract import Inputs, STRATEGIES, FACTORIES, baskets, experiment, experiment_identity, payoff
 from replay.preparation import digest, encoded, load_snapshot, sha
@@ -71,6 +72,9 @@ class ImplicationReader(CrossVenueReader):
 def check_manifest(value, snapshot, complete, mode):
     fields = ("version strategy venue_mode snapshot_sha256 policy policy_sha256 experiment_sha256 "
               "fee_config fee_engine_identity files instantaneous_positive settlement_model outcomes_provider valuation")
+    manifest_layout(value)
+    if "layout" in value:
+        fields += " layout"
     obj(value, fields + (" summary_sha256" if complete else ""))
     require(mode in STRATEGIES and value["venue_mode"] == mode and value["strategy"] == STRATEGIES[mode],
             "implication strategy/mode binding")

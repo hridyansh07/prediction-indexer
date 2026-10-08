@@ -71,11 +71,18 @@ def strategy_config(base, root, known=False):
 
 
 class Harness(CoverageHarness):
-    def __init__(self, root, *, known=False, pairs=False, policy=None, **kwargs):
+    def __init__(self, root, *, known=False, pairs=False, policy=None, layout=None, **kwargs):
         def factory(context):
             self.complement_config = strategy_config(dict(context["config"]), root, known)
             if policy:
                 self.complement_config["policy"] = {**self.complement_config["policy"], **policy}
+            if layout is not None and self.complement_config["policy"]["version"] != 1:
+                from dataclasses import replace
+                from replay.economic_sdk.runtime import Runtime
+                from replay.strategies.same_venue_complement.strategy import SameVenueComplement
+                strategy = SameVenueComplement(self.complement_config)
+                strategy.experiment = replace(strategy.experiment, layout=layout)
+                return Runtime(strategy, context)
             return build({**context, "config": self.complement_config})
         detail_factory = paired_detail if pairs else preparation_detail
         if pairs:
@@ -107,7 +114,8 @@ class Harness(CoverageHarness):
         return read_provisional(self.output, self.root / "context", expected_sha256=self.sha)
 
     def records(self, name):
-        return [json.loads(line) for line in (self.output / name).read_bytes().splitlines()]
+        from replay.tests.sdk_tables import records
+        return records(self.output, name, len(self.snapshot["scopes"]))
 
 
 class ComplementIntegrationTests(unittest.TestCase):

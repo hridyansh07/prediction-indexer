@@ -51,7 +51,7 @@ class Base(unittest.TestCase):
         self.root = Path(self.tmp.name)
 
     def harness(self, **kwargs):
-        h = Harness(self.root, **kwargs)
+        h = Harness(self.root, layout=2, **kwargs)
         for writer in h.strategy.writers.values():
             self.addCleanup(writer.stream.close)
         return h
@@ -138,7 +138,7 @@ class SharedViewTests(Base):
 
         for restore in (False, True):
             with self.subTest(same_time_restore=restore), tempfile.TemporaryDirectory() as tmp:
-                h = Harness(Path(tmp), policy=v2_policy())
+                h = Harness(Path(tmp), policy=v2_policy(), layout=2)
                 with patch.object(h.strategy.strategy, "evaluate", side_effect=gross_only) as evaluate:
                     h.window(); h.quote(12, 0); h.quote(12, 1); h.group(13)
                     evaluate.reset_mock()
@@ -355,7 +355,7 @@ class AggregateOutputTests(Base):
         results = []
         for policy in (None, v2_policy(audit_intervals=True)):
             with tempfile.TemporaryDirectory() as tmp:
-                h = Harness(Path(tmp), known=True, policy=policy)
+                h = Harness(Path(tmp), known=True, policy=policy, layout=2)
                 from replay.tests.economic_scenarios import scenario_single_known_slices
                 scenario_single_known_slices(h)
                 h.finish()
@@ -367,7 +367,7 @@ class AggregateOutputTests(Base):
         for controls, episodes in (([], False), ([{"kind": "time_shift", "shift_ns": ["5"]}], False),
                                    ([{"kind": "time_shift", "shift_ns": ["5"]}], True)):
             with self.subTest(controls=bool(controls), episodes=episodes), tempfile.TemporaryDirectory() as tmp:
-                h = Harness(Path(tmp), policy=v2_policy(controls=controls, controls_episodes=episodes))
+                h = Harness(Path(tmp), policy=v2_policy(controls=controls, controls_episodes=episodes), layout=2)
                 h.window(); h.quote(12, 0); h.quote(12, 1)
                 result = h.finish()
                 files = {str(p.relative_to(h.output)) for p in h.output.rglob("*") if p.is_file()}
@@ -435,7 +435,7 @@ class ControlTests(Base):
             with self.subTest(consumed_change=consumed_change), tempfile.TemporaryDirectory() as tmp:
                 h = Harness(Path(tmp), policy=v2_policy(
                     controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
-                    controls_episodes=True, controls_slices=True))
+                    controls_episodes=True, controls_slices=True), layout=2)
                 for writer in h.strategy.writers.values():
                     self.addCleanup(writer.stream.close)
                 h.window(); h.quote(12, 0); h.quote(12, 1); h.group(18)

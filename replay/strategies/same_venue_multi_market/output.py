@@ -10,6 +10,7 @@ from replay.strategies.cross_venue_arbitrage.contract import asset_row, asset_va
 from replay.economic_sdk import FillSpec, Strategy, aggregate_reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.fills import step_atoms
+from replay.economic_sdk.output import manifest_layout
 from replay.economic_sdk.reader import read_json, signed
 from replay.fees import Policy
 from replay.fees.domain import AccountClass, Component, Evidence, Venue
@@ -218,6 +219,9 @@ class MultiMarketReader(Strategy):
 def check_manifest(value, snapshot, complete):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive settlement_model outcomes_provider")
+    manifest_layout(value)
+    if "layout" in value:
+        fields += " layout"
     obj(value, fields + (" summary_sha256" if complete else ""))
     require(type(value["version"]) is int and value["version"] == 1 and value["strategy"] == STRATEGY,
             "manifest version/strategy")

@@ -109,7 +109,7 @@ def experiment(policy, experiment_sha256):
                 controls.extend(Control("time_shift", int(s)) for s in control["shift_ns"])
             else:
                 controls.append(Control(control["kind"]))
-        controls, layout = tuple(controls), 2
+        controls, layout = tuple(controls), 3
         ring, profile = int(policy["time_shift_ring_entries"]), policy["profile"]
     return Experiment(
         strategy=STRATEGY, policy=policy, policy_sha256=digest(policy),

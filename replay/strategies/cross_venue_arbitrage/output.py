@@ -16,6 +16,7 @@ from replay.economic_sdk.fills import step_atoms
 from replay.fees import Policy
 from replay.fees.domain import AccountClass, Component, Evidence, Venue
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
+from replay.economic_sdk.output import manifest_layout
 from replay.economic_sdk.reader import read_json, signed
 from replay.preparation import digest, encoded, load_snapshot, sha
 from replay.streams.protocol import freeze, obj, require, uint
@@ -230,6 +231,9 @@ class CrossVenueReader(Strategy):
 def check_manifest(value, snapshot, complete):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive settlement_model outcomes_provider valuation")
+    manifest_layout(value)
+    if "layout" in value:
+        fields += " layout"
     obj(value, fields + (" summary_sha256" if complete else ""))
     require(type(value["version"]) is int and value["version"] == 2 and value["strategy"] == STRATEGY)
     policy_config(value["policy"]); valuation_config(value["valuation"])
