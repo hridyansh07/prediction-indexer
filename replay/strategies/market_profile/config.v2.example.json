@@ -9,6 +9,7 @@
       "activity",
       "availability",
       "depth",
+      "levels",
       "pair_consistency",
       "quote_stability",
       "self_crossing",

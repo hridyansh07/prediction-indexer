@@ -146,7 +146,7 @@ class PolicyVersionTests(Case):
         path = Path(__file__).parent.parent / "strategies" / "market_profile" / "config.v2.example.json"
         policy = json.loads(path.read_text())["policy"]
         self.assertEqual(policy["version"], 2)
-        self.assertEqual(set(policy["groups"]), set(V1_GROUPS) | {"availability", "transitions"})
+        self.assertEqual(set(policy["groups"]), set(V1_GROUPS) | {"availability", "levels", "transitions"})
         profile_policy(policy, standalone=True)
 
 
