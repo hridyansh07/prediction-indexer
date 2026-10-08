@@ -209,6 +209,7 @@ Read only the rows relevant to the task, but read those documents completely.
 | Outcome masks for replay strategies | [`docs/OUTCOME_MASKS_V1.md`](docs/OUTCOME_MASKS_V1.md) | [`analysis/README.md`](analysis/README.md), [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md) |
 | Outcome spaces, masks, claims, event relationships | [`analysis/README.md`](analysis/README.md) | [`universe/README.md`](universe/README.md) for claim storage, `tests/test_outcome_space.py`, `tests/test_masks.py`, `tests/test_claims.py` |
 | Universe event store, API, bundle history, outcomes, Replay job control plane | [`universe/README.md`](universe/README.md) | `tests/test_event_universe_store.py`, `tests/test_universe_outcomes.py`, `tests/test_replay_jobs*.py` |
+| Game-state pulls, scheduling, event-keyed raw receipts and timelines | [`gamestate/README.md`](gamestate/README.md), [`scripts/KALSHI_GAME_STATE_PULL_V1.md`](scripts/KALSHI_GAME_STATE_PULL_V1.md) | `tests/test_kalshi_game_state.py`, `tests/test_gamestate_scheduled.py` |
 | Pending specifications | [`docs/specs/`](docs/specs/) | the component README the spec extends |
 
 ## 5. Component boundaries
@@ -223,6 +224,7 @@ Keep new code in the layer that owns the decision:
 | `encoder/` | one strict streaming Zstd contract in Python and Rust | event schemas, archive policy, full-buffer production helpers |
 | `archive/` | immutable object storage, archive verification/receipts, manifests, deletion eligibility, durable filesystem primitives | canonical event meaning, direct splice control, any knowledge of `targeter/` |
 | `universe/` | the event store, bundle history, outcomes, auth, Replay job control plane | capture, book reconstruction, economics |
+| `gamestate/` | public game-state pulls, immutable raw archive, offline timeline derivation | book interpretation, economics, capture |
 | `engine/` | venue normalizers, verified derivatives, risk reconstruction, Redis transport | strategies, scheduling, deployment |
 | `replay/` | decoding, book reconstruction, trust/recovery, ordered gates, strategies | mutation of raw/canonical evidence |
 | `analysis/` | outcome spaces, masks, claims | irreversible capture filtering |

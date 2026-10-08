@@ -186,7 +186,12 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertNotIn("ARCHIVE_S3_BUCKET", server)
         runtime = compose.split("x-universe-runtime:", 1)[1].split("\nservices:", 1)[0]
         self.assertNotIn("environment:", runtime)
-        self.assertEqual(compose.count("    environment: *universe-job-environment"), 3)
+        self.assertEqual(compose.count("    environment: *universe-job-environment"), 4)
+        game = compose.split("  event-universe-game-state:", 1)[1].split("  replay-redis:", 1)[0]
+        self.assertIn("GAMESTATE_DATA_ROOT", game)
+        self.assertIn("gamestate.run_scheduled", game)
+        self.assertNotIn("*replay-volume", game)
+        self.assertNotIn("*universe-volume", game)
 
     def test_jobs_are_direct_configured_scripts_without_an_argument_parser(
         self,

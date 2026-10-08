@@ -539,6 +539,27 @@ docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-b
 independently. The immutable archive is the evidence and retention authority;
 the Universe SQLite file is disposable and rebuildable.
 
+### Event-keyed game-state job
+
+`event-universe-game-state` is a one-shot `jobs` service. Host cron may invoke
+it every 30 minutes. Its config is `configs/gamestate.json`; it has archive
+access, not capture or Replay/auth database mounts. Deploying and running a
+backfill are operator actions, not configuration-validation steps.
+
+| Root | Contents | Backup/rollback rule |
+|---|---|---|
+| `EVENT_UNIVERSE_DATA_ROOT` | Universe SQLite, backups | Rebuildable from archive; do not touch Replay DB |
+| `REPLAY_DATA_ROOT` | Jobs and auth DB | Not rebuildable; keep independent verified backups |
+| `GAMESTATE_DATA_ROOT` | Append-only retry ledger | Rebuildable; losing it resets retry/backoff only |
+| `EVENT_UNIVERSE_ARCHIVE_ROOT` | Local archive objects | Immutable evidence; never delete on rollback |
+
+The new ledger has its own version and needs no Universe/auth migration.
+Rollback disables this scheduled job and restores the prior image; retain
+all raw receipts and timelines. Existing V1 game-state readers remain valid.
+Allow at least 256 MiB of temporary disk per pull. Adapter limits still apply
+to backfill, which runs with explicit half-open activation bounds. A complete
+raw receipt does not prove settlement; timeline repair is offline regeneration.
+
 ### Safe full rebuild ordering
 
 A schema change that does not migrate (a stale database is rejected with a rebuild

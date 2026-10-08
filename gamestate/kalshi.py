@@ -271,6 +271,8 @@ class Client:
         clock=time.time_ns,
         monotonic=time.monotonic,
         records=None,
+        universe_spacing=UNIVERSE_SPACING,
+        kalshi_spacing=KALSHI_SPACING,
     ):
         self.send, self.sleep, self.clock, self.monotonic = (
             send,
@@ -281,6 +283,11 @@ class Client:
         self.records = AttemptLog() if records is None else records
         self.retries = 0
         self.next_request: dict[str, float] = {}
+        self.universe_spacing, self.kalshi_spacing = universe_spacing, kalshi_spacing
+
+    def close(self):
+        if isinstance(self.records, AttemptLog):
+            self.records.close()
 
     def get(self, url):
         if len(url) > 8192:
@@ -293,7 +300,7 @@ class Client:
                 if self.records.file.tell() + MAX_BODY * 6 + 16384 > MAX_RAW:
                     raise FetchError("invocation_raw_limit")
             host = urlsplit(url).netloc
-            spacing = KALSHI_SPACING if is_kalshi(url) else UNIVERSE_SPACING
+            spacing = self.kalshi_spacing if is_kalshi(url) else self.universe_spacing
             self.sleep(max(0, self.next_request.get(host, 0) - self.monotonic()))
             self.next_request[host] = self.monotonic() + spacing
             r = dict(
@@ -571,14 +578,20 @@ def put_json(store, key, doc):
 def prefix_valid(prefix):
     normalize_key(prefix)
     if not re.fullmatch(
-        r"gamestate/source=kalshi/date=\d{4}-\d\d-\d\d/milestone=[A-Za-z0-9_.:-]+/fetch=\d{8}T\d{6}\.\d{6}Z",
+        r"gamestate/source=kalshi/(?:event=[0-9a-f]{64}/)?date=\d{4}-\d\d-\d\d/milestone=[A-Za-z0-9_.:-]+/fetch=\d{8}T\d{6}\.\d{6}Z",
         prefix,
     ):
         raise ValueError("invalid_fetch_prefix")
     parts = prefix.split("/")
-    datetime.strptime(parts[2].removeprefix("date="), "%Y-%m-%d")
-    datetime.strptime(parts[4].removeprefix("fetch="), "%Y%m%dT%H%M%S.%fZ")
+    datetime.strptime(parts[-3].removeprefix("date="), "%Y-%m-%d")
+    datetime.strptime(parts[-1].removeprefix("fetch="), "%Y%m%dT%H%M%S.%fZ")
     return prefix
+
+
+def event_identity(value):
+    if type(value) is not str or not re.fullmatch(r"event:d1:[0-9a-f]{64}", value):
+        raise ValueError("event_identity")
+    return value
 
 
 def read_receipt(store, prefix):
@@ -588,11 +601,15 @@ def read_receipt(store, prefix):
         if len(raw) > MAX_METADATA or handle.read(1):
             raise ValueError("receipt_size")
     r = loads(raw)
-    if not isinstance(r, dict) or set(r) != RECEIPT_FIELDS:
+    event_keyed = "/event=" in prefix
+    fields = RECEIPT_FIELDS | ({"event_id"} if event_keyed else set())
+    if not isinstance(r, dict) or set(r) != fields:
         raise ValueError("receipt_fields")
+    if event_keyed and f"/event={event_identity(r['event_id']).split(':')[-1]}/" not in prefix:
+        raise ValueError("receipt_event_identity")
     if (
         type(r["receipt_version"]) is not int
-        or r["receipt_version"] != 1
+        or r["receipt_version"] != (2 if event_keyed else 1)
         or r["source"] != "kalshi"
         or type(r["script_version"]) is not int
         or r["script_version"] != 1
@@ -694,10 +711,13 @@ def read_records(store, prefix):
     return r, iterator()
 
 
-def existing_complete(store, milestone_id):
+def existing_complete(store, milestone_id, *, event_id=None):
     identifier(milestone_id)
+    if event_id is not None:
+        event_identity(event_id)
     count = 0
-    for key in store.list_keys("gamestate/source=kalshi/"):
+    root = "gamestate/source=kalshi/" + (f"event={event_id.split(':')[-1]}/" if event_id else "")
+    for key in store.list_keys(root):
         count += 1
         if count > 100000:
             raise ValueError("listing_limit")
@@ -726,7 +746,7 @@ def existing_complete(store, milestone_id):
     return False
 
 
-def archive_fetch(store, m, bundle_ids, records, started_ns, status):
+def archive_fetch(store, m, bundle_ids, records, started_ns, status, *, event_id=None):
     validate_milestone(m)
     dt = datetime.fromtimestamp(started_ns // 1_000_000_000, timezone.utc)
     stamp = dt.strftime("%Y%m%dT%H%M%S") + f".{started_ns % 1_000_000_000 // 1000:06d}Z"
@@ -734,7 +754,9 @@ def archive_fetch(store, m, bundle_ids, records, started_ns, status):
         timestamp(m["start_date"]) // 1_000_000_000, timezone.utc
     ).strftime("%Y-%m-%d")
     prefix = prefix_valid(
-        f"gamestate/source=kalshi/date={date}/milestone={m['id']}/fetch={stamp}"
+        "gamestate/source=kalshi/"
+        + (f"event={event_identity(event_id).split(':')[-1]}/" if event_id else "")
+        + f"date={date}/milestone={m['id']}/fetch={stamp}"
     )
     if any(store.list_keys(prefix + "/")):
         raise ValueError("fetch_prefix_exists")
@@ -768,7 +790,7 @@ def archive_fetch(store, m, bundle_ids, records, started_ns, status):
             )
         )
     receipt = dict(
-        receipt_version=1,
+        receipt_version=2 if event_id else 1,
         source="kalshi",
         milestone_id=m["id"],
         bundle_ids=sorted(set(bundle_ids)),
@@ -782,17 +804,21 @@ def archive_fetch(store, m, bundle_ids, records, started_ns, status):
         provider_checksum=metadata.provider_checksum,
         provider_checksum_algorithm=metadata.provider_checksum_algorithm,
     )
+    if event_id:
+        receipt["event_id"] = event_id
     put_json(store, prefix + "/receipt.json", receipt)
     return prefix
 
 
 def timeline_key(prefix):
-    return f"{prefix}/timeline.v{DERIVATION_VERSION}.json"
+    return f"{prefix}/timeline.v{DERIVATION_VERSION + int('/event=' in prefix)}.json"
 
 
 def regenerate(store, prefix, output=None):
     receipt, records = read_records(store, prefix)
     timeline = derive(receipt, records)
+    if "event_id" in receipt:
+        timeline.update(event_id=receipt["event_id"], derivation_version=DERIVATION_VERSION + 1)
     if output is None:
         # Versioned so that a derivation fix is republished beside the raw
         # object under the next version; an identical rerun proves the object.
@@ -1085,7 +1111,9 @@ def derive(receipt, records):
     }
 
 
-def run(client, store, base, bundles, *, skip_existing=True):
+def run(client, store, base, bundles, *, skip_existing=True, event_id=None):
+    if event_id is not None:
+        event_identity(event_id)
     report: dict[str, Any] = {
         "report_version": 1,
         "bundles_considered": len(set(bundles)),
@@ -1130,7 +1158,7 @@ def run(client, store, base, bundles, *, skip_existing=True):
             )
     for mid, group in sorted(grouped.items()):
         try:
-            if skip_existing and existing_complete(store, mid):
+            if skip_existing and existing_complete(store, mid, event_id=event_id):
                 report["milestones_skipped"] += 1
                 continue
             start = len(client.records)
@@ -1173,6 +1201,7 @@ def run(client, store, base, bundles, *, skip_existing=True):
                 rows,
                 started,
                 "complete" if complete else "incomplete",
+                event_id=event_id,
             )
             report["milestones_fetched"] += 1
             report["milestones_incomplete"] += int(not complete)

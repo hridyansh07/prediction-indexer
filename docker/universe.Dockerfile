@@ -34,8 +34,10 @@ COPY replay/ ./replay/
 COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
+COPY gamestate/ ./gamestate/
 COPY configs/event_universe.json /etc/prediction-indexer/event_universe.json
 COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json
+COPY configs/gamestate.json /etc/prediction-indexer/gamestate.json
 
 USER universe:universe
 
