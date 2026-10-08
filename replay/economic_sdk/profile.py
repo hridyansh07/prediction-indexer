@@ -30,6 +30,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     DISPOSITIONS,
     FILES,
     GROUPS,
+    LEVELS_FILE,
     MAX_PROFILE_ROWS,
     STRATEGY,
     TRANSITIONS_FILE,
@@ -39,6 +40,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     profile_identity,
     profile_policy,
 )
+from replay.economic_sdk.levels import LevelRecorder
 from replay.economic_sdk.transitions import TransitionRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
@@ -128,6 +130,7 @@ class Collector:
         self.start = int(snapshot["config"]["start_ns"])
         self.end = int(snapshot["config"]["end_ns"])
         self.scope = 0
+        self.sequence = 0       # the cut being applied, for rows written at scope entry
         self.validity = {}      # key -> (validity, reason kind) of the live book
         self.side_facts = {}    # key -> {side: (best, depth bands, slippages) | None}
         self.state = {}         # key -> committed _State
@@ -144,6 +147,11 @@ class Collector:
         if "transitions" in self.groups:
             self.transitions = TransitionRecorder(snapshot, self.plans, self.policy, self.counterpart,
                                                   root, self.budget)
+        self.levels = None
+        if "levels" in self.groups:
+            self.levels = LevelRecorder(snapshot, self.plans, self.policy, self.counterpart,
+                                        root, self.budget)
+        self.streams = tuple(s for s in (self.transitions, self.levels) if s is not None)
         if self.availability is not None:
             self.budget.charge(len(entities(snapshot)) * 2048, "profile state budget")
 
@@ -235,17 +243,19 @@ class Collector:
         self._open_scope(0, start)
         if self.availability is not None:
             self.availability.initial(cut)
-        if self.transitions is not None:
-            self.transitions.initial(cut)
+        for stream in self.streams:
+            stream.initial(cut, self.rows)
 
     def cut(self, cut, raw, time, changed=None):
         if self.availability is not None:
             self.availability.cut(cut, raw, time)
         if self.staged is not None and time > self.staged:
             self._commit()
+        # Scopes opened by this advance write their rows from the state before this cut.
+        self.sequence = cut.sequence
         self._advance(time)
-        if self.transitions is not None:
-            self.transitions.cut(cut, raw, time, self.rows, self.scope)
+        for stream in self.streams:
+            stream.cut(cut, raw, time, self.rows, self.scope)
         transitions = cut.body["book_transitions"]
         scope_books = self.rows
         if raw >= self.start and "activity" in self.groups:
@@ -296,10 +306,13 @@ class Collector:
             for key in derive:
                 self.pending[key] = self._derive(key)
 
-    def terminal(self, end):
+    def terminal(self, end, sequence=None):
         if self.staged is not None:
             self._commit()
+        self.sequence = self.sequence + 1 if sequence is None else sequence
         self._advance(end)
+        for stream in self.streams:
+            stream.flush(self.sequence)
         self._close_scope(end, "RUN_END")
         if self.availability is not None:
             self.availability.terminal(end)
@@ -357,6 +370,8 @@ class Collector:
                 self._close_scope(at, "SCOPE_END")
                 self.scope += 1
                 self._open_scope(self.scope, at)
+                for stream in self.streams:
+                    stream.open_scope(self.scope, at, self.rows, self.sequence)
             else:
                 self._flush_rows(at)
 
@@ -653,4 +668,6 @@ class Collector:
         files = {name: writer.finish() for name, writer in self.writers.items()}
         if self.transitions is not None:
             files[TRANSITIONS_FILE] = self.transitions.finish()
+        if self.levels is not None:
+            files[LEVELS_FILE] = self.levels.finish()
         return files

@@ -1,15 +1,16 @@
-"""Independent reader for the market profile ``transitions`` group.
+"""Independent reader for the market profile ``transitions`` and ``levels`` groups.
 
-It does not import the collector. From the snapshot and the policy it
-re-derives the book table, decodes ``transitions.ndjson.zst`` through the shared
-codec into a scratch file it creates and removes (both identities are verified
-before any row is read), and checks every row on its own and in sequence:
+It imports neither the collector nor the recorders. From the snapshot and the
+policy it re-derives the written-book table, decodes each Zstandard file through
+the shared codec in two streaming passes (both identities are verified before any
+row is read; no decoded byte is written to disk), and checks every row on its own
+and in sequence (``docs/specs/MARKET_PROFILE_V2.md`` section 7.1):
 
-- closed schemas, canonical decimals, scope and book membership, time order;
-- per (scope, book) continuity of the best quotes, including the Kalshi
-  projected ask, which is recomputed from the counterpart's bid chain;
-- exact arithmetic of moves, flows, depletion and the reason;
-- consistency with the profile's own rows (activity counts, state durations).
+- closed schemas per row type, canonical decimals, scope and book membership,
+  time and row order;
+- per (scope, book) the opening row, the top-of-book chain, the ladder replay;
+- consistency with the profile's own rows (activity counts, state durations,
+  bucket opens) and, when both files exist, between the two files.
 
 This verifies internal consistency; it is not a second reconstruction of the
 book from the tape.
@@ -20,25 +21,30 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from encoder import CodecError, LogicalIdentity, StoredIdentity, decode_stream
 from replay.economic_sdk import bounds
 from replay.economic_sdk.profile_policy import (
+    LEVELS_FILE,
+    LEVELS_MAX_BYTES,
+    LEVELS_MAX_LINE,
+    LEVELS_MAX_ROWS,
     TRANSITIONS_FILE,
     TRANSITIONS_MAX_BYTES,
     TRANSITIONS_MAX_ROWS,
 )
-from replay.streams.protocol import decode, obj, require
+from replay.economic_sdk.profile_stream_io import stream_lines
+from replay.streams.protocol import decode, require
 
-_FIELDS = ("scope book t_ns kind validity prev_bid prev_ask bid ask bid_added bid_removed ask_added "
-           "ask_removed bid_best_added bid_best_removed ask_best_added ask_best_removed bid_depleted "
-           "ask_depleted bid_move_atoms ask_move_atoms bid_move_ticks ask_move_ticks reason trades "
-           "venue_time trade_venue_time")
-KINDS = ("snapshot", "operations", "invalidation")
-REASONS = ("snapshot", "invalidation", "insert", "unknown")
+VENUE = ("venue_ns", "venue_first_ns", "venue_kind", "venue_res", "sent_ns")
+TOP = "type scope book cut t_ns cause validity bid ask"
+TRADE = "type scope book cut t_ns price qty aggressor disposition"
+LADDER = "type scope book cut t_ns cause validity bids asks"
+DIFF = "type scope book cut t_ns levels"
+TOP_CAUSES = ("open", "operations", "snapshot", "invalidation")
+LADDER_CAUSES = ("open", "snapshot", "invalidation")
+DISPOSITIONS = ("applied", "observed", "not_authority", "invalidated")
 EVENT_KINDS = ("exchange_event", "book_update", "trade_report", "book_as_of", "mixed")
 RESOLUTIONS = ("millisecond", "microsecond", "mixed")
-GROUP_ROWS = 100_000  # rows sharing one scope and instant buffered for Kalshi checks
-_ZERO = {"bid": 0, "ask": 0, "none": 0}
+GROUP_ROWS = 100_000  # rows sharing one cut, buffered for the cross-file join
 
 
 def _big(value):
@@ -55,28 +61,34 @@ def _signed(value):
     return int(value)
 
 
-def _optional(value, parse):
-    return None if value is None else parse(value)
+def _count(value, name):
+    require(type(value) is int and value >= 0, name)
+    return value
 
 
 def identity_record(value):
-    """Closed manifest identity of the stored file: logical and stored sides."""
-    obj(value, "logical stored")
-    logical = obj(value["logical"], "sha256 byte_length records")
-    stored = obj(value["stored"], "sha256 byte_length")
+    """Closed manifest identity of a stored file: logical and stored sides."""
+    require(type(value) is dict and set(value) == {"logical", "stored"}, "closed schema")
+    logical, stored = value["logical"], value["stored"]
+    require(type(logical) is dict and set(logical) == {"sha256", "byte_length", "records"}, "closed schema")
+    require(type(stored) is dict and set(stored) == {"sha256", "byte_length"}, "closed schema")
     for side in (logical, stored):
         require(type(side["sha256"]) is str and len(side["sha256"]) == 64
-                and all(c in "0123456789abcdef" for c in side["sha256"]), "transitions sha256")
-        require(type(side["byte_length"]) is int and 0 <= side["byte_length"], "transitions byte length")
+                and all(c in "0123456789abcdef" for c in side["sha256"]), "stream sha256")
+        require(type(side["byte_length"]) is int and 0 <= side["byte_length"], "stream byte length")
     require(type(logical["records"]) is int and 0 <= logical["records"] <= TRANSITIONS_MAX_ROWS
-            and logical["byte_length"] <= TRANSITIONS_MAX_BYTES, "transitions budget")
+            and logical["byte_length"] <= TRANSITIONS_MAX_BYTES, "stream budget")
     return logical, stored
 
 
 def tables(snapshot, policy):
-    """Planned books of any scope in index order, scope membership and counterparts."""
+    """Written books in index order, and the set of book indexes written in each scope.
+
+    A Kalshi ``complement`` folds into its Yes (``outcome``) book whenever that is
+    present in some scope; otherwise it is written as itself.
+    """
     plans = {(p["instrument"], p["orientation"]): p for p in snapshot["plans"]}
-    members, keys, scoped = {}, set(), []
+    members, present, scoped = {}, set(), []
     for scope in snapshot["scopes"]:
         inside = set()
         for member in scope["members"]:
@@ -85,9 +97,11 @@ def tables(snapshot, policy):
                 if key in plans:
                     inside.add(key)
                     members.setdefault(key, member["market_id"])
-        keys |= inside
+        present |= inside
         scoped.append(inside)
-    ordered = sorted(keys)
+    ordered = sorted({key for key in present
+                      if not (key[1] == "complement" and plans[key]["venue"] == "kalshi"
+                              and (key[0], "outcome") in present)})
     index = {key: i for i, key in enumerate(ordered)}
     books = []
     for key in ordered:
@@ -100,7 +114,7 @@ def tables(snapshot, policy):
                       "tick_atoms": policy["tick_atoms"][plan["venue"]],
                       "ask_source": "projected" if kalshi else "native",
                       "ask_source_book": list(other) if kalshi and other in plans else None})
-    return books, index, [{index[key] for key in inside} for inside in scoped]
+    return books, index, [{index[key] for key in inside if key in index} for inside in scoped]
 
 
 def _instant(value):
@@ -132,325 +146,439 @@ def scope_table(snapshot):
 def _quote(value, scale):
     if value is None:
         return None
-    require(type(value) is list and len(value) == 2, "transition quote shape")
+    require(type(value) is list and len(value) == 2, "quote shape")
     price, quantity = _big(value[0]), _big(value[1])
-    require(price <= 10 ** int(scale) and quantity > 0, "transition quote range")
+    require(price <= 10 ** int(scale) and quantity > 0, "quote range")
     return price, quantity
 
 
-def _clock(value, limit):
-    if value is None:
-        return None
-    obj(value, "first_event_ns last_event_ns event_kind event_resolution last_sent_ns events")
-    first, last = _optional(value["first_event_ns"], _big), _optional(value["last_event_ns"], _big)
-    sent = _optional(value["last_sent_ns"], _big)
-    require((first is None) == (last is None) == (value["event_kind"] is None)
-            == (value["event_resolution"] is None), "venue time event fields")
-    require(first is not None or sent is not None, "empty venue time")
-    require(first is None or first <= last, "venue time order")
-    require(value["event_kind"] is None or value["event_kind"] in EVENT_KINDS, "venue time kind")
-    require(value["event_resolution"] is None or value["event_resolution"] in RESOLUTIONS, "venue time resolution")
-    require(type(value["events"]) is int and 1 <= value["events"] <= limit, "venue time events")
-    return value["events"]
+def _ladder(value, scale, descending):
+    require(type(value) is list, "ladder shape")
+    prices, result = [], {}
+    for entry in value:
+        price, quantity = _quote(entry, scale)
+        prices.append(price)
+        result[price] = quantity
+    require(prices == sorted(set(prices), reverse=descending), "ladder order")
+    return result
 
 
-def _row(row, books, scopes, memberships, scope_bounds, start):
-    """Everything about one row that needs no other row."""
-    obj(row, _FIELDS)
-    for name in ("scope", "book"):
-        require(type(row[name]) is int and row[name] >= 0, "transition " + name)
-    scope, index = row["scope"], row["book"]
-    require(scope < len(scopes) and index < len(books) and index in memberships[scope],
-            "transition book outside scope")
-    book = books[index]
-    t = _big(row["t_ns"])
-    scope_start, scope_end = scope_bounds[scope]
-    require(max(scope_start, start) <= t < scope_end, "transition time outside scope")
-    kind = row["kind"]
-    require(kind in KINDS, "transition kind")
-    validity = row["validity"]
-    require(type(validity) is str, "transition validity")
-    usable = validity == "usable"
-    if kind == "invalidation":
-        require(validity.startswith("unusable:") and len(validity) > 9
-                and validity[9:].replace("_", "").isalnum(), "invalidation validity")
+def _venue(row, kind):
+    """The flat optional venue-time keys of section 3.3; absent keys are omitted, never null."""
+    present = {name for name in VENUE if name in row}
+    if "venue_ns" in row:
+        last = _big(row["venue_ns"])
+        require("venue_kind" in row and "venue_res" in row, "venue time kind/resolution")
+        require(row["venue_kind"] in EVENT_KINDS and row["venue_res"] in RESOLUTIONS, "venue time kind")
+        if "venue_first_ns" in row:
+            require(kind != "trade" and _big(row["venue_first_ns"]) < last, "venue time order")
     else:
-        require(usable, "transition validity for kind")
-    scale = book["price_scale"]
-    quotes = {name: _quote(row[name], scale) for name in ("prev_bid", "prev_ask", "bid", "ask")}
-    kalshi = book["venue"] == "kalshi"
-    if not usable:
-        require(quotes["bid"] is None and quotes["ask"] is None, "unusable book with quotes")
-    tick = int(book["tick_atoms"])
-    for name in ("bid", "ask"):
-        old, new = quotes["prev_" + name], quotes[name]
-        move = None if old is None or new is None else new[0] - old[0]
-        require(row[name + "_move_atoms"] == (None if move is None else str(move)), "move atoms")
-        ticks = None if move is None or move % tick else str(move // tick)
-        require(row[name + "_move_ticks"] == ticks, "move ticks")
-
-    flows = {}
-    for name in ("bid", "ask"):
-        values = {field: row[f"{name}_{field}"] for field in ("added", "removed", "best_added", "best_removed")}
-        depleted = row[name + "_depleted"]
-        counted = kind == "operations" and not (kalshi and name == "ask")
-        if not counted:
-            require(all(v is None for v in values.values()) and depleted is None, "flows outside operations")
-            continue
-        added, removed = _big(values["added"]), _big(values["removed"])
-        previous = quotes["prev_" + name]
-        if previous is None:
-            require(values["best_added"] is None and values["best_removed"] is None and depleted is None,
-                    "best flows on an empty side")
-            best_added = best_removed = None
-        else:
-            best_added, best_removed = _big(values["best_added"]), _big(values["best_removed"])
-            require(type(depleted) is bool and best_added <= added and best_removed <= removed,
-                    "best flows exceed side flows")
-            require(not depleted or best_removed >= previous[1], "depletion without removal")
-            new = quotes[name]
-            if new is not None and new[0] == previous[0]:
-                require(new[1] == previous[1] + best_added - best_removed, "best level arithmetic")
-            elif new is None or (new[0] < previous[0] if name == "bid" else new[0] > previous[0]):
-                require(depleted, "best level worsened without depletion")
-            else:
-                require(added > 0, "better level without addition")
-        if previous is None and quotes[name] is not None:
-            require(added > 0, "level appeared without addition")
-        flows[name] = (added, removed)
-    if kind == "operations":
-        added = sum(a for a, _ in flows.values())
-        removed = sum(r for _, r in flows.values())
-        expected = "insert" if removed == 0 and added > 0 else "unknown"
-    else:
-        expected = kind
-    require(row["reason"] == expected, "transition reason")
-
-    trades = obj(row["trades"], "count qty_atoms aggressor")
-    require(type(trades["count"]) is int and trades["count"] >= 0, "trade count")
-    quantity = _big(trades["qty_atoms"])
-    aggressor = obj(trades["aggressor"], "bid ask none")
-    require(all(type(v) is int and v >= 0 for v in aggressor.values())
-            and sum(aggressor.values()) == trades["count"] and (trades["count"] > 0 or quantity == 0),
-            "trade totals")
-    _clock(row["venue_time"], 2**31)
-    trade_events = _clock(row["trade_venue_time"], trades["count"])
-    require(trade_events is None or trades["count"] > 0, "trade venue time without trades")
-    return {"scope": scope, "book": index, "t": t, "kind": kind, "usable": usable, "validity": validity,
-            "reason": row["reason"], "trades": trades["count"], **quotes}
+        require(not present & {"venue_first_ns", "venue_kind", "venue_res"}, "venue time without venue_ns")
+    if "sent_ns" in row:
+        _big(row["sent_ns"])
+    require(present <= set(VENUE), "venue time keys")
 
 
-class _Chain:
-    __slots__ = ("bid", "ask", "usable", "first_t", "last_t", "validity", "implied")
+def _closed(row, fields):
+    required = set(fields.split())
+    require(type(row) is dict and set(row) - set(VENUE) == required and required <= set(row), "closed schema")
+
+
+class _Order:
+    """Row order of one file: ``(cut, t)`` never decreases; in a cut, opening rows come first."""
 
     def __init__(self):
-        self.bid = self.ask = self.usable = None
-        self.first_t = self.last_t = self.validity = None
+        self.cut = self.t = self.key = self.where = None
+
+    def check(self, cut, t, scope, book, opening, trade):
+        require(self.cut is None or (cut >= self.cut and t >= self.t), "row order")
+        key = (0, scope, book, 0) if opening else (1, 0, book, 1 if trade else 0)
+        if self.cut == cut:
+            require(key >= self.key and (key != self.key or trade), "row order within a cut")
+        else:
+            self.where = None
+        if not opening:
+            require(self.where in (None, (scope, t)), "rows of one cut span scopes or times")
+            self.where = (scope, t)
+        self.cut, self.t, self.key = cut, t, key
+
+
+class _Layout:
+    """What both files need about the snapshot: books, scope membership, open times."""
+
+    def __init__(self, snapshot, policy):
+        self.books, self.index, self.memberships = tables(snapshot, policy)
+        self.keys = [(b["instrument"], b["orientation"]) for b in self.books]
+        scopes = snapshot["scopes"]
+        self.start = int(snapshot["config"]["start_ns"])
+        self.ends = [int(s["end_ns"]) for s in scopes]
+        self.opens = [self.start] + self.ends[:-1]
+
+    def row(self, row, kind):
+        """Shared fields of a row: scope, book, cut and time, checked against the layout."""
+        for name in ("scope", "book", "cut"):
+            require(type(row[name]) is int and row[name] >= 0, "row " + name)
+        scope, book = row["scope"], row["book"]
+        require(scope < len(self.ends) and book < len(self.books) and book in self.memberships[scope],
+                "row book outside scope")
+        t = _big(row["t_ns"])
+        opening = row.get("cause") == "open"
+        require(t == self.opens[scope] if opening else self.opens[scope] <= t < self.ends[scope],
+                "row time outside scope")
+        _venue(row, kind)
+        return scope, book, row["cut"], t, opening
+
+
+class _Tops:
+    """Row-by-row checks of ``transitions.ndjson.zst``; yields one group per cut."""
+
+    def __init__(self, root, layout, identity, facts, groups):
+        self.layout, self.facts, self.groups = layout, facts, groups
+        self.logical, self.stored = identity_record(identity)
+        self.path = Path(root) / TRANSITIONS_FILE
+        require(self.path.is_file() and not self.path.is_symlink(), "regular transitions required")
+        self.books = {}      # (scope, book) -> state
+        self.order = _Order()
+        self.count = 0
+        self.types, self.causes = {}, {}
+        self.buckets = {}    # (scope, book) -> [bucket pointer, per-bucket [non-open tops, trades]]
+
+    def _book(self, scope, book):
+        return self.books.get((scope, book))
+
+    def row(self, line):
+        self.count += 1
+        require(self.count <= self.logical["records"], "transition count")
+        row = decode(line, bounds.MAX_LINE)
+        kind = row.get("type") if type(row) is dict else None
+        require(kind in ("top", "trade"), "transition row type")
+        _closed(row, TOP if kind == "top" else TRADE)
+        layout = self.layout
+        scope, book, cut, t, opening = layout.row(row, kind)
+        self.order.check(cut, t, scope, book, opening, kind == "trade")
+        info = layout.books[book]
+        state = self.books.get((scope, book))
+        key = layout.keys[book]
+        held = self.facts["buckets"].get((scope, key))
+        activity = "activity" in self.groups and held is not None
+        pointer = None
+        if activity and not opening:
+            pointer = self.buckets.setdefault((scope, book), [0, [[0, 0] for _ in held]])
+            while t >= held[pointer[0]][1]:
+                pointer[0] += 1
+            require(held[pointer[0]][0] <= t, "row outside its profile bucket")
+        if kind == "trade":
+            require(state is not None, "trade before the opening row")
+            require(row["disposition"] in DISPOSITIONS and row["aggressor"] in (None, "bid", "ask"),
+                    "trade fields")
+            _big(row["price"]), _big(row["qty"])
+            if pointer is not None:
+                pointer[1][pointer[0]][1] += 1
+            self.types["trade"] = self.types.get("trade", 0) + 1
+            return {"type": "trade", "scope": scope, "book": book, "cut": cut}
+        cause = row["cause"]
+        require(cause in TOP_CAUSES, "top cause")
+        validity = row["validity"]
+        require(type(validity) is str and (validity in ("usable", "not_initialized") or (
+            validity.startswith("unusable:") and len(validity) > 9 and validity[9:].replace("_", "").isalnum())),
+            "top validity")
+        bid, ask = _quote(row["bid"], info["price_scale"]), _quote(row["ask"], info["price_scale"])
+        require(validity == "usable" or (bid is None and ask is None), "unusable book with quotes")
+        top = (validity, bid, ask)
+        if opening:
+            require(state is None, "more than one open row")
+            state = self.books[scope, book] = _Held(t)
+            state.first = top
+            state.pending = True
+        else:
+            require(state is not None, "first top row is not an open row")
+            require(top != state.last or cause in ("snapshot", "invalidation"), "top row without a change")
+            if state.pending and t > state.opened:
+                self._opened(scope, book, state)
+            state.pending = False
+            state.implied[state.last[0]] = state.implied.get(state.last[0], 0) + t - state.at
+            if pointer is not None:
+                pointer[1][pointer[0]][0] += 1
+        state.last, state.at = top, t
+        self.types["top"] = self.types.get("top", 0) + 1
+        self.causes[cause] = self.causes.get(cause, 0) + 1
+        return {"type": "top", "scope": scope, "book": book, "cut": cut, "cause": cause,
+                "bid": bid, "ask": ask}
+
+    def _opened(self, scope, book, state):
+        """The opening quotes equal the profile's quotes at the scope's first bucket open."""
+        quotes = self.facts["open"].get((scope, self.layout.keys[book]))
+        if quotes is not None:
+            scale = self.layout.books[book]["price_scale"]
+            first = state.first
+            require(first[1] == _quote(quotes["bid"], scale) and first[2] == _quote(quotes["ask"], scale),
+                    "opening row differs from the profile bucket open")
+
+    def groups_of(self):
+        """Yield ``(cut, rows)`` for each cut, validating as rows form."""
+        current, rows = None, []
+        for line in stream_lines(self.path, self.logical, self.stored, bounds.MAX_LINE, "transitions"):
+            result = self.row(line)
+            if current is not None and result["cut"] != current:
+                yield current, rows
+                rows = []
+            current = result["cut"]
+            rows.append(result)
+            require(len(rows) <= GROUP_ROWS, "transition group budget")
+        require(self.count == self.logical["records"], "transition count")
+        if rows:
+            yield current, rows
+        self.finish()
+
+    def finish(self):
+        layout = self.layout
+        for scope, members in enumerate(layout.memberships):
+            for book in members:
+                require((scope, book) in self.books, "missing open row")
+        for (scope, book), state in self.books.items():
+            if state.pending:
+                self._opened(scope, book, state)
+            held = dict(state.implied)
+            held[state.last[0]] = held.get(state.last[0], 0) + layout.ends[scope] - state.at
+            have = self.facts["state"].get((scope, layout.keys[book]))
+            require(have is not None, "transitions for a book without profile rows")
+            require({n: ns for n, ns in held.items() if ns} == {n: ns for n, ns in have.items() if ns},
+                    "transition validity disagrees with profile state durations")
+
+
+class _Held:
+    __slots__ = ("opened", "first", "last", "at", "implied", "pending")
+
+    def __init__(self, at):
+        self.opened = self.at = at
+        self.first = self.last = None
         self.implied = {}
+        self.pending = False
 
 
-def _project(quote, unit):
-    return None if quote is None else (unit - quote[0], quote[1])
+class _Replay:
+    __slots__ = ("sides", "best")
+
+    def __init__(self, bids, asks):
+        self.sides = (bids, asks)
+        self.best = [None, None]
+        self.settle(0), self.settle(1)
+
+    def settle(self, side):
+        levels = self.sides[side]
+        self.best[side] = (max(levels) if side == 0 else min(levels)) if levels else None
+
+    def top(self):
+        return tuple(None if p is None else (p, self.sides[s][p]) for s, p in enumerate(self.best))
 
 
-def validate_transitions(root, snapshot, identity, policy, facts, groups):
-    """Check the file against the snapshot, policy and the profile rows' ``facts``.
+class _Levels:
+    """Row-by-row checks of ``levels.ndjson.zst``; replays diffs onto the latest ladder."""
+
+    def __init__(self, root, layout, identity):
+        self.layout = layout
+        self.logical, self.stored = identity_record(identity)
+        self.path = Path(root) / LEVELS_FILE
+        require(self.path.is_file() and not self.path.is_symlink(), "regular levels required")
+        require(self.logical["records"] <= LEVELS_MAX_ROWS and self.logical["byte_length"] <= LEVELS_MAX_BYTES,
+                "levels budget")
+        self.books = {}
+        self.order = _Order()
+        self.count = 0
+        self.types, self.causes = {}, {}
+
+    def row(self, line):
+        self.count += 1
+        require(self.count <= self.logical["records"], "level count")
+        row = decode(line, LEVELS_MAX_LINE)
+        kind = row.get("type") if type(row) is dict else None
+        require(kind in ("ladder", "diff"), "level row type")
+        _closed(row, LADDER if kind == "ladder" else DIFF)
+        layout = self.layout
+        scope, book, cut, t, opening = layout.row(row, kind)
+        self.order.check(cut, t, scope, book, opening, False)
+        info = layout.books[book]
+        scale = info["price_scale"]
+        state = self.books.get((scope, book))
+        out = {"type": kind, "scope": scope, "book": book, "cut": cut, "cause": None}
+        if kind == "ladder":
+            cause = row["cause"]
+            require(cause in LADDER_CAUSES, "ladder cause")
+            validity = row["validity"]
+            require(type(validity) is str and (validity in ("usable", "not_initialized") or (
+                validity.startswith("unusable:") and len(validity) > 9)), "ladder validity")
+            bids = _ladder(row["bids"], scale, True)
+            asks = _ladder(row["asks"], scale, False)
+            # An unusable book has no ladder. A Kalshi Yes book whose complement is invalidated
+            # stays usable: it keeps its bids and loses its projected asks.
+            require(validity == "usable" or not (bids or asks), "empty ladder required")
+            require(cause != "invalidation" or validity != "usable"
+                    or (info["ask_source_book"] is not None and not asks), "invalidation ladder")
+            if opening:
+                require(state is None, "more than one open ladder")
+            else:
+                require(state is not None, "first ladder row is not an open row")
+            out["before"] = None if state is None else state.top()
+            state = self.books[scope, book] = _Replay(bids, asks)
+            out["cause"] = cause
+            self.causes[cause] = self.causes.get(cause, 0) + 1
+        else:
+            require(state is not None, "first level row is not an open ladder")
+            changes = row["levels"]
+            require(type(changes) is list and changes, "diff levels")
+            seen = []
+            out["before"] = state.top()
+            for entry in changes:
+                require(type(entry) is list and len(entry) == 3 and entry[0] in ("bid", "ask"), "diff entry")
+                side = 0 if entry[0] == "bid" else 1
+                price, delta = _big(entry[1]), _signed(entry[2])
+                require(price <= 10 ** int(scale) and delta != 0, "diff entry range")
+                seen.append((side, price))
+                levels = state.sides[side]
+                new = levels.get(price, 0) + delta
+                require(new >= 0, "diff drives a level negative")
+                if new:
+                    levels[price] = new
+                else:
+                    levels.pop(price, None)
+            require(seen == sorted(set(seen)), "diff order")
+            state.settle(0), state.settle(1)
+        self.types[kind] = self.types.get(kind, 0) + 1
+        out["after"] = state.top()
+        out["opening"] = opening
+        return out
+
+    def groups_of(self):
+        current, rows = None, []
+        for line in stream_lines(self.path, self.logical, self.stored, LEVELS_MAX_LINE, "levels"):
+            result = self.row(line)
+            if current is not None and result["cut"] != current:
+                yield current, rows
+                rows = []
+            current = result["cut"]
+            rows.append(result)
+            require(len(rows) <= GROUP_ROWS, "level group budget")
+        require(self.count == self.logical["records"], "level count")
+        if rows:
+            yield current, rows
+        for scope, members in enumerate(self.layout.memberships):
+            for book in members:
+                require((scope, book) in self.books, "missing open ladder")
+
+
+def _join(tops, levels):
+    """Lockstep over the two files: replayed ladders must agree with the top rows, cut by cut."""
+    top_now, replay_now = {}, {}
+    a, b = tops.groups_of(), levels.groups_of()
+    try:
+        _lockstep(a, b, top_now, replay_now)
+    finally:
+        a.close()
+        b.close()
+
+
+def _lockstep(a, b, top_now, replay_now):
+    left, right = next(a, None), next(b, None)
+    while left is not None or right is not None:
+        use_left = right is None or (left is not None and left[0] <= right[0])
+        use_right = left is None or (right is not None and right[0] <= left[0])
+        top_rows = left[1] if use_left else []
+        level_rows = right[1] if use_right else []
+        by_top, by_level = {}, {}
+        for r in top_rows:
+            if r["type"] == "top":
+                by_top.setdefault((r["scope"], r["book"]), []).append(r)
+        for r in level_rows:
+            by_level.setdefault((r["scope"], r["book"]), []).append(r)
+        for key in sorted(set(by_top) | set(by_level)):
+            for r in by_top.get(key, ()):
+                top_now[key] = (r["bid"], r["ask"])
+            for r in by_level.get(key, ()):
+                replay_now[key] = r["after"]
+            opened_top = [r for r in by_top.get(key, ()) if r["cause"] == "open"]
+            opened_level = [r for r in by_level.get(key, ()) if r["opening"]]
+            later_top = [r for r in by_top.get(key, ()) if r["cause"] != "open"]
+            later_level = [r for r in by_level.get(key, ()) if not r["opening"]]
+            require(len(opened_top) == len(opened_level), "open rows differ between transitions and levels")
+            require(len(later_top) <= 1 and len(later_level) <= 1, "rows of one book in one cut")
+            if later_top:
+                require(later_level, "top row without a levels row")
+                cause = later_top[0]["cause"]
+                level = later_level[0]
+                require(level["type"] == "diff" if cause == "operations"
+                        else level["type"] == "ladder" and level["cause"] == cause,
+                        "top row cause differs from the levels row")
+            elif later_level:
+                level = later_level[0]
+                require(level["type"] == "diff" and level["before"] == level["after"],
+                        "levels change the top without a top row")
+            require(replay_now.get(key) == top_now.get(key), "replayed ladder differs from the top row")
+        if use_left:
+            left = next(a, None)
+        if use_right:
+            right = next(b, None)
+
+
+def _drain(groups):
+    for _ in groups:
+        pass
+
+
+def validate_streams(root, snapshot, files, policy, facts, groups):
+    """Check the stream files against the snapshot, policy and the profile rows' ``facts``.
 
     Returns the summary additions. ``facts`` carries, per (scope, book key), the
-    profile's state durations, first-bucket open quotes and per-bucket activity
-    counts; each cross-check applies only when its group produced them.
+    profile's state durations, bucket-open quotes and per-bucket activity counts;
+    each cross-check applies only when its group produced them.
     """
-    root = Path(root)
-    logical, stored = identity_record(identity)
-    books, index, memberships = tables(snapshot, policy)
-    keys = [(b["instrument"], b["orientation"]) for b in books]
-    scopes = snapshot["scopes"]
-    bounds_by_scope = [(int(s["start_ns"]), int(s["end_ns"])) for s in scopes]
-    start = int(snapshot["config"]["start_ns"])
-    path = root / TRANSITIONS_FILE
-    require(path.is_file() and not path.is_symlink(), "regular transitions required")
+    layout = _Layout(snapshot, policy)
+    tops = levels = None
+    if "transitions" in groups:
+        tops = _Tops(root, layout, files[TRANSITIONS_FILE], facts, groups)
+    if "levels" in groups:
+        levels = _Levels(root, layout, files[LEVELS_FILE])
+    if tops is not None and levels is not None:
+        _join(tops, levels)
+    elif tops is not None:
+        _drain(tops.groups_of())
+    else:
+        _drain(levels.groups_of())
 
-    chain, pending, last = {}, {}, None
-    buckets = {}          # (scope, book) -> [bucket pointer, per-bucket [rows, trades]]
-    kinds, reasons, attached = {}, {}, 0
-    count = 0
-    group = []
-
-    def opened(scope, book):
-        quotes = facts["open"].get((scope, keys[book]))
-        if quotes is None:
-            return None
-        scale = books[book]["price_scale"]
-        return {name: _quote(quotes[name], scale) for name in ("bid", "ask")}
-
-    def settle(entries):
-        scope, t = entries[0]["scope"], entries[0]["t"]
-        scope_start = bounds_by_scope[scope][0]
-        trajectory, first = {}, {}
-        for r in entries:
-            book = books[r["book"]]
-            state = chain.get((scope, r["book"]))
-            kalshi = book["venue"] == "kalshi"
-            prior_usable = None
-            if state is None:
-                state = chain[scope, r["book"]] = _Chain()
-                state.first_t = t
-                entry = opened(scope, r["book"]) if t > scope_start else None
-                if entry is not None:
-                    require(r["prev_bid"] == entry["bid"] and (kalshi or r["prev_ask"] == entry["ask"]),
-                            "first transition differs from the scope-entry quotes")
-                bid_before = r["prev_bid"]
-                first[scope, r["book"]] = r
-            else:
-                require(r["prev_bid"] == state.bid and (kalshi or r["prev_ask"] == state.ask),
-                        "transition chain broken")
-                bid_before = state.bid
-                prior_usable = state.usable
-                state.implied[state.validity] = state.implied.get(state.validity, 0) + t - state.last_t
-            trajectory.setdefault(r["book"], [bid_before]).append(r["bid"])
-            state.bid, state.usable, state.validity, state.last_t = r["bid"], r["usable"], r["validity"], t
-            state.ask = None if kalshi else r["ask"]
-            r["prior_usable"] = prior_usable
-        for r in entries:
-            book = books[r["book"]]
-            if book["venue"] != "kalshi":
-                continue
-            counterpart = book["ask_source_book"]
-            if counterpart is None:
-                require(r["prev_ask"] is None and r["ask"] is None, "projected ask without a source book")
-                continue
-            other = index[tuple(counterpart)]
-            unit = 10 ** int(book["price_scale"])
-            if other in trajectory:
-                states = trajectory[other]
-            elif (r["scope"], other) in chain:
-                states = [chain[r["scope"], other].bid]
-            else:
-                entry = opened(r["scope"], other)
-                states = None if entry is None else [entry["bid"]]
-            claim = (r["prev_ask"], r["ask"], r["usable"], r["prior_usable"], unit)
-            if states is None:
-                pending.setdefault((r["scope"], other), []).append(claim)
-            else:
-                _projection(claim, {_project(s, unit) for s in states})
-        # Claims made before the counterpart's first row hold its entry state.
-        for key, r in first.items():
-            for claim in pending.pop(key, ()):
-                _projection(claim, {_project(r["prev_bid"], claim[4])})
-
-    def _projection(claim, allowed):
-        prev_ask, ask, usable, prior_usable, _ = claim
-        require(ask in allowed if usable else ask is None, "projected ask differs from the counterpart bid")
-        if prior_usable is None:
-            require(prev_ask is None or prev_ask in allowed, "projected prior ask differs from the counterpart bid")
-        else:
-            require(prev_ask in allowed if prior_usable else prev_ask is None,
-                    "projected prior ask differs from the counterpart bid")
-
-    expected = dict(expected_logical=LogicalIdentity(logical["sha256"], logical["byte_length"], logical["records"]),
-                    expected_stored=StoredIdentity(stored["sha256"], stored["byte_length"]),
-                    max_decoded_bytes=logical["byte_length"])
-
-    def take(payload):
-        nonlocal count, last, group, attached
-        require(len(payload) <= bounds.MAX_LINE and payload.endswith(b"\n"), "transition line/truncation")
-        count += 1
-        require(count <= logical["records"], "transition count")
-        r = _row(decode(payload, bounds.MAX_LINE), books, scopes, memberships, bounds_by_scope, start)
-        order = (r["scope"], r["t"])
-        require(last is None or last <= order, "transition time order")
-        if last is not None and order != last:
-            settle(group)
-            group = []
-        last = order
-        group.append(r)
-        require(len(group) <= GROUP_ROWS, "transition group budget")
-        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
-        reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
-        attached += r["trades"]
-        held = facts["buckets"].get((r["scope"], keys[r["book"]]))
-        if held is not None and "activity" in groups:
-            pointer = buckets.setdefault((r["scope"], r["book"]), [0, [[0, 0] for _ in held]])
-            while r["t"] >= held[pointer[0]][1]:
-                pointer[0] += 1
-            require(held[pointer[0]][0] <= r["t"], "transition outside its profile bucket")
-            pointer[1][pointer[0]][0] += 1
-            pointer[1][pointer[0]][1] += r["trades"]
-
-    class Lines:
-        """Splits decoded bytes into lines for ``take``; nothing is stored beyond one partial line."""
-
-        def __init__(self):
-            self.partial = b""
-
-        def write(self, data):
-            view = bytes(data)
-            start = 0
-            while (end := view.find(b"\n", start)) >= 0:
-                line, self.partial = self.partial + view[start:end + 1], b""
-                take(line)
-                start = end + 1
-            self.partial += view[start:]
-            require(len(self.partial) <= bounds.MAX_LINE, "transition line/truncation")
-            return len(data)
-
-        def flush(self):
-            pass
-
-    class Digest:
-        def write(self, data):
-            return len(data)
-
-        def flush(self):
-            pass
-
-    # Decoded bytes are never written anywhere. Pass one verifies both identities with a
-    # sink that keeps nothing, so no row is validated from an unverified frame; pass two
-    # decodes the same frame again into a line splitter that validates each row as it forms.
-    try:
-        with path.open("rb") as source:
-            decode_stream(source, Digest(), **expected)
-        lines = Lines()
-        with path.open("rb") as source:
-            decode_stream(source, lines, **expected)
-    except CodecError as error:
-        require(False, f"transitions codec: {error}")
-    require(not lines.partial, "transition line/truncation")
-    require(count == logical["records"], "transition count")
-    if group:
-        settle(group)
-
-    # The profile's state durations agree with the row validity sequence. Time before
-    # a book's first row is held in its (unrecorded) entry state, one kind.
-    for (scope, book), state in chain.items():
-        held = dict(state.implied)
-        held[state.validity] = held.get(state.validity, 0) + bounds_by_scope[scope][1] - state.last_t
-        have = facts["state"].get((scope, keys[book]))
-        require(have is not None, "transitions for a book without profile rows")
-        lead = state.first_t - bounds_by_scope[scope][0]
-        difference = {name: have.get(name, 0) - held.get(name, 0) for name in set(have) | set(held)}
-        extra = {name: ns for name, ns in difference.items() if ns}
-        require(all(ns > 0 for ns in extra.values()) and sum(extra.values()) == lead and len(extra) <= 1,
-                "transition validity disagrees with profile state durations")
-
-    unattached = None
-    if "activity" in groups:
-        total = 0
-        for (scope, key), held in sorted(facts["buckets"].items()):
-            if key not in index:
-                continue
-            seen = buckets.get((scope, index[key]), (0, [[0, 0] for _ in held]))[1]
-            for (_, _, counts), (rows, trades) in zip(held, seen, strict=True):
-                require(counts is not None and rows == counts[0], "transition rows differ from activity transitions")
-                require(trades <= counts[1], "transition trades exceed activity trades")
-                total += counts[1]
-        unattached = total - attached
-
-    result = {"transition_books": books,
-              "transition_scopes": scope_table(snapshot),
-              "transition_rows": {"total": count, "by_kind": dict(sorted(kinds.items())),
-                                  "by_reason": dict(sorted(reasons.items()))}}
-    if unattached is not None:
-        result["transition_trades"] = {"attached": attached, "unattached": unattached}
-    require(len(str(result)) < bounds.MAX_METADATA, "transition summary budget")
+    result = {"transition_books": layout.books, "transition_scopes": scope_table(snapshot)}
+    if tops is not None:
+        skipped = _activity(tops, layout, facts, groups)
+        result["transition_rows"] = {"total": tops.count, "by_type": dict(sorted(tops.types.items())),
+                                     "by_cause": dict(sorted(tops.causes.items()))}
+        result["transition_trades_skipped"] = skipped
+    if levels is not None:
+        result["level_rows"] = {"total": levels.count, "by_type": dict(sorted(levels.types.items())),
+                                "by_cause": dict(sorted(levels.causes.items()))}
+    require(len(str(result)) < bounds.MAX_METADATA, "stream summary budget")
     return result
+
+
+def _activity(tops, layout, facts, groups):
+    """Trade and top rows against the profile's per-bucket activity; the skipped-trade counts.
+
+    The counts are derived from the profile rows, so they exist only with ``activity``.
+    """
+    if "activity" not in groups:
+        return None
+    skipped = {"scale_mismatch": 0, "unwritten_book": 0}
+    written = {key: i for i, key in enumerate(layout.keys)}
+    for (scope, key), held in sorted(facts["buckets"].items()):
+        if key not in written:
+            # A planned book the files never write: a Kalshi complement folded into its Yes book.
+            skipped["unwritten_book"] += sum(counts[1] for _, _, counts in held)
+            continue
+        book = written[key]
+        seen = tops.buckets.get((scope, book), (0, [[0, 0] for _ in held]))[1]
+        other = layout.books[book]["ask_source_book"]
+        companion = facts["buckets"].get((scope, tuple(other))) if other is not None else None
+        for i, ((_, _, counts), (rows, trades)) in enumerate(zip(held, seen, strict=True)):
+            transitions, nonduplicate, mismatch = counts
+            require(trades + mismatch == nonduplicate, "trade rows differ from activity trades")
+            extra = 0 if companion is None else companion[i][2][0]
+            require(rows <= transitions + extra, "top rows exceed activity transitions")
+            skipped["scale_mismatch"] += mismatch
+    return skipped

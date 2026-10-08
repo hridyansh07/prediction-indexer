@@ -4,8 +4,8 @@ Kept apart from the collector so the independent readers can share the policy
 contract without importing the code that writes the output.
 
 Version 1 is the embedded and standalone policy of SDK spec section 7. Version 2
-has the same closed fields and may add the standalone-only ``availability`` and
-``transitions`` groups (``docs/specs/MARKET_PROFILE_V2.md``); a version-1
+has the same closed fields and may add the standalone-only ``availability``,
+``levels`` and ``transitions`` groups (``docs/specs/MARKET_PROFILE_V2.md``); a version-1
 policy is byte-for-byte what it always was.
 """
 
@@ -17,13 +17,18 @@ from replay.streams.protocol import obj, require, uint
 
 STRATEGY = "market_profile_v1"
 GROUPS = ("activity", "depth", "pair_consistency", "quote_stability", "self_crossing", "top_of_book")
-V2_GROUPS = ("availability", "transitions")
+V2_GROUPS = ("availability", "levels", "transitions")
 FILES = ("incidents.ndjson", "pair_profile.ndjson", "profile.ndjson")
 AVAILABILITY_FILE = "availability.ndjson"
 TRANSITIONS_FILE = "transitions.ndjson.zst"
 TRANSITIONS_PLAIN = "transitions.ndjson"  # provisional; deleted once the frame is committed
 TRANSITIONS_MAX_ROWS = 50_000_000
 TRANSITIONS_MAX_BYTES = 16 * 1024**3
+LEVELS_FILE = "levels.ndjson.zst"
+LEVELS_PLAIN = "levels.ndjson"  # provisional; deleted once the frame is committed
+LEVELS_MAX_ROWS = TRANSITIONS_MAX_ROWS
+LEVELS_MAX_BYTES = TRANSITIONS_MAX_BYTES
+LEVELS_MAX_LINE = 1024 * 1024  # a ladder line; transitions keep the 64 KiB MAX_LINE
 DISPOSITIONS = ("applied", "duplicate", "invalidated", "not_authority", "observed")
 MAX_PROFILE_ROWS = 2_000_000
 
@@ -61,7 +66,8 @@ def profile_files(policy):
     """The exact file set a policy produces; manifests and readers use this."""
     groups = set(policy["groups"])
     return (FILES + ((AVAILABILITY_FILE,) if "availability" in groups else ())
-            + ((TRANSITIONS_FILE,) if "transitions" in groups else ()))
+            + ((TRANSITIONS_FILE,) if "transitions" in groups else ())
+            + ((LEVELS_FILE,) if "levels" in groups else ()))
 
 
 def pairs_of(scope):

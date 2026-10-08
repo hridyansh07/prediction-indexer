@@ -17,13 +17,15 @@ from replay.economic_sdk.profile_policy import (
     DISPOSITIONS,
     FILES,
     GROUPS,
+    LEVELS_FILE,
+    LEVELS_PLAIN,
     TRANSITIONS_FILE,
     TRANSITIONS_PLAIN,
     pairs_of,
     profile_policy,
 )
 from replay.economic_sdk.reader import lines, signed
-from replay.economic_sdk.transitions_reader import validate_transitions
+from replay.economic_sdk.transitions_reader import validate_streams
 from replay.streams.protocol import obj, require, uint  # noqa: F401
 
 _STATE = ("usable_ns", "not_initialized_ns", "unusable_ns", "bid_empty_ns", "ask_empty_ns",
@@ -98,11 +100,13 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
               "orientation venue market_id price_scale quantity_scale start_ns end_ns tick_atoms "
               "ask_source groups state " + " ".join(g for g in GROUPS if g in groups and g != "pair_consistency"))
     # Version-2 outputs that the policy did not ask for must not exist beside the others.
-    for name, wanted in ((AVAILABILITY_FILE, "availability"), (TRANSITIONS_FILE, "transitions")):
+    for name, wanted in ((AVAILABILITY_FILE, "availability"), (TRANSITIONS_FILE, "transitions"),
+                         (LEVELS_FILE, "levels")):
         require(wanted in groups or not (root / name).exists(), "unexpected output file " + name)
-    require(not (root / TRANSITIONS_PLAIN).exists() and not (root / (TRANSITIONS_PLAIN + ".open")).exists(),
-            "unexpected provisional transitions file")
-    facts = {"state": {}, "open": {}, "buckets": {}} if "transitions" in groups else None
+    for plain in (TRANSITIONS_PLAIN, LEVELS_PLAIN):
+        require(not (root / plain).exists() and not (root / (plain + ".open")).exists(),
+                "unexpected provisional stream file")
+    facts = {"state": {}, "open": {}, "buckets": {}} if groups & {"transitions", "levels"} else None
     last, cursor, totals = None, {}, {}
     for row in lines(root, "profile.ndjson", files["profile.ndjson"]):
         obj(row, fields)
@@ -211,7 +215,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                     and sum(activity["aggressor"].values()) == nonduplicate, "aggressor partition")
             _big(activity["traded_quantity_atoms"])
             signed(activity["trade_mid2_deviation_atoms"])
-            activity_counts = (activity["transitions"], nonduplicate)
+            activity_counts = (activity["transitions"], nonduplicate, activity["trades_scale_mismatch"])
         if "quote_stability" in groups:
             stability = obj(row["quote_stability"], "edges_ns bid ask censored")
             require(stability["edges_ns"] == policy["survival_edges_ns"])
@@ -310,9 +314,9 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         "availability/profile usable time")
         availability = duration_rows(durations)
 
-    transitions = None
-    if "transitions" in groups:
-        transitions = validate_transitions(root, snapshot, files[TRANSITIONS_FILE], policy, facts, groups)
+    streams = None
+    if groups & {"transitions", "levels"}:
+        streams = validate_streams(root, snapshot, files, policy, facts, groups)
 
     result = {"version": 1, "experiment_sha256": experiment_sha256, "policy": policy,
               "books": [{"scope": scope, "instrument": key[0], "orientation": key[1],
@@ -322,8 +326,8 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         for (scope, market), total in sorted(pair_totals.items())]}
     if availability is not None:
         result["availability_durations"] = availability
-    if transitions is not None:
-        result.update(transitions)
+    if streams is not None:
+        result.update(streams)
     return result
 
 

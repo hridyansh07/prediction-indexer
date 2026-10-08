@@ -15,6 +15,7 @@ from replay.economic_sdk.bounds import MAX_METADATA
 from replay.economic_sdk.profile import (
     STRATEGY,
     TRANSITIONS_FILE,
+    LEVELS_FILE,
     Collector,
     profile_files,
     profile_identity,
@@ -58,7 +59,7 @@ class MarketProfile:
                 return
             require(self.input.bound, "missing initial")
             if cut.kind == "terminal":
-                self.collector.terminal(self.clock.terminal())
+                self.collector.terminal(self.clock.terminal(), cut.sequence)
                 self.terminal = True
                 return
             require(cut.kind == "cut")
@@ -110,10 +111,12 @@ def _manifest(value, complete):
             "profile experiment identity")
     names, files = profile_files(policy), value["files"]
     require(type(files) is dict and set(files) == set(names), "output file set")
-    check_files({k: v for k, v in files.items() if k != TRANSITIONS_FILE},
-                tuple(n for n in names if n != TRANSITIONS_FILE))
-    if TRANSITIONS_FILE in files:
-        identity_record(files[TRANSITIONS_FILE])
+    framed = (TRANSITIONS_FILE, LEVELS_FILE)
+    check_files({k: v for k, v in files.items() if k not in framed},
+                tuple(n for n in names if n not in framed))
+    for name in framed:
+        if name in files:
+            identity_record(files[name])
     if complete:
         sha(value["summary_sha256"])
 
