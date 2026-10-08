@@ -50,9 +50,11 @@ rather than interpreted as absence. A timeline is not required for skip.
 Exit 1 means discovery/fetch, archive, or timeline failure; an ordinary unmapped
 bundle is not an invocation failure unless its reason is `fetch_failed`.
 Regeneration returns only a timeline, not a fetch report. Without
-`--timeline-output`, regeneration immutably publishes beside the raw receipt:
-identical bytes are idempotent; different bytes conflict. Use an explicit local
-output for rebuilding after a derivation change. Raw objects are never rewritten.
+`--timeline-output`, regeneration immutably publishes beside the raw receipt as
+`timeline.v<derivation_version>.json`: identical bytes are idempotent; different
+bytes under the same version conflict. A derivation fix bumps
+`DERIVATION_VERSION`, and regeneration then publishes the new version beside the
+old one. Raw objects are never rewritten.
 
 ## Mapping and capture
 
@@ -69,17 +71,19 @@ Unmapped reasons: `no_kalshi_events`, `no_milestone`, `multiple_milestones`,
 be treated as an empty result. A nonempty milestone cursor is ambiguous and gives
 `multiple_milestones`. Inconsistent snapshots of the same milestone fail closed.
 
-All bundles sharing a milestone share one fetch and one receipt. Raw records
-include their Universe history/context attempts and Kalshi mapping attempts, then
-live data and every related nested event, in actual request order. Raw sequence
-numbers are contiguous within that fetch; report sequence numbers cover the whole
-invocation. Unmapped/discovery attempts remain visible as metadata in the report;
+All bundles sharing a milestone share one fetch and one receipt. Raw records are
+Kalshi responses only: the mapping `/milestones` attempts, then live data and every
+related nested event, in actual request order. Universe history and selection
+attempts are mapping evidence, not game state; they stay in `report.json`. Raw
+sequence numbers are contiguous within that fetch; report sequence numbers cover
+the whole invocation. Unmapped/discovery attempts remain visible as metadata in the report;
 there is no guessed milestone archive location for them.
 
-Requests are globally spaced by at least 0.2 seconds. 429, 5xx, and timeouts get
-at most five total attempts with 1/2/4/8-second backoff. Valid numeric or HTTP-date
-Retry-After is honored; a wait over 60 seconds aborts rather than retrying early.
-Other connection errors and 4xx are not retried. Redirects are refused, and HTTP
+Requests are spaced per host: 0.2 seconds for Kalshi, 3.4 seconds for Universe,
+which admits three unauthenticated requests per ten seconds. 429, 5xx, timeouts
+and connection errors (including a body cut short) get at most five total attempts
+with 1/2/4/8-second backoff. Valid numeric or HTTP-date Retry-After is honored; a
+wait over 60 seconds aborts rather than retrying early. 4xx is not retried. Redirects are refused, and HTTP
 errors are read as responses. A 200 with invalid JSON or invalid fields is a
 visible failure, not an empty result. An exhausted endpoint does not stop fetching
 other related events; the committed receipt is `incomplete`.
@@ -98,10 +102,10 @@ Object prefix:
 gamestate/source=kalshi/date=<UTC milestone start date>/milestone=<id>/fetch=<fetch start %Y%m%dT%H%M%S.%fZ>
 ```
 
-The fetch start covers the first associated history/mapping request. Each prefix
+The fetch start is the first archived (Kalshi mapping) request. Each prefix
 must be unused. Publication is `responses.ndjson.zst`, fresh metadata verification,
 then `receipt.json` as the raw commit marker. Only then is the raw reopened,
-verified, decoded to temporary disk, and used to publish `timeline.json`.
+verified, decoded to temporary disk, and used to publish `timeline.v1.json`.
 Timeline failure does not undo a committed receipt, and the report retains its
 prefix and fetched count.
 
@@ -143,8 +147,11 @@ The adapter recognizes `product_metadata.competition_scope = "Map N Winner"`;
 it does not parse titles or ticker names. Live periods come from
 `home_stats`/`away_stats` rows, and scores from `home_periods`/`away_periods`.
 Bo1 may omit the latter; no final-series-score substitution is made.
-Tournament is `details.tournament_name`. Series is identified by
-`details.main_game_event_ticker`. Only market `result=yes` establishes a market
+Tournament is `details.tournament_name`. The series event is
+`details.main_game_event_ticker`, or, when that field is absent, the single entry
+of `primary_event_tickers`; `series.event_ticker` records which. With neither, or
+when that event was not fetched, the series winner is null and
+`series_event_missing` is reported. Only market `result=yes` establishes a market
 winner; cross-check uses `custom_strike.esports_competitor` and the exact home/away
 competitor IDs. Live winner flags never fill a missing market winner.
 Derived start subtracts the agreed duration in ns from the agreed market close.
@@ -153,7 +160,7 @@ Disagreement produces a null derived start, not a selected side's duration/time.
 Required inconsistencies are `winner_disagreement`, `unsettled_map_market`, and
 `map_count_difference`. Additional diagnostics: `response_shape`,
 `archived_milestone_missing` (derivation failure), `milestone_changed`,
-`related_event_missing`, `live_data_missing`, `invalid_time`,
+`related_event_missing`, `live_data_missing`, `invalid_time`, `series_event_missing`,
 `unsettled_series_market`, `multiple_winner_markets`, `period_shape`,
 `duplicate_period`, `map_event_shape`, `unsupported_event_scope`,
 `winner_crosscheck_unavailable`, `map_event_missing`, `duration_disagreement`,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -38,6 +39,11 @@ from archive.storage.factory import build_store
 from encoder import LogicalIdentity, StoredIdentity, decode_stream, encode_stream
 
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
+# Seconds between requests to one host. Universe admits three unauthenticated
+# requests per ten seconds (configs/event_universe.json); Kalshi is public.
+KALSHI_SPACING = 0.2
+UNIVERSE_SPACING = 3.4
+DERIVATION_VERSION = 1
 MAX_BODY = 4 * 1024 * 1024
 MAX_RAW = 128 * 1024 * 1024
 MAX_METADATA = 1024 * 1024
@@ -162,6 +168,10 @@ def transport(url):
         return response.code, dict(response.headers), body
 
 
+def is_kalshi(url):
+    return url.startswith(KALSHI + "/")
+
+
 def body_bytes(record):
     if not isinstance(record, dict):
         raise ValueError("record_shape")
@@ -270,7 +280,7 @@ class Client:
         )
         self.records = AttemptLog() if records is None else records
         self.retries = 0
-        self.next_request = 0
+        self.next_request: dict[str, float] = {}
 
     def get(self, url):
         if len(url) > 8192:
@@ -282,8 +292,10 @@ class Client:
                 self.records.file.seek(0, 2)
                 if self.records.file.tell() + MAX_BODY * 6 + 16384 > MAX_RAW:
                     raise FetchError("invocation_raw_limit")
-            self.sleep(max(0, self.next_request - self.monotonic()))
-            self.next_request = self.monotonic() + 0.2
+            host = urlsplit(url).netloc
+            spacing = KALSHI_SPACING if is_kalshi(url) else UNIVERSE_SPACING
+            self.sleep(max(0, self.next_request.get(host, 0) - self.monotonic()))
+            self.next_request[host] = self.monotonic() + spacing
             r = dict(
                 record_version=1,
                 seq=len(self.records),
@@ -328,9 +340,10 @@ class Client:
                     if isinstance(error.reason, TimeoutError)
                     else "connection"
                 )
-                retry = r["error"] == "timeout"
-            except OSError:
-                r["error"] = "connection"
+                retry = True
+            except (OSError, http.client.HTTPException):
+                # A reset or a body cut short (IncompleteRead) is transient.
+                r["error"], retry = "connection", True
             except FetchError as error:
                 r["error"] = str(error)
             self.records.append(r)
@@ -773,11 +786,17 @@ def archive_fetch(store, m, bundle_ids, records, started_ns, status):
     return prefix
 
 
+def timeline_key(prefix):
+    return f"{prefix}/timeline.v{DERIVATION_VERSION}.json"
+
+
 def regenerate(store, prefix, output=None):
     receipt, records = read_records(store, prefix)
     timeline = derive(receipt, records)
     if output is None:
-        put_json(store, prefix + "/timeline.json", timeline)
+        # Versioned so that a derivation fix is republished beside the raw
+        # object under the next version; an identical rerun proves the object.
+        put_json(store, timeline_key(prefix), timeline)
     else:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1028,11 +1047,18 @@ def derive(receipt, records):
                 },
             }
         )
-    primary = events.get(details.get("main_game_event_ticker"), {})
+    series_ticker = details.get("main_game_event_ticker")
+    series_source = "details.main_game_event_ticker"
+    if series_ticker is None and len(m["primary_event_tickers"]) == 1:
+        series_ticker = m["primary_event_tickers"][0]
+        series_source = "primary_event_tickers"
+    primary = events.get(series_ticker, {}) if isinstance(series_ticker, str) else {}
+    if not primary:
+        issue("series_event_missing")
     series_winner = winner(primary, None) if primary else None
     crosscheck(primary, series_winner, None)
     return {
-        "derivation_version": 1,
+        "derivation_version": DERIVATION_VERSION,
         "milestone_id": m["id"],
         "bundle_ids": receipt["bundle_ids"],
         "game": {"value": details.get("game"), "source_field": "details.game"},
@@ -1045,6 +1071,7 @@ def derive(receipt, records):
         "match_end_ns": ns(m.get("end_date")),
         "status": {"value": details.get("status"), "source_field": "details.status"},
         "series": {
+            "event_ticker": {"value": series_ticker, "source_field": series_source},
             "winner_market": series_winner,
             "score": {
                 "value": {k: live.get(k) for k in ("home_score", "away_score")},
@@ -1106,7 +1133,6 @@ def run(client, store, base, bundles, *, skip_existing=True):
             if skip_existing and existing_complete(store, mid):
                 report["milestones_skipped"] += 1
                 continue
-            started = client.records[group["ranges"][0][0]]["requested_at_ns"]
             start = len(client.records)
             m = group["milestone"]
             complete = True
@@ -1130,9 +1156,16 @@ def run(client, store, base, bundles, *, skip_existing=True):
                         }
                     )
             ranges = group["ranges"] + [(start, len(client.records))]
-            rows = (
-                client.records[i] for first, last in ranges for i in range(first, last)
-            )
+            # Only Kalshi responses are game-state evidence; the Universe
+            # mapping requests stay in report.json.
+            kalshi = [
+                i
+                for first, last in ranges
+                for i in range(first, last)
+                if is_kalshi(client.records[i]["url"])
+            ]
+            started = client.records[kalshi[0]]["requested_at_ns"]
+            rows = (client.records[i] for i in kalshi)
             prefix = archive_fetch(
                 store,
                 m,
@@ -1232,15 +1265,22 @@ def main(argv=None):
         parser.error(
             "set UNIVERSE_BASE_URL to a public API base URL without credentials"
         )
+    try:
+        for bundle in args.bundle:
+            identifier(bundle)
+        if args.activation_start and timestamp(args.activation_start) >= timestamp(
+            args.activation_end
+        ):
+            parser.error("activation-start must precede activation-end")
+    except ValueError:
+        parser.error("invalid bundle id or RFC 3339 activation bound")
     c = Client()
     try:
         bundles = args.bundle
         if args.activation_start:
-            if timestamp(args.activation_start) >= timestamp(args.activation_end):
-                parser.error("activation-start must precede activation-end")
             bundles = sorted(
                 {
-                    identifier(r["bundle_id"])
+                    identifier(r.get("bundle_id"))
                     for r in pages(
                         c,
                         base,
@@ -1253,18 +1293,21 @@ def main(argv=None):
                     )
                 }
             )
-        for bundle in bundles:
-            identifier(bundle)
-        report = run(c, store, base, bundles, skip_existing=args.skip_existing)
-    except FetchError as error:
-        report = run(c, store, base, [])
-        report["failures"].append(
-            {
-                "milestone_id": None,
-                "reason": "selection_discovery_failed",
-                "detail": str(error),
-            }
-        )
+    except (FetchError, ValueError, KeyError, TypeError) as error:
+        bundles = None
+        detail = str(error) if isinstance(error, FetchError) else "selection_shape"
+    try:
+        if bundles is not None:
+            report = run(c, store, base, bundles, skip_existing=args.skip_existing)
+        else:
+            report = run(c, store, base, [])
+            report["failures"].append(
+                {
+                    "milestone_id": None,
+                    "reason": "selection_discovery_failed",
+                    "detail": detail,
+                }
+            )
     finally:
         c.records.close()
     destination = args.report or args.output_root / "report.json"

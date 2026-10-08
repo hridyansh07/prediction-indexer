@@ -1,5 +1,6 @@
 """Offline, minimal public-contract shapes; transports never use the network."""
 
+import http.client
 import json
 import tempfile
 import unittest
@@ -75,6 +76,14 @@ class MappingTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertEqual(pull.map_bundle(client(replies), tickers)[1], reason)
 
+    def test_milestone_query_sends_required_limit(self):
+        c = client([{"milestones": [milestone()]}])
+        pull.map_bundle(c, ["SERIES"])
+        self.assertEqual(
+            c.send.urls,
+            [pull.KALSHI + "/milestones?limit=10&related_event_ticker=SERIES"],
+        )
+
     def test_exact_same_milestone_and_type(self):
         m = milestone()
         self.assertEqual(
@@ -112,6 +121,34 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(len(c.records), 5)
         self.assertEqual(c.retries, 4)
 
+    def test_dropped_connection_is_recorded_and_retried(self):
+        for error in (http.client.IncompleteRead(b"par"), ConnectionResetError()):
+            with self.subTest(error=type(error).__name__):
+                c = client([error, {"ok": True}])
+                self.assertEqual(c.get("https://example.test/x"), {"ok": True})
+                self.assertEqual(
+                    [(r["status"], r["error"]) for r in c.records],
+                    [(None, "connection"), (200, None)],
+                )
+                self.assertEqual(c.retries, 1)
+        c = client([http.client.BadStatusLine("x")] * 5)
+        with self.assertRaisesRegex(pull.FetchError, "connection"):
+            c.get("https://example.test/x")
+        self.assertEqual(len(c.records), 5)
+
+    def test_pacing_is_per_host(self):
+        waits, now = [], [0.0]
+        c = pull.Client(
+            Fake([{"a": 1}] * 3),
+            sleep=lambda d: waits.append(d),
+            monotonic=lambda: now[0],
+            records=[],
+        )
+        c.get("https://universe.test/v1/x")
+        c.get(pull.KALSHI + "/milestones?limit=10")
+        c.get("https://universe.test/v1/y")
+        self.assertEqual(waits, [0, 0, pull.UNIVERSE_SPACING])
+
     def test_non_utf8_and_closed_record(self):
         c = client([(200, {}, b"\xff\x00")])
         with self.assertRaises(pull.FetchError):
@@ -136,7 +173,7 @@ class HttpTests(unittest.TestCase):
             records=[],
         )
         c.get("https://example.test")
-        self.assertEqual(waits, [0, 3, 0.2])
+        self.assertEqual(waits, [0, 3, pull.UNIVERSE_SPACING])
         c = client([(429, {"Retry-After": "999"}, b"wait")])
         with self.assertRaisesRegex(pull.FetchError, "retry_after_exceeds_budget"):
             c.get("https://example.test")
@@ -297,7 +334,65 @@ def records(game="cs2", *, result="yes", extra_period=False):
     return m, c.records
 
 
+def rewrite(rows, index, doc):
+    """Replace one archived response with a new exact attempt for the same URL."""
+    rows = list(rows)
+    c = client([doc])
+    c.get(rows[index]["url"])
+    rows[index] = c.records[0]
+    return rows
+
+
+def derive(rows):
+    return pull.derive({"milestone_id": "match-id", "bundle_ids": ["bundle"]}, rows)
+
+
+def codes(timeline):
+    return {i["code"] for i in timeline["inconsistencies"]}
+
+
 class ArchiveTests(unittest.TestCase):
+    def test_tampered_logical_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = LocalObjectStore(Path(root))
+            m, rows = records()
+            prefix = pull.archive_fetch(
+                store, m, ["bundle"], rows, 1_800_000_000_000000000, "complete"
+            )
+            receipt_path = Path(root) / prefix / "receipt.json"
+            original = json.loads(receipt_path.read_text())
+            for logical in (
+                dict(original["logical"], sha256="0" * 64),
+                dict(original["logical"], byte_length=original["logical"]["byte_length"] - 1),
+                dict(original["logical"], line_count=original["logical"]["line_count"] + 1),
+            ):
+                with self.subTest(logical=logical):
+                    receipt_path.write_text(json.dumps(dict(original, logical=logical)))
+                    with self.assertRaises((ValueError, pull.ObjectStoreError)):
+                        _, rows_out = pull.read_records(store, prefix)
+                        list(rows_out)
+                    self.assertFalse(pull.existing_complete(store, "match-id"))
+
+    def test_timeline_rerun_is_idempotent_and_a_new_version_sits_beside_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = LocalObjectStore(Path(root))
+            m, rows = records()
+            prefix = pull.archive_fetch(
+                store, m, ["bundle"], rows, 1_800_000_000_000000000, "complete"
+            )
+            first = pull.regenerate(store, prefix)
+            self.assertEqual(pull.regenerate(store, prefix), first)
+            with patch.object(pull, "DERIVATION_VERSION", 2):
+                self.assertEqual(pull.regenerate(store, prefix)["derivation_version"], 2)
+            self.assertEqual(
+                sorted(
+                    k.rsplit("/", 1)[-1]
+                    for k in store.list_keys(prefix + "/")
+                    if "timeline" in k
+                ),
+                ["timeline.v1.json", "timeline.v2.json"],
+            )
+
     def test_exact_roundtrip_skip_refetch_and_regeneration(self):
         with tempfile.TemporaryDirectory() as root:
             store = LocalObjectStore(Path(root))
@@ -359,7 +454,7 @@ class ArchiveTests(unittest.TestCase):
                 )
                 pull.regenerate(store, prefix)
             self.assertEqual(
-                calls, ["responses.ndjson.zst", "receipt.json", "timeline.json"]
+                calls, ["responses.ndjson.zst", "receipt.json", "timeline.v1.json"]
             )
             with patch.object(
                 store, "put_immutable", side_effect=pull.ObjectStoreError("offline")
@@ -526,7 +621,13 @@ class RunTests(unittest.TestCase):
             self.assertEqual(report["milestones_fetched"], 1)
             self.assertEqual(report["requests"], 9)
             prefix = report["fetches"][0]["prefix"]
-            self.assertEqual(pull.read_receipt(store, prefix)["bundle_ids"], bundles)
+            receipt, archived = pull.read_records(store, prefix)
+            self.assertEqual(receipt["bundle_ids"], bundles)
+            archived = list(archived)
+            # Universe history and selection reads stay in the report only.
+            self.assertEqual(receipt["request_count"], 5)
+            self.assertTrue(all(r["url"].startswith(pull.KALSHI + "/") for r in archived))
+            self.assertEqual(receipt["fetch_started_ns"], archived[0]["requested_at_ns"])
             c = client(run_replies(bundles)[:-3])
             self.assertEqual(
                 pull.run(c, store, "https://example.test", bundles)[
@@ -568,6 +669,14 @@ class RunTests(unittest.TestCase):
             self.assertEqual(len(timeline["maps"]), 1)
             self.assertIsNone(timeline["maps"][0]["scores"]["home"]["value"])
 
+    def test_dropped_universe_connection_maps_to_fetch_failed(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = LocalObjectStore(Path(root))
+            c = client([http.client.IncompleteRead(b"")] * 5)
+            report = pull.run(c, store, "https://example.test", ["bundle"])
+            self.assertEqual(report["bundles_unmapped"], {"fetch_failed": 1})
+            self.assertEqual(report["requests"], 5)
+
     def test_every_history_context_is_unioned(self):
         c = client(
             [
@@ -596,7 +705,7 @@ class RunTests(unittest.TestCase):
             original = store.put_immutable
 
             def put(key, *args, **kwargs):
-                if key.endswith("timeline.json"):
+                if key.endswith("timeline.v1.json"):
                     raise pull.ObjectStoreError("timeline failed")
                 return original(key, *args, **kwargs)
 
@@ -676,6 +785,35 @@ class CliTests(unittest.TestCase):
             self.assertEqual(report["requests"], 1)
             self.assertEqual(
                 report["failures"][0]["reason"], "selection_discovery_failed"
+            )
+
+    def test_discovery_row_without_bundle_id_still_reports(self):
+        with tempfile.TemporaryDirectory() as root:
+            c = pull.Client(
+                Fake([{"selections": [{"run_id": "r"}], "next_cursor": None}]),
+                sleep=lambda _: None,
+            )
+            with (
+                patch.object(pull, "Client", return_value=c),
+                patch.dict(
+                    "os.environ", {"UNIVERSE_BASE_URL": "https://example.test"}, clear=True
+                ),
+            ):
+                code = pull.main(
+                    [
+                        "--activation-start",
+                        "2026-09-27T00:00:00Z",
+                        "--activation-end",
+                        "2026-09-28T00:00:00Z",
+                        "--output-root",
+                        root,
+                    ]
+                )
+            self.assertEqual(code, 1)
+            failure = json.loads((Path(root) / "report.json").read_text())["failures"][0]
+            self.assertEqual(
+                (failure["reason"], failure["detail"]),
+                ("selection_discovery_failed", "selection_shape"),
             )
 
     def test_offline_regeneration_cli(self):
@@ -766,6 +904,61 @@ class DerivationTests(unittest.TestCase):
         self.assertIn(
             "unsettled_map_market", {i["code"] for i in timeline["inconsistencies"]}
         )
+
+    def test_series_event_without_main_game_ticker(self):
+        _, rows = records()
+        mapping = pull.loads(pull.body_bytes(rows[0]))
+        del mapping["milestones"][0]["details"]["main_game_event_ticker"]
+        t = derive(rewrite(rows, 0, mapping))
+        self.assertEqual(
+            t["series"]["event_ticker"],
+            {"value": "SERIES", "source_field": "primary_event_tickers"},
+        )
+        self.assertEqual(t["series"]["winner_market"]["ticker"], "SERIES-H")
+        self.assertNotIn("series_event_missing", codes(t))
+        # Two primary events and no main ticker: never choose one.
+        mapping["milestones"][0]["primary_event_tickers"].append("MAP1")
+        t = derive(rewrite(rows, 0, mapping))
+        self.assertIsNone(t["series"]["winner_market"])
+        self.assertIn("series_event_missing", codes(t))
+
+    def test_unsettled_series_market(self):
+        _, rows = records()
+        doc = pull.loads(pull.body_bytes(rows[3]))
+        doc["event"]["markets"][0]["result"] = ""
+        t = derive(rewrite(rows, 3, doc))
+        self.assertIsNone(t["series"]["winner_market"])
+        self.assertIn("unsettled_series_market", codes(t))
+
+    def test_forfeit_close_and_settlement_disagreements(self):
+        _, rows = records()
+        live = pull.loads(pull.body_bytes(rows[1]))
+        live["live_data"]["details"]["away_stats"][0]["stats"]["map_forfeit"] = 1
+        doc = pull.loads(pull.body_bytes(rows[2]))
+        market = doc["event"]["markets"][0]
+        doc["event"]["markets"].append(
+            dict(
+                market,
+                ticker="MAP1-A",
+                result="no",
+                close_time="2026-09-27T13:00:05Z",
+                settlement_ts="2026-09-27T13:03:00Z",
+            )
+        )
+        t = derive(rewrite(rewrite(rows, 1, live), 2, doc))
+        self.assertTrue(
+            {
+                "forfeit_disagreement",
+                "market_close_disagreement",
+                "market_settlement_disagreement",
+            }
+            <= codes(t)
+        )
+        one = t["maps"][0]
+        self.assertIsNone(one["forfeit"]["value"])
+        self.assertIsNone(one["close_ns"])
+        self.assertIsNone(one["settlement_ns"])
+        self.assertIsNone(one["derived_start_ns"])
 
     def test_missing_bundle_map_ref_is_not_an_inconsistency(self):
         _, rows = records()
