@@ -171,7 +171,9 @@ Required inconsistencies are `winner_disagreement`, `unsettled_map_market`, and
 `bundles_unmapped` (reason → count), `milestones_fetched`, `milestones_skipped`,
 `milestones_incomplete`, `requests`, `retries`, `bundles`, `fetches`, `failures`,
 `request_attempts`. Bundle rows have `bundle_id`, nullable `milestone_id`, nullable
-`reason`. Fetch rows have `milestone_id`, `prefix`, `status`, `errors` (URL/reason).
+`reason`. Fetch rows have `milestone_id`, `prefix`, `status`, `errors` (URL/reason),
+and `disqualified` (whether the derived timeline has a disqualifying inconsistency;
+null when the timeline could not be written).
 Attempt rows have `seq`, `url`, `status`, `error`, `requested_at_ns`,
 `received_at_ns`; no bodies or headers. Failure rows have `milestone_id`, `reason`,
 and only discovery failures add `detail`. Failure reasons distinguish
@@ -180,14 +182,15 @@ and only discovery failures add `detail`. Failure reasons distinguish
 
 ## Bounds and verification
 
+Bounds apply to single untrusted inputs, never to how much is paged or listed:
 20-second socket timeout; 4 MiB accepted response bodies; 1 KiB content-type;
-8 KiB URLs; 4 KiB cursors; 50 rows/page; 100 pages; 1,000 history/discovery rows
-or input bundles; 100 related tickers/periods; 1,000 markets/event; 10,000 HTTP
-attempts; 128 MiB invocation journal and per-fetch decoded raw; 1 MiB receipt and
-timeline; 100,000 listed archive keys. A bound is a visible failure, never ordinary
-absence. Oversized bodies are rejected rather than partially archived as complete.
-An invocation journal lives on temporary disk; compression and verified decoding
-are streaming. Temporary files are closed/removed even on failures.
+8 KiB URLs; 4 KiB cursors; 50 rows/page; 100 related tickers/periods; 1,000
+markets/event; 128 MiB per-fetch decoded raw; 1 MiB receipt and timeline. Pages
+and archive listings stream; only cursors are retained, and a repeated cursor is
+an error. A bound is a visible failure, never ordinary absence. Oversized bodies
+are rejected rather than partially archived as complete. The attempt journal lives
+on temporary disk; compression and verified decoding are streaming. Temporary
+files are closed/removed even on failures.
 
 ```bash
 .venv/bin/python -m unittest tests.test_kalshi_game_state

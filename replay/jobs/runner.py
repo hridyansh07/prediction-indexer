@@ -31,7 +31,7 @@ from replay.jobs.stages import (
     validate_job_root,
 )
 from replay.preparation import load_snapshot
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.store import ReplayJobStore
 
 
 @dataclass(frozen=True)

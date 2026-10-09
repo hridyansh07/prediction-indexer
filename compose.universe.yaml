@@ -137,7 +137,7 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_sync.py"]
+    command: ["python", "-u", "-m", "universe", "sync"]
 
   event-universe-backfill:
     <<: *universe-runtime
@@ -145,7 +145,7 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_backfill.py"]
+    command: ["python", "-u", "-m", "universe", "backfill"]
 
   event-universe-backup:
     <<: *universe-runtime
@@ -153,7 +153,28 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_backup.py"]
+    command: ["python", "-u", "-m", "universe", "backup"]
+
+  event-universe-game-state:
+    <<: *universe-runtime
+    profiles: [jobs]
+    restart: "no"
+    environment: *universe-job-environment
+    # Attempt journal, raw reserialization and Zstd frame each need bounded temp space.
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    command: ["python", "-u", "-m", "gamestate.run_scheduled", "/etc/prediction-indexer/gamestate.json"]
+    volumes:
+      - *universe-archive-volume
+      - type: bind
+        source: ${GAMESTATE_DATA_ROOT:-./data/gamestate}
+        target: /var/lib/gamestate
+        bind:
+          create_host_path: true
+    networks: [replay-private, replay-egress]
+    depends_on:
+      event-universe:
+        condition: service_healthy
 
   replay-redis:
     image: redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635

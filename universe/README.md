@@ -9,7 +9,7 @@ Targeter runs. It has three roles:
 2. **Authentication**: Sign-In With Ethereum (SIWE) sessions and a member
    allowlist.
 3. **Replay jobs control plane**: durable submission, idempotency, quota and
-   transition records for Replay jobs (`universe/replay_jobs.py`). The runner
+   transition records for Replay jobs (`universe/jobs/store.py`). The runner
    that executes jobs lives under `replay/` (see
    [`docs/REPLAY_JOBS_V1.md`](../docs/REPLAY_JOBS_V1.md)).
 
@@ -29,10 +29,12 @@ fields are rejected.
 
 | Command | Purpose |
 |---|---|
-| `python universe/run_server.py` | Open/initialize all three SQLite schemas and serve the API (`ThreadingHTTPServer`, host/port from `api`) |
-| `python universe/run_sync.py` | One-shot incremental ingestion of newly committed runs |
-| `python universe/run_backfill.py` | One-shot oldest-first backfill of `backfill.generated_start` to `backfill.generated_end` (both required) |
-| `python universe/run_backup.py` | Online-backup the SQLite file, upload it immutably under `backup.object_prefix`, print path, key, SHA-256, length |
+| `python -m universe serve` | Open/initialize all three SQLite schemas and serve the API (`ThreadingHTTPServer`, host/port from `api`) |
+| `python -m universe sync` | One-shot incremental ingestion of newly committed runs |
+| `python -m universe backfill` | One-shot oldest-first backfill of `backfill.generated_start` to `backfill.generated_end` (both required) |
+| `python -m universe backup` | Online-backup the SQLite file, upload it immutably under `backup.object_prefix`, print path, key, SHA-256, length |
+
+Each command takes no options; everything comes from the config.
 
 `compose.universe.yaml` runs `event-universe` (the server) and the profile
 `jobs` services `event-universe-sync`, `event-universe-backfill` and
@@ -54,7 +56,7 @@ packages: metadata via `verify_metadata_objects` in manifest order, bounded JSON
 via `archive.read_verified_json`, NDJSON via `ArchivedObjectByteStreamer`.
 Universe does not implement store reads, checksums, or Zstandard decoding.
 
-Bounds (`universe/sync.py`): manifest 16 MiB; selection report 128 MiB; selected
+Bounds (`universe/ingest/sync.py`): manifest 16 MiB; selection report 128 MiB; selected
 normalized catalogue artifacts 128 MiB decoded per run (warning at 96 MiB); one
 NDJSON row 4 MiB; 100,000 catalogue references per report. Only artifacts for
 venues referenced by complete-run candidates are retrieved; their stored/logical
@@ -157,7 +159,7 @@ ingestion order and not lifecycle: absence after the last-seen run is ambiguous
 mints a new claim; coverage `INCOMPLETE_COVERAGE` keeps findings conditional.
 
 Claims are recomputed per candidate bundle, over the bundle minus its excluded
-markets, from Universe's own rows (`universe/claim_projection.py`), so no
+markets, from Universe's own rows (`universe/claims/claim_projection.py`), so no
 Targeter change is needed to re-project history. Ingestion checks the
 reconstruction against the report's recorded cross-venue relations: a relation
 the claims invent is a guessed equivalence and rejects the run
@@ -187,7 +189,7 @@ Read (no authentication):
 | `GET /v1/markets/<market_id>?market_template_version=&outcome_space_version=` | Canonical market, venue instances, selections, claims |
 | `GET /v1/claims/<claim_id>` | Claim, its reach, and its claim relations |
 | `GET /v1/claims/<claim_id>/markets?limit=&cursor=` | Markets expressing the claim, paged |
-| `GET /v1/bundles/<bundle_id>/outcomes` | Read-only normal-resolution spaces, claim keys, statuses and token alignment (`universe/outcomes.py`; contract in [`docs/OUTCOME_MASKS_V1.md`](../docs/OUTCOME_MASKS_V1.md)); 409 if the bundle maps to more than one event |
+| `GET /v1/bundles/<bundle_id>/outcomes` | Read-only normal-resolution spaces, claim keys, statuses and token alignment (`universe/claims/outcomes.py`; contract in [`docs/OUTCOME_MASKS_V1.md`](../docs/OUTCOME_MASKS_V1.md)); 409 if the bundle maps to more than one event |
 | `GET /v1/bundles/<bundle_id>/history` | Selection occurrences of one bundle |
 | `GET /v1/bundles?limit=&cursor=` | Bundles by last selection |
 | `GET /v1/selections` | Selection occurrences (`activation_start/end`, `selected_start/end`, `venue`, `sort=activation\|selected`) |
@@ -226,7 +228,7 @@ repeat of an earlier submission; new jobs naming it are refused.
 
 ## Authentication and rate limiting
 
-`universe/auth.py` implements SIWE: the server issues a nonce (kept in process
+`universe/jobs/auth.py` implements SIWE: the server issues a nonce (kept in process
 memory with a TTL, at most 500 live, lost on restart), verifies the signed
 message against the configured domain, URI, statement and chain ID, and issues
 a bearer token whose SHA-256 digest is stored in `sessions`. A member must be on
@@ -234,7 +236,7 @@ the allowlist; the configured `admin_address` is the admin. Allowlist changes ar
 recorded in the append-only `allowlist_events` table. Failed sign-ins return a
 uniform 401. Session and nonce TTLs come from `replay.auth`.
 
-`universe/rate_limit.py` applies a bounded in-process token bucket only to
+`universe/api/rate_limit.py` applies a bounded in-process token bucket only to
 requests whose TCP peer is in `replay.rate_limit.trusted_proxy_addresses`
 (the reverse proxy); it keys on the final `X-Forwarded-For` address for
 unauthenticated requests and on the session otherwise. Direct internal callers
@@ -272,22 +274,29 @@ Two independent SQLite files:
 
 ## File layout
 
-| File | Role |
+| Path | Role |
 |---|---|
-| `api.py` | HTTP routing, framing, cursors, response budget |
-| `store.py` | SQLite schema validation, writers, readers, backup |
-| `sync.py`, `backfill.py` | Verified archive retrieval, ingestion, retry ledger |
-| `projection.py`, `market_projection.py`, `event_identity.py` | Bundle history and market projections; identity allocation |
-| `claim_projection.py`, `outcomes.py` | Claim reconstruction and the ingestion equivalence check; bundle outcomes read |
-| `auth.py`, `rate_limit.py` | SIWE sessions, allowlist, rate limiting |
-| `replay_jobs.py` | Durable Replay jobs store |
+| `__main__.py`, `commands.py` | `python -m universe {serve,sync,backfill,backup}` |
 | `config.py` | Closed JSON config |
-| `run_*.py` | One-shot entry points |
+| `schema/` | `schema.sql`, `replay_auth.sql`, `replay_jobs.sql` |
+| `store/` | `UniverseStore` facade over `connection.py` (open, pragmas, schema validation), `ingest_tx.py` (the admitted-run write transaction, checkpoints, sync-failure ledger), `reads/` (`health`, `runs`, `events`, `markets`, `claims`, `bundles`), `backup.py`, shared row helpers in `records.py` and response limits in `limits.py` |
+| `ingest/` | `sync.py`, `backfill.py`: verified archive retrieval, ingestion, retry ledger |
+| `derive/` | `projection.py`, `market_projection.py`, `event_identity.py`: bundle history and market projections, identity allocation |
+| `claims/` | `claim_projection.py`, `outcomes.py`: claim reconstruction and the ingestion equivalence check; bundle outcomes read |
+| `api/` | `server.py` (application and HTTP handler), `routes.py` (the ordered route table), `framing.py` (validation, cursors, body framing, error mapping, response budget), `rate_limit.py`, `replay_jobs.py` (auth and job endpoints) |
+| `jobs/` | `store.py` (durable Replay jobs store) and `auth.py` (SIWE sessions, allowlist); retiring with the jobs UI |
+
+Dependencies point one way: `derive` imports nothing else from Universe;
+`claims` imports `derive` (and the store's `DetailTooLarge`, lazily); `store`
+imports `derive` and `claims`; `ingest` imports `store`, `derive` and `claims`;
+`jobs` imports only `config`; `api` imports `store`, `claims`, `derive`, `jobs`
+and `config`. Nothing below `api`/`ingest` imports them.
+`tests/test_universe_layout.py` asserts this.
 
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest tests.test_event_universe_store tests.test_universe_outcomes
+.venv/bin/python -m unittest tests.test_event_universe_store tests.test_universe_outcomes tests.test_universe_layout
 ```
 
 `tests/generate_event_universe_contract.py` emits real application responses used

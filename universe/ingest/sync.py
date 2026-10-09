@@ -35,8 +35,8 @@ from targeter.v2.manifest import (
     parse_run_manifest,
 )
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.market_projection import project_market_universe
-from universe.projection import (
+from universe.derive.market_projection import project_market_universe
+from universe.derive.projection import (
     PROJECTION_VERSION,
     project_bundle_retirements,
     project_selected_bundles,

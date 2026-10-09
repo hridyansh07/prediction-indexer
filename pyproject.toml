@@ -22,7 +22,7 @@ dev = []
 replay-redis = ["redis>=6.4,<7"]
 
 [tool.setuptools.packages.find]
-include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*"]
+include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*", "gamestate*"]
 
 [tool.setuptools.package-data]
 replay = ["README.md"]

@@ -21,11 +21,11 @@ from targeter.v2.run import run_shadow
 from targeter.v2.run_archive import archive_run
 from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from universe.api import UniverseApplication
-from universe.backfill import backfill_targeter_history
+from universe.ingest.backfill import backfill_targeter_history
 from universe.config import UniverseConfigError, load_config
-from universe.event_identity import canonical_event_id
-from universe.market_projection import project_market_universe
-from universe.projection import (
+from universe.derive.event_identity import canonical_event_id
+from universe.derive.market_projection import project_market_universe
+from universe.derive.projection import (
     ProjectionError,
     project_bundle_retirements,
     project_selected_bundles,
@@ -38,7 +38,7 @@ from universe.store import (
     file_sha256,
 )
 from analysis.claims import CLAIM_IDENTITY_VERSION
-from universe.sync import BOOTSTRAP_RUN_BUDGET, SyncResult, UniverseSync
+from universe.ingest.sync import BOOTSTRAP_RUN_BUDGET, SyncResult, UniverseSync
 
 R1 = "20260101T000000.000001Z"
 R2 = "20260101T001000.000002Z"
@@ -1542,7 +1542,7 @@ class EventUniverseTests(unittest.TestCase):
                         (oversized, R1),
                     )
                     connection.commit()
-                    with mock.patch("universe.store.json.loads") as decode:
+                    with mock.patch("universe.store.reads.runs.json.loads") as decode:
                         with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
                             self.database.targeter_run_detail(R1)
                         decode.assert_not_called()
@@ -2164,15 +2164,15 @@ class ClaimModelTests(unittest.TestCase):
         compiled, the claims imply a cross-venue relation the report never
         recorded -- a guessed equivalence -- and the run must not commit.
         """
-        from universe.claim_projection import verify_claims
-        from universe.market_projection import MarketProjectionError
+        from universe.claims.claim_projection import verify_claims
+        from universe.derive.market_projection import MarketProjectionError
 
         with self.assertRaisesRegex(MarketProjectionError, "the report does not record"):
             verify_claims({("kalshi:a#claim=0", "polymarket:b#claim=0", "IDENTITY")}, [])
 
     def test_a_relation_the_claims_miss_is_counted_not_raised(self) -> None:
         """A false negative costs coverage, not correctness, so it is counted."""
-        from universe.claim_projection import verify_claims
+        from universe.claims.claim_projection import verify_claims
 
         recorded = [
             {
@@ -2187,8 +2187,8 @@ class ClaimModelTests(unittest.TestCase):
 
     def test_recomputed_claims_match_the_report(self) -> None:
         """End to end: no shortfall and no invention on a real projection."""
-        from universe.claim_projection import project_claims
-        from universe.market_projection import project_market_universe
+        from universe.claims.claim_projection import project_claims
+        from universe.derive.market_projection import project_market_universe
 
         report = _selection_report(R1, G1)
         events, markets = _catalog_rows(report)
@@ -2200,7 +2200,7 @@ class ClaimModelTests(unittest.TestCase):
         self.assertGreater(len(claims["market_claims"]), len(claims["claims"]))
 
     def _projection(self):
-        from universe.market_projection import project_market_universe
+        from universe.derive.market_projection import project_market_universe
 
         report = _selection_report(R1, G1)
         events, markets = _catalog_rows(report)
@@ -2220,8 +2220,8 @@ class ClaimModelTests(unittest.TestCase):
 
         Against the real archive this rejected all 38 attempted runs.
         """
-        from universe.claim_projection import project_claims
-        from universe.market_projection import MarketProjectionError
+        from universe.claims.claim_projection import project_claims
+        from universe.derive.market_projection import MarketProjectionError
 
         projection = self._projection()
         excluded = "kalshi:series"
@@ -2260,7 +2260,7 @@ class ClaimModelTests(unittest.TestCase):
         relationships were derived, so excluding it here would drop claims the
         report does account for.
         """
-        from universe.claim_projection import _excluded_markets
+        from universe.claims.claim_projection import _excluded_markets
 
         self.assertEqual(
             _excluded_markets(
