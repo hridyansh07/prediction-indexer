@@ -5,7 +5,7 @@ import os
 import re
 from pathlib import Path
 
-from archive.common.durable import fsync_directory
+from archive.common.durable import fsync_directory, remove_durable
 from archive.storage.base import normalize_key
 from replay.economic_sdk.profile_stream_io import stream_lines
 from replay.streams.protocol import decode
@@ -113,7 +113,13 @@ def write(path, value):
 def write_chunks(path, chunks, *, maximum=METADATA):
     """No replacement, receipt-last callers; failure cannot leave a durable marker."""
     path = safe_path(path)
+    missing, parent = [], path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
     path.parent.mkdir(parents=True, exist_ok=True)
+    for parent in reversed(missing):
+        fsync_directory(parent.parent)
     temporary = path.with_name(path.name + ".open")
     linked, created, size = False, False, 0
     try:
@@ -130,7 +136,7 @@ def write_chunks(path, chunks, *, maximum=METADATA):
         fsync_directory(path.parent)
     except BaseException:
         if linked:
-            path.unlink(missing_ok=True)
+            remove_durable(path)
         raise
     finally:
         if created:
