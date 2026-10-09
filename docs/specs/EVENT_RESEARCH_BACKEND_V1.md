@@ -14,8 +14,8 @@ it is not evidence that a phase is implemented. The implementation base is
   fail closed. Episode and denominator rows retain their existing indexes.
 - Per-run `limits.state_bytes`, default 128 MiB, propagated to collectors and
   independent readers. This resource limit is not an experiment identity input.
-- Behavior-preserving Universe package/entry-point restructuring, preserving
-  schema, transaction/failure order, endpoints, auth and Replay jobs.
+- Existing Universe HTTP contracts are reused without schema, endpoint, auth or
+  Replay job changes.
 - One-shot game-state pulls and retry ledger. New scheduled storage is keyed
   directly by immutable Universe `event:d1:<sha256>` identity, not a mutable
   bundle or title. Existing raw/timeline format readers remain supported. No
@@ -56,3 +56,19 @@ No command deletes inputs, historical outputs or archive objects. Retry ledgers
 are rebuildable local operational state, not evidence authority. Scheduled jobs
 remain one-shot with external cadence. Rollout/backfill/cloud acceptance require
 separate operator execution; repository tests use disposable local stores only.
+
+## Implementation deviations from the broader plan
+
+Part C's behavior-preserving Universe package/route-table relocation is omitted
+as unrelated structural cleanup for this narrowed backend implementation. The
+scheduled job uses existing bundle/history/outcome endpoints and has no import
+of Universe internals. The new game-state root/data-layout documentation and
+Compose service are included. This is an implementation scope interpretation,
+not a claim that Part C was implemented.
+
+Corpus aggregate histograms, viability prose, calibration and publication are
+omitted alongside the owner-excluded corpus/release/UI work. Direct backend
+event/episode Parquet records and bounded queries remain included. The local
+build receipt is not a publication or release manifest. No current pointer is
+ever written; its conditional-update invariant therefore remains unchanged.
+Upstream-absent titles/labels are null/omitted; no classifications are invented.
