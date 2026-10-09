@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from universe import run_backfill
-from universe.sync import SyncResult
+from universe.ingest.sync import SyncResult
 
 ROOT = Path(__file__).resolve().parents[1]
 

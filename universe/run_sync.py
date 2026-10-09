@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from universe.config import load_config  # noqa: E402
 from universe.store import UniverseStore  # noqa: E402
-from universe.sync import UniverseSync  # noqa: E402
+from universe.ingest.sync import UniverseSync  # noqa: E402
 
 
 def main() -> int:

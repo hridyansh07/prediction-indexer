@@ -18,10 +18,10 @@ from tests.test_event_universe_store import G1, R1, _publish_run, _selection_rep
 from tests.test_replay_auth import ADMIN, MEMBER, auth_config, siwe_message
 from tests.test_replay_jobs import ROOT, Limits, request_bytes, runner_config
 from universe.api import build_server
-from universe.auth import AuthStore, Principal
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.auth import AuthStore, Principal
+from universe.jobs.store import ReplayJobStore
 from universe.store import UniverseStore
-from universe.sync import UniverseSync
+from universe.ingest.sync import UniverseSync
 
 
 class ReplayJobsHTTPAcceptanceTests(unittest.TestCase):

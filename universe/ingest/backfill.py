@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from archive.storage.base import ObjectStore
 from universe.store import UniverseStore
-from universe.sync import SyncResult, UniverseSync
+from universe.ingest.sync import SyncResult, UniverseSync
 
 
 def backfill_targeter_history(

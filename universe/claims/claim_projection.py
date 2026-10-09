@@ -49,7 +49,7 @@ from targeter.v2.models import (
     parse_timestamp,
 )
 from targeter.v2.relationships import derive_bundle_claims
-from universe.market_projection import MarketProjectionError
+from universe.derive.market_projection import MarketProjectionError
 
 
 _RECONSTRUCTED_CLASSIFICATION = (

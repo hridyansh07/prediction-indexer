@@ -12,7 +12,7 @@ from archive.storage import INDEPENDENT, LocalObjectStore
 from tests.test_event_universe_store import R1, G1, _publish_run, _selection_report
 from universe.api import UniverseApplication
 from universe.store import SCHEMA_VERSION, UniverseStore
-from universe.sync import UniverseSync
+from universe.ingest.sync import UniverseSync
 
 FIXED_NOW_NS = 1_767_226_200_000_000_000
 

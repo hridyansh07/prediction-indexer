@@ -20,9 +20,9 @@ from replay.jobs.contracts import (
     parse_request,
     request_sha256,
 )
-from universe.auth import AuthError, AuthStore, checksum_address
-from universe.replay_jobs import ReplayJobError, ReplayJobStore
-from universe.rate_limit import RateLimiter
+from universe.jobs.auth import AuthError, AuthStore, checksum_address
+from universe.jobs.store import ReplayJobError, ReplayJobStore
+from universe.api.rate_limit import RateLimiter
 from universe.store import (
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     DetailTooLarge,

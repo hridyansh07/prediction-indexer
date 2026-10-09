@@ -20,7 +20,7 @@ from eth_utils import is_address, is_checksum_address, to_checksum_address
 from universe.config import AuthConfig
 
 
-SCHEMA_PATH = Path(__file__).with_name("schema") / "replay_auth.sql"
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "replay_auth.sql"
 ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 NONCE_RE = re.compile(r"[0-9a-f]{32}\Z")
 TIMESTAMP_RE = re.compile(

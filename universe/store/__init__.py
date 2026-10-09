@@ -16,10 +16,10 @@ from typing import Any, Iterable, Iterator, Mapping
 from archive.common.durable import fsync_directory
 from archive.storage.base import normalize_key
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.event_identity import EventIdentityError, resolve_market_projection
-from universe.claim_projection import project_claims
-from universe.market_projection import MARKET_PROJECTION_VERSION, MarketProjectionError
-from universe.projection import PROJECTION_VERSION
+from universe.derive.event_identity import EventIdentityError, resolve_market_projection
+from universe.claims.claim_projection import project_claims
+from universe.derive.market_projection import MARKET_PROJECTION_VERSION, MarketProjectionError
+from universe.derive.projection import PROJECTION_VERSION
 
 SCHEMA_VERSION = 6
 STALE_AFTER_SECONDS = 3_600
@@ -35,7 +35,7 @@ class BundleEventConflict(ValueError):
 
 
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
-SCHEMA_PATH = Path(__file__).with_name("schema") / "schema.sql"
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "schema.sql"
 REBUILD_INSTRUCTION = (
     "remove the rebuildable SQLite file and run backfill from the immutable archive"
 )
@@ -1616,7 +1616,7 @@ class UniverseStore:
 
     def bundle_outcomes(self, bundle_id: str) -> dict[str, Any] | None:
         """One read transaction; semantic masks never alter catalogue evidence."""
-        from universe.outcomes import bundle_document
+        from universe.claims.outcomes import bundle_document
 
         with closing(self.connect(readonly=True)) as connection:
             connection.execute("BEGIN")

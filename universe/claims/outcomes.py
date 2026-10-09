@@ -7,7 +7,7 @@ from analysis.claims import (
     space_shape_id,
 )
 from targeter.v2.relationships import _meaningful_labels, _spaces, market_scope_masks
-from universe.claim_projection import rebuild_bundle
+from universe.claims.claim_projection import rebuild_bundle
 
 
 def _tokens(market, claims):

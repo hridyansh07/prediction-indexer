@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from universe.auth import AuthStore
+from universe.jobs.auth import AuthStore
 from universe.config import RateLimitConfig
 
 
