@@ -1,32 +1,37 @@
 """Strict event-keyed archive selection and offline timeline re-derivation."""
 import hashlib
 from gamestate import kalshi
-from archive.storage.base import ObjectExpectation
+from archive.storage.base import ObjectExpectation, VerificationFailure
 from encoder import StoredIdentity
 
 
 def latest(store, event_id, *, require_timeline=True):
+    """The best archived fetch for one event: complete first, then newest.
+
+    The listing streams and only the best candidate is retained. A receipt that
+    fails strict reading is skipped and counted in ``rejected_fetches``; it never
+    hides a readable fetch of the same event.
+    """
     kalshi.event_identity(event_id)
     root = "gamestate/source=kalshi/event=" + event_id.split(":")[-1] + "/"
-    candidates, count = [], 0
+    best, rejected = None, 0
     for key in store.list_keys(root):
-        count += 1
-        if count > 100000:
-            raise ValueError("listing_limit")
-        if key.endswith("/receipt.json"):
-            prefix = key.removesuffix("/receipt.json")
+        if not key.endswith("/receipt.json"):
+            continue
+        prefix = key.removesuffix("/receipt.json")
+        try:
             receipt = kalshi.read_receipt(store, prefix)
-            candidates.append((receipt["status"] == "complete", receipt["fetch_started_ns"], prefix))
-            if len(candidates) > 1000:
-                raise ValueError("event_fetch_limit")
-    if not candidates:
-        return {"state": "no_source", "inputs": {}}
-    complete, _, prefix = max(candidates)
+        except (ValueError, KeyError, TypeError, VerificationFailure):
+            rejected += 1
+            continue
+        candidate = (receipt["status"] == "complete", receipt["fetch_started_ns"], prefix)
+        best = candidate if best is None or candidate > best else best
+    if best is None:
+        return {"state": "no_source", "inputs": {}, "rejected_fetches": rejected}
+    complete, _, prefix = best
     receipt, records = kalshi.read_records(store, prefix)
-    derived = kalshi.derive(receipt, records)
-    derived.update(event_id=event_id, derivation_version=kalshi.DERIVATION_VERSION + 1)
-    bad = {"response_shape", "live_data_missing", "related_event_missing", "milestone_changed"}
-    state = "ok" if complete and not any(i["code"] in bad for i in derived["inconsistencies"]) else "incomplete"
+    derived = kalshi.event_timeline(receipt, records)
+    state = "ok" if complete and not kalshi.disqualified(derived) else "incomplete"
     inputs = {prefix + "/responses.ndjson.zst": receipt["stored"]}
     key = prefix + "/receipt.json"
     with store.open(key, max_bytes=kalshi.MAX_METADATA) as stream:
@@ -47,4 +52,4 @@ def latest(store, event_id, *, require_timeline=True):
             if payload != kalshi.dumps(derived):
                 raise ValueError("timeline_raw_binding")
             inputs[key] = StoredIdentity(hashlib.sha256(payload).hexdigest(), len(payload)).as_record()
-    return {"state": state, "timeline": derived, "inputs": inputs}
+    return {"state": state, "timeline": derived, "inputs": inputs, "rejected_fetches": rejected}

@@ -47,9 +47,12 @@ DERIVATION_VERSION = 1
 MAX_BODY = 4 * 1024 * 1024
 MAX_RAW = 128 * 1024 * 1024
 MAX_METADATA = 1024 * 1024
-MAX_PAGES = 100
 MAX_ITEMS = 1000
-MAX_ATTEMPTS = 10000
+# A complete raw receipt whose derived timeline carries one of these is not
+# usable game state; the scheduled job treats it as final, never as a refetch.
+DISQUALIFYING = frozenset(
+    {"response_shape", "live_data_missing", "related_event_missing", "milestone_changed"}
+)
 RECORD_FIELDS = {
     "record_version",
     "seq",
@@ -245,8 +248,6 @@ class AttemptLog:
     def append(self, record):
         self.file.seek(0, 2)
         encoded = dumps(record)
-        if self.file.tell() + len(encoded) > MAX_RAW:
-            raise FetchError("invocation_raw_limit")
         self.offsets.append(self.file.tell())
         self.file.write(encoded)
 
@@ -260,6 +261,16 @@ class AttemptLog:
 
     def close(self):
         self.file.close()
+
+
+class Discard:
+    """Attempt sink for requests that are not evidence, such as Universe discovery."""
+
+    def __len__(self):
+        return 0
+
+    def append(self, record):
+        pass
 
 
 class Client:
@@ -293,12 +304,6 @@ class Client:
         if len(url) > 8192:
             raise FetchError("url_too_large")
         for attempt in range(5):
-            if len(self.records) >= MAX_ATTEMPTS:
-                raise FetchError("attempt_limit")
-            if isinstance(self.records, AttemptLog):
-                self.records.file.seek(0, 2)
-                if self.records.file.tell() + MAX_BODY * 6 + 16384 > MAX_RAW:
-                    raise FetchError("invocation_raw_limit")
             host = urlsplit(url).netloc
             spacing = self.kalshi_spacing if is_kalshi(url) else self.universe_spacing
             self.sleep(max(0, self.next_request.get(host, 0) - self.monotonic()))
@@ -387,10 +392,10 @@ class Client:
 
 
 def pages(client, base, path, query=None):
+    """Stream every page; only cursors are retained, to reject a cursor loop."""
     query = dict(query or {}, limit=50)
     seen = set()
-    count = 0
-    for _ in range(MAX_PAGES):
+    while True:
         doc = client.get(base.rstrip("/") + path + "?" + urlencode(query))
         if set(doc) != {"selections", "sort", "next_cursor"} and set(doc) != {
             "selections",
@@ -404,9 +409,6 @@ def pages(client, base, path, query=None):
             or any(not isinstance(r, dict) for r in rows)
         ):
             raise FetchError("page_shape")
-        count += len(rows)
-        if count > MAX_ITEMS:
-            raise FetchError("item_limit")
         yield from rows
         if cursor is None:
             return
@@ -419,7 +421,6 @@ def pages(client, base, path, query=None):
             raise FetchError("cursor_loop_or_invalid")
         seen.add(cursor)
         query["cursor"] = cursor
-    raise FetchError("page_limit")
 
 
 def bundle_tickers(client, base, bundle):
@@ -711,33 +712,34 @@ def read_records(store, prefix):
     return r, iterator()
 
 
+def disqualified(timeline):
+    return any(i["code"] in DISQUALIFYING for i in timeline["inconsistencies"])
+
+
+def event_timeline(receipt, records):
+    """The published timeline for one receipt; event-keyed fetches carry their event."""
+    timeline = derive(receipt, records)
+    if "event_id" in receipt:
+        timeline.update(event_id=receipt["event_id"], derivation_version=DERIVATION_VERSION + 1)
+    return timeline
+
+
 def existing_complete(store, milestone_id, *, event_id=None):
     identifier(milestone_id)
     if event_id is not None:
         event_identity(event_id)
-    count = 0
-    root = "gamestate/source=kalshi/" + (f"event={event_id.split(':')[-1]}/" if event_id else "")
+    # The legacy namespace and each event namespace are disjoint key prefixes.
+    root = "gamestate/source=kalshi/" + (
+        f"event={event_id.split(':')[-1]}/" if event_id else "date="
+    )
     for key in store.list_keys(root):
-        count += 1
-        if count > 100000:
-            raise ValueError("listing_limit")
         if f"/milestone={milestone_id}/" not in key or not key.endswith(
             "/receipt.json"
         ):
             continue
         try:
             receipt, rows = read_records(store, key.removesuffix("/receipt.json"))
-            timeline = derive(receipt, rows)
-            if any(
-                i["code"]
-                in {
-                    "response_shape",
-                    "live_data_missing",
-                    "related_event_missing",
-                    "milestone_changed",
-                }
-                for i in timeline["inconsistencies"]
-            ):
+            if disqualified(derive(receipt, rows)):
                 continue
         except (ValueError, KeyError, TypeError, VerificationFailure):
             continue
@@ -816,9 +818,7 @@ def timeline_key(prefix):
 
 def regenerate(store, prefix, output=None):
     receipt, records = read_records(store, prefix)
-    timeline = derive(receipt, records)
-    if "event_id" in receipt:
-        timeline.update(event_id=receipt["event_id"], derivation_version=DERIVATION_VERSION + 1)
+    timeline = event_timeline(receipt, records)
     if output is None:
         # Versioned so that a derivation fix is republished beside the raw
         # object under the next version; an identical rerun proves the object.
@@ -1111,9 +1111,12 @@ def derive(receipt, records):
     }
 
 
-def run(client, store, base, bundles, *, skip_existing=True, event_id=None):
+def run(client, store, base, bundles, *, skip_existing=True, event_id=None, universe=None):
+    """Map bundles and archive their milestones. ``client`` records Kalshi evidence;
+    ``universe`` (default: the same client) serves the Universe mapping reads."""
     if event_id is not None:
         event_identity(event_id)
+    universe = client if universe is None else universe
     report: dict[str, Any] = {
         "report_version": 1,
         "bundles_considered": len(set(bundles)),
@@ -1129,12 +1132,10 @@ def run(client, store, base, bundles, *, skip_existing=True, event_id=None):
         "failures": [],
     }
     grouped: dict[str, Any] = {}
-    if len(set(bundles)) > MAX_ITEMS:
-        raise ValueError("bundle_limit")
     for bundle in sorted(set(bundles)):
         start = len(client.records)
         try:
-            tickers = bundle_tickers(client, base, bundle)
+            tickers = bundle_tickers(universe, base, bundle)
             m, reason = map_bundle(client, tickers)
         except (FetchError, KeyError, ValueError, TypeError):
             m, reason = None, "fetch_failed"
@@ -1211,6 +1212,7 @@ def run(client, store, base, bundles, *, skip_existing=True, event_id=None):
                     "prefix": prefix,
                     "status": "complete" if complete else "incomplete",
                     "errors": errors,
+                    "disqualified": None,
                 }
             )
         except (ValueError, ObjectStoreError, OSError, KeyError, TypeError) as error:
@@ -1224,7 +1226,7 @@ def run(client, store, base, bundles, *, skip_existing=True, event_id=None):
             report["failures"].append({"milestone_id": mid, "reason": reason})
             continue
         try:
-            regenerate(store, prefix)
+            report["fetches"][-1]["disqualified"] = disqualified(regenerate(store, prefix))
         except (ValueError, ObjectStoreError, OSError, KeyError, TypeError):
             report["failures"].append(
                 {"milestone_id": mid, "reason": "timeline_failed"}

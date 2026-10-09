@@ -550,7 +550,7 @@ backfill are operator actions, not configuration-validation steps.
 |---|---|---|
 | `EVENT_UNIVERSE_DATA_ROOT` | Universe SQLite, backups | Rebuildable from archive; do not touch Replay DB |
 | `REPLAY_DATA_ROOT` | Jobs and auth DB | Not rebuildable; keep independent verified backups |
-| `GAMESTATE_DATA_ROOT` | Append-only retry ledger | Rebuildable; losing it resets retry/backoff only |
+| `GAMESTATE_DATA_ROOT` | Append-only attempt ledger and bundle → event map | Rebuildable; losing it costs one remapping pass, never a refetch of archived games |
 | `EVENT_UNIVERSE_ARCHIVE_ROOT` | Local archive objects | Immutable evidence; never delete on rollback |
 
 The new ledger has its own version and needs no Universe/auth migration.

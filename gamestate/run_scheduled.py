@@ -14,31 +14,49 @@ from urllib.parse import quote, urlencode, urlsplit
 from archive.storage.factory import build_store
 from gamestate import kalshi
 
-OUTCOMES = {"complete", "incomplete", "fetch_failed", "timeline_failed",
-            "no_kalshi_events", "no_milestone", "multiple_milestones", "ticker_not_related"}
+# Retried with backoff until MAX_TRIES; every other outcome is final.
+RETRY = frozenset({"incomplete", "fetch_failed", "unavailable"})
+OUTCOMES = RETRY | {"complete", "complete_inconsistent", "timeline_failed",
+                    "no_kalshi_events", "no_milestone", "multiple_milestones", "ticker_not_related"}
+MAX_TRIES = 5
 
+LEDGER_VERSION = 2
 LEDGER_SCHEMA = """
     CREATE TABLE IF NOT EXISTS fetch_attempts(
-        event_id TEXT NOT NULL, bundle_id TEXT NOT NULL,
+        event_id TEXT, bundle_id TEXT NOT NULL,
         attempted_at_ns INTEGER NOT NULL, outcome TEXT NOT NULL,
         milestone_id TEXT, prefix TEXT, error TEXT);
     CREATE INDEX IF NOT EXISTS event_attempts ON fetch_attempts(event_id, attempted_at_ns);
+    CREATE INDEX IF NOT EXISTS bundle_attempts ON fetch_attempts(bundle_id, attempted_at_ns);
+    CREATE TABLE IF NOT EXISTS bundle_events(
+        bundle_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, recorded_at_ns INTEGER NOT NULL);
     CREATE TRIGGER IF NOT EXISTS attempts_no_update BEFORE UPDATE ON fetch_attempts
         BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
     CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON fetch_attempts
         BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
-    PRAGMA user_version=1;
+    CREATE TRIGGER IF NOT EXISTS bundle_events_no_update BEFORE UPDATE ON bundle_events
+        BEGIN SELECT RAISE(ABORT, 'append-only bundle events'); END;
+    CREATE TRIGGER IF NOT EXISTS bundle_events_no_delete BEFORE DELETE ON bundle_events
+        BEGIN SELECT RAISE(ABORT, 'append-only bundle events'); END;
+    PRAGMA user_version=2;
 """
 
 
 class Ledger:
+    """Rebuildable operational state: attempt history and the immutable bundle → event map.
+
+    A final outcome here is the skip authority, so finished bundles cost no network or
+    archive call. Losing the ledger only costs one mapping pass; the pull itself still
+    skips milestones the archive already holds complete.
+    """
+
     def __init__(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
         try:
             version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, LEDGER_VERSION):
                 raise ValueError("gamestate_ledger_version")
             def objects(connection):
                 return {(kind, name): " ".join(sql.split()) for kind, name, sql in connection.execute(
@@ -46,7 +64,7 @@ class Ledger:
             actual = objects(self.connection)
             with closing(sqlite3.connect(":memory:")) as expected:
                 expected.executescript(LEDGER_SCHEMA)
-                if (version == 0 and actual) or (version == 1 and actual != objects(expected)):
+                if (version == 0 and actual) or (version == LEDGER_VERSION and actual != objects(expected)):
                     raise ValueError("gamestate_ledger_schema")
             if version == 0:
                 self.connection.executescript("BEGIN IMMEDIATE;" + LEDGER_SCHEMA + "COMMIT;")
@@ -62,24 +80,43 @@ class Ledger:
     def __exit__(self, *_):
         self.connection.close()
 
-    def due(self, event_id, now_ns):
+    def event_for(self, bundle_id):
+        row = self.connection.execute(
+            "SELECT event_id FROM bundle_events WHERE bundle_id=?", (kalshi.identifier(bundle_id),)).fetchone()
+        return None if row is None else row[0]
+
+    def record_event(self, bundle_id, event_id, at):
+        known = self.event_for(bundle_id)
         kalshi.event_identity(event_id)
+        if known is not None:
+            if known != event_id:
+                raise ValueError("bundle_event_changed")
+            return
+        with self.connection:
+            self.connection.execute("INSERT INTO bundle_events VALUES(?,?,?)", (bundle_id, event_id, at))
+
+    def due(self, now_ns, *, event_id=None, bundle_id=None):
+        """Event-keyed once the event is known; bundle-keyed for failures before that."""
+        if event_id is not None:
+            where, key = "event_id=?", kalshi.event_identity(event_id)
+        else:
+            where, key = "event_id IS NULL AND bundle_id=?", kalshi.identifier(bundle_id)
         last = self.connection.execute(
-            "SELECT attempted_at_ns,outcome FROM fetch_attempts WHERE event_id=? ORDER BY rowid DESC LIMIT 1",
-            (event_id,)).fetchone()
-        if last is None or last[1] in ("complete", "timeline_failed"):
-            # The archive, never this rebuildable ledger, is skip authority.
+            f"SELECT attempted_at_ns,outcome FROM fetch_attempts WHERE {where} ORDER BY rowid DESC LIMIT 1",
+            (key,)).fetchone()
+        if last is None:
             return True
-        if last[1] not in ("incomplete", "fetch_failed"):
+        if last[1] not in RETRY:
             return False
         attempts = self.connection.execute(
-            "SELECT COUNT(*) FROM fetch_attempts WHERE event_id=? AND outcome IN ('incomplete','fetch_failed')",
-            (event_id,)).fetchone()[0]
+            f"SELECT COUNT(*) FROM fetch_attempts WHERE {where} AND outcome IN ({','.join('?' * len(RETRY))})",
+            (key, *sorted(RETRY))).fetchone()[0]
         wait = min(24, 2 ** (attempts - 1)) * 3600 * 10**9
-        return attempts < 5 and now_ns >= last[0] + wait
+        return attempts < MAX_TRIES and now_ns >= last[0] + wait
 
     def append(self, event_id, bundle_id, at, outcome, milestone_id, prefix, error):
-        kalshi.event_identity(event_id)
+        if event_id is not None:
+            kalshi.event_identity(event_id)
         kalshi.identifier(bundle_id)
         if outcome not in OUTCOMES or type(at) is not int or at < 0:
             raise ValueError("attempt_schema")
@@ -120,16 +157,16 @@ def eligible(history, now_ns, delay):
 
 
 def bundles(client, base):
-    cursor, seen, count = None, set(), 0
-    for _ in range(2000):
+    """Stream every bundle; only cursors are retained, to reject a cursor loop."""
+    cursor, seen = None, set()
+    while True:
         query = {"limit": 50, **({"cursor": cursor} if cursor else {})}
         page = client.get(base.rstrip("/") + "/v1/bundles?" + urlencode(query))
         if set(page) != {"bundles", "next_cursor"} or type(page["bundles"]) is not list or len(page["bundles"]) > 50:
             raise ValueError("bundles_page")
         for row in page["bundles"]:
-            count += 1
-            if count > 100000 or type(row) is not dict or row.get("lifecycle") not in ("active", "retired"):
-                raise ValueError("bundles_bound_or_shape")
+            if type(row) is not dict or row.get("lifecycle") not in ("active", "retired"):
+                raise ValueError("bundles_shape")
             yield row
         cursor = page["next_cursor"]
         if cursor is None:
@@ -137,56 +174,85 @@ def bundles(client, base):
         if type(cursor) is not str or not 0 < len(cursor) <= 4096 or cursor in seen:
             raise ValueError("bundles_cursor")
         seen.add(cursor)
-    raise ValueError("bundles_page_limit")
+
+
+def resolve_event(universe, base, bundle, now_ns, delay):
+    """``None`` until the settle delay has elapsed; then the bundle's immutable event id."""
+    path = f"/v1/bundles/{quote(bundle, safe='')}"
+    if not eligible(kalshi.pages(universe, base, path + "/history"), now_ns, delay):
+        return None
+    outcomes = universe.get(base.rstrip("/") + path + "/outcomes")
+    if outcomes.get("version") != 1 or outcomes.get("bundle_id") != bundle:
+        raise ValueError("outcomes_identity")
+    return kalshi.event_identity(outcomes.get("event_id"))
+
+
+def pull_outcome(report):
+    """Ledger outcome, milestone, prefix and error for one single-bundle pull report."""
+    mapped = report["bundles"][0]
+    milestone = mapped["milestone_id"]
+    if mapped["reason"] is not None:
+        return mapped["reason"], milestone, None, None
+    if report["milestones_skipped"]:
+        return "complete", milestone, None, None  # already archived complete
+    fetch = report["fetches"][0] if report["fetches"] else None
+    if report["failures"]:
+        reason = report["failures"][0]["reason"]
+        if reason == "timeline_failed" and fetch is not None:
+            return "timeline_failed", milestone, fetch["prefix"], reason
+        return "fetch_failed", milestone, None, reason
+    if fetch["status"] == "incomplete":
+        return "incomplete", milestone, fetch["prefix"], fetch["errors"][0]["reason"] if fetch["errors"] else None
+    return ("complete_inconsistent" if fetch["disqualified"] else "complete"), milestone, fetch["prefix"], None
 
 
 def execute(document, store, ledger, client_factory, *, now_ns, activation=None, pull=kalshi.run):
+    """One pass over every retired bundle. A bundle that fails is recorded and the pass continues."""
     document = config(document)
-    base, attempted, failed, considered = document["universe_base_url"], 0, 0, 0
-    seen_events = set()
-    client = client_factory()
+    base = document["universe_base_url"]
+    result = {"version": 1, "eligible": 0, "attempted": 0, "failed": 0}
+    universe = client_factory(records=kalshi.Discard())
     try:
-        for row in bundles(client, base):
+        for row in bundles(universe, base):
             if row["lifecycle"] != "retired":
                 continue
             if activation is not None and not activation[0] <= kalshi.timestamp(row["activation_at"]) < activation[1]:
                 continue
-            bundle = kalshi.identifier(row["bundle_id"])
-            history = list(kalshi.pages(client, base, f"/v1/bundles/{quote(bundle, safe='')}/history"))
-            if not eligible(history, now_ns, document["settle_delay_seconds"]):
-                continue
-            considered += 1
-            outcomes = client.get(base.rstrip("/") + f"/v1/bundles/{quote(bundle, safe='')}/outcomes")
-            if outcomes.get("version") != 1 or outcomes.get("bundle_id") != bundle:
-                raise ValueError("outcomes_identity")
-            event = kalshi.event_identity(outcomes.get("event_id"))
-            if event in seen_events or not ledger.due(event, now_ns):
-                continue
-            seen_events.add(event)
-            from gamestate.timeline import latest
-            prior = latest(store, event, require_timeline=False)
-            if prior["state"] == "ok":
-                continue
-            fetch_client = client_factory()
             try:
-                report = pull(fetch_client, store, base, [bundle], event_id=event)
-                mapped = report["bundles"][0]
-                fetch = next(iter(report["fetches"]), None)
-                outcome = mapped["reason"] or (fetch["status"] if fetch else "complete")
-                if report["failures"]:
-                    outcome = "timeline_failed" if fetch and fetch["status"] == "complete" else "fetch_failed"
-                ledger.append(event, bundle, now_ns, outcome, mapped["milestone_id"],
-                              fetch["prefix"] if fetch else None,
-                              report["failures"][0]["reason"] if report["failures"] else None)
-                failed += int(outcome in ("incomplete", "fetch_failed", "timeline_failed"))
-                attempted += 1
-            finally:
-                fetch_client.close()
-            if activation is None and attempted >= document["max_bundles_per_run"]:
+                bundle = kalshi.identifier(row["bundle_id"])
+            except ValueError:
+                result["failed"] += 1  # not ledger-addressable; visible in the exit status
+                continue
+            event = ledger.event_for(bundle)
+            if not ledger.due(now_ns, event_id=event, bundle_id=bundle):
+                continue
+            outcome = milestone = prefix = error = None
+            try:
+                if event is None:
+                    resolved = resolve_event(universe, base, bundle, now_ns, document["settle_delay_seconds"])
+                    if resolved is None:
+                        continue
+                    ledger.record_event(bundle, resolved, now_ns)
+                    event = resolved
+                    if not ledger.due(now_ns, event_id=event):
+                        continue  # another bundle of this event already settled it
+                result["eligible"] += 1
+                fetch = client_factory()
+                try:
+                    report = pull(fetch, store, base, [bundle], event_id=event, universe=universe)
+                finally:
+                    fetch.close()
+                outcome, milestone, prefix, error = pull_outcome(report)
+            except (ValueError, KeyError, TypeError, OSError, kalshi.ObjectStoreError) as failure:
+                outcome, error = "unavailable", (str(failure) or type(failure).__name__)[:512]
+            ledger.append(event, bundle, now_ns, outcome, milestone, prefix, error)
+            result["attempted"] += 1
+            result["failed"] += int(outcome in RETRY or outcome == "timeline_failed")
+            if activation is None and result["attempted"] >= document["max_bundles_per_run"]:
                 break
     finally:
-        client.close()
-    return {"version": 1, "eligible": considered, "attempted": attempted, "failed": failed}
+        universe.close()
+    return result
 
 
 def main(argv=None):
@@ -213,8 +279,9 @@ def main(argv=None):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with Ledger(path) as ledger:
             store = build_store([path.parent], environ=environment)
-            factory = lambda: kalshi.Client(universe_spacing=document["universe_spacing_seconds"],
-                                           kalshi_spacing=document["kalshi_spacing_seconds"])
+            factory = lambda records=None: kalshi.Client(universe_spacing=document["universe_spacing_seconds"],
+                                                         kalshi_spacing=document["kalshi_spacing_seconds"],
+                                                         records=records)
             result = execute(document, store, ledger, factory, now_ns=time.time_ns(), activation=activation)
     print(kalshi.dumps(result).decode(), end="")
     return int(result["failed"] > 0)

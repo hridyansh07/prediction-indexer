@@ -194,15 +194,21 @@ class HttpTests(unittest.TestCase):
             ["r1", "r2"],
         )
         self.assertIn("cursor=c1", c.send.urls[1])
-        with patch.object(pull, "MAX_PAGES", 1):
-            with self.assertRaisesRegex(pull.FetchError, "page_limit"):
-                list(
-                    pull.pages(
-                        client([{"selections": [], "next_cursor": "c"}]),
-                        "https://example.test",
-                        "/v1/selections",
-                    )
+        # No page or item cap: a long history streams; only a cursor loop is an error.
+        many = [{"selections": [{"run_id": f"r{i}"}] * 50, "next_cursor": f"c{i}"} for i in range(150)]
+        many.append({"selections": [], "next_cursor": None})
+        self.assertEqual(
+            sum(1 for _ in pull.pages(client(many), "https://example.test", "/v1/selections")),
+            7500,
+        )
+        with self.assertRaisesRegex(pull.FetchError, "cursor_loop"):
+            list(
+                pull.pages(
+                    client([{"selections": [], "next_cursor": "c"}] * 2),
+                    "https://example.test",
+                    "/v1/selections",
                 )
+            )
         for bad in (
             {"selections": [], "next_cursor": None, "unknown": 1},
             {"selections": [{}] * 51, "next_cursor": None},
