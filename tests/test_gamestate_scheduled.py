@@ -9,6 +9,28 @@ EVENT = "event:d1:" + "a" * 64
 
 
 class ScheduledTests(unittest.TestCase):
+    def test_job_temporary_storage_fits_the_adapter_raw_bound(self):
+        compose = Path("compose.universe.yaml").read_text()
+        service = compose.split("  event-universe-game-state:\n", 1)[1].split("\n  replay-redis:", 1)[0]
+        self.assertIn("/tmp:size=512m", service)
+
+    def test_ledger_reopen_preserves_attempts_and_rejects_schema_tamper(self):
+        import sqlite3
+        from gamestate.run_scheduled import Ledger
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ledger.sqlite3"
+            with Ledger(path) as ledger:
+                ledger.append(EVENT, "bundle-a", 0, "fetch_failed", None, None, "fetch_failed")
+            with Ledger(path) as ledger:
+                self.assertFalse(ledger.due(EVENT, 0))
+            with sqlite3.connect(path) as connection:
+                connection.execute("DROP TRIGGER attempts_no_delete")
+            with self.assertRaisesRegex(ValueError, "ledger_schema"):
+                Ledger(path)
+            with sqlite3.connect(path) as connection:
+                self.assertIsNone(connection.execute("SELECT sql FROM sqlite_master WHERE name='attempts_no_delete'").fetchone())
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0], 1)
+
     def test_event_identity_is_the_archive_namespace_and_strict_receipt_binding(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = LocalObjectStore(Path(temporary))

@@ -7,6 +7,7 @@ import re
 import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -16,29 +17,44 @@ from gamestate import kalshi
 OUTCOMES = {"complete", "incomplete", "fetch_failed", "timeline_failed",
             "no_kalshi_events", "no_milestone", "multiple_milestones", "ticker_not_related"}
 
+LEDGER_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS fetch_attempts(
+        event_id TEXT NOT NULL, bundle_id TEXT NOT NULL,
+        attempted_at_ns INTEGER NOT NULL, outcome TEXT NOT NULL,
+        milestone_id TEXT, prefix TEXT, error TEXT);
+    CREATE INDEX IF NOT EXISTS event_attempts ON fetch_attempts(event_id, attempted_at_ns);
+    CREATE TRIGGER IF NOT EXISTS attempts_no_update BEFORE UPDATE ON fetch_attempts
+        BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
+    CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON fetch_attempts
+        BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
+    PRAGMA user_version=1;
+"""
+
 
 class Ledger:
     def __init__(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
-        self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
-            raise ValueError("gamestate_ledger_version")
-        self.connection.executescript("""
-            CREATE TABLE IF NOT EXISTS fetch_attempts(
-                event_id TEXT NOT NULL, bundle_id TEXT NOT NULL,
-                attempted_at_ns INTEGER NOT NULL, outcome TEXT NOT NULL,
-                milestone_id TEXT, prefix TEXT, error TEXT);
-            CREATE INDEX IF NOT EXISTS event_attempts ON fetch_attempts(event_id, attempted_at_ns);
-            CREATE TRIGGER IF NOT EXISTS attempts_no_update BEFORE UPDATE ON fetch_attempts
-                BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
-            CREATE TRIGGER IF NOT EXISTS attempts_no_delete BEFORE DELETE ON fetch_attempts
-                BEGIN SELECT RAISE(ABORT, 'append-only attempts'); END;
-            PRAGMA user_version=1;
-        """)
+        try:
+            version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1):
+                raise ValueError("gamestate_ledger_version")
+            def objects(connection):
+                return {(kind, name): " ".join(sql.split()) for kind, name, sql in connection.execute(
+                    "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")}
+            actual = objects(self.connection)
+            with closing(sqlite3.connect(":memory:")) as expected:
+                expected.executescript(LEDGER_SCHEMA)
+                if (version == 0 and actual) or (version == 1 and actual != objects(expected)):
+                    raise ValueError("gamestate_ledger_schema")
+            if version == 0:
+                self.connection.executescript("BEGIN IMMEDIATE;" + LEDGER_SCHEMA + "COMMIT;")
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            self.connection.close()
+            raise
 
     def __enter__(self):
         return self

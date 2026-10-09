@@ -160,6 +160,9 @@ services:
     profiles: [jobs]
     restart: "no"
     environment: *universe-job-environment
+    # Attempt journal, raw reserialization and Zstd frame each need bounded temp space.
+    tmpfs:
+      - /tmp:size=512m,mode=1777
     command: ["python", "-u", "-m", "gamestate.run_scheduled", "/etc/prediction-indexer/gamestate.json"]
     volumes:
       - *universe-archive-volume

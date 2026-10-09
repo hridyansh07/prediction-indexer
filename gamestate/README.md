@@ -27,6 +27,9 @@ A complete ledger entry never grants skip: only verified archive bytes do.
 A missing timeline does not invalidate raw completeness or trigger a live
 refetch; regenerate it offline with the pull CLI. Losing the ledger resets
 backoff, not archive identities. Never delete archive objects to reset it.
+Opening a ledger validates its version and all schema objects, including the
+append-only triggers; it never repairs an existing schema. Fresh initialization
+is transactional. There is no in-place migration of evidence or Universe data.
 
 The Compose `jobs` service has a separate `GAMESTATE_DATA_ROOT`, private archive
 access and no capture/Replay database mounts. Configure archive environment
