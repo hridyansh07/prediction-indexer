@@ -1542,7 +1542,7 @@ class EventUniverseTests(unittest.TestCase):
                         (oversized, R1),
                     )
                     connection.commit()
-                    with mock.patch("universe.store.json.loads") as decode:
+                    with mock.patch("universe.store.reads.runs.json.loads") as decode:
                         with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
                             self.database.targeter_run_detail(R1)
                         decode.assert_not_called()

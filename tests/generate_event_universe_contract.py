@@ -26,7 +26,7 @@ def generate_contract() -> dict:
             root / "objects", store_id="archive", durability=INDEPENDENT
         )
         _publish_run(objects, _selection_report(R1, G1))
-        with mock.patch("universe.store.time.time_ns", return_value=FIXED_NOW_NS):
+        with mock.patch("universe.store.ingest_tx.time.time_ns", return_value=FIXED_NOW_NS):
             result = UniverseSync(database, objects).sync_range(
                 datetime(2026, 1, 1, tzinfo=timezone.utc),
                 datetime(2026, 1, 2, tzinfo=timezone.utc),

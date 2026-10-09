@@ -292,12 +292,12 @@ class UniverseOutcomesTests(unittest.TestCase):
         from universe.store import DetailTooLarge
 
         with (
-            patch("universe.store.DETAIL_ROW_LIMIT", 1),
+            patch("universe.store.limits.DETAIL_ROW_LIMIT", 1),
             self.assertRaises(DetailTooLarge),
         ):
             self.db.bundle_outcomes("bundle-1")
         with (
-            patch("universe.store.EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES", 100),
+            patch("universe.store.limits.EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES", 100),
             self.assertRaises(DetailTooLarge),
         ):
             self.db.bundle_outcomes("bundle-1")
