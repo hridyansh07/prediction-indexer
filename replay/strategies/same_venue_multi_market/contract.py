@@ -12,6 +12,7 @@ from replay.strategies.cross_venue_arbitrage.contract import SCALE, UNIT, source
 from replay.economic_sdk.fills import fill_policy
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.economic_sdk.types import Basket, Experiment
+from replay.economic_sdk.game import game_policy, experiment_policy
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain, PreparedInput
 from replay.streams.protocol import obj, require, uint
@@ -40,7 +41,10 @@ def _numbers(value, cap, positive):
 
 def policy_config(value):
     """Closed policy version 1; fill checks are the only mode."""
-    value = obj(plain(value), _FIELDS)
+    value = plain(value)
+    value = obj(value, _FIELDS + (" game" if type(value) is dict and "game" in value else ""))
+    if "game" in value:
+        game_policy(value["game"])
     require(type(value["version"]) is int and value["version"] == 1, "policy version")
     fill_policy(value["fills"], FILL_KIND)
     require(type(value["max_legs"]) is int and 2 <= value["max_legs"] <= MAX_LEGS, "max_legs")
@@ -58,7 +62,7 @@ def policy_config(value):
 def experiment_identity(snapshot_sha, policy, fees):
     return digest({"strategy": STRATEGY, "entity_contract_version": 1, "native_scales": True,
                    "settlement_model": SETTLEMENT, "snapshot_sha256": snapshot_sha,
-                   "policy": policy, "fees": fees})
+                   "policy": experiment_policy(policy), "fees": fees})
 
 
 def experiment(policy, identity):

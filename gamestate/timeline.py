@@ -28,10 +28,17 @@ def latest(store, event_id, *, require_timeline=True):
         best = candidate if best is None or candidate > best else best
     if best is None:
         return {"state": "no_source", "inputs": {}, "rejected_fetches": rejected}
-    complete, _, prefix = best
+    _, _, prefix = best
+    result = read_fetch(store, prefix, require_timeline=require_timeline)
+    result["rejected_fetches"] = rejected
+    return result
+
+
+def read_fetch(store, prefix, *, require_timeline=True):
+    """Verify one archived fetch and its immutable offline timeline."""
     receipt, records = kalshi.read_records(store, prefix)
     derived = kalshi.event_timeline(receipt, records)
-    state = "ok" if complete and not kalshi.disqualified(derived) else "incomplete"
+    state = "ok" if receipt["status"] == "complete" and not kalshi.disqualified(derived) else "incomplete"
     inputs = {prefix + "/responses.ndjson.zst": receipt["stored"]}
     key = prefix + "/receipt.json"
     with store.open(key, max_bytes=kalshi.MAX_METADATA) as stream:
@@ -52,4 +59,4 @@ def latest(store, event_id, *, require_timeline=True):
             if payload != kalshi.dumps(derived):
                 raise ValueError("timeline_raw_binding")
             inputs[key] = StoredIdentity(hashlib.sha256(payload).hexdigest(), len(payload)).as_record()
-    return {"state": state, "timeline": derived, "inputs": inputs, "rejected_fetches": rejected}
+    return {"state": state, "timeline": derived, "inputs": inputs, "rejected_fetches": 0}

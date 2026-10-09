@@ -10,6 +10,7 @@ Strategy code, configuration examples and strategy specifications live under
 | [strategies/](strategies/README.md) | Current strategies, their configs, readers and specifications |
 | `economic_sdk/`, [fees/](fees/README.md), `strategy_sdk.py` | Shared strategy runtime, fees and protocol |
 | `preparation.py`, `preparation_sources.py`, `prepare_context.py`, `outcome_model.py` | Frozen context preparation and outcome modelling |
+| `prepare_game_state.py`, `game_state.py`, `economic_sdk/game.py` | Pinned event game input, strict loading and timed SDK releases |
 | `streams/`, `strategy_adapter.py`, `supervisor.py` | Redis delivery and strategy lifecycle |
 | `bench/`, `jobs/`, `ops/` | Local runs, queued jobs and operational checks |
 | `economic_fills.py`, `economic_intervals.py` | Shared economic fill and interval contracts |

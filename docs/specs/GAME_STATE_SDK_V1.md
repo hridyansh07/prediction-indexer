@@ -1,7 +1,10 @@
 # Game-state SDK V1
 
-Status: **proposed.** Depends on the event-keyed game-state archive from PR #62
-(`gamestate/`, receipt v2, `timeline.v2.json`). Nothing here is implemented.
+Status: **implemented for offline replay.** Uses the event-keyed game-state
+archive (`gamestate/`, receipt v2, `timeline.v2.json`). Synthetic preparation,
+runtime, bench and independent-reader tests cover the contract. The retained
+C9–LYON acceptance in §8 remains unverified; live capture and corpus execution
+are not implemented by this change.
 
 Strategies that condition on the match (a map ending, the series score, time into
 a map) need game state inside replay. This spec adds it to the economic strategy
@@ -89,6 +92,11 @@ Closed schema, version 1:
 - `segment_kind` names what a segment is (`map` for Kalshi esports). Segments are
   ordered by `index`.
 - `source` traces the file back to the archived fetch it was derived from.
+  Its name and prefix are nonempty strings when present. Times and scores are
+  unsigned JSON integers bounded by u64; a missing start or settlement is null.
+  Segment ends are required. A match-level-only event may have no segments.
+  The complete serialized file is bounded at 1 MiB; opaque details still obey
+  strict JSON decoding (no duplicate keys or nonfinite numbers).
 
 ## 2. Preparation (runner side)
 
@@ -102,6 +110,23 @@ Closed schema, version 1:
    file and still succeeds: unavailable is a result, not an error.
 3. Reshape the fetch's `timeline.v2.json` into §1, align competitors, write
    `game_state.json` atomically, and print its SHA-256.
+
+The event identity, participants and complete event market list come from the
+committed context's Universe outcomes document; sport/game come from its bundle
+evidence and must agree across occurrences. Preparation requires that pinned
+event identity, including for unavailable results. The CLI uses exported
+`ARCHIVE_*` configuration through the shared store factory and reads no dotenv.
+It refuses an existing output directory. Publication finishes the file, fsyncs
+it, renames it, fsyncs the directory, then hashes the exact persisted bytes and
+checks them with the independent loader.
+
+The current timeline has competitor IDs rather than names. The Kalshi adapter
+therefore streams the same verified raw fetch to recover labels from market
+strikes and `yes_sub_title`; raw vendor fields do not enter the SDK. Ambiguous
+labels or alignment leave participant indexes null. Contradictory timelines,
+unresolved winner sides or invalid final scores produce `incomplete`. Rejected
+receipts with no usable fetch also produce `incomplete`, rather than ordinary
+absence. An archive with no receipt for a Kalshi event produces `no_fetch`.
 
 The corpus runner runs this once per event before fanning out strategy lines and
 passes the directory and SHA-256 to each line. A runner may skip launching a line
@@ -134,6 +159,11 @@ The loader turns the file into an ordered queue of facts:
 - Winners and `details` are never released before `segment_end`.
 - Facts are applied before the book cut at the same instant, so both see one state.
 - An applied fact is removed from the queue. Memory falls as the run advances.
+- Equal-time segment facts apply in index order, start before end before
+  settlement; a match end applies after all segment facts at that instant.
+  Windows that invert the known sequence of phases, or overflow u64 release
+  times, fail before consumption. Settlement remains independent of a delayed
+  segment-end release.
 
 ## 4. The game view
 
@@ -196,6 +226,10 @@ In policy:
   `experiment_sha256`.
 - A basket declares `("game", None)` in its `inputs` to read game state. Only those
   entities are re-evaluated when a fact is released.
+  Place it within an existing leg's input tuple, or append one global input
+  tuple `(("game", None),)` after the book-leg input tuples. A reading basket
+  requires `GameRequirement` and a game policy. Up to 128 distinct timers are
+  allowed, anchored at any fact kind in §3, with nonnegative integer ns offsets.
 - Releases are a third event source in `_advance`, after scope boundaries and
   before time-shift timers at the same instant. Fingerprints of game-reading
   entities include `view.revision`, so a cached observation is reused only for an
@@ -208,21 +242,47 @@ In policy:
   closed `game` object: `phase`, `segment`, `score`, `revision`. The manifest gains
   a `game_state` binding (SHA-256, windows, mode). Readers require the object
   exactly when the binding exists.
+  Phase/segment/score consistency is checked even after rehashing a tampered row.
+  This extension is supported by complement policy 2, cross-venue/implication
+  policies 2 and 3, and multi-market policy 1 (all SDK layout 2). Frozen complement
+  policy 1 continues to reject it. Experiment identity binds the file hash and
+  decisions; the local mount path is not a semantic experiment input.
 
 ## 6. Bench and corpus runner
 
 - Bench run specs gain an optional `game_state_path` beside `context_directory`,
   mounted read-only, with `{game_state}` and `{game_state_sha256}` tokens.
 - `.bench/fixtures/build_fixture.py` gains a `prepare_game_state` stage.
+  It uses `replay.bench.game_state.prepare_fixture_stage` after context
+  preparation, writes one `game_state/game_state.json`, and verifies an existing
+  file before reuse without refreshing it. Only this builder source is tracked;
+  downloaded windows, derivatives and run outputs remain ignored.
 - The corpus runner prepares game state per event as one stage before strategy
   lines. The jobs runner is out of scope (it is retiring).
 
+`python -m replay.bench prepare-game-state <context_dir> <out_dir>` exposes the
+same preparation stage. Bench resolves the SHA-256 before Docker, rejects policy
+pins differing from that file, mounts it at `/bench/game_state.json` read-only,
+and records its hash in the resolved spec and result. Required unavailable groups
+get a closed `game_state_unavailable` result with reason and hash, and no strategy
+outputs; other groups can run. The aggregate bench status is
+`GAME_STATE_UNAVAILABLE` (exit 2) when any group is skipped, or `FAILED` if an
+active group fails. An all-skipped invocation does not start the supervisor.
+
 ## 7. Priors tool
 
-`python -m gamestate.priors --archive-env …` streams every `ok` timeline in the
+`python -m gamestate.priors --archive-env ARCHIVE --output /research/priors.json`
+streams every verified `ok` timeline in the
 archive and writes per-game statistics (count, median, p10, p90) for segment
 duration, gap between segments and settlement delay to a local JSON report. It
 never writes to the archive.
+
+`--archive-env` names an exported variable prefix, not a dotenv file. Known
+Kalshi game names map to Universe vocabulary. Exact samples use temporary
+SQLite storage, retaining one timeline at a time. The median averages the middle
+two samples; p10/p90 use nearest rank. Report values are decimal ns strings
+(a half-ns median is permitted), with null for empty metrics and counts of ok
+and incomplete fetches. Existing output files are refused.
 
 ## 8. Tests and acceptance
 
@@ -263,3 +323,23 @@ Offline, with small hand-authored inputs:
 - **Live capture.** Timed in-segment state needs polling Kalshi `live_data` during
   matches. Those would be new fact kinds with opaque `details`, released at
   `received_at`, in the same queue.
+
+## 10. Offline verification (9 October 2026)
+
+The final focused gate passed **283 tests**, spanning the new game input tests,
+bench, SDK runtime/ports/outcomes/fills, all affected strategy readers, preparation,
+Kalshi archival and scheduled game state. Existing complement and cross-venue
+byte goldens remain pinned. A separate read-only verification thread passed
+**268 focused tests** and reported no remaining material findings. Its source
+identity, episode-shape, nonfinite-number and whole-file-hashing findings were
+resolved; strict-reader regressions were demonstrated before their fixes.
+
+The broader root gate ran **933 tests**, with one existing stale-retrieval
+cleanup failure. Replay ran **555 tests**, with 33 skipped, two failing signal
+subtests and one error in the existing bundle-runner process tests. All failing
+cases reproduced in the untouched main checkout: they rely on Linux `/proc` or
+`prctl` on this macOS host. The final focused gate also covers the subsequent
+finite-number and pre-reader cleanup fixes. Python syntax and whitespace checks
+passed. No Rust, wire, supervisor or deployment implementation changed, so Rust
+and Compose gates were not run. Docker/Redis execution, live services and the
+retained C9–LYON book-close acceptance remain unverified.

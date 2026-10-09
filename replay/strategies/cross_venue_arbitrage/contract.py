@@ -7,6 +7,7 @@ import json
 from replay.strategies.same_venue_complement.contract import policy_config as sdk_policy, reason, experiment as sdk_experiment
 from replay.strategies._shared.fee_bridge import FeeEconomicsUnavailable
 from replay.economic_sdk.fills import fill_policy
+from replay.economic_sdk.game import experiment_policy
 from replay.economic_sdk.types import Basket
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.fees.domain import Asset, AssetKind, InstrumentEconomics
@@ -69,7 +70,7 @@ def policy_config(value):
     """Policy 2 (the fixed-size sweep) or policy 3 (fill checks at a 1-contract trigger)."""
     value = plain(value)
     if type(value) is dict and value.get("version") == 3:
-        obj(value, _V3_FIELDS)
+        obj(value, _V3_FIELDS + (" game" if "game" in value else ""))
         sdk_policy(_sweep(value))
         fill_policy(value["fills"], FILL_KIND)
         return value
@@ -88,7 +89,7 @@ def sizes(policy):
 def experiment_identity(snapshot_sha, policy, fees, valuation):
     return digest({"strategy": STRATEGY, "bridge_version": 1, "entity_contract_version": 2, "native_scales": True,
                    "settlement_model": SETTLEMENT, "snapshot_sha256": snapshot_sha,
-                   "policy": policy, "fees": fees, "valuation": valuation})
+                   "policy": experiment_policy(policy), "fees": fees, "valuation": valuation})
 
 
 def experiment(policy, identity):

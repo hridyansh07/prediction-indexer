@@ -71,7 +71,8 @@ class ImplicationReader(CrossVenueReader):
 def check_manifest(value, snapshot, complete, mode):
     fields = ("version strategy venue_mode snapshot_sha256 policy policy_sha256 experiment_sha256 "
               "fee_config fee_engine_identity files instantaneous_positive settlement_model outcomes_provider valuation")
-    obj(value, fields + (" summary_sha256" if complete else ""))
+    from replay.economic_sdk.game import manifest_fields
+    obj(value, fields + (" summary_sha256" if complete else "") + manifest_fields(value))
     require(mode in STRATEGIES and value["venue_mode"] == mode and value["strategy"] == STRATEGIES[mode],
             "implication strategy/mode binding")
     require(type(value["version"]) is int and value["version"] == 1, "implication output version")

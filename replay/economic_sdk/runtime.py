@@ -39,7 +39,8 @@ from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, 
                                        END_BOOK_LINE, end_books,
                                        crossed, price)
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
-from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, Observation
+from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, GameRequirement, Observation
+from replay.economic_sdk.game import ANCHORS, Timeline, binding as game_binding, episode_game, game_policy
 from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
@@ -82,7 +83,7 @@ class _Episode:
                  "quotes", "qualified", "viable", "opening_survival", "cost", "fill",
                  # layout 2 only
                  "open_class", "open_reasons", "class_now", "class_since", "slice_classes",
-                 "class_ns", "qualifying", "skew_points", "by_skew", "at_max")
+                 "class_ns", "qualifying", "skew_points", "by_skew", "at_max", "open_game", "max_game")
 
 
 def _fingerprint(views, plan):
@@ -128,6 +129,31 @@ class Runtime:
         self.root = Path(context["output_directory"])
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
+        requirements = strategy.requirements(self.snapshot, experiment.policy)
+        self.game = None
+        self.game_timers = []
+        self.game_requirement = requirements.game
+        self.game_entities = set()
+        game_cost = 0
+        if "game" in experiment.policy:
+            from replay.game_state import load
+            require(not self.legacy, "game state requires SDK layout 2")
+            policy = game_policy(experiment.policy["game"])
+            document = load(policy["input"]["path"], policy["input"]["sha256"], self.snapshot)
+            self.game = Timeline(document, policy, int(self.snapshot["config"]["start_ns"]))
+            # JSON-shaped header/details plus all possible declared pending
+            # timers. This reservation covers the overlay without keeping it.
+            game_cost = 2 * bounds.json_cost(plain(document)) + len(self.game.facts) * (
+                512 + 128 * (bounds.INT + bounds.SLOT))
+        if self.game_requirement is not None:
+            require(type(self.game_requirement) is GameRequirement and self.game is not None,
+                    "game requirement needs game policy")
+            timers = self.game_requirement.timers
+            require(type(timers) is tuple and len(timers) <= 128 and len(set(timers)) == len(timers),
+                    "game timers declaration")
+            for anchor, offset in timers:
+                require(anchor in ANCHORS and type(offset) is int and 0 <= offset <= 2**64 - 1,
+                        "game timer anchor/offset")
         if self.legacy:
             self.layout_files = Layout(experiment)
             names = self.layout_files.files
@@ -149,7 +175,8 @@ class Runtime:
         self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
                            + bounds.json_cost(experiment.policy))
 
-        requirements = strategy.requirements(self.snapshot, experiment.policy)
+        if self.game is not None:
+            self.budget.charge(game_cost)
         self.builders = {}
         for key, requirement in sorted(requirements.books.items()):
             require(key in self.plans and type(requirement) is BookRequirement, "book requirement")
@@ -238,6 +265,10 @@ class Runtime:
                 if self.profile is not None:
                     self.profile.initial(cut, start)
                 self._scope(0)
+                if self.game is not None:
+                    self._release_game(start)
+                    while self.game_timers and self.game_timers[0] <= start:
+                        heapq.heappop(self.game_timers)
                 self._stage(start, set(self.entities))
                 return
             require(self.strategy.bound, "missing initial")
@@ -314,8 +345,7 @@ class Runtime:
                 # A touched input: unchanged when every object it reads is identical.
                 memo = self.memo.get(entity_id)
                 if (self.legacy or memo is None or memo[1] is not value[0] or not _same(
-                        memo[0], _fingerprint(self._views(self.entities[entity_id], time),
-                                              self.plans_of[entity_id]))):
+                        memo[0], self._input_fingerprint(entity_id, time))):
                     affected.add(entity_id)
             elif self.legacy and value[0].status == EVALUATED:
                 entity = self.entities[entity_id]
@@ -428,6 +458,7 @@ class Runtime:
         self.current = {}
         self.reads = {}
         self.plans_of = {}
+        self.game_entities = set()
         self.reverse, self.shift_reverse = {}, {}
         if not self.legacy:
             self.index = {}
@@ -442,16 +473,27 @@ class Runtime:
                 continue
             inputs = entity.basket.inputs
             if inputs is not None:
+                require(len(entity.legs) <= len(inputs) <= len(entity.legs) + 1, "basket input arity")
+                game_reads = any(source == "game" for leg in inputs for source, _ in leg)
+                if game_reads:
+                    require(self.game is not None and self.game_requirement is not None,
+                            "basket game input needs game requirement")
+                    require(all(size is None for leg in inputs for source, size in leg if source == "game"),
+                            "basket game input size")
+                    self.game_entities.add(entity.id)
+                if len(inputs) > len(entity.legs):
+                    require(inputs[-1] == (("game", None),), "basket global game input")
                 self.plans_of[entity.id] = tuple(
                     tuple((_BEST if source == "best" else _CROSSED if source == "crossed"
                            else _TRANSFORM if source in _SOURCE_SIDES else _FILL, source, size)
-                          for source, size in leg)
-                    for leg in inputs)
+                          for source, size in leg if source != "game")
+                    for leg in inputs[:len(entity.legs)])
             for position, key in enumerate(entity.legs):
                 if inputs is not None:
                     read = self.reads.get((entity.id, key), frozenset())
                     for source, _ in inputs[position]:
-                        read = read | _SOURCE_SIDES.get(source, frozenset((source,)))
+                        if source != "game":
+                            read = read | _SOURCE_SIDES.get(source, frozenset((source,)))
                     self.reads[entity.id, key] = read
                 if entity.shift is not None and entity.shift[0] == position:
                     self.shift_reverse.setdefault((key, entity.shift[1]), set()).add(entity.id)
@@ -474,8 +516,20 @@ class Runtime:
             self.budget.replace(self.fill_specs_cost, cost)
             self.fill_specs, self.fill_specs_cost = specs, cost
 
+    def _release_game(self, time):
+        facts = self.game.advance(time)
+        if self.game_requirement is not None:
+            for fact in facts:
+                for anchor, offset in self.game_requirement.timers:
+                    if anchor == fact.kind:
+                        due = max(self.clock.start, fact.release_ns, fact.source_ns + offset)
+                        require(due <= 2**64 - 1, "game timer overflow")
+                        if due < self.clock.end:
+                            heapq.heappush(self.game_timers, due)
+        return bool(facts)
+
     def _advance(self, time):
-        """Process scope boundaries and shift timers up to ``time`` in order."""
+        """Scope boundaries, game releases, then timers, before same-time books."""
         entered = set()
         while True:
             boundary = (int(self.clock.scopes[self.clock.scope]["end_ns"])
@@ -483,13 +537,14 @@ class Runtime:
             if boundary is not None and boundary > time:
                 boundary = None
             due = self.timers[0][0] if self.timers and self.timers[0][0] <= time else None
-            if boundary is None and due is None:
+            release = self.game.next_time if self.game is not None else None
+            if release is not None and release > time:
+                release = None
+            game_due = self.game_timers[0] if self.game_timers and self.game_timers[0] <= time else None
+            if boundary is None and due is None and release is None and game_due is None:
                 break
-            at = min(x for x in (boundary, due) if x is not None)
+            at = min(x for x in (boundary, release, game_due, due) if x is not None)
             affected = set()
-            while self.timers and self.timers[0][0] == at:
-                _, key, shift = heapq.heappop(self.timers)
-                affected.update(self.shift_reverse.get((key, shift), ()))
             if boundary == at:
                 self._close_scope(at, "SCOPE_END", False)
                 for _ in self.clock.advance(at):
@@ -497,6 +552,20 @@ class Runtime:
                 self.scope = self.clock.scope
                 self._scope(self.scope)
                 affected = set(self.entities)
+            if release == at and self._release_game(at):
+                affected.update(self.game_entities)
+            while self.game_timers and self.game_timers[0] == at:
+                heapq.heappop(self.game_timers)
+                affected.update(self.game_entities)
+                # A threshold must evaluate even if a strategy cached its prior
+                # state-only observation. Timers are explicitly declared inputs.
+                for entity_id in self.game_entities:
+                    memo = self.memo.pop(entity_id, None)
+                    if memo is not None:
+                        self.budget.release(memo[2])
+            while self.timers and self.timers[0][0] == at:
+                _, key, shift = heapq.heappop(self.timers)
+                affected.update(self.shift_reverse.get((key, shift), ()))
             if affected:
                 self._stage(at, affected)
             if at < time:
@@ -510,6 +579,13 @@ class Runtime:
         return entered
 
     # -- evaluation and staging ---------------------------------------------------
+    def _input_fingerprint(self, entity_id, time, views=None):
+        parts = _fingerprint(self._views(self.entities[entity_id], time) if views is None else views,
+                             self.plans_of[entity_id])
+        if entity_id in self.game_entities:
+            parts.append(self.game.view.revision)
+        return parts
+
     def _evaluate(self, entity_id):
         entity = self.entities[entity_id]
         if entity.admission is not None:
@@ -518,7 +594,7 @@ class Runtime:
         views = self._views(entity, self.staged_time)
         plan = self.plans_of.get(entity_id)
         if plan is not None:
-            fingerprint = _fingerprint(views, plan)
+            fingerprint = self._input_fingerprint(entity_id, self.staged_time, views)
             memo = self.memo.get(entity_id)
             if memo is not None and _same(memo[0], fingerprint):
                 observation = memo[1]
@@ -575,7 +651,7 @@ class Runtime:
 
     def _fresh(self, entity, views):
         context = Context(self.staged_time, self.sequence, self.scope,
-                          self.experiment.experiment_sha256)
+                          self.experiment.experiment_sha256, self.game.view if self.game is not None else None)
         observation = self.strategy.evaluate(entity, views, context)
         require(type(observation) is Observation and observation.status in self.statuses,
                 "observation status")
@@ -774,6 +850,9 @@ class Runtime:
         episode.viable = set()
         episode.opening_survival = None
         episode.cost = bounds.episode_cost(observation, len(self.tiers))
+        if self.game is not None:
+            episode.open_game = episode.max_game = episode_game(self.game.view)
+            episode.cost += 2 * bounds.json_cost(episode.open_game)
         if not self.legacy:
             episode.open_class = episode.class_now = observation.value_class
             episode.open_reasons = observation.reasons
@@ -799,6 +878,8 @@ class Runtime:
         if episode.fill is None and observation.quotes != episode.quotes:
             self._check_retained_slice(observation.quotes, payload)
             cost = bounds.episode_cost(observation, len(self.tiers)) * (1 if self.legacy else 2)
+            if self.game is not None:
+                cost += bounds.json_cost(episode.open_game) + bounds.json_cost(episode.max_game)
             self.budget.replace(episode.cost, cost)
             episode.cost = cost
             self._emit_slice(episode, time, "CONSUMED_CHANGED", False)
@@ -816,6 +897,8 @@ class Runtime:
             first = self.experiment.maxima[0]
             if maxima[first] is not None and maxima[first] != episode.maxima[first]:
                 episode.at_max = (payload, observation.quotes)
+                if self.game is not None:
+                    episode.max_game = episode_game(self.game.view)
         episode.maxima = maxima
 
     def _emit_slice(self, episode, end, reason, censored):
@@ -940,6 +1023,9 @@ class Runtime:
                 episode.fill.json["end_books"] = end_books(
                     self.fill_specs[episode.entity][0].sources, self._views(entity, end))
                 row["fill"] = episode.fill.json
+            if self.game is not None:
+                row["open"]["game"] = episode.open_game
+                row["at_max"]["game"] = episode.max_game
             self.writers[group_of(entity) + "episodes.ndjson"].append(row)
 
     # -- measurements and denominators ---------------------------------------
@@ -1066,11 +1152,14 @@ class Runtime:
             if self.profile is not None:
                 files |= self.profile.finish_files()
             manifest = self.strategy.manifest(files, self.instantaneous)
+            if self.game is not None:
+                manifest["game_state"] = game_binding(self.experiment.policy["game"])
             snapshot, strategy = self.snapshot, self.strategy
             # Release runtime state before the reader so the two peaks never overlap.
             self.views.clear(); self.rings.clear(); self.staged.clear()
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
             self.memo.clear(); self.reasons.clear()
+            self.game = None; self.game_timers.clear(); self.game_entities.clear()
             self.budget = None
             summary = strategy.validate(self.root, snapshot, manifest)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")

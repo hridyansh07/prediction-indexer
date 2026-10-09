@@ -24,9 +24,12 @@ def import_callable(reference):
 
 
 def validate_result(value):
-    obj(value, 'version label status started_at run_seconds image context fee_catalog_identity groups error')
+    obj(value, 'version label status started_at run_seconds image context fee_catalog_identity groups error'
+        + (' game_state_sha256' if 'game_state_sha256' in value else ''))
+    if 'game_state_sha256' in value:
+        sha(value['game_state_sha256'])
     require(type(value['version']) is int and value['version'] == 1, 'result version')
-    require(value['status'] in {'SUCCESS', 'CHECKS_FAILED', 'FAILED'}, 'result status')
+    require(value['status'] in {'SUCCESS', 'CHECKS_FAILED', 'FAILED', 'GAME_STATE_UNAVAILABLE'}, 'result status')
     require(type(value['label']) is str and bool(value['label']), 'result label')
     require(type(value['started_at']) is str and datetime.fromisoformat(value['started_at']).tzinfo is not None, 'result timestamp')
     require(type(value['run_seconds']) in (int, float) and value['run_seconds'] >= 0, 'result duration')
@@ -39,11 +42,23 @@ def validate_result(value):
     require(type(value['groups']) is list, 'result groups')
     names = []
     for group in value['groups']:
-        obj(group, 'name factory receipt checks')
+        obj(group, 'name factory receipt checks' + (' unavailable' if 'unavailable' in group else ''))
+        if 'unavailable' in group:
+            unavailable = obj(group['unavailable'], 'status reason sha256')
+            require(unavailable['status'] == 'game_state_unavailable' and unavailable['reason'] in
+                    ('no_source', 'no_fetch', 'incomplete') and group['receipt'] is None and not group['checks'],
+                    'unavailable game result')
+            sha(unavailable['sha256'])
+            require(unavailable['sha256'] == value.get('game_state_sha256'), 'unavailable game pin mismatch')
         names.append(group['name'])
         require(type(group['receipt']) is dict or group['receipt'] is None, 'reader receipt')
         require(type(group['checks']) is dict and all(type(v) is bool for v in group['checks'].values()), 'check flags')
     require(len(names) == len(set(names)), 'duplicate result group')
+    unavailable = any('unavailable' in group for group in value['groups'])
+    require((value['status'] == 'GAME_STATE_UNAVAILABLE' and unavailable)
+            or value['status'] == 'FAILED'
+            or value['status'] in ('SUCCESS', 'CHECKS_FAILED') and not unavailable,
+            'unavailable game status mismatch')
     if value['error'] is not None:
         obj(value['error'], 'type message trace_tail')
         require(all(type(v) is str for v in value['error'].values()), 'result error strings')
@@ -52,12 +67,15 @@ def validate_result(value):
 
 def initial_result(spec):
     runtime = spec['runtime']
-    return {'version': 1, 'label': runtime['label'], 'status': 'FAILED',
+    result = {'version': 1, 'label': runtime['label'], 'status': 'FAILED',
             'started_at': datetime.now(timezone.utc).isoformat(), 'run_seconds': 0,
             'image': runtime['image'], 'context': runtime['context'],
             'fee_catalog_identity': runtime['fee_catalog_identity'],
             'groups': [{'name': g['name'], 'factory': g['factory'], 'receipt': None, 'checks': {}} for g in spec['groups']],
             'error': None}
+    if 'game_state_sha256' in runtime:
+        result['game_state_sha256'] = runtime['game_state_sha256']
+    return result
 
 
 def execute(spec, output=Path('/bench'), *, redis_url, supervisor_run=supervisor.run,
@@ -84,12 +102,29 @@ def execute(spec, output=Path('/bench'), *, redis_url, supervisor_run=supervisor
         if spec['runtime']['fee_catalog_identity'] is not None:
             require(catalog_loader(root / 'fees' / spec['runtime']['fee_catalog_identity']).identity == spec['runtime']['fee_catalog_identity'], 'catalog pin mismatch')
         config = supervisor_config(spec)
+        active = spec['groups']
+        if 'game_state_sha256' in spec['runtime']:
+            from replay.game_state import load
+            game = load(root / 'game_state.json', spec['runtime']['game_state_sha256'], snapshot)
+            active = []
+            for group, entry in zip(spec['groups'], result['groups']):
+                policy = group['config'].get('policy', {}).get('game')
+                if policy is not None and policy['required'] and game['state'] == 'unavailable':
+                    entry['unavailable'] = {'status': 'game_state_unavailable', 'reason': game['reason'],
+                                            'sha256': spec['runtime']['game_state_sha256']}
+                    write_json(root / 'groups' / group['name'] / 'game_state_unavailable.json', entry['unavailable'])
+                else:
+                    active.append(group)
+            config['strategies'] = {g['name']: config['strategies'][g['name']] for g in active}
+            config['transport']['groups'] = [g['name'] for g in active]
         for group in spec['groups']:
             (root / 'groups' / group['name'] / 'work').mkdir(parents=True)
         write_json(root / 'input.json', config)
-        completed = supervisor_run(config, root / 'run', redis_url)
+        completed = supervisor_run(config, root / 'run', redis_url) if active else None
         all_passed = True
         for group, entry in zip(spec['groups'], result['groups']):
+            if 'unavailable' in entry:
+                continue
             directory = root / 'groups' / group['name']
             returned = plain(readers[group['name']](root / 'run', group['name']))
             require(type(returned) is dict and type(returned.get('receipt')) is dict, 'reader must return a receipt')
@@ -110,6 +145,8 @@ def execute(spec, output=Path('/bench'), *, redis_url, supervisor_run=supervisor
                 all_passed = all_passed and checked['passed']
         result['status'] = 'SUCCESS' if all_passed else 'CHECKS_FAILED'
         code = 0 if all_passed else 2
+        if len(active) != len(spec['groups']):
+            result['status'], code = 'GAME_STATE_UNAVAILABLE', 2
     except (Exception, KeyboardInterrupt) as error:
         result['status'], result['error'] = 'FAILED', error_document(error)
     finally:
