@@ -4,7 +4,7 @@ Layout 1 is the frozen complement V1 wire (policy 1 only): a complete interval
 partition in ``measurements.ndjson`` (real and placebo rows mixed), full
 slices, and ``placebo_episodes.ndjson``.
 
-Layouts 2 and 3 aggregate a strategy's episodes; time per
+Layout 2 is the SDK default. A strategy's result is its episodes; time per
 status and value class per measured key is aggregated into denominators:
 
 - ``entities.json`` and ``reasons.json``: tables that rows reference by index;
@@ -14,25 +14,10 @@ status and value class per measured key is aggregated into denominators:
   denominators, plus episodes/slices only when the policy asks for them;
 - ``audit/measurements.ndjson`` and ``audit/slices.ndjson``: the complete
   interval partition and full slices, only with ``audit_intervals``.
-
-Layout 3 is the default. It substitutes sorted, deduplicated
-``descriptors.ndjson``, scoped ``entities.ndjson`` and ``reasons.ndjson`` for
-the two metadata documents. All episode/denominator indexes are unchanged.
 """
 
 from replay.economic_sdk.types import CONTROL, REAL
 from replay.streams.protocol import require
-
-
-def manifest_layout(manifest, *, legacy=False):
-    """The layout field is the new wire discriminator; absent means the old wire."""
-    require(type(manifest) is dict, "closed manifest schema")
-    if "layout" not in manifest:
-        return 1 if legacy else 2
-    value = manifest["layout"]
-    require(type(value) is int and value == 3 and not legacy, "unknown output layout")
-    return value
-
 
 _V1 = {("measurements", REAL): "measurements.ndjson", ("measurements", CONTROL): "measurements.ndjson",
        ("episodes", REAL): "episodes.ndjson", ("episodes", CONTROL): "placebo_episodes.ndjson",
@@ -62,16 +47,13 @@ def group_of(entity):
 
 
 def aggregate_files(experiment):
-    """Every aggregate file, by group, in a fixed order."""
-    require(type(experiment.layout) is int and experiment.layout in (2, 3), "unknown output layout")
-    tables = (["descriptors.ndjson", "entities.ndjson"] if experiment.layout == 3
-              else ["entities.json"])
-    reasons = "reasons.ndjson" if experiment.layout == 3 else "reasons.json"
-    files = {"": tables + [reasons, "denominators.ndjson", "episodes.ndjson", "slices.ndjson"]}
+    """Every file layout 2 writes, by group, in a fixed order."""
+    files = {"": ["entities.json", "reasons.json", "denominators.ndjson", "episodes.ndjson",
+                  "slices.ndjson"]}
     if experiment.audit_intervals:
         files[""] += ["audit/measurements.ndjson", "audit/slices.ndjson"]
     for control in experiment.controls:
-        names = tables + ["denominators.ndjson"]
+        names = ["entities.json", "denominators.ndjson"]
         if experiment.controls_episodes:
             names.append("episodes.ndjson")
         if experiment.controls_slices:

@@ -60,7 +60,7 @@ def wide_fixture(scope_count=14):
 
 
 class WideHarness(Harness):
-    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False, layout=None):
+    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False):
         self.root=root
         d, doc, c=wide_fixture(scope_count)
         if pin:
@@ -93,13 +93,6 @@ class WideHarness(Harness):
             cfg["valuation"]={"version":1,"kind":"PARITY_SCENARIO","unit":"research_dollar",
                               "assets":sorted(cfg["fees"]["assets"].values(),key=encoded)}
             self.cross_config=cfg
-            if layout is not None:
-                from dataclasses import replace
-                from replay.economic_sdk.runtime import Runtime
-                from replay.strategies.cross_venue_arbitrage.strategy import CrossVenueArbitrage
-                strategy = CrossVenueArbitrage(cfg)
-                strategy.experiment = replace(strategy.experiment, layout=layout)
-                return Runtime(strategy, context)
             return build({**context,"config":cfg})
         with patch("replay.tests.test_bundle_coverage.detail",side_effect=lambda:copy.deepcopy(d)), \
              patch("replay.tests.test_bundle_coverage.config",side_effect=lambda:copy.deepcopy(c)), \
@@ -108,7 +101,7 @@ class WideHarness(Harness):
             BaseHarness.__init__(self,root,mixed=True,pin=pin)
 
     def populate(self):
-        self.window(end=int(self.snapshot["config"]["end_ns"]))
+        self.window()
         for p in self.initial["plans"]:
             ps,qs=int(p["price_scale"]),int(p["quantity_scale"])
             ladder(self,12,p["instrument"],bids=((10**ps//10,2000*10**qs),),
@@ -124,7 +117,7 @@ class WideHarness(Harness):
 class MetadataRegressionTests(unittest.TestCase):
     def test_default_sweep_finishes_with_full_scoped_rejections(self):
         with tempfile.TemporaryDirectory() as tmp:
-            h=WideHarness(Path(tmp), layout=2)
+            h=WideHarness(Path(tmp))
             try:
                 h.populate()
                 result=h.finish()
@@ -150,14 +143,14 @@ class MetadataRegressionTests(unittest.TestCase):
             root=Path(tmp)
             from replay.streams.protocol import ProtocolError
             with self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
-                WideHarness(root,scope_count=70,layout=2)
+                WideHarness(root,scope_count=70)
             self.assertEqual(list((root/"output").iterdir()),[])
 
     def test_eight_and_four_sizes_have_identical_shared_route_time_and_episodes(self):
         summaries=[]
         for sizes in (SIZES,["1","10","100","1000"]):
             with tempfile.TemporaryDirectory() as tmp:
-                h=WideHarness(Path(tmp),sizes=sizes,controls=True,layout=2)
+                h=WideHarness(Path(tmp),sizes=sizes,controls=True)
                 try:
                     h.populate(); result=h.finish()
                     summaries.append(result["summary"])
@@ -258,8 +251,6 @@ class SDKMetadataBoundaryTests(unittest.TestCase):
         from replay.economic_sdk.entity_tables import entity_rows
         h=Harness(root,policy={"controls":[{"kind":"time_shift","shift_ns":["5"]}] if big_group else []})
         s=h.strategy.strategy
-        from dataclasses import replace
-        s.experiment = replace(s.experiment, layout=2)
         snapshot={**s.snapshot,"scopes":[s.snapshot["scopes"][0],s.snapshot["scopes"][0]]}
         desc={"legs":[],"admission":"UNSUPPORTED_SHAPE","padding":""}
         # Keep the nontarget table small. Each target row has a fixed-width digest.

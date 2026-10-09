@@ -16,7 +16,7 @@ from .contract import (
 )
 from replay.economic_sdk import Strategy, aggregate_reader, reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
-from replay.economic_sdk.output import Layout, manifest_layout
+from replay.economic_sdk.output import Layout
 from replay.economic_sdk.reader import quantiles as _quantiles  # noqa: F401  (stable test surface)
 from replay.economic_sdk.reader import read_json as _json
 from replay.economic_sdk.reader import signed as _signed
@@ -35,9 +35,6 @@ SKEW_ARTIFACT_EDGE_NS = 1_000_000_000
 def check_manifest(value, complete=True):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive payout_assumption")
-    manifest_layout(value, legacy=value.get("version") == 1)
-    if "layout" in value:
-        fields += " layout"
     if complete:
         fields += " summary_sha256"
     obj(value, fields)
@@ -363,7 +360,7 @@ def _skew_artifact(positive, policy):
     return bool(positive) and all(edges[int(b)] >= SKEW_ARTIFACT_EDGE_NS for b in positive)
 
 
-def validate_content(directory, snapshot, manifest, *, state_bytes=None):
+def validate_content(directory, snapshot, manifest):
     """Validate semantic files and return the independently derived summary."""
     check_manifest(manifest, "summary_sha256" in manifest)
     strategy = ComplementReader.for_manifest(manifest, snapshot)
@@ -372,13 +369,13 @@ def validate_content(directory, snapshot, manifest, *, state_bytes=None):
         strategy.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"],
                                                     strategy.experiment.profile,
                                                     manifest["experiment_sha256"],
-                                                    manifest["snapshot_sha256"], state_bytes=state_bytes)
+                                                    manifest["snapshot_sha256"])
     if strategy.experiment.layout == 1:
-        return reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
-    return aggregate_reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
+        return reader.validate(directory, snapshot, manifest, strategy)
+    return aggregate_reader.validate(directory, snapshot, manifest, strategy)
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256, state_bytes=None):
+def read_provisional(directory, snapshot_directory, *, expected_sha256):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = _json(root / "manifest.json")
@@ -393,7 +390,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256, state_by
     for field in ("run_id", "attempt_id", "group"):
         require(type(receipt[field]) is str and 0 < len(receipt[field]) <= 128)
     require(type(receipt["terminal"]) is int and receipt["terminal"] >= 2)
-    summary = validate_content(root, snapshot, manifest, state_bytes=state_bytes)
+    summary = validate_content(root, snapshot, manifest)
     require(encoded(_json(root / "summary.json")) == encoded(summary)
             and manifest["summary_sha256"] == digest(summary), "summary identity/schema")
     return {"receipt": receipt, "manifest": manifest, "summary": summary}
@@ -411,8 +408,7 @@ def read_completed(run_directory, group):
     inputs = Inputs(spec["config"])
     inputs.prepared.bind(freeze(initial(config)))
     result = read_provisional(root / success["outputs"][group], spec["config"]["snapshot_directory"],
-                              expected_sha256=spec["config"]["snapshot_sha256"],
-                              state_bytes=config["limits"].get("state_bytes", 128 * 1024**2))
+                              expected_sha256=spec["config"]["snapshot_sha256"])
     require(result["manifest"]["experiment_sha256"] == inputs.experiment_sha256
             and result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity,
             "configured identity")

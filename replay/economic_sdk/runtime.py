@@ -34,7 +34,7 @@ from replay.economic_fills import Fill  # noqa: F401  (re-exported for strategie
 from replay.economic_intervals import CutClock, EpisodeMath
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
-from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table, table3_rows, write_rows
+from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table
 from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, check_spec,
                                        END_BOOK_LINE, end_books,
                                        crossed, price)
@@ -125,10 +125,6 @@ class Runtime:
         # Fill mode (spec §13): the trigger kind's episodes are priced fills.
         self.fill = experiment.fills
         self.snapshot = strategy.snapshot
-        self.state_bytes = context.get("limits", {}).get("state_bytes", bounds.MAX_STATE)
-        self.budget = bounds.StateBudget(self.state_bytes)
-        self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
-                           + bounds.json_cost(experiment.policy))
         self.root = Path(context["output_directory"])
         require(self.root.is_dir() and not any(self.root.iterdir()), "output directory must be empty")
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
@@ -138,10 +134,9 @@ class Runtime:
         else:
             self.groups = aggregate_files(experiment)
             names = tuple(group + name for group, files in self.groups.items()
-                          for name in files if name.endswith(".ndjson")
-                          and name not in ("descriptors.ndjson", "entities.ndjson", "reasons.ndjson"))
+                          for name in files if name.endswith(".ndjson"))
         self.plans = {(p["instrument"], p["orientation"]): plain(p) for p in self.snapshot["plans"]}
-        self.entity_table_bytes = preflight(strategy, self.snapshot, self.plans, state_bytes=self.state_bytes)
+        self.entity_table_bytes = preflight(strategy, self.snapshot, self.plans)
         self.writers = {}
         for name in names:
             path = self.root / name
@@ -150,6 +145,9 @@ class Runtime:
                                             max_records=bounds.MAX_ROWS,
                                             max_line_bytes=bounds.MAX_LINE)
         self.clock = CutClock(self.snapshot)
+        self.budget = bounds.StateBudget()
+        self.budget.charge(experiment.static_reservation + bounds.json_cost(self.snapshot)
+                           + bounds.json_cost(experiment.policy))
 
         requirements = strategy.requirements(self.snapshot, experiment.policy)
         self.builders = {}
@@ -1051,22 +1049,11 @@ class Runtime:
         """Entity tables (once per scope, per group) and the reason table."""
         tables = {}
         for group in self.groups:
-            if self.experiment.layout == 3:
-                for leaf in ("descriptors.ndjson", "entities.ndjson"):
-                    name = group + leaf
-                    tables[name] = write_rows(self.root, name, table3_rows(
-                        self.strategy, self.snapshot, self.plans, group, leaf, state_bytes=self.state_bytes),
-                        expected_size=self.entity_table_bytes[name])
-                continue
             name = group + "entities.json"
             tables[name] = write_table(self.root, name, table_chunks(
                 self.strategy, self.snapshot, self.plans, group),
                 expected_size=self.entity_table_bytes[name])
-        if self.experiment.layout == 3:
-            tables["reasons.ndjson"] = write_rows(self.root, "reasons.ndjson", (
-                {"reason": index, "value": value} for index, value in enumerate(self.reason_list)))
-        else:
-            tables["reasons.json"] = self._write_table("reasons.json", {"reasons": self.reason_list})
+        tables["reasons.json"] = self._write_table("reasons.json", {"reasons": self.reason_list})
         return tables
 
     def finish(self):
@@ -1079,15 +1066,13 @@ class Runtime:
             if self.profile is not None:
                 files |= self.profile.finish_files()
             manifest = self.strategy.manifest(files, self.instantaneous)
-            if self.experiment.layout == 3:
-                manifest["layout"] = 3
             snapshot, strategy = self.snapshot, self.strategy
             # Release runtime state before the reader so the two peaks never overlap.
             self.views.clear(); self.rings.clear(); self.staged.clear()
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
             self.memo.clear(); self.reasons.clear()
             self.budget = None
-            summary = strategy.validate(self.root, snapshot, manifest, state_bytes=self.state_bytes)
+            summary = strategy.validate(self.root, snapshot, manifest)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")
             if not self.legacy:
                 for name, control in summary.get("controls", {}).items():

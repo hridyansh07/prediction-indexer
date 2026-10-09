@@ -150,8 +150,8 @@ class PairFills(Strategy):
                 "policy": self.policy, "experiment_sha256": self.experiment.experiment_sha256,
                 "files": files, "instantaneous_positive": instantaneous}
 
-    def validate(self, directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
-        return aggregate_reader.validate(directory, snapshot, manifest, self, state_bytes=state_bytes)
+    def validate(self, directory, snapshot, manifest):
+        return aggregate_reader.validate(directory, snapshot, manifest, self)
 
     def open_facts(self, values, entity, kind):
         return int(obj(values, "edge")["edge"])

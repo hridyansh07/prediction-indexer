@@ -68,7 +68,7 @@ def experiment(policy, identity):
         skew_edges_ns=tuple(int(e) for e in policy["leg_skew_buckets_ns"]),
         kinds=("gross", "net"), episode_classes=EPISODE_CLASSES, value_classes=VALUE_CLASSES,
         diagnostic_statuses=DIAGNOSTICS, measurement_fields=(), unevaluated_fields=(),
-        maxima=("gap_gross", "gap_net"), slice_invariant=("gap_gross",), layout=3,
+        maxima=("gap_gross", "gap_net"), slice_invariant=("gap_gross",), layout=2,
         audit_intervals=policy["audit_intervals"], static_reservation=RESOLVER_RESERVATION,
         profile=policy["profile"], fills=fill_policy(policy["fills"], FILL_KIND))
 

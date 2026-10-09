@@ -1614,11 +1614,7 @@ def parse_runner_config(raw):
     _require(type(presets) is dict and bool(presets), "limits must be a nonempty object")
     for name, preset in presets.items():
         _identifier(name, "limits preset name")
-        fields = _LIMIT_FIELDS + (" state_bytes" if "state_bytes" in preset else "")
-        _check_limits(_closed(preset, fields, f"limits.{name}"), name)
-        if "state_bytes" in preset:
-            _positive_int(preset["state_bytes"], f"limits.{name}.state_bytes")
-            _require(preset["state_bytes"] <= 1024**3, "state_bytes exceeds 1 GiB")
+        _check_limits(_closed(preset, _LIMIT_FIELDS, f"limits.{name}"), name)
         _require(
             preset["run_seconds"] < orchestration.max_job_seconds,
             f"limits.{name}.run_seconds must be below orchestration.max_job_seconds",

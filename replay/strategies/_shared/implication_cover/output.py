@@ -7,7 +7,6 @@ from replay.strategies import canonical_reference
 from replay.strategies.cross_venue_arbitrage.contract import UNIT, SETTLEMENT, policy_config, valuation_config
 from replay.strategies.cross_venue_arbitrage.output import CrossVenueReader
 from replay.economic_sdk import aggregate_reader
-from replay.economic_sdk.output import manifest_layout
 from replay.economic_sdk.reader import read_json, signed
 from replay.strategies._shared.implication_cover.contract import Inputs, STRATEGIES, FACTORIES, baskets, experiment, experiment_identity, payoff
 from replay.preparation import digest, encoded, load_snapshot, sha
@@ -72,9 +71,6 @@ class ImplicationReader(CrossVenueReader):
 def check_manifest(value, snapshot, complete, mode):
     fields = ("version strategy venue_mode snapshot_sha256 policy policy_sha256 experiment_sha256 "
               "fee_config fee_engine_identity files instantaneous_positive settlement_model outcomes_provider valuation")
-    manifest_layout(value)
-    if "layout" in value:
-        fields += " layout"
     obj(value, fields + (" summary_sha256" if complete else ""))
     require(mode in STRATEGIES and value["venue_mode"] == mode and value["strategy"] == STRATEGIES[mode],
             "implication strategy/mode binding")
@@ -97,7 +93,7 @@ def check_manifest(value, snapshot, complete, mode):
         require(type(amount) is int and 0 <= amount <= 2 ** 64 - 1, "instantaneous positive count")
 
 
-def validate_content(directory, snapshot, manifest, bridge=None, *, state_bytes=128 * 1024**2):
+def validate_content(directory, snapshot, manifest, bridge=None):
     mode = manifest.get("venue_mode")
     check_manifest(manifest, snapshot, "summary_sha256" in manifest, mode)
     if bridge is not None:
@@ -107,11 +103,11 @@ def validate_content(directory, snapshot, manifest, bridge=None, *, state_bytes=
     if reader.experiment.profile is not None:
         from replay.economic_sdk.profile_reader import validate_profile
         reader.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"], reader.experiment.profile,
-                                                  manifest["experiment_sha256"], manifest["snapshot_sha256"], state_bytes=state_bytes)
-    return aggregate_reader.validate(directory, snapshot, manifest, reader, state_bytes=state_bytes)
+                                                  manifest["experiment_sha256"], manifest["snapshot_sha256"])
+    return aggregate_reader.validate(directory, snapshot, manifest, reader)
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256, mode, bridge=None, state_bytes=128 * 1024**2):
+def read_provisional(directory, snapshot_directory, *, expected_sha256, mode, bridge=None):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = read_json(root / "manifest.json")
@@ -124,7 +120,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256, mode, br
     for field in ("run_id", "attempt_id", "group"):
         require(type(receipt[field]) is str and 0 < len(receipt[field]) <= 128, "receipt identifiers")
     require(type(receipt["terminal"]) is int and receipt["terminal"] >= 2, "terminal sequence")
-    summary = validate_content(root, snapshot, manifest, bridge, state_bytes=state_bytes)
+    summary = validate_content(root, snapshot, manifest, bridge)
     require(encoded(summary) == encoded(read_json(root / "summary.json")) and
             digest(summary) == manifest["summary_sha256"], "summary identity/schema")
     return {"receipt": receipt, "manifest": manifest, "summary": summary}
@@ -143,8 +139,7 @@ def read_completed(run_directory, group, *, mode):
     inputs = Inputs(spec["config"], mode)
     inputs.prepared.bind(freeze(initial(config)))
     result = read_provisional(root / success["outputs"][group], spec["config"]["snapshot_directory"],
-                              expected_sha256=spec["config"]["snapshot_sha256"], mode=mode, bridge=inputs.bridge,
-                              state_bytes=config["limits"].get("state_bytes", 128 * 1024**2))
+                              expected_sha256=spec["config"]["snapshot_sha256"], mode=mode, bridge=inputs.bridge)
     require(result["manifest"]["experiment_sha256"] == inputs.identity and
             result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity, "configured identity")
     require({k: result["receipt"][k] for k in ("identity", "attempt_id", "group", "run_id", "terminal")} ==

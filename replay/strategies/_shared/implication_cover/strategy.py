@@ -50,8 +50,8 @@ class ImplicationCover(ImplicationReader, CrossVenueArbitrage):
         result.update(version=1, venue_mode=self.mode)
         return result
 
-    def validate(self, directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
+    def validate(self, directory, snapshot, manifest):
         require(self.bound, "missing initial")
         require(manifest["venue_mode"] == self.mode and manifest["settlement_model"] == SETTLEMENT,
                 "implication runtime mode")
-        return validate_content(directory, snapshot, manifest, self.bridge, state_bytes=state_bytes)
+        return validate_content(directory, snapshot, manifest, self.bridge)

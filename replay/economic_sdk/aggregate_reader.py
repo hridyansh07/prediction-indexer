@@ -30,7 +30,6 @@ from __future__ import annotations
 
 from array import array
 from bisect import bisect_right
-from dataclasses import replace
 from pathlib import Path
 
 from replay.economic_fills import Fill
@@ -39,7 +38,7 @@ from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.fills import (FILL_LIVE, FILL_STATES, KILL_PRICE, MAX_END_REASON,
                                        check_experiment)
 from replay.economic_sdk.entity_tables import entity_rows
-from replay.economic_sdk.output import aggregate_files, file_list, group_of, manifest_layout
+from replay.economic_sdk.output import aggregate_files, file_list, group_of
 from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES, SELL_SOURCES
 from replay.preparation import digest, encoded
@@ -321,8 +320,8 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
             require(best == _level(value["kill_best"]), "fill end book kill level")
 
 
-def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_STATE):
-    experiment = replace(strategy.experiment, layout=manifest_layout(manifest))
+def validate(directory, snapshot, manifest, strategy):
+    experiment = strategy.experiment
     check_experiment(experiment)
     snapshot = plain(snapshot)
     root = Path(directory)
@@ -336,7 +335,7 @@ def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_
     edges = experiment.skew_edges_ns
     statuses = set(SDK_STATUSES + ADMISSIONS + experiment.diagnostic_statuses)
     end_reasons = (set(SDK_STATUSES + experiment.diagnostic_statuses) - {EVALUATED}) | {"PREDICATE_FALSE"}
-    budget = Budget(snapshot, manifest, experiment.policy, limit=state_bytes)
+    budget = Budget(snapshot, manifest, experiment.policy)
 
     def bucket_of(spread):
         return next((i for i, edge in enumerate(edges) if spread < edge), len(edges))
@@ -346,16 +345,7 @@ def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_
         require(row["skew_bucket"] == bucket_of(spread), "skew bucket/leg skew")
         return row["skew_bucket"]
 
-    if experiment.layout == 3:
-        values = []
-        for row in lines(root, "reasons.ndjson", files["reasons.ndjson"]):
-            obj(row, "reason value")
-            require(type(row["reason"]) is int and row["reason"] == len(values), "reason table order")
-            budget.reserve(bounds.json_cost(row["value"]) + bounds.SLOT)
-            values.append(row["value"])
-        table = {"reasons": values}
-    else:
-        table = obj(_table(root, "reasons.json", files), "reasons")
+    table = obj(_table(root, "reasons.json", files), "reasons")
     require(type(table["reasons"]) is list, "reason table")
     texts = []
     for value in table["reasons"]:
@@ -369,47 +359,19 @@ def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_
                 "reason index")
         return value
 
+    resolved = [resolve(strategy, snapshot, index, plans) for index in range(len(scopes))]
     aggregates, all_entities = {}, {}
     for group, names in aggregate_files(experiment).items():
         entities = []
         for index in range(len(scopes)):
-            resolved = resolve(strategy, snapshot, index, plans)
-            members = sorted((e for e in resolved.values() if group_of(e) == group),
+            members = sorted((e for e in resolved[index].values() if group_of(e) == group),
                              key=lambda e: e.order)
-            budget.reserve(1024 * len(members), "reader state budget (layout)")
-            cache = all_entities.setdefault(group, {})
-            for position, entity in enumerate(members):
-                if entity.id not in cache:
-                    budget.reserve(bounds.json_cost(entity.descriptor))
-                    cache[entity.id] = entity
-                else:
-                    require(cache[entity.id].descriptor == entity.descriptor
-                            and cache[entity.id].order == entity.order, "descriptor hash conflict")
-                    members[position] = cache[entity.id]
             entities.append(members)
-        if experiment.layout == 3:
-            expected = all_entities[group]
-            previous, seen = None, set()
-            for row in lines(root, group + "descriptors.ndjson", files[group + "descriptors.ndjson"]):
-                obj(row, "hash descriptor")
-                key = row["hash"]
-                require(type(key) is str and (previous is None or key > previous)
-                        and key in expected and digest(row["descriptor"]) == key
-                        and row["descriptor"] == expected[key].descriptor, "descriptor table")
-                previous = key
-                seen.add(key)
-            require(seen == set(expected), "descriptor table coverage")
-            stored = iter(lines(root, group + "entities.ndjson", files[group + "entities.ndjson"]))
-            for scope, members in enumerate(entities):
-                for index, entity in enumerate(members):
-                    row = next(stored, None)
-                    require(type(row) is dict and type(row.get("scope")) is int
-                            and type(row.get("entity")) is int
-                            and row == {"scope": scope, "entity": index, "hash": entity.id}, "entity table")
-            require(next(stored, None) is None, "entity table coverage")
-        else:
-            stored = obj(_table(root, group + "entities.json", files), "scopes")
-            require(stored["scopes"] == [entity_rows({e.id: e for e in members}, group) for members in entities], "entity table")
+            budget.reserve(1024 * len(members), "reader state budget (layout)")
+            for entity in members:
+                all_entities.setdefault(group, {})[entity.id] = entity
+        stored = obj(_table(root, group + "entities.json", files), "scopes")
+        require(stored["scopes"] == [entity_rows({e.id: e for e in members}, group) for members in entities], "entity table")
         aggregates[group] = _group(
             root, group, names, files, entities, scopes, run_end, experiment, strategy, statuses,
             end_reasons, kinds, tiers, tier_ints, texts, reason_indexes, skew, budget, plans)

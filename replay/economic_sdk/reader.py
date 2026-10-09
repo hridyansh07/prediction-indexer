@@ -106,13 +106,12 @@ def bucket(value):
 class Budget:
     """Conservative O(1) accounting for reader-owned detached state."""
 
-    def __init__(self, *roots, limit=None):
-        self.limit = bounds.StateBudget(bounds.MAX_STATE if limit is None else limit).limit
+    def __init__(self, *roots):
         self.used = sum(bounds.json_cost(root) for root in roots)
-        require(self.used <= self.limit, "reader state budget")
+        require(self.used <= bounds.MAX_STATE, "reader state budget")
 
     def reserve(self, growth, message="reader state budget"):
-        require(self.used + growth <= self.limit, message)
+        require(self.used + growth <= bounds.MAX_STATE, message)
         self.used += growth
 
     def release(self, size):
@@ -188,7 +187,7 @@ class Aggregates:
         return quantiles(values, self.budget)
 
 
-def validate(directory, snapshot, manifest, strategy, *, state_bytes=None):
+def validate(directory, snapshot, manifest, strategy):
     """Validate the semantic files and return the strategy's derived summary."""
     experiment = strategy.experiment
     snapshot = plain(snapshot)
@@ -201,7 +200,7 @@ def validate(directory, snapshot, manifest, strategy, *, state_bytes=None):
     field_names = experiment.measurement_fields
     statuses = set(SDK_STATUSES + ADMISSIONS + experiment.diagnostic_statuses)
     end_reasons = set(SDK_STATUSES + experiment.diagnostic_statuses + ("PREDICATE_FALSE", "SCOPE_END", "RUN_END")) - {EVALUATED}
-    budget = Budget(snapshot, manifest, experiment.policy, limit=state_bytes)
+    budget = Budget(snapshot, manifest, experiment.policy)
 
     expected, entities = {}, {}
     for scope in range(len(snapshot["scopes"])):

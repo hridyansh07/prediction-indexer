@@ -134,8 +134,7 @@ class Harness(BaseHarness):
             ladder(self, 12, "polymarket:"+token, bids=((bid_atoms, quantity*10**qs),), asks=((price_atoms, quantity*10**qs),))
 
     def records(self, file):
-        from replay.tests.sdk_tables import records
-        return records(self.output, file, len(self.snapshot["scopes"]))
+        return [json.loads(line) for line in (self.output/file).read_bytes().splitlines()]
 
     def finish(self):
         self.terminal(); self.decoder.finish(); self.strategy.finish()

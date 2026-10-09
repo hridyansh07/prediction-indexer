@@ -110,8 +110,7 @@ def check_experiment(experiment):
     if policy is None:
         return
     require(type(policy) is FillPolicy, "fill policy")
-    require(type(experiment.layout) is int and experiment.layout in (2, 3),
-            "fill checks require aggregate output layout")
+    require(experiment.layout == 2, "fill checks require output layout 2")
     require(not experiment.controls, "controls are not supported with fill checks (deferred)")
     require(policy.kind in experiment.kinds, "fill trigger kind must be a declared episode kind")
 

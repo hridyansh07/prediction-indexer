@@ -257,27 +257,8 @@ identity.
 
 ## 5. Output
 
-Output **layout 3** is the SDK default. Aggregate manifests carry `layout: 3`;
-unknown layouts are rejected. Existing manifests without this discriminator
-remain policy-defined layout 1 or 2 and validate without rewriting.
-
-Layout 3 replaces layout 2's tables with:
-
-| File | Rows |
-|---|---|
-| `descriptors.ndjson` | `{hash, descriptor}`, distinct hashes in sorted order |
-| `entities.ndjson` | `{scope, entity, hash}`, sorted by scope then entity index |
-| `reasons.ndjson` | `{reason, value}`, dense reason indexes in original order |
-
-The same table pair appears in each enabled control directory. NDJSON row/line/
-byte bounds replace the metadata cap for these tables; admission checks them
-before opening output files. The independent reader resolves every scoped
-entity, checks descriptor hashes/order/coverage, exact indexes and reason
-uniqueness, and verifies every file identity. Episode and denominator rows
-are unchanged. Identical descriptors are retained once across reader scopes.
-Layout 1 and its byte-pinned goldens are unchanged.
-
-For compatibility, these are the **layout 2** files under the group's directory:
+Output **layout 2** is the SDK default. These are the files under the group's
+output directory:
 
 | File | Contents |
 |---|---|
@@ -552,9 +533,7 @@ Recursive size accounting is replaced by **count-based bounds**.
   - entities × kinds open episodes;
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
-  - per-run `limits.state_bytes` (default 128 MiB, at most 1 GiB), passed
-    to collectors, table preflight and aggregate readers; it is not part
-    of the experiment or semantic identity;
+  - the 128 MiB detached-state limit;
   - the file, line and row limits of the complement spec.
 
   Exceeding any cap fails the attempt. Nothing is truncated.
