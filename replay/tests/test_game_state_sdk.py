@@ -251,6 +251,99 @@ class GameInputTests(unittest.TestCase):
         prepare_game_state(context2, self.root / "conflict", store=store)
         self.assertIsNone(json.loads((self.root / "conflict/game_state.json").read_bytes())["competitors"]["home"]["participant"])
 
+    def series_archive(self, name, closes, *, end, winners, score=None):
+        """A complete Kalshi fetch; a ``None`` close is a map Kalshi listed no market for."""
+        from archive.storage.local import LocalObjectStore
+        from gamestate import kalshi
+        from tests.test_kalshi_game_state import client, milestone, pull
+        score = score or {side: winners.count(side) for side in ("home", "away")}
+        mapped = [(i, close) for i, close in enumerate(closes, 1) if close is not None]
+        m = milestone(("SERIES", *(f"MAP{i}" for i, _ in mapped)))
+        m["details"]["game"], m["end_date"] = "lol", end
+
+        def event(ticker, win, close, scope=None):
+            return {"event": {"event_ticker": ticker, "product_metadata": {"competition_scope": scope} if scope else {},
+                              "markets": [{"ticker": f"{ticker}-{side[0].upper()}", "yes_sub_title": label,
+                                           "result": "yes" if side == win else "no",
+                                           "custom_strike": {"esports_competitor": side[0]},
+                                           "close_time": close, "settlement_ts": close}
+                                          for side, label in (("home", "Alpha"), ("away", "Beta"))]}}
+        live = {"home_score": score["home"], "away_score": score["away"]}
+        for side in ("home", "away"):
+            live[side + "_periods"] = {f"period_{i}": 1 for i in range(1, len(closes) + 1)}
+            live[side + "_stats"] = [{"period": f"period_{i}", "stats": {
+                "map_duration_seconds": 1200, "map_forfeit": 0, "winner": int(win == side)}}
+                for i, win in enumerate(winners, 1)]
+        series_winner = "home" if score["home"] > score["away"] else "away"
+        replies = [{"milestones": [m]}, {"live_data": {"milestone_id": m["id"], "details": live}},
+                   *(event(f"MAP{i}", winners[i - 1], close, f"Map {i} Winner") for i, close in mapped),
+                   event("SERIES", series_winner, end)]
+        urls = [pull.KALSHI + "/milestones?limit=10&related_event_ticker=SERIES",
+                pull.KALSHI + "/live_data/milestone/match-id",
+                *(pull.KALSHI + f"/events/MAP{i}?with_nested_markets=true" for i, _ in mapped),
+                pull.KALSHI + "/events/SERIES?with_nested_markets=true"]
+        fetch = client(replies)
+        for url in urls:
+            fetch.get(url)
+        store = LocalObjectStore(self.root / ("archive-" + name))
+        prefix = kalshi.archive_fetch(store, m, ["bundle-1"], fetch.records, 1_800_000_000_000000000,
+                                      "complete", event_id=document()["event_id"])
+        kalshi.regenerate(store, prefix)
+        return store
+
+    def prepared(self, name, store):
+        from replay.prepare_game_state import prepare_game_state
+        from replay.preparation import load_snapshot
+        from replay.game_state import load
+        context = self.root / "context"
+        if not context.exists():
+            prepare(config(), context, universe=lambda *_: detail(), outcomes=lambda _: document())
+        sha = prepare_game_state(context, self.root / name, store=store)
+        return load(self.root / name / "game_state.json", sha, load_snapshot(context))
+
+    def test_preparation_deciding_map_without_market_takes_series_result(self):
+        from gamestate.kalshi import timestamp
+        end = "2026-09-27T13:50:00Z"
+        store = self.series_archive("bo3", ["2026-09-27T12:30:00Z", "2026-09-27T13:10:00Z", None],
+                                    end=end, winners=["home", "away", "home"])
+        game = self.prepared("bo3", store)
+        self.assertEqual(game["state"], "ok")
+        last = game["segments"][-1]
+        self.assertEqual((last["index"], last["winner"], last["end_ns"], last["settled_ns"]),
+                         (3, "home", timestamp(end), None))
+        self.assertEqual(last["start_ns"], timestamp(end) - 1200 * 10**9)
+        self.assertEqual(last["details"]["duration_s"], 1200)
+        self.assertEqual(game["match"]["score"], {"home": 2, "away": 1})
+        bo1 = self.prepared("bo1", self.series_archive("bo1", [None], end=end, winners=["away"]))
+        self.assertEqual((bo1["state"], bo1["segments"][0]["winner"], bo1["match"]["winner"]),
+                         ("ok", "away", "away"))
+
+    def test_preparation_deciding_map_guards_fail_closed(self):
+        closes = ["2026-09-27T12:30:00Z", "2026-09-27T13:10:00Z", None]
+        cases = {
+            "stats_disagree": dict(closes=closes, winners=["home", "away", "away"], score={"home": 2, "away": 1}),
+            "score_mismatch": dict(closes=closes, winners=["home", "away", "home"], score={"home": 2, "away": 0}),
+            "not_last": dict(closes=[None, "2026-09-27T13:10:00Z"], winners=["home", "home"]),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                store = self.series_archive(name, case["closes"], end="2026-09-27T13:50:00Z",
+                                            winners=case["winners"], score=case.get("score"))
+                game = self.prepared(name, store)
+                self.assertEqual((game["state"], game["reason"]), ("unavailable", "incomplete"))
+
+    def test_preparation_late_or_reordered_market_close_is_incomplete_not_an_error(self):
+        cases = {
+            "reordered": (["2026-09-27T13:50:00Z", "2026-09-27T13:10:00Z"], "2026-09-27T14:00:00Z"),
+            "after_match_end": (["2026-09-27T12:30:00Z", "2026-09-27T13:10:00Z"], "2026-09-27T13:00:00Z"),
+            "deciding_overlap": (["2026-09-27T12:30:00Z", "2026-09-27T13:40:00Z", None], "2026-09-27T13:50:00Z"),
+        }
+        for name, (closes, end) in cases.items():
+            with self.subTest(name):
+                winners = ["home", "away", "home"][:len(closes)] if len(closes) == 3 else ["home", "home"]
+                game = self.prepared(name, self.series_archive(name, closes, end=end, winners=winners))
+                self.assertEqual((game["state"], game["reason"]), ("unavailable", "incomplete"))
+
     def harness(self, value=None, *, scopes=False, **game_changes):
         path, sha = self.write(value)
         from replay.preparation import prepare as real_prepare

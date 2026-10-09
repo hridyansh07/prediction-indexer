@@ -124,7 +124,18 @@ The current timeline has competitor IDs rather than names. The Kalshi adapter
 therefore streams the same verified raw fetch to recover labels from market
 strikes and `yes_sub_title`; raw vendor fields do not enter the SDK. Ambiguous
 labels or alignment leave participant indexes null. Contradictory timelines,
-unresolved winner sides or invalid final scores produce `incomplete`. Rejected
+unresolved winner sides, invalid final scores, or segment winners that do not
+add up to the final score produce `incomplete`.
+
+Kalshi lists no winner market for the deciding map: every Bo1, and the last map
+of a series that went the distance. When that is the timeline's only
+inconsistency, the deciding segment takes its winner from the series result
+(its own live statistics must agree), its end from the match end, and its start
+from that end minus its duration; `settled_ns` is null because no market exists
+to settle. Kalshi can also close a map market late, after the next map or after
+the match ended. Times that then break the loader's ordering rules (start ≤ end
+≤ settlement, no overlap with the previous segment, match end at or after the
+last segment end) make the event `incomplete`, not a preparation error. Rejected
 receipts with no usable fetch also produce `incomplete`, rather than ordinary
 absence. An archive with no receipt for a Kalshi event produces `no_fetch`.
 
