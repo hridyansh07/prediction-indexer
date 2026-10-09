@@ -2,6 +2,7 @@
 from fractions import Fraction
 
 from replay.economic_fills import Fill
+from replay.economic_sdk.bounds import StateBudget, json_cost
 from replay.research.io import closed, digest, document, natural, need, rows
 from replay.research.layout import effective_claim
 from replay.strategies._shared.fee_bridge import FeeBridge
@@ -10,6 +11,7 @@ from replay.strategy_sdk import plain
 
 def tables(root, manifest):
     files = manifest["files"]
+    budget = StateBudget()
     if "layout" in manifest:
         need(type(manifest["layout"]) is int and manifest["layout"] == 3, "unknown layout")
         descriptors, prior = {}, None
@@ -17,6 +19,7 @@ def tables(root, manifest):
             closed(row, "hash descriptor")
             h = row["hash"]
             need(h == digest(row["descriptor"]) and (prior is None or h > prior), "descriptor identity/order")
+            budget.charge(json_cost(row) + 256, "research entity budget")
             descriptors[h], prior = row["descriptor"], h
         entities, previous, counts = {}, None, {}
         for row in rows(root, "entities.ndjson", files["entities.ndjson"]):
@@ -25,6 +28,7 @@ def tables(root, manifest):
             need(all(type(v) is int and v >= 0 for v in key) and (previous is None or key > previous),
                  "entity order")
             need(row["entity"] == counts.get(row["scope"], 0) and row["hash"] in descriptors, "entity index/hash")
+            budget.charge(256, "research entity budget")
             entities[key] = descriptors[row["hash"]]
             counts[row["scope"]] = row["entity"] + 1
             previous = key
@@ -32,6 +36,7 @@ def tables(root, manifest):
     need("entities.json" in files, "legacy layout 1 is not a research input")
     table = document(root / "entities.json")
     closed(table, "scopes")
+    budget.charge(json_cost(table), "research entity budget")
     result = {}
     for s, scoped in enumerate(table["scopes"]):
         for e, row in enumerate(scoped):
@@ -126,6 +131,8 @@ def check_fill(carried, descriptor, start, end_reason, manifest, snapshot, scope
     effective = [None] * len(units)
     for result, sizing in zip(carried["results"], policy["sizings"]):
         closed(result, "name role mode steps stop value legs before after impact_ppm beyond tradeable kill_prices")
+        need(all(type(result[k]) is list and len(result[k]) == len(units)
+                 for k in ("legs", "before", "after", "impact_ppm", "beyond")), "fill leg array shape")
         mode = "edge" if sizing.get("edge") else "target"
         need((result["name"], result["role"], result["mode"]) == (sizing["name"], sizing["role"], mode), "sizing binding")
         steps = natural(result["steps"])
@@ -224,6 +231,15 @@ def check_fill(carried, descriptor, start, end_reason, manifest, snapshot, scope
              and natural(carried["kill_best"][0]) >= natural(effective[i]), "kill crossing")
     else:
         need(carried["kill_leg"] is None and carried["kill_best"] is None, "unexpected kill crossing")
+    need(type(carried["end_books"]) is list and len(carried["end_books"]) == len(units), "end book count")
+    for i, book in enumerate(carried["end_books"]):
+        closed(book, "validity reason crossed best")
+        need(type(book["validity"]) is str and book["validity"]
+             and type(book["crossed"]) is bool and (book["reason"] is None or type(book["reason"]) is str), "end book shape")
+        best = None if book["best"] is None else _levels([book["best"]])[0]
+        need(best is None or (book["validity"] == "usable" and best[0] <= maximums[i]), "end book best")
+        if end_reason == "KILL_PRICE" and i == carried["kill_leg"]:
+            need(book["best"] == carried["kill_best"], "end book kill level")
 
 
 def check_episodes(root, snapshot, manifest, config):
@@ -236,6 +252,9 @@ def check_episodes(root, snapshot, manifest, config):
     seen, last_end = set(), {}
     for r in rows(root, "episodes.ndjson", manifest["files"]["episodes.ndjson"]):
         count += 1
+        need(count <= 200000, "research episode bound")
+        fields = set("scope entity episode_id kind start_ns end_ns end_reason censored opening_slice_survival_ns viable_tiers qualified_ns qualified_by_skew_ns class_ns qualifying_class_ns open maxima at_max".split())
+        need(set(r) == fields | ({"fill"} if "fill" in r else set()), "episode schema")
         key = r["scope"], r["entity"]
         need(key in entities and r["episode_id"] not in seen, "episode entity/identity")
         seen.add(r["episode_id"])
@@ -243,6 +262,7 @@ def check_episodes(root, snapshot, manifest, config):
         s = snapshot["scopes"][key[0]]
         start, end = natural(r["start_ns"]), natural(r["end_ns"])
         need(int(s["start_ns"]) <= start < end <= int(s["end_ns"]), "episode scope bounds")
+        need(type(r["censored"]) is bool and r["censored"] == (r["end_reason"] == "RUN_END"), "episode censor reason")
         order_key = (*key, r["kind"])
         need(start >= last_end.get(order_key, 0), "episode overlap")
         last_end[order_key] = end

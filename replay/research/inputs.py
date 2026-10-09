@@ -4,6 +4,8 @@ import json
 import re
 
 from replay.preparation import load_snapshot
+from replay.fees.artifacts import parse_canonical
+from replay.fees.schedules import Catalog
 from replay.strategy_sdk import plain
 from replay.strategies import canonical_reference
 from replay.research.io import child, closed, digest, document, identity, need, safe_path
@@ -96,6 +98,41 @@ def completed(directory, group, lens, snapshot_sha, bindings):
     need(strategy["config"]["snapshot_sha256"] == snapshot_sha, "configured snapshot binding")
     output = child(run, success["outputs"][group])
     manifest = read(output / "manifest.json")
+    base_fields = set("version strategy snapshot_sha256 policy experiment_sha256 files summary_sha256".split())
+    if lens != "profile":
+        base_fields.update("policy_sha256 fee_config fee_engine_identity instantaneous_positive".split())
+        base_fields.update("payout_assumption".split() if lens == "complement" else "settlement_model outcomes_provider".split())
+        if lens in ("cross_venue", "implication_cover_same", "implication_cover_cross"):
+            base_fields.add("valuation")
+        if lens.startswith("implication_cover"):
+            base_fields.add("venue_mode")
+    need(type(manifest) is dict and set(manifest) == base_fields | ({"layout"} if "layout" in manifest else set()),
+         "closed output manifest")
+    policy = manifest["policy"]
+    version = policy["version"] if lens in ("profile", "complement") else 2 if lens == "cross_venue" else 1
+    need(type(manifest["version"]) is int and manifest["version"] == version
+         and (lens not in ("profile", "complement") or version == 2), "output manifest version")
+    need(manifest["strategy"] == FACTORIES[lens] + "_v1", "output manifest strategy")
+    need("layout" not in manifest or (lens != "profile" and type(manifest["layout"]) is int
+                                    and manifest["layout"] == 3), "output manifest layout")
+    experiment = {"strategy": manifest["strategy"], "policy": policy, "snapshot_sha256": snapshot_sha}
+    if lens != "profile":
+        need(manifest["policy_sha256"] == digest(policy), "output policy identity")
+        experiment["fees"] = manifest["fee_config"]
+        if lens != "multi_market":
+            experiment["bridge_version"] = 1
+        if lens != "complement":
+            need(manifest["settlement_model"] == "normal_resolution_only", "output settlement model")
+            experiment.update(entity_contract_version=2 if lens == "cross_venue" else 1,
+                              native_scales=True, settlement_model=manifest["settlement_model"])
+        if "valuation" in manifest:
+            experiment["valuation"] = manifest["valuation"]
+        if lens.startswith("implication_cover"):
+            mode = "same_venue" if lens.endswith("same") else "cross_venue"
+            need(manifest["venue_mode"] == mode, "output venue mode")
+            experiment["venue_mode"] = mode
+    need(manifest["experiment_sha256"] == digest(experiment), "output experiment identity")
+    need(type(manifest["files"]) is dict and len(manifest["files"]) <= 1000, "manifest file bound")
     receipt = closed(read(output / "content_receipt.json"), "version semantic_sha256 run_id attempt_id group identity terminal")
     expected = {"version": 1, "semantic_sha256": digest(manifest), "run_id": configuration["transport"]["run_id"],
                 "attempt_id": success["attempt"], "group": group, "identity": success["identity"], "terminal": success["terminal"]}
@@ -121,13 +158,15 @@ def completed(directory, group, lens, snapshot_sha, bindings):
             original = str(child(root, "fees/" + config["fees"]["catalog_identity"]))
         fees = safe_path(original)
         # Catalogue manifest owns the finite input set; do not scan unrelated directories.
-        catalog = document(fees / "manifest.json")
+        with child(fees, "manifest.json").open("rb") as stream:
+            catalog = parse_canonical(stream.read(8 * 1024**2 + 1))
+        need(type(catalog) is Catalog and catalog.identity == config["fees"]["catalog_identity"], "catalog input identity")
         for p in (fees / "manifest.json", fees / "receipt.json"):
             paths.append(p)
-        for p in fees.iterdir():
-            if p.name.startswith(("source-", "schedule-")) and p.suffix in (".blob", ".json"):
-                paths.append(child(fees, p.name))
-        need(len(paths) <= 12000 and type(catalog) is dict, "catalog input bound")
+        names = {f"schedule-{s.identity}.json" for s in catalog.schedules}
+        names.update(f"source-{source.sha256}.blob" for s in catalog.schedules for source in s.sources)
+        paths.extend(child(fees, name) for name in sorted(names))
+        need(len(paths) <= 12000, "catalog input bound")
         config["fees"]["catalog_directory"] = str(fees)
     for p in paths:
         bindings[str(p)] = identity(p)

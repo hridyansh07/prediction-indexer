@@ -1,6 +1,7 @@
 """Exact-input-bound verification report and fresh re-verification for every build."""
 from gamestate.timeline import latest
 from replay.research import inputs
+from replay.economic_sdk.bounds import StateBudget, json_cost
 from replay.streams.protocol import ProtocolError
 from replay.research.io import document, identity, need, write
 from replay.research.verify.profile import check_profile
@@ -13,8 +14,10 @@ def inspect(config_path, runs_path, *, store=None):
     bindings = {str(inputs.safe_path(p)): identity(p) for p in (config_path, runs_path)}
     report = {"research_verify_version": 1, "inputs": bindings, "archive_inputs": {}, "events": []}
     resolved, seen = {}, set()
+    budget = StateBudget(1024**3)
     for entry in runs["events"]:
         snapshot, event_id, snapshot_sha = inputs.context(entry["context"], entry["bundle_id"], bindings)
+        budget.charge(json_cost(snapshot), "research retained-context budget")
         need(event_id not in seen, "duplicate immutable event")
         seen.add(event_id)
         event = {"event_id": event_id, "bundle_id": entry["bundle_id"], "lenses": {}}
@@ -39,6 +42,7 @@ def inspect(config_path, runs_path, *, store=None):
         report["archive_inputs"][event_id] = game["inputs"]
         event["game_state"] = game["state"]
         data["game"] = game
+        budget.charge(json_cost(game) + json_cost(event) + len(bindings) * 256, "research verification budget")
         resolved[event_id] = data
         report["events"].append(event)
     # A read concurrent with a producer must not bind different bytes to the result.

@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 from itertools import groupby
 
+from replay.economic_sdk.bounds import json_cost
 from replay.research.io import digest, need, natural, rows
 from replay.research.layout import layout
 
@@ -25,6 +26,7 @@ def groups(root, name, expected, snapshot, books, membership):
     previous = None
     for cut, lines in groupby(rows(root, name, expected), key=lambda r: r["cut"]):
         group = []
+        retained = 0
         need(type(cut) is int and cut >= 0, "cut range")
         for r in lines:
             kind = r["type"]
@@ -39,6 +41,8 @@ def groups(root, name, expected, snapshot, books, membership):
             order = (cut, t, 0 if opening else 1, s if opening else 0, b, int(kind == "trade"))
             need(previous is None or order >= previous, "stream order")
             previous = order
+            retained += json_cost(r)
+            need(retained <= 32 * 1024**2, "cut retained byte bound")
             group.append(r)
             need(len(group) <= 100000, "cut row limit")
         yield cut, group
@@ -48,6 +52,7 @@ def check_profile(root, snapshot, files):
     need({"profile.ndjson", "availability.ndjson", "transitions.ndjson.zst"} <= set(files),
          "profile requires activity, availability and transitions")
     books, membership, native = layout(snapshot)
+    need(len(books) <= 64 and len(membership) <= 128, "research book/scope bound")
     by_key = {(b["instrument"], b["orientation"]): b["book"] for b in books}
     duration, expected_trades = defaultdict(Counter), Counter()
     profile_cursor = {}
@@ -158,6 +163,8 @@ def check_profile(root, snapshot, files):
                         else:
                             levels_side.pop(p, None)
                     need(seen == sorted(set(seen)), "diff order")
+                need(sum(len(side) for sides in ladders.values() for side in sides) <= 200000,
+                     "replayed ladder retained bound")
                 touched.add(key)
             if "levels.ndjson.zst" in files:
                 for key in touched:

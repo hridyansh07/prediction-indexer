@@ -42,6 +42,12 @@ class ResearchFillTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fee.*value"):
             self.check(tamper)
 
+    def test_unknown_episode_fields_and_end_book_tamper_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "episode schema"):
+            self.check(lambda row: row.update(classification="invented"))
+        with self.assertRaisesRegex(ValueError, "end book"):
+            self.check(lambda row: row["fill"]["end_books"][0].update(validity="not_initialized", best=["23", "1"]))
+
     def test_kill_one_atom_boundary_and_false_edge_witness(self):
         def kill(row):
             row["fill"]["results"][0]["kill_prices"][0] = "0"
