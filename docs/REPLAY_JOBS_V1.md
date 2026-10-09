@@ -80,8 +80,8 @@ contract amendment, not an unreviewed local override.
 | Workstream | Owns (writes) | Must not touch |
 |---|---|---|
 | W0 | `replay/jobs/contracts.py`, `configs/replay_runner.json`, this document | everything else |
-| W1 | `universe/auth.py`, auth tables, `do_POST`/`do_DELETE` plumbing and body cap in `universe/api.py`, the `replay.auth` config section | job tables, runner, `replay/` |
-| W2 | `universe/replay_jobs.py`, job routes in `universe/api.py` | auth internals, runner stages |
+| W1 | `universe/jobs/auth.py`, auth tables, `do_POST`/`do_DELETE` plumbing and body cap in `universe/api/`, the `replay.auth` config section | job tables, runner, `replay/` |
+| W2 | `universe/jobs/store.py`, job routes in `universe/api/replay_jobs.py` | auth internals, runner stages |
 | Bundle cache | `replay/jobs/bundle.py`, `archive/canonical_restore.py`, `materialize_range --describe`, strict derivative pin inspection | job DB, Universe, supervisor |
 | W4 | `replay/jobs/runner.py`, `replay/jobs/stages.py`, `python -m replay.jobs` | Universe, bundle internals, `archive/` |
 | Production deployment | `compose.universe.yaml` `replay` profile, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `replay/ops/`, `docs/DEPLOYMENT.md`, AGENTS routing | request, auth, API, cache, runner, receipt, and strategy semantics |
@@ -575,7 +575,7 @@ unchanged.
 **Delivers** job submission, listing, and cancellation, plus a store module the
 runner reuses.
 
-**Store module** `universe/replay_jobs.py` (standard library plus
+**Store module** `universe/jobs/store.py` (standard library plus
 `replay.jobs.contracts` and W1's `Principal`; it does not import auth internals).
 It persists `JobRow`s and never writes a row that `JobRow` would reject; every
 state change is one of §3.8's transition functions. Its immutable results are

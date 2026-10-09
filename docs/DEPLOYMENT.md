@@ -539,19 +539,27 @@ docker compose -f compose.universe.yaml --profile jobs run --rm event-universe-b
 independently. The immutable archive is the evidence and retention authority;
 the Universe SQLite file is disposable and rebuildable.
 
+### Universe VM data roots
+
+Every persistent path on the Universe VM is one of these host roots, bind-mounted
+by `compose.universe.yaml`. Paths and variable names are unchanged by the
+`universe/` package layout; no data moves.
+
+| Root (env var) | Container path | Holds | Services | Rebuildable | Backup/rollback rule |
+|---|---|---|---|---|---|
+| `EVENT_UNIVERSE_DATA_ROOT` | `/var/lib/event-universe` | `event-universe.sqlite3`, Zstd staging, `backups/` | `event-universe`, `-sync`, `-backfill`, `-backup` | Yes, by backfill from the archive | `event-universe-backup` uploads immutable copies; never touch the Replay DB when rebuilding |
+| `REPLAY_DATA_ROOT` | `/var/lib/replay` | `jobs.sqlite3` (jobs and auth tables), active Replay state | `event-universe`, `replay-*` | **No** | Independent verified `replay-backup` copies before any change |
+| `GAMESTATE_DATA_ROOT` | `/var/lib/gamestate` | `gamestate.sqlite3` (attempt ledger and bundle → event map) | `event-universe-game-state` | Yes | Losing it costs one remapping pass, never a refetch of archived games |
+| `EVENT_UNIVERSE_ARCHIVE_ROOT` | `/var/lib/archive` | Local archive objects (local backend only) | sync, backfill, backup, game-state, `replay-*` | — (evidence) | Immutable; never delete on rollback |
+
+Moving the auth tables out of `jobs.sqlite3` waits for the jobs retirement.
+
 ### Event-keyed game-state job
 
 `event-universe-game-state` is a one-shot `jobs` service. Host cron may invoke
 it every 30 minutes. Its config is `configs/gamestate.json`; it has archive
 access, not capture or Replay/auth database mounts. Deploying and running a
 backfill are operator actions, not configuration-validation steps.
-
-| Root | Contents | Backup/rollback rule |
-|---|---|---|
-| `EVENT_UNIVERSE_DATA_ROOT` | Universe SQLite, backups | Rebuildable from archive; do not touch Replay DB |
-| `REPLAY_DATA_ROOT` | Jobs and auth DB | Not rebuildable; keep independent verified backups |
-| `GAMESTATE_DATA_ROOT` | Append-only attempt ledger and bundle → event map | Rebuildable; losing it costs one remapping pass, never a refetch of archived games |
-| `EVENT_UNIVERSE_ARCHIVE_ROOT` | Local archive objects | Immutable evidence; never delete on rollback |
 
 The new ledger has its own version and needs no Universe/auth migration.
 Rollback disables this scheduled job and restores the prior image; retain

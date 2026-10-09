@@ -137,7 +137,7 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_sync.py"]
+    command: ["python", "-u", "-m", "universe", "sync"]
 
   event-universe-backfill:
     <<: *universe-runtime
@@ -145,7 +145,7 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_backfill.py"]
+    command: ["python", "-u", "-m", "universe", "backfill"]
 
   event-universe-backup:
     <<: *universe-runtime
@@ -153,7 +153,7 @@ services:
     restart: "no"
     environment: *universe-job-environment
     volumes: *universe-job-volumes
-    command: ["python", "-u", "universe/run_backup.py"]
+    command: ["python", "-u", "-m", "universe", "backup"]
 
   event-universe-game-state:
     <<: *universe-runtime
