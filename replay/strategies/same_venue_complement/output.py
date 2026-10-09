@@ -363,7 +363,7 @@ def _skew_artifact(positive, policy):
     return bool(positive) and all(edges[int(b)] >= SKEW_ARTIFACT_EDGE_NS for b in positive)
 
 
-def validate_content(directory, snapshot, manifest, *, state_bytes=128 * 1024**2):
+def validate_content(directory, snapshot, manifest, *, state_bytes=None):
     """Validate semantic files and return the independently derived summary."""
     check_manifest(manifest, "summary_sha256" in manifest)
     strategy = ComplementReader.for_manifest(manifest, snapshot)
@@ -372,13 +372,13 @@ def validate_content(directory, snapshot, manifest, *, state_bytes=128 * 1024**2
         strategy.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"],
                                                     strategy.experiment.profile,
                                                     manifest["experiment_sha256"],
-                                                    manifest["snapshot_sha256"])
+                                                    manifest["snapshot_sha256"], state_bytes=state_bytes)
     if strategy.experiment.layout == 1:
         return reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
     return aggregate_reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256, state_bytes=128 * 1024**2):
+def read_provisional(directory, snapshot_directory, *, expected_sha256, state_bytes=None):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = _json(root / "manifest.json")

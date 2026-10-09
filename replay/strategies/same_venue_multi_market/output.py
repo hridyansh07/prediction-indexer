@@ -255,7 +255,7 @@ def validate_content(directory, snapshot, manifest, bridge, *, state_bytes=128 *
         from replay.economic_sdk.profile_reader import validate_profile
         strategy.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"],
                                                     strategy.experiment.profile,
-                                                    manifest["experiment_sha256"], manifest["snapshot_sha256"])
+                                                    manifest["experiment_sha256"], manifest["snapshot_sha256"], state_bytes=state_bytes)
     return aggregate_reader.validate(directory, snapshot, manifest, strategy, state_bytes=state_bytes)
 
 

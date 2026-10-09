@@ -106,8 +106,8 @@ def bucket(value):
 class Budget:
     """Conservative O(1) accounting for reader-owned detached state."""
 
-    def __init__(self, *roots, limit=bounds.MAX_STATE):
-        self.limit = bounds.StateBudget(limit).limit
+    def __init__(self, *roots, limit=None):
+        self.limit = bounds.StateBudget(bounds.MAX_STATE if limit is None else limit).limit
         self.used = sum(bounds.json_cost(root) for root in roots)
         require(self.used <= self.limit, "reader state budget")
 
@@ -188,7 +188,7 @@ class Aggregates:
         return quantiles(values, self.budget)
 
 
-def validate(directory, snapshot, manifest, strategy, *, state_bytes=bounds.MAX_STATE):
+def validate(directory, snapshot, manifest, strategy, *, state_bytes=None):
     """Validate the semantic files and return the strategy's derived summary."""
     experiment = strategy.experiment
     snapshot = plain(snapshot)

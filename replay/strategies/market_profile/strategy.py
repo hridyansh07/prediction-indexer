@@ -45,6 +45,7 @@ class MarketProfile:
         self.binding = {k: context[k] for k in ("run_id", "attempt_id", "group", "identity")}
         self.clock = CutClock(self.snapshot)
         budget = bounds.StateBudget(context.get("limits", {}).get("state_bytes", bounds.MAX_STATE))
+        self.state_bytes = budget.limit
         budget.charge(bounds.json_cost(self.snapshot) + bounds.json_cost(self.policy))
         self.collector = Collector(self.policy, self.snapshot, self.input.sha256, self.root,
                                    self.experiment_sha256, budget=budget, standalone=True)
@@ -80,7 +81,7 @@ class MarketProfile:
             manifest = {"version": manifest_version(self.policy), "strategy": STRATEGY, "snapshot_sha256": self.input.sha256,
                         "policy": self.policy, "experiment_sha256": self.experiment_sha256,
                         "files": files}
-            summary = validate_content(self.root, self.snapshot, manifest)
+            summary = validate_content(self.root, self.snapshot, manifest, state_bytes=self.state_bytes)
             write_json_durable(self.root / "summary.json", summary)
             manifest["summary_sha256"] = digest(summary)
             write_json_durable(self.root / "manifest.json", manifest)
@@ -124,15 +125,15 @@ def _manifest(value, complete):
         sha(value["summary_sha256"])
 
 
-def validate_content(directory, snapshot, manifest):
+def validate_content(directory, snapshot, manifest, *, state_bytes=None):
     _manifest(manifest, "summary_sha256" in manifest)
     summary = validate_profile(directory, plain(snapshot), manifest["files"], manifest["policy"],
-                               manifest["experiment_sha256"], manifest["snapshot_sha256"], standalone=True)
+                               manifest["experiment_sha256"], manifest["snapshot_sha256"], standalone=True, state_bytes=state_bytes)
     require(len(encoded(summary)) <= MAX_METADATA, "summary budget")
     return summary
 
 
-def read_provisional(directory, snapshot_directory, *, expected_sha256):
+def read_provisional(directory, snapshot_directory, *, expected_sha256, state_bytes=None):
     root = Path(directory)
     snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = read_json(root / "manifest.json")
@@ -141,7 +142,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256):
     receipt = obj(read_json(root / "content_receipt.json"),
                   "version semantic_sha256 run_id attempt_id group identity terminal")
     require(receipt["version"] == 1 and receipt["semantic_sha256"] == digest(manifest), "semantic identity")
-    summary = validate_content(root, snapshot, manifest)
+    summary = validate_content(root, snapshot, manifest, state_bytes=state_bytes)
     require(encoded(read_json(root / "summary.json")) == encoded(summary)
             and manifest["summary_sha256"] == digest(summary), "summary identity/schema")
     return {"receipt": receipt, "manifest": manifest, "summary": summary}
@@ -159,7 +160,8 @@ def read_completed(run_directory, group):
     prepared = PreparedInput({k: spec["config"][k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
     prepared.bind(freeze(initial(config)))
     result = read_provisional(root / success["outputs"][group], spec["config"]["snapshot_directory"],
-                              expected_sha256=spec["config"]["snapshot_sha256"])
+                              expected_sha256=spec["config"]["snapshot_sha256"],
+                              state_bytes=config["limits"].get("state_bytes", bounds.MAX_STATE))
     require(result["manifest"]["policy"] == profile_policy(spec["config"]["policy"], standalone=True),
             "configured policy")
     receipt = result["receipt"]

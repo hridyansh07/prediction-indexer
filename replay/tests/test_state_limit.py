@@ -55,3 +55,17 @@ class StateLimitTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 bounds.StateBudget(bad)
         self.assertIn("state_bytes", LIMITS)
+
+    def test_profile_provisional_reader_checks_limit_before_retaining_facts(self):
+        import tempfile
+        from pathlib import Path
+        from replay.tests.test_market_profile import Harness
+        from replay.strategies.market_profile.strategy import read_provisional
+        with tempfile.TemporaryDirectory() as directory:
+            h = Harness(Path(directory))
+            h.window()
+            h.finish()
+            with self.assertRaisesRegex(ProtocolError, "reader state budget"):
+                read_provisional(h.profile_output, Path(directory) / "context", expected_sha256=h.sha, state_bytes=1)
+            result = read_provisional(h.profile_output, Path(directory) / "context", expected_sha256=h.sha, state_bytes=1024**3)
+            self.assertTrue(result["summary"]["books"])

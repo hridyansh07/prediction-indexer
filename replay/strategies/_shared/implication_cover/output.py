@@ -107,7 +107,7 @@ def validate_content(directory, snapshot, manifest, bridge=None, *, state_bytes=
     if reader.experiment.profile is not None:
         from replay.economic_sdk.profile_reader import validate_profile
         reader.profile_summary = validate_profile(Path(directory), snapshot, manifest["files"], reader.experiment.profile,
-                                                  manifest["experiment_sha256"], manifest["snapshot_sha256"])
+                                                  manifest["experiment_sha256"], manifest["snapshot_sha256"], state_bytes=state_bytes)
     return aggregate_reader.validate(directory, snapshot, manifest, reader, state_bytes=state_bytes)
 
 

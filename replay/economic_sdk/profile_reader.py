@@ -24,7 +24,8 @@ from replay.economic_sdk.profile_policy import (
     pairs_of,
     profile_policy,
 )
-from replay.economic_sdk.reader import lines, signed
+from replay.economic_sdk.reader import Budget, lines, signed
+from replay.economic_sdk.bounds import json_cost
 from replay.economic_sdk.transitions_reader import validate_streams
 from replay.streams.protocol import obj, require, uint  # noqa: F401
 
@@ -70,8 +71,9 @@ def _bucketed(start, end, width, scope_start, scope_end):
 
 
 def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_sha256, *,
-                     standalone=False):
+                     standalone=False, state_bytes=None):
     policy = profile_policy(policy, standalone=standalone)
+    budget = Budget(snapshot, policy, limit=state_bytes)
     root = Path(root)
     groups = set(policy["groups"])
     width = int(policy["bucket_ns"])
@@ -79,6 +81,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
     scopes = snapshot["scopes"]
     books, members, pairs = {}, {}, {}
     for index, scope in enumerate(scopes):
+        budget.reserve(sum(len(m["books"]) for m in scope["members"]) * 4096)
         books[index] = sorted({(b["instrument"], b["orientation"]) for m in scope["members"]
                                for b in m["books"] if (b["instrument"], b["orientation"]) in plans})
         for member in scope["members"]:
@@ -225,6 +228,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         and all(type(c) is int and c >= 0 for c in counts), "survival histogram")
             obj(stability["censored"], "bid ask")
         if facts is not None:
+            budget.reserve(256 + json_cost(activity_counts))
             held = facts["state"].setdefault((scope, key), {})
             for name, value in (("usable", d["usable_ns"]), ("not_initialized", d["not_initialized_ns"]),
                                 *(("unusable:" + why, _big(ns)) for why, ns in reasons.items())):
