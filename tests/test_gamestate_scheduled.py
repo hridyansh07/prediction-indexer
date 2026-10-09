@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from gamestate import kalshi
 from tests.test_kalshi_game_state import client, milestone, records as archived
@@ -23,10 +23,11 @@ def document():
 class Router:
     """One scripted Universe + Kalshi, routed by URL so no test depends on client order."""
 
-    def __init__(self, events, *, live=None, broken=(), venues=None):
+    def __init__(self, events, *, live=None, broken=(), venues=None, active=()):
         self.events = events  # bundle id -> event id
         self.broken = set(broken)  # bundles whose /outcomes is a 404
         self.venues = venues or {}  # bundle id -> venues (default kalshi + polymarket)
+        self.active = set(active)  # bundles not retired yet
         self.calls = []
         _, rows = archived()
         self.kalshi = [kalshi.loads(kalshi.body_bytes(r)) for r in rows]
@@ -45,13 +46,17 @@ class Router:
                 body = self.kalshi[2] if path.endswith("/MAP1") else self.kalshi[3]
             return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
         parts = path.strip("/").split("/")
-        if parts == ["v1", "bundles"]:
-            body = {"bundles": [{"bundle_id": b, "lifecycle": "retired", "activation_at": "2026-09-27T10:00:00Z",
-                                 "venues": self.venues.get(b, ["kalshi", "polymarket"])}
-                                for b in sorted(self.events)], "next_cursor": None}
+        if parts == ["v1", "selections"]:
+            # The server's venue filter; each bundle appears in two occurrences.
+            venue = parse_qs(urlsplit(url).query).get("venue", [None])[0]
+            rows = [{"bundle_id": b, "run_id": run, "activation_at": "2026-09-27T10:00:00Z"}
+                    for b in sorted(self.events) for run in ("r1", "r2")
+                    if venue is None or venue in self.venues.get(b, ["kalshi", "polymarket"])]
+            body = {"selections": rows, "sort": "activation", "next_cursor": None}
         elif parts[-1] == "history":
+            retirement = None if parts[2] in self.active else {"retired_at": RETIRED_AT}
             body = {"selections": [{"run_id": "run", "bundle_id": parts[2],
-                                    "retirement": {"retired_at": RETIRED_AT}}], "next_cursor": None}
+                                    "retirement": retirement}], "next_cursor": None}
         elif parts[-1] == "outcomes":
             if parts[2] in self.broken:
                 return 404, {"Content-Type": "application/json"}, b'{"error":"not_found"}'
@@ -160,7 +165,7 @@ class ScheduledTests(unittest.TestCase):
         original = self.store.list_keys
         self.store.list_keys = lambda prefix: listed.append(prefix) or original(prefix)
         scheduled(self.store, ledger, router, SETTLED + 24 * HOUR)
-        self.assertEqual(router.universe(), ["/v1/bundles"])
+        self.assertEqual(router.universe(), ["/v1/selections"])
         self.assertEqual(router.count(kalshi.KALSHI), 0)
         self.assertEqual(listed, [])
 
@@ -170,8 +175,25 @@ class ScheduledTests(unittest.TestCase):
         ledger = self.ledger()
         result = scheduled(self.store, ledger, router, SETTLED)
         self.assertNotIn("/v1/bundles/bundle-a/history", router.universe())
+        self.assertIn("venue=kalshi", router.calls[0])
         self.assertEqual(ledger.connection.execute("SELECT bundle_id FROM fetch_attempts").fetchall(), [("bundle-b",)])
         self.assertEqual(result["failed"], 0)
+
+    def test_unretired_bundles_wait_without_a_ledger_row(self):
+        router = Router({"bundle-a": EVENT, "bundle-b": OTHER}, active={"bundle-a"})
+        ledger = self.ledger()
+        result = scheduled(self.store, ledger, router, SETTLED)
+        self.assertEqual(ledger.connection.execute("SELECT bundle_id FROM fetch_attempts").fetchall(), [("bundle-b",)])
+        self.assertEqual(result["failed"], 0)
+        self.assertIsNone(ledger.event_for("bundle-a"))
+
+    def test_backfill_passes_canonical_activation_bounds(self):
+        router = Router({"bundle-a": EVENT})
+        start, end = kalshi.timestamp("2026-08-01T00:00:00Z"), kalshi.timestamp("2026-10-07T00:00:00Z")
+        scheduled(self.store, self.ledger(), router, SETTLED, activation=(start, end))
+        query = parse_qs(urlsplit(router.calls[0]).query)
+        self.assertEqual((query["activation_start"], query["activation_end"]),
+                         (["2026-08-01T00:00:00Z"], ["2026-10-07T00:00:00Z"]))
 
     def test_shared_event_is_pulled_once(self):
         router = Router({"bundle-a": EVENT, "bundle-b": EVENT})
@@ -285,8 +307,7 @@ class ScheduledTests(unittest.TestCase):
         from gamestate.run_scheduled import eligible
         self.assertTrue(eligible([{"retirement": {"retired_at": RETIRED_AT}}], SETTLED, 7200))
         self.assertFalse(eligible([{"retirement": {"retired_at": RETIRED_AT}}], SETTLED - 10**9, 7200))
-        with self.assertRaises(ValueError):
-            eligible([{"retirement": None}], 0, 7200)
+        self.assertFalse(eligible([{"retirement": None}], 10**20, 7200))  # not retired yet
 
 
 if __name__ == "__main__":

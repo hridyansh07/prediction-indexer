@@ -8,8 +8,9 @@ import sqlite3
 import sys
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlsplit
 
 from archive.storage.factory import build_store
 from gamestate import kalshi
@@ -149,32 +150,34 @@ def config(value):
 
 
 def eligible(history, now_ns, delay):
+    """Retired at least ``delay`` ago. A bundle that has not retired is simply not eligible yet."""
     retired = {kalshi.timestamp(row["retirement"]["retired_at"])
                for row in history if row.get("retirement") is not None}
-    if not retired:
-        raise ValueError("retirement_missing")
-    return now_ns >= min(retired) + int(delay * 10**9)
+    return bool(retired) and now_ns >= min(retired) + int(delay * 10**9)
 
 
-def bundles(client, base):
-    """Stream every bundle; only cursors are retained, to reject a cursor loop."""
-    cursor, seen = None, set()
-    while True:
-        query = {"limit": 50, **({"cursor": cursor} if cursor else {})}
-        page = client.get(base.rstrip("/") + "/v1/bundles?" + urlencode(query))
-        if set(page) != {"bundles", "next_cursor"} or type(page["bundles"]) is not list or len(page["bundles"]) > 50:
-            raise ValueError("bundles_page")
-        for row in page["bundles"]:
-            if (type(row) is not dict or row.get("lifecycle") not in ("active", "retired")
-                    or type(row.get("venues")) is not list):
-                raise ValueError("bundles_shape")
-            yield row
-        cursor = page["next_cursor"]
-        if cursor is None:
-            return
-        if type(cursor) is not str or not 0 < len(cursor) <= 4096 or cursor in seen:
-            raise ValueError("bundles_cursor")
-        seen.add(cursor)
+def rfc3339(ns):
+    """The Universe's canonical UTC timestamp form for a query bound."""
+    moment = datetime.fromtimestamp(ns // 10**9, timezone.utc).replace(microsecond=ns % 10**9 // 1000)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def kalshi_bundles(client, base, activation):
+    """Distinct bundles with a Kalshi target, streamed from the selection history.
+
+    The server filters by venue, so bundles with only Polymarket or Limitless
+    markets never appear. Only cursors and the set of bundle ids already yielded
+    are retained.
+    """
+    query = {"venue": "kalshi", "sort": "activation"}
+    if activation is not None:
+        query.update(activation_start=rfc3339(activation[0]), activation_end=rfc3339(activation[1]))
+    seen = set()
+    for row in kalshi.pages(client, base, "/v1/selections", query):
+        bundle = row.get("bundle_id")
+        if bundle not in seen:
+            seen.add(bundle)
+            yield bundle
 
 
 def resolve_event(universe, base, bundle, now_ns, delay):
@@ -214,15 +217,9 @@ def execute(document, store, ledger, client_factory, *, now_ns, activation=None,
     result = {"version": 1, "eligible": 0, "attempted": 0, "failed": 0}
     universe = client_factory(records=kalshi.Discard())
     try:
-        for row in bundles(universe, base):
-            if row["lifecycle"] != "retired":
-                continue
-            if "kalshi" not in row["venues"]:
-                continue  # Kalshi milestones are the only source; other venues need another lens
-            if activation is not None and not activation[0] <= kalshi.timestamp(row["activation_at"]) < activation[1]:
-                continue
+        for value in kalshi_bundles(universe, base, activation):
             try:
-                bundle = kalshi.identifier(row["bundle_id"])
+                bundle = kalshi.identifier(value)
             except ValueError:
                 result["failed"] += 1  # not ledger-addressable; visible in the exit status
                 continue
