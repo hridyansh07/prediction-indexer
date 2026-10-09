@@ -21,11 +21,12 @@ MAX_PAIRS = 4096
 
 
 def experiment_identity(snapshot_sha, policy, fees, valuation, mode):
+    from replay.economic_sdk.game import experiment_policy
     require(mode in STRATEGIES, "implication venue mode")
     return digest({"strategy": STRATEGIES[mode], "venue_mode": mode,
                    "bridge_version": 1, "entity_contract_version": 1, "native_scales": True,
                    "settlement_model": SETTLEMENT, "snapshot_sha256": snapshot_sha,
-                   "policy": policy, "fees": fees, "valuation": valuation})
+                   "policy": experiment_policy(policy), "fees": fees, "valuation": valuation})
 
 
 def experiment(policy, identity, mode):

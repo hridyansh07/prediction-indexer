@@ -4,6 +4,14 @@ The public Kalshi adapter owns pulls, immutable raw responses and offline
 timeline derivation. It imports archive/encoder, not Universe implementation
 or Replay. `python -m gamestate.run_pull` retains the explicit-bundle CLI.
 
+`gamestate.prepared` projects verified Kalshi timelines and receipted raw labels
+into generic segments for runner-side preparation. `gamestate.timeline.read_fetch`
+verifies one fetch; `python -m gamestate.priors --archive-env ARCHIVE --output
+/research/priors.json` streams verified ok fetches into a local per-game statistics
+report using temporary disk. These tools never write to the archive.
+The consuming overlay is specified in
+[GAME_STATE_SDK_V1.md](../docs/specs/GAME_STATE_SDK_V1.md).
+
 `python -m gamestate.run_scheduled configs/gamestate.json` is one-shot. External
 cron owns the 30-minute cadence. It streams `/v1/selections?venue=kalshi`, holding
 only the cursor and the bundle ids already seen; the server's venue filter leaves

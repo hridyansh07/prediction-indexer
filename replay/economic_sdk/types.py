@@ -34,9 +34,17 @@ class BookRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class GameRequirement:
+    """Read the frozen game view; optional (anchor fact, offset ns) timers."""
+
+    timers: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Requirements:
     books: dict
     profile: object = None
+    game: GameRequirement | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +157,7 @@ class Context:
     sequence: int
     scope: int
     experiment_sha256: str
+    game: object = None
 
 
 @dataclass(frozen=True)

@@ -65,6 +65,13 @@ its reader re-prices values and kill prices using the pinned fee bridge.
 Cyclic controls are rejected because substitution can destroy the mask proof.
 Control results stay isolated from real results.
 
+Both policies optionally accept the prepared-input `game` block defined by
+[GAME_STATE_SDK_V1.md](../../../../docs/specs/GAME_STATE_SDK_V1.md). Its hash and
+release decisions enter experiment identity. Manifests require the corresponding
+game binding and episode `open`/`at_max` rows require closed game annotations;
+independent readers enforce presence and consistency. Output without the block
+retains its existing schema and bytes.
+
 Both variants require explicit quote-asset valuation before scalar economics.
 The existing PARITY_SCENARIO values each listed native quote asset at one
 research dollar; USD, USDC and pUSD remain separately identified native flows.
