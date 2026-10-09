@@ -165,7 +165,8 @@ def bundles(client, base):
         if set(page) != {"bundles", "next_cursor"} or type(page["bundles"]) is not list or len(page["bundles"]) > 50:
             raise ValueError("bundles_page")
         for row in page["bundles"]:
-            if type(row) is not dict or row.get("lifecycle") not in ("active", "retired"):
+            if (type(row) is not dict or row.get("lifecycle") not in ("active", "retired")
+                    or type(row.get("venues")) is not list):
                 raise ValueError("bundles_shape")
             yield row
         cursor = page["next_cursor"]
@@ -216,6 +217,8 @@ def execute(document, store, ledger, client_factory, *, now_ns, activation=None,
         for row in bundles(universe, base):
             if row["lifecycle"] != "retired":
                 continue
+            if "kalshi" not in row["venues"]:
+                continue  # Kalshi milestones are the only source; other venues need another lens
             if activation is not None and not activation[0] <= kalshi.timestamp(row["activation_at"]) < activation[1]:
                 continue
             try:

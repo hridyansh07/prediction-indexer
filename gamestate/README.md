@@ -6,7 +6,9 @@ or Replay. `python -m gamestate.run_pull` retains the explicit-bundle CLI.
 
 `python -m gamestate.run_scheduled configs/gamestate.json` is one-shot. External
 cron owns the 30-minute cadence. It pages every Universe bundle holding only the
-cursor. For a retired bundle it has not mapped yet it reads the retirement history
+cursor. Bundles without a Kalshi market are skipped with no call (Polymarket- or
+Limitless-only events need another source). For a retired bundle it has not
+mapped yet it reads the retirement history
 (two-hour settle delay, not a settlement assertion) and `/v1/bundles/<bundle>/outcomes`
 to obtain the immutable `event:d1:<sha256>`, then pulls. Universe responses are
 mapping reads, never recorded; only Kalshi responses become archived evidence.

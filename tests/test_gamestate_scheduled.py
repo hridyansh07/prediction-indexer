@@ -23,9 +23,10 @@ def document():
 class Router:
     """One scripted Universe + Kalshi, routed by URL so no test depends on client order."""
 
-    def __init__(self, events, *, live=None, broken=()):
+    def __init__(self, events, *, live=None, broken=(), venues=None):
         self.events = events  # bundle id -> event id
         self.broken = set(broken)  # bundles whose /outcomes is a 404
+        self.venues = venues or {}  # bundle id -> venues (default kalshi + polymarket)
         self.calls = []
         _, rows = archived()
         self.kalshi = [kalshi.loads(kalshi.body_bytes(r)) for r in rows]
@@ -45,7 +46,8 @@ class Router:
             return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()
         parts = path.strip("/").split("/")
         if parts == ["v1", "bundles"]:
-            body = {"bundles": [{"bundle_id": b, "lifecycle": "retired", "activation_at": "2026-09-27T10:00:00Z"}
+            body = {"bundles": [{"bundle_id": b, "lifecycle": "retired", "activation_at": "2026-09-27T10:00:00Z",
+                                 "venues": self.venues.get(b, ["kalshi", "polymarket"])}
                                 for b in sorted(self.events)], "next_cursor": None}
         elif parts[-1] == "history":
             body = {"selections": [{"run_id": "run", "bundle_id": parts[2],
@@ -161,6 +163,15 @@ class ScheduledTests(unittest.TestCase):
         self.assertEqual(router.universe(), ["/v1/bundles"])
         self.assertEqual(router.count(kalshi.KALSHI), 0)
         self.assertEqual(listed, [])
+
+    def test_bundles_without_a_kalshi_market_cost_no_calls(self):
+        # Polymarket/Limitless-only bundles need another source; they are skipped, not failed.
+        router = Router({"bundle-a": EVENT, "bundle-b": OTHER}, venues={"bundle-a": ["limitless", "polymarket"]})
+        ledger = self.ledger()
+        result = scheduled(self.store, ledger, router, SETTLED)
+        self.assertNotIn("/v1/bundles/bundle-a/history", router.universe())
+        self.assertEqual(ledger.connection.execute("SELECT bundle_id FROM fetch_attempts").fetchall(), [("bundle-b",)])
+        self.assertEqual(result["failed"], 0)
 
     def test_shared_event_is_pulled_once(self):
         router = Router({"bundle-a": EVENT, "bundle-b": EVENT})
