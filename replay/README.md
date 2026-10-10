@@ -63,6 +63,12 @@ declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns
 - bounded output;
 - the independent reader.
 
+The [bounded payout optimizer](strategies/bounded_payout_optimizer/README.md) adds
+a strategy-owned exact quantity search, native hypothetical accounts, released
+result history and entry/settlement timers using the shared time/views/fees/masks.
+Its position outputs have a separate closed schema and independent reader;
+existing SDK detection fills remain unchanged.
+
 Target-record run selection includes every run in the half-open capture window
 and the latest run strictly before it. Production run archive receipts remain
 the authority: prefix listings are not accepted as commit evidence. Each read

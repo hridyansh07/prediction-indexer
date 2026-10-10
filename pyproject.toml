@@ -28,6 +28,7 @@ include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "univers
 replay = ["README.md"]
 "replay.legacy" = ["README.md", "GATE1_FAILURES.md", "policy.json"]
 "replay.strategies" = ["README.md"]
+"replay.strategies.bounded_payout_optimizer" = ["README.md", "SPEC.md", "config.example.json", "bench.example.json"]
 "replay.strategies.bundle_coverage" = ["README.md", "SPEC.md", "config.example.json", "bench.example.json"]
 "replay.strategies.same_venue_complement" = ["README.md", "SPEC.md", "config.example.json"]
 "replay.strategies.cross_venue_arbitrage" = ["README.md", "SPEC.md", "SOURCE.json", "config.example.json"]

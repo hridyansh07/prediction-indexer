@@ -1,6 +1,8 @@
 # Game-aware bounded minimum-payout optimizer V1
 
-Status: **PROPOSED — first implementation priority; not implemented or empirically validated.**
+Status: **IMPLEMENTED OFFLINE — synthetic contract tests; no empirical/live validation.**
+
+Implementation and closed formats: [strategy package](../../replay/strategies/bounded_payout_optimizer/README.md).
 
 The [shared economic scenario contract](ECONOMIC_POSITION_SCENARIOS_V1.md) is
 normative for visibility, exact accounting, fees, capacity, positions and outputs.
@@ -218,8 +220,8 @@ ordinary absence. No probability model or actual execution proof is required.
 The current [multi-market](../../replay/strategies/same_venue_multi_market/SPEC.md),
 [cross-venue](../../replay/strategies/cross_venue_arbitrage/SPEC.md) and
 [implication](../../replay/strategies/_shared/implication_cover/SPEC.md) contracts
-provide reusable pricing/proof boundaries, but do not implement this general
-search, dynamic proof, capacity ledger or held-position lifecycle. Future work
-must address the shared released-fact/state/timer/reader gaps. Genuine input
+provide reusable pricing/proof boundaries. The optimizer now implements the
+general search, dynamic proof, capacity ledger and held-position lifecycle in its
+own package; it preserves those strategies and the SDK detection schemas. Genuine input
 prerequisites are reviewed masks/rules, fee/economics bindings, capital and
 visibility/settlement assumptions; richer game telemetry is not required.

@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "source_revision": "0000000000000000000000000000000000000000",
+  "snapshot_directory": "/research/context",
+  "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "fees": {
+    "catalog_directory": "/research/reviewed-fee-catalog",
+    "catalog_identity": "0000000000000000000000000000000000000000000000000000000000000000",
+    "reference_ns": "0",
+    "limitless_buy_bps": 300,
+    "limitless_sell_bps": 150,
+    "kalshi_member_class": "NON_DIRECT",
+    "assets": {
+      "kalshi": {
+        "kind": "USD",
+        "ledger": "<reviewed-collateral-ledger>",
+        "token": "<reviewed-collateral-identity>"
+      }
+    },
+    "instrument_bindings": []
+  },
+  "policy": {
+    "version": 1,
+    "max_legs": 4,
+    "max_books": 128,
+    "max_outcomes": 1024,
+    "max_search_nodes": 100000,
+    "alternatives": 8,
+    "quantities": [
+      {
+        "instrument": "kalshi:<reviewed-captured-instrument>",
+        "orientation": "complement",
+        "increment": "1",
+        "cap": "100"
+      },
+      {
+        "instrument": "kalshi:<reviewed-captured-instrument>",
+        "orientation": "outcome",
+        "increment": "1",
+        "cap": "100"
+      }
+    ],
+    "minimum_net_margin": "0.01",
+    "minimum_return_bps": "0",
+    "decision_delay_ns": "0",
+    "max_entries_per_event": 1,
+    "rearm_nonpositive_ns": "1000000000",
+    "holding_cost": {
+      "rate_per_ns": "0",
+      "maximum_duration_ns": null
+    },
+    "settlement": {
+      "mode": "NORMAL_RESOLUTION_SCENARIO",
+      "delay_ns": "0"
+    }
+  },
+  "valuation": null,
+  "account": {
+    "initial_cash": [
+      {
+        "venue": "kalshi",
+        "asset": {
+          "kind": "USD",
+          "ledger": "<reviewed-collateral-ledger>",
+          "token": "<reviewed-collateral-identity>"
+        },
+        "amount": "1000"
+      }
+    ],
+    "transaction_budget": "1000",
+    "event_budget": "1000",
+    "max_outstanding_cost": "1000",
+    "max_open_positions": 1
+  },
+  "rules": {
+    "event_id": "<prepared-event-id>",
+    "compatibility_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "normal_resolution_only": true,
+    "assumptions": [
+      "REPLACE_WITH_REVIEWED_NORMAL_RESOLUTION_ASSUMPTIONS"
+    ],
+    "books": [
+      {
+        "instrument": "kalshi:<reviewed-captured-instrument>",
+        "orientation": "complement",
+        "rule_identity": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "instrument": "kalshi:<reviewed-captured-instrument>",
+        "orientation": "outcome",
+        "rule_identity": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  }
+}

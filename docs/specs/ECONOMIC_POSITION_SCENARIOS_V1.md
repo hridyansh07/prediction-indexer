@@ -1,6 +1,11 @@
 # Economic position scenarios V1
 
-Status: **PROPOSED — documentation only; not implemented or empirically validated.**
+Status: **SHARED CONTRACT — implemented locally by the bounded payout optimizer;
+other proposed strategies remain separate work. No empirical/live validation.**
+
+The [optimizer implementation](../../replay/strategies/bounded_payout_optimizer/SPEC.md)
+has its own closed output, independent reader and synthetic offline tests. The
+shared SDK itself retains its original detection-only API.
 
 This is the shared economic contract for the proposed
 [bounded payout optimizer](BOUNDED_PAYOUT_OPTIMIZER_V1.md),
@@ -313,4 +318,6 @@ facts. Position timers must be scheduled explicitly in observer time; the existi
 game timer formula `max(release, source+offset)` is not `entry+offset` or
 `release+offset`. These are implementation gaps, not dependencies on rich telemetry.
 
-No tests, replays, live calls or empirical measurements accompany this proposal.
+The optimizer package now has offline contract-shaped search/account/game/output
+tests and a real Decoder/bench reader path. No live calls or empirical
+measurements accompany this contract.

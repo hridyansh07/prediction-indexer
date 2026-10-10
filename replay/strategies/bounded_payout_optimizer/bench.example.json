@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "image": {
+    "build_context": "/absolute/<repo-or-worktree>",
+    "dockerfile": "docker/replay-runner.Dockerfile",
+    "reuse_id": null
+  },
+  "redis": {
+    "image": "redis:8.2-alpine",
+    "maxmemory": "150mb"
+  },
+  "base_run_config": "/absolute/<supervisor-config>.json",
+  "context_directory": "/absolute/<prepared-context>",
+  "fee_catalog_directory": "/absolute/<reviewed-fee-catalog>",
+  "mounts": [
+    {
+      "host": "/absolute/<derivatives>",
+      "container": "/bench/in/derivatives"
+    }
+  ],
+  "limits": {
+    "attempt_seconds": 3600,
+    "run_seconds": 3700,
+    "stall_seconds": 120
+  },
+  "groups": [
+    {
+      "name": "payout",
+      "factory": "replay.strategies.bounded_payout_optimizer:build",
+      "revision": "<same-reviewed-source-revision-as-config>",
+      "config": {
+        "version": 1,
+        "source_revision": "0000000000000000000000000000000000000000",
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": {
+          "catalog_directory": "{fees}/{catalog_identity}",
+          "catalog_identity": "{catalog_identity}",
+          "reference_ns": "0",
+          "limitless_buy_bps": 300,
+          "limitless_sell_bps": 150,
+          "kalshi_member_class": "NON_DIRECT",
+          "assets": {
+            "kalshi": {
+              "kind": "USD",
+              "ledger": "<reviewed-collateral-ledger>",
+              "token": "<reviewed-collateral-identity>"
+            }
+          },
+          "instrument_bindings": []
+        },
+        "policy": {
+          "version": 1,
+          "max_legs": 4,
+          "max_books": 128,
+          "max_outcomes": 1024,
+          "max_search_nodes": 100000,
+          "alternatives": 8,
+          "quantities": [
+            {
+              "instrument": "kalshi:<reviewed-captured-instrument>",
+              "orientation": "complement",
+              "increment": "1",
+              "cap": "100"
+            },
+            {
+              "instrument": "kalshi:<reviewed-captured-instrument>",
+              "orientation": "outcome",
+              "increment": "1",
+              "cap": "100"
+            }
+          ],
+          "minimum_net_margin": "0.01",
+          "minimum_return_bps": "0",
+          "decision_delay_ns": "0",
+          "max_entries_per_event": 1,
+          "rearm_nonpositive_ns": "1000000000",
+          "holding_cost": {
+            "rate_per_ns": "0",
+            "maximum_duration_ns": null
+          },
+          "settlement": {
+            "mode": "NORMAL_RESOLUTION_SCENARIO",
+            "delay_ns": "0"
+          },
+          "game": {
+            "required": false,
+            "input": {
+              "path": "{game_state}",
+              "sha256": "{game_state_sha256}"
+            },
+            "windows": {
+              "segment_start": {
+                "after_ms": 0
+              },
+              "segment_end": {
+                "after_ms": 0
+              },
+              "match_end": {
+                "after_ms": 0
+              }
+            },
+            "segment_start": "at_segment_end",
+            "priors": {}
+          }
+        },
+        "valuation": null,
+        "account": {
+          "initial_cash": [
+            {
+              "venue": "kalshi",
+              "asset": {
+                "kind": "USD",
+                "ledger": "<reviewed-collateral-ledger>",
+                "token": "<reviewed-collateral-identity>"
+              },
+              "amount": "1000"
+            }
+          ],
+          "transaction_budget": "1000",
+          "event_budget": "1000",
+          "max_outstanding_cost": "1000",
+          "max_open_positions": 1
+        },
+        "rules": {
+          "event_id": "<prepared-event-id>",
+          "compatibility_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "normal_resolution_only": true,
+          "assumptions": [
+            "REPLACE_WITH_REVIEWED_NORMAL_RESOLUTION_ASSUMPTIONS"
+          ],
+          "books": [
+            {
+              "instrument": "kalshi:<reviewed-captured-instrument>",
+              "orientation": "complement",
+              "rule_identity": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            {
+              "instrument": "kalshi:<reviewed-captured-instrument>",
+              "orientation": "outcome",
+              "rule_identity": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          ]
+        }
+      },
+      "reader": "replay.strategies.bounded_payout_optimizer:read_completed",
+      "checks": [
+        "replay.strategies.bounded_payout_optimizer:check"
+      ],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "scenario"
+        ]
+      }
+    }
+  ],
+  "game_state_path": "/absolute/<prepared-game-state>.json"
+}
