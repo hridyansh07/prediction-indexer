@@ -1,0 +1,504 @@
+{
+  "version": 1,
+  "snapshot_directory": "/research/context",
+  "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "fees": {
+    "catalog_directory": "/research/reviewed-fee-catalog",
+    "catalog_identity": "REPLACE_WITH_REVIEWED_CATALOG_IDENTITY",
+    "reference_ns": "REPLACE_WITH_REVIEWED_REFERENCE_NS",
+    "limitless_buy_bps": 300,
+    "limitless_sell_bps": 150,
+    "kalshi_member_class": "NON_DIRECT",
+    "assets": {
+      "kalshi": {
+        "kind": "USD",
+        "ledger": "REPLACE_WITH_REVIEWED_LEDGER",
+        "token": "REPLACE_WITH_REVIEWED_TOKEN"
+      },
+      "polymarket": {
+        "kind": "USDC",
+        "ledger": "REPLACE_WITH_REVIEWED_LEDGER",
+        "token": "REPLACE_WITH_REVIEWED_TOKEN"
+      }
+    },
+    "instrument_bindings": []
+  },
+  "source_revision": "0000000000000000000000000000000000000000",
+  "policy": {
+    "version": 1,
+    "game": {
+      "required": true,
+      "input": {
+        "path": "/research/game_state.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "windows": {
+        "segment_start": {
+          "after_ms": 0
+        },
+        "segment_end": {
+          "after_ms": 0
+        },
+        "match_end": {
+          "after_ms": 0
+        }
+      },
+      "segment_start": "at_segment_end",
+      "priors": {}
+    },
+    "cohort": "milestone_primary",
+    "quantity_grid": [
+      "1",
+      "10",
+      "100"
+    ],
+    "window_ns": "2000000000",
+    "history_ns": "120000000000",
+    "history_changes": 100000,
+    "exit_horizon_ns": "30000000000",
+    "decision_delay_ns": "0",
+    "minimum_leader_move": "0.02",
+    "minimum_forecast_margin": "0.05",
+    "minimum_forecast_return_bps": "0",
+    "take_profit_fraction": "0.02",
+    "stop_loss_fraction": "0.05",
+    "exit_on_next_segment_end": true,
+    "exit_on_match_end": true,
+    "cooldown_after_close_ns": "30000000000",
+    "rearm_false_ns": "1000000000",
+    "max_entries_per_event": 1,
+    "max_open_per_target": 1,
+    "capacity_mode": "CUMULATIVE_DISPLAY_CAP",
+    "trading_status_mode": "TRADABLE_IF_USABLE_SCENARIO",
+    "valuation": {
+      "mode": "PARITY_SCENARIO",
+      "weights": {
+        "kalshi": "1",
+        "polymarket": "1"
+      }
+    },
+    "initial_cash": [
+      {
+        "venue": "kalshi",
+        "asset": {
+          "kind": "USD",
+          "ledger": "REPLACE_WITH_REVIEWED_LEDGER",
+          "token": "REPLACE_WITH_REVIEWED_TOKEN"
+        },
+        "amount": "1000"
+      },
+      {
+        "venue": "polymarket",
+        "asset": {
+          "kind": "USDC",
+          "ledger": "REPLACE_WITH_REVIEWED_LEDGER",
+          "token": "REPLACE_WITH_REVIEWED_TOKEN"
+        },
+        "amount": "1000"
+      }
+    ],
+    "transaction_budget": "1000",
+    "event_budget": "1000",
+    "maximum_outstanding_cost": "1000",
+    "maximum_concurrent_positions": 10,
+    "holding_rate_per_ns": "0",
+    "settlement": {
+      "mode": "UNRESOLVED",
+      "delay_ns": "0",
+      "immediate_availability": false,
+      "evidence": []
+    },
+    "models": [
+      {
+        "version": 1,
+        "role": "target_only",
+        "provenance": "ASSUMED_RESPONSE_MODEL",
+        "assumption": "Illustrative zero-displacement baseline; replace with a separately pinned reviewed model.",
+        "horizon_ns": "30000000000",
+        "features": [
+          "delta_L",
+          "delta_T",
+          "released_milestones"
+        ],
+        "relations": [
+          "IDENTITY",
+          "COMPLEMENT"
+        ],
+        "cohorts": [
+          {
+            "game": null,
+            "phase": "unavailable",
+            "score_quality": "book_only",
+            "prefix_quality": "book_only",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          }
+        ],
+        "fallback": null,
+        "training": null
+      },
+      {
+        "version": 1,
+        "role": "target_milestones",
+        "provenance": "ASSUMED_RESPONSE_MODEL",
+        "assumption": "Illustrative zero-displacement baseline; replace with a separately pinned reviewed model.",
+        "horizon_ns": "30000000000",
+        "features": [
+          "delta_L",
+          "delta_T",
+          "released_milestones"
+        ],
+        "relations": [
+          "IDENTITY",
+          "COMPLEMENT"
+        ],
+        "cohorts": [
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "0",
+            "beta_T": "0",
+            "intercept": "0"
+          }
+        ],
+        "fallback": null,
+        "training": null
+      },
+      {
+        "version": 1,
+        "role": "leader_milestones",
+        "provenance": "ASSUMED_RESPONSE_MODEL",
+        "assumption": "Illustrative transparent unit leader response, not fitted or measured.",
+        "horizon_ns": "30000000000",
+        "features": [
+          "delta_L",
+          "delta_T",
+          "released_milestones"
+        ],
+        "relations": [
+          "IDENTITY",
+          "COMPLEMENT"
+        ],
+        "cohorts": [
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "pre_match",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "in_segment",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "between_segments",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "complete",
+            "prefix_quality": "complete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "complete",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          },
+          {
+            "game": null,
+            "phase": "finished",
+            "score_quality": "unknown",
+            "prefix_quality": "incomplete",
+            "home": null,
+            "away": null,
+            "elapsed_min_ns": "0",
+            "elapsed_max_ns": null,
+            "beta_L": "1",
+            "beta_T": "0",
+            "intercept": "0"
+          }
+        ],
+        "fallback": null,
+        "training": null
+      }
+    ],
+    "rule_bindings": [],
+    "max_books": 256,
+    "max_routes": 4096,
+    "models_tried": 3,
+    "thresholds_tried": 1
+  }
+}

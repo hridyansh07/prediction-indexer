@@ -1,6 +1,11 @@
 # Milestone-conditioned venue and sibling leader–follower V1
 
-Status: **PROPOSED — second implementation priority; not implemented or empirically validated.**
+Status: **IMPLEMENTED OFFLINE V1 — identity/complement models; not empirically validated.**
+
+The [strategy package](../../replay/strategies/milestone_leader_follower/README.md)
+implements this contract with bounded causal history, hypothetical positions,
+independent readers and bench entry points. V1 intentionally leaves other
+relationship models visibly unavailable, as permitted below.
 
 The [shared economic scenario contract](ECONOMIC_POSITION_SCENARIOS_V1.md) owns
 visibility, exact fees/cash, capacity, hypothetical positions and outputs.
@@ -256,12 +261,14 @@ bid depth at the horizon. Sell those 40 with exact SELL fees, keep 60 in
 `EXIT_PENDING`, and expose partial P&L plus residual cost. Do not value the
 remaining 60 at the 40-contract bid and call the trade closed.
 
-## 7. Implementation prerequisites
+## 7. Implementation boundary
 
-Reuse SDK book views, exact native walks, fees and game releases. Future bounded
-history, signal/account state, entry-anchored timers and independent position
-reading are required by the shared contract; current pure `evaluate`/fill episode
-machinery does not implement them. State cohorts need complete/unknown score
-quality, not blind use of GameView counts. Relationship-specific models and
-past-event identities are genuine inputs; continuous gameplay telemetry and
-measured real-world order latency are not prerequisites.
+The package reuses SDK book views, exact native walks, fees and game releases.
+Its bounded history, signal/account state, entry-anchored timers and independent
+position reader implement the shared contract within this strategy; the existing
+pure `evaluate`/fill episode machinery and pinned artifacts stay unchanged. State
+cohorts distinguish complete/unknown score from winner-prefix completeness.
+Relationship-specific models and past-event identities are genuine inputs;
+continuous gameplay telemetry and measured real-world latency remain unnecessary.
+Offline contract tests and the package README document checks and limits; an
+implementation is not evidence of held-out empirical leadership.

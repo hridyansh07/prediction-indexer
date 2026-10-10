@@ -6,6 +6,7 @@ and documentation here. Start with its README, then its specification.
 | Package | Measures |
 |---|---|
 | [bundle_coverage](bundle_coverage/README.md) | Historical book, member and bundle availability |
+| [milestone_leader_follower](milestone_leader_follower/README.md) | Causal venue/sibling innovations, model baselines and hypothetical target positions |
 | [market_profile](market_profile/README.md) | Per-book state, activity, depth and quote stability |
 | [same_venue_complement](same_venue_complement/README.md) | Both sides of one instrument on one venue |
 | [same_venue_multi_market](same_venue_multi_market/README.md) | Complete sets spanning one venue's markets |
