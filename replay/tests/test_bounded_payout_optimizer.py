@@ -84,6 +84,11 @@ def optimizer_policy(**changes):
     result.update(changes);return result
 
 
+def decision_payload(rows):
+    from replay.strategies.bounded_payout_optimizer.stream import pack
+    return b''.join(encoded({'version':2,'index':i,'kind':'checkpoint','state':pack(r)})+b'\n'for i,r in enumerate(rows))
+
+
 class OptimizerHarness(MultiHarness):
     def __init__(self,root,*,p=None,game=None,cash='100',cap='2',books=None,configure=None,**kw):
         def factory(context):
@@ -114,6 +119,15 @@ class OptimizerHarness(MultiHarness):
 
     def close(self):
         self.strategy.writer.stream.close();self.strategy.episode_writer.stream.close()
+
+    def records(self,name):
+        rows=super().records(name)
+        if name not in('decisions.ndjson','episodes.ndjson'):return rows
+        from replay.strategies.bounded_payout_optimizer.stream import expand,unpack
+        result=[];previous=None
+        for index,stored in enumerate(rows):
+            previous=expand(stored,previous,index);result.append(unpack(previous))
+        return result
 
 
 class OptimizerReplayTests(unittest.TestCase):
@@ -185,7 +199,7 @@ class OptimizerReplayTests(unittest.TestCase):
             if mutation=='cash':row['scenarios'][0]['after']['cash'][0]['amount']='999'
             elif mutation=='margin':row['scenarios'][0]['detection'][0]['found']['best']['margin']='999'
             else:row['unexpected']=True
-            payload=b''.join(encoded(r)+b'\n'for r in rows);(h.output/'decisions.ndjson').write_bytes(payload)
+            payload=decision_payload(rows);(h.output/'decisions.ndjson').write_bytes(payload)
             manifest=deepcopy(result['manifest']);manifest.pop('summary_sha256')
             manifest['files']['decisions.ndjson']={'sha256':hashlib.sha256(payload).hexdigest(),'byte_length':len(payload),'records':len(rows)}
             with self.subTest(mutation=mutation),self.assertRaises(ProtocolError):
@@ -402,7 +416,7 @@ class OptimizerFinalContractTests(unittest.TestCase):
         self.assertEqual((episodes[0]['start_ns'],episodes[0]['end_ns'],episodes[0]['duration_ns']),(12,40,28))
         self.assertTrue(episodes[0]['censored']);self.assertEqual(result['summary']['rows'][0]['episodes'],1)
         bad=deepcopy(episodes);bad[0]['duration_ns']=29
-        payload=b''.join(encoded(r)+b'\n'for r in bad);(h.output/'episodes.ndjson').write_bytes(payload)
+        payload=decision_payload(bad);(h.output/'episodes.ndjson').write_bytes(payload)
         manifest=deepcopy(result['manifest']);manifest.pop('summary_sha256');manifest['files']['episodes.ndjson']={'sha256':hashlib.sha256(payload).hexdigest(),'byte_length':len(payload),'records':1}
         with self.assertRaisesRegex(ProtocolError,'independent detection episode'):validate_content(h.output,h.snapshot,manifest,h.strategy.bridge)
 
@@ -520,9 +534,209 @@ class OptimizerDeadlineReaderTests(unittest.TestCase):
             row['actions']=prior['actions']
             for p in row['after']['positions']:
                 for lot in p['lots']:lot['settled_at']=40
-        payload=b''.join(encoded(r)+b'\n'for r in rows);(h.output/'decisions.ndjson').write_bytes(payload)
+        payload=decision_payload(rows);(h.output/'decisions.ndjson').write_bytes(payload)
         manifest=deepcopy(result['manifest']);manifest.pop('summary_sha256');manifest['files']['decisions.ndjson']={'sha256':hashlib.sha256(payload).hexdigest(),'byte_length':len(payload),'records':len(rows)}
         with self.assertRaisesRegex(ProtocolError,'missing required decision deadline'):validate_content(h.output,h.snapshot,manifest,h.strategy.bridge)
+
+
+class OptimizerReviewRegressions(unittest.TestCase):
+    setUp = OptimizerReplayTests.setUp
+    harness = OptimizerReplayTests.harness
+
+    def test_reader_rejects_false_advertised_bound_and_frontier_kind(self):
+        h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2));result=h.finish()
+        original=h.records('decisions.ndjson')
+        for mutation in ('upper_bound','frontier_status'):
+            rows=deepcopy(original)
+            problem=next(r['scenarios'][0]['detection'][0]for r in rows if r['type']=='decision'and r['scenarios'][0]['actions'])
+            if mutation=='upper_bound':problem['upper_bound']='0'
+            else:problem['found']['frontier_status']='EXHAUSTIVE_OPTIMAL_FRONTIER'
+            payload=decision_payload(rows);(h.output/'decisions.ndjson').write_bytes(payload)
+            manifest=deepcopy(result['manifest']);manifest.pop('summary_sha256')
+            manifest['files']['decisions.ndjson']={'sha256':hashlib.sha256(payload).hexdigest(),'byte_length':len(payload),'records':len(rows)}
+            with self.subTest(mutation=mutation),self.assertRaisesRegex(ProtocolError,'independent.*(upper bound|frontier)'):
+                validate_content(h.output,h.snapshot,manifest,h.strategy.bridge)
+
+    def test_reader_rejects_writer_valuation_bug_even_while_patch_is_active(self):
+        from replay.strategies.bounded_payout_optimizer import scenario
+        original=scenario.portfolio_value
+        def broken(*args):
+            margin,*rest=original(*args)
+            return (margin+1,*rest)
+        h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')},cap='1')
+        with patch.object(scenario,'portfolio_value',side_effect=broken):
+            h.pm_ask(12,'123',(200,1));h.pm_ask(12,'987',(1000,1))
+            with self.assertRaisesRegex(ProtocolError,'independent.*(margin|payoff|valuation)'):
+                h.finish()
+
+    def test_entire_decision_has_one_shared_search_budget(self):
+        from replay.strategies.bounded_payout_optimizer import scenario
+        original=scenario.solve;visits=[]
+        def counting(*args,**kwargs):
+            result=original(*args,**kwargs);visits.append(result['visited']);return result
+        h=self.harness(game=game_file(),p={'max_search_nodes':8})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        with patch.object(scenario,'solve',side_effect=counting):
+            h.strategy.flush()
+        self.assertLessEqual(sum(visits),8,visits)
+
+    def test_contradictory_results_are_flagged_in_knowledge(self):
+        k=Knowledge({'home':0,'away':1})
+        k.apply([{'kind':'segment_end','index':i,'winner':'home','release_ns':i,'source_ns':i}for i in (1,2,3)])
+        self.assertEqual(k.feasible(('seq:HH','seq:HAH','seq:HAA','seq:AHH','seq:AHA','seq:AA')),())
+        self.assertTrue(k.record()['contradiction'])
+
+    def test_malformed_settlement_uses_closed_config_error(self):
+        from replay.strategies.bounded_payout_optimizer.contract import validate
+        h=self.harness()
+        for bad in ({},[],{'mode':'NORMAL_RESOLUTION_SCENARIO'},'not a block'):
+            cfg=deepcopy(h.optimizer_config);cfg['policy']['settlement']=bad
+            with self.subTest(bad=bad),self.assertRaises(ProtocolError):validate(cfg)
+
+    def test_skipped_entries_summary_counts_reasons(self):
+        h=self.harness(cash='0');h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        result=h.finish()
+        self.assertEqual(result['summary']['rows'][0]['skipped_entries_by_reason'],{'CASH_BUDGET_OR_CAPACITY':1})
+
+    def test_scope_change_cancels_pending_even_if_native_books_survive(self):
+        h=self.harness(scopes=True,p={'decision_delay_ns':'10'})
+        h.pm_ask(20,'123',(400,2));h.pm_ask(20,'987',(500,2));h.group(21)
+        h.group(26)
+        h.finish()
+        actions=[a for r in h.records('decisions.ndjson')if r['type']=='decision'for a in r['scenarios'][0]['actions']]
+        self.assertTrue(any(a['kind']=='CANCELLED'and a['reason']=='SCOPE_CHANGED'for a in actions),actions)
+        self.assertFalse(any(a['kind']=='OPEN'for a in actions))
+
+    def test_unchanged_book_gets_current_decision_fee_proofs(self):
+        h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2));h.group(13)
+        h.strategy.flush()
+        h.strategy.decide(14,force=True)
+        h.finish()
+        row=next(r for r in h.records('decisions.ndjson')if r['t_ns']=='14')
+        proofs=[o for r in row['scenarios'][0]['detection'] for o in r['found']['best']['orders']]
+        self.assertTrue(proofs)
+        self.assertEqual({o['fee_priced_ns']for o in proofs},{14})
+
+    def test_cache_cannot_hide_changed_economics_at_materialization(self):
+        from replay.strategies.bounded_payout_optimizer import scenario
+        h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2));h.group(13)
+        h.strategy.flush()
+        original=scenario.price_order
+        def changed(*args,**kwargs):
+            order=original(*args,**kwargs)
+            if order is not None and args[3]==14:order={**order,'cash':order['cash']-Fraction(1,100)}
+            return order
+        with patch.object(scenario,'price_order',side_effect=changed),self.assertRaises(ProtocolError):
+            h.strategy.decide(14,force=True)
+
+    def test_reader_rejects_false_unavailable_search_that_hides_positive(self):
+        from replay.strategies.bounded_payout_optimizer import strategy
+        original=strategy.search
+        def missing(*args,**kwargs):
+            before=kwargs['budget'].used
+            results,models=original(*args,**kwargs)
+            kwargs['budget'].used=before
+            return ([{'shape':r['shape'],'status':'INPUT_UNAVAILABLE','rejected':r['rejected']}if 'found'in r else r for r in results],models)
+        h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        with patch.object(strategy,'search',side_effect=missing),self.assertRaises(ProtocolError):h.finish()
+
+    def test_reader_rejects_writer_settlement_fault_with_consistent_writer_ledger(self):
+        from replay.strategies.bounded_payout_optimizer.scenario import Account
+        g=game_file();g['segments']=[{'index':1,'start_ns':12,'start_estimated':True,'end_ns':20,'settled_ns':None,'winner':'home','details':{}},
+            {'index':2,'start_ns':21,'start_estimated':True,'end_ns':30,'settled_ns':None,'winner':'home','details':{}}]
+        g['match']={'end_ns':30,'winner':'home','score':{'home':2,'away':0}}
+        h=self.harness(game=g,p={'settlement':{'mode':'NORMAL_RESOLUTION_SCENARIO','delay_ns':'2'}})
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        original=Account.settle
+        def faulty(account,*args):
+            actions=original(account,*args)
+            for action in actions:
+                if action['kind']!='SETTLEMENT':continue
+                position=next(p for p in account.positions if p['id']==action['position'])
+                lot=next(l for l in position['lots']if l['key']==action['key'])
+                action['credit']+=1;lot['credit']+=1;position['pnl']+=1
+                account.cash[cash_key(lot['venue'],lot['asset'])]+=1
+            return actions
+        with patch.object(Account,'settle',faulty),self.assertRaises(ProtocolError):h.finish()
+
+    def test_repeated_fee_certificates_fit_real_event_output_budget(self):
+        h=self.harness(books={('kalshi:series','outcome'),('kalshi:beta','outcome')},cap='100',fees='collateral')
+        h.kalshi_ask(12,'series','outcome',(48,100));h.kalshi_ask(12,'beta','outcome',(48,100));h.group(13)
+        h.kalshi_ask(14,'series','outcome',(47,100));h.group(15)
+        h.kalshi_ask(16,'series','outcome',(48,100));h.group(17)
+        h.kalshi_ask(18,'series','outcome',(47,100));h.group(19);h.finish()
+        raw=[json.loads(line)for line in (h.output/'decisions.ndjson').read_bytes().splitlines()]
+        delta=next(row for row in reversed(raw)if row['kind']=='delta')
+        from replay.strategies.bounded_payout_optimizer.contract import MAX_BYTES
+        self.assertLess(100000*(len(encoded(delta))+1),MAX_BYTES)
+
+    def test_supervised_finish_does_not_run_the_long_independent_audit(self):
+        h=self.harness();h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        h.terminal();h.decoder.finish()
+        with patch('replay.strategies.bounded_payout_optimizer.output.validate_content',side_effect=AssertionError('audit stalls terminal ACK')):
+            h.strategy.finish()
+        read_provisional(h.output,self.root/'context',expected_sha256=h.sha,bridge=h.strategy.bridge)
+
+    def test_gross_branch_bounds_match_cartesian_with_nonlinear_nonnegative_fees(self):
+        from itertools import product
+        import random
+        rng=random.Random(83)
+        for case in range(30):
+            books=[dict(key=(str(i),'outcome'),keys=frozenset(w for w in 'abc'if rng.randrange(2)),increment=1,cap=3,ask=rng.randrange(1,10),fee=rng.randrange(4))for i in range(4)]
+            def pricing(b,q):return dict(key=b['key'],quantity=q,cash=-Fraction(b['ask']*q+b['fee']*(q%2),10),retained=Fraction(q),source=b['key'],taken=((1,q),))
+            coefficients={b['key']:tuple(10*int(w in b['keys'])-b['ask']for w in 'abc')for b in books}
+            found=solve(books,tuple('abc'),pricing,max_legs=3,max_nodes=10000,outcome_bounds=(10,coefficients))
+            reference=[]
+            for vector in product(range(4),repeat=4):
+                orders=[pricing(b,q)for b,q in zip(books,vector)if q]
+                if len(orders)>3:continue
+                cost=-sum((o['cash']for o in orders),Fraction(0));floor=min(sum(q for b,q in zip(books,vector)if w in b['keys'])for w in 'abc')
+                reference.append((-(floor-cost),cost,len(orders),tuple((o['key'],o['quantity'])for o in orders)))
+            best=found['best']
+            with self.subTest(case=case):
+                self.assertTrue(found['complete'])
+                self.assertEqual((-best['margin'],best['cost'],len(best['orders']),tuple((o['key'],o['quantity'])for o in best['orders'])),min(reference))
+
+    def test_transport_is_bounded_canonical_and_copy_on_write(self):
+        from replay.strategies.bounded_payout_optimizer.stream import pack,unpack,expand,changes
+        old=pack({'type':'decision','value':{'items':['a','b'],'time':1}})
+        new=pack({'type':'decision','value':{'items':['a','changed','c'],'time':2}})
+        stored={'version':2,'index':1,'kind':'delta','patch':changes(old,new)}
+        result=expand(stored,old,1)
+        self.assertEqual(unpack(result)['value']['items'],['a','changed','c'])
+        self.assertEqual(unpack(old)['value']['items'],['a','b'])
+        for bad in ({**stored,'unexpected':1},{**stored,'index':True},{**stored,'patch':[1,999,[0,'bad']]}):
+            with self.subTest(bad=bad),self.assertRaises(ProtocolError):expand(bad,old,1)
+        with patch('replay.strategies.bounded_payout_optimizer.stream.MAX_LINE',8),self.assertRaises(ProtocolError):expand(stored,old,1)
+
+    def test_primitive_cache_enforces_byte_bound_and_contains_no_proof_ids(self):
+        from replay.strategies.bounded_payout_optimizer.scenario import PrimitiveCache
+        cache=PrimitiveCache(4096)
+        for i in range(100):cache.put((str(i),),{'quantity':i,'cash':Fraction(-i,10)})
+        self.assertLessEqual(cache.retained_bytes,4096)
+        self.assertLess(len(cache.items),100)
+
+    def test_reader_rejects_certified_negative_that_hides_missing_fees(self):
+        from replay.strategies.bounded_payout_optimizer import strategy
+        def configure(cfg):
+            from replay.fees.artifacts import build_catalog
+            from replay.fees.schedules import Catalog
+            catalog=Catalog.build(());directory=build_catalog(self.root/'no-fees',catalog,{})
+            cfg['fees'].update(catalog_directory=str(directory),catalog_identity=catalog.identity)
+        h=self.harness(configure=configure,books={('polymarket:123','outcome'),('polymarket:987','outcome')})
+        h.pm_ask(12,'123',(900,2));h.pm_ask(12,'987',(900,2))
+        original=strategy.search
+        def hide_unknown(*args,**kwargs):
+            results,models=original(*args,**kwargs)
+            for result in results:
+                if 'found'in result:
+                    result['found']['unknown_books']=[];result['fee_diagnostics']=[];result['pricing_failures']={};result['economic_status']='COMPLETE_NONPOSITIVE'
+            return results,models
+        with patch.object(strategy,'search',side_effect=hide_unknown),self.assertRaises(ProtocolError):h.finish()
 
 if __name__ == '__main__':
     unittest.main()

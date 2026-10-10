@@ -66,6 +66,7 @@ def validate(config):
     require(h['maximum_duration_ns'] is None or uint(h['maximum_duration_ns']) > 0, 'holding duration')
     s = p['settlement']
     if s is not None:
+        require(type(s) is dict and 'mode' in s, 'settlement block')
         require(s['mode'] in ('NORMAL_RESOLUTION_SCENARIO','PINNED_SETTLEMENT'), 'settlement mode')
         if s['mode'] == 'NORMAL_RESOLUTION_SCENARIO':
             obj(s,'mode delay_ns'); uint(s['delay_ns'])

@@ -6,6 +6,7 @@ remains bound to the supervisor/pins; carried detached books are writer-attested
 from fractions import Fraction
 import hashlib
 from pathlib import Path
+from collections import OrderedDict
 
 from replay.economic_sdk.game import Timeline, binding, experiment_policy
 from replay.economic_sdk.bounds import MAX_STATE, json_cost
@@ -16,8 +17,8 @@ from replay.strategy_sdk import plain
 from replay.streams.protocol import decode, obj, require, uint, freeze
 from replay.strategies._shared.fee_bridge import FeeBridge
 from .contract import NAME, MAX_LINE, MAX_BYTES, MAX_ROWS, Inputs, validate, decimal, wire, cash_key
-from .core import Capacity, Knowledge
-from .scenario import models, search, price_order, portfolio_value, weights, remaining_payouts, liquidation_marks, position_metrics, outstanding_cost
+from .audit import Capacity, Knowledge, models, price_order, verify_portfolio, negative_bound, weights, remaining_payouts, liquidation_marks, position_metrics, outstanding_cost
+from .stream import expand,unpack
 
 
 def read_json(path):
@@ -66,34 +67,34 @@ class ReaderAccount:
         return True
 
     def settlements(self,time,knowledge):
-        result=[]; policy=self.config['policy']['settlement']
-        for p in self.open_positions:
-            for lot in p['lots']:
-                if lot['settled']:continue
-                if knowledge.contradiction:
-                    p['guarantee_valid']=False; continue
-                due=payout=None
-                if policy and policy['mode']=='PINNED_SETTLEMENT':
-                    row=next((r for r in policy['payouts'] if (r['instrument'],r['orientation'])==tuple(lot['key'])),None)
-                    if row: due=int(row['availability_ns']); payout=Fraction(row['payout'])
-                elif policy:
+        policy=self.config['policy']['settlement'];credits=[];positions=self.open_positions
+        pin={(r['instrument'],r['orientation']):(Fraction(r['payout']),int(r['availability_ns']))for r in policy['payouts']}if policy and policy['mode']=='PINNED_SETTLEMENT'else {}
+        for position in positions:
+            unresolved=[lot for lot in position['lots']if not lot['settled']]
+            if knowledge.contradiction:
+                position['guarantee_valid']=False;continue
+            for lot in unresolved:
+                entitlement=pin.get(tuple(lot['key']))
+                if policy and policy['mode']=='NORMAL_RESOLUTION_SCENARIO':
                     possible=knowledge.feasible(lot['all_outcomes'])
-                    if not possible:
-                        p['guarantee_valid']=False;continue
-                    values={w in lot['keys'] for w in possible}
-                    if len(values)==1:
-                        if lot['determined_ns'] is None: lot['determined_ns']=knowledge.determined(lot['keys'],lot['all_outcomes'])
-                        if lot['determined_ns'] is None:continue
-                        due=lot['determined_ns']+int(policy['delay_ns']); payout=Fraction(int(next(iter(values))))
-                if due is None:continue
-                lot['due_ns']=max(p['opened_ns'],due)
-                if lot['due_ns']>time:continue
-                credit=lot['retained']*payout; key=cash_key(lot['venue'],lot['asset'])
-                self.cash[key]=self.cash.get(key,Fraction(0))+credit; self.assets[key]=lot['asset']
-                lot.update(settled=True,settled_at=time,credit=credit,remaining_quantity=Fraction(0)); p['pnl']+=credit+lot['cash']
-                result.append({'kind':'SETTLEMENT','position':p['id'],'key':lot['key'],'credit':credit,
-                    'payout':payout,'due_ns':lot['due_ns'],'mode':policy['mode']})
-            if all(l['settled'] for l in p['lots']): p['state']='CLOSED'; self.closed_at=time
+                    if not possible:position['guarantee_valid']=False;continue
+                    paid=sum(w in lot['keys']for w in possible)
+                    if paid not in (0,len(possible)):continue
+                    first=knowledge.determined(lot['keys'],lot['all_outcomes'])
+                    if first is None:continue
+                    lot['determined_ns']=first
+                    entitlement=Fraction(int(paid==len(possible))),first+int(policy['delay_ns'])
+                if entitlement is None:continue
+                payout,available=entitlement;lot['due_ns']=max(position['opened_ns'],available)
+                if lot['due_ns']<=time:credits.append((position,lot,payout))
+        result=[]
+        for position,lot,payout in credits:
+            amount=lot['retained']*payout;account=cash_key(lot['venue'],lot['asset'])
+            self.cash[account]=self.cash.get(account,Fraction(0))+amount;self.assets[account]=lot['asset']
+            lot.update(settled=True,settled_at=time,credit=amount,remaining_quantity=Fraction(0));position['pnl']+=amount+lot['cash']
+            result.append({'kind':'SETTLEMENT','position':position['id'],'key':lot['key'],'credit':amount,'payout':payout,'due_ns':lot['due_ns'],'mode':policy['mode']})
+        for position in positions:
+            if all(lot['settled']for lot in position['lots']):position['state']='CLOSED';self.closed_at=time
         return result
 
     def opening(self,solution,time,identity,all_outcomes):
@@ -117,24 +118,103 @@ def selected(results):
     return min(rows,key=lambda r:(-r['found']['best']['margin'],r['found']['best']['cost'],len(r['found']['best']['orders']),r['shape'])) if rows else None
 
 
-def verify_scenario(row,account,config,snapshot,bridge,books,knowledge,time,sequence,scope,identity):
-    obj(row,'scenario comparison_label before detection actions after liquidation_marks pending signal armed nonpositive_since')
+def verify_search(rows,config,snapshot,bridge,books,knowledge,time,sequence,scope,identity,account=None,frozen=None,conditioned=False,remaining=None,proofs=None):
+    current,rejected,masks=models(snapshot,scope,config,bridge,books)
+    require(type(rows)is list and 1<=len(rows)<=len(masks.spaces)+1,'independent problem count')
+    shapes=[r['shape']for r in rows];require(shapes==(sorted(masks.spaces)or[None]),'independent problem identity/coverage')
+    if remaining is None:remaining=[config['policy']['max_search_nodes']]
+    if proofs is None:proofs={}
+    result=[]
+    for row in rows:
+        require(row['rejected']==rejected,'independent rejected input admission')
+        expected=None;selected_models=[];outcomes=()
+        if row['shape']is None:expected='OUTCOMES_UNAVAILABLE'
+        else:
+            space=masks.spaces[row['shape']]
+            selected_models=[m for m in current if m['shape']==row['shape']]
+            outcomes=knowledge.feasible(space.keys)if conditioned else tuple(space.keys)
+            if space.coverage!='EXHAUSTIVE':expected='INCOMPLETE_SPACE'
+            elif not outcomes:expected='GAME_CONTRADICTION'
+            elif len(selected_models)>config['policy']['max_books']or len(outcomes)>config['policy']['max_outcomes']:expected='DOMAIN_EXCEEDED'
+            elif frozen is not None:
+                selected_models=[{**m,'cap':min(m['cap'],frozen[m['key']])}for m in selected_models if m['key']in frozen]
+                if {m['key']for m in selected_models}!=set(frozen):expected='PENDING_ADMISSION_CHANGED'
+            if expected is None:
+                if not selected_models:expected='INPUT_UNAVAILABLE'
+                elif remaining[0]==0:expected='SEARCH_BUDGET_EXHAUSTED'
+                elif decimal(config['policy']['holding_cost']['rate_per_ns'])and config['policy']['holding_cost']['maximum_duration_ns']is None:expected='HOLDING_COST_UNKNOWN'
+        if 'found'not in row:
+            obj(row,'shape status rejected');require(expected is not None and row['status']==expected,'independent unavailable problem cause')
+            result.append(row);continue
+        require(expected is None,'independent search admission cause')
+        obj(row,'shape status economic_status outcomes fee_diagnostics pricing_failures blocked_portfolios valuation_unknown rejected found qualifying depth_caps upper_bound negative_certificate')
+        require(row['shape']in masks.spaces,'independent supported outcome shape')
+        space=masks.spaces[row['shape']];require(space.coverage=='EXHAUSTIVE','independent exhaustive scope')
+        outcomes=knowledge.feasible(space.keys)if conditioned else tuple(space.keys)
+        require(outcomes and list(outcomes)==row['outcomes'],'independent released outcome constraints')
+        lookup={m['key']:m for m in selected_models}
+        require(row['depth_caps']==[{'key':list(m['key']),'quantity_atoms':str(m['cap']),'configured_atoms':str(m['configured_cap'])}for m in selected_models],'independent displayed grid caps')
+        valuations=weights(config['valuation'],[cash_key('',m['asset'])[1]for m in selected_models])
+        require(row['valuation_unknown']is(valuations is None),'independent valuation availability')
+        gross_upper=None if valuations is None else sum(sorted((Fraction(m['cap'],10**m['quantity_scale'])*valuations[0][cash_key('',m['asset'])[1]]for m in selected_models),reverse=True)[:config['policy']['max_legs']],Fraction(0))
+        require(row['upper_bound']==wire(gross_upper),'independent gross payout upper bound')
+        found=obj(row['found'],'best alternatives capital_frontier frontier_status visited complete unknown_books')
+        require(found['frontier_status']=='BOUNDED_FEASIBLE_SAMPLES','independent sampled capital frontier kind')
+        require(type(found['visited'])is int and 0<=found['visited']<=config['policy']['max_search_nodes']and type(found['complete'])is bool,'independent search count bound')
+        require(found['visited']<=remaining[0],'independent shared search allowance');remaining[0]-=found['visited']
+        bound=negative_bound(selected_models,outcomes,config)
+        # The count includes whole-suffix bounds as well as portfolio valuations;
+        # enumeration/branch coverage is writer-attested, never an optimality proof.
+        require(found['visited']<=config['policy']['max_search_nodes'],'independent finite domain evaluation budget')
+        require(row['status']==('SEARCH_COMPLETE'if found['complete']else'SEARCH_LIMITED'),'independent search status')
+        native={**found,'best':verify_portfolio(found['best'],lookup,outcomes,config,bridge,time,sequence,scope,identity,account.capacity if account else None,proofs)}
+        for name in ('alternatives','capital_frontier'):
+            require(type(found[name])is list and len(found[name])<=config['policy']['alternatives'],'independent retained proof bound')
+            native[name]=[verify_portfolio(p,lookup,outcomes,config,bridge,time,sequence,scope,identity,account.capacity if account else None,proofs)for p in found[name]]
+        best=native['best']
+        require(all(best['margin']>=p['margin']for p in native['alternatives']+native['capital_frontier']),'independent retained winner objective')
+        if account:require(all(account.permits(p['orders'])for p in [best]+native['alternatives']+native['capital_frontier']),'independent entry capital constraints')
+        qualifying=best['margin']>0 and best['margin']>=decimal(config['policy']['minimum_net_margin'])and 10000*best['margin']>=int(config['policy']['minimum_return_bps'])*best['cost']
+        require(row['qualifying']is qualifying,'independent entry margin gates')
+        require(row['negative_certificate']==(wire({'kind':'UNIFORM_OUTCOME_GROSS_DUAL_BOUND','margin_upper_bound':bound})if bound is not None else None),'independent negative dual certificate')
+        if row['economic_status']=='COMPLETE_NONPOSITIVE':
+            require(found['complete']and best['margin']<=0 and bound is not None and bound<=0 and not found['unknown_books']and not row['valuation_unknown'],'independent certified economic negative')
+            availability=proofs.setdefault('availability',OrderedDict())
+            for model in selected_models:
+                levels=account.capacity.eligible(model['source'],model['source_levels'])if account else model['source_levels']
+                key=bridge.engine_identity,scope,model['key'],model['market_id'],model['increment'],digest(wire(levels))
+                if bridge._engine.resolver.reference_time is None or key not in availability:
+                    availability[key]=price_order(bridge,model,model['increment'],time,sequence,scope,identity,account.capacity if account else None)is not None
+                    while len(availability)>4096:availability.popitem(last=False)
+                require(availability[key],'independent certified negative fee availability')
+        if qualifying:require(row['economic_status']=='POSITIVE','independent positive economic status')
+        elif best['margin']>0:require(row['economic_status']=='FEASIBLE_BELOW_ENTRY_THRESHOLD','independent below-threshold status')
+        else:require(row['economic_status']in ('COMPLETE_NONPOSITIVE','INPUT_UNKNOWN','UNCERTIFIED_NONPOSITIVE','LIMITED_NO_POSITIVE'),'independent nonpositive uncertainty')
+        result.append({**row,'found':native})
+    return result,current
+
+
+def verify_scenario(row,account,config,snapshot,bridge,books,knowledge,time,sequence,scope,identity,remaining,proofs):
+    obj(row,'scenario comparison_label before detection actions after liquidation_marks pending signal armed nonpositive_since entry_search')
     name=row['scenario']; conditioned=name=='conditioned'
     require(row['before']==account.record(time),'reader opening account conservation')
     actions=account.settlements(time,knowledge)
-    detected,current_models=search(config,bridge,snapshot,scope,books,knowledge,time,sequence,identity,conditioned=conditioned)
-    require(row['detection']==wire(detected),'independent search/payoff/fee proof')
+    detected,current_models=verify_search(row['detection'],config,snapshot,bridge,books,knowledge,time,sequence,scope,identity,conditioned=conditioned,remaining=remaining,proofs=proofs)
     positive=selected(detected)
     nonpositive=bool(detected) and all(r.get('economic_status')=='COMPLETE_NONPOSITIVE' and r['found']['best']['margin']<=0 for r in detected)
     if nonpositive:
         if account.nonpositive_since is None:account.nonpositive_since=time
         if not account.open_positions and account.nonpositive_since+int(config['policy']['rearm_nonpositive_ns'])<=time:account.armed=True
     else:account.nonpositive_since=None
-    attempted=False
+    attempted=False;used_entry_search=False
+    if account.pending and account.pending['scope']!=scope:
+        pending=account.pending;account.pending=None;attempted=True
+        actions.append({'kind':'CANCELLED','attempt':pending['id'],'reason':'SCOPE_CHANGED'})
     if account.pending and account.pending['due_ns']<=time:
         pending=account.pending;account.pending=None;attempted=True
-        found,current=search(config,bridge,snapshot,scope,books,knowledge,time,sequence,identity,account=account,
-                    frozen={tuple(k):q for k,q in pending['caps']},conditioned=conditioned)
+        require(row['entry_search']is not None,'missing required delayed entry proof');used_entry_search=True
+        found,current=verify_search(row['entry_search'],config,snapshot,bridge,books,knowledge,time,sequence,scope,identity,account=account,
+                    frozen={tuple(k):q for k,q in pending['caps']},conditioned=conditioned,remaining=remaining,proofs=proofs)
         best=selected([r for r in found if r['shape']==pending['shape']]); modelmap={b['key']:b for b in current}
         if best and all(modelmap.get(tuple(k),{}).get('rule_identity')==rule for k,rule in pending['rules']):
             actions.append(account.opening(best['found']['best'],time,pending['id'],outcome_scope(snapshot,scope).spaces[pending['shape']].keys))
@@ -148,17 +228,19 @@ def verify_scenario(row,account,config,snapshot,bridge,books,knowledge,time,sequ
             actions.append({'kind':'SKIPPED','attempt':attempt,'reason':'OPEN_OR_SAME_TIME_CLOSED_POSITION'})
         elif int(config['policy']['decision_delay_ns']):
             best=positive['found']['best'];due=time+int(config['policy']['decision_delay_ns'])
-            account.pending={'id':attempt,'due_ns':due,'shape':positive['shape'],'caps':[(o['key'],o['quantity']) for o in best['orders']],
+            account.pending={'id':attempt,'due_ns':due,'shape':positive['shape'],'scope':scope,'caps':[(o['key'],o['quantity']) for o in best['orders']],
                 'rules':[(o['key'],o['rule_identity']) for o in best['orders']]}
             actions.append({'kind':'PENDING','attempt':attempt,'due_ns':due,'caps':account.pending['caps']})
         else:
-            found,_=search(config,bridge,snapshot,scope,books,knowledge,time,sequence,identity,account=account,conditioned=conditioned)
+            require(row['entry_search']is not None,'missing required entry proof');used_entry_search=True
+            found,_=verify_search(row['entry_search'],config,snapshot,bridge,books,knowledge,time,sequence,scope,identity,account=account,conditioned=conditioned,remaining=remaining,proofs=proofs)
             best=selected(found)
             if best:
                 actions.append(account.opening(best['found']['best'],time,attempt,outcome_scope(snapshot,scope).spaces[best['shape']].keys))
                 actions.extend(account.settlements(time,knowledge))
             else:actions.append({'kind':'SKIPPED','attempt':attempt,'reason':'CASH_BUDGET_OR_CAPACITY','search':found})
     account.signal=positive is not None
+    require(used_entry_search or row['entry_search']is None,'unrequested entry proof')
     require(row['actions']==wire(actions),'independent position lifecycle/actions')
     require(row['liquidation_marks']==wire(liquidation_marks(config,bridge,account,models(snapshot,scope,config,bridge,books,require_asks=False)[0],time,sequence,scope,identity)),'independent unposted liquidation mark')
     require(row['after']==account.record(time),'reader closing account/depth/holdings conservation')
@@ -190,10 +272,11 @@ def check_books(rows,plans,allowed,time):
 def validate_content(directory,snapshot,manifest,bridge=None):
     obj(manifest,'version strategy snapshot_sha256 experiment_sha256 config fee_engine_identity files run_identity source_revision labels'+
         (' summary_sha256' if 'summary_sha256'in manifest else '')+(' game_state' if 'game_state'in manifest else ''))
-    require(type(manifest['version'])is int and manifest['version']==1 and manifest['strategy']==NAME,'optimizer output version')
+    require(type(manifest['version'])is int and manifest['version']==2 and manifest['strategy']==NAME,'optimizer output version')
     config=validate(manifest['config']);require(manifest['source_revision']==config['source_revision'],'source revision binding');require(config['snapshot_sha256']==manifest['snapshot_sha256'],'snapshot manifest pin')
     for field in ('snapshot_sha256','experiment_sha256','fee_engine_identity','run_identity'):sha(manifest[field])
     bridge=bridge or FeeBridge(config['fees'],plain(snapshot['plans']))
+    require(not bridge._engine.policy.include_account_rebates and not bridge._engine.policy.include_rounding_refunds,'independent nonnegative fee assumptions for dual bound')
     require(bridge.engine_identity==manifest['fee_engine_identity'],'fee engine identity')
     identity=digest({'strategy':NAME,'snapshot_sha256':manifest['snapshot_sha256'],'source_revision':config['source_revision'],'policy':experiment_policy(config['policy']),
                      'fees':bridge.semantic_config,'valuation':config['valuation'],'account':config['account'],'rules':config['rules']})
@@ -217,13 +300,14 @@ def validate_content(directory,snapshot,manifest,bridge=None):
     allowed|={source_key(k)for k in allowed};allowed&=set(plans)
     obj(manifest['files'],'decisions.ndjson episodes.ndjson');file=obj(manifest['files']['decisions.ndjson'],'sha256 byte_length records');sha(file['sha256'])
     path=Path(directory)/'decisions.ndjson';require(path.is_file()and not path.is_symlink(),'regular decision file')
-    hasher=hashlib.sha256();size=count=0;previous=None;sequence=-1;terminal=None;latest=None;stats={};episodes={}
+    hasher=hashlib.sha256();size=count=0;previous=None;sequence=-1;terminal=None;latest=None;stats={};episodes={};transport_state=None
+    availability=OrderedDict()
     episode_path=Path(directory)/'episodes.ndjson'
     require(episode_path.is_file()and not episode_path.is_symlink(),'regular episode file')
-    episode_hasher=hashlib.sha256();episode_size=episode_count=0
+    episode_hasher=hashlib.sha256();episode_size=episode_count=0;episode_transport_state=None
     episode_file=obj(manifest['files']['episodes.ndjson'],'sha256 byte_length records');sha(episode_file['sha256'])
     def close_episode(name,end,chosen,censored,stream):
-        nonlocal episode_size,episode_count
+        nonlocal episode_size,episode_count,episode_transport_state
         prior=episodes.pop(name)
         if end==prior['start_ns']:return
         expected=wire({**prior,'end_ns':end,'duration_ns':end-prior['start_ns'],'censored':censored,
@@ -232,7 +316,9 @@ def validate_content(directory,snapshot,manifest,bridge=None):
         require(raw and len(raw)<=MAX_LINE and raw.endswith(b'\n'),'bounded episode line/LF')
         episode_count+=1;episode_size+=len(raw);episode_hasher.update(raw)
         require(episode_count<=MAX_ROWS and episode_size<=MAX_BYTES,'episode file budget')
-        require(raw==encoded(expected)+b'\n','independent detection episode')
+        stored=decode(raw[:-1],MAX_LINE);require(encoded(stored)+b'\n'==raw,'canonical episode bytes')
+        episode_transport_state=expand(stored,episode_transport_state,episode_count-1)
+        require(unpack(episode_transport_state)==expected,'independent detection episode')
         stats[name]['episodes']+=1
     def update_episodes(row,stream):
         end=int(row['t_ns']);censored=row['type']=='terminal'
@@ -265,7 +351,8 @@ def validate_content(directory,snapshot,manifest,bridge=None):
         while raw := stream.readline(MAX_LINE+1):
             size+=len(raw);count+=1;hasher.update(raw)
             require(size<=MAX_BYTES and count<=MAX_ROWS and len(raw)<=MAX_LINE and raw.endswith(b'\n'),'decision file budget/LF')
-            row=decode(raw[:-1],MAX_LINE);require(encoded(row)+b'\n'==raw,'canonical decision bytes')
+            stored=decode(raw[:-1],MAX_LINE);require(encoded(stored)+b'\n'==raw,'canonical decision bytes')
+            transport_state=expand(stored,transport_state,count-1);row=unpack(transport_state)
             require(terminal is None,'rows after terminal')
             time=uint(row['t_ns']);require(previous is None or time>previous,'strict committed decision time')
             require(type(row['sequence'])is int and row['sequence']>=sequence,'decision sequence');sequence=row['sequence']
@@ -293,7 +380,10 @@ def validate_content(directory,snapshot,manifest,bridge=None):
                     elif f.kind=='match_end':value.update(winner=f.value['winner'],score=dict(f.value['score']))
                     facts.append(value)
             require(row['facts']==facts,'only every released game fact')
-            knowledge.apply(facts);require(row['knowledge']==knowledge.record(),'released knowledge/prefix alignment')
+            knowledge.apply(facts)
+            if 'conditioned'in accounts:
+                for space in outcome_scope(snapshot,row['scope']).spaces.values():knowledge.feasible(space.keys)
+            require(row['knowledge']==knowledge.record(),'released knowledge/prefix alignment')
             add_duration(time)
             if row['type']=='terminal':
                 obj(row,'type t_ns sequence facts knowledge books scope accounts');require(type(row['scope'])is int and row['scope']==len(snapshot['scopes'])-1,'terminal scope');require(time==end,'terminal at run end')
@@ -310,18 +400,25 @@ def validate_content(directory,snapshot,manifest,bridge=None):
                     for action in actions:stats[r['scenario']]['actions'][action['kind']]=stats[r['scenario']]['actions'].get(action['kind'],0)+1
                 terminal=row;latest=None
             else:
-                obj(row,'type t_ns sequence scope facts knowledge books scenarios');require(row['type']=='decision'and time<end,'decision type/end')
+                obj(row,'type t_ns sequence scope facts knowledge books scenarios search_budget');require(row['type']=='decision'and time<end,'decision type/end')
+                search_budget=obj(row['search_budget'],'limit evaluations')
+                evaluations=sum(r['found']['visited']for scenario in row['scenarios']for r in scenario['detection']+(scenario['entry_search']or [])if 'found'in r)
+                require(search_budget=={'limit':policy['max_search_nodes'],'evaluations':evaluations}and evaluations<=policy['max_search_nodes'],'independent per-decision search budget')
                 require(previous is not None or time==start,'decision start coverage')
                 scope=next(i for i,s in enumerate(snapshot['scopes'])if int(s['start_ns'])<=time<int(s['end_ns']))
                 require(type(row['scope'])is int and row['scope']==scope,'current scope at decision')
                 check_books(row['books'],plans,allowed,time)
                 require([r['scenario']for r in row['scenarios']]==list(accounts),'decision scenarios')
+                remaining=[policy['max_search_nodes']];proofs={'availability':availability}
                 for r in row['scenarios']:
                     name=r['scenario'];label='STATE_CONDITIONED'if name=='conditioned'else 'STATIC_GAME_UNAVAILABLE'if timeline is None or timeline.view.phase=='unavailable'else 'STATIC_REFERENCE'
                     require(r['comparison_label']==label,'game/static comparison label')
-                    verify_scenario(r,accounts[name],config,snapshot,bridge,row['books'],knowledge,time,sequence,scope,identity)
-                    stats.setdefault(name,dict(positive_ns=0,below_entry_threshold_ns=0,complete_nonpositive_ns=0,unknown_ns=0,episodes=0,actions={}))
-                    for action in r['actions']:stats[name]['actions'][action['kind']]=stats[name]['actions'].get(action['kind'],0)+1
+                    verify_scenario(r,accounts[name],config,snapshot,bridge,row['books'],knowledge,time,sequence,scope,identity,remaining,proofs)
+                    stats.setdefault(name,dict(positive_ns=0,below_entry_threshold_ns=0,complete_nonpositive_ns=0,unknown_ns=0,episodes=0,actions={},skipped_entries_by_reason={}))
+                    for action in r['actions']:
+                        stats[name]['actions'][action['kind']]=stats[name]['actions'].get(action['kind'],0)+1
+                        if action['kind']=='SKIPPED':
+                            reasons=stats[name]['skipped_entries_by_reason'];reasons[action['reason']]=reasons.get(action['reason'],0)+1
                 latest=row
             update_episodes(row,episode_stream)
             require(json_cost({'accounts':[a.record(time)for a in accounts.values()],'history':knowledge.history,'episodes':wire(episodes)})<=MAX_STATE,'reader retained state budget')
@@ -334,9 +431,12 @@ def validate_content(directory,snapshot,manifest,bridge=None):
     for name,account in accounts.items():
         stat=stats[name];require(sum(stat[k]for k in('positive_ns','below_entry_threshold_ns','complete_nonpositive_ns','unknown_ns'))==int(snapshot['config']['end_ns'])-int(snapshot['config']['start_ns']),'event-time denominator')
         rows.append({'scenario':name,**{k:str(v)if k.endswith('_ns')else v for k,v in stat.items()},'final_account':account.record(int(snapshot['config']['end_ns']))})
-    summary={'version':1,'strategy':NAME,'event_id':config['rules']['event_id'],'snapshot_sha256':manifest['snapshot_sha256'],
+    summary={'version':2,'strategy':NAME,'event_id':config['rules']['event_id'],'snapshot_sha256':manifest['snapshot_sha256'],
         'experiment_sha256':identity,'terminal_sequence':sequence+1,'time_unit':'event_nanoseconds','history_complete':snapshot['history_complete'],
-        'labels':labels,'rows':rows,'verification':'REPRICED_FEES_PAYOFFS_AND_NATIVE_LEDGER','book_evidence':'WRITER_ATTESTED_DETACHED_BOOKS_BOUND_TO_SUPERVISOR_PINS'}
+        'labels':labels,'rows':rows,'verification':'REPRICED_FEES_PAYOFFS_AND_NATIVE_LEDGER',
+        'search_coverage_verification':'WRITER_ATTESTED_GRID_COVERAGE_OR_INDEPENDENT_NEGATIVE_DUAL_BOUND',
+        'optimality_verification':'FEASIBLE_CERTIFICATE_ONLY_UNLESS_DUAL_BOUND_ATTAINED',
+        'book_evidence':'WRITER_ATTESTED_DETACHED_BOOKS_BOUND_TO_SUPERVISOR_PINS'}
     require(len(encoded(summary))<=MAX_LINE,'optimizer summary bound')
     return summary
 
@@ -350,7 +450,7 @@ def read_provisional(directory,snapshot_directory,*,expected_sha256,bridge=None)
     root=Path(directory);snapshot=load_snapshot(snapshot_directory,expected_sha256=expected_sha256)
     manifest=read_json(root/'manifest.json');require(manifest['snapshot_sha256']==expected_sha256,'snapshot binding')
     receipt=obj(read_json(root/'content_receipt.json'),'version semantic_sha256 run_id attempt_id group identity terminal')
-    require(type(receipt['version'])is int and receipt['version']==1,'receipt version');sha(receipt['identity']);sha(receipt['semantic_sha256'])
+    require(type(receipt['version'])is int and receipt['version']==2,'receipt version');sha(receipt['identity']);sha(receipt['semantic_sha256'])
     require(receipt['semantic_sha256']==digest(manifest),'semantic receipt identity')
     for field in('run_id','attempt_id','group'):require(type(receipt[field])is str and 0<len(receipt[field])<=128,'receipt identifiers')
     require(type(receipt['terminal'])is int and receipt['terminal']>=2,'terminal sequence')

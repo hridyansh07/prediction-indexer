@@ -7,13 +7,14 @@ from replay.economic_sdk.bounds import MAX_STATE, json_cost, view_cost
 from replay.economic_sdk.types import BookRequirement
 from replay.economic_sdk.views import ViewBuilder, touched_sides
 from replay.game_state import load
-from replay.preparation import digest
-from replay.strategy_sdk import LineWriter, plain
+from replay.preparation import digest,encoded
+from replay.strategy_sdk import plain
 from replay.streams.protocol import require
 from replay.supervisor import write_json_durable
 from .contract import Inputs, NAME, MAX_LINE, MAX_BYTES, MAX_ROWS, wire
-from .core import Knowledge
-from .scenario import Account, search, liquidation_marks, models as current_models
+from .core import Knowledge, SearchBudget
+from .stream import DecisionWriter
+from .scenario import Account, PrimitiveCache, search, liquidation_marks, models as current_models
 
 
 def fact_row(fact):
@@ -50,9 +51,12 @@ class Runtime:
         needed |= {source_key(k) for k in needed}
         self.builders={k:ViewBuilder(BookRequirement(('bid','ask'),(1,),ladders=('bid','ask')),plans[k]) for k in sorted(needed) if k in plans}
         self.views={}; self.staged=None; self.sequence=-1; self.terminal=False; self.poisoned=False; self.last_inputs=None
-        self.writer=LineWriter(self.root/'decisions.ndjson',max_bytes=MAX_BYTES,max_records=MAX_ROWS,max_line_bytes=MAX_LINE)
-        self.episode_writer=LineWriter(self.root/'episodes.ndjson',max_bytes=MAX_BYTES,max_records=MAX_ROWS,max_line_bytes=MAX_LINE)
+        self.writer=DecisionWriter(self.root/'decisions.ndjson',max_bytes=MAX_BYTES,max_records=MAX_ROWS,max_line_bytes=MAX_LINE)
+        self.episode_writer=DecisionWriter(self.root/'episodes.ndjson',max_bytes=MAX_BYTES,max_records=MAX_ROWS,max_line_bytes=MAX_LINE)
         self.episodes={}; self.facts=[]; self.decisions=0; self.processed_time=self.clock.start-1
+        self.pricing_cache=PrimitiveCache()
+        self.latest=None
+        self.stats={name:dict(positive_ns=0,below_entry_threshold_ns=0,complete_nonpositive_ns=0,unknown_ns=0,episodes=0,actions={},skipped_entries_by_reason={})for name in self.accounts}
 
     def __call__(self,cut):
         try:
@@ -111,6 +115,7 @@ class Runtime:
             self.release(time)
         else:
             self.release(time)
+            self.duration(time)
             rows=[]
             for name,account in self.accounts.items():
                 actions=account.settle(time,self.knowledge)
@@ -121,6 +126,7 @@ class Runtime:
                 current,_,_=current_models(self.snapshot,self.clock.scope,self.config,self.bridge,self.books(),require_asks=False)
                 marks=liquidation_marks(self.config,self.bridge,account,current,time,self.sequence,self.clock.scope,self.identity)
                 rows.append({'scenario':name,'actions':actions,'after':wire(account.record(time)),'liquidation_marks':wire(marks)})
+                self.count_actions(name,actions)
             self.update_episodes(time,None)
             self.guard_state(time)
             self.writer.append({'type':'terminal','t_ns':str(time),'sequence':self.sequence,
@@ -150,11 +156,17 @@ class Runtime:
                    any(l['due_ns'] is not None and l['due_ns'] <= time for p in a.open_positions for l in p['lots'] if not l['settled'])
                    for a in self.accounts.values())
         if not force and not timers and not self.facts and fingerprint == self.last_inputs: return
+        self.duration(time)
         self.last_inputs=fingerprint; scenarios=[]; episode_candidates={}
+        budget=SearchBudget(self.config['policy']['max_search_nodes'])
+        pricing_cache=self.pricing_cache
+        slots=2*len(self.accounts)
         for name,account in self.accounts.items():
             before=wire(account.record(time)); actions=account.settle(time,self.knowledge)
             conditioned=name == 'conditioned'
-            detected,models=search(self.config,self.bridge,self.snapshot,scope,books,self.knowledge,time,self.sequence,self.identity,conditioned=conditioned)
+            allowance=max(1,budget.remaining//slots) if budget.remaining else 0
+            detected,models=search(self.config,self.bridge,self.snapshot,scope,books,self.knowledge,time,self.sequence,self.identity,conditioned=conditioned,budget=budget,allotment=allowance,pricing_cache=pricing_cache)
+            slots-=1
             signal=choose(detected)
             episode_candidates[name]=(scope,signal)
             known_nonpositive=bool(detected) and all(r.get('economic_status') == 'COMPLETE_NONPOSITIVE' and r['found']['best']['margin'] <= 0 for r in detected)
@@ -165,11 +177,16 @@ class Runtime:
             else: account.nonpositive_since=None
             by_key={b['key']:b for b in models}
             pending=account.pending
-            attempted=False
+            attempted=False;entry_search=None
+            if pending is not None and pending['scope']!=scope:
+                account.pending=None;attempted=True
+                actions.append({'kind':'CANCELLED','attempt':pending['id'],'reason':'SCOPE_CHANGED'})
+                pending=None
             if pending is not None and pending['due_ns'] <= time:
                 account.pending=None; attempted=True
                 results,_=search(self.config,self.bridge,self.snapshot,scope,books,self.knowledge,time,self.sequence,self.identity,
-                    account=account,frozen={tuple(k):q for k,q in pending['caps']},conditioned=conditioned)
+                    account=account,frozen={tuple(k):q for k,q in pending['caps']},conditioned=conditioned,budget=budget,allotment=max(1,budget.remaining//slots) if budget.remaining else 0)
+                entry_search=results
                 solution=choose([r for r in results if r['shape'] == pending['shape']])
                 if solution and all(by_key.get(tuple(k),{}).get('rule_identity') == rule for k,rule in pending['rules']):
                     action=account.open(solution['found']['best'],time,scope,pending['id'],by_key,
@@ -186,12 +203,13 @@ class Runtime:
                     actions.append({'kind':'SKIPPED','attempt':attempt,'reason':'OPEN_OR_SAME_TIME_CLOSED_POSITION'})
                 elif int(self.config['policy']['decision_delay_ns']):
                     best=signal['found']['best']; due=time+int(self.config['policy']['decision_delay_ns'])
-                    account.pending={'id':attempt,'due_ns':due,'shape':signal['shape'],
+                    account.pending={'id':attempt,'due_ns':due,'shape':signal['shape'],'scope':scope,
                         'caps':[(o['key'],o['quantity']) for o in best['orders']],
                         'rules':[(o['key'],o['rule_identity']) for o in best['orders']]}
                     actions.append({'kind':'PENDING','attempt':attempt,'due_ns':due,'caps':account.pending['caps']})
                 else:
-                    results,_=search(self.config,self.bridge,self.snapshot,scope,books,self.knowledge,time,self.sequence,self.identity,account=account,conditioned=conditioned)
+                    results,_=search(self.config,self.bridge,self.snapshot,scope,books,self.knowledge,time,self.sequence,self.identity,account=account,conditioned=conditioned,budget=budget,allotment=max(1,budget.remaining//slots) if budget.remaining else 0)
+                    entry_search=results
                     solution=choose(results)
                     if solution:
                         actions.append(account.open(solution['found']['best'],time,scope,attempt,by_key,
@@ -199,21 +217,42 @@ class Runtime:
                         actions.extend(account.settle(time,self.knowledge))
                     else: actions.append({'kind':'SKIPPED','attempt':attempt,'reason':'CASH_BUDGET_OR_CAPACITY','search':results})
             account.signal=signal is not None
+            slots-=1
             scenarios.append({'scenario':name,'comparison_label':('STATE_CONDITIONED' if conditioned else 'STATIC_GAME_UNAVAILABLE' if not self.game or self.game.view.phase == 'unavailable' else 'STATIC_REFERENCE'),
                               'before':before,'detection':wire(detected),'actions':wire(actions),'after':wire(account.record(time)),
+                              'entry_search':wire(entry_search),
                               'liquidation_marks':wire(liquidation_marks(self.config,self.bridge,account,current_models(self.snapshot,scope,self.config,self.bridge,books,require_asks=False)[0],time,self.sequence,scope,self.identity)),
                               'pending':wire(account.pending),'signal':account.signal,'armed':account.armed,'nonpositive_since':account.nonpositive_since})
+            self.count_actions(name,actions)
         self.update_episodes(time,episode_candidates)
         self.guard_state(time)
         self.writer.append({'type':'decision','t_ns':str(time),'sequence':self.sequence,'scope':scope,
-                            'facts':self.facts,'knowledge':self.knowledge.record(),'books':books,'scenarios':scenarios})
+                            'facts':self.facts,'knowledge':self.knowledge.record(),'books':books,'scenarios':scenarios,
+                            'search_budget':{'limit':budget.limit,'evaluations':budget.used}})
         self.facts=[]; self.decisions+=1; self.processed_time=time
+        self.latest={'time':time,'scenarios':scenarios}
+
+    def count_actions(self,name,actions):
+        stats=self.stats[name]
+        for action in actions:
+            counts=stats['actions'];counts[action['kind']]=counts.get(action['kind'],0)+1
+            if action['kind']=='SKIPPED':
+                reasons=stats['skipped_entries_by_reason'];reasons[action['reason']]=reasons.get(action['reason'],0)+1
+
+    def duration(self,time):
+        if self.latest is None:return
+        elapsed=time-self.latest['time'];require(elapsed>=0,'optimizer duration')
+        for row in self.latest['scenarios']:
+            detected=row['detection']
+            status=('positive'if any(r.get('qualifying')for r in detected)else'below_entry_threshold'if any(r.get('economic_status')=='FEASIBLE_BELOW_ENTRY_THRESHOLD'for r in detected)else'complete_nonpositive'if detected and all(r.get('economic_status')=='COMPLETE_NONPOSITIVE'for r in detected)else'unknown')
+            self.stats[row['scenario']][status+'_ns']+=elapsed
+        self.latest=None
 
     def guard_state(self,time):
         detached=sum(view_cost(view,1)for view in self.views.values())
         retained=json_cost(wire({'accounts':[a.record(time)for a in self.accounts.values()],
                                  'history':self.knowledge.history,'episodes':self.episodes}))
-        require(detached+retained<=MAX_STATE,'optimizer retained decision state budget')
+        require(detached+retained+self.pricing_cache.retained_bytes<=MAX_STATE,'optimizer retained decision state budget')
 
     def update_episodes(self,time,candidates):
         for name in self.accounts:
@@ -228,6 +267,7 @@ class Runtime:
                 if time>prior['start_ns']:
                     self.episode_writer.append(wire({**prior,'end_ns':time,'duration_ns':time-prior['start_ns'],
                         'censored':candidates is None,'reason':'RUN_END'if candidates is None else 'SIGNAL_CHANGED'if chosen else 'PREDICATE_FALSE'}))
+                    self.stats[name]['episodes']+=1
                 del self.episodes[name]
             if chosen:
                 if name not in self.episodes:
@@ -239,7 +279,7 @@ class Runtime:
     def finish(self):
         require(self.terminal and not self.poisoned,'optimizer requires terminal')
         files={'decisions.ndjson':self.writer.finish(),'episodes.ndjson':self.episode_writer.finish()}
-        manifest={'version':1,'strategy':NAME,'snapshot_sha256':self.inputs.prepared.sha256,
+        manifest={'version':2,'strategy':NAME,'snapshot_sha256':self.inputs.prepared.sha256,
                   'experiment_sha256':self.identity,'config':self.config,'fee_engine_identity':self.bridge.engine_identity,
                   'files':files,'run_identity':self.binding['identity'],'source_revision':self.config['source_revision'],
                   'labels':['SIMULTANEOUS_DISPLAYED_SCENARIO','CUMULATIVE_DISPLAY_CAP','TRADABLE_IF_USABLE_SCENARIO',
@@ -247,11 +287,15 @@ class Runtime:
         if self.config['policy']['settlement'] and self.config['policy']['settlement']['mode'] == 'NORMAL_RESOLUTION_SCENARIO' and self.config['policy']['settlement']['delay_ns'] == '0':
             manifest['labels'].append('IMMEDIATE_NORMAL_PAYOUT_AVAILABILITY_SCENARIO')
         if self.game: manifest['game_state']=binding(self.config['policy']['game'])
-        from .output import validate_content
-        summary=validate_content(self.root,self.snapshot,manifest,self.bridge)
+        summary={'version':2,'strategy':NAME,'event_id':self.config['rules']['event_id'],'snapshot_sha256':manifest['snapshot_sha256'],
+            'experiment_sha256':self.identity,'terminal_sequence':self.sequence+1,'time_unit':'event_nanoseconds','history_complete':self.snapshot['history_complete'],
+            'labels':manifest['labels'],'rows':[{'scenario':name,**{k:str(v)if k.endswith('_ns')else v for k,v in self.stats[name].items()},'final_account':wire(account.record(self.clock.end))}for name,account in self.accounts.items()],
+            'verification':'REPRICED_FEES_PAYOFFS_AND_NATIVE_LEDGER','search_coverage_verification':'WRITER_ATTESTED_GRID_COVERAGE_OR_INDEPENDENT_NEGATIVE_DUAL_BOUND',
+            'optimality_verification':'FEASIBLE_CERTIFICATE_ONLY_UNLESS_DUAL_BOUND_ATTAINED','book_evidence':'WRITER_ATTESTED_DETACHED_BOOKS_BOUND_TO_SUPERVISOR_PINS'}
+        require(len(encoded(summary))<=MAX_LINE,'optimizer summary bound')
         manifest['summary_sha256']=digest(summary)
         write_json_durable(self.root/'summary.json',summary); write_json_durable(self.root/'manifest.json',manifest)
-        receipt={'version':1,'semantic_sha256':digest(manifest),**self.binding,'terminal':self.sequence+1}
+        receipt={'version':2,'semantic_sha256':digest(manifest),**self.binding,'terminal':self.sequence+1}
         write_json_durable(self.root/'content_receipt.json',receipt)
         return receipt
 

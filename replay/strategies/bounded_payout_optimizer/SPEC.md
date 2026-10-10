@@ -22,8 +22,11 @@ and bounded unknown-fee samples are retained.
 book needs a positive decimal `increment` and `cap`, representable at its native
 quantity scale. Caps need not be exact grid multiples; the last admitted grid
 point is their floor. Maxima are 8 legs, 128 configured books, 1,024 outcomes,
-10,000,000 complete-vector evaluations and 16 alternatives. Recommended search
-budget is 100,000. Quantity and rule bindings define the declared domain; an
+10,000,000 portfolio/partial-bound evaluations and 16 alternatives. Recommended
+budget is 100,000 across the whole decision, including static/conditioned
+detection and immediate/delayed entry searches. A deterministic equal share of
+the remaining pool reserves work for each remaining detection/entry slot; unused
+shares return to the pool. Analytical q=0 costs no node. Quantity and rule bindings define the declared domain; an
 unconfigured/unsupported sibling does not veto supported candidates. Missing
 required declared book inputs remain visible and cannot prove a complete negative.
 
@@ -76,17 +79,33 @@ holding-assumption timers use detached observable books. Non-Kalshi bid-only
 changes affect terminal/current bid marks but do not trigger acquisition search;
 Kalshi opposite bids are the native ask source. Identical inputs do not resignal.
 
-The deterministic search includes zero, full-cap total-mask/partition/two-leg
-cover seeds, then every remaining support/grid vector until exhausted or limited.
-No one-contract fee or concavity pruning is used. Objective ties prefer lower
+The deterministic search includes zero and bounded full-cap covering-support
+seeds, then support/grid enumeration with exact gross-outcome suffix bounds.
+Bounds use best displayed asks, native quantity atoms, masks and a configured
+valuation; retained quantity cannot exceed gross quantity and BUY charges cannot
+improve cash. They require the pinned FeeBridge policy that excludes rebates and
+rounding refunds. They make no fee-concavity assumption. Scalar mask arithmetic
+is compiled once per problem; native vectors and fee certificates are built only
+for retained samples. Objective ties prefer lower
 robust cash commitment, fewer legs, then sorted native keys/quantity atoms.
-`SEARCH_COMPLETE` means that declared, currently depth-bounded grid was exhausted;
-`SEARCH_LIMITED` reports visited evaluations, repriced feasible best/alternatives
-and a conservative gross-payout upper bound. A limited absent solution or missing
+`SEARCH_COMPLETE` is the writer's attestation that the depth-bounded grid was
+exhausted or valid bounds eliminated its remaining branches. The reader checks
+feasibility and carried bounds, not every positive search branch or global
+optimality. Reaching the scalar upper bound stops with `SEARCH_LIMITED` if the tie
+domain remains unexhausted. `SEARCH_LIMITED` reports visited evaluations, repriced
+feasible best/alternatives and conservative bounds. A limited absent solution or missing
 fees/depth/valuation is unknown, not an economic negative. A feasible positive
-below entry thresholds has its own status and duration, never a nonpositive label. The bounded
-`capital_frontier` contains feasible nondominated cost/margin samples labelled
-`BOUNDED_FEASIBLE_SAMPLES`; it does not claim a complete continuous frontier.
+below entry thresholds has its own status and duration. A complete zero result
+without an independently checkable negative bound is `UNCERTIFIED_NONPOSITIVE`,
+also unknown for duration/rearm. `COMPLETE_NONPOSITIVE` additionally requires a
+nonpositive uniform-outcome gross dual certificate and known minimum-grid fee
+availability. The certificate bounds expected gross payoff less best-ask cost,
+using each leg cap, max-leg count and the minimum across valuation scenarios.
+Minimum payout cannot exceed that expectation; nonnegative fees/holding costs
+cannot improve it. The reader derives the bound and availability independently.
+The `capital_frontier` contains nondominated samples from the same retained
+best/alternative pool, labelled `BOUNDED_FEASIBLE_SAMPLES`; it does not claim a
+complete continuous frontier or a separate search over lower-capital portfolios.
 
 Detection uses full undepleted displayed sources independently of account cash.
 A qualifying margin is strictly positive and meets margin/return thresholds.
@@ -98,7 +117,8 @@ status. This is not evidence of atomic fills or venue availability.
 
 Delayed entry freezes shape, support, rule identities and maximum quantities;
 the due search can only shrink on that support. Admission loss or rule identity
-change cancels visibly. Pending attempts reserve no capital or depth. Positions
+change cancels visibly. A scope change cancels immediately, before the due time.
+Pending attempts reserve no capital or depth. Positions
 keep fixed acquired lots and original proofs until supported resolution. Signal
 loss, unavailable books and scope changes do not sell them.
 
@@ -118,31 +138,72 @@ explicit. No marks are credits and no discretionary sales are implemented.
 
 ## Output and independent verification
 
-Version-1 closed output consists of `decisions.ndjson`, `episodes.ndjson`,
+Version-2 closed output consists of `decisions.ndjson`, `episodes.ndjson`,
 `summary.json`, `manifest.json`, then receipt-last `content_receipt.json`.
 NDJSON is canonical exact JSON with LF. Each file is capped at 512 MiB/1,000,000
 records; each line and JSON artifact at 8 MiB. Released history caps at 4,096
 result/final facts. Detached views/accounts/active episodes are bounded to
 128 MiB; a search additionally caps its memoized exact vectors/prices at 128 MiB.
+The persistent pinned-fee primitive cache has a 16 MiB charged-byte cap and holds
+only amounts/native consumption, never assessment IDs. It keys engine, scope,
+book, quantity and exact source identity. Historical/unpinned resolvers bypass
+it. Every retained order is reassessed at its current decision time/sequence;
+changed amounts fail closed. Accounts always reprice their entry source.
 Excess fails visibly rather than truncating economic evidence.
+
+Both NDJSON streams contain closed `{version:2,index,kind,state}` checkpoints or
+`{version:2,index,kind,patch}` deltas. Indices start at zero and are dense. A
+checkpoint is mandatory every 1,024 rows; terminal decisions also checkpoint.
+The state has exactly `assets`, `models`, `orders`, `portfolios`, `row`. Assets
+are sorted unique native asset records; models are sorted unique immutable
+native order fields; orders are sorted by fee time, native key, quantity and
+canonical bytes; portfolios are sorted by fee time and quantity vector, with
+canonical bytes breaking ties. Typed `asset_ref`, `model_ref`, `order_ref` and
+`portfolio_ref` replace duplicates. The reader reconstructs and repacks the state
+to enforce canonical pools, closed schemas and existing references.
+
+Patch `[0,value]` replaces a node. `[1,index,patch,...]` changes dictionary fields
+by their sorted-key indices; `[2,length,index,patch,...]` updates/truncates/appends
+list slots. Indices strictly increase and must exist, except declared appends.
+Scalar lists use replacement; otherwise the shorter canonical replacement wins
+against a structural patch, with structural patches winning ties. Copy-on-write
+keeps earlier decisions immutable. Patch nodes cap at 100,000/depth 32; unpacking
+caps at 2,000,000 nodes/depth 32 and packed state at 8 MiB. These JSON transport
+references preserve native economic arithmetic and all capture/prepared data.
 
 Every decision carries released knowledge, observable native books, fees, source
 levels, search completeness, account before/actions/after and signal/pending
-lineage. Episodes are maximal positive-length intervals of the selected vector's
+lineage, actual entry-search proofs and a total decision evaluation counter.
+Episodes are maximal positive-length intervals of the selected vector's
 scope/shape/outcomes/quantities/retained-payout/rule semantics; same-time transient
 states create no duration. Terminal positive episodes are censored. Summary
 qualifying-positive/below-entry-threshold/complete-nonpositive/unknown durations partition event time per account,
 without summing route overlap. Attempts, capacity, native ledgers and residuals
-are reported separately from detection.
+are reported separately from detection. Skipped entries also count each reason.
 
 The bounded streaming reader independently loads released facts, reconstructs
 signal/rearm/delay state and native accounts/capacity, reprices every carried
 proof through the pinned fee engine, verifies held-lot settlement/P&L/marks,
-re-solves the grid and verifies exact episodes and required quiet deadlines. It never imports writer Runtime
-or Account. Pure fee/search/payoff arithmetic is shared; small-domain reference
-tests verify exhaustive search against a separate Cartesian implementation.
+exact episodes, unavailable-status causes, full problem identity coverage,
+gross payout upper bounds, sampled frontier labels and required quiet deadlines.
+It never imports writer search, valuation, settlement,
+ledger, Runtime or Account. `audit.py` derives native flows and valuation directly
+from masks and Fee SDK assessments; `output.py` reconstructs independent account
+state. Identical fee certificates are priced once per decision. Only pinned
+fee-availability booleans may persist across reader decisions. Small-domain
+Cartesian regressions exercise branch bounds with nonlinear nonnegative fees.
+The summary explicitly labels search coverage as writer-attested except for
+independently checked negative dual bounds, and optimality as feasible-certificate
+verification unless a checked objective bound is attained.
 Completed reading additionally requires supervisor SUCCESS and factory/config,
 run identity, receipt terminal, snapshot/game/source/fee/output bindings.
+
+Supervised `finish()` writes its bounded own counters/ledger, file identities,
+manifest and receipt. It does not run the long audit before terminal ACK. The
+bench's completed/provisional reader independently derives the full summary and
+compares every field before accepting the participant. A content receipt alone
+does not authenticate economic correctness. See [PERFORMANCE.md](PERFORMANCE.md)
+for measured synthetic event throughput, output sizes and hard-domain limits.
 
 Carried detached books are writer-attested and tied to the supervisor's pinned
 run; this reader does not independently replay every tape cut to authenticate

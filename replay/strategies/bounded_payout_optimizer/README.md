@@ -15,7 +15,9 @@ Read [SPEC.md](SPEC.md) for the implemented closed contract, then the approved
 and [economic position scenarios](../../../docs/specs/ECONOMIC_POSITION_SCENARIOS_V1.md).
 `core.py` owns exact search, released knowledge and capacity; `scenario.py` owns
 native fee pricing and hypothetical accounts; `strategy.py` stages decisions;
-`output.py` independently reconstructs the ledger and fee/payoff proofs.
+`audit.py` independently derives native fee/payoff arithmetic; `output.py`
+reconstructs the ledger and required lifecycle without writer economic helpers.
+`stream.py` stores version-2 checkpoints, references and deltas for both outputs.
 
 [config.example.json](config.example.json) and [bench.example.json](bench.example.json)
 are templates. Replace every angle-bracket/zero pin, supply reviewed fee economics
@@ -36,3 +38,6 @@ Run the offline contracts with the project virtualenv:
 The package has synthetic contract tests and a real Decoder/bench SUCCESS reader
 path. No live venue, account, historical profitability or actual execution has
 been validated. Separate scenario/group profits and capacities cannot be added.
+The reader certifies carried feasible portfolios and negative dual bounds;
+positive search coverage and unrestricted global optimality remain writer
+attestations. See [PERFORMANCE.md](PERFORMANCE.md) for offline scalability evidence.
