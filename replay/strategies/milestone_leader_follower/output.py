@@ -18,7 +18,7 @@ from replay.economic_sdk.outcomes import outcome_scope
 from replay.game_state import load as load_game
 from replay.economic_sdk.reader import read_json
 from replay.preparation import digest, encoded, load_snapshot, sha
-from replay.strategies._shared.fee_bridge import FeeBridge
+from replay.strategies._shared.fee_bridge import FeeBridge, FeeEconomicsUnavailable
 from replay.strategy_sdk import PreparedInput, plain
 from replay.streams.protocol import decode, obj, require, freeze, uint
 from replay.supervisor import initial, read_success
@@ -106,21 +106,31 @@ class Verifier:
         self.episode_expected = {}
         self.book_histories = {}
         self.route_histories = {}
-        self.books = {}
-        self.results = {}; self.milestones = []; self.match_score = None; self.last_result = None
+        self.books = OrderedDict()
+        self.results = {}; self.milestones = []; self.match_score = None; self.last_result = None; self.contradiction = False
         self.timeline = Timeline(load_game(self.policy['game']['input']['path'], self.policy['game']['input']['sha256'], snapshot), self.policy['game'], int(snapshot['config']['start_ns']))
         self.db.executescript('CREATE TABLE observations(time INTEGER, role TEXT, target TEXT, payload TEXT, PRIMARY KEY(time,role,target)); CREATE TABLE predictions(id TEXT PRIMARY KEY,payload TEXT); CREATE TABLE decisions(time INTEGER PRIMARY KEY,payload TEXT); CREATE TABLE books(time INTEGER,key TEXT,payload TEXT, PRIMARY KEY(time,key)); CREATE TABLE attempts(id TEXT PRIMARY KEY,payload TEXT);')
         self.db.executescript('CREATE INDEX books_asof ON books(key,time DESC); CREATE INDEX observations_asof ON observations(role,target,time DESC);')
+        self.db.execute('CREATE TABLE candidates(time INTEGER,role TEXT,target TEXT,payload TEXT,PRIMARY KEY(time,role,target))')
         self.last_time = None
         self.previous = {}
         self.valuation_cache = OrderedDict()
+        self.size_cache = OrderedDict()
 
     def weight(self, key):
         return number(self.policy['valuation']['weights'][self.plans[key]['venue']])
 
     def book(self, key, time):
+        identity = key,time
+        if identity in self.books:
+            self.books.move_to_end(identity)
+            return self.books[identity]
         row = self.db.execute('SELECT payload FROM books WHERE key=? AND time<=? ORDER BY time DESC LIMIT 1', (json.dumps(list(key)), time)).fetchone()
-        return None if row is None else json.loads(row[0])
+        value = None if row is None else json.loads(row[0])
+        self.books[identity] = value
+        if len(self.books) > 128:
+            self.books.popitem(last=False)
+        return value
 
     def ladder(self, key, side, time):
         physical = key
@@ -203,11 +213,17 @@ class Verifier:
         require(row['assessment_ids'] == [x.identity for x in assessed[0][1]] and row['assumptions'] == sorted({a for x in assessed[0][1] for a in x.assumptions}) and row['evidence'] == sorted({x.evidence.value for x in assessed[0][1]}), 'fee assessment identity/evidence')
         return cash, retained.numerator
 
-    def priced(self, key, side, quantity, time, route, *, forecast=None, debits=None, totals=None):
+    def priced(self, key, side, quantity, time, route, *, forecast=None, debits=None, totals=None, status=False):
         """Build native evidence independently from committed inputs, not outputs."""
+        def result(order, reason=None):
+            return (order, reason) if status else order
+        if key not in self.rules or self.fees.economics(key) is None:
+            return result(None,'FEE_UNKNOWN')
+        if quantity <= 0 or quantity % int(self.rules[key]['quantity_increment_atoms']):
+            return result(None,'UNREPRESENTABLE_QUANTITY')
         source, levels = self.ladder(key, 'ask' if side == 'BUY' else 'bid', time)
         if levels is None:
-            return None
+            return result(None,'UNUSABLE')
         plan = self.plans[key]
         if debits is not None:
             physical = [(10 ** int(plan['price_scale'])-p,q) for p,q in levels] if source[:2] != key else levels
@@ -219,12 +235,14 @@ class Verifier:
                 price = min(Fraction(scale), max(Fraction(0), p + forecast*scale)) // increment * increment
                 merged[price] = merged.get(price,0) + q
             levels = sorted(merged.items(), reverse=True)
+        if not levels:
+            return result(None,'NO_EXIT_DEPTH' if side == 'SELL' else 'DEPTH_LIMITED')
         cache_key = None
         if debits is None:
             cache_key = (key,side,quantity,tuple(levels),digest(route),forecast)
             if cache_key in self.valuation_cache:
                 self.valuation_cache.move_to_end(cache_key)
-                return self.valuation_cache[cache_key]
+                return result(self.valuation_cache[cache_key])
         remaining = quantity; taken = []; consumed = []
         for price, amount in levels:
             use = min(remaining, amount)
@@ -232,26 +250,126 @@ class Verifier:
                 taken.append((price,use)); consumed.append((price,amount)); remaining -= use
             if remaining == 0:
                 break
-        if remaining or quantity <= 0 or quantity % int(self.rules[key]['quantity_increment_atoms']):
-            return None
+        if remaining:
+            return result(None,'DEPTH_LIMITED')
         decision = json.loads(self.db.execute('SELECT payload FROM decisions WHERE time=?', (time,)).fetchone()[0])
         native_time = time if forecast is None else time + int(self.policy['exit_horizon_ns'])
         cost = sum(p*q for p,q in taken)
-        assessed, reasons = self.fees.assess_orders(experiment=self.experiment, scope=decision['scope'], basket={'lineage':route}, direction=side, size=quantity, time=native_time, sequence=decision['sequence'], legs=({'market_id':route['market_id'], 'key':key, 'fill':Fill(quantity,cost,False,tuple(taken),tuple(consumed)), 'price_scale':int(plan['price_scale']), 'quantity_scale':int(plan['quantity_scale']), 'side':side},), account=STRATEGY)
+        try:
+            assessed, reasons = self.fees.assess_orders(experiment=self.experiment, scope=decision['scope'], basket={'lineage':route}, direction=side, size=quantity, time=native_time, sequence=decision['sequence'], legs=({'market_id':route['market_id'], 'key':key, 'fill':Fill(quantity,cost,False,tuple(taken),tuple(consumed)), 'price_scale':int(plan['price_scale']), 'quantity_scale':int(plan['quantity_scale']), 'side':side},), account=STRATEGY)
+        except FeeEconomicsUnavailable:
+            return result(None,'FEE_UNKNOWN')
         if reasons or assessed[0] is None or any(x.net_deltas is None for x in assessed[0][1]):
-            return None
+            return result(None,'FEE_UNKNOWN')
         economics, results = assessed[0]
+        if any(d.asset not in (economics.quote,economics.outcome) for assessment in results for d in assessment.net_deltas):
+            return result(None,'FEE_UNKNOWN')
         cash = sum((Fraction(d.atoms,10**d.scale) for result in results for d in result.net_deltas if d.asset == economics.quote),Fraction(0))
         outcome = sum((Fraction(d.atoms,10**d.scale) for result in results for d in result.net_deltas if d.asset == economics.outcome),Fraction(0))
         retained = (outcome if side == 'BUY' else -outcome) * 10 ** int(plan['quantity_scale'])
         if retained.denominator != 1 or retained <= 0 or retained % int(self.rules[key]['quantity_increment_atoms']):
-            return None
-        result = {'key':list(key),'side':side,'quantity_atoms':str(quantity),'price_scale':plan['price_scale'],'quantity_scale':plan['quantity_scale'],'taken':[list(x) for x in taken],'consumed':[list(x) for x in consumed],'cost_atoms':str(cost),'source':list(source),'source_taken':[[10**int(plan['price_scale'])-p if source[:2]!=key else p,q] for p,q in taken],'cash':r(cash),'outcome':r(outcome),'retained_atoms':str(retained.numerator),'asset':asset(economics.quote),'assessment_ids':[x.identity for x in results],'assumptions':sorted({a for x in results for a in x.assumptions}),'evidence':sorted({x.evidence.value for x in results}),'time_ns':str(native_time),'sequence':decision['sequence'],'scope':decision['scope'],'lineage':route,'forecast_displacement':None if forecast is None else r(forecast)}
+            return result(None,'UNREPRESENTABLE_HOLDINGS')
+        if side == 'SELL' and retained > quantity:
+            return result(None,'OUTCOME_DEBIT_EXCEEDS_OWNED')
+        order = {'key':list(key),'side':side,'quantity_atoms':str(quantity),'price_scale':plan['price_scale'],'quantity_scale':plan['quantity_scale'],'taken':[list(x) for x in taken],'consumed':[list(x) for x in consumed],'cost_atoms':str(cost),'source':list(source),'source_taken':[[10**int(plan['price_scale'])-p if source[:2]!=key else p,q] for p,q in taken],'cash':r(cash),'outcome':r(outcome),'retained_atoms':str(retained.numerator),'asset':asset(economics.quote),'assessment_ids':[x.identity for x in results],'assumptions':sorted({a for x in results for a in x.assumptions}),'evidence':sorted({x.evidence.value for x in results}),'time_ns':str(native_time),'sequence':decision['sequence'],'scope':decision['scope'],'lineage':route,'forecast_displacement':None if forecast is None else r(forecast)}
         if cache_key is not None:
-            self.valuation_cache[cache_key] = result
+            self.valuation_cache[cache_key] = order
             if len(self.valuation_cache) > 128:
                 self.valuation_cache.popitem(last=False)
-        return result
+        return result(order)
+
+    def sizes(self, target, time, route, forecast, *, debits=None, totals=None, maximum=None):
+        """Derive every pinned size and its first unavailable reason independently."""
+        cache_key = None
+        if debits is None:
+            _, asks = self.ladder(target,'ask',time); _, bids = self.ladder(target,'bid',time)
+            cache_key = target,None if asks is None else tuple(asks),None if bids is None else tuple(bids),digest(route),forecast,maximum
+            if cache_key in self.size_cache:
+                self.size_cache.move_to_end(cache_key)
+                return self.size_cache[cache_key]
+        sizes = []
+        for q in self.policy['quantity_grid']:
+            quantity = number(q)*10**int(self.plans[target]['quantity_scale'])
+            if maximum is not None and quantity.denominator == 1 and quantity > maximum:
+                continue
+            row = {'quantity':q,'status':'UNREPRESENTABLE_QUANTITY','buy':None,'forecast_sale':None,'initial_sale':None,'forecast_charge':None,'forecast_net':None,'initial_net':None,'qualifies':False}
+            sizes.append(row)
+            if quantity.denominator != 1:
+                continue
+            buy, reason = self.priced(target,'BUY',quantity.numerator,time,route,debits=debits,totals=totals,status=True)
+            if reason:
+                row['status'] = reason; continue
+            row['buy'] = {k:buy[k] for k in ('cash','retained_atoms','quantity_atoms')}
+            future, reason = self.priced(target,'SELL',int(buy['retained_atoms']),time,route,forecast=forecast,debits=debits,totals=totals,status=True)
+            if reason:
+                row['status'] = reason; continue
+            row['forecast_sale'] = {'cash':future['cash']}
+            current, reason = self.priced(target,'SELL',int(buy['retained_atoms']),time,route,debits=debits,totals=totals,status=True)
+            if reason:
+                row['status'] = 'INITIAL_MARK_'+reason; continue
+            cost = -rational(buy['cash']); charge = cost*number(self.policy['holding_rate_per_ns'])*int(self.policy['exit_horizon_ns'])
+            net = (rational(future['cash'])-cost-charge)*self.weight(target); mark = (rational(current['cash'])-cost)*self.weight(target)
+            qualifies = net > 0 and net >= number(self.policy['minimum_forecast_margin']) and 10000*net >= number(self.policy['minimum_forecast_return_bps'])*cost*self.weight(target) and mark >= -number(self.policy['stop_loss_fraction'])*cost*self.weight(target)
+            row.update(status='AVAILABLE',initial_sale={'cash':current['cash'],'taken':[current['taken'][0]]},forecast_charge=r(charge),forecast_net=r(net),initial_net=r(mark),qualifies=qualifies)
+        if cache_key is not None:
+            self.size_cache[cache_key] = sizes
+            if len(self.size_cache) > 128:
+                self.size_cache.popitem(last=False)
+        return sizes
+
+    def candidate(self, role, target, route, time, knowledge, target_data):
+        """Reconstruct a candidate from pinned model and independent histories."""
+        model = self.models[role]; leg, feasible, authority = target_data
+        state = {'game':None,'phase':'unavailable','score_quality':'book_only','prefix_quality':'book_only','score':[0,0],'elapsed_ns':'0'} if role == 'target_only' else knowledge
+        matching = [i for i,item in enumerate(model['cohorts']) if (item['game'] is None or item['game'] == state['game']) and item['phase'] == state['phase'] and item['score_quality'] == state['score_quality'] and item['prefix_quality'] == state['prefix_quality'] and all(item[k] is None or item[k] == state['score'][j] for j,k in enumerate(('home','away'))) and int(item['elapsed_min_ns']) <= int(state['elapsed_ns']) and (item['elapsed_max_ns'] is None or int(state['elapsed_ns']) < int(item['elapsed_max_ns']))]
+        index = matching[0] if matching else model['fallback']
+        if index is not None and state['score_quality'] == 'unknown' and model['cohorts'][index]['score_quality'] != 'unknown':
+            index = None
+        target_history = self.book_histories[target,authority]
+        target_endpoint = self.endpoints(self.book_histories,(target,authority),time)
+        leader_history = None; leader_endpoint = None
+        if route is not None and route['proof'] is not None:
+            history_key = tuple(route['leader']),target,route['proof']
+            leader_history = self.route_histories[history_key]
+            leader_endpoint = self.endpoints(self.route_histories,history_key,time)
+        row = {'role':role,'target':list(target),'route':route,'model_id':digest(model),'cohort':index,'target_endpoint':target_endpoint,'leader_endpoint':leader_endpoint,'displacement':None,'status':'MODEL_UNAVAILABLE','sizes':[],'selected':None,'signal':None,'innovation':None,'prediction_id':None,'alternates':[]}
+        if knowledge['contradiction']:
+            row['status'] = 'GAME_CONTRADICTION'; return row
+        if index is None or role == 'leader_milestones' and (route is None or route['relation'] not in ('IDENTITY','COMPLEMENT')):
+            return row
+        if target_endpoint is None or role == 'leader_milestones' and leader_endpoint is None:
+            row['status'] = 'HISTORY_BOUND_EXCEEDED' if target_history['overflowed'] or leader_history is not None and leader_history['overflowed'] else 'HISTORY_UNAVAILABLE'
+            return row
+        item = model['cohorts'][index]; dl = rational(leader_endpoint['delta']) if role == 'leader_milestones' else Fraction(0)
+        forecast = number(item['beta_L'])*dl + number(item['beta_T'])*rational(target_endpoint['delta']) + number(item['intercept'])
+        row['displacement'] = r(forecast)
+        if route is None:
+            route = {'leader':None,'target':list(target),'market_id':leg.market_id,'leader_market_id':None,'shape_id':leg.shape_id,'leader_keys':[],'target_keys':sorted(leg.keys),'feasible_keys':sorted(feasible),'relation':'TARGET_BASELINE','proof':None,'rule_ids':[self.rules[target]['rule_sha256']],'candidate_id':digest([role,target])}
+            row['route'] = route
+        sizes = self.sizes(target,time,route,forecast); row['sizes'] = sizes
+        available = [i for i,size in enumerate(sizes) if size['status'] == 'AVAILABLE']
+        if available:
+            qualified = [i for i in available if sizes[i]['qualifies']]
+            selected = min(qualified or available,key=lambda i:(-rational(sizes[i]['forecast_net']),-rational(sizes[i]['buy']['cash']),number(sizes[i]['quantity'])))
+            row.update(selected=selected,status='AVAILABLE',signal=sizes[selected]['qualifies'] and (role != 'leader_milestones' or abs(dl) >= number(self.policy['minimum_leader_move'])) and knowledge['phase'] != 'finished')
+            history = leader_history if role == 'leader_milestones' else target_history
+            current = history['values'][-1]
+            row['innovation'] = [route['leader'] if role == 'leader_milestones' else list(target),str(current[0]),current[2],route['proof']]
+        else:
+            row['status'] = sizes[0]['status'] if sizes else 'SIZE_UNAVAILABLE'
+        _, bids = self.ladder(target,'bid',time)
+        if bids:
+            row['prediction_id'] = digest([self.experiment,role,list(target),time,route['candidate_id']])
+        return compact_observation(row)
+
+    def revalidate(self, observation, original, knowledge, time, debits, totals):
+        target = original['route']['target']; role = original['role']
+        stored = self.db.execute('SELECT payload FROM observations WHERE time=? AND role=? AND target=?',(time,role,json.dumps(target))).fetchone()
+        require(stored is not None,'entry repricing committed history exists')
+        current = json.loads(stored[0])
+        require(all(observation[k] == current[k] for k in ('role','target','route','model_id','cohort','target_endpoint','leader_endpoint')),'entry repricing committed history/model/route')
+        self.model(observation,knowledge,time,debits=debits,totals=totals,maximum=int(original['maximum_quantity_atoms']))
+        require(observation['selected'] is None or observation['innovation'] == current['innovation'],'entry repricing committed innovation')
 
     def mark(self, key, owned, time, lineage, debits, totals, *, status=False):
         source, observed = self.ladder(key, 'bid', time)
@@ -316,20 +434,29 @@ class Verifier:
         dt = rational(observation['target_endpoint']['delta'])
         forecast = number(item['beta_L']) * dl + number(item['beta_T']) * dt + number(item['intercept'])
         require(observation['displacement'] == r(forecast), 'independent response-model arithmetic')
+        expected_sizes = self.sizes(target,time,observation['route'],forecast,debits=debits,totals=totals,maximum=maximum)
+        require(len(observation['sizes']) == len(expected_sizes),'complete independent size availability')
+        for carried, expected_size in zip(observation['sizes'],expected_sizes):
+            obj(carried,'quantity status buy forecast_sale initial_sale forecast_charge forecast_net initial_net qualifies')
+            require(type(carried['qualifies']) is bool,'size predicate')
+            require(all(carried[k] == expected_size[k] for k in ('quantity','status','forecast_charge','forecast_net','initial_net','qualifies')),'independent size availability and economics')
+            for field in ('buy','forecast_sale','initial_sale'):
+                actual, expected_order = carried[field], expected_size[field]
+                require((actual is None) == (expected_order is None),'independent size availability proof')
+                if actual is not None:
+                    if 'key' not in actual:
+                        obj(actual,{'buy':'cash retained_atoms quantity_atoms','forecast_sale':'cash','initial_sale':'cash taken'}[field])
+                    # Compact valuation proof contains cash and holdings only;
+                    # complete orders additionally receive their native audit.
+                    require(all(actual[k] == expected_order[k] for k in actual if k in ('cash','retained_atoms','quantity_atoms')),'independent size valuation')
+                    if 'taken' in actual and 'key' not in actual:
+                        require(actual['taken'] == [expected_order['taken'][0]],'compact first-bid proof')
         if observation['selected'] is None:
             require(observation['signal'] is None,'unavailable economic quantity')
-            for q in self.policy['quantity_grid']:
-                quantity = number(q)*10**int(self.plans[target]['quantity_scale'])
-                if quantity.denominator != 1 or maximum is not None and quantity > maximum:
-                    continue
-                buy = self.priced(target,'BUY',quantity.numerator,time,observation['route'],debits=debits,totals=totals)
-                if buy is not None:
-                    future = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],forecast=forecast,debits=debits,totals=totals)
-                    current = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],debits=debits,totals=totals)
-                    require(future is None or current is None,'independent required available size suppressed')
+            require(not any(s['status'] == 'AVAILABLE' for s in expected_sizes),'independent required available size suppressed')
+            require(observation['status'] == (expected_sizes[0]['status'] if expected_sizes else 'SIZE_UNAVAILABLE') and observation['innovation'] is None,'independent unavailable size reason')
             return
-        expected_sizes = [q for q in self.policy['quantity_grid'] if maximum is None or number(q) * 10 ** int(self.plans[target]['quantity_scale']) <= maximum]
-        require([x['quantity'] for x in observation['sizes']] == expected_sizes, 'complete eligible pinned size grid')
+        require(observation['status'] == 'AVAILABLE','available economic observation status')
         available = []
         for i, size in enumerate(observation['sizes']):
             obj(size, 'quantity status buy forecast_sale initial_sale forecast_charge forecast_net initial_net qualifies')
@@ -397,12 +524,13 @@ class Verifier:
     def causal_histories(self, scope_index, time, resets, knowledge):
         scope = outcome_scope(self.snapshot, scope_index)
         targets = {}
-        for key, plan in self.plans.items():
+        for key in sorted((b['instrument'],b['orientation']) for b in self.snapshot['scopes'][scope_index]['outcome_books']):
+            plan = self.plans[key]
             leg = scope.leg(key)
             if leg is None or key not in self.rules or self.fees.economics(key) is None:
                 continue
             space = scope.spaces[leg.shape_id]
-            if space.coverage != 'EXHAUSTIVE' or space.scope != 'series':
+            if space.coverage != 'EXHAUSTIVE' or space.scope != 'series' or not all(k.startswith('seq:') for k in space.keys):
                 continue
             results = {} if self.policy['cohort'] == 'book_only_comparison' else dict(knowledge['released_results'])
             feasible = [k for k in space.keys if all(w is None or i <= len(k[4:]) and k[4:][i - 1] == ('H' if w == 0 else 'A') for i, w in results.items()) and (self.policy['cohort'] == 'book_only_comparison' or knowledge['phase'] != 'finished' or knowledge['score_quality'] != 'complete' or [k[4:].count('H'), k[4:].count('A')] == knowledge['score'])]
@@ -412,17 +540,22 @@ class Verifier:
             reset = any(k == key or k[0] == key[0] and plan['venue'] == 'kalshi' for k in resets)
             self.remember(self.book_histories, (key, authority), time, self.midpoint(key, time), reset)
             targets[key] = (leg, frozenset(feasible), authority)
-        active = set()
-        for target, (tleg, feasible, authority) in targets.items():
-            for leader, (lleg, _, _) in targets.items():
-                if lleg.market_id == tleg.market_id or lleg.shape_id != tleg.shape_id or self.rules[leader]['alignment_id'] != self.rules[target]['alignment_id']:
+        active = set(); routes = []
+        for target, (tleg, feasible, authority) in sorted(targets.items()):
+            for leader, (lleg, _, _) in sorted(targets.items()):
+                if lleg.market_id == tleg.market_id or self.rules[leader]['alignment_id'] != self.rules[target]['alignment_id']:
                     continue
                 left, right = lleg.keys & feasible, tleg.keys & feasible
-                kind = 'IDENTITY' if left == right else 'COMPLEMENT' if not left & right and left | right == feasible else None
-                if not kind or not left or not right or left == feasible or right == feasible:
+                kind = 'UNSUPPORTED_SCOPE' if lleg.shape_id != tleg.shape_id else 'RESOLVED_OR_TAUTOLOGY' if not left or not right or left == feasible or right == feasible else 'IDENTITY' if left == right else 'COMPLEMENT' if not left & right and left | right == feasible else 'IMPLICATION' if left < right else 'REVERSE_IMPLICATION' if right < left else 'MUTUAL_EXCLUSION' if not left & right else 'OVERLAP'
+                route = {'leader':list(leader),'target':list(target),'market_id':tleg.market_id,'leader_market_id':lleg.market_id,'shape_id':tleg.shape_id,'leader_keys':sorted(lleg.keys),'target_keys':sorted(tleg.keys),'feasible_keys':sorted(feasible),'relation':kind,'proof':None,'rule_ids':[self.rules[k]['rule_sha256'] for k in (leader,target)]}
+                proof = None
+                if kind in ('IDENTITY','COMPLEMENT'):
+                    proof_base = digest([leader, target, lleg.shape_id, kind, sorted(lleg.keys), sorted(tleg.keys)])
+                    proof = digest([proof_base, route['rule_ids'], [self.plans[k]['lane'] for k in (leader, target)]])
+                    route['proof'] = proof
+                route['candidate_id'] = digest(route); routes.append(route)
+                if proof is None:
                     continue
-                proof_base = digest([leader, target, lleg.shape_id, kind, sorted(lleg.keys), sorted(tleg.keys)])
-                proof = digest([proof_base, [self.rules[k]['rule_sha256'] for k in (leader, target)], [self.plans[k]['lane'] for k in (leader, target)]])
                 key = leader, target, proof; active.add(key)
                 value = self.midpoint(leader, time)
                 if value is not None and kind == 'COMPLEMENT':
@@ -431,7 +564,7 @@ class Verifier:
                 self.remember(self.route_histories, key, time, value, reset)
         self.route_histories = {k: h for k, h in self.route_histories.items() if k in active}
         self.book_histories = {k: h for k, h in self.book_histories.items() if k[0] in targets}
-        return targets
+        return targets, routes
 
     def decisions(self, row):
         obj(row, 'version time_ns sequence scope knowledge released book_updates history_resets observations admission')
@@ -451,7 +584,11 @@ class Verifier:
                 ident = digest([f.kind, f.release_ns, f.source_ns, f.index]); self.milestones.append(ident); self.last_result = f.release_ns
             if f.kind == 'segment_end':
                 winner = f.value[0]
-                self.results[f.index] = None if winner is None else self.timeline.view.competitors[winner]['participant']
+                aligned = None if winner is None else self.timeline.view.competitors[winner]['participant']
+                aligned = aligned if aligned in (0,1) else None
+                if f.index in self.results and self.results[f.index] != aligned:
+                    self.contradiction = True
+                self.results[f.index] = aligned
             if f.kind == 'match_end':
                 self.match_score = [None, None]
                 for side in ('home', 'away'):
@@ -460,6 +597,15 @@ class Verifier:
                         self.match_score[participant] = f.value['score'][side]
         knowledge = obj(row['knowledge'], 'game phase score score_quality prefix prefix_quality released_results milestones elapsed_ns contradiction')
         if self.policy['cohort'] != 'book_only_comparison':
+            # Pinned exhaustive series spaces are independent semantic authority;
+            # a carried contradiction flag may never suppress the common schedule.
+            for space in outcome_scope(self.snapshot,scope).spaces.values():
+                if space.coverage != 'EXHAUSTIVE' or space.scope != 'series' or not all(k.startswith('seq:') for k in space.keys):
+                    continue
+                feasible = [k for k in space.keys if all(w is None or i <= len(k[4:]) and k[4:][i-1] == ('H' if w == 0 else 'A') for i,w in self.results.items()) and (self.match_score is None or any(x is None for x in self.match_score) or [k[4:].count('H'),k[4:].count('A')] == self.match_score)]
+                if not feasible:
+                    self.contradiction = True
+            require(type(knowledge['contradiction']) is bool and knowledge['contradiction'] == self.contradiction,'independent game contradiction')
             prefix = []
             for i in range(1, len(self.results) + 1):
                 if self.results.get(i) not in (0, 1):
@@ -489,12 +635,22 @@ class Verifier:
             obj(unsupported, 'candidate_id relation status'); sha(unsupported['candidate_id'])
             require(unsupported['relation'] not in ('IDENTITY', 'COMPLEMENT') and unsupported['status'] == 'MODEL_UNAVAILABLE', 'explicit unsupported relation')
         scope_model = outcome_scope(self.snapshot, scope)
-        targets_history = self.causal_histories(scope, time, [tuple(x) for x in row['history_resets']], knowledge)
+        targets_history, routes = self.causal_histories(scope, time, [tuple(x) for x in row['history_resets']], knowledge)
+        require(admission['routes'] == len(routes) and admission['unsupported_routes'] == [{'candidate_id':r['candidate_id'],'relation':r['relation'],'status':'MODEL_UNAVAILABLE'} for r in routes if r['relation'] not in ('IDENTITY','COMPLEMENT')],'independent candidate admission counts')
         seen = set()
         for observation in row['observations']:
             role = observation['role']; target = tuple(observation['target']); key = role, target
             require(key not in seen, 'one selected leader per target/role'); seen.add(key)
             route = observation['route']
+            require(target in targets_history,'independent captured candidate target')
+            candidates = [self.candidate(role,target,r,time,knowledge,targets_history[target]) for r in routes if tuple(r['target']) == target] if role == 'leader_milestones' else []
+            if not candidates:
+                candidates = [self.candidate(role,target,None,time,knowledge,targets_history[target])]
+            matching_candidates = [c for c in candidates if c['route'] == route]
+            require(len(matching_candidates) == 1,'independent candidate membership')
+            expected_candidate = matching_candidates[0]
+            selection = [{'candidate_id':None if c['route'] is None else c['route']['candidate_id'],'leader':None if c['route'] is None else c['route']['leader'],'proof':None if c['route'] is None else c['route']['proof'],'status':c['status'],'available':c['selected'] is not None,'signal':c['signal'],'forecast_net':None if c['selected'] is None else c['sizes'][c['selected']]['forecast_net'],'buy_cash':None if c['selected'] is None else c['sizes'][c['selected']]['buy']['cash']} for c in candidates]
+            self.db.execute('INSERT INTO candidates VALUES(?,?,?,?)',(time,role,json.dumps(list(target)),json.dumps(selection)))
             if route is not None:
                 obj(route, 'leader target market_id leader_market_id shape_id leader_keys target_keys feasible_keys relation proof rule_ids candidate_id')
                 require(route['target'] == list(target) and route['rule_ids'] == ([self.rules[tuple(route['leader'])]['rule_sha256'], self.rules[target]['rule_sha256']] if role == 'leader_milestones' else [self.rules[target]['rule_sha256']]), 'route committed rule lineage')
@@ -522,6 +678,7 @@ class Verifier:
                 require(observation['leader_endpoint'] == expected_leader_endpoint, 'independent transformed history/warm-up')
                 require(route['proof'] in {k[2] for k in self.route_histories if k[:2] == (tuple(route['leader']), target)}, 'relationship proof identity')
             self.model(observation, knowledge, time)
+            require(all(compact_observation(observation)[k] == expected_candidate[k] for k in expected_candidate if k not in ('alternates','sizes')),'independent candidate state/model/innovation')
             _, prediction_bids = self.ladder(target,'bid',time)
             require((observation['prediction_id'] is not None) == (observation['displacement'] is not None and bool(prediction_bids)),'required common price forecast')
             self.db.execute('INSERT INTO observations VALUES(?,?,?,?)', (time, role, json.dumps(observation['target']), json.dumps(compact_observation(observation))))
@@ -540,6 +697,16 @@ class Verifier:
         require(row['role'] == observation['role'] and row['target'] == observation['target'] and row['signal'] == observation['signal'] and row['forecast_displacement'] == observation['displacement'] and row['forecast_net'] == (None if size is None else size['forecast_net']) and row['capacity_mode'] == 'ISOLATED_NONADDITIVE', 'common schedule prediction binding')
         time = int(uint(row['observed_ns'])); decision = int(uint(row['decision_ns'])); due = int(uint(row['desired_ns']))
         require(due == decision + int(self.policy['exit_horizon_ns']) and time == (int(self.snapshot['config']['end_ns']) if row['status'] == 'RUN_END' else due), 'forecast causal horizon')
+        end = int(self.snapshot['config']['end_ns'])
+        expected_sale = None
+        if due >= end:
+            expected_status = 'RUN_END'
+        elif size is None:
+            expected_status = 'PRICE_ONLY'
+        else:
+            expected_sale, reason = self.priced(tuple(row['target']),'SELL',int(size['buy']['retained_atoms']),time,observation['route'],status=True)
+            expected_status = reason or 'OBSERVED'
+        require(row['status'] == expected_status and (row['sale'] is None) == (expected_sale is None),'independent counterfactual availability')
         _, bids = self.ladder(tuple(row['target']), 'bid', time)
         _, initial_bids = self.ladder(tuple(row['target']), 'bid', decision)
         error = None if row['status'] == 'RUN_END' or not bids else Fraction(bids[0][0] - initial_bids[0][0], 10 ** int(self.plans[tuple(row['target'])]['price_scale'])) - rational(row['forecast_displacement'])
@@ -643,7 +810,7 @@ def verify_actions(v, root, manifest):
                 else:
                     revalidation = row.get('revalidation'); require(revalidation is not None, 'skip repricing evidence')
                     knowledge = json.loads(v.db.execute('SELECT payload FROM decisions WHERE time=?', (time,)).fetchone()[0])['knowledge']
-                    v.model(revalidation, knowledge, time, debits=debit[role], totals=totals[role], maximum=int(original['maximum_quantity_atoms']))
+                    v.revalidate(revalidation,original,knowledge,time,debit[role],totals[role])
                     if revalidation['signal'] is not True or revalidation['innovation'] != original['innovation'] or not int(policy['decision_delay_ns']) and int(revalidation['sizes'][revalidation['selected']]['buy']['quantity_atoms']) != int(original['maximum_quantity_atoms']):
                         expected = 'CAPACITY_OR_PREDICATE'
                     else:
@@ -673,7 +840,7 @@ def verify_actions(v, root, manifest):
             observed = v.db.execute('SELECT payload FROM decisions WHERE time=?', (time,)).fetchone(); require(observed is not None and row['knowledge'] == json.loads(observed[0])['knowledge'], 'opening knowledge')
             require(row['horizon_ns'] == str(time + int(policy['exit_horizon_ns'])), 'entry-anchored horizon')
             repriced = row['revalidation']
-            v.model(repriced, row['knowledge'], time, debits=debit[role], totals=totals[role], maximum=int(attempts[attempt]['row']['maximum_quantity_atoms']))
+            v.revalidate(repriced,attempts[attempt]['row'],row['knowledge'],time,debit[role],totals[role])
             current = v.db.execute('SELECT payload FROM observations WHERE time=? AND role=? AND target=?', (time, role, json.dumps(list(key)))).fetchone()
             require(current is not None, 'entry current observation')
             current = json.loads(current[0])
@@ -710,6 +877,22 @@ def verify_actions(v, root, manifest):
                 fingerprint = (source if observed_bids is not None else None, None if observed_bids is None else tuple(observed_bids), v.fees.engine_identity)
                 require(position.get('last_exit_fingerprint') != fingerprint, 'no identical-state residual retry')
                 position['last_exit_fingerprint'] = fingerprint
+                expected_sale = None
+                if observed_bids is None:
+                    unavailable_reason = 'UNUSABLE'
+                else:
+                    eligible_bids = v.eligible(source,observed_bids,debit[role],totals[role])
+                    increment = int(v.rules[key]['quantity_increment_atoms'])
+                    quantity = min(position['holding'],sum(q for _,q in eligible_bids))//increment*increment
+                    if not quantity:
+                        unavailable_reason = 'NO_EXIT_DEPTH'
+                    else:
+                        expected_sale, unavailable_reason = v.priced(key,'SELL',quantity,time,position['route'],debits=debit[role],totals=totals[role],status=True)
+                require((kind == 'EXIT_UNAVAILABLE') == (expected_sale is None),'independent exit availability')
+                if kind == 'EXIT_UNAVAILABLE':
+                    require(row['reason'] == unavailable_reason,'independent exit unavailable reason')
+                else:
+                    require(row['order']['quantity_atoms'] == expected_sale['quantity_atoms'],'independent maximum exit quantity')
             if kind == 'EXIT_UNAVAILABLE':
                 require(position['exit_reason'] is not None, 'unavailable exit keeps holding'); v.counts[role]['no_exits'] += 1; continue
             if kind == 'SETTLED':

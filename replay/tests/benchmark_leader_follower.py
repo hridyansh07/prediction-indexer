@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import tempfile
 import time
+import sqlite3
+from unittest.mock import patch
 
 from replay.tests.test_milestone_leader_follower import Harness
 from replay.tests.economic_scenarios import ladder, M
@@ -33,8 +35,18 @@ def run(changes):
         start = time.perf_counter(); h.strategy.finish(); finish = time.perf_counter()-start
         manifest = json.loads((h.output/'manifest.json').read_bytes())
         print(json.dumps({'runtime_seconds':runtime,'finish_seconds':finish,'book_changes':changes,'files':manifest['files'],'stage':'writer_complete'}),flush=True)
-        start = time.perf_counter(); read_provisional(h.output,root/'context',expected_sha256=h.sha); audit = time.perf_counter()-start
-        result = {'book_changes':changes,'runtime_seconds':runtime,'finish_seconds':finish,'independent_audit_seconds':audit,'maximum_callback_seconds':max(timings),'files':manifest['files'],'total_bytes':sum(x['byte_length'] for x in manifest['files'].values())}
+        indexes = []; connect = sqlite3.connect
+        class MeasuredConnection(sqlite3.Connection):
+            def close(self):
+                indexes.append(Path(self.execute('PRAGMA database_list').fetchone()[2]).stat().st_size)
+                return super().close()
+        def measured_connect(*args,**kwargs):
+            return connect(*args,**kwargs,factory=MeasuredConnection)
+        start = time.perf_counter()
+        with patch('replay.strategies.milestone_leader_follower.output.sqlite3.connect',measured_connect):
+            read_provisional(h.output,root/'context',expected_sha256=h.sha)
+        audit = time.perf_counter()-start
+        result = {'book_changes':changes,'runtime_seconds':runtime,'finish_seconds':finish,'independent_audit_seconds':audit,'independent_index_bytes':max(indexes),'maximum_callback_seconds':max(timings),'files':manifest['files'],'total_bytes':sum(x['byte_length'] for x in manifest['files'].values())}
         print(json.dumps(result,sort_keys=True),flush=True)
         return result
 

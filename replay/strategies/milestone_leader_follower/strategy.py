@@ -296,6 +296,9 @@ class MilestoneLeaderFollower:
         facts = () if self.policy['cohort'] == 'book_only_comparison' else self.timeline.advance(now)
         self.knowledge.release(facts, self.timeline.view.competitors)
         book_only = self.policy['cohort'] == 'book_only_comparison'
+        if not book_only:
+            for space in outcome_scope(self.snapshot,self.scope).spaces.values():
+                self.knowledge.feasible(space)
         state = self.knowledge.state(self.timeline.view, now, book_only)
         if book_only:
             # Optional comparison explicitly ignores released constraints as well.

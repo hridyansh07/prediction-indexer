@@ -55,6 +55,19 @@ def required_actions(v, stream, positions, debits, totals):
             return any(r['kind'] in kind and (attempt is None or r['attempt_id'] == attempt) and (position is None or r['position_id'] == position) and (reason is None or r['reason'] == reason) for r in actions)
         decision = None if payload is None else json.loads(payload)
         observations = {} if decision is None else {(r['role'], tuple(r['target'])): r for r in decision['observations']}
+        for key, observation in observations.items():
+            candidates = json.loads(v.db.execute('SELECT payload FROM candidates WHERE time=? AND role=? AND target=?',(time,key[0],json.dumps(list(key[1])))).fetchone()[0])
+            pending = states.get(key,{}).get('pending')
+            if pending is not None and key[0] == 'leader_milestones':
+                frozen = [c for c in candidates if c['leader'] == pending['route']['leader'] and c['proof'] == pending['route']['proof']]
+                candidates = frozen or candidates
+                usable = [c for c in frozen if c['available']]
+            else:
+                usable = [c for c in candidates if c['available']]
+            positive = [c for c in usable if c['signal']]
+            winner = min(positive or usable,key=lambda c:(-Fraction(c['forecast_net']),-Fraction(c['buy_cash']),c['candidate_id'])) if usable else candidates[0]
+            alternates = [{'candidate_id':c['candidate_id'],'status':c['status'],'forecast_net':c['forecast_net']} for c in candidates if c is not winner] if key[0] == 'leader_milestones' else []
+            require((None if observation['route'] is None else observation['route']['candidate_id']) == winner['candidate_id'] and observation['alternates'] == alternates,'independent best candidate selection and alternates')
         if decision is not None:
             for ident, p in positions.items():
                 if not p['holding']:
@@ -124,7 +137,7 @@ def required_actions(v, stream, positions, debits, totals):
                 due = time + int(v.policy['decision_delay_ns'])
                 if due > time:
                     require(exists(('PENDING',), attempt=ident), 'required pending entry missing')
-                    state['pending'] = {'id': ident, 'innovation': obs['innovation'], 'due': due}
+                    state['pending'] = {'id': ident, 'innovation': obs['innovation'], 'route':obs['route'], 'due': due}
                 else:
                     require(exists(('OPEN', 'SKIPPED'), attempt=ident), 'required immediate entry disposition missing')
                 state['armed'] = False; state['last_attempt'] = time
