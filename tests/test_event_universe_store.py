@@ -31,6 +31,7 @@ from universe.derive.projection import (
     project_selected_bundles,
 )
 from universe.store import (
+    CONTEXT_ROW_LIMIT,
     DETAIL_ROW_LIMIT,
     DetailTooLarge,
     EvidenceConflict,
@@ -1052,7 +1053,7 @@ class EventUniverseTests(unittest.TestCase):
         )
         self.assertEqual(self.database.status()["counts"]["bundle_contexts"], 1)
 
-    def test_retained_origin_ingests_a_context_the_api_cannot_serve(self) -> None:
+    def test_retained_origin_context_past_a_thousand_relationships_is_ingested_and_served(self) -> None:
         report = _selection_report(R1, G1)
         relationships = report["candidates"][0]["relationship_analysis"]["relationships"]
         template = relationships[0]
@@ -1091,9 +1092,19 @@ class EventUniverseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(occurrence, ("retained", R1))
         self.assertEqual(stored_relationships, len(relationships))
-        # The API keeps refusing to serve in one response what ingestion accepted.
-        with self.assertRaises(DetailTooLarge):
-            self.database.selection_detail(R2, "bundle-1")
+        # Relationships grow with the square of the market count; production
+        # contexts reach 3,240 rows at about 0.7 MB, inside the byte budget.
+        # The response byte budget, not a 1,000-row cap, decides what is served.
+        detail = self.database.selection_detail(R2, "bundle-1")
+        assert detail is not None
+        self.assertEqual(len(detail["context"]["relationships"]), len(relationships))
+        run_detail = self.database.targeter_run_detail(R2)
+        assert run_detail is not None
+        bundles, _ = self.database.list_bundles(limit=2)
+        self.assertEqual([row["bundle_id"] for row in bundles], ["bundle-1"])
+        status, body = UniverseApplication(self.database).get("/v1/bundles?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["bundles"][0]["target_count"], 2)
 
     def test_retained_selection_fails_closed_on_origin_drift(self) -> None:
         origin = _publish_run(self.objects, _selection_report(R1, G1))
@@ -1578,10 +1589,33 @@ class EventUniverseTests(unittest.TestCase):
                        right_venue, coverage
                    ) VALUES (?, ?, 'left', 'right', 'IDENTITY', 'series',
                              'kalshi', 'polymarket', 'EXHAUSTIVE')""",
-                ((context, index) for index in range(1, 1001)),
+                ((context, index) for index in range(1, CONTEXT_ROW_LIMIT + 1)),
             )
         with self.assertRaisesRegex(DetailTooLarge, "child-row limit"):
             self.database.selection_detail(R1, "bundle-1")
+
+    def test_bundle_list_summarizes_a_context_too_large_to_serve(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        before, _ = self.database.list_bundles(limit=2)
+        with sqlite3.connect(self.database.path) as connection:
+            context = connection.execute(
+                "SELECT context_sha256 FROM bundle_contexts"
+            ).fetchone()[0]
+            connection.executemany(
+                """INSERT INTO context_relationships(
+                       context_sha256, relationship_index, left_market,
+                       right_market, relationship, scope, left_venue,
+                       right_venue, coverage
+                   ) VALUES (?, ?, 'left', ?, 'IDENTITY', 'series',
+                             'kalshi', 'polymarket', 'EXHAUSTIVE')""",
+                ((context, index, "r" * 1200) for index in range(1, 1501)),
+            )
+        # The detail stays refused by the byte budget; the list never needs it.
+        with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
+            self.database.selection_detail(R1, "bundle-1")
+        after, _ = self.database.list_bundles(limit=2)
+        self.assertEqual(after, before)
 
     def test_list_events_pages_before_indexed_counts_and_counts_market_versions(
         self,
