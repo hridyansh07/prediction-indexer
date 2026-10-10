@@ -7,6 +7,7 @@ Recorded books remain reconstruction attestations; this is not another raw repla
 import hashlib
 import json
 from fractions import Fraction
+from collections import OrderedDict
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -24,12 +25,14 @@ from replay.supervisor import initial, read_success
 from replay.supervisor import read as read_run
 
 from .contract import STRATEGY, ROLES, configuration, identity, number, rational, r
+from .obligations import required_actions
+from .wire import Unpacker, compact_observation
 
-NAMES = ('decisions.ndjson', 'actions.ndjson', 'episodes.ndjson', 'predictions.ndjson', 'positions.ndjson', 'denominators.ndjson')
+NAMES = ('decisions.ndjson', 'actions.ndjson', 'episodes.ndjson', 'predictions.ndjson', 'positions.ndjson', 'denominators.ndjson', 'objects.ndjson')
 MAX_LINE = 4 * 1024 * 1024
 
 
-def rows(root, name, file):
+def raw_rows(root, name, file):
     obj(file, 'sha256 byte_length records'); sha(file['sha256'])
     require(type(file['byte_length']) is int and 0 <= file['byte_length'] <= 512 * 1024 * 1024 and type(file['records']) is int and 0 <= file['records'] <= 1000000, 'file limits')
     path = root / name
@@ -41,14 +44,42 @@ def rows(root, name, file):
             total += len(payload); count += 1; checksum.update(payload)
             require(total <= 512 * 1024 * 1024 and count <= 1000000, 'file bound')
             row = decode(payload, MAX_LINE)
-            require(type(row['version']) is int and row['version'] == 1, 'row version')
+            require(type(row['version']) is int and row['version'] == 2, 'row version')
             yield row
     require(file == {'sha256': checksum.hexdigest(), 'byte_length': total, 'records': count}, 'file identity')
 
 
+def objects(root, file=None):
+    path = root / 'objects.ndjson'
+    require(path.stat().st_size <= 33*1024*1024,'relationship dictionary bound')
+    if file is None:
+        with path.open('rb') as stream:
+            checksum = hashlib.sha256(); count = total = 0
+            for line in stream:
+                checksum.update(line); count += 1; total += len(line)
+        file = {'sha256':checksum.hexdigest(),'byte_length':total,'records':count}
+    result = {}
+    for row in raw_rows(root,'objects.ndjson',file):
+        obj(row,'version id sha256 value'); require(row['id'] == len(result) and type(row['id']) is int,'dense relationship identities')
+        require(row['sha256'] == digest(row['value']),'relationship content identity')
+        result[row['id']] = row['value']
+    return result
+
+
+def rows(root, name, file):
+    unpacker = Unpacker(objects(root))
+    for row in raw_rows(root,name,file):
+        if name == 'predictions.ndjson' and 'batch' in row:
+            obj(row,'version batch'); require(type(row['batch']) is list and 0 < len(row['batch']) <= 768,'forecast batch bound')
+            for item in row['batch']:
+                yield unpacker.decode(item)
+        else:
+            yield unpacker.decode(row)
+
+
 def manifest_schema(manifest, snapshot):
     obj(manifest, 'version strategy config experiment_sha256 fee_engine_identity settlement_model membership_basis history_complete scenario trading_status financing files' + (' summary_sha256' if 'summary_sha256' in manifest else ''))
-    require(type(manifest['version']) is int and manifest['version'] == 1 and manifest['strategy'] == STRATEGY, 'manifest version/strategy')
+    require(type(manifest['version']) is int and manifest['version'] == 2 and manifest['strategy'] == STRATEGY, 'manifest version/strategy')
     config = configuration(manifest['config'], snapshot)
     require(manifest['experiment_sha256'] == identity(config), 'experiment identity')
     require(manifest['settlement_model'] == 'normal_resolution_only' and manifest['scenario'] == 'SIMULTANEOUS_DISPLAYED_SCENARIO' and manifest['trading_status'] == 'trading_status_unknown', 'scenario labels')
@@ -79,8 +110,10 @@ class Verifier:
         self.results = {}; self.milestones = []; self.match_score = None; self.last_result = None
         self.timeline = Timeline(load_game(self.policy['game']['input']['path'], self.policy['game']['input']['sha256'], snapshot), self.policy['game'], int(snapshot['config']['start_ns']))
         self.db.executescript('CREATE TABLE observations(time INTEGER, role TEXT, target TEXT, payload TEXT, PRIMARY KEY(time,role,target)); CREATE TABLE predictions(id TEXT PRIMARY KEY,payload TEXT); CREATE TABLE decisions(time INTEGER PRIMARY KEY,payload TEXT); CREATE TABLE books(time INTEGER,key TEXT,payload TEXT, PRIMARY KEY(time,key)); CREATE TABLE attempts(id TEXT PRIMARY KEY,payload TEXT);')
+        self.db.executescript('CREATE INDEX books_asof ON books(key,time DESC); CREATE INDEX observations_asof ON observations(role,target,time DESC);')
         self.last_time = None
         self.previous = {}
+        self.valuation_cache = OrderedDict()
 
     def weight(self, key):
         return number(self.policy['valuation']['weights'][self.plans[key]['venue']])
@@ -119,7 +152,7 @@ class Verifier:
         return answer
 
     def order(self, row, time, *, debits=None, totals=None):
-        obj(row, 'key side quantity_atoms price_scale quantity_scale levels taken consumed cost_atoms source source_taken cash outcome retained_atoms asset assessment_ids assumptions evidence time_ns sequence scope lineage forecast_displacement')
+        obj(row, 'key side quantity_atoms price_scale quantity_scale taken consumed cost_atoms source source_taken cash outcome retained_atoms asset assessment_ids assumptions evidence time_ns sequence scope lineage forecast_displacement')
         decision = self.db.execute('SELECT payload FROM decisions WHERE time=?', (time,)).fetchone()
         require(decision is not None, 'order belongs to committed decision')
         decision = json.loads(decision[0])
@@ -137,7 +170,6 @@ class Verifier:
             physical = [(10 ** int(plan['price_scale']) - p, q) for p, q in observed] if source[:2] != key else observed
             available = self.eligible(source, physical, debits, totals)
             observed = [(10 ** int(plan['price_scale']) - p, q) for p, q in available] if source[:2] != key else available
-        require(row['levels'] == [list(x) for x in observed], 'order displayed/capacity levels')
         levels = observed
         if row['forecast_displacement'] is not None:
             move = rational(row['forecast_displacement']); maximum = 10 ** int(plan['price_scale']); increment = int(self.rules[key]['price_increment_atoms']); merged = {}
@@ -170,6 +202,56 @@ class Verifier:
         require(row['side'] != 'SELL' or retained <= size, 'sell does not debit excess holdings')
         require(row['assessment_ids'] == [x.identity for x in assessed[0][1]] and row['assumptions'] == sorted({a for x in assessed[0][1] for a in x.assumptions}) and row['evidence'] == sorted({x.evidence.value for x in assessed[0][1]}), 'fee assessment identity/evidence')
         return cash, retained.numerator
+
+    def priced(self, key, side, quantity, time, route, *, forecast=None, debits=None, totals=None):
+        """Build native evidence independently from committed inputs, not outputs."""
+        source, levels = self.ladder(key, 'ask' if side == 'BUY' else 'bid', time)
+        if levels is None:
+            return None
+        plan = self.plans[key]
+        if debits is not None:
+            physical = [(10 ** int(plan['price_scale'])-p,q) for p,q in levels] if source[:2] != key else levels
+            available = self.eligible(source, physical, debits, totals)
+            levels = [(10 ** int(plan['price_scale'])-p,q) for p,q in available] if source[:2] != key else available
+        if forecast is not None:
+            merged = {}; scale = 10 ** int(plan['price_scale']); increment = int(self.rules[key]['price_increment_atoms'])
+            for p,q in levels:
+                price = min(Fraction(scale), max(Fraction(0), p + forecast*scale)) // increment * increment
+                merged[price] = merged.get(price,0) + q
+            levels = sorted(merged.items(), reverse=True)
+        cache_key = None
+        if debits is None:
+            cache_key = (key,side,quantity,tuple(levels),digest(route),forecast)
+            if cache_key in self.valuation_cache:
+                self.valuation_cache.move_to_end(cache_key)
+                return self.valuation_cache[cache_key]
+        remaining = quantity; taken = []; consumed = []
+        for price, amount in levels:
+            use = min(remaining, amount)
+            if use:
+                taken.append((price,use)); consumed.append((price,amount)); remaining -= use
+            if remaining == 0:
+                break
+        if remaining or quantity <= 0 or quantity % int(self.rules[key]['quantity_increment_atoms']):
+            return None
+        decision = json.loads(self.db.execute('SELECT payload FROM decisions WHERE time=?', (time,)).fetchone()[0])
+        native_time = time if forecast is None else time + int(self.policy['exit_horizon_ns'])
+        cost = sum(p*q for p,q in taken)
+        assessed, reasons = self.fees.assess_orders(experiment=self.experiment, scope=decision['scope'], basket={'lineage':route}, direction=side, size=quantity, time=native_time, sequence=decision['sequence'], legs=({'market_id':route['market_id'], 'key':key, 'fill':Fill(quantity,cost,False,tuple(taken),tuple(consumed)), 'price_scale':int(plan['price_scale']), 'quantity_scale':int(plan['quantity_scale']), 'side':side},), account=STRATEGY)
+        if reasons or assessed[0] is None or any(x.net_deltas is None for x in assessed[0][1]):
+            return None
+        economics, results = assessed[0]
+        cash = sum((Fraction(d.atoms,10**d.scale) for result in results for d in result.net_deltas if d.asset == economics.quote),Fraction(0))
+        outcome = sum((Fraction(d.atoms,10**d.scale) for result in results for d in result.net_deltas if d.asset == economics.outcome),Fraction(0))
+        retained = (outcome if side == 'BUY' else -outcome) * 10 ** int(plan['quantity_scale'])
+        if retained.denominator != 1 or retained <= 0 or retained % int(self.rules[key]['quantity_increment_atoms']):
+            return None
+        result = {'key':list(key),'side':side,'quantity_atoms':str(quantity),'price_scale':plan['price_scale'],'quantity_scale':plan['quantity_scale'],'taken':[list(x) for x in taken],'consumed':[list(x) for x in consumed],'cost_atoms':str(cost),'source':list(source),'source_taken':[[10**int(plan['price_scale'])-p if source[:2]!=key else p,q] for p,q in taken],'cash':r(cash),'outcome':r(outcome),'retained_atoms':str(retained.numerator),'asset':asset(economics.quote),'assessment_ids':[x.identity for x in results],'assumptions':sorted({a for x in results for a in x.assumptions}),'evidence':sorted({x.evidence.value for x in results}),'time_ns':str(native_time),'sequence':decision['sequence'],'scope':decision['scope'],'lineage':route,'forecast_displacement':None if forecast is None else r(forecast)}
+        if cache_key is not None:
+            self.valuation_cache[cache_key] = result
+            if len(self.valuation_cache) > 128:
+                self.valuation_cache.popitem(last=False)
+        return result
 
     def mark(self, key, owned, time, lineage, debits, totals, *, status=False):
         source, observed = self.ladder(key, 'bid', time)
@@ -207,8 +289,23 @@ class Verifier:
                 obj(endpoint, 'previous_ns previous current_ns current delta price_revision')
                 require(int(uint(endpoint['previous_ns'])) <= time - int(self.policy['window_ns']) and int(uint(endpoint['current_ns'])) <= time, 'causal as-of endpoints')
                 require(rational(endpoint['current']) - rational(endpoint['previous']) == rational(endpoint['delta']), 'midpoint change arithmetic')
-        if observation['selected'] is None:
-            require(observation['signal'] is None and observation['prediction_id'] is None, 'unavailable observation'); return
+        state = {'game':None,'phase':'unavailable','score_quality':'book_only','prefix_quality':'book_only','score':[0,0],'elapsed_ns':'0'} if role == 'target_only' else knowledge
+        matching = [i for i,item in enumerate(model['cohorts']) if (item['game'] is None or item['game'] == state['game']) and item['phase'] == state['phase'] and item['score_quality'] == state['score_quality'] and item['prefix_quality'] == state['prefix_quality'] and all(item[k] is None or item[k] == state['score'][i] for i,k in enumerate(('home','away'))) and int(item['elapsed_min_ns']) <= int(state['elapsed_ns']) and (item['elapsed_max_ns'] is None or int(state['elapsed_ns']) < int(item['elapsed_max_ns']))]
+        expected_index = matching[0] if matching else model['fallback']
+        if expected_index is not None and state['score_quality'] == 'unknown' and model['cohorts'][expected_index]['score_quality'] != 'unknown':
+            expected_index = None
+        require(observation['cohort'] == expected_index,'independent cohort availability')
+        unsupported = role == 'leader_milestones' and (observation['route'] is None or observation['route']['relation'] not in ('IDENTITY','COMPLEMENT'))
+        missing_history = observation['target_endpoint'] is None or role == 'leader_milestones' and observation['leader_endpoint'] is None
+        if knowledge['contradiction'] or expected_index is None or unsupported or missing_history:
+            overflowed = any(h.get('overflowed') for k,h in self.book_histories.items() if k[0] == target)
+            if observation['route'] is not None:
+                route = observation['route']
+                overflowed = overflowed or self.route_histories.get((tuple(route['leader']) if route['leader'] is not None else None,target,route['proof']),{}).get('overflowed',False)
+            expected_status = 'GAME_CONTRADICTION' if knowledge['contradiction'] else 'MODEL_UNAVAILABLE' if expected_index is None or unsupported else 'HISTORY_BOUND_EXCEEDED' if overflowed else 'HISTORY_UNAVAILABLE'
+            require(observation['selected'] is None and observation['displacement'] is None and observation['signal'] is None and observation['prediction_id'] is None,'required unavailable observation')
+            require(observation['status'] == expected_status,'independent unavailability reason')
+            return
         index = observation['cohort']; require(type(index) is int and 0 <= index < len(model['cohorts']), 'cohort index')
         item = model['cohorts'][index]
         state = {'game': None, 'phase': 'unavailable', 'score_quality': 'book_only', 'prefix_quality': 'book_only', 'score': [0, 0], 'elapsed_ns': '0'} if role == 'target_only' else knowledge
@@ -219,6 +316,18 @@ class Verifier:
         dt = rational(observation['target_endpoint']['delta'])
         forecast = number(item['beta_L']) * dl + number(item['beta_T']) * dt + number(item['intercept'])
         require(observation['displacement'] == r(forecast), 'independent response-model arithmetic')
+        if observation['selected'] is None:
+            require(observation['signal'] is None,'unavailable economic quantity')
+            for q in self.policy['quantity_grid']:
+                quantity = number(q)*10**int(self.plans[target]['quantity_scale'])
+                if quantity.denominator != 1 or maximum is not None and quantity > maximum:
+                    continue
+                buy = self.priced(target,'BUY',quantity.numerator,time,observation['route'],debits=debits,totals=totals)
+                if buy is not None:
+                    future = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],forecast=forecast,debits=debits,totals=totals)
+                    current = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],debits=debits,totals=totals)
+                    require(future is None or current is None,'independent required available size suppressed')
+            return
         expected_sizes = [q for q in self.policy['quantity_grid'] if maximum is None or number(q) * 10 ** int(self.plans[target]['quantity_scale']) <= maximum]
         require([x['quantity'] for x in observation['sizes']] == expected_sizes, 'complete eligible pinned size grid')
         available = []
@@ -228,25 +337,41 @@ class Verifier:
             require(type(size['qualifies']) is bool, 'size predicate')
             if size['status'] != 'AVAILABLE':
                 continue
+            compact_size = 'key' not in size['buy']
+            if compact_size:
+                compact = [size[x] for x in ('buy','forecast_sale','initial_sale')]
+                buy = self.priced(target,'BUY',int(size['buy']['quantity_atoms']),time,observation['route'],debits=debits,totals=totals)
+                require(buy is not None, 'compact native purchase proof')
+                future = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],forecast=forecast,debits=debits,totals=totals)
+                current = self.priced(target,'SELL',int(buy['retained_atoms']),time,observation['route'],debits=debits,totals=totals)
+                require(future is not None and current is not None, 'compact native liquidation proof')
+                expected = [{'cash':buy['cash'],'retained_atoms':buy['retained_atoms'],'quantity_atoms':buy['quantity_atoms']},{'cash':future['cash']},{'cash':current['cash'],'taken':[current['taken'][0]]}]
+                require(compact == expected, 'compact independently priced cash/holdings')
+                size['buy'],size['forecast_sale'],size['initial_sale'] = buy,future,current
             require(int(size['buy']['quantity_atoms']) == number(size['quantity']) * 10 ** int(self.plans[target]['quantity_scale']) and all(order['key'] == list(target) and order['lineage'] == observation['route'] for order in (size['buy'], size['forecast_sale'], size['initial_sale'])), 'native size and route lineage')
-            buy, retained = self.order(size['buy'], time, debits=debits, totals=totals)
-            future, _ = self.order(size['forecast_sale'], time, debits=debits, totals=totals)
-            current, _ = self.order(size['initial_sale'], time, debits=debits, totals=totals)
-            require(size['forecast_sale']['forecast_displacement'] == observation['displacement'] and int(size['forecast_sale']['time_ns']) == time + int(self.policy['exit_horizon_ns']), 'forecast bid shift/horizon')
+            if compact_size:
+                buy = rational(size['buy']['cash']); retained = int(size['buy']['retained_atoms'])
+                future = rational(size['forecast_sale']['cash']); current = rational(size['initial_sale']['cash'])
+            else:
+                buy, retained = self.order(size['buy'], time, debits=debits, totals=totals)
+                future, _ = self.order(size['forecast_sale'], time, debits=debits, totals=totals)
+                current, _ = self.order(size['initial_sale'], time, debits=debits, totals=totals)
+            require(size['forecast_sale']['forecast_displacement'] == observation['displacement'] and (compact_size or int(size['forecast_sale']['time_ns']) == time + int(self.policy['exit_horizon_ns'])), 'forecast bid shift/horizon')
             require(int(size['forecast_sale']['quantity_atoms']) == retained and int(size['initial_sale']['quantity_atoms']) == retained, 'retained holdings valuation')
             cost = -buy; charge = cost * number(self.policy['holding_rate_per_ns']) * int(self.policy['exit_horizon_ns']); net = (future - cost - charge) * self.weight(target); mark = (current - cost) * self.weight(target)
             require(size['forecast_charge'] == r(charge) and size['forecast_net'] == r(net) and size['initial_net'] == r(mark), 'forecast/current net arithmetic')
             qualifying = net > 0 and net >= number(self.policy['minimum_forecast_margin']) and 10000 * net >= number(self.policy['minimum_forecast_return_bps']) * cost * self.weight(target) and mark >= -number(self.policy['stop_loss_fraction']) * cost * self.weight(target)
             require(size['qualifies'] == qualifying, 'economic/initial-loss gate')
             available.append(i)
-        require(available and observation['selected'] == min(available, key=lambda i: (-rational(observation['sizes'][i]['forecast_net']), -rational(observation['sizes'][i]['buy']['cash']), number(observation['sizes'][i]['quantity']))), 'maximum-net size/tie ordering')
+        qualified = [i for i in available if observation['sizes'][i]['qualifies']]
+        require(available and observation['selected'] == min(qualified or available, key=lambda i: (-rational(observation['sizes'][i]['forecast_net']), -rational(observation['sizes'][i]['buy']['cash']), number(observation['sizes'][i]['quantity']))), 'maximum-net eligible size/tie ordering')
         size = observation['sizes'][observation['selected']]
         require(observation['signal'] == (size['qualifies'] and (role != 'leader_milestones' or abs(dl) >= number(self.policy['minimum_leader_move'])) and knowledge['phase'] != 'finished'), 'directional signal')
 
     def remember(self, store, key, time, value, reset=False):
         if reset or value is None:
-            store[key] = {'values': [], 'revision': store.get(key, {}).get('revision', 0)}
-        history = store.setdefault(key, {'values': [], 'revision': 0})
+            store[key] = {'values': [], 'revision': store.get(key, {}).get('revision', 0),'overflowed':False}
+        history = store.setdefault(key, {'values': [], 'revision': 0,'overflowed':False})
         if value is None:
             return
         values = history['values']
@@ -254,7 +379,9 @@ class Verifier:
             values.pop(0)
         if not values or values[-1][1] != value:
             history['revision'] += 1
-            require(len(values) < self.policy['history_changes'], 'reader history bound')
+            if len(values) >= self.policy['history_changes']:
+                values.clear()
+                history['overflowed'] = True
             values.append((time, value, history['revision']))
 
     def endpoints(self, store, key, time):
@@ -264,6 +391,7 @@ class Verifier:
         if not previous:
             return None
         old, current = previous[-1], values[-1]
+        store[key]['overflowed'] = False
         return {'previous_ns': str(old[0]), 'previous': r(old[1]), 'current_ns': str(current[0]), 'current': r(current[1]), 'delta': r(current[1] - old[1]), 'price_revision': current[2]}
 
     def causal_histories(self, scope_index, time, resets, knowledge):
@@ -314,7 +442,8 @@ class Verifier:
             statuses = self.denoms.setdefault(key, {})
             statuses[observation['status']] = statuses.get(observation['status'], 0) + time - start
         self.previous = {}
-        facts = self.timeline.advance(time)
+        facts = () if self.policy['cohort'] == 'book_only_comparison' else self.timeline.advance(time)
+        require(all(f.release_ns == time or f.release_ns <= int(self.snapshot['config']['start_ns']) for f in facts),'required game-release decision time')
         expected = [{'kind': f.kind, 'release_ns': str(f.release_ns), 'source_ns': str(f.source_ns), 'index': f.index, 'winner': f.value[0] if f.kind == 'segment_end' else None, 'score': dict(f.value['score']) if f.kind == 'match_end' else None} for f in facts]
         require(row['released'] == expected, 'every released fact; no future facts')
         for f in facts:
@@ -393,31 +522,40 @@ class Verifier:
                 require(observation['leader_endpoint'] == expected_leader_endpoint, 'independent transformed history/warm-up')
                 require(route['proof'] in {k[2] for k in self.route_histories if k[:2] == (tuple(route['leader']), target)}, 'relationship proof identity')
             self.model(observation, knowledge, time)
-            self.db.execute('INSERT INTO observations VALUES(?,?,?,?)', (time, role, json.dumps(observation['target']), json.dumps(observation)))
+            _, prediction_bids = self.ladder(target,'bid',time)
+            require((observation['prediction_id'] is not None) == (observation['displacement'] is not None and bool(prediction_bids)),'required common price forecast')
+            self.db.execute('INSERT INTO observations VALUES(?,?,?,?)', (time, role, json.dumps(observation['target']), json.dumps(compact_observation(observation))))
             self.counts[role]['decisions'] += 1; self.counts[role]['no_trade'] += observation['signal'] is not True
             self.previous[key] = time, observation
             if observation['prediction_id'] is not None:
                 require(observation['prediction_id'] == digest([self.experiment, role, list(target), time, route['candidate_id']]), 'prediction identity')
-                self.db.execute('INSERT INTO predictions VALUES(?,?)', (observation['prediction_id'], json.dumps(observation)))
+                self.db.execute('INSERT INTO predictions VALUES(?,?)', (observation['prediction_id'], json.dumps(compact_observation(observation))))
         require(seen == {(role, target) for role in ROLES for target in targets_history} and admission['captured_books'] == len(targets_history), 'complete common model schedule')
         self.last_time = time
 
     def prediction(self, row):
         obj(row, 'version prediction_id role target decision_ns desired_ns observed_ns signal forecast_displacement forecast_net forecast_error counterfactual_net status capacity_mode sale')
         stored = self.db.execute('SELECT payload FROM predictions WHERE id=?', (row['prediction_id'],)).fetchone(); require(stored is not None, 'prediction lineage')
-        observation = json.loads(stored[0]); size = observation['sizes'][observation['selected']]
-        require(row['role'] == observation['role'] and row['target'] == observation['target'] and row['signal'] == observation['signal'] and row['forecast_displacement'] == observation['displacement'] and row['forecast_net'] == size['forecast_net'] and row['capacity_mode'] == 'ISOLATED_NONADDITIVE', 'common schedule prediction binding')
+        observation = json.loads(stored[0]); size = None if observation['selected'] is None else observation['sizes'][observation['selected']]
+        require(row['role'] == observation['role'] and row['target'] == observation['target'] and row['signal'] == observation['signal'] and row['forecast_displacement'] == observation['displacement'] and row['forecast_net'] == (None if size is None else size['forecast_net']) and row['capacity_mode'] == 'ISOLATED_NONADDITIVE', 'common schedule prediction binding')
         time = int(uint(row['observed_ns'])); decision = int(uint(row['decision_ns'])); due = int(uint(row['desired_ns']))
         require(due == decision + int(self.policy['exit_horizon_ns']) and time == (int(self.snapshot['config']['end_ns']) if row['status'] == 'RUN_END' else due), 'forecast causal horizon')
+        _, bids = self.ladder(tuple(row['target']), 'bid', time)
+        _, initial_bids = self.ladder(tuple(row['target']), 'bid', decision)
+        error = None if row['status'] == 'RUN_END' or not bids else Fraction(bids[0][0] - initial_bids[0][0], 10 ** int(self.plans[tuple(row['target'])]['price_scale'])) - rational(row['forecast_displacement'])
+        require(row['forecast_error'] == (None if error is None else r(error)), 'independent price forecast error')
+        if error is not None:
+            stats = self.counts[row['role']]; stats['forecast_observations'] += 1; stats['forecast_squared_error'] += error * error
         if row['sale'] is not None:
+            require(size is not None,'price-only forecast has no hypothetical sale')
             cash, _ = self.order(row['sale'], time)
             target = tuple(row['target']); scale = 10 ** int(self.plans[target]['price_scale']); cost = -rational(size['buy']['cash'])
             error = Fraction(row['sale']['taken'][0][0] - size['initial_sale']['taken'][0][0], scale) - rational(row['forecast_displacement'])
             net = (cash - cost - cost * number(self.policy['holding_rate_per_ns']) * (time - decision)) * self.weight(target)
             require(row['forecast_error'] == r(error) and row['counterfactual_net'] == r(net), 'counterfactual/error arithmetic')
-            stats = self.counts[row['role']]; stats['forecast_observations'] += 1; stats['forecast_squared_error'] += error * error; stats['counterfactual_sum'] += net
+            stats = self.counts[row['role']]; stats['counterfactual_sum'] += net
         else:
-            require(row['forecast_error'] is None and row['counterfactual_net'] is None, 'unavailable forecast is not profit')
+            require(row['counterfactual_net'] is None, 'unavailable counterfactual is not profit')
         self.db.execute('DELETE FROM predictions WHERE id=?', (row['prediction_id'],))
 
 
@@ -427,6 +565,7 @@ def validate_content(directory, snapshot, manifest):
         db = sqlite3.connect(str(Path(scratch) / 'index.sqlite3'))
         try:
             verifier = Verifier(snapshot, config, manifest['experiment_sha256'], db)
+            objects(root,manifest['files']['objects.ndjson'])
             require(manifest['fee_engine_identity'] == verifier.fees.engine_identity, 'fee engine identity')
             for row in rows(root, 'decisions.ndjson', manifest['files']['decisions.ndjson']):
                 verifier.decisions(row)
@@ -452,7 +591,7 @@ def verify_actions(v, root, manifest):
     last = -1
     prior_attempt = {}
     base = 'version role time_ns kind reason attempt_id position_id'
-    for row in rows(root, 'actions.ndjson', manifest['files']['actions.ndjson']):
+    for row in required_actions(v, rows(root, 'actions.ndjson', manifest['files']['actions.ndjson']), positions, debit, totals):
         role = row['role']; require(role in ROLES, 'action role'); time = int(uint(row['time_ns'])); require(time >= last, 'action order'); last = time
         kind = row['kind']; attempt = row['attempt_id']; sha(attempt)
         extras = {'SIGNALLED': ' innovation route maximum_quantity_atoms due_ns baseline_predictions', 'PENDING': '', 'CANCELLED': '', 'SKIPPED': ' revalidation' if 'revalidation' in row else '', 'OPEN': ' order ledger revalidation knowledge horizon_ns', 'EXIT_LATCHED': '', 'EXIT_UNAVAILABLE': '', 'CLOSED': ' order ledger lateness_ns', 'PARTIAL_EXIT': ' order ledger lateness_ns', 'SETTLED': ' ledger payout payout_per_contract settlement_identity'}
@@ -639,7 +778,7 @@ def verify_actions(v, root, manifest):
         stats = v.counts[role]; count = stats['forecast_observations']; values = sorted(outcomes[role])
         native = [{'venue': venue, 'asset': item['asset'], 'initial_cash': item['amount'], 'ending_cash': r(cash[role][venue]), 'native_cash_change': r(cash[role][venue] - number(item['amount']))} for item in policy['initial_cash'] for venue in (item['venue'],)]
         report.append({'role': role, 'event_id': event, **{k: value for k, value in stats.items() if k not in ('forecast_squared_error', 'counterfactual_sum')}, 'forecast_mse': None if count == 0 else r(stats['forecast_squared_error'] / count), 'counterfactual_nonadditive_sum': r(stats['counterfactual_sum']), 'censored_residuals': residuals[role], 'closed_position_net_total': r(sum(values, Fraction(0))), 'wins': sum(x > 0 for x in values), 'losses': sum(x < 0 for x in values), 'closed_position_distribution': [r(x) for x in values], 'tail_min': None if not values else r(values[0]), 'capital_used': r(spends[role]), 'native_cash': native, 'capacity_debits': [{'source': list(source), 'total': str(totals[role][source]), 'prices': [[str(p), str(q)] for (s, p), q in sorted(debit[role].items()) if s == source]} for source in sorted(totals[role])]})
-    return {'version': 1, 'strategy': STRATEGY, 'experiment_sha256': v.experiment, 'rows': report, 'comparison': {'schedule': 'COMMON_UNION_OBSERVABLE_TRIGGERS', 'accounts': 'INDEPENDENT_NOT_ADDITIVE', 'prediction_counterfactuals': 'ISOLATED_NONADDITIVE', 'event_clusters': 1, 'event_clustered_uncertainty': 'UNAVAILABLE_SINGLE_EVENT', 'models_tried': policy['models_tried'], 'thresholds_tried': policy['thresholds_tried'], 'empirical_leadership_verdict': 'NO_CORPUS_INFERENCE'}, 'normal_resolution_only': True, 'membership_basis': v.snapshot['membership_basis'], 'history_complete': v.snapshot['history_complete']}
+    return {'version': 2, 'strategy': STRATEGY, 'experiment_sha256': v.experiment, 'rows': report, 'comparison': {'schedule': 'COMMON_UNION_OBSERVABLE_TRIGGERS', 'accounts': 'INDEPENDENT_NOT_ADDITIVE', 'prediction_counterfactuals': 'ISOLATED_NONADDITIVE', 'event_clusters': 1, 'event_clustered_uncertainty': 'UNAVAILABLE_SINGLE_EVENT', 'models_tried': policy['models_tried'], 'thresholds_tried': policy['thresholds_tried'], 'empirical_leadership_verdict': 'NO_CORPUS_INFERENCE'}, 'normal_resolution_only': True, 'membership_basis': v.snapshot['membership_basis'], 'history_complete': v.snapshot['history_complete']}
 
 
 def verify_intervals(v, root, manifest):
@@ -675,8 +814,9 @@ def verify_intervals(v, root, manifest):
         previous = episodes.get(key, -1); require(start >= previous, 'nonoverlapping detections'); episodes[key] = end
         require((key, start) not in actual_episodes, 'unique episode')
         actual_episodes[key, start] = (end, row['end_reason'])
-        observations = v.db.execute('SELECT time,payload FROM observations WHERE role=? AND target=? AND time>=? AND time<? ORDER BY time', (key[0], json.dumps(list(key[1])), start, end)).fetchall()
-        require(observations and observations[0][0] == start and all(json.loads(payload)['signal'] is True for _, payload in observations), 'episode covers only actual positive economic signal')
+        observations = v.db.execute('SELECT time,payload FROM observations WHERE role=? AND target=? AND time>=? AND time<? ORDER BY time', (key[0], json.dumps(list(key[1])), start, end))
+        first = next(observations,None)
+        require(first is not None and first[0] == start and json.loads(first[1])['signal'] is True and all(json.loads(payload)['signal'] is True for _, payload in observations), 'episode covers only actual positive economic signal')
 
     require(actual_episodes == expected, 'every maximal positive episode')
 
@@ -684,7 +824,7 @@ def read_provisional(directory, snapshot_directory, *, expected_sha256, fee_cata
     root = Path(directory); snapshot = load_snapshot(snapshot_directory, expected_sha256=expected_sha256)
     manifest = read_json(root / 'manifest.json'); require(manifest['config']['snapshot_sha256'] == expected_sha256, 'snapshot binding')
     receipt = obj(read_json(root / 'content_receipt.json'), 'version semantic_sha256 run_id attempt_id group identity terminal')
-    require(type(receipt['version']) is int and receipt['version'] == 1 and receipt['semantic_sha256'] == digest(manifest), 'content receipt identity')
+    require(type(receipt['version']) is int and receipt['version'] == 2 and receipt['semantic_sha256'] == digest(manifest), 'content receipt identity')
     actual_manifest = json.loads(json.dumps(manifest))
     if fee_catalog_directory is not None:
         actual_manifest['config']['fees']['catalog_directory'] = str(fee_catalog_directory)

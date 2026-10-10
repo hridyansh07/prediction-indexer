@@ -124,6 +124,12 @@ def model_policy(model, parent):
         if model['role'] == 'target_only':
             require(cohort['score_quality'] == cohort['prefix_quality'] == 'book_only' and cohort['phase'] == 'unavailable', 'target-only must ignore milestones')
     require(model['fallback'] is None or type(model['fallback']) is int and 0 <= model['fallback'] < len(model['cohorts']), 'frozen fallback cohort')
+    for i, left in enumerate(model['cohorts']):
+        for right in model['cohorts'][i + 1:]:
+            fields_overlap = all(left[k] is None or right[k] is None or left[k] == right[k] for k in ('game', 'home', 'away')) and all(left[k] == right[k] for k in ('phase', 'score_quality', 'prefix_quality'))
+            left_end = int(left['elapsed_max_ns']) if left['elapsed_max_ns'] is not None else 2**64
+            right_end = int(right['elapsed_max_ns']) if right['elapsed_max_ns'] is not None else 2**64
+            require(not (fields_overlap and max(int(left['elapsed_min_ns']), int(right['elapsed_min_ns'])) < min(left_end, right_end)), 'overlapping model cohorts')
     if model['provenance'] == 'ASSUMED_RESPONSE_MODEL':
         require(model['training'] is None and bool(model['assumption']), 'declared model assumption')
     else:

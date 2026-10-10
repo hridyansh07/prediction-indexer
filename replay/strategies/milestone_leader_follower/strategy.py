@@ -15,9 +15,10 @@ from replay.supervisor import write_json_durable
 from .contract import STRATEGY, ROLES, configuration, identity, number, r
 from .economics import Account, Capacity, Pricing, atoms
 from .history import History, Knowledge, cohort, displacement, relation
+from .wire import Codec, Writer
 
 LIMITS = {'max_bytes': 512 * 1024 * 1024, 'max_records': 1000000, 'max_line_bytes': 4 * 1024 * 1024}
-FILES = ('decisions.ndjson', 'actions.ndjson', 'episodes.ndjson', 'predictions.ndjson', 'positions.ndjson', 'denominators.ndjson')
+FILES = ('decisions.ndjson', 'actions.ndjson', 'episodes.ndjson', 'predictions.ndjson', 'positions.ndjson', 'denominators.ndjson', 'objects.ndjson')
 
 
 class MilestoneLeaderFollower:
@@ -37,7 +38,9 @@ class MilestoneLeaderFollower:
         self.all_positions = {role: [] for role in ROLES}
         self.root = Path(context['output_directory'])
         require(self.root.is_dir() and not any(self.root.iterdir()), 'output directory must be empty')
-        self.writers = {name: LineWriter(self.root / name, **LIMITS) for name in FILES}
+        objects = LineWriter(self.root / 'objects.ndjson', **LIMITS)
+        self.codec = Codec(objects)
+        self.writers = {name: objects if name == 'objects.ndjson' else Writer(LineWriter(self.root / name, **LIMITS),self.codec,batch=name=='predictions.ndjson') for name in FILES}
         self.binding = {k: context[k] for k in ('run_id', 'attempt_id', 'group', 'identity')}
         self.clock = CutClock(self.snapshot)
         self.books, self.history, self.routes_history, self.signals = {}, {}, {}, {}
@@ -51,6 +54,7 @@ class MilestoneLeaderFollower:
         self.pending_predictions = []
         self.pending_prediction_bytes = 0
         self.episode_count = 0
+        self.counts = {role: {'decisions':0,'no_trade':0,'attempts':0,'opens':0,'full_exits':0,'partial_exits':0,'no_exits':0,'skips':{},'forecast_observations':0,'forecast_squared_error':Fraction(0),'counterfactual_sum':Fraction(0)} for role in ROLES}
 
     def __call__(self, cut):
         try:
@@ -95,7 +99,7 @@ class MilestoneLeaderFollower:
         times = []
         if self.scope + 1 < len(self.snapshot['scopes']):
             times.append(int(self.snapshot['scopes'][self.scope]['end_ns']))
-        if self.timeline.next_time is not None:
+        if self.policy['cohort'] != 'book_only_comparison' and self.timeline.next_time is not None:
             times.append(max(self.clock.start, self.timeline.next_time))
         now = self.last_decision if self.last_decision is not None else self.clock.start - 1
         for history in (*self.history.values(), *self.routes_history.values()):
@@ -244,10 +248,11 @@ class MilestoneLeaderFollower:
             row['status'] = 'GAME_CONTRADICTION'; return row
         if index is None:
             return row
-        if target_endpoint is None or model['role'] == 'leader_milestones' and leader_endpoint is None:
-            row['status'] = 'HISTORY_UNAVAILABLE'; return row
-        if model['role'] == 'leader_milestones' and route['relation'] not in ('IDENTITY', 'COMPLEMENT'):
+        if model['role'] == 'leader_milestones' and (route is None or route['relation'] not in ('IDENTITY', 'COMPLEMENT')):
             return row
+        if target_endpoint is None or model['role'] == 'leader_milestones' and leader_endpoint is None:
+            overflowing = target_history.overflowed or route is not None and route['proof'] is not None and self.routes_history[tuple(route['leader']), target, route['proof']].overflowed
+            row['status'] = 'HISTORY_BOUND_EXCEEDED' if overflowing else 'HISTORY_UNAVAILABLE'; return row
         delta_l = Fraction(leader_endpoint['delta']) if model['role'] == 'leader_milestones' else Fraction(0)
         delta_t = Fraction(target_endpoint['delta'])
         move = displacement(model, index, delta_l, delta_t)
@@ -264,7 +269,8 @@ class MilestoneLeaderFollower:
         available = [i for i, size in enumerate(sizes) if size['status'] == 'AVAILABLE']
         if not available:
             row['status'] = sizes[0]['status'] if sizes else 'SIZE_UNAVAILABLE'; return row
-        selected = min(available, key=lambda i: (-Fraction(sizes[i]['forecast_net']), -Fraction(sizes[i]['buy']['cash']), number(sizes[i]['quantity'])))
+        qualified = [i for i in available if sizes[i]['qualifies']]
+        selected = min(qualified or available, key=lambda i: (-Fraction(sizes[i]['forecast_net']), -Fraction(sizes[i]['buy']['cash']), number(sizes[i]['quantity'])))
         row['selected'], row['status'] = selected, 'AVAILABLE'
         row['signal'] = sizes[selected]['qualifies'] and (model['role'] != 'leader_milestones' or abs(delta_l) >= number(self.policy['minimum_leader_move'])) and state['phase'] != 'finished'
         if model['role'] == 'leader_milestones':
@@ -287,7 +293,7 @@ class MilestoneLeaderFollower:
                 if key not in observable:
                     value = {**book, 'validity': 'unusable', 'bids': [], 'asks': [], 'reason': 'scope_unavailable', 'last_change_ns': str(now)}
                     self.books[key] = value; self.transcript_updates[key] = value; self.history_resets.add(key)
-        facts = self.timeline.advance(now)
+        facts = () if self.policy['cohort'] == 'book_only_comparison' else self.timeline.advance(now)
         self.knowledge.release(facts, self.timeline.view.competitors)
         book_only = self.policy['cohort'] == 'book_only_comparison'
         state = self.knowledge.state(self.timeline.view, now, book_only)
@@ -326,17 +332,20 @@ class MilestoneLeaderFollower:
                 else:
                     selected = self._observation(model, target, None, now, state)
                     selected['alternates'] = []
-                if selected['selected'] is not None:
+                _, initial_bids = self.pricing.ladder(target,'bid',self.books)
+                if selected['displacement'] is not None and initial_bids:
                     selected['prediction_id'] = digest([self.experiment, model['role'], list(target), now, selected['route']['candidate_id']])
                     require(len(self.pending_predictions) < 100000, 'prediction horizon bound exceeded')
-                    size = selected['sizes'][selected['selected']]
+                    size = None if selected['selected'] is None else selected['sizes'][selected['selected']]
                     lightweight = {k: selected[k] for k in ('role', 'target', 'route', 'prediction_id', 'signal', 'displacement')}
-                    lightweight.update(selected=0, sizes=[{'buy': {'retained_atoms': size['buy']['retained_atoms'], 'cash': size['buy']['cash']}, 'initial_sale': {'taken': [size['initial_sale']['taken'][0]]}, 'forecast_net': size['forecast_net']}])
+                    lightweight.update(initial_bid=initial_bids[0][0],selected=None if size is None else 0, sizes=[] if size is None else [{'buy': {'retained_atoms': size['buy']['retained_atoms'], 'cash': size['buy']['cash']}, 'initial_sale': {'taken': [size['initial_sale']['taken'][0]]}, 'forecast_net': size['forecast_net']}])
                     byte_cost = len(encoded(lightweight)) + 512
                     require(self.pending_prediction_bytes + byte_cost <= 64 * 1024 * 1024, 'pending forecast state bound exceeded')
                     self.pending_prediction_bytes += byte_cost
                     self.pending_predictions.append({'row': lightweight, 'due': now + int(self.policy['exit_horizon_ns']), 'time': now, 'scope': self.scope, 'byte_cost': byte_cost})
                 observations.append(selected)
+                self.counts[model['role']]['decisions'] += 1
+                self.counts[model['role']]['no_trade'] += selected['signal'] is not True
         exited = {role: set() for role in ROLES}
         for role, account in self.accounts.items():
             for position in list(account.positions.values()):
@@ -391,6 +400,12 @@ class MilestoneLeaderFollower:
         signal['episode'] = None
 
     def _action(self, role, now, kind, reason, attempt, position, **extra):
+        stats = self.counts[role]
+        counter = {'SIGNALLED':'attempts','OPEN':'opens','CLOSED':'full_exits','SETTLED':'full_exits','PARTIAL_EXIT':'partial_exits','EXIT_UNAVAILABLE':'no_exits'}.get(kind)
+        if counter is not None:
+            stats[counter] += 1
+        if kind in ('SKIPPED','CANCELLED'):
+            stats['skips'][reason] = stats['skips'].get(reason,0) + 1
         self.writers['actions.ndjson'].append({'version': 1, 'role': role, 'time_ns': str(now), 'kind': kind, 'reason': reason,
             'attempt_id': attempt, 'position_id': None if position is None else position['id'], **extra})
 
@@ -460,6 +475,7 @@ class MilestoneLeaderFollower:
         if reason:
             self._action(role, now, 'SKIPPED', reason, attempt['attempt_id'], None, revalidation=repriced); return
         position, ledger = account.open(order, attempt, now, state)
+        position['original_space'] = outcome_scope(self.snapshot, self.scope).spaces[position['shape_id']]
         self.all_positions[role].append(position)
         self._action(role, now, 'OPEN', 'SIMULTANEOUS_DISPLAYED_SCENARIO', attempt['attempt_id'], position, order=order, ledger=ledger, revalidation=repriced, knowledge=state, horizon_ns=str(position['horizon']))
         # Known-outcome cash never predates acquisition and posts after the opening.
@@ -478,8 +494,10 @@ class MilestoneLeaderFollower:
             if item is not None:
                 position.update(settlement_due=max(position['opened'], int(item['available_ns'])), payout=number(item['payout']), settlement_identity=item['evidence_sha256'])
             return
+        if self.policy['cohort'] == 'book_only_comparison':
+            return
         scope = outcome_scope(self.snapshot, self.scope)
-        space = scope.spaces.get(position['shape_id'])
+        space = position.get('original_space', scope.spaces.get(position['shape_id']))
         if space is None:
             return
         resolved = self.knowledge.first_resolution(space, position['claim_keys'])
@@ -540,17 +558,23 @@ class MilestoneLeaderFollower:
 
     def _prediction_outcome(self, prediction, now, censored=False):
         row = prediction['row']; target = tuple(row['target'])
-        size = row['sizes'][row['selected']]
+        size = None if row['selected'] is None else row['sizes'][row['selected']]
         sale = None; reason = 'RUN_END' if censored else None
-        if not censored:
+        if not censored and size is not None:
             sale, reason = self.pricing.order(target, 'SELL', int(size['buy']['retained_atoms']), self.books, None, now, self.sequence, self.scope, row['route'])
-        initial_bid = size['initial_sale']['taken'][0][0]
-        actual_bid = None if sale is None else sale['taken'][0][0]
+        initial_bid = row['initial_bid']
+        _, visible_bids = self.pricing.ladder(target, 'bid', self.books)
+        actual_bid = None if censored or not visible_bids else visible_bids[0][0]
         scale = 10 ** int(self.pricing.plans[target]['price_scale'])
         error = None if actual_bid is None else r(Fraction(actual_bid - initial_bid, scale) - Fraction(row['displacement']))
-        cost = -Fraction(size['buy']['cash'])
+        cost = Fraction(0) if size is None else -Fraction(size['buy']['cash'])
         charge = cost * number(self.policy['holding_rate_per_ns']) * (now - prediction['time'])
-        self.writers['predictions.ndjson'].append({'version': 1, 'prediction_id': row['prediction_id'], 'role': row['role'], 'target': row['target'], 'decision_ns': str(prediction['time']), 'desired_ns': str(prediction['due']), 'observed_ns': str(now), 'signal': row['signal'], 'forecast_displacement': row['displacement'], 'forecast_net': size['forecast_net'], 'forecast_error': error, 'counterfactual_net': None if sale is None else r((Fraction(sale['cash']) - cost - charge) * self.pricing.weight(target)), 'status': reason or 'OBSERVED', 'capacity_mode': 'ISOLATED_NONADDITIVE', 'sale': sale})
+        stats = self.counts[row['role']]
+        if error is not None:
+            stats['forecast_observations'] += 1; stats['forecast_squared_error'] += Fraction(error)**2
+        if sale is not None:
+            stats['counterfactual_sum'] += (Fraction(sale['cash'])-cost-charge)*self.pricing.weight(target)
+        self.writers['predictions.ndjson'].append({'version': 1, 'prediction_id': row['prediction_id'], 'role': row['role'], 'target': row['target'], 'decision_ns': str(prediction['time']), 'desired_ns': str(prediction['due']), 'observed_ns': str(now), 'signal': row['signal'], 'forecast_displacement': row['displacement'], 'forecast_net': None if size is None else size['forecast_net'], 'forecast_error': error, 'counterfactual_net': None if sale is None else r((Fraction(sale['cash']) - cost - charge) * self.pricing.weight(target)), 'status': reason or ('PRICE_ONLY' if size is None else 'OBSERVED'), 'capacity_mode': 'ISOLATED_NONADDITIVE', 'sale': sale})
 
     def finish(self):
         try:
@@ -562,22 +586,35 @@ class MilestoneLeaderFollower:
             for (role, target), statuses in sorted(self.denominators.items()):
                 self.writers['denominators.ndjson'].append({'version': 1, 'role': role, 'target': list(target), 'status_ns': {k: str(v) for k, v in sorted(statuses.items())}})
             files = {name: writer.finish() for name, writer in self.writers.items()}
-            manifest = {'version': 1, 'strategy': STRATEGY, 'config': self.config, 'experiment_sha256': self.experiment,
+            manifest = {'version': 2, 'strategy': STRATEGY, 'config': self.config, 'experiment_sha256': self.experiment,
                         'fee_engine_identity': self.fees.engine_identity, 'settlement_model': 'normal_resolution_only',
                         'membership_basis': self.snapshot['membership_basis'], 'history_complete': self.snapshot['history_complete'],
                         'scenario': 'SIMULTANEOUS_DISPLAYED_SCENARIO', 'trading_status': 'trading_status_unknown',
                         'financing': 'ZERO_FINANCING_COST_SCENARIO' if number(self.policy['holding_rate_per_ns']) == 0 else 'ANALYTICAL_HOLDING_COST_SCENARIO',
                         'files': files}
-            from .output import validate_content
-            summary = validate_content(self.root, self.snapshot, manifest)
+            # The independent completion reader performs the full causal audit.
+            # Publishing summaries from bounded accumulated state avoids a long
+            # duplicate audit without progress inside the supervised worker.
+            summary = self._summary()
             write_json_durable(self.root / 'summary.json', summary)
             manifest['summary_sha256'] = digest(summary)
             write_json_durable(self.root / 'manifest.json', manifest)
-            write_json_durable(self.root / 'content_receipt.json', {'version': 1, 'semantic_sha256': digest(manifest), **self.binding, 'terminal': self.sequence + 1})
+            write_json_durable(self.root / 'content_receipt.json', {'version': 2, 'semantic_sha256': digest(manifest), **self.binding, 'terminal': self.sequence + 1})
             self.finished = True
         except Exception:
             self.poisoned = True
             raise
+
+    def _summary(self):
+        report = []
+        event = self.snapshot.get('outcomes',{}).get('document',{}).get('event_id')
+        for role in ROLES:
+            stats = self.counts[role]; account = self.accounts[role]; positions = self.all_positions[role]
+            values = sorted((p['closed_pnl']-p['holding_charge'])*self.pricing.weight(p['target']) for p in positions if not p['holding_atoms'])
+            count = stats['forecast_observations']
+            native = [{'venue':item['venue'],'asset':item['asset'],'initial_cash':item['amount'],'ending_cash':r(account.cash[item['venue']]),'native_cash_change':r(account.cash[item['venue']]-number(item['amount']))} for item in self.policy['initial_cash']]
+            report.append({'role':role,'event_id':event,**{k:value for k,value in stats.items() if k not in ('forecast_squared_error','counterfactual_sum')},'forecast_mse':None if count == 0 else r(stats['forecast_squared_error']/count),'counterfactual_nonadditive_sum':r(stats['counterfactual_sum']),'censored_residuals':sum(p['holding_atoms']>0 for p in positions),'closed_position_net_total':r(sum(values,Fraction(0))),'wins':sum(x>0 for x in values),'losses':sum(x<0 for x in values),'closed_position_distribution':[r(x) for x in values],'tail_min':None if not values else r(values[0]),'capital_used':r(account.event_spend),'native_cash':native,'capacity_debits':account.capacity.record()})
+        return {'version':2,'strategy':STRATEGY,'experiment_sha256':self.experiment,'rows':report,'comparison':{'schedule':'COMMON_UNION_OBSERVABLE_TRIGGERS','accounts':'INDEPENDENT_NOT_ADDITIVE','prediction_counterfactuals':'ISOLATED_NONADDITIVE','event_clusters':1,'event_clustered_uncertainty':'UNAVAILABLE_SINGLE_EVENT','models_tried':self.policy['models_tried'],'thresholds_tried':self.policy['thresholds_tried'],'empirical_leadership_verdict':'NO_CORPUS_INFERENCE'},'normal_resolution_only':True,'membership_basis':self.snapshot['membership_basis'],'history_complete':self.snapshot['history_complete']}
 
 
 def build(context):

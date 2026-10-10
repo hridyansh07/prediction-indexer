@@ -58,7 +58,7 @@ def configuration(base, root, changes=None, game=None, fee_mode=None):
 
 
 class Harness(BaseHarness):
-    def __init__(self, root, changes=None, game=None, scopes=False, fee_mode=None, vendor_detail=None, outcomes=None, pin=None):
+    def __init__(self, root, changes=None, game=None, scopes=False, fee_mode=None, vendor_detail=None, outcomes=None, pin=None, end_ns=None):
         def factory(context):
             self.leader_config = configuration(dict(context['config']), root, changes, game, fee_mode)
             return build({**context, 'config': self.leader_config})
@@ -66,7 +66,12 @@ class Harness(BaseHarness):
             return prepare(*args, **kwargs, outcomes=lambda _: outcomes or document())
         from replay.tests.test_preparation import detail, config
         supplied_detail = vendor_detail or detail()
-        with patch('replay.tests.test_bundle_coverage.detail', return_value=supplied_detail), patch('replay.tests.test_bundle_coverage.config', side_effect=lambda: config(supplied_detail)), patch('replay.tests.test_bundle_coverage.build', side_effect=factory), patch('replay.tests.test_bundle_coverage.prepare', side_effect=prepare_outcomes):
+        def supplied_config():
+            value = config(supplied_detail)
+            if end_ns is not None:
+                value['end_ns'] = str(end_ns); value['occurrences'][0]['end_ns'] = str(end_ns)
+            return value
+        with patch('replay.tests.test_bundle_coverage.detail', return_value=supplied_detail), patch('replay.tests.test_bundle_coverage.config', side_effect=supplied_config), patch('replay.tests.test_bundle_coverage.build', side_effect=factory), patch('replay.tests.test_bundle_coverage.prepare', side_effect=prepare_outcomes):
             super().__init__(root, mixed=True, scopes=scopes, pin=pin)
 
     def plan_index(self, instrument, orientation='outcome'):
@@ -88,7 +93,9 @@ class Harness(BaseHarness):
         return read_provisional(self.output, self.root / 'context', expected_sha256=self.sha)
 
     def records(self, filename):
-        return [json.loads(line) for line in (self.output / filename).read_bytes().splitlines()]
+        from replay.strategies.milestone_leader_follower.output import rows
+        manifest = json.loads((self.output / 'manifest.json').read_bytes())
+        return list(rows(self.output,filename,manifest['files'][filename]))
 
 
 class LeaderTests(unittest.TestCase):
@@ -295,7 +302,7 @@ class LeaderTests(unittest.TestCase):
 
     def rewrite(self, h, filename, mutate):
         records = h.records(filename); mutate(records)
-        payload = b''.join(encoded(x) + b'\n' for x in records)
+        payload = b''.join(encoded(h.strategy.codec.encode(x,new=False,full_books=True)) + b'\n' for x in records)
         (h.output / filename).write_bytes(payload)
         manifest = json.loads((h.output / 'manifest.json').read_bytes())
         manifest['files'][filename] = {'sha256': hashlib.sha256(payload).hexdigest(), 'byte_length': len(payload), 'records': len(records)}
@@ -448,8 +455,9 @@ class LeaderTests(unittest.TestCase):
         self.assertEqual(history.endpoints(5, 2)['previous'], '1/2')
         history.observe(7, None); history.observe(7, Fraction(3, 5)); self.assertIsNone(history.endpoints(8, 2))
         history.observe(8, Fraction(7, 10)); history.observe(9, Fraction(4, 5))
-        with self.assertRaisesRegex(ProtocolError, 'history change bound'):
-            history.observe(10, Fraction(9, 10))
+        history.observe(10, Fraction(9, 10))
+        self.assertTrue(history.overflowed)
+        self.assertIsNone(history.endpoints(10, 2))
 
 
 if __name__ == '__main__':

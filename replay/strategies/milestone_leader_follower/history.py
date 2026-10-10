@@ -13,24 +13,31 @@ class History:
         self.values = deque()
         self.price_revision = 0
         self.innovation_time = None
+        self.overflowed = False
 
     def observe(self, time, coordinate):
         if coordinate is None:
             self.values.clear()
             self.innovation_time = None
+            self.overflowed = False
             return
         while len(self.values) > 1 and self.values[1][0] <= time - self.interval:
             self.values.popleft()
         if not self.values or self.values[-1][1] != coordinate:
             self.price_revision += 1
             self.innovation_time = time
-            require(len(self.values) < self.limit, 'history change bound exceeded')
+            if len(self.values) >= self.limit:
+                # No endpoint is invented after discarding necessary evidence.
+                # Restart a full warm-up and expose why attempts are unavailable.
+                self.values.clear()
+                self.overflowed = True
             self.values.append((time, coordinate, self.price_revision))
 
     def endpoints(self, time, window):
         if not self.values or self.values[0][0] > time - window:
             return None
         previous = next(x for x in reversed(self.values) if x[0] <= time - window)
+        self.overflowed = False
         current = self.values[-1]
         return {'previous_ns': str(previous[0]), 'previous': r(previous[1]), 'current_ns': str(current[0]), 'current': r(current[1]), 'delta': r(current[1] - previous[1]), 'price_revision': current[2]}
 

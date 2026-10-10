@@ -122,8 +122,11 @@ abs(delta_L) >= minimum_leader_move
 Also require current bid depth to support the initial full liquidation mark and
 its loss not to exceed the configured stop-loss amount. This prevents opening
 a position already beyond its own risk limit. Current bids used for that mark
-are not consumed until an actual hypothetical sale. Choose the quantity with
-largest forecast net, ties lower C then smaller q. This is a forecast-sized
+are not consumed until an actual hypothetical sale. Choose among quantities
+passing **all** gates the quantity with largest forecast net, ties lower C then
+smaller q. A larger failing quantity never vetoes a smaller qualifying quantity.
+If none qualifies, the largest available valuation remains a no-trade diagnostic.
+This is a forecast-sized
 position, not Kelly sizing or a guaranteed return.
 
 Recommended pinned defaults:
@@ -216,7 +219,11 @@ the best ex post baseline. Assumed models declare their assumptions separately.
 
 Measure forecast error and counterfactual target trade outcomes for all models
 at a common decision schedule (union of their candidate triggers), including
-no-trade decisions. Then run each model's thresholded policy with identical cash,
+no-trade decisions. Price forecast error uses the committed target best bid at
+the decision and horizon, independently of full-size execution depth. Thin depth
+can make counterfactual net unavailable while price forecast error remains
+measurable; no economic P&L is invented for that unfilled size.
+Then run each model's thresholded policy with identical cash,
 size grid, capacity, timing and exit conventions in independent accounts. A
 baseline need not satisfy the leader-move gate; its own economic threshold is
 its trigger. This separates incremental prediction from signal frequency and

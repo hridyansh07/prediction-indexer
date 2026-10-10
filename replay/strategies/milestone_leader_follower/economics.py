@@ -1,5 +1,6 @@
 """Exact native orders, physical-source capacity and long-only scenario lots."""
 from fractions import Fraction
+from collections import OrderedDict
 
 from replay.economic_fills import walk
 from replay.strategies._shared.fee_bridge import FeeEconomicsUnavailable
@@ -52,6 +53,7 @@ class Pricing:
         self.plans = {(x['instrument'], x['orientation']): x for x in snapshot['plans']}
         self.rules = {(x['instrument'], x['orientation']): x for x in policy['rule_bindings']}
         self.fees, self.policy, self.experiment = fees, policy, experiment
+        self.observation_sizes = OrderedDict()
         for item in policy['initial_cash']:
             require(fees._assets.get(item['venue']) is not None and item['asset'] == asset_record(fees._assets[item['venue']]), 'cash native asset binding')
         assets = {digest(item['asset']) for item in policy['initial_cash']}
@@ -105,7 +107,6 @@ class Pricing:
         source, levels = self.ladder(key, 'ask' if side == 'BUY' else 'bid', books, capacity)
         if levels is None:
             return None, 'UNUSABLE'
-        native_levels = levels
         if forecast is not None:
             levels = self.shift(key, levels, forecast)
         if not levels:
@@ -146,9 +147,17 @@ class Pricing:
             source_taken = [(maximum - p, q) for p, q in fill.taken]
         else:
             source_taken = list(fill.taken)
-        return {'key': list(key), 'side': side, 'quantity_atoms': str(quantity_atoms), 'price_scale': plan['price_scale'], 'quantity_scale': plan['quantity_scale'], 'levels': [list(x) for x in native_levels], 'taken': [list(x) for x in fill.taken], 'consumed': [list(x) for x in fill.consumed], 'cost_atoms': str(fill.cost), 'source': list(source), 'source_taken': [list(x) for x in source_taken], 'cash': r(cash), 'outcome': r(outcome), 'retained_atoms': str(retained_atoms), 'asset': asset_record(economics.quote), 'assessment_ids': [x.identity for x in results], 'assumptions': sorted({a for x in results for a in x.assumptions}), 'evidence': sorted({x.evidence.value for x in results}), 'time_ns': str(time), 'sequence': sequence, 'scope': scope, 'lineage': lineage, 'forecast_displacement': None if forecast is None else r(forecast)}, None
+        return {'key': list(key), 'side': side, 'quantity_atoms': str(quantity_atoms), 'price_scale': plan['price_scale'], 'quantity_scale': plan['quantity_scale'], 'taken': [list(x) for x in fill.taken], 'consumed': [list(x) for x in fill.consumed], 'cost_atoms': str(fill.cost), 'source': list(source), 'source_taken': [list(x) for x in source_taken], 'cash': r(cash), 'outcome': r(outcome), 'retained_atoms': str(retained_atoms), 'asset': asset_record(economics.quote), 'assessment_ids': [x.identity for x in results], 'assumptions': sorted({a for x in results for a in x.assumptions}), 'evidence': sorted({x.evidence.value for x in results}), 'time_ns': str(time), 'sequence': sequence, 'scope': scope, 'lineage': lineage, 'forecast_displacement': None if forecast is None else r(forecast)}, None
 
     def sizes(self, target, books, capacity, time, sequence, scope, route, displacement, maximum=None):
+        cache_key = None
+        if capacity is None:
+            _, asks = self.ladder(target,'ask',books)
+            _, bids = self.ladder(target,'bid',books)
+            cache_key = (target,asks,bids,scope,route['candidate_id'],displacement,maximum)
+            if cache_key in self.observation_sizes:
+                self.observation_sizes.move_to_end(cache_key)
+                return self.observation_sizes[cache_key]
         result = []
         scale = int(self.plans[target]['quantity_scale'])
         for size in self.policy['quantity_grid']:
@@ -179,6 +188,13 @@ class Pricing:
             qualifies = net > 0 and net >= number(self.policy['minimum_forecast_margin']) and 10000 * net >= number(self.policy['minimum_forecast_return_bps']) * scalar_cost and initial >= -number(self.policy['stop_loss_fraction']) * scalar_cost
             row.update(status='AVAILABLE', forecast_charge=r(charge), forecast_net=r(net), initial_net=r(initial), qualifies=qualifies)
             result.append(row)
+        if cache_key is not None:
+            # FeeBridge resolves this frozen catalog at its pinned reference_ns.
+            # Only scalar valuation orders are reused; actual orders and delayed
+            # account repricing always pass capacity and retain their own clocks.
+            self.observation_sizes[cache_key] = result
+            if len(self.observation_sizes) > 128:
+                self.observation_sizes.popitem(last=False)
         return result
 
 
