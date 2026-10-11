@@ -559,22 +559,52 @@ class OptimizerReviewRegressions(unittest.TestCase):
             h.finish()
 
     def test_honest_rejected_declared_inputs_stay_unknown(self):
-        for reason in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN'):
+        for reason in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','SELF_CROSSED_LEG','UNSUPPORTED_SCALE'):
             with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
                 root=Path(tmp)
                 def configure(cfg):
                     if reason=='ECONOMICS_UNKNOWN':
                         cfg['fees']['instrument_bindings']=[r for r in cfg['fees']['instrument_bindings']if r['instrument']!='polymarket:987']
+                    elif reason=='UNSUPPORTED_SCALE':
+                        next(q for q in cfg['policy']['quantities']if q['instrument']=='polymarket:987')['increment']='0.0000003'
                 h=OptimizerHarness(root,books={('polymarket:123','outcome'),('polymarket:987','outcome')},configure=configure)
                 try:
                     h.window();h.pm_ask(12,'123',(900,2))
                     if reason=='ONE_SIDED':h.pm_ask(12,'987')
                     elif reason=='DEPTH_LIMITED':h.pm_ask(12,'987',(900,Fraction(1,2)))
                     elif reason=='ECONOMICS_UNKNOWN':h.pm_ask(12,'987',(900,2))
+                    elif reason=='UNSUPPORTED_SCALE':h.pm_ask(12,'987',(950,2))
+                    elif reason=='SELF_CROSSED_LEG':
+                        from replay.tests.economic_scenarios import ladder
+                        ladder(h,12,'polymarket:987',bids=((960,2000000),),asks=((950,2000000),))
                     result=h.finish();stat=result['summary']['rows'][0]
                     self.assertEqual(stat['unknown_ns'],'30');self.assertEqual(stat['complete_nonpositive_ns'],'0')
                     rejected=[r for row in h.records('decisions.ndjson')if row['type']=='decision'for d in row['scenarios'][0]['detection']for r in d['rejected']]
                     self.assertTrue(any(r.get('key')==['polymarket:987','outcome']and r['reason']==reason for r in rejected),rejected)
+                finally:h.close()
+
+    def test_reader_rejects_crossed_and_unrepresentable_declared_negative(self):
+        from replay.strategies.bounded_payout_optimizer import strategy
+        from replay.tests.economic_scenarios import ladder
+        original=strategy.search
+        def falsely_certified(*args,**kwargs):
+            results,models=original(*args,**kwargs)
+            for result in results:
+                if 'found'in result and result['negative_certificate']['margin_upper_bound']==0:
+                    result['economic_status']='COMPLETE_NONPOSITIVE'
+            return results,models
+        for reason in ('SELF_CROSSED_LEG','UNSUPPORTED_SCALE'):
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                def configure(cfg):
+                    if reason=='UNSUPPORTED_SCALE':
+                        next(q for q in cfg['policy']['quantities']if q['instrument']=='polymarket:987')['increment']='0.0000003'
+                h=OptimizerHarness(Path(tmp),books={('polymarket:123','outcome'),('polymarket:987','outcome')},configure=configure)
+                try:
+                    h.window();h.pm_ask(12,'123',(900,2))
+                    if reason=='SELF_CROSSED_LEG':ladder(h,12,'polymarket:987',bids=((960,2000000),),asks=((950,2000000),))
+                    else:h.pm_ask(12,'987',(950,2))
+                    with patch.object(strategy,'search',side_effect=falsely_certified),self.assertRaisesRegex(ProtocolError,'independent.*negative.*input'):
+                        h.finish()
                 finally:h.close()
 
     def test_reader_rejects_rule_event_pin_even_if_writer_guard_is_faulty(self):

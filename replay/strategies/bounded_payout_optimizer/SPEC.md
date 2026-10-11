@@ -29,6 +29,8 @@ the remaining pool reserves work for each remaining detection/entry slot; unused
 shares return to the pool. Analytical q=0 costs no node. Quantity and rule bindings define the declared domain; an
 unconfigured/unsupported sibling does not veto supported candidates. Missing
 required declared book inputs remain visible and cannot prove a complete negative.
+Crossed or unrepresentable declared inputs also remain unknown for negative
+measurement and rearm; their rejection cannot certify the full declared domain.
 
 `rules` pins the event, compatibility/evidence SHA-256, sorted assumptions,
 `normal_resolution_only: true` and each book's reviewed rule identity. This is an

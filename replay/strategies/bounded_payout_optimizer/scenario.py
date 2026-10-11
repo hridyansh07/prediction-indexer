@@ -406,7 +406,7 @@ def search(config, bridge, snapshot, scope, book_rows, knowledge, time, sequence
         if not valuation_unknown:
             negative_certificate={'kind':'UNIFORM_OUTCOME_GROSS_DUAL_BOUND','margin_upper_bound':dual_bound}
         declared={(r['instrument'],r['orientation'])for r in config['policy']['quantities']}
-        uncertain=valuation_unknown or bool(found['unknown_books']) or any(tuple(r.get('key',())) in declared and r['reason'] in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','NOT_CAPTURED') for r in rejected)
+        uncertain=valuation_unknown or bool(found['unknown_books']) or any(tuple(r.get('key',())) in declared and r['reason'] in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','NOT_CAPTURED','SELF_CROSSED_LEG','UNSUPPORTED_SCALE') for r in rejected)
         status='SEARCH_COMPLETE' if found['complete'] else 'SEARCH_LIMITED'
         certified_negative=negative_certificate is not None and negative_certificate['margin_upper_bound']<=0
         result.append({'shape':shape,'status':status,'economic_status':'POSITIVE' if qualification else 'FEASIBLE_BELOW_ENTRY_THRESHOLD'if found['best']['margin']>0 else 'INPUT_UNKNOWN' if uncertain else 'COMPLETE_NONPOSITIVE' if found['complete']and certified_negative else 'UNCERTIFIED_NONPOSITIVE'if found['complete']else 'LIMITED_NO_POSITIVE',
