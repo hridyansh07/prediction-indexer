@@ -41,15 +41,44 @@ def settlement(v, position, time):
     return None
 
 
+def next_account_decision(v, positions, states, debits, totals, time, knowledge):
+    """Independent deadlines after the preceding decision's audited ledger."""
+    deadlines = []
+    for state in states.values():
+        if state['pending'] is not None:
+            deadlines.append((state['pending']['due'], 'pending-entry'))
+        if state['false_since'] is not None:
+            deadlines.append((state['false_since'] + int(v.policy['rearm_false_ns']), 'rearm'))
+    rate = number(v.policy['holding_rate_per_ns'])
+    for position in positions.values():
+        if not position['holding']:
+            continue
+        due = settlement(v, position, time)
+        if due is not None and not knowledge['contradiction']:
+            deadlines.append((due, 'settlement'))
+        if position['exit_reason'] is not None:
+            continue
+        deadlines.append((position['horizon'], 'horizon'))
+        if rate > 0 and position['basis'] > 0:
+            mark = v.mark(position['target'], position['holding'], time, position['route'], debits[position['role']], totals[position['role']])
+            if mark is not None:
+                remaining = (mark - position['basis'] + position['cost'] * number(v.policy['stop_loss_fraction'])) / (position['basis'] * rate)
+                deadline = position['opened'] + max(0, -(-remaining.numerator // remaining.denominator))
+                deadlines.append((deadline, 'holding-cost'))
+    return min((item for item in deadlines if item[0] > time), default=None)
+
+
 def required_actions(v, stream, positions, debits, totals):
     """Yield supplied rows only after proving all obligations at that time exist."""
     groups = iter(groupby(stream, key=lambda r: int(r['time_ns'])))
     current = next(groups, None)
     states = {}
+    deadline = None
     end = int(v.snapshot['config']['end_ns'])
     times = chain(v.db.execute('SELECT time,payload FROM decisions ORDER BY time'), ((end, None),))
     for time, payload in times:
         require(current is None or current[0] >= time, 'required action belongs to committed observer time')
+        require(deadline is None or deadline[0] >= time, 'required ' + ('' if deadline is None else deadline[1]) + ' decision time')
         actions = list(current[1]) if current is not None and current[0] == time else []
         def exists(kind, *, attempt=None, position=None, reason=None):
             return any(r['kind'] in kind and (attempt is None or r['attempt_id'] == attempt) and (position is None or r['position_id'] == position) and (reason is None or r['reason'] == reason) for r in actions)
@@ -144,6 +173,8 @@ def required_actions(v, stream, positions, debits, totals):
             state['truth'] = truth
         for row in actions:
             yield row
+        if decision is not None:
+            deadline = next_account_decision(v, positions, states, debits, totals, time, decision['knowledge'])
         if current is not None and current[0] == time:
             current = next(groups, None)
     require(current is None, 'required action after run end')

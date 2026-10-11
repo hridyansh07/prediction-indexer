@@ -25,6 +25,151 @@ class RepairTests(unittest.TestCase):
     def audit(self, h):
         return validate_content(h.output, h.strategy.snapshot, json.loads((h.output / 'manifest.json').read_bytes()))
 
+    @staticmethod
+    def omit_deadline(deadline):
+        original = MilestoneLeaderFollower._next
+        def next_time(strategy, limit):
+            due = original(strategy, limit)
+            if due != deadline:
+                return due
+            previous = strategy.last_decision
+            try:
+                strategy.last_decision = deadline
+                return original(strategy, limit)
+            finally:
+                strategy.last_decision = previous
+        return next_time
+
+    def test_quiet_history_endpoint_closes_honest_episode(self):
+        h = self.h(changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        h.prime(); h.leaders(14,600); h.group(35); h.finish()
+        episodes = [r for r in h.records('episodes.ndjson') if r['role'] == 'leader_milestones' and r['target'] == ['polymarket:123','outcome']]
+        self.assertEqual([(r['start_ns'],r['end_ns']) for r in episodes],[('14','16')])
+
+    def test_reader_requires_omitted_quiet_history_endpoint(self):
+        h = self.h(changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(History,'timers',return_value=[]):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required history-window decision time'):
+                h.finish()
+
+    def test_reader_requires_quiet_history_endpoint_before_terminal(self):
+        h = self.h(changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(History,'timers',return_value=[]):
+            h.prime(); h.leaders(14,600)
+            with self.assertRaisesRegex(ProtocolError,'required history-window decision time'):
+                h.finish()
+
+    def test_reader_requires_exact_scope_deadline(self):
+        h = self.h(scopes='uncaptured',changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(23)):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required scope decision time'):
+                h.finish()
+
+    def test_reader_requires_relevant_elapsed_model_deadline(self):
+        g = game_file(); g['segments'] = [{'index':1,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}}]; g['match'] = None
+        models = [model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]
+        m = models[1]
+        between = next(c for c in m['cohorts'] if c['phase'] == 'between_segments')
+        between['elapsed_max_ns'] = '1'
+        m['cohorts'].append({**between,'elapsed_min_ns':'1','elapsed_max_ns':None,'intercept':'0.1'})
+        h = self.h(game=g,changes={'exit_horizon_ns':'30','models':models})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(19)):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required model-elapsed decision time'):
+                h.finish()
+
+    def test_reader_requires_pending_entry_deadline_before_late_cancellation(self):
+        h = self.h(changes={'decision_delay_ns':'1','exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(15)):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required pending-entry decision time'):
+                h.finish()
+
+    def test_reader_requires_holding_charge_stop_deadline(self):
+        h = self.h(changes={'holding_rate_per_ns':'0.01'})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(18)):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required holding-cost decision time'):
+                h.finish()
+
+    def test_reader_requires_settlement_deadline_before_terminal(self):
+        g = game_file(); g['segments'] = [{'index':i,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}} for i in (1,2)]; g['match'] = {'end_ns':18,'winner':'home','score':{'home':2,'away':0}}
+        h = self.h(game=g,changes={'exit_on_next_segment_end':False,'exit_on_match_end':False,'settlement':{'mode':'NORMAL_RESOLUTION_SCENARIO','delay_ns':'2','immediate_availability':False,'evidence':[]},'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(20)):
+            h.prime(); h.leaders(14,600); h.group(19)
+            with self.assertRaisesRegex(ProtocolError,'required settlement decision time'):
+                h.finish()
+
+    def test_reader_requires_signal_rearm_deadline(self):
+        h = self.h(changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(17)):
+            h.prime(); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required rearm decision time'):
+                h.finish()
+
+    def test_reader_requires_game_release_before_terminal(self):
+        g = game_file(); g['segments'] = [{'index':1,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}}]; g['match'] = None
+        h = self.h(game=g,changes={'exit_horizon_ns':'30','models':[model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(18)):
+            h.prime(); h.leaders(14,600)
+            with self.assertRaisesRegex(ProtocolError,'required game-release decision time'):
+                h.finish()
+
+    def test_reader_requires_forecast_horizon_decision_even_with_backdated_outcome(self):
+        original = MilestoneLeaderFollower._prediction_outcome
+        def backdate(strategy, prediction, now, censored=False):
+            return original(strategy,prediction,prediction['due'] if prediction['due'] == 22 and not censored else now,censored)
+        h = self.h()
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(22)), patch.object(MilestoneLeaderFollower,'_prediction_outcome',backdate):
+            h.prime(); h.target(12,quantity=M//2); h.leaders(14,600); h.group(35)
+            with self.assertRaisesRegex(ProtocolError,'required forecast-horizon decision time'):
+                h.finish()
+
+    def test_reader_rejects_writer_only_bypass_of_native_cash_asset_binding(self):
+        from replay.streams.protocol import require
+        def bypass(condition, message):
+            if message != 'cash native asset binding':
+                require(condition,message)
+        changes = {'initial_cash':[{'venue':venue,'asset':{'kind':'USD','ledger':'synthetic','token':'kalshi'},'amount':'1000'} for venue in ('kalshi','polymarket')]}
+        with patch('replay.strategies.milestone_leader_follower.economics.require',side_effect=bypass):
+            h = self.h(changes=changes)
+        h.prime(); h.leaders(14,600); h.target(16,610,620)
+        with self.assertRaisesRegex(ProtocolError,'cash native asset binding'):
+            h.finish()
+
+    def elapsed_models(self, phase='between_segments'):
+        models = [model(role,'30') for role in ('target_only','target_milestones','leader_milestones')]
+        m = models[1]
+        before = next(c for c in m['cohorts'] if c['phase'] == phase)
+        before['elapsed_max_ns'] = '1'
+        m['cohorts'].append({**before,'elapsed_min_ns':'1','elapsed_max_ns':None,'intercept':'0.1'})
+        return models
+
+    def test_honest_elapsed_model_deadline_opens_baseline_position(self):
+        g = game_file(); g['segments'] = [{'index':1,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}}]; g['match'] = None
+        h = self.h(game=g,changes={'exit_horizon_ns':'30','models':self.elapsed_models()})
+        h.prime(); h.leaders(14,600); h.group(35); h.finish()
+        self.assertTrue(any(r['kind'] == 'OPEN' and r['role'] == 'target_milestones' and r['time_ns'] == '19' for r in h.records('actions.ndjson')))
+
+    def test_irrelevant_elapsed_cohort_does_not_require_quiet_decision(self):
+        g = game_file(); g['segments'] = [{'index':1,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}}]; g['match'] = None
+        h = self.h(game=g,changes={'exit_horizon_ns':'30','models':self.elapsed_models('in_segment')})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(19)):
+            h.prime(); h.leaders(14,600); h.group(35); h.finish()
+        self.assertNotIn('19',[r['time_ns'] for r in h.records('decisions.ndjson')])
+
+    def test_unusable_histories_do_not_require_elapsed_or_window_timers(self):
+        g = game_file(); g['segments'] = [{'index':1,'start_ns':None,'start_estimated':False,'end_ns':18,'settled_ns':None,'winner':'home','details':{}}]; g['match'] = None
+        h = self.h(game=g,changes={'exit_horizon_ns':'30','models':self.elapsed_models()})
+        with patch.object(MilestoneLeaderFollower,'_next',self.omit_deadline(19)):
+            h.prime(); h.leaders(14,600)
+            for instrument, orientation in (('kalshi:series','outcome'),('kalshi:series','complement'),('polymarket:123','outcome')):
+                ladder(h,16,instrument,orientation,why={'kind':'connection_closed'})
+            h.group(35); h.finish()
+        self.assertNotIn('19',[r['time_ns'] for r in h.records('decisions.ndjson')])
+
     def test_required_entry_cannot_be_deleted_with_its_entire_ledger(self):
         h = self.h(); h.prime(); h.leaders(14, 600); h.target(16, 610, 620); h.finish()
         self.rewrite(h, 'actions.ndjson', lambda rows: rows.clear())

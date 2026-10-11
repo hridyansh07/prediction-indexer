@@ -98,6 +98,9 @@ class Verifier:
         self.snapshot, self.config, self.experiment, self.db = snapshot, config, experiment, db
         self.policy = config['policy']
         self.fees = FeeBridge(config['fees'], snapshot['plans'])
+        for item in self.policy['initial_cash']:
+            native = self.fees._assets.get(item['venue'])
+            require(native is not None and item['asset'] == asset(native), 'cash native asset binding')
         self.plans = {(p['instrument'], p['orientation']): p for p in snapshot['plans']}
         self.rules = {(p['instrument'], p['orientation']): p for p in self.policy['rule_bindings']}
         self.models = {m['role']: m for m in self.policy['models']}
@@ -113,6 +116,7 @@ class Verifier:
         self.db.executescript('CREATE INDEX books_asof ON books(key,time DESC); CREATE INDEX observations_asof ON observations(role,target,time DESC);')
         self.db.execute('CREATE TABLE candidates(time INTEGER,role TEXT,target TEXT,payload TEXT,PRIMARY KEY(time,role,target))')
         self.last_time = None
+        self.last_knowledge = None
         self.previous = {}
         self.valuation_cache = OrderedDict()
         self.size_cache = OrderedDict()
@@ -566,10 +570,49 @@ class Verifier:
         self.book_histories = {k: h for k, h in self.book_histories.items() if k[0] in targets}
         return targets, routes
 
+    def next_required_decision(self):
+        """Derive quiet deadlines from reader-owned inputs and causal histories."""
+        now = self.last_time if self.last_time is not None else int(self.snapshot['config']['start_ns']) - 1
+        deadlines = [(int(scope['start_ns']), 'scope') for scope in self.snapshot['scopes'][1:]]
+        if self.policy['cohort'] != 'book_only_comparison' and self.timeline.next_time is not None:
+            deadlines.append((max(int(self.snapshot['config']['start_ns']), self.timeline.next_time), 'game-release'))
+        window = int(self.policy['window_ns'])
+        for history in (*self.book_histories.values(), *self.route_histories.values()):
+            deadlines.extend((sample[0] + window, 'history-window') for sample in history['values'])
+        if self.last_result is not None and self.last_knowledge is not None:
+            state = self.last_knowledge
+            for model in self.policy['models']:
+                if model['role'] == 'target_only':
+                    continue
+                # Elapsed cohorts are relevant only to matching released state
+                # with usable causal features. No absent/invalid book invents a
+                # timer, and an unrelated cohort cannot demand an observation.
+                usable = any(
+                    key[0] == model['role'] and observation['target_endpoint'] is not None
+                    and (model['role'] != 'leader_milestones' or observation['leader_endpoint'] is not None and observation['route']['proof'] is not None)
+                    for key, (_, observation) in self.previous.items()
+                )
+                if not usable:
+                    continue
+                for item in model['cohorts']:
+                    if (
+                        item['game'] is not None and item['game'] != state['game']
+                        or any(item[k] != state[k] for k in ('phase','score_quality','prefix_quality'))
+                        or any(item[k] is not None and item[k] != state['score'][i] for i,k in enumerate(('home','away')))
+                    ):
+                        continue
+                    deadlines.extend((self.last_result + int(boundary), 'model-elapsed') for boundary in (item['elapsed_min_ns'],item['elapsed_max_ns']) if boundary is not None)
+        return min((item for item in deadlines if item[0] > now), default=None)
+
+    @staticmethod
+    def check_required_decision(deadline, time):
+        require(deadline is None or deadline[0] >= time, 'required ' + ('' if deadline is None else deadline[1]) + ' decision time')
+
     def decisions(self, row):
         obj(row, 'version time_ns sequence scope knowledge released book_updates history_resets observations admission')
         time = int(uint(row['time_ns'])); require(self.last_time is None or time > self.last_time, 'committed decision order')
         require(int(self.snapshot['config']['start_ns']) <= time < int(self.snapshot['config']['end_ns']), 'decision half-open run')
+        deadline = self.next_required_decision()
         scope = row['scope']; require(type(scope) is int and 0 <= scope < len(self.snapshot['scopes']) and int(self.snapshot['scopes'][scope]['start_ns']) <= time < int(self.snapshot['scopes'][scope]['end_ns']), 'decision scope')
         for key, (start, observation) in self.previous.items():
             statuses = self.denoms.setdefault(key, {})
@@ -688,7 +731,9 @@ class Verifier:
                 require(observation['prediction_id'] == digest([self.experiment, role, list(target), time, route['candidate_id']]), 'prediction identity')
                 self.db.execute('INSERT INTO predictions VALUES(?,?)', (observation['prediction_id'], json.dumps(compact_observation(observation))))
         require(seen == {(role, target) for role in ROLES for target in targets_history} and admission['captured_books'] == len(targets_history), 'complete common model schedule')
+        self.check_required_decision(deadline, time)
         self.last_time = time
+        self.last_knowledge = knowledge
 
     def prediction(self, row):
         obj(row, 'version prediction_id role target decision_ns desired_ns observed_ns signal forecast_displacement forecast_net forecast_error counterfactual_net status capacity_mode sale')
@@ -698,6 +743,8 @@ class Verifier:
         time = int(uint(row['observed_ns'])); decision = int(uint(row['decision_ns'])); due = int(uint(row['desired_ns']))
         require(due == decision + int(self.policy['exit_horizon_ns']) and time == (int(self.snapshot['config']['end_ns']) if row['status'] == 'RUN_END' else due), 'forecast causal horizon')
         end = int(self.snapshot['config']['end_ns'])
+        if due < end:
+            require(self.db.execute('SELECT 1 FROM decisions WHERE time=?',(due,)).fetchone() is not None, 'required forecast-horizon decision time')
         expected_sale = None
         if due >= end:
             expected_status = 'RUN_END'
@@ -737,6 +784,7 @@ def validate_content(directory, snapshot, manifest):
             for row in rows(root, 'decisions.ndjson', manifest['files']['decisions.ndjson']):
                 verifier.decisions(row)
             end = int(snapshot['config']['end_ns'])
+            verifier.check_required_decision(verifier.next_required_decision(), end)
             for key, (start, observation) in verifier.previous.items():
                 statuses = verifier.denoms.setdefault(key, {})
                 statuses[observation['status']] = statuses.get(observation['status'], 0) + end - start
