@@ -1,71 +1,102 @@
 # Bounded payout optimizer: masks, triggers and acquisition curves
 
-Status: **PROPOSED — discussion record and pipeline overlay; no implementation.**
+Status: **PROPOSED — settled design decisions and advisory extensions; no implementation.**
 
 Written 2026-10-11 against `codex/payoff-optimizer` at
 `f77a5cf1fe7f339e4a0202d6b3d6568c417416e9`. The implementation inspected for
 this note is on that separate branch; this authoring worktree contains the
 shared specifications but does not contain the optimizer package yet.
 
-This proposal narrows and changes the search policy in
-[the V1 optimizer specification](BOUNDED_PAYOUT_OPTIMIZER_V1.md). It does not
-supersede that specification or describe already shipped behavior. Accounting,
-visibility, capacity and settlement continue to follow
-[the economic position scenario contract](ECONOMIC_POSITION_SCENARIOS_V1.md).
+Updated after the design discussion in
+[this thread](https://ampcode.com/threads/T-01a12a46-bc76-70dc-812f-dcbdcb38705e).
+Sections 1–10 record the settled scope and episode semantics for this proposal;
+sections 11–12 are algorithm and performance recommendations, not adopted solver
+choices or measured results.
 
-## 1. Changes discussed
+This proposal changes the search and reporting policy in
+[the V1 optimizer specification](BOUNDED_PAYOUT_OPTIMIZER_V1.md): its primary
+result is now an opportunity episode with one onset allocation, not a held-position
+simulation. For this proposed pipeline, the decisions below replace V1's broad
+mask-count domain, percentage-return gate and position-taking lifecycle. Other V1
+policies and the existing implementation are unchanged. Reuse the exact native
+pricing, fee, visibility and within-portfolio source checks in
+[the economic position scenario contract](ECONOMIC_POSITION_SCENARIOS_V1.md).
+Any future held-position analysis remains a separately declared scenario under
+that contract; it is not required to discover or report these episodes.
+
+## 1. Settled scope and objective
 
 Build candidate baskets from **distinct payoff masks**, then retain native books
-as acquisition routes for those masks. Focus this policy on baskets with **three
-or four distinct masks**. Remove the ordinary two-mask plays already covered by
-the existing strategies, and explicitly identify any additional basket families
-whose full economic domain those strategies already evaluate.
+as acquisition routes for those masks. Each verified allocation must acquire
+positive grid-sized quantities in **exactly three or four distinct masks**.
+One-/two-mask plays are outside this strategy's scope. Do not infer that their
+economic domain is exhausted by other strategies, or exclude a compatible
+three-/four-mask family merely because another strategy describes it.
 
 Maintain a cheap price screen for each basket. A relevant book update should
 first refresh that screen; detailed quantity sizing begins only when the screen
 cannot rule out a qualifying purchase. Build cumulative acquisition curves only
-for surviving baskets, and extend them only as far as economically justified.
+for sizing attempts, and extend them only as far as economically justified.
 
 Include the applicable pinned fees in acquisition costs. Cache repeated fee
 calculations and cumulative prefixes. Use a continuous optimization relaxation
 to find promising sizes and bound unexamined quantities; refine and verify the
 actual lot-sized, rounded-fee positions exactly.
 
+At a successful onset, **size once using only the committed state at that time**.
+Freeze the proposed native allocation, acquisition cost and payout proof. Observe
+later updates to maintain the trigger and determine the episode end; do not resize
+the allocation or select a retrospectively better allocation from the interval.
+An unsuccessful attempt does not open an episode; the retry recommendation is in
+section 11.4.
+
 The objective remains **maximum minimum net profit**, after fees and declared
 holding charges, rather than maximum payout, contract count or return percentage.
+Require a minimum all-in acquisition commitment and an absolute net-margin floor.
+There is no percentage-return gate in this proposed policy; numerical thresholds
+and the versioned configuration fields remain to be pinned. Minimum commitment
+means portfolio cash acquisition value, not a lower price bound on each contract.
 
 ## 2. Overlay on the current pipeline
 
-All implementation names in this table refer to the inspected optimizer branch.
+All current-behavior implementation names refer to the inspected optimizer branch.
+The proposed column describes the episode-first pipeline, not shipped behavior.
 
 | Stage | Current behavior | Proposed change and where it fits |
 | --- | --- | --- |
-| Prepare and validate inputs | Pin membership, exhaustive outcome spaces, native economics, rules, quantities, fees, game policy and account configuration. | Add an explicit candidate policy for distinct-mask counts and excluded basket families. Pin its identity. Preserve existing admission requirements. |
-| Stage observable state | `Runtime.__call__`, `release`, `flush` and `decide` commit same-time books, scope changes, released facts and timers. | Preserve this ordering. Add basket dependency tracking after the committed state is available. Lifecycle timers still run even when no acquisition basket needs sizing. |
+| Prepare and validate inputs | Pin membership, exhaustive outcome spaces, native economics, rules, quantities, fees, game policy and account configuration. | Pin the three-/four-mask policy, trigger identity, minimum commitment and net margin. Preserve admission requirements; do not require a held-position account or settlement configuration for opportunity reporting. |
+| Stage observable state | `Runtime.__call__`, `release`, `flush` and `decide` commit same-time books, scope changes, released facts and timers. | Preserve this ordering. Add basket dependency tracking after the committed state is available; never use future updates or eventual episode duration to size the onset. |
 | Build native models | `scenario.models` constructs a model for each eligible native book, with its mask, source, scales, grid, cap and rule binding. | Separate structural mask groups from native routing models. Compile basket geometry on structural changes, rather than reconstructing native-book support combinations on every price update. |
-| Select baskets | `core.solve` seeds covers and enumerates supports from one through `max_legs` native books, subject to the configured limit. | Generate only declared three/four-mask baskets. Check outcome coverage and the explicit existing-strategy exclusion registry before book-depth work. Count logical masks separately from native orders. |
-| Decide whether to size | The current whole-input fingerprint skips identical acquisition states. Other relevant changes can start quantity search; there is no maintained per-basket price gate. | Recheck only affected baskets using best-price optimistic bounds. Defer curve construction and detailed sizing while a basket is ruled out. |
+| Select baskets | `core.solve` seeds covers and enumerates supports from one through `max_legs` native books, subject to the configured limit. | Generate only compatible three-/four-mask baskets. Check outcome coverage before book-depth work; do not add family exclusions without a separately approved domain proof. Count logical masks separately from native orders. |
+| Decide whether to size | The current whole-input fingerprint skips identical acquisition states. Other relevant changes can start quantity search; there is no maintained per-basket price gate. | Recheck only affected baskets. Size a potential onset; after a successful opening, maintain only the trigger. Failed-attempt invalidation is a separate concern, not permission to resize an open episode. |
 | Acquire prices and fees | `scenario.price_order` walks a requested quantity and assesses one ordered fill per consumed native level. A bounded cache already stores pinned whole-order economic amounts. | Build bounded cumulative prefixes once, including fees. Cache schedule/price/quantity fee primitives separately from source-dependent curves. Query earlier full levels from the prefix and price only the final partial level. |
 | Optimize quantities | `core.solve` enumerates quantity grids with gross branch bounds; `PortfolioEvaluator` scores compiled mask arithmetic. | Solve a segment-based continuous relaxation, expand relevant curve prefixes and use its bounds to guide exact discrete refinement. Avoid the full quantity cross-product where a valid bound eliminates it. |
-| Verify and qualify | Retained candidates receive fresh fee proofs. Exact margin and return gates determine qualifying findings. | Preserve that boundary. Verify native quantities, actual fees, retained payouts, valuation, holding charges and joint source use before treating a candidate as positive. |
-| Revalidate and open | Detection uses undepleted books. Immediate entry re-solves against account cash and cumulative capacity; delayed entry freezes native support and maximum quantities. | Reuse the same curve/solver machinery on the entry domain. Detection curves do not authorize entry against depleted books. Preserve delay restrictions and all-or-none posting. |
-| Hold and settle | Fixed acquired lots remain until supported resolution; unresolved run-end holdings are censored. | Preserve this behavior. Curve cutoffs and later signal loss affect new acquisitions, not held lots. |
-| Write and independently read | Version-2 output carries economic proofs and lifecycle evidence. `audit.py` and `output.py` independently reprice and reconstruct them. | Add versioned candidate, screening, curve-bound and solver evidence. The reader must independently validate exclusions, carried bounds and exact portfolios without importing the writer's optimizer. |
+| Verify and qualify | Retained candidates receive fresh fee proofs. Exact margin and return gates determine qualifying findings. | Verify native quantities, exact fees, retained payouts, valuation, holding charges and joint source use. Enforce minimum commitment and absolute margin within sizing; do not percentage-gate only the unconstrained winner. |
+| Open an episode | Detection uses undepleted books. Immediate entry re-solves against account cash and cumulative capacity; delayed entry freezes native support and maximum quantities. | Record a verified onset allocation on that committed snapshot. Opening is analytical, not a cash/depth debit or execution claim. Failed or unknown sizing does not open an episode. |
+| Track and close | Current episodes follow the selected quantity vector; fixed acquired lots separately remain until supported resolution. | Track each basket's trigger interval, without allocation changes. End on trigger failure or explicit unavailable/semantic boundaries; censor still-active episodes at run end. No held-position settlement is required. |
+| Write and independently read | Version-2 output carries economic proofs and lifecycle evidence. `audit.py` and `output.py` independently reprice and reconstruct them. | Version the episode policy/output and carry onset, screening and solver evidence. Independently check trigger intervals and exact opening portfolios without importing the writer's optimizer. |
 
-```mermaid
-flowchart TD
-    A[Pinned masks, rules and native routes] --> B[Three/four-mask basket registry]
-    C[Committed books, released facts and timers] --> D[Affected baskets]
-    B --> D
-    D --> E[Cheap optimistic price screen]
-    E -->|Cannot rule out opportunity| F[Truncated acquisition prefixes with fees]
-    F --> G[Continuous bound and candidate quantities]
-    G -->|Unseen depth may improve result| F
-    G --> H[Exact lot sizes, fees and payoff verification]
-    H --> I[Entry gates and account/capacity revalidation]
-    I --> J[Open fixed native lots]
-    J --> K[Supported settlement or censored residual]
-    E -->|Valid bound rules out opportunity| L[Record screened result]
+```diagram
+Compatible masks and native routes
+                │
+                ▼
+Three-/four-mask baskets and book dependencies
+                │
+                ▼
+Committed update → affected basket screens
+                │
+                ├─ ruled out → wait for relevant update
+                │
+                ▼
+Potential onset → lazy curves and bounded exact sizing
+                │
+                ├─ failed/unknown → no episode; retry policy in §11.4
+                │
+                ▼
+Verified opening → freeze onset allocation and proof
+                │
+                ▼
+Track trigger only → close interval or censor at run end
 ```
 
 ## 3. Masks are economic legs; books are native routes
@@ -87,15 +118,18 @@ require more than three native orders.
 
 Use separate limits for distinct masks and native acquired orders. Do not silently
 reinterpret V1's `max_legs`, which currently counts native acquired claims.
-Preserve native quantity grids, cash budgets and aggregate physical source
-consumption after grouping. A pooled curve must retain its route decomposition;
-it cannot treat cash on different venues as freely interchangeable.
+Preserve native quantity grids, declared sizing budgets and aggregate physical
+source consumption within each candidate. A pooled curve must retain its route
+decomposition; scalar valuation does not establish native collateral transfers.
 
 Compile groups separately for the static full-space and released-state-conditioned
 problems. Retain original full-space masks and rule identities for traceability.
 Supported released results can change conditional equivalences and basket
 coverage. A map-end or phase transition without a winner does not shrink the
-space. Acquired positions retain their original native identities and quantities.
+space. If conditioning collapses a basket to fewer than three distinct masks, it
+is outside this policy. Frozen onset allocations keep their original native
+identities and quantities; changed semantics end the old episode rather than
+retroactively changing its proof.
 
 ## 4. Candidate construction and existing-strategy exclusions
 
@@ -113,10 +147,12 @@ Record exclusions explicitly. The three/four-mask policy intentionally excludes
 V1's one-leg known-payout and two-mask candidates; exclusion is not evidence that
 those trades have no economic opportunity.
 
-For additional existing-strategy exclusions, identify the exact family and its
-supported routing, quantity, rule and fee domain. A same-venue complete-set
-implementation does not automatically establish coverage of all cross-venue
-versions or unequal-quantity variants. The precise registry remains to be pinned.
+No additional existing-strategy family exclusions have been adopted. Any later
+exclusion needs an approved proof covering its routing, quantity, rule and fee
+domain. A same-venue complete-set implementation does not establish coverage of
+all cross-venue versions, unequal quantities or profitable larger sizes hidden by
+a one-contract rounded-fee trigger. Those supported three-/four-mask baskets
+must reach the optimizer rather than being removed before their curves are built.
 
 **Do not discard a larger basket merely because a subset is a known cover.**
 For example, on outcomes A-2-0 / A-2-1 / B-wins, these three masks pay:
@@ -133,9 +169,10 @@ superset of an existing pair family would remove this useful overlap basket.
 
 ## 5. Cheap price triggers and dependencies
 
-The trigger has two boundaries: a cheap **sizing trigger** and the existing exact
-**entry predicate**. Passing the cheap screen means further work is justified;
-it is not a positive signal or authorization to take a position.
+The trigger has two boundaries: a cheap **potential-opportunity screen** and the
+exact **opening-allocation predicate**. Passing the screen means sizing may be
+worthwhile; it does not prove that an executable grid-sized net portfolio exists.
+A verified qualifying allocation starts an episode at that committed time.
 
 For a declared fixed ratio r, let L(r) be its minimum unit payout. Before fees,
 an additional basket unit improves profit while:
@@ -146,7 +183,9 @@ sum_i r_i * marginal_price_i < L(r)
 
 For the equal-sized overlap above, this becomes `p1 + p2 + p3 < 2`.
 With fees, use applicable effective acquisition prices and holding charges.
-Testing only one ratio cannot rule out all unequal-quantity opportunities.
+Testing only one ratio or a bid/ask spread cannot rule out all unequal-quantity
+opportunities. Section 11 recommends a geometry-aware covering trigger; its
+algorithm/backend has not yet been adopted.
 
 For free quantities, use a small optimistic relaxation: permit available routes
 to acquire up to their caps at their best current prices, with a supported lower
@@ -157,14 +196,17 @@ can screen out entry eligibility without labelling all profit nonpositive.
 
 The dependency index maps native acquisition sources to their basket users.
 Price, relevant depth, usability, scope and supported knowledge changes invalidate
-the affected screens, prefixes or solutions. A cheaper alternative venue must
-also invalidate a basket whose previously selected route did not change.
+the affected screens and failed-attempt evidence. Fee availability/model changes
+and quantity rules also matter. A cheaper alternative venue must invalidate a
+basket whose previously selected route did not change.
 Changes beyond a retained prefix may be ignored for sizing only if the existing
 tail certificate still covers the updated state.
 
 These subscriptions are strategy work selection. Capture and replay continue
-preserving the input evidence. Pending entries, held-lot settlement, liquidation
-marks and required quiet timers retain their own dependencies.
+preserving the input evidence. After successful onset sizing, subsequent updates
+maintain only the declared trigger and observability/semantic boundaries. They do
+not resize or replace that episode's allocation. A later separate held-position
+scenario would need its own dependencies and accounting.
 
 ## 6. Cutoff prices and lazy curve construction
 
@@ -224,7 +266,7 @@ Keys must cover the resolved model, policy, side, price, quantity, native fee
 asset/scales and any relevant rounding state. Equal numeric models may share
 economic primitives across books; native bindings and fresh assessment identities
 are retained separately. Source-dependent prefix costs additionally depend on
-the eligible ladder and account capacity.
+the eligible ladder and declared source/cap constraints.
 
 Preserve one declared order per acquired native claim per action, with one
 ordered fill per consumed level. Aggregating different price levels into one average-price fill
@@ -283,9 +325,13 @@ scenarios add a margin constraint for every outcome/scenario pair. Native routes
 remain separate variables even when they share a payoff mask. Physical aliases
 share one resource; scalar valuation never enables native cash transfers.
 
-The relaxation guides quantities and provides valid upper bounds. Actual positions
-must satisfy lot grids, positive quantity in three/four distinct masks, the native
-order limit, exact rounded fees, native cash and cumulative source capacity.
+The relaxation guides quantities and provides valid upper bounds. Verified onset
+allocations must satisfy lot grids, positive quantity in three/four distinct masks,
+the native-order limit, exact rounded fees, declared budgets and joint physical
+source capacity on that snapshot. Minimum commitment belongs in the exact sizing
+domain, not a post-filter on its unconstrained winner. Maximize net margin among
+the allocations meeting that commitment; do not assume an under-committed winner
+means no qualifying allocation exists.
 Those restrictions may require integer search or a mixed-integer formulation.
 Precomputing rounded costs makes evaluation cheaper but does not make the exact
 discrete problem continuous or automatically convex.
@@ -301,75 +347,107 @@ Preserve objective tie-breaking by lower cash commitment, fewer native orders
 and deterministic native quantity keys. An attained objective bound can establish
 maximum margin while leaving the tie domain unresolved; report that distinction.
 
-Keep one shared whole-decision work budget across static/conditioned detection,
-prefix expansion, refinement and immediate/delayed entry work. Solver iterations,
-curve levels, cache memory and proof size also need explicit limits: counting
-one solver call as one old search node would not bound its internal work.
+Keep one shared whole-decision work budget across affected static/conditioned
+screens, onset attempts, prefix expansion and refinement. Successful episodes
+consume trigger-maintenance work, not repeated full-sizing work. Solver iterations,
+candidate construction, curve levels, cache memory and proof size also need
+explicit limits: counting one solver call as one old search node would not bound
+its internal work. A verified positive at the limit may be reported as best found
+with its gap; only a checked bound or exhausted domain establishes the maximum.
 
-## 9. Signals, positions and audit evidence
+## 9. Onset allocations, episode intervals and audit evidence
 
-Exact entry continues to require all admission and accounting conditions plus:
+For a verified onset allocation q, let A(q) be all-in acquisition cash value in
+the pinned valuation basis and M(q) its minimum net margin after fees and declared
+holding charges. Opening requires admission, exact native/source feasibility and:
 
 ```text
-M > 0
-M >= minimum_net_margin
-10000 * M >= minimum_return_bps * acquisition_cash_value
+A(q) >= minimum_acquisition_cash_value
+M(q) > 0
+M(q) >= minimum_net_margin
 ```
 
-The price screen and curve cutoff never replace these gates. Account revalidation
-may change the feasible size or routes within the permitted immediate-entry
-domain. Delayed entry retains the existing frozen native support and quantity
-caps; it cannot silently switch to a newly cheap venue.
+The commitment threshold measures the whole purchase including cash fees, not
+per-contract price or raw unused book depth. Pin its unit; under multiple valuation
+scenarios use the declared robust commitment convention and retain each scenario's
+cost/payout arithmetic. Do not infer robust margin by subtracting independently
+minimized payout and maximized cost when they come from different scenarios.
+`minimum_return_bps` is not an opening condition for this proposed policy. The
+field names above describe a future versioned contract, not existing config fields.
 
-Retain fixed acquired lots until the configured supported settlement. New game
-facts can update their conditional payout reporting without resizing them or
-creating cash. Scope changes cancel affected pending entries and preserve held
-claims and original source debits.
+Episode identity is the canonical mask basket plus scope, supported outcome/rule
+semantics, static/conditioned scenario and trigger policy, not the selected native
+quantity vector. Track supported baskets independently rather than reporting only
+the globally selected winner. Their allocations are isolated, non-additive
+displayed-book opportunities; opening an episode consumes no cash or depth.
 
-Outputs should distinguish structural exclusion, missing input, certified screen,
-entry-threshold screen, feasible positive, unclosed optimization gap and work-limit
-stop. These are different reasons and measurable-time categories. Negatives and
-optimality claims must name their declared basket/route/quantity domain and the
-certificate that covers it. A narrowed three/four-mask result is not a result for
-V1's former broad domain.
+The first successful sizing attempt starts the interval at its committed observer
+time t1. Freeze its native routes, purchased/retained quantities, consumed levels,
+fees, cost and payout proof. Never use later prices/depth, t2, eventual duration,
+or a later best allocation to justify that opening. Solver wall time does not
+permit consuming a future replay state while finishing the t1 calculation.
+Failed or search-limited attempts without a qualifying witness do not open an
+episode and cannot establish a complete negative. A later successful retry starts
+at that later time, never at the earlier failed screen crossing.
 
-Include candidate identity, mask-to-route mapping, exclusion reason, screen
-inputs/bound, prefix boundaries, tail assumptions, actual/conservative fee model,
-exact native orders, remaining bound/gap and work counters. Reuse bounded
-checkpoint/delta transport rather than repeating entire curves in every row.
-Any new closed fields or policy semantics require explicit versioning and matched
-writer, independent reader and fixtures.
+After opening, observe the trigger, not a new sizing objective. Do not resize,
+switch native routes, report allocation changes or select an episode-wide maximum.
+Close at the first committed trigger failure; distinguish unavailable inputs or
+changed scope/outcome/rule semantics from an economic-negative end. Unknown inputs
+or an uncertified solver status are not proof that the trigger became false.
+An active interval at run end is censored. Same-time transient states contribute
+no positive duration.
 
-The independent reader must rederive the relevant mask geometry, native fee/payoff
-amounts, capacity/cash conservation, lifecycle and carried certificates. It must
-not accept the writer's solver output as proof of an omitted opportunity. Without
-independent coverage evidence, preserve the current writer-attestation limitation.
+The interval means **trigger-positive time with a verified opening allocation**.
+It does not assert that the opening depth/size remained available or that some
+net-qualified allocation existed at every later time. Tracking an optimistic
+screen is not continuous exact net-profit verification. No actual execution,
+held-lot P&L, cash availability or settlement is inferred from episode duration.
+
+Report t1/t2, duration, end reason/censoring, mask and native-route identities,
+opening allocation and fee proofs, acquisition commitment x, minimum payout y,
+net margin, pinned holding/valuation assumptions, and maximum-certified versus
+best-found-with-gap status. In a single valuation basis, margin is y minus x minus
+the holding bound; preserve full vectors for robust/native reporting. Report only
+the onset allocation, not a later optimum or an allocation valid throughout the
+interval. Separate structural exclusion, missing input, certified screening,
+below-threshold attempts and work-limit uncertainty from opened episodes.
+
+Carry screen inputs/certificates, prefix/tail assumptions, work counters and
+failed-attempt reasons sufficiently to audit interval boundaries and onset proofs.
+Reuse bounded checkpoint/delta transport rather than repeating entire curves.
+Version policy/output changes explicitly and update the independent reader and
+fixtures; do not reinterpret existing V1/V2 fields silently. The reader must
+rederive mask geometry, native fees/payoffs, within-allocation source feasibility,
+trigger boundaries and carried bounds without importing the writer's optimizer.
+Unchecked search coverage remains a writer attestation, not proof of an omitted
+opportunity or an unrestricted optimum.
 
 ## 10. Implementation sequence and decisions still to pin
 
 Suggested sequence:
 
-1. Define versioned mask-count/native-order policy and the exact exclusion registry.
+1. Version the mask/native-order policy, trigger/episode semantics and cash/margin gates.
 2. Compile mask baskets, native alternatives and dependency indices.
-3. Add a certified cheap screen and explicit screened-result accounting.
+3. Prototype a certified screen and failed-attempt invalidation before a full rewrite.
 4. Add bounded curve prefixes, fee primitive caching and exact partial-level queries.
-5. Add the relaxation, tail expansion and bounded discrete refinement.
-6. Integrate both detection and account revalidation, then extend the independent
-   reader and output versions with coverage/bound evidence.
+5. Add onset-only relaxation, tail expansion and bounded discrete refinement.
+6. Integrate frozen-allocation episodes and independent onset/interval verification.
 
-Still to pin before implementation: the exact additional excluded families;
-native-order cap when venue splitting increases order count; solver backend and
-exact certificate format; work/curve/memory limits; and whether a conservative
-fee-envelope scenario is wanted alongside the recommended actual-fee scenario.
-No arbitrary percentage defining "near the trigger" was agreed; the proposed
-optimistic price screen supplies the economic trigger instead.
+Still to pin: numerical minimum commitment/margin and valuation conventions;
+native-order cap when venue splitting increases order count; the trigger backend,
+failed-attempt retry/certificate policy, solver and exact certificate format;
+candidate/work/curve/memory/output limits; and whether a separately labelled
+conservative-fee scenario is wanted. No extra family exclusions, return-percentage
+gate or arbitrary percentage defining "near the trigger" have been adopted.
 
-Later verification should cover duplicate-mask routing and native cash separation,
-the overlap example despite existing pair covers, unequal sizes, rounded fees,
-partial-level prefix queries, a cheaper alternate venue, tail-bound invalidation,
-game/scope changes, delayed frozen support and independent certificate corruption.
-Profile the same retained synthetic fixtures before and after; no speedup or
-real-event completion estimate is established by this design note.
+Later verification should cover duplicate-mask routing, the overlap despite pair
+covers, unequal sizes, rounded fees, minimum-commitment-constrained sizing, partial
+levels, cheaper alternate venues, tail-bound invalidation, game/scope changes,
+failed attempts followed by depth-only success, no backdating/lookahead, no sizing
+while an episode is open, unavailable/censored ends and certificate corruption.
+Measure screening false positives and retry-heavy cases as well as negatives and
+successful onsets. No speedup or corpus completion estimate is established here.
 
 Baseline source references:
 
@@ -379,5 +457,183 @@ Baseline source references:
 - [Independent reader](https://github.com/hridyansh07/prediction-indexer/blob/f77a5cf1fe7f339e4a0202d6b3d6568c417416e9/replay/strategies/bounded_payout_optimizer/output.py)
 - [Fee SDK](../../replay/fees/README.md)
 
-This authoring task changes documentation only. No tests, strategy runs, live
-probes or deployment actions accompany it.
+This revision changes documentation only. Its examples can be checked offline;
+no implementation, corpus benchmark, live probe or deployment accompanies it.
+
+## 11. Advisory: geometry-aware unequal-size triggers
+
+**Recommendation, not an adopted backend.** Prefer a complete fractional
+payoff-cover screen over spread heuristics or a handpicked ratio list. The oracle
+consultation and arithmetic checks are recorded in the discussion thread above.
+
+### 11.1 Compile payout patterns and cover ratios
+
+For k binary masks, each outcome has a k-bit payoff-incidence pattern. Deduplicate
+equal patterns: at most 8 rows for k=3 or 16 for k=4, even if the exhaustive space
+contains many more outcomes. This compresses payout constraints, not native routes
+or source capacities. Each valuation scenario still needs its own arithmetic.
+
+For unit retained payouts and nonnegative flat acquisition prices p, let A be the
+incidence matrix. Any profitable continuous nonnegative ratio exists exactly when:
+
+```text
+mu(p) = min p^T r  subject to r >= 0, A r >= 1
+mu(p) < 1
+```
+
+Normalize a profitable portfolio by its minimum payout to obtain such a cover;
+conversely a cover costing less than one has positive minimum gross profit.
+Normalization is only an existence screen, not a change to the sizing objective.
+Precompute the vertices V of this price-independent covering polyhedron, then
+test `min_{v in V} p^T v < 1` on affected price updates. Complete exact enumeration
+is essential; selected equal-size ratios cannot establish a negative. Zero-mask
+components in a relaxed vertex must not be discarded merely because actual onset
+allocations require three/four positive grid-sized masks.
+
+Synthetic four-mask example, with rows `(1100, 1010, 0110, 0001)` and prices
+`(.60, .60, .60, .05)`:
+
+| Quantity vector | Acquisition cost | Minimum payout | Gross margin |
+| --- | ---: | ---: | ---: |
+| (1, 1, 1, 1) | 1.85 | 1.00 | -0.85 |
+| (1, 1, 1, 2) | 1.90 | 2.00 | 0.10 |
+
+The normalized cover `(.5, .5, .5, 1)` costs .95. Equal-size testing misses the
+unequal-size positive; full cover-vertex testing does not. Spread handling alone
+does not supply this outcome geometry.
+
+### 11.2 Add native-route caps and safe fee bounds
+
+For route j, use supported bounds `C_j(q) >= c_j*q` on cash cost and
+`h_j(q) <= a_j*q` on retained quantity over its whole admitted domain. Zero cash
+fees and gross retained quantity are safe optimistic choices only under supported
+nonnegative-charge/no-rebate assumptions. At a single valuation, fixed retention
+permits mask-level optimistic cost per retained unit `c_j/a_j`; taking the cheapest
+eligible route while ignoring its capacity is a screen, not a feasible allocation.
+
+A route-level LP can tighten absolute-profit screening:
+
+```text
+maximize m
+subject to 0 <= q_j <= u_j
+           m <= sum_j (P_wj - c_j) * q_j  for each payout pattern w
+```
+
+P uses optimistic retained payouts and the declared valuation. Relax unsupported
+constraints rather than removing real feasible allocations. Price total capped
+depth at its best ask, not only best-level quantity: that is optimistic even when
+actual orders must consume deeper levels. Native cash, shared-source and positive
+mask-count constraints can be relaxed for a screen but must hold in exact sizing.
+Keep all routes; cheapest-route-only capacity can miss profitable split acquisition.
+
+A checked upper bound below the absolute-margin threshold excludes qualification;
+a nonpositive bound excludes strictly positive profit. Passing does not establish
+minimum commitment. Do not impose `C_lower(q) >= minimum_commitment` as a relaxation
+of the actual commitment floor: it can exclude qualifying actual costs. Apply that
+floor in exact sizing, or derive a correctly directed necessary screening condition.
+Unknown fees remain unknown; conservative fee upper bounds cannot prove an
+actual-fee negative. A one-lot rounded-fee loss cannot prune larger sizes.
+
+### 11.3 Reuse cached dual certificates before solving again
+
+For the boxed route relaxation, any outcome weights y with `y >= 0` and
+`sum(y) = 1` give the upper bound:
+
+```text
+U(y) = sum_j u_j * max(0, sum_w y_w * P_wj - c_j)
+```
+
+Minimum payout is no greater than weighted-average payout. These weights are
+certificates, not estimated outcome probabilities. Recheck a cached rational y
+against current coefficients/caps; it remains a valid bound even if no longer
+optimal. Solve only when it is inconclusive. The baseline `gross_dual_bound` uses
+uniform outcome weights; a route LP can choose tighter weights. Its native-order
+limit cannot be silently reused as the new distinct-mask limit.
+
+### 11.4 Retry failed onsets without resizing successful episodes
+
+Recommend retrying on relevant changed inputs while screen-positive and unopened;
+skip identical states and reuse any certificate that still covers the update.
+Price false-to-true transitions alone can miss depth-only or rounded-fee success.
+
+For three partition masks at unchanged .33 asks and synthetic per-order fee
+`.01 * ceil(q/10)`, depth one costs 1.02 against payout 1; depth ten costs 9.93
+against payout 10, earning .07. The gross price screen is true throughout. This is
+a synthetic counterexample, not a venue fee schedule.
+
+Retain the failed-attempt fingerprint. Retry after relevant depth, alternative
+route, fee, usability, quantity or released-knowledge changes unless a valid bound
+excludes qualification on the changed state. Limited failure is unknown, not a
+complete negative. A success freezes the allocation and stops sizing for that
+episode; later success after earlier failure must not be backdated. Repeated
+screen-positive failures are the main potential source of high sizing frequency.
+
+### 11.5 Candidate implementations and fallback
+
+- [cddlib](https://github.com/cddlib/cddlib) / [pycddlib rational interface](https://pycddlib.readthedocs.io/en/latest/cddgmp.html): double-description conversion from covering inequalities to exact vertices/rays.
+- [lrslib](https://cgm.cs.mcgill.ca/~avis/C/lrs.html): exact reverse-search vertex/ray enumeration, also useful for an independent geometry cross-check.
+- [HiGHS Python interface](https://ergo-code.github.io/HiGHS/dev/interfaces/python/example-py/) and [solvers](https://ergo-code.github.io/HiGHS/dev/solvers/): incremental coefficient/bound changes and simplex basis hot starts; a persistent route-level LP is the fallback when mask-price reduction is too loose.
+- [Boyd and Vandenberghe, Convex Optimization](https://web.stanford.edu/~boyd/cvxbook/): LP duality and independently checkable bounds.
+
+These are established algorithms/interfaces, not measured improvements here.
+Recommend compiled cover tests, cached dual bounds and a capped LP before full
+curve sizing. Use exact native verification and bounded integer refinement for
+lots/rounded fees; continuous or floating-point solver status is not an economic
+certificate. Backend/version choice, deterministic traversal, certificate format
+and work limits require a further implementation decision.
+
+## 12. Advisory: corpus performance and prototype gate
+
+The expected saving comes from replacing repeated full sizing with cheap affected-
+basket screens, and sizing only prospective onsets or failed-attempt retries.
+Three/four masks do not alone bound basket count, native routes, levels or retry
+frequency. Compatibility, coverage and price filters reduce work; a raw subset
+count is a ceiling, not a forecast of actual solver calls.
+
+Let U be relevant committed updates, B_t affected baskets at update t, E successful
+onset attempts and R unsuccessful/unresolved retries. The intended cost shape is:
+
+```text
+old: replay + repeated quantity searches + output/independent audit
+new: replay + geometry compilation + sum_t(screen work for B_t)
+     + (E + R) onset sizing work + output/independent audit
+```
+
+If screens remain positive while depth/fees block qualification, R can approach
+the update count. This is the key failure mode, not eliminated by warm starts.
+Compile equivalent geometry once, maintain book prefixes, dispatch only affected
+baskets and reuse valid exclusion bounds before launching another sizing attempt.
+
+The baseline's [recorded synthetic measurements](https://github.com/hridyansh07/prediction-indexer/blob/f77a5cf1fe7f339e4a0202d6b3d6568c417416e9/replay/strategies/bounded_payout_optimizer/PERFORMANCE.md)
+are evidence of existing costs, not a benchmark of this proposal:
+
+| Pattern | Writer plus independent audit | Evidence |
+| --- | ---: | --- |
+| Certified negative, 100,000 updates | About 208 seconds | Measured synthetic run |
+| Two-mask fee-positive pattern at 100,000 updates | About 44.7 minutes | Linear projection from 1,000 updates; two masks are outside the new scope |
+| Hard overlap pattern at 100,000 updates | About 3.4 hours | Linear projection from 100 updates |
+
+At 1,200 bundles, ten minutes average means 200 serial hours. One minute means
+20 hours; 30 seconds means ten hours. Ideal eight-worker times are 25, 2.5 and
+1.25 hours respectively, before storage, memory and verification contention.
+
+**Provisional recommendation, not an approved SLO or speed claim:** aim for
+30–60 seconds average end-to-end per bundle, then measure tail/runtime distribution
+and corpus throughput on the intended hardware. Ten minutes per bundle is not
+the accepted design expectation. Do not promise a ten-minute bundle becomes a
+thirty-second bundle without evidence, or silently discard hard bundles to meet
+the target.
+
+Prototype the screen/onset path before a full rewrite. Compare representative
+negative, positive and retry-heavy retained/synthetic inputs on the same stack;
+include three-/four-mask portfolios rather than only pair opportunities. Measure
+geometry compilation, updates, affected baskets, screen passes, successful/failed
+sizings, solver work, output bytes, peak memory and independent audit separately.
+Report end-to-end mean, median, tail and worst-case time, with cold/warm input
+processing distinguished. Compare equivalent scope and certified/best-found
+results so speed is not purchased by hiding opportunities or weakening proof.
+
+Bound construction, screening, solver, refinement and reader work explicitly.
+Preserve work-limit statuses and gaps; a fast feasible witness is not proof of a
+maximum, and a timed-out absent witness is not a negative. No new solver runtime,
+speedup or 1,200-bundle completion time has been measured for this proposal.
