@@ -50,3 +50,38 @@ class OverlayStore:
         for key in self.base.list_keys(prefix):
             if key not in seen:
                 yield key
+
+
+class VerifyingSink:
+    """A write-only layer: verifies each write against its expected identity, keeps nothing.
+
+    With a fresh layer per bundle, bundle staging only writes derivative copies and
+    its bundle receipt here and never reads them back (the local installs are what
+    replay mounts), so keeping a third copy would only spend disk.
+    """
+
+    store_id = "corpus-verifying-sink"
+    durability = None
+
+    def put_immutable(self, key, reader, expected_identity, *, content_type=None, content_encoding=None):
+        import hashlib
+        from archive.storage.base import ObjectMetadata
+        digest, length = hashlib.sha256(), 0
+        while chunk := reader.read(1 << 22):
+            digest.update(chunk)
+            length += len(chunk)
+        if (digest.hexdigest(), length) != (expected_identity.sha256, expected_identity.byte_length):
+            raise ObjectStoreError(f"sink write disagrees with its expected identity: {key}")
+        return ObjectMetadata(key, length, digest.hexdigest(), digest.hexdigest(), "SHA256",
+                              content_type, content_encoding)
+
+    def head(self, key):
+        return None
+
+    def list_keys(self, prefix):
+        return iter(())
+
+    def _absent(self, *args, **kwargs):
+        raise ObjectStoreError("the verifying sink holds no objects")
+
+    verify_metadata = verify = open = open_verified = _absent

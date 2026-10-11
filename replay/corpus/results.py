@@ -9,7 +9,8 @@ from pathlib import Path
 
 RECEIPT = "corpus_receipt.json"
 VERSION = 1
-FIELDS = {"corpus_receipt_version", "corpus_key", "bundle_id", "status", "bench_exit", "game_state", "files"}
+FIELDS = {"corpus_receipt_version", "corpus_key", "bundle_id", "status", "bench_exit", "game_state",
+          "excluded_groups", "files"}
 
 
 def _hash(path):
@@ -30,7 +31,8 @@ def _copy(source, destination):
         os.fsync(writer.fileno())
 
 
-def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_exit, game_state):
+def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_exit, game_state,
+           excluded_groups=()):
     """Copy every regular file of a finished bench output, hash it, then write the receipt last."""
     bench_output, destination = Path(bench_output), Path(destination)
     if destination.exists():
@@ -44,7 +46,8 @@ def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_ex
         sha, length = _hash(destination / relative)
         files.append({"path": relative, "byte_length": length, "sha256": sha})
     receipt = {"corpus_receipt_version": VERSION, "corpus_key": corpus_key, "bundle_id": bundle_id,
-               "status": status, "bench_exit": bench_exit, "game_state": game_state, "files": files}
+               "status": status, "bench_exit": bench_exit, "game_state": game_state,
+               "excluded_groups": list(excluded_groups), "files": files}
     raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
     with (destination / RECEIPT).open("xb") as writer:
         writer.write(raw)

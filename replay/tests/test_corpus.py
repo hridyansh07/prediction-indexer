@@ -15,8 +15,8 @@ from encoder import StoredIdentity
 from replay.corpus import results, spec as specs
 from replay.corpus.__main__ import corpus_key
 from replay.corpus.ledger import Ledger
-from replay.corpus.overlay import OverlayStore
-from replay.corpus.pipeline import Pipeline, StageError, retired_bundles, run_corpus
+from replay.corpus.overlay import OverlayStore, VerifyingSink
+from replay.corpus.pipeline import Pipeline, StageError, preflight_groups, retired_bundles, run_corpus
 
 
 def put(store, key, data):
@@ -62,6 +62,49 @@ class OverlayTests(unittest.TestCase):
                 self.assertEqual(reader.read(), b"[1]")
             self.assertEqual(list(overlay.list_keys("canonical/")), ["canonical/w/receipt.json"])
             self.assertEqual(list(overlay.list_keys("replay/")), ["replay/bundles/b/bundle_receipt.json"])
+
+
+class SinkAndPreflightTests(unittest.TestCase):
+    def test_sink_verifies_writes_and_keeps_nothing(self):
+        sink = VerifyingSink()
+        data = b"derivative bytes"
+        meta = sink.put_immutable("replay/derivatives/x", io.BytesIO(data),
+                                  StoredIdentity(hashlib.sha256(data).hexdigest(), len(data)))
+        self.assertEqual(meta.byte_length, len(data))
+        self.assertIsNone(sink.head("replay/derivatives/x"))
+        with self.assertRaisesRegex(ObjectStoreError, "expected identity"):
+            sink.put_immutable("k", io.BytesIO(b"other"), StoredIdentity(hashlib.sha256(data).hexdigest(), len(data)))
+        with self.assertRaises(ObjectStoreError):
+            sink.open("replay/derivatives/x")
+
+    def test_preflight_excludes_refusing_groups_and_keeps_the_rest(self):
+        from replay.economic_sdk import factory
+
+        class Fits:
+            def __init__(self, config):
+                self.config = config
+
+        class TooBig(Fits):
+            pass
+
+        module = SimpleNamespace(fits=factory(Fits), too_big=factory(TooBig), plain=lambda context: None)
+        seen = []
+
+        def fake_preflight(strategy):
+            seen.append(strategy.config)
+            if isinstance(strategy, TooBig):
+                raise ValueError("entity metadata preflight: entities.json requires 16009633 bytes; limit 8388608")
+
+        groups = [{"name": "a", "factory": "m:fits", "config": {"path": "{context}"}},
+                  {"name": "b", "factory": "m:too_big", "config": {}},
+                  {"name": "c", "factory": "m:plain", "config": {}}]
+        with patch("replay.economic_sdk.entity_tables.preflight", side_effect=fake_preflight), \
+             patch("importlib.import_module", return_value=module):
+            runnable, excluded = preflight_groups(groups, lambda c: {k: v.replace("{context}", "/ctx") for k, v in c.items()})
+        self.assertEqual([g["name"] for g in runnable], ["a", "c"])   # non-SDK groups pass through
+        self.assertEqual(excluded[0]["group"], "b")
+        self.assertIn("16009633", excluded[0]["reason"])
+        self.assertEqual(seen[0], {"path": "/ctx"})   # tokens resolved to host paths
 
 
 class LedgerTests(unittest.TestCase):
@@ -160,6 +203,11 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(retired_bundles("http://u", opener=opener), ["b1", "b3"])
         self.assertTrue(opener.urls[1].endswith("&cursor=c/1"))
 
+    def setUp(self):
+        patcher = patch("replay.corpus.pipeline.preflight_groups", side_effect=lambda groups, resolve: (groups, []))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None):
         root = Path(tmp)
         spec = spec_document(root)
@@ -174,6 +222,7 @@ class PipelineTests(unittest.TestCase):
 
         def prepare(root_dir, request, resolved, receipt, pins, config):
             (root_dir / "context").mkdir()
+            (root_dir / "context/receipt.json").write_text('{"snapshot_sha256": "' + "a" * 64 + '"}')
             return {"plans": [], "config": {"start_ns": "1"}}
 
         def game(context, out, *, store):
@@ -203,9 +252,10 @@ class PipelineTests(unittest.TestCase):
             with patch("replay.corpus.pipeline.parse_request", create=True), \
                  patch("replay.jobs.contracts.parse_request", return_value="request"), \
                  patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {"fees": 1}, {"val": 1})):
-                state, code, receipt = pipeline.run("b1")
-            self.assertEqual((state, code), ("done", 0))
+                state, code, receipt, excluded = pipeline.run("b1")
+            self.assertEqual((state, code, excluded), ("done", 0, []))
             self.assertIsInstance(calls["store"], OverlayStore)
+            self.assertIsInstance(calls["store"].layer, VerifyingSink)
             spec = calls["bench_spec"]
             self.assertIsNone(spec["image"]["reuse_id"])
             self.assertEqual(pipeline.image_id, "sha256:img")   # later bundles reuse the built image

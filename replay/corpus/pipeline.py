@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import inspect
 import json
 import shutil
 import time
@@ -12,10 +14,9 @@ from pathlib import Path
 from urllib.parse import quote
 from urllib.request import ProxyHandler, build_opener
 
-from archive.storage.local import LocalObjectStore
 from replay.corpus import results
 from replay.corpus.fees import fee_inputs
-from replay.corpus.overlay import OverlayStore
+from replay.corpus.overlay import OverlayStore, VerifyingSink
 from replay.corpus.spec import substitute
 
 PUBLISHER, PYTHON = Path("/usr/local/bin/replay-publish"), Path("/usr/local/bin/python3.13")
@@ -44,6 +45,37 @@ def retired_bundles(base_url, *, timeout=120, opener=None):
     return [row["bundle_id"] for row in sorted(retired, key=lambda r: (r["capture_start_at"], r["bundle_id"]))]
 
 
+def _strategy_class(factory_ref):
+    module, attr = factory_ref.split(":")
+    build = getattr(importlib.import_module(module), attr)
+    return inspect.getclosurevars(build).nonlocals.get("strategy_class")
+
+
+def preflight_groups(groups, resolve):
+    """Split groups into runnable and excluded before the bench starts.
+
+    A strategy that refuses at setup exits fatally and the supervisor stops every
+    group of that replay, so one oversized entity table would cost the whole
+    bundle. Economic-SDK groups are constructed on the host and run through the
+    same entity-table preflight the runtime performs; refusals are excluded and
+    recorded instead.
+    """
+    from replay.economic_sdk import entity_tables
+    runnable, excluded = [], []
+    for group in groups:
+        strategy_class = _strategy_class(group["factory"])
+        if strategy_class is None:
+            runnable.append(group)
+            continue
+        try:
+            entity_tables.preflight(strategy_class(resolve(group["config"])))
+        except Exception as error:
+            excluded.append({"group": group["name"], "reason": f"{type(error).__name__}: {error}"[:500]})
+        else:
+            runnable.append(group)
+    return runnable, excluded
+
+
 def _job_id(bundle_id):
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha256(bundle_id.encode()).hexdigest()[:16]
 
@@ -70,7 +102,7 @@ class Pipeline:
         return Path(self.spec["results_root"]) / self.corpus_key[:16] / bundle_id
 
     def run(self, bundle_id):
-        """Return (state, bench_exit, receipt_sha256); raise StageError on a failed stage."""
+        """Return (state, bench_exit, receipt_sha256, excluded_groups); raise StageError on a failed stage."""
         from replay.jobs.contracts import parse_request
         work = Path(self.spec["work_root"]) / bundle_id
         shutil.rmtree(work, ignore_errors=True)   # a crashed earlier attempt
@@ -81,7 +113,7 @@ class Pipeline:
                 "replay_request_version": 1, "bundle_id": bundle_id, "probe_markets": None, "interval": None,
                 "strategy": {"name": "bundle_coverage", "config": {}}, "limits": "small"}).encode(), self.config)
             resolved = _stage("resolve", self.history.resolve, job_id, request, self.config)
-            store = OverlayStore(self.canonical, LocalObjectStore(work / "layer", store_id="corpus-layer"))
+            store = OverlayStore(self.canonical, VerifyingSink())
             for name in ("work", "derivatives", "job"):
                 (work / name).mkdir()
             ready = _stage("materialize", self.ensure_bundle, bundle_id, resolved.window_interval, store=store,
@@ -100,6 +132,23 @@ class Pipeline:
                 document = json.loads(game_path.read_bytes())
                 game_state = {"state": document["state"], "reason": document["reason"]}
             catalog, fees, valuation = _stage("fees", fee_inputs, snapshot, self.spec["fees"], work / "fees")
+            groups = [dict(g, config=substitute(g["config"], {"@corpus:fees": fees, "@corpus:valuation": valuation}))
+                      for g in self.spec["groups"]]
+            tokens = {"{context}": str(context),
+                      "{snapshot_sha256}": json.loads((context / "receipt.json").read_bytes())["snapshot_sha256"],
+                      "{fees}": str(Path(catalog).parent), "{catalog_identity}": Path(catalog).name}
+            if game_path is not None:
+                tokens["{game_state}"] = str(game_path)
+                tokens["{game_state_sha256}"] = hashlib.sha256(game_path.read_bytes()).hexdigest()
+
+            def resolve(config):
+                text = json.dumps(config)
+                for token, value in tokens.items():
+                    text = text.replace(token, value)
+                return json.loads(text)
+            groups, excluded = _stage("preflight", preflight_groups, groups, resolve)
+            if not groups:
+                raise StageError("preflight", RuntimeError(f"every group refused: {excluded}"))
             document = _stage("run_config", self._run_config, job_id, request, ready, snapshot, context, work)
             (work / "run.json").write_text(json.dumps(document, indent=1))
             bench_spec = {
@@ -111,9 +160,8 @@ class Pipeline:
                 "mounts": [{"host": str(work / "derivatives"), "container": DERIVATIVES_MOUNT}],
                 "limits": self.spec["limits"],
                 "groups": [{"name": g["name"], "factory": g["factory"], "revision": self.corpus_key[:16],
-                            "config": substitute(g["config"], {"@corpus:fees": fees, "@corpus:valuation": valuation}),
-                            "reader": g["reader"], "checks": g["checks"], "compare": g["compare"]}
-                           for g in self.spec["groups"]],
+                            "config": g["config"], "reader": g["reader"], "checks": g["checks"],
+                            "compare": g["compare"]} for g in groups],
             }
             if game_path is not None:
                 bench_spec["game_state_path"] = str(game_path)
@@ -125,9 +173,9 @@ class Pipeline:
             status = json.loads((work / "bench" / "result.json").read_bytes())["status"]
             receipt_sha = _stage("commit", results.commit, work / "bench", self.results_dir(bundle_id),
                                  corpus_key=self.corpus_key, bundle_id=bundle_id, status=status,
-                                 bench_exit=exit_code, game_state=game_state)
+                                 bench_exit=exit_code, game_state=game_state, excluded_groups=excluded)
             state = {"SUCCESS": "done", "GAME_STATE_UNAVAILABLE": "game_state_unavailable"}.get(status, "failed")
-            return state, exit_code, receipt_sha
+            return state, exit_code, receipt_sha, excluded
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -166,10 +214,12 @@ def run_corpus(pipeline, ledger, bundles, *, retry_failed=False, log=print):
         ledger.start(pipeline.corpus_key, bundle_id)
         started = time.monotonic()
         try:
-            state, exit_code, receipt = pipeline.run(bundle_id)
+            state, exit_code, receipt, excluded = pipeline.run(bundle_id)
             ledger.finish(pipeline.corpus_key, bundle_id, state, seconds=time.monotonic() - started,
-                          bench_exit=exit_code, receipt_sha256=receipt)
-            log(f"[{index}/{len(bundles)}] {bundle_id} {state} exit={exit_code} {time.monotonic() - started:.0f}s")
+                          bench_exit=exit_code, receipt_sha256=receipt,
+                          detail=json.dumps({"excluded_groups": excluded}) if excluded else None)
+            note = f" excluded={[e['group'] for e in excluded]}" if excluded else ""
+            log(f"[{index}/{len(bundles)}] {bundle_id} {state} exit={exit_code} {time.monotonic() - started:.0f}s{note}")
         except StageError as error:
             ledger.finish(pipeline.corpus_key, bundle_id, "failed", seconds=time.monotonic() - started,
                           stage=error.stage, detail="".join(traceback.format_exception(error.error))[-4000:])
