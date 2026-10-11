@@ -617,6 +617,32 @@ class OptimizerReviewRegressions(unittest.TestCase):
         h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
         with self.assertRaisesRegex(ProtocolError,'independent rule event alignment'):h.finish()
 
+    def test_uncaptured_declared_market_stays_unknown_after_scope_change(self):
+        h=self.harness(scopes='uncaptured',books={('kalshi:series','outcome'),('polymarket:123','outcome')})
+        h.kalshi_ask(12,'series','outcome',(90,2));h.pm_ask(12,'123',(900,2));h.group(25)
+        stat=h.finish()['summary']['rows'][0]
+        self.assertEqual(stat['unknown_ns'],'19');self.assertEqual(stat['complete_nonpositive_ns'],'11')
+
+    def test_uncaptured_undeclared_sibling_does_not_veto_negative(self):
+        h=self.harness(scopes='uncaptured',books={('kalshi:series','outcome')})
+        h.kalshi_ask(12,'series','outcome',(90,2));h.group(25)
+        stat=h.finish()['summary']['rows'][0]
+        self.assertEqual(stat['unknown_ns'],'2');self.assertEqual(stat['complete_nonpositive_ns'],'28')
+
+    def test_reader_rejects_false_negative_from_market_only_uncaptured_row(self):
+        from replay.strategies.bounded_payout_optimizer import strategy
+        original=strategy.search
+        def falsely_certified(*args,**kwargs):
+            results,models=original(*args,**kwargs)
+            for result in results:
+                if 'found'in result and any(r.get('market_id')=='polymarket:series'and r['reason']=='NOT_CAPTURED'for r in result['rejected']):
+                    result['economic_status']='COMPLETE_NONPOSITIVE'
+            return results,models
+        h=self.harness(scopes='uncaptured',books={('kalshi:series','outcome'),('polymarket:123','outcome')})
+        with patch.object(strategy,'search',side_effect=falsely_certified),self.assertRaisesRegex(ProtocolError,'independent.*negative.*input'):
+            h.kalshi_ask(12,'series','outcome',(90,2));h.pm_ask(12,'123',(900,2));h.group(25)
+            h.finish()
+
     def test_reader_rejects_false_advertised_bound_and_frontier_kind(self):
         h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
         h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2));result=h.finish()

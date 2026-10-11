@@ -31,6 +31,9 @@ unconfigured/unsupported sibling does not veto supported candidates. Missing
 required declared book inputs remain visible and cannot prove a complete negative.
 Crossed or unrepresentable declared inputs also remain unknown for negative
 measurement and rearm; their rejection cannot certify the full declared domain.
+Market-only uncaptured rejections are associated with configured native books
+using the pinned scope membership union. An undeclared uncaptured sibling does
+not create uncertainty for the declared search domain.
 
 `rules` pins the event, compatibility/evidence SHA-256, sorted assumptions,
 `normal_resolution_only: true` and each book's reviewed rule identity. This is an

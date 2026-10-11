@@ -180,6 +180,9 @@ def verify_search(rows,config,snapshot,bridge,books,knowledge,time,sequence,scop
         if row['economic_status']=='COMPLETE_NONPOSITIVE':
             declared={(q['instrument'],q['orientation'])for q in config['policy']['quantities']}
             missing_declared=any(tuple(r.get('key',()))in declared and r['reason']in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','NOT_CAPTURED','SELF_CROSSED_LEG','UNSUPPORTED_SCALE')for r in rejected)
+            lost_markets={r['market_id']for r in rejected if r['reason']=='NOT_CAPTURED'and 'market_id'in r}
+            if lost_markets:
+                missing_declared=missing_declared or any(member['market_id']in lost_markets and bool({(b['instrument'],b['orientation'])for b in member['books']}&declared)for pinned_scope in snapshot['scopes']for member in pinned_scope['members'])
             require(not missing_declared,'independent negative declared input availability')
             require(found['complete']and best['margin']<=0 and bound is not None and bound<=0 and not found['unknown_books']and not row['valuation_unknown'],'independent certified economic negative')
             availability=proofs.setdefault('availability',OrderedDict())

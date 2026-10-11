@@ -407,6 +407,10 @@ def search(config, bridge, snapshot, scope, book_rows, knowledge, time, sequence
             negative_certificate={'kind':'UNIFORM_OUTCOME_GROSS_DUAL_BOUND','margin_upper_bound':dual_bound}
         declared={(r['instrument'],r['orientation'])for r in config['policy']['quantities']}
         uncertain=valuation_unknown or bool(found['unknown_books']) or any(tuple(r.get('key',())) in declared and r['reason'] in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','NOT_CAPTURED','SELF_CROSSED_LEG','UNSUPPORTED_SCALE') for r in rejected)
+        uncaptured_markets={r['market_id']for r in rejected if r['reason']=='NOT_CAPTURED'and 'market_id'in r}
+        if uncaptured_markets:
+            declared_markets={member['market_id']for pinned_scope in snapshot['scopes']for member in pinned_scope['members']if any((b['instrument'],b['orientation'])in declared for b in member['books'])}
+            uncertain=uncertain or bool(uncaptured_markets&declared_markets)
         status='SEARCH_COMPLETE' if found['complete'] else 'SEARCH_LIMITED'
         certified_negative=negative_certificate is not None and negative_certificate['margin_upper_bound']<=0
         result.append({'shape':shape,'status':status,'economic_status':'POSITIVE' if qualification else 'FEASIBLE_BELOW_ENTRY_THRESHOLD'if found['best']['margin']>0 else 'INPUT_UNKNOWN' if uncertain else 'COMPLETE_NONPOSITIVE' if found['complete']and certified_negative else 'UNCERTIFIED_NONPOSITIVE'if found['complete']else 'LIMITED_NO_POSITIVE',
