@@ -44,9 +44,10 @@ to find promising sizes and bound unexamined quantities; refine and verify the
 actual lot-sized, rounded-fee positions exactly.
 
 At a successful onset, **size once using only the committed state at that time**.
-Freeze the proposed native allocation, acquisition cost and payout proof. Observe
-later updates to maintain the trigger and determine the episode end; do not resize
-the allocation or select a retrospectively better allocation from the interval.
+Freeze the proposed native allocation, acquisition cost and payout proof. On later
+updates, **reprice that frozen allocation against current depth** to determine the
+episode end (section 9); do not resize the allocation or select a retrospectively
+better allocation from the interval.
 An unsuccessful attempt does not open an episode; the retry recommendation is in
 section 11.4.
 
@@ -68,13 +69,13 @@ The proposed column describes the episode-first pipeline, not shipped behavior.
 | Stage observable state | `Runtime.__call__`, `release`, `flush` and `decide` commit same-time books, scope changes, released facts and timers. | Preserve this ordering. Add basket dependency tracking after the committed state is available; never use future updates or eventual episode duration to size the onset. |
 | Build native models | `scenario.models` constructs a model for each eligible native book, with its mask, source, scales, grid, cap and rule binding. | Separate structural mask groups from native routing models. Compile basket geometry on structural changes, rather than reconstructing native-book support combinations on every price update. |
 | Select baskets | `core.solve` seeds covers and enumerates supports from one through `max_legs` native books, subject to the configured limit. | Generate only compatible three-/four-mask baskets. Check outcome coverage before book-depth work; do not add family exclusions without a separately approved domain proof. Count logical masks separately from native orders. |
-| Decide whether to size | The current whole-input fingerprint skips identical acquisition states. Other relevant changes can start quantity search; there is no maintained per-basket price gate. | Recheck only affected baskets. Size a potential onset; after a successful opening, maintain only the trigger. Failed-attempt invalidation is a separate concern, not permission to resize an open episode. |
+| Decide whether to size | The current whole-input fingerprint skips identical acquisition states. Other relevant changes can start quantity search; there is no maintained per-basket price gate. | Recheck only affected baskets. Size a potential onset; after a successful opening, only reprice the frozen allocation. Failed-attempt invalidation is a separate concern, not permission to resize an open episode. |
 | Acquire prices and fees | `scenario.price_order` walks a requested quantity and assesses one ordered fill per consumed native level. A bounded cache already stores pinned whole-order economic amounts. | Build bounded cumulative prefixes once, including fees. Cache schedule/price/quantity fee primitives separately from source-dependent curves. Query earlier full levels from the prefix and price only the final partial level. |
 | Optimize quantities | `core.solve` enumerates quantity grids with gross branch bounds; `PortfolioEvaluator` scores compiled mask arithmetic. | Solve a segment-based continuous relaxation, expand relevant curve prefixes and use its bounds to guide exact discrete refinement. Avoid the full quantity cross-product where a valid bound eliminates it. |
 | Verify and qualify | Retained candidates receive fresh fee proofs. Exact margin and return gates determine qualifying findings. | Verify native quantities, exact fees, retained payouts, valuation, holding charges and joint source use. Enforce minimum commitment and absolute margin within sizing; do not percentage-gate only the unconstrained winner. |
 | Open an episode | Detection uses undepleted books. Immediate entry re-solves against account cash and cumulative capacity; delayed entry freezes native support and maximum quantities. | Record a verified onset allocation on that committed snapshot. Opening is analytical, not a cash/depth debit or execution claim. Failed or unknown sizing does not open an episode. |
-| Track and close | Current episodes follow the selected quantity vector; fixed acquired lots separately remain until supported resolution. | Track each basket's trigger interval, without allocation changes. End on trigger failure or explicit unavailable/semantic boundaries; censor still-active episodes at run end. No held-position settlement is required. |
-| Write and independently read | Version-2 output carries economic proofs and lifecycle evidence. `audit.py` and `output.py` independently reprice and reconstruct them. | Version the episode policy/output and carry onset, screening and solver evidence. Independently check trigger intervals and exact opening portfolios without importing the writer's optimizer. |
+| Track and close | Current episodes follow the selected quantity vector; fixed acquired lots separately remain until supported resolution. | On each update to a book the frozen allocation uses, walk current depth for the same native routes and quantities with exact fees. End when any leg can no longer fill its frozen quantity, the repriced margin fails the gates, or an unavailable/semantic boundary occurs; censor still-active episodes at run end. No held-position settlement is required. |
+| Write and independently read | Version-2 output carries economic proofs and lifecycle evidence. `audit.py` and `output.py` independently reprice and reconstruct them. | Version the episode policy/output and carry onset, repricing, screening and solver evidence. Independently check exact opening portfolios and the repricing at each interval boundary without importing the writer's optimizer. |
 
 ```diagram
 Compatible masks and native routes
@@ -96,7 +97,12 @@ Potential onset → lazy curves and bounded exact sizing
 Verified opening → freeze onset allocation and proof
                 │
                 ▼
-Track trigger only → close interval or censor at run end
+Reprice frozen allocation at current depth
+                │
+                ├─ depth short / margin fails / unavailable → close interval
+                │
+                ▼
+Still qualifying → continue, or censor at run end
 ```
 
 ## 3. Masks are economic legs; books are native routes
@@ -203,9 +209,10 @@ Changes beyond a retained prefix may be ignored for sizing only if the existing
 tail certificate still covers the updated state.
 
 These subscriptions are strategy work selection. Capture and replay continue
-preserving the input evidence. After successful onset sizing, subsequent updates
-maintain only the declared trigger and observability/semantic boundaries. They do
-not resize or replace that episode's allocation. A later separate held-position
+preserving the input evidence. After successful onset sizing, updates to the
+books an open episode uses reprice its frozen allocation (section 9) and check
+observability/semantic boundaries. They do not resize or replace that episode's
+allocation, and the screen no longer decides its end. A later separate held-position
 scenario would need its own dependencies and accounting.
 
 ## 6. Cutoff prices and lazy curve construction
@@ -349,7 +356,8 @@ maximum margin while leaving the tie domain unresolved; report that distinction.
 
 Keep one shared whole-decision work budget across affected static/conditioned
 screens, onset attempts, prefix expansion and refinement. Successful episodes
-consume trigger-maintenance work, not repeated full-sizing work. Solver iterations,
+consume repricing work (one depth walk per frozen leg), not repeated full-sizing
+work. Solver iterations,
 candidate construction, curve levels, cache memory and proof size also need
 explicit limits: counting one solver call as one old search node would not bound
 its internal work. A verified positive at the limit may be reported as best found
@@ -390,19 +398,32 @@ Failed or search-limited attempts without a qualifying witness do not open an
 episode and cannot establish a complete negative. A later successful retry starts
 at that later time, never at the earlier failed screen crossing.
 
-After opening, observe the trigger, not a new sizing objective. Do not resize,
-switch native routes, report allocation changes or select an episode-wide maximum.
-Close at the first committed trigger failure; distinguish unavailable inputs or
-changed scope/outcome/rule semantics from an economic-negative end. Unknown inputs
-or an uncertified solver status are not proof that the trigger became false.
-An active interval at run end is censored. Same-time transient states contribute
-no positive duration.
+After opening, **reprice the frozen allocation**, not a new sizing objective. On
+each committed update to a book that any frozen leg uses, walk that leg's current
+eligible depth for its frozen native route and purchased quantity, assess exact
+fees for the same declared orders and recompute retained payouts and M(q). This is
+a fixed-quantity depth walk with no search. The episode continues while every leg
+fills its full frozen quantity from displayed depth and the repriced allocation
+still satisfies `M(q) > 0` and `M(q) >= minimum_net_margin`. The minimum
+acquisition commitment is an onset condition only: quantities are frozen, so a
+cheaper repricing must not end a still-qualifying episode.
 
-The interval means **trigger-positive time with a verified opening allocation**.
-It does not assert that the opening depth/size remained available or that some
-net-qualified allocation existed at every later time. Tracking an optimistic
-screen is not continuous exact net-profit verification. No actual execution,
-held-lot P&L, cash availability or settlement is inferred from episode duration.
+Close at the first committed update where the frozen allocation fails. Record the
+end reason: `DEPTH_SHORTFALL` (a leg can no longer fill its frozen quantity),
+`MARGIN_BELOW_THRESHOLD` (it fills but the repriced margin fails), or an
+unavailable-input or changed scope/outcome/rule boundary, kept distinct from the
+economic ends. Unknown inputs or unavailable fees are not proof that the
+allocation stopped qualifying. An active interval at run end is censored.
+Same-time transient states contribute no positive duration. Updates to books the
+allocation does not use cannot end the episode, even when a different allocation
+would now be better.
+
+The interval means **time during which the exact onset allocation remained
+fillable from displayed depth and net-qualified under exact fees**. It does not
+assert that a larger or better allocation existed, and it does not deplete depth
+between episodes: each episode is an isolated displayed-book opportunity. No
+actual execution, queue position, held-lot P&L, cash availability or settlement
+is inferred from episode duration.
 
 Report t1/t2, duration, end reason/censoring, mask and native-route identities,
 opening allocation and fee proofs, acquisition commitment x, minimum payout y,
@@ -413,13 +434,15 @@ the onset allocation, not a later optimum or an allocation valid throughout the
 interval. Separate structural exclusion, missing input, certified screening,
 below-threshold attempts and work-limit uncertainty from opened episodes.
 
-Carry screen inputs/certificates, prefix/tail assumptions, work counters and
-failed-attempt reasons sufficiently to audit interval boundaries and onset proofs.
+Carry screen inputs/certificates, prefix/tail assumptions, work counters,
+failed-attempt reasons and the repriced allocation at each interval end
+sufficiently to audit interval boundaries and onset proofs.
 Reuse bounded checkpoint/delta transport rather than repeating entire curves.
 Version policy/output changes explicitly and update the independent reader and
 fixtures; do not reinterpret existing V1/V2 fields silently. The reader must
 rederive mask geometry, native fees/payoffs, within-allocation source feasibility,
-trigger boundaries and carried bounds without importing the writer's optimizer.
+the frozen-allocation repricing at each interval end and carried bounds without
+importing the writer's optimizer.
 Unchecked search coverage remains a writer attestation, not proof of an omitted
 opportunity or an unrestricted optimum.
 
@@ -437,15 +460,20 @@ Suggested sequence:
 Still to pin: numerical minimum commitment/margin and valuation conventions;
 native-order cap when venue splitting increases order count; the trigger backend,
 failed-attempt retry/certificate policy, solver and exact certificate format;
-candidate/work/curve/memory/output limits; and whether a separately labelled
-conservative-fee scenario is wanted. No extra family exclusions, return-percentage
+candidate/work/curve/memory/output limits; whether a separately labelled
+conservative-fee scenario is wanted; and a dominance rule for four-mask baskets
+that contain a qualifying three-mask basket (a positive triple plus a small
+purchase of any fourth mask can still qualify, so one opportunity can otherwise
+open several overlapping four-mask episodes). No extra family exclusions, return-percentage
 gate or arbitrary percentage defining "near the trigger" have been adopted.
 
 Later verification should cover duplicate-mask routing, the overlap despite pair
 covers, unequal sizes, rounded fees, minimum-commitment-constrained sizing, partial
 levels, cheaper alternate venues, tail-bound invalidation, game/scope changes,
 failed attempts followed by depth-only success, no backdating/lookahead, no sizing
-while an episode is open, unavailable/censored ends and certificate corruption.
+while an episode is open, depth-shortfall and margin ends of a frozen allocation
+while the price screen stays positive, updates to unused books not ending an
+episode, unavailable/censored ends and certificate corruption.
 Measure screening false positives and retry-heavy cases as well as negatives and
 successful onsets. No speedup or corpus completion estimate is established here.
 
