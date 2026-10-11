@@ -18,9 +18,9 @@ from replay.jobs.contracts import (
     parse_producer,
     parse_runner_config,
 )
-from universe.auth import AuthStore
+from universe.jobs.auth import AuthStore
 from universe.config import load_config
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.store import ReplayJobStore
 
 MAX_DESCRIPTOR_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")

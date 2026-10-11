@@ -1107,3 +1107,28 @@ fails the attempt at open. The conservativeness tests cover all three.
   measure apparent edge, not executable trades, so two routes that walk the same
   book side at the same time each keep the whole ladder; overlapping fills show
   an opportunity live on several markets at once.
+
+## 14. Prepared game-state overlay
+
+[GAME_STATE_SDK_V1.md](specs/GAME_STATE_SDK_V1.md) defines the implemented optional
+second input for SDK layout 2. The runner prepares and pins one closed
+`game_state.json` per event; the SDK loads it once without archive or network
+access. `Requirements.game = GameRequirement(timers=...)` and basket input
+`("game", None)` declare reading entities. `Context.game` holds the frozen
+current `GameView`, or is null when no game policy exists.
+
+Scope changes, fact releases and declared timers join `_advance` before books
+at the same instant. Applied facts leave the queue; memo fingerprints carry the
+revision. The current phase, score, most recent result and opaque source details
+are observable only after release. Time-derived observations declare
+`context_free=False`. Required unavailable inputs fail before book consumption
+or output writers, with code `game_state_unavailable` and a structured reason.
+
+An optional closed `policy.game` binds requiredness, input hash, release windows,
+start mode and explicit per-game priors into the experiment identity. Its path
+identifies the mounted file and does not enter that semantic identity. When the
+block exists, manifests require `game_state: {sha256, windows, mode}`, and episode
+`open`/`at_max` each require closed `game: {phase, segment, score, revision}`.
+Independent readers check those bindings and phase consistency. Without the
+block, persisted output remains unchanged, including the pinned complement and
+cross-venue goldens. Layout 1 retains its closed legacy schemas.

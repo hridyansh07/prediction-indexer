@@ -15,7 +15,7 @@ strategies are specified separately, after this lands.
 
 A structural strategy needs, for every captured book, the subset of the event's
 outcome space that the book pays on. Universe already derives exactly this at
-ingestion (`universe/claim_projection.py` → `derive_bundle_claims`) but stores
+ingestion (`universe/claims/claim_projection.py` → `derive_bundle_claims`) but stores
 only the claim identity and its key **count**, not the keys. The snapshot that
 strategies receive (`context.json` v1) carries pairwise relationships but no
 masks.

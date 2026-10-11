@@ -1,5 +1,12 @@
 # Cross-venue arbitrage research V1
 
+Policies 2 and 3 optionally accept the closed `game` block from
+[GAME_STATE_SDK_V1.md](../../../docs/specs/GAME_STATE_SDK_V1.md). It binds prepared
+input bytes and release decisions to experiment identity, requires a matching
+manifest binding, and adds closed episode `open.game`/`at_max.game` annotations.
+Independent readers reject missing or inconsistent game annotations. Existing
+policies without this block preserve their pinned output bytes.
+
 Implemented bounded V1, based on reconciled `a11bbf0`. The default eight-size
 sweep passed one retained Procyon fixture through Linux Redis/publisher execution
 and independent completed reading. Broader corpus and live execution remain unverified.

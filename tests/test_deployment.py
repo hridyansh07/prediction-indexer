@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from universe import run_backfill
-from universe.sync import SyncResult
+from universe import commands
+from universe.ingest.sync import SyncResult
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -164,7 +164,9 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertIn("configs/event_universe.json", compose)
         self.assertIn("EVENT_UNIVERSE_DATA_ROOT", compose)
         self.assertNotIn("CAPTURE_DATA_ROOT", compose)
-        self.assertIn('CMD ["python", "-u", "universe/run_server.py"]', dockerfile)
+        self.assertIn('CMD ["python", "-u", "-m", "universe", "serve"]', dockerfile)
+        for command in ("sync", "backfill", "backup"):
+            self.assertIn(f'command: ["python", "-u", "-m", "universe", "{command}"]', compose)
         self.assertIn('"eth-account>=0.13,<0.14"', dockerfile)
         config = (ROOT / "configs" / "event_universe.json").read_text(
             encoding="utf-8"
@@ -186,23 +188,29 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         self.assertNotIn("ARCHIVE_S3_BUCKET", server)
         runtime = compose.split("x-universe-runtime:", 1)[1].split("\nservices:", 1)[0]
         self.assertNotIn("environment:", runtime)
-        self.assertEqual(compose.count("    environment: *universe-job-environment"), 3)
+        self.assertEqual(compose.count("    environment: *universe-job-environment"), 4)
+        game = compose.split("  event-universe-game-state:", 1)[1].split("  replay-redis:", 1)[0]
+        self.assertIn("GAMESTATE_DATA_ROOT", game)
+        self.assertIn("gamestate.run_scheduled", game)
+        self.assertNotIn("*replay-volume", game)
+        self.assertNotIn("*universe-volume", game)
 
     def test_jobs_are_direct_configured_scripts_without_an_argument_parser(
         self,
     ) -> None:
         universe = ROOT / "universe"
         self.assertFalse((universe / "cli.py").exists())
-        for name in (
-            "run_server.py",
-            "run_sync.py",
-            "run_backfill.py",
-            "run_backup.py",
-        ):
-            source = (universe / name).read_text(encoding="utf-8")
-            with self.subTest(name=name):
-                self.assertIn("load_config()", source)
-                self.assertNotIn("argparse", source)
+        self.assertEqual(sorted(universe.glob("run_*.py")), [])
+        # One command name selects a configured job; there are no options.
+        for name in ("commands.py", "__main__.py"):
+            self.assertNotIn("argparse", (universe / name).read_text(encoding="utf-8"))
+        source = (universe / "commands.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("config = load_config()"), 4)
+        from universe.__main__ import COMMANDS, main
+        self.assertEqual(sorted(COMMANDS), ["backfill", "backup", "serve", "sync"])
+        with mock.patch("sys.stderr"):
+            self.assertEqual(main([]), 2)
+            self.assertEqual(main(["sync", "--extra"]), 2)
         config = (ROOT / "configs" / "event_universe.json").read_text(encoding="utf-8")
         self.assertIn('"event_universe_config_version": 4', config)
         self.assertIn('"generated_start": null', config)
@@ -217,14 +225,14 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         result = SyncResult(completed=True, pending_failures=1)
 
         with (
-            mock.patch.object(run_backfill, "load_config", return_value=config),
-            mock.patch.object(run_backfill, "UniverseStore") as store,
+            mock.patch.object(commands, "load_config", return_value=config),
+            mock.patch.object(commands, "UniverseStore") as store,
             mock.patch.object(
-                run_backfill, "backfill_targeter_history", return_value=result
+                commands, "backfill_targeter_history", return_value=result
             ),
             mock.patch("builtins.print"),
         ):
-            self.assertEqual(run_backfill.main(), 1)
+            self.assertEqual(commands.backfill(), 1)
         store.return_value.initialize.assert_called_once_with()
 
     def test_schema_is_market_universe_without_raw_evidence_tables(self) -> None:

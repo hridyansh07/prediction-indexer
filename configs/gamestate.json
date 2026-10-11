@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "universe_base_url": "http://event-universe:8080",
+  "universe_spacing_seconds": 0,
+  "kalshi_spacing_seconds": 0.2,
+  "settle_delay_seconds": 7200,
+  "max_bundles_per_run": 50,
+  "ledger_path": "/var/lib/gamestate/gamestate.sqlite3",
+  "archive": {
+    "backend_env": "ARCHIVE_BACKEND",
+    "root_env": "ARCHIVE_ROOT",
+    "bucket_env": "ARCHIVE_GCS_BUCKET",
+    "durability_env": "ARCHIVE_DURABILITY",
+    "store_id_env": "ARCHIVE_STORE_ID"
+  }
+}

@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
 from replay.jobs import contracts as jobs
-from universe.auth import Principal
+from universe.jobs.auth import Principal
 
 
-SCHEMA_PATH = Path(__file__).with_name("schema") / "replay_jobs.sql"
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "replay_jobs.sql"
 SCHEMA_VERSION = 1
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._~-]{1,128}\Z")
 ACTIVE_STATUSES = tuple(sorted(jobs.STATUSES - jobs.TERMINAL))

@@ -24,7 +24,7 @@ from replay.ops.preflight import PreflightError, check_capacity, check_private_r
 from replay.ops import preflight
 from replay.ops import __main__ as operations
 from tests.test_replay_jobs import Limits
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.store import ReplayJobStore
 
 
 class ReplayJobsBackupTests(unittest.TestCase):

@@ -422,3 +422,26 @@ economic figures of its own.
 - Multi-attempt and resume semantics.
 - Running without Docker against locally built Rust binaries.
 - Report or page generation from run outputs.
+
+## 12. Optional prepared game state
+
+The [game-state SDK contract](specs/GAME_STATE_SDK_V1.md) adds runner-side
+`prepare-game-state <context_dir> <out_dir>` and optional run-spec
+`game_state_path`. Preparation uses exported `ARCHIVE_*` variables and the pinned
+Universe event identity. It produces one immutable file for every strategy line
+of the event, including an explicit unavailable result. The fixture builder
+`.bench/fixtures/build_fixture.py` performs this stage after preparing context;
+its verified existing input is reused without reopening the archive.
+
+Groups can use `{game_state}` and `{game_state_sha256}` in `policy.game.input`.
+Resolution validates and hashes the input before Docker, requires the group pin
+to match, and mounts the file read-only at `/bench/game_state.json`. The resolved
+runtime and result carry `game_state_sha256` only when a file is supplied.
+
+Required unavailable groups receive `groups/<name>/game_state_unavailable.json`
+with closed `{status, reason, sha256}` and no reader receipt or strategy output.
+Other groups continue; an all-skipped invocation never calls the supervisor.
+The combined result is `GAME_STATE_UNAVAILABLE` with exit 2 if any group was
+skipped, or `FAILED` if an active group failed. Independent result validation
+checks the skip's pin and status. The Replay transport and supervisor contracts
+remain unchanged; production jobs integration is outside this scope.

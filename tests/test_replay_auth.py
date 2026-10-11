@@ -15,7 +15,7 @@ from pathlib import Path
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from universe.auth import AuthError, AuthStore, NonceStore, Principal, checksum_address
+from universe.jobs.auth import AuthError, AuthStore, NonceStore, Principal, checksum_address
 from universe.api import build_server
 from universe.config import (
     AuthConfig,
@@ -23,7 +23,7 @@ from universe.config import (
     UniverseConfigError,
     load_config,
 )
-from universe.rate_limit import RateLimiter
+from universe.api.rate_limit import RateLimiter
 
 
 UTC = timezone.utc

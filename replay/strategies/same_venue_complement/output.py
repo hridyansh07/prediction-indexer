@@ -17,6 +17,7 @@ from .contract import (
 from replay.economic_sdk import Strategy, aggregate_reader, reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.output import Layout
+from replay.economic_sdk.game import manifest_fields
 from replay.economic_sdk.reader import quantiles as _quantiles  # noqa: F401  (stable test surface)
 from replay.economic_sdk.reader import read_json as _json
 from replay.economic_sdk.reader import signed as _signed
@@ -37,7 +38,7 @@ def check_manifest(value, complete=True):
               "fee_engine_identity files instantaneous_positive payout_assumption")
     if complete:
         fields += " summary_sha256"
-    obj(value, fields)
+    obj(value, fields + manifest_fields(value))
     policy_config(value["policy"])
     require(type(value["version"]) is int and value["version"] == value["policy"]["version"])
     require(value["strategy"] == STRATEGY and value["payout_assumption"] == PAYOUT)

@@ -39,7 +39,7 @@ class ArchivedSelections:
 
     def _row(self, run_id, bundle_id, expected):
         from targeter.v2.manifest import parse_run_manifest
-        from universe.projection import project_selected_bundles
+        from universe.derive.projection import project_selected_bundles
 
         receipt = self.receipts.get(run_id)
         require(receipt is not None, "missing pinned Targeter receipt")
@@ -107,7 +107,7 @@ class ArchivedSelections:
         return matches[0]
 
     def __call__(self, occurrence, bundle_id):
-        from universe.sync import _complete_context, _projected_targets
+        from universe.ingest.sync import _complete_context, _projected_targets
 
         expected = source_pin(occurrence["source"])
         row = self._row(occurrence["run_id"], bundle_id, expected)

@@ -30,9 +30,9 @@ from tests.test_event_universe_store import (
     _selection_report,
 )
 from tests.test_targeter_replay_stream import _compression, _entry, _stored
-from universe.projection import project_selected_bundles
+from universe.derive.projection import project_selected_bundles
 from universe.store import EvidenceConflict
-from universe.sync import _complete_context
+from universe.ingest.sync import _complete_context
 
 
 def report():

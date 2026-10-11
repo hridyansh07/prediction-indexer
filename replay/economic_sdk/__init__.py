@@ -8,7 +8,7 @@ slices, controls, bounded output and the independent reader.
 from replay.economic_sdk.types import (
     ADMISSIONS, CONTROL, DEPTH_LIMITED, EVALUATED, ONE_SIDED, REAL, SDK_STATUSES, UNUSABLE,
     Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSizing, FillSpec,
-    Observation, Requirements,
+    GameRequirement, Observation, Requirements,
 )
 from replay.economic_sdk.views import BookView
 
@@ -16,7 +16,7 @@ __all__ = [
     "ADMISSIONS", "CONTROL", "DEPTH_LIMITED", "EVALUATED", "ONE_SIDED", "REAL",
     "SDK_STATUSES", "UNUSABLE", "Basket", "BookRequirement", "BookView", "Context",
     "Control", "Experiment", "FillPolicy", "FillSizing", "FillSpec", "Observation",
-    "Requirements", "Strategy", "factory",
+    "GameRequirement", "Requirements", "Strategy", "factory",
 ]
 
 

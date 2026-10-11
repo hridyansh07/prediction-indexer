@@ -127,6 +127,8 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
                 '--tmpfs', '/tmp:rw,nosuid,noexec,size=1g', '--entrypoint', 'python']
         args += _mount(root, '/bench', readonly=False)
         args += _mount(Path(spec['context_directory']).resolve(), '/bench/context')
+        if spec.get('game_state_path') is not None:
+            args += _mount(Path(spec['game_state_path']).resolve(), '/bench/game_state.json')
         if spec['fee_catalog_directory'] is not None:
             args += _mount(Path(spec['fee_catalog_directory']).resolve(), '/bench/fees/' + resolved['runtime']['fee_catalog_identity'])
         for mount in spec['mounts']:

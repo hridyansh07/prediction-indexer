@@ -16,6 +16,7 @@ Policy 2 fields beyond policy 1: ``controls`` (list, default empty),
 
 from replay.economic_sdk.bounds import MAX_METADATA
 from replay.economic_sdk.types import Basket, Control, Experiment
+from replay.economic_sdk.game import game_policy, experiment_policy
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
 from replay.streams.protocol import obj, require, uint
@@ -40,7 +41,11 @@ _V2_FIELDS = _V1_FIELDS + (" controls controls_episodes controls_slices audit_in
 def policy_config(value):
     value = plain(value)
     require(type(value) is dict and value.get("version") in (1, 2), "policy version")
-    obj(value, _V1_FIELDS if value["version"] == 1 else _V2_FIELDS)
+    fields = _V1_FIELDS if value["version"] == 1 else _V2_FIELDS
+    if value["version"] == 2 and "game" in value:
+        fields += " game"
+        game_policy(value["game"])
+    obj(value, fields)
     for name, cap, positive in (("sizes_contracts", 16, True), ("latency_tiers_ns", 8, True),
                                 ("leg_skew_buckets_ns", 16, False)):
         entries = value[name]
@@ -90,7 +95,7 @@ def reason(value):
 
 
 def experiment_identity(snapshot_sha, policy, fee_config):
-    return digest({"strategy": STRATEGY, "bridge_version": 1, "policy": policy,
+    return digest({"strategy": STRATEGY, "bridge_version": 1, "policy": experiment_policy(policy),
                    "fees": fee_config, "snapshot_sha256": snapshot_sha})
 
 

@@ -104,6 +104,7 @@ def _read_run(directory):
     spec = validate_resolved(read_json(root / 'spec.resolved.json'))
     require(result['status'] in {'SUCCESS', 'CHECKS_FAILED'}, 'comparison requires completed readers')
     runtime = spec['runtime']
+    require(result.get('game_state_sha256') == runtime.get('game_state_sha256'), 'run game state pin binding mismatch')
     require(all(result[key] == runtime[key] for key in ('label', 'image', 'context', 'fee_catalog_identity')),
             'run result pin binding mismatch')
     require([g['name'] for g in spec['groups']] == [g['name'] for g in result['groups']], 'run group binding mismatch')

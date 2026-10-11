@@ -12,7 +12,7 @@ from archive.storage import INDEPENDENT, LocalObjectStore
 from tests.test_event_universe_store import R1, G1, _publish_run, _selection_report
 from universe.api import UniverseApplication
 from universe.store import SCHEMA_VERSION, UniverseStore
-from universe.sync import UniverseSync
+from universe.ingest.sync import UniverseSync
 
 FIXED_NOW_NS = 1_767_226_200_000_000_000
 
@@ -26,7 +26,7 @@ def generate_contract() -> dict:
             root / "objects", store_id="archive", durability=INDEPENDENT
         )
         _publish_run(objects, _selection_report(R1, G1))
-        with mock.patch("universe.store.time.time_ns", return_value=FIXED_NOW_NS):
+        with mock.patch("universe.store.ingest_tx.time.time_ns", return_value=FIXED_NOW_NS):
             result = UniverseSync(database, objects).sync_range(
                 datetime(2026, 1, 1, tzinfo=timezone.utc),
                 datetime(2026, 1, 2, tzinfo=timezone.utc),

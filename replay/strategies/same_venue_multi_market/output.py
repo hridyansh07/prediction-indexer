@@ -218,7 +218,8 @@ class MultiMarketReader(Strategy):
 def check_manifest(value, snapshot, complete):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive settlement_model outcomes_provider")
-    obj(value, fields + (" summary_sha256" if complete else ""))
+    from replay.economic_sdk.game import manifest_fields
+    obj(value, fields + (" summary_sha256" if complete else "") + manifest_fields(value))
     require(type(value["version"]) is int and value["version"] == 1 and value["strategy"] == STRATEGY,
             "manifest version/strategy")
     policy_config(value["policy"])

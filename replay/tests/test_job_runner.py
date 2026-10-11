@@ -29,8 +29,8 @@ from replay.jobs.stages import (
     write_marker,
 )
 from targeter.v2.models import isoformat, parse_timestamp
-from universe.auth import Principal
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.auth import Principal
+from universe.jobs.store import ReplayJobStore
 
 
 ROOT = Path(__file__).resolve().parents[2]

@@ -100,6 +100,11 @@ Supervisor entry:
 - `audit_intervals`, default `false`;
 - `time_shift_ring_entries`;
 - `profile`, which is `null` or a market-profile policy.
+- Optional `game`, the closed prepared-input policy in
+  [GAME_STATE_SDK_V1.md](../../../docs/specs/GAME_STATE_SDK_V1.md). It binds the
+  input hash and release decisions into experiment identity and adds a required
+  manifest binding and closed `open.game`/`at_max.game` annotations. Policy 1
+  retains its original closed schema and byte identity.
 
 **Schema and loading**
 

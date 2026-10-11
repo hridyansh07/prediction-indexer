@@ -13,7 +13,7 @@ from .common import import_name, name, path, positive, read_json, sha
 LIMITS = {'attempts', 'no_progress', 'progress_margin', 'stall_seconds',
           'attempt_seconds', 'run_seconds', 'poll_seconds', 'stop_seconds'}
 TOKEN = re.compile(r'\{([^{}]*)\}')
-TOKENS = {'context', 'snapshot_sha256', 'fees', 'catalog_identity', 'output'}
+TOKENS = {'context', 'snapshot_sha256', 'fees', 'catalog_identity', 'output', 'game_state', 'game_state_sha256'}
 FIELDS = 'version image redis base_run_config context_directory fee_catalog_directory mounts limits groups'
 
 
@@ -26,14 +26,14 @@ def substitute(value, replacements):
         def replace(match):
             token = match[1]
             require(token in TOKENS, 'unknown config token')
-            require(replacements[token] is not None, 'fee token requires a catalog')
+            require(replacements[token] is not None, 'game token requires a prepared file' if token.startswith('game_state') else 'fee token requires a catalog')
             return replacements[token]
         return TOKEN.sub(replace, value)
     return value
 
 
 def validate_run_spec(spec, *, check_paths=True):
-    obj(spec, FIELDS)
+    obj(spec, FIELDS + (' game_state_path' if type(spec) is dict and 'game_state_path' in spec else ''))
     require(type(spec['version']) is int and spec['version'] == 1, 'bench spec version')
     image = obj(spec['image'], 'build_context dockerfile reuse_id')
     path(image['build_context'], directory=True, exists=check_paths)
@@ -50,6 +50,8 @@ def validate_run_spec(spec, *, check_paths=True):
     require(type(redis['maxmemory']) is str and re.fullmatch(r'[1-9][0-9]*(?:[kKmMgG][bB]?)?', redis['maxmemory']) is not None, 'positive Redis maxmemory required')
     path(spec['base_run_config'], directory=False, exists=check_paths)
     path(spec['context_directory'], directory=True, exists=check_paths)
+    if spec.get('game_state_path') is not None:
+        path(spec['game_state_path'], directory=False, exists=check_paths)
     if spec['fee_catalog_directory'] is not None:
         path(spec['fee_catalog_directory'], directory=True, exists=check_paths)
     require(type(spec['mounts']) is list, 'mounts array required')
@@ -61,7 +63,7 @@ def validate_run_spec(spec, *, check_paths=True):
         require(str(dest) == mount['container'] and '..' not in dest.parts, 'normalized container path required')
         # The /bench output, fixed context/fees and bench evidence artifacts
         # cannot be shadowed. User mounts must also be disjoint from one another.
-        for reserved in ('/bench/context', '/bench/fees', '/bench/run', '/bench/groups',
+        for reserved in ('/bench/context', '/bench/fees', '/bench/game_state.json', '/bench/run', '/bench/groups',
                          '/bench/spec.resolved.json', '/bench/input.json', '/bench/result.json',
                          '/bench/logs', '/bench/orchestration.json', '/bench/image.id'):
             base = Path(reserved)
@@ -112,6 +114,15 @@ def resolve_spec(spec, *, label, run_id, image):
     snapshot_sha256 = sha(read_json(Path(spec['context_directory']) / 'receipt.json')['snapshot_sha256'])
     snapshot = load_snapshot(spec['context_directory'], expected_sha256=snapshot_sha256)
     catalog = load_catalog(spec['fee_catalog_directory']) if spec['fee_catalog_directory'] is not None else None
+    game_sha = None
+    if spec.get('game_state_path') is not None:
+        import hashlib
+        from replay.game_state import MAX_BYTES, load
+        with Path(spec['game_state_path']).open('rb') as stream:
+            payload = stream.read(MAX_BYTES + 1)
+        require(len(payload) <= MAX_BYTES, 'game state byte bound')
+        game_sha = hashlib.sha256(payload).hexdigest()
+        load(spec['game_state_path'], game_sha, snapshot)
     result = deepcopy(spec)
     for group in result['groups']:
         group['config'] = substitute(group['config'], {
@@ -119,6 +130,8 @@ def resolve_spec(spec, *, label, run_id, image):
             'fees': '/bench/fees' if catalog else None,
             'catalog_identity': catalog.identity if catalog else None,
             'output': '/bench/groups/' + group['name'] + '/work',
+            'game_state': '/bench/game_state.json' if game_sha else None,
+            'game_state_sha256': game_sha,
         })
     result['runtime'] = {
         'label': label, 'run_id': run_id, 'image': image,
@@ -127,13 +140,32 @@ def resolve_spec(spec, *, label, run_id, image):
         'fee_catalog_identity': catalog.identity if catalog else None,
         'base_run_config': plain(base_config(read_json(spec['base_run_config']))),
     }
+    if game_sha is not None:
+        result['runtime']['game_state_sha256'] = game_sha
+    _game_pins(result)
     return result
 
 
+def _game_pins(spec):
+    from replay.economic_sdk.game import game_policy
+    pin = spec['runtime'].get('game_state_sha256')
+    for group in spec['groups']:
+        policy = group['config'].get('policy')
+        if type(policy) is dict and 'game' in policy:
+            require(pin is not None, 'bench game policy requires a prepared file')
+            value = game_policy(policy['game'])
+            require(value['input'] == {'path': '/bench/game_state.json', 'sha256': pin},
+                    'bench game state policy pin mismatch')
+
+
 def validate_resolved(spec):
-    obj(spec, FIELDS + ' runtime')
+    obj(spec, FIELDS + ' runtime' + (' game_state_path' if type(spec) is dict and 'game_state_path' in spec else ''))
     validate_run_spec({k: v for k, v in spec.items() if k != 'runtime'}, check_paths=False)
-    runtime = obj(spec['runtime'], 'label run_id image context fee_catalog_identity base_run_config')
+    runtime = obj(spec['runtime'], 'label run_id image context fee_catalog_identity base_run_config'
+                  + (' game_state_sha256' if spec.get('game_state_path') is not None else ''))
+    if spec.get('game_state_path') is not None:
+        sha(runtime['game_state_sha256'])
+    _game_pins(spec)
     name(runtime['label']); name(runtime['run_id'])
     validate_image(runtime['image'])
     context = obj(runtime['context'], 'snapshot_sha256 outcomes_provider')

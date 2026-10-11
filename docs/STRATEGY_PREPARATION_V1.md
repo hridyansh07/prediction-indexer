@@ -39,7 +39,7 @@ For an in-process read, supply
 `universe=lambda occurrence, bundle: store.selection_detail(occurrence['run_id'], bundle)`
 and `outcomes=lambda bundle: store.bundle_outcomes(bundle)`. The optional
 `outcomes` source is called once after occurrence reads; when omitted, preparation
-uses `universe.outcomes` if available. Absence/transport unavailability is recorded
+uses `universe.claims.outcomes` if available. Absence/transport unavailability is recorded
 and does not fail coverage-only preparation; malformed models and HTTP 409 abort.
 
 All fields below are required; unknown fields and duplicate JSON keys fail. Version

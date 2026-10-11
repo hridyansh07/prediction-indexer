@@ -230,7 +230,8 @@ class CrossVenueReader(Strategy):
 def check_manifest(value, snapshot, complete):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive settlement_model outcomes_provider valuation")
-    obj(value, fields + (" summary_sha256" if complete else ""))
+    from replay.economic_sdk.game import manifest_fields
+    obj(value, fields + (" summary_sha256" if complete else "") + manifest_fields(value))
     require(type(value["version"]) is int and value["version"] == 2 and value["strategy"] == STRATEGY)
     policy_config(value["policy"]); valuation_config(value["valuation"])
     require(value["settlement_model"] == SETTLEMENT and value["outcomes_provider"] == snapshot.get("outcomes", {}).get("provider"),

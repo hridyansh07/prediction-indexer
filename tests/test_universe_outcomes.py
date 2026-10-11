@@ -20,7 +20,7 @@ from tests.test_event_universe_store import (
 )
 from universe.api import UniverseApplication
 from universe.store import UniverseStore
-from universe.sync import UniverseSync
+from universe.ingest.sync import UniverseSync
 
 
 class UniverseOutcomesTests(unittest.TestCase):
@@ -69,8 +69,8 @@ class UniverseOutcomesTests(unittest.TestCase):
         report["candidates"][0]["relationship_analysis"]["relationships"] = []
         # Let the report record the actual hand-authored bundle's relationships.
         from targeter.v2.relationships import derive_bundle_relationships
-        from universe.claim_projection import rebuild_bundle
-        from universe.market_projection import project_market_universe
+        from universe.claims.claim_projection import rebuild_bundle
+        from universe.derive.market_projection import project_market_universe
 
         p = project_market_universe(
             report, catalog_events=self.events, catalog_markets=self.markets
@@ -292,12 +292,12 @@ class UniverseOutcomesTests(unittest.TestCase):
         from universe.store import DetailTooLarge
 
         with (
-            patch("universe.store.DETAIL_ROW_LIMIT", 1),
+            patch("universe.store.limits.DETAIL_ROW_LIMIT", 1),
             self.assertRaises(DetailTooLarge),
         ):
             self.db.bundle_outcomes("bundle-1")
         with (
-            patch("universe.store.EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES", 100),
+            patch("universe.store.limits.EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES", 100),
             self.assertRaises(DetailTooLarge),
         ):
             self.db.bundle_outcomes("bundle-1")

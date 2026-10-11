@@ -92,6 +92,12 @@ policy (version 1) is:
 | `leg_skew_buckets_ns` | Leg skew buckets. |
 | `audit_intervals` | The SDK's opt-in interval audit. |
 | `profile` | `null` or a market-profile policy. |
+| `game` (optional) | The closed prepared-input policy in [GAME_STATE_SDK_V1.md](../../../docs/specs/GAME_STATE_SDK_V1.md). |
+
+With `game`, layout-2 manifests require its hash/windows/mode binding and episodes
+require closed `open.game` and `at_max.game` annotations, checked by the independent
+reader. Input bytes and release decisions enter experiment identity. Without it,
+the original closed output schemas and identities are unchanged.
 
 `replay/strategies/same_venue_multi_market/config.example.json` is a template with
 placeholder inputs. The strategy opts into native scales: each leg stays in its

@@ -21,16 +21,17 @@ from targeter.v2.run import run_shadow
 from targeter.v2.run_archive import archive_run
 from tests.test_targeter_v2 import NOW, STRATEGY_PATH, snapshot
 from universe.api import UniverseApplication
-from universe.backfill import backfill_targeter_history
+from universe.ingest.backfill import backfill_targeter_history
 from universe.config import UniverseConfigError, load_config
-from universe.event_identity import canonical_event_id
-from universe.market_projection import project_market_universe
-from universe.projection import (
+from universe.derive.event_identity import canonical_event_id
+from universe.derive.market_projection import project_market_universe
+from universe.derive.projection import (
     ProjectionError,
     project_bundle_retirements,
     project_selected_bundles,
 )
 from universe.store import (
+    CONTEXT_ROW_LIMIT,
     DETAIL_ROW_LIMIT,
     DetailTooLarge,
     EvidenceConflict,
@@ -38,7 +39,7 @@ from universe.store import (
     file_sha256,
 )
 from analysis.claims import CLAIM_IDENTITY_VERSION
-from universe.sync import BOOTSTRAP_RUN_BUDGET, SyncResult, UniverseSync
+from universe.ingest.sync import BOOTSTRAP_RUN_BUDGET, SyncResult, UniverseSync
 
 R1 = "20260101T000000.000001Z"
 R2 = "20260101T001000.000002Z"
@@ -1052,7 +1053,7 @@ class EventUniverseTests(unittest.TestCase):
         )
         self.assertEqual(self.database.status()["counts"]["bundle_contexts"], 1)
 
-    def test_retained_origin_ingests_a_context_the_api_cannot_serve(self) -> None:
+    def test_retained_origin_context_past_a_thousand_relationships_is_ingested_and_served(self) -> None:
         report = _selection_report(R1, G1)
         relationships = report["candidates"][0]["relationship_analysis"]["relationships"]
         template = relationships[0]
@@ -1091,9 +1092,19 @@ class EventUniverseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(occurrence, ("retained", R1))
         self.assertEqual(stored_relationships, len(relationships))
-        # The API keeps refusing to serve in one response what ingestion accepted.
-        with self.assertRaises(DetailTooLarge):
-            self.database.selection_detail(R2, "bundle-1")
+        # Relationships grow with the square of the market count; production
+        # contexts reach 3,240 rows at about 0.7 MB, inside the byte budget.
+        # The response byte budget, not a 1,000-row cap, decides what is served.
+        detail = self.database.selection_detail(R2, "bundle-1")
+        assert detail is not None
+        self.assertEqual(len(detail["context"]["relationships"]), len(relationships))
+        run_detail = self.database.targeter_run_detail(R2)
+        assert run_detail is not None
+        bundles, _ = self.database.list_bundles(limit=2)
+        self.assertEqual([row["bundle_id"] for row in bundles], ["bundle-1"])
+        status, body = UniverseApplication(self.database).get("/v1/bundles?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["bundles"][0]["target_count"], 2)
 
     def test_retained_selection_fails_closed_on_origin_drift(self) -> None:
         origin = _publish_run(self.objects, _selection_report(R1, G1))
@@ -1542,7 +1553,7 @@ class EventUniverseTests(unittest.TestCase):
                         (oversized, R1),
                     )
                     connection.commit()
-                    with mock.patch("universe.store.json.loads") as decode:
+                    with mock.patch("universe.store.reads.runs.json.loads") as decode:
                         with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
                             self.database.targeter_run_detail(R1)
                         decode.assert_not_called()
@@ -1578,10 +1589,33 @@ class EventUniverseTests(unittest.TestCase):
                        right_venue, coverage
                    ) VALUES (?, ?, 'left', 'right', 'IDENTITY', 'series',
                              'kalshi', 'polymarket', 'EXHAUSTIVE')""",
-                ((context, index) for index in range(1, 1001)),
+                ((context, index) for index in range(1, CONTEXT_ROW_LIMIT + 1)),
             )
         with self.assertRaisesRegex(DetailTooLarge, "child-row limit"):
             self.database.selection_detail(R1, "bundle-1")
+
+    def test_bundle_list_summarizes_a_context_too_large_to_serve(self) -> None:
+        _publish_run(self.objects, _selection_report(R1, G1))
+        self.assertEqual(UniverseSync(self.database, self.objects).sync().failures, [])
+        before, _ = self.database.list_bundles(limit=2)
+        with sqlite3.connect(self.database.path) as connection:
+            context = connection.execute(
+                "SELECT context_sha256 FROM bundle_contexts"
+            ).fetchone()[0]
+            connection.executemany(
+                """INSERT INTO context_relationships(
+                       context_sha256, relationship_index, left_market,
+                       right_market, relationship, scope, left_venue,
+                       right_venue, coverage
+                   ) VALUES (?, ?, 'left', ?, 'IDENTITY', 'series',
+                             'kalshi', 'polymarket', 'EXHAUSTIVE')""",
+                ((context, index, "r" * 1200) for index in range(1, 1501)),
+            )
+        # The detail stays refused by the byte budget; the list never needs it.
+        with self.assertRaisesRegex(DetailTooLarge, "byte limit"):
+            self.database.selection_detail(R1, "bundle-1")
+        after, _ = self.database.list_bundles(limit=2)
+        self.assertEqual(after, before)
 
     def test_list_events_pages_before_indexed_counts_and_counts_market_versions(
         self,
@@ -2164,15 +2198,15 @@ class ClaimModelTests(unittest.TestCase):
         compiled, the claims imply a cross-venue relation the report never
         recorded -- a guessed equivalence -- and the run must not commit.
         """
-        from universe.claim_projection import verify_claims
-        from universe.market_projection import MarketProjectionError
+        from universe.claims.claim_projection import verify_claims
+        from universe.derive.market_projection import MarketProjectionError
 
         with self.assertRaisesRegex(MarketProjectionError, "the report does not record"):
             verify_claims({("kalshi:a#claim=0", "polymarket:b#claim=0", "IDENTITY")}, [])
 
     def test_a_relation_the_claims_miss_is_counted_not_raised(self) -> None:
         """A false negative costs coverage, not correctness, so it is counted."""
-        from universe.claim_projection import verify_claims
+        from universe.claims.claim_projection import verify_claims
 
         recorded = [
             {
@@ -2187,8 +2221,8 @@ class ClaimModelTests(unittest.TestCase):
 
     def test_recomputed_claims_match_the_report(self) -> None:
         """End to end: no shortfall and no invention on a real projection."""
-        from universe.claim_projection import project_claims
-        from universe.market_projection import project_market_universe
+        from universe.claims.claim_projection import project_claims
+        from universe.derive.market_projection import project_market_universe
 
         report = _selection_report(R1, G1)
         events, markets = _catalog_rows(report)
@@ -2200,7 +2234,7 @@ class ClaimModelTests(unittest.TestCase):
         self.assertGreater(len(claims["market_claims"]), len(claims["claims"]))
 
     def _projection(self):
-        from universe.market_projection import project_market_universe
+        from universe.derive.market_projection import project_market_universe
 
         report = _selection_report(R1, G1)
         events, markets = _catalog_rows(report)
@@ -2220,8 +2254,8 @@ class ClaimModelTests(unittest.TestCase):
 
         Against the real archive this rejected all 38 attempted runs.
         """
-        from universe.claim_projection import project_claims
-        from universe.market_projection import MarketProjectionError
+        from universe.claims.claim_projection import project_claims
+        from universe.derive.market_projection import MarketProjectionError
 
         projection = self._projection()
         excluded = "kalshi:series"
@@ -2260,7 +2294,7 @@ class ClaimModelTests(unittest.TestCase):
         relationships were derived, so excluding it here would drop claims the
         report does account for.
         """
-        from universe.claim_projection import _excluded_markets
+        from universe.claims.claim_projection import _excluded_markets
 
         self.assertEqual(
             _excluded_markets(

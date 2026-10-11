@@ -19,7 +19,7 @@ from replay.ops.backup import (
 )
 from replay.ops.preflight import run_preflight
 from universe.config import load_config
-from universe.replay_jobs import ReplayJobStore
+from universe.jobs.store import ReplayJobStore
 
 
 def _root() -> Path:

@@ -11,8 +11,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from replay.jobs import contracts as c
-from universe.auth import Principal
-from universe.replay_jobs import (
+from universe.jobs.auth import Principal
+from universe.jobs.store import (
     ReplayJobError,
     ReplayJobStore,
 )
@@ -96,7 +96,7 @@ class ReplayJobStoreTests(unittest.TestCase):
 
     def test_initialize_coexists_with_auth_and_rejects_owned_tampering(self) -> None:
         from tests.test_replay_auth import auth_config
-        from universe.auth import AuthStore
+        from universe.jobs.auth import AuthStore
 
         auth = AuthStore(self.path, auth_config())
         auth.initialize()

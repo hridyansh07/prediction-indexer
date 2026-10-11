@@ -18,7 +18,7 @@ RUN groupadd --gid "${APP_GID}" universe \
 WORKDIR /app
 
 COPY encoder/ ./encoder/
-# The first-party import closure of universe/run_server.py is wider than the
+# The first-party import closure of `python -m universe` is wider than the
 # four packages Universe itself names. archive/common/seal.py needs
 # splices.common.segment, targeter/targets.py needs analysis.storage, and both
 # archive/archiver/manifest.py and targeter/v2/target_records.py need replay.
@@ -34,11 +34,13 @@ COPY replay/ ./replay/
 COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
+COPY gamestate/ ./gamestate/
 COPY configs/event_universe.json /etc/prediction-indexer/event_universe.json
 COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json
+COPY configs/gamestate.json /etc/prediction-indexer/gamestate.json
 
 USER universe:universe
 
 EXPOSE 8080
 
-CMD ["python", "-u", "universe/run_server.py"]
+CMD ["python", "-u", "-m", "universe", "serve"]

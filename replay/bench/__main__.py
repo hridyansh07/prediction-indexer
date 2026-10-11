@@ -20,6 +20,8 @@ def main(argv=None):
     prepare.add_argument('config', type=Path); prepare.add_argument('out_dir', type=Path)
     prepare.add_argument('--warm-timeout-s', type=float, default=120)
     prepare.add_argument('--allow-outcomes-unavailable', action='store_true')
+    game_state = commands.add_parser('prepare-game-state')
+    game_state.add_argument('context_dir', type=Path); game_state.add_argument('out_dir', type=Path)
     context = commands.add_parser('compare-context')
     context.add_argument('a', type=Path); context.add_argument('b', type=Path)
     context.add_argument('--expect-only', default='')
@@ -37,7 +39,12 @@ def main(argv=None):
     except SystemExit as error:
         return 0 if error.code == 0 else 1
     try:
-        if args.command == 'prepare':
+        if args.command == 'prepare-game-state':
+            from archive.storage.factory import build_store
+            from replay.prepare_game_state import prepare_game_state
+            pin = prepare_game_state(args.context_dir, args.out_dir, store=build_store(primary_roots=[args.context_dir]))
+            report, code = {'game_state_sha256': pin}, 0
+        elif args.command == 'prepare':
             code, report = prepare_context(args.config, args.out_dir, warm_timeout_s=args.warm_timeout_s,
                                            allow_outcomes_unavailable=args.allow_outcomes_unavailable)
         elif args.command == 'fees':

@@ -41,6 +41,7 @@ from replay.economic_sdk.entity_tables import entity_rows
 from replay.economic_sdk.output import aggregate_files, file_list, group_of
 from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES, SELL_SOURCES
+from replay.economic_sdk.game import check_binding, check_episode_game
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
 from replay.streams.protocol import obj, require, uint
@@ -321,6 +322,7 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
 
 
 def validate(directory, snapshot, manifest, strategy):
+    check_binding(manifest)
     experiment = strategy.experiment
     check_experiment(experiment)
     snapshot = plain(snapshot)
@@ -489,7 +491,10 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         for name, amount in classes.items():
             key = (scope, index, kind, name)
             lifetime_by_class[key] = lifetime_by_class.get(key, 0) + amount
-        opening = obj(row["open"], "value_class reasons leg_skew_ns skew_bucket values quotes")
+        game_fields = " game" if "game" in experiment.policy else ""
+        opening = obj(row["open"], "value_class reasons leg_skew_ns skew_bucket values quotes" + game_fields)
+        if game_fields:
+            check_episode_game(opening["game"])
         require(opening["value_class"] in classes, "episode opening class")
         reason_indexes(opening["reasons"])
         opening_skew = skew(opening)
@@ -502,7 +507,10 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
             parsed = None if value is None else signed(value)
             require(open_value is None or (parsed is not None and parsed >= signed(open_value)),
                     "maximum consistency")
-        at_max = obj(row["at_max"], "values quotes")
+        at_max = obj(row["at_max"], "values quotes" + game_fields)
+        if game_fields:
+            check_episode_game(at_max["game"])
+            require(at_max["game"]["revision"] >= opening["game"]["revision"], "episode game revision order")
         strategy.open_facts(at_max["values"], entity, kind)
         strategy.check_quotes(at_max["quotes"], at_max["values"], entity)
         require(at_max["values"][maxima_fields[0]] == maxima[maxima_fields[0]], "values at maximum")

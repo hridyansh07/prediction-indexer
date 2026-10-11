@@ -8,7 +8,7 @@ import json
 import sqlite3
 from typing import Any
 
-from universe.market_projection import canonical_market_id
+from universe.derive.market_projection import canonical_market_id
 
 
 EVENT_IDENTITY_VERSION = 1
