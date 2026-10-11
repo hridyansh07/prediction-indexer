@@ -170,6 +170,34 @@ class RepairTests(unittest.TestCase):
             h.group(35); h.finish()
         self.assertNotIn('19',[r['time_ns'] for r in h.records('decisions.ndjson')])
 
+    def test_honest_nonempty_book_only_decisions_cover_pinned_run_start(self):
+        h = self.h(changes={'cohort':'book_only_comparison'})
+        h.prime(); h.leaders(14,600); h.target(16,610,620); h.finish()
+        self.assertEqual(h.records('decisions.ndjson')[0]['time_ns'],'10')
+        denominator = next(r for r in h.records('denominators.ndjson') if r['role'] == 'target_only' and r['target'] == ['polymarket:123','outcome'])
+        self.assertEqual(sum(int(x) for x in denominator['status_ns'].values()),30)
+        self.assertEqual(denominator['status_ns']['HISTORY_UNAVAILABLE'],'3')
+
+    def test_reader_requires_initial_decision_for_nonempty_book_only_transcript(self):
+        original = MilestoneLeaderFollower._decision
+        def omit_start(strategy, time):
+            if time == strategy.clock.start:
+                strategy.last_decision = time
+                return
+            return original(strategy,time)
+        h = self.h(changes={'cohort':'book_only_comparison'})
+        with patch.object(MilestoneLeaderFollower,'_decision',omit_start):
+            h.prime(); h.leaders(14,600); h.target(16,610,620)
+            with self.assertRaisesRegex(ProtocolError,'required initial decision time'):
+                h.finish()
+
+    def test_no_input_zero_row_book_only_transcript_remains_accepted(self):
+        h = self.h(changes={'cohort':'book_only_comparison'})
+        with patch.object(MilestoneLeaderFollower,'_decision',lambda strategy,time:setattr(strategy,'last_decision',time)):
+            h.window(); h.finish()
+        self.assertEqual(h.records('decisions.ndjson'),[])
+        self.assertEqual(h.records('denominators.ndjson'),[])
+
     def test_required_entry_cannot_be_deleted_with_its_entire_ledger(self):
         h = self.h(); h.prime(); h.leaders(14, 600); h.target(16, 610, 620); h.finish()
         self.rewrite(h, 'actions.ndjson', lambda rows: rows.clear())

@@ -731,6 +731,8 @@ class Verifier:
                 require(observation['prediction_id'] == digest([self.experiment, role, list(target), time, route['candidate_id']]), 'prediction identity')
                 self.db.execute('INSERT INTO predictions VALUES(?,?)', (observation['prediction_id'], json.dumps(compact_observation(observation))))
         require(seen == {(role, target) for role in ROLES for target in targets_history} and admission['captured_books'] == len(targets_history), 'complete common model schedule')
+        if self.last_time is None:
+            require(time == int(self.snapshot['config']['start_ns']), 'required initial decision time')
         self.check_required_decision(deadline, time)
         self.last_time = time
         self.last_knowledge = knowledge
