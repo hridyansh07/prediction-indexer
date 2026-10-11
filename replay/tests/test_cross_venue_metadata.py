@@ -11,7 +11,7 @@ from analysis.claims import claim_id
 from replay.strategies.cross_venue_arbitrage.strategy import build
 from replay.strategies.cross_venue_arbitrage.output import read_provisional
 from replay.economic_sdk.entities import resolve
-from replay.economic_sdk.bounds import MAX_METADATA
+from replay.economic_sdk.bounds import MAX_ENTITY_TABLE
 from replay.preparation import encoded, prepare
 from replay.tests.test_bundle_coverage import Harness as BaseHarness
 from replay.tests.test_cross_venue_arbitrage import Harness
@@ -134,7 +134,7 @@ class MetadataRegressionTests(unittest.TestCase):
                                      int(interval["end_ns"])-int(interval["start_ns"]))
                     d=table["scopes"][scope][denominator["entity"]]["descriptor"]
                     self.assertEqual(d["size_contracts"] is None,d["admission"] is not None)
-                self.assertLessEqual((h.output/"entities.json").stat().st_size,MAX_METADATA)
+                self.assertLessEqual((h.output/"entities.json").stat().st_size,MAX_ENTITY_TABLE)
                 self.assertTrue(result["summary"]["rows"])
             finally: h.close()
 
@@ -142,7 +142,9 @@ class MetadataRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             from replay.streams.protocol import ProtocolError
-            with self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
+            # 70 scopes exceed 8 MiB; the 64 MiB bound itself is pinned byte for byte below.
+            with patch("replay.economic_sdk.bounds.MAX_ENTITY_TABLE",8*1024*1024), \
+                 self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
                 WideHarness(root,scope_count=70)
             self.assertEqual(list((root/"output").iterdir()),[])
 
@@ -263,7 +265,7 @@ class SDKMetadataBoundaryTests(unittest.TestCase):
         entities=resolve(s,snapshot,0,s.plans)
         raw=encoded({"scopes":[entity_rows(entities,big_group),entity_rows(entities,big_group)]})+b"\n"
         # Two equal rows: use an extra one-byte field to cover odd remainders.
-        target=MAX_METADATA+over
+        target=MAX_ENTITY_TABLE+over
         extra=(target-len(raw))%2
         if extra:
             # A trailing scope adds a comma plus an empty array (3 bytes).
@@ -287,7 +289,7 @@ class SDKMetadataBoundaryTests(unittest.TestCase):
                     try:
                         rows=[entity_rows(resolve(s,snapshot,i,s.plans),group) for i in range(len(snapshot["scopes"]))]
                         canonical=encoded({"scopes":rows})+b"\n"
-                        self.assertEqual(len(canonical),MAX_METADATA+over)
+                        self.assertEqual(len(canonical),MAX_ENTITY_TABLE+over)
                         self.assertEqual(b"".join(table_chunks(s,snapshot,s.plans,group)),canonical)
                         if over:
                             with self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*"+group+"entities.json"):
@@ -299,9 +301,9 @@ class SDKMetadataBoundaryTests(unittest.TestCase):
                                 Runtime(s,{**h.context,"output_directory":str(output)})
                             self.assertEqual(list(output.iterdir()),[])
                         else:
-                            self.assertEqual(preflight(s,snapshot,s.plans)[group+"entities.json"],MAX_METADATA)
+                            self.assertEqual(preflight(s,snapshot,s.plans)[group+"entities.json"],MAX_ENTITY_TABLE)
                             output=Path(tmp)/"tables"; (output/group).mkdir(parents=True)
                             identity=write_table(output,group+"entities.json",table_chunks(s,snapshot,s.plans,group))
                             self.assertEqual((output/(group+"entities.json")).read_bytes(),canonical)
-                            self.assertEqual(identity,{"sha256":hashlib.sha256(canonical).hexdigest(),"byte_length":MAX_METADATA,"records":1})
+                            self.assertEqual(identity,{"sha256":hashlib.sha256(canonical).hexdigest(),"byte_length":MAX_ENTITY_TABLE,"records":1})
                     finally: h.close()

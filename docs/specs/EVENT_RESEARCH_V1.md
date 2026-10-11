@@ -73,37 +73,29 @@ Non-goals for V1:
 Merge `feat/kalshi-game-state-pull-v1` (commits `2527ea5`, `27260ec`). Part A
 moves its code into a package (§A1). It doesn't change its formats.
 
-### A0.2 SDK entity and reason tables as NDJSON (layout 3)
+### A0.2 Raise the SDK entity-table limit
 
 **Problem:** `entities.json` is one JSON record with every scope's entity list.
 Each scope repeats identical descriptors (about 560 KB per scope for LoL), and
-the record is capped by `bounds.MAX_METADATA` (8 MiB). Cross-venue and the
-implication covers therefore fail above roughly 14–20 scopes.
+the record was capped by `bounds.MAX_METADATA` (8 MiB). Cross-venue and the
+implication covers therefore failed above roughly 14–20 scopes. Retired
+bundles measured in corpus trials need 13.8–16 MB.
 
-**Change:** add output **layout 3**, identical to layout 2 except for the
-tables:
+**Change (decided):** raise the limit rather than change the output layout.
 
-| Layout 2 file | Layout 3 file | Rows |
-|---|---|---|
-| `entities.json` | `descriptors.ndjson` | `{hash, descriptor}`, one per distinct entity hash, sorted by hash |
-| | `entities.ndjson` | `{scope, entity, hash}`, one per (scope, entity index), sorted by scope, then entity |
-| `reasons.json` | `reasons.ndjson` | `{reason, value}`, one per reason index, in index order |
+- A new `bounds.MAX_ENTITY_TABLE` of 64 MiB bounds `entities.json` (real and
+  control groups) in the preflight, the streaming writer and both readers.
+- `MAX_METADATA` stays 8 MiB for `reasons.json`, configurations, summaries and
+  manifests.
+- The layout, file names, schemas and preflight error text are unchanged, so
+  existing layout-2 runs still validate and output identities do not move.
+- `docs/ECONOMIC_STRATEGY_SDK_V1.md` §5 and §8 record the new limit.
+- No new regression: the existing exact-bound and one-byte-over tests in
+  `replay/tests/test_cross_venue_metadata.py` now pin the 64 MiB bound.
 
-Requirements:
-- Rows reference entities by `(scope, entity)` index exactly as in layout 2,
-  so episode, denominator and slice rows are unchanged.
-- Row and line bounds are the SDK's NDJSON bounds (`MAX_ROWS`, `MAX_LINE`).
-  `MAX_METADATA` no longer applies to these tables.
-- Every SDK strategy writes layout 3 by default. Layout 1 (complement
-  policy 1, pinned by `complement_v1_golden.json`) is unchanged.
-- `reader.py` and `aggregate_reader.py` read layouts 2 and 3. A layout-2 run
-  still validates.
-- The manifest records the layout. Closed schemas reject unknown layouts.
-- `entity_tables.py`'s preflight check becomes a row-count check.
-- **Regression first:** a test with 64 scopes of identical entities fails on
-  layout 2 with the current `entity metadata preflight` error, and passes on
-  layout 3. Its semantic output (episodes, denominators) must equal a
-  15-scope run's rows for the shared scopes.
+A deduplicated layout (distinct descriptors in their own NDJSON table,
+referenced by hash from each scope) remains possible if events outgrow 64 MiB.
+It is not part of V1.
 
 ### A0.3 Detached state budget
 
@@ -688,7 +680,7 @@ There are no live fixtures.
 
 Order of commits and steps:
 
-1. A0.1, A0.2 and A0.3, each a separate commit with its regression test.
+1. A0.1, A0.2 and A0.3, each a separate commit; A0.3 with its regression test.
 2. Part C, moves first and edits after. Its gates pass before Part A starts,
    because Part A edits `compose.universe.yaml`.
 3. Part A.

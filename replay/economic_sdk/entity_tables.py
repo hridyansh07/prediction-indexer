@@ -52,8 +52,8 @@ def preflight(strategy, snapshot=None, plans=None):
     for group in aggregate_files(strategy.experiment):
         name = group + "entities.json"
         size = sum(len(chunk) for chunk in table_chunks(strategy, snapshot, plans, group))
-        require(size <= bounds.MAX_METADATA,
-                f"entity metadata preflight: {name} requires {size} bytes; limit {bounds.MAX_METADATA}")
+        require(size <= bounds.MAX_ENTITY_TABLE,
+                f"entity metadata preflight: {name} requires {size} bytes; limit {bounds.MAX_ENTITY_TABLE}")
         result[name] = size
     return result
 
@@ -67,7 +67,7 @@ def write_table(root, name, chunks, *, expected_size=None):
     with temporary.open("xb") as stream:
         for chunk in chunks:
             size += len(chunk)
-            require(size <= bounds.MAX_METADATA, "output line budget")
+            require(size <= bounds.MAX_ENTITY_TABLE, "output line budget")
             stream.write(chunk)
             identity.update(chunk)
         require(expected_size is None or size == expected_size,

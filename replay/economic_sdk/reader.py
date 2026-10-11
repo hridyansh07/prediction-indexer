@@ -79,21 +79,22 @@ def lines(root, name, identity):
             "file identity")
 
 
-def document(root, name, identity):
-    """One-record NDJSON table (entities, reasons), bounded by MAX_METADATA.
+def document(root, name, identity, limit=bounds.MAX_METADATA):
+    """One-record NDJSON table (entities, reasons), bounded by ``limit``.
 
-    Tables are written as a single record up to the metadata bound, which real
-    bundles exceed the per-row MAX_LINE with; the file identity still binds it.
+    Tables are written as a single record up to their bound (MAX_ENTITY_TABLE
+    for entities, MAX_METADATA otherwise), which real bundles exceed the per-row
+    MAX_LINE with; the file identity still binds it.
     """
     path = root / name
     require(path.is_file() and not path.is_symlink(), "regular output required")
     with path.open("rb") as stream:
-        payload = stream.read(bounds.MAX_METADATA + 1)
-    require(len(payload) <= bounds.MAX_METADATA, "table/size")
+        payload = stream.read(limit + 1)
+    require(len(payload) <= limit, "table/size")
     require(payload.endswith(b"\n") and payload.count(b"\n") == 1, "table is one record")
     require({"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
              "records": 1} == identity, "file identity")
-    return decode(payload, bounds.MAX_METADATA)
+    return decode(payload, limit)
 
 
 def bucket(value):
