@@ -10,6 +10,7 @@ from universe.store.backup import Backup, SQLITE_CONTENT_TYPE, file_sha256
 from universe.store.connection import Connection, REBUILD_INSTRUCTION, SCHEMA_PATH, SCHEMA_VERSION
 from universe.store.ingest_tx import IngestTransactions
 from universe.store.limits import (
+    CONTEXT_ROW_LIMIT,
     DETAIL_ROW_LIMIT,
     EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES,
     STALE_AFTER_SECONDS,
@@ -45,6 +46,7 @@ class UniverseStore(
 
 __all__ = [
     "BundleEventConflict",
+    "CONTEXT_ROW_LIMIT",
     "DETAIL_ROW_LIMIT",
     "DetailTooLarge",
     "EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES",

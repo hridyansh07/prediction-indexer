@@ -598,8 +598,11 @@ def _limit(value: int) -> int:
     return min(value, 1000)
 
 
-def _ensure_detail_rows(groups: tuple[list[Any], ...], label: str) -> None:
-    if any(len(rows) > limits.DETAIL_ROW_LIMIT for rows in groups):
+def _ensure_detail_rows(
+    groups: tuple[list[Any], ...], label: str, limit: int | None = None
+) -> None:
+    bound = limits.DETAIL_ROW_LIMIT if limit is None else limit
+    if any(len(rows) > bound for rows in groups):
         raise DetailTooLarge(f"{label} exceeds the child-row limit")
 
 

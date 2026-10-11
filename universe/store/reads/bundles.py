@@ -203,7 +203,7 @@ class BundleReads:
             ).fetchall()
             output = []
             for row in rows[:bounded]:
-                context = self._context(connection, str(row["context_sha256"]))
+                context = self._context_summary(connection, str(row["context_sha256"]))
                 output.append(
                     {
                         "bundle_id": row["bundle_id"],
@@ -217,10 +217,8 @@ class BundleReads:
                         "first_selected_at": row["first_selected_at"],
                         "last_selected_at": row["last_selected_at"],
                         "occurrence_count": row["occurrence_count"],
-                        "venues": sorted(
-                            {target["venue"] for target in context["targets"]}
-                        ),
-                        "target_count": len(context["targets"]),
+                        "venues": context["venues"],
+                        "target_count": context["target_count"],
                         "lifecycle": "retired" if row["retired"] else "active",
                     }
                 )
@@ -239,6 +237,40 @@ class BundleReads:
             {**_selection_record(row), "context": context}, "selection detail"
         )
 
+    def _context_summary(
+        self, connection: sqlite3.Connection, context_sha256: str
+    ) -> dict[str, Any]:
+        """The list fields of one context, without rebuilding its child rows.
+
+        A listing page must not depend on whether each full context would fit
+        one detail response; relationships alone grow with the square of the
+        market count.
+        """
+        context = connection.execute(
+            """SELECT sport, game, topology, activation_at, capture_start_at
+               FROM bundle_contexts WHERE context_sha256 = ?""",
+            (context_sha256,),
+        ).fetchone()
+        if context is None:
+            raise EvidenceConflict(f"bundle context {context_sha256} is absent")
+        participants = connection.execute(
+            """SELECT name FROM context_participants
+               WHERE context_sha256 = ? ORDER BY position LIMIT ?""",
+            (context_sha256, limits.DETAIL_ROW_LIMIT + 1),
+        ).fetchall()
+        _ensure_detail_rows((participants,), "bundle context")
+        venues = connection.execute(
+            """SELECT venue, COUNT(*) AS targets FROM context_targets
+               WHERE context_sha256 = ? GROUP BY venue ORDER BY venue""",
+            (context_sha256,),
+        ).fetchall()
+        return {
+            **_row_record(context),
+            "participants": [value["name"] for value in participants],
+            "venues": [value["venue"] for value in venues],
+            "target_count": sum(value["targets"] for value in venues),
+        }
+
     def _context(
         self,
         connection: sqlite3.Connection,
@@ -248,13 +280,14 @@ class BundleReads:
     ) -> dict[str, Any]:
         """Rebuild one bundle context, optionally under the API response limits.
 
-        The row and byte limits exist so a single HTTP response stays inside the
-        response budget; they are presentation limits. Ingestion must never fail
+        The byte limit keeps a single HTTP response inside the response budget;
+        the row bound only caps how many rows one read loads. Both are
+        presentation limits. Ingestion must never fail
         because a record would be awkward to serve, so the write path reads the
         whole context with ``bounded=False`` and only the API keeps the bound.
         """
         # SQLite treats a negative LIMIT as unbounded.
-        row_limit = limits.DETAIL_ROW_LIMIT + 1 if bounded else -1
+        row_limit = limits.CONTEXT_ROW_LIMIT + 1 if bounded else -1
         context = connection.execute(
             "SELECT * FROM bundle_contexts WHERE context_sha256 = ?",
             (context_sha256,),
@@ -313,6 +346,7 @@ class BundleReads:
             _ensure_detail_rows(
                 (participants, events, markets, targets, assets, relationships),
                 "bundle context",
+                limits.CONTEXT_ROW_LIMIT,
             )
         record = {
             "bundle_id": context["bundle_id"],

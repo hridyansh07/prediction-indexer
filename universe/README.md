@@ -173,7 +173,11 @@ All responses are strict JSON (sorted keys, `Cache-Control: no-store`) and must
 stay under 1,750,000 bytes (else 413). Unknown query parameters are rejected
 (400). List `limit` is 1 to 100 (default 100; `/v1/targeter/status` defaults to
 5); cursors are opaque and query-specific. Detail documents are capped at 1,000
-child rows (`DetailTooLarge` yields 413). Request bodies must be a single JSON
+child rows (`DetailTooLarge` yields 413), except bundle contexts: those are
+bounded by the response byte budget, since relationships grow with the square of
+the market count (production reaches 3,240 rows at about 0.7 MB). A context read
+loads at most 20,000 rows per child table. `/v1/bundles` reads only each
+context's summary fields, so one large context never fails a list page. Request bodies must be a single JSON
 object with `Content-Type: application/json`, at most 64 KiB, with unique keys
 and exactly the documented fields.
 
