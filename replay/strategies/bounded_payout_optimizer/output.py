@@ -178,6 +178,9 @@ def verify_search(rows,config,snapshot,bridge,books,knowledge,time,sequence,scop
         require(row['qualifying']is qualifying,'independent entry margin gates')
         require(row['negative_certificate']==(wire({'kind':'UNIFORM_OUTCOME_GROSS_DUAL_BOUND','margin_upper_bound':bound})if bound is not None else None),'independent negative dual certificate')
         if row['economic_status']=='COMPLETE_NONPOSITIVE':
+            declared={(q['instrument'],q['orientation'])for q in config['policy']['quantities']}
+            missing_declared=any(tuple(r.get('key',()))in declared and r['reason']in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN','NOT_CAPTURED')for r in rejected)
+            require(not missing_declared,'independent negative declared input availability')
             require(found['complete']and best['margin']<=0 and bound is not None and bound<=0 and not found['unknown_books']and not row['valuation_unknown'],'independent certified economic negative')
             availability=proofs.setdefault('availability',OrderedDict())
             for model in selected_models:
@@ -274,6 +277,8 @@ def validate_content(directory,snapshot,manifest,bridge=None):
         (' summary_sha256' if 'summary_sha256'in manifest else '')+(' game_state' if 'game_state'in manifest else ''))
     require(type(manifest['version'])is int and manifest['version']==2 and manifest['strategy']==NAME,'optimizer output version')
     config=validate(manifest['config']);require(manifest['source_revision']==config['source_revision'],'source revision binding');require(config['snapshot_sha256']==manifest['snapshot_sha256'],'snapshot manifest pin')
+    document=snapshot.get('outcomes',{}).get('document')
+    require(document is None or config['rules']['event_id']==document['event_id'],'independent rule event alignment')
     for field in ('snapshot_sha256','experiment_sha256','fee_engine_identity','run_identity'):sha(manifest[field])
     bridge=bridge or FeeBridge(config['fees'],plain(snapshot['plans']))
     require(not bridge._engine.policy.include_account_rebates and not bridge._engine.policy.include_rounding_refunds,'independent nonnegative fee assumptions for dual bound')

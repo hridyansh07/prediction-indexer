@@ -543,6 +543,50 @@ class OptimizerReviewRegressions(unittest.TestCase):
     setUp = OptimizerReplayTests.setUp
     harness = OptimizerReplayTests.harness
 
+    def test_reader_rejects_negative_with_declared_rejected_inputs(self):
+        from replay.strategies.bounded_payout_optimizer import strategy
+        original=strategy.search
+        def falsely_certified(*args,**kwargs):
+            results,models=original(*args,**kwargs)
+            for result in results:
+                if 'found'in result and result['negative_certificate']['margin_upper_bound']==0:
+                    self.assertEqual(result['economic_status'],'INPUT_UNKNOWN')
+                    result['economic_status']='COMPLETE_NONPOSITIVE'
+            return results,models
+        h=self.harness();h.pm_ask(12,'123',(900,2))
+        # The faulty writer produces coherent durations, rearm state and hashes.
+        with patch.object(strategy,'search',side_effect=falsely_certified),self.assertRaisesRegex(ProtocolError,'independent.*negative.*input'):
+            h.finish()
+
+    def test_honest_rejected_declared_inputs_stay_unknown(self):
+        for reason in ('UNUSABLE','ONE_SIDED','DEPTH_LIMITED','ECONOMICS_UNKNOWN'):
+            with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
+                root=Path(tmp)
+                def configure(cfg):
+                    if reason=='ECONOMICS_UNKNOWN':
+                        cfg['fees']['instrument_bindings']=[r for r in cfg['fees']['instrument_bindings']if r['instrument']!='polymarket:987']
+                h=OptimizerHarness(root,books={('polymarket:123','outcome'),('polymarket:987','outcome')},configure=configure)
+                try:
+                    h.window();h.pm_ask(12,'123',(900,2))
+                    if reason=='ONE_SIDED':h.pm_ask(12,'987')
+                    elif reason=='DEPTH_LIMITED':h.pm_ask(12,'987',(900,Fraction(1,2)))
+                    elif reason=='ECONOMICS_UNKNOWN':h.pm_ask(12,'987',(900,2))
+                    result=h.finish();stat=result['summary']['rows'][0]
+                    self.assertEqual(stat['unknown_ns'],'30');self.assertEqual(stat['complete_nonpositive_ns'],'0')
+                    rejected=[r for row in h.records('decisions.ndjson')if row['type']=='decision'for d in row['scenarios'][0]['detection']for r in d['rejected']]
+                    self.assertTrue(any(r.get('key')==['polymarket:987','outcome']and r['reason']==reason for r in rejected),rejected)
+                finally:h.close()
+
+    def test_reader_rejects_rule_event_pin_even_if_writer_guard_is_faulty(self):
+        from replay.strategies.bounded_payout_optimizer import contract
+        original=contract.require
+        def skip_writer_event_guard(condition,message):
+            if message!='rule event alignment':return original(condition,message)
+        with patch.object(contract,'require',side_effect=skip_writer_event_guard):
+            h=self.harness(configure=lambda cfg:cfg['rules'].update(event_id='event:d1:'+'b'*64))
+        h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2))
+        with self.assertRaisesRegex(ProtocolError,'independent rule event alignment'):h.finish()
+
     def test_reader_rejects_false_advertised_bound_and_frontier_kind(self):
         h=self.harness(books={('polymarket:123','outcome'),('polymarket:987','outcome')})
         h.pm_ask(12,'123',(400,2));h.pm_ask(12,'987',(500,2));result=h.finish()

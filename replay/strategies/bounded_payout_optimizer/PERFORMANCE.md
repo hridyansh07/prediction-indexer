@@ -106,9 +106,10 @@ labelled synthetic-hash transport rehearsal. `worst_callback_seconds` includes
 the initial decision, per-update callbacks and final flush. Temporary outputs
 are removed only by their owning temporary-directory scope.
 
-The final focused/package/bench gate passed **76 tests in 4.996 s**, including
-52 optimizer tests. Falsifying regressions cover writer valuation and settlement
-corruption, hidden positives through false unavailability, whole-decision
+The final focused/package/bench gate passed **79 tests in 4.936 s**, including
+55 optimizer tests. Falsifying regressions cover writer valuation and settlement
+corruption, false complete negatives with missing declared inputs, mismatched
+rule-event pins in provisional reading, hidden positives through false unavailability, whole-decision
 budgeting, current-time fee identities and changed fee economics, independently
 checked negative fee availability, pending scope cancellation, contradictory
 knowledge, skipped-entry reasons, malformed settlement errors, bounded canonical
