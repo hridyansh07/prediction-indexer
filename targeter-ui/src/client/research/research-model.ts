@@ -207,6 +207,20 @@ export interface OverlayDocument {
   items: IntervalItem[];
 }
 
+// ---------------------------------------------------------------- configuration
+
+/**
+ * The research base URL. An unset or empty VITE_CORPUS_BASE_URL (Vite turns
+ * `VITE_CORPUS_BASE_URL=` into "") means /corpus in development and "not
+ * configured" in production.
+ */
+export function resolveCorpusBase(
+  configured: string | undefined,
+  dev: boolean,
+): string {
+  return (configured || (dev ? '/corpus' : '')).replace(/\/+$/, '');
+}
+
 // ---------------------------------------------------------------- identity
 
 export class IdentityError extends Error {}

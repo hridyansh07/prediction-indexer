@@ -17,6 +17,7 @@ import {
   maskAfter,
   nextMoment,
   rawToChart,
+  resolveCorpusBase,
   sortEvents,
   tilesInRange,
   valuesAt,
@@ -499,5 +500,16 @@ test('long instrument ids are abbreviated for display only', () => {
   assert.equal(
     displayLabel({ ...BOOKS[0], label: 'kalshi:KXLOLGAME-X' }),
     'kalshi:KXLOLGAME-X',
+  );
+});
+
+test('an empty VITE_CORPUS_BASE_URL falls back to /corpus in dev only', () => {
+  assert.equal(resolveCorpusBase('', true), '/corpus');
+  assert.equal(resolveCorpusBase(undefined, true), '/corpus');
+  assert.equal(resolveCorpusBase('', false), '');
+  assert.equal(resolveCorpusBase(undefined, false), '');
+  assert.equal(
+    resolveCorpusBase('https://cdn.example/corpus/', false),
+    'https://cdn.example/corpus',
   );
 });

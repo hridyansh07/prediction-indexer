@@ -1,6 +1,7 @@
 // Loading research files: every byte is checked against its manifest before use (spec §5.1).
 import { useQuery } from '@tanstack/react-query';
 import {
+  resolveCorpusBase,
   verifyIdentity,
   type AvailabilityDocument,
   type CorpusManifest,
@@ -13,10 +14,10 @@ import {
   type RawTile,
 } from './research-model';
 
-const configured = import.meta.env.VITE_CORPUS_BASE_URL as string | undefined;
-export const CORPUS_BASE = (
-  configured ?? (import.meta.env.DEV ? '/corpus' : '')
-).replace(/\/$/, '');
+export const CORPUS_BASE = resolveCorpusBase(
+  import.meta.env.VITE_CORPUS_BASE_URL as string | undefined,
+  import.meta.env.DEV,
+);
 const IMMUTABLE = Number.POSITIVE_INFINITY;
 const decoder = new TextDecoder();
 
