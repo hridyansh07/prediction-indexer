@@ -1,0 +1,32 @@
+# Corpus runner on a dedicated Linux machine (replay/corpus/README.md).
+#
+#   CORPUS_ROOT=$HOME/pi-data CORPUS_REPO=$PWD \
+#   CORPUS_UID=$(id -u) CORPUS_GID=$(id -g) DOCKER_GID=$(getent group docker | cut -d: -f3) \
+#   docker compose -f compose.corpus.yaml run --rm corpus run SPEC
+#
+# The runner starts each bundle's bench containers through the host daemon, and
+# the daemon resolves bind mounts on the host. So the data root and the checkout
+# are mounted at the same path inside and outside, and every path in a corpus
+# spec is a host path.
+services:
+  corpus:
+    build:
+      context: .
+      dockerfile: docker/corpus-runner.Dockerfile
+    image: prediction-indexer-corpus:local
+    user: "${CORPUS_UID:?}:${CORPUS_GID:?}"
+    group_add:
+      - "${DOCKER_GID:?}"
+    # A Universe tunnel listens on the host's loopback.
+    network_mode: host
+    working_dir: ${CORPUS_REPO:?}
+    environment:
+      HOME: /tmp
+      # The checkout belongs to the host user; git refuses it otherwise.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CORPUS_ROOT:?}:${CORPUS_ROOT:?}
+      - ${CORPUS_REPO:?}:${CORPUS_REPO:?}:ro
