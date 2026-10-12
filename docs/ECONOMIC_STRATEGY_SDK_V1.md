@@ -536,7 +536,7 @@ Recursive size accounting is replaced by **count-based bounds**.
   - entities × kinds open episodes;
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
-  - the 128 MiB detached-state limit;
+  - the 512 MiB detached-state limit;
   - the 64 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
     one-record tables and documents;
   - the file, line and row limits of the complement spec.

@@ -1,6 +1,6 @@
 # Event research V1: game-state archive, SDK limits and Universe layout
 
-Status: **A0.1, A0.2, Part A and Part C implemented; A0.3 deferred.**
+Status: **A0.1, A0.2, A0.3, Part A and Part C implemented.**
 Base: `master` at `bd63927`.
 
 This spec covers what the strategy corpus needs beyond the strategies
@@ -85,12 +85,12 @@ A deduplicated layout (distinct descriptors in their own NDJSON table,
 referenced by hash from each scope) remains possible if events outgrow 64 MiB.
 It is not part of V1.
 
-### A0.3 Detached state budget (deferred)
+### A0.3 Detached state budget
 
 **Problem:** `runtime.py` charges `static_reservation + json_cost(snapshot) +
 json_cost(policy)` before any trading state. With about 55 scopes, the
 snapshot alone plus the resolver reservation (complement, multi-market) is
-expected to exceed `bounds.MAX_STATE` (128 MiB), which fails the attempt with
+expected to exceed `bounds.MAX_STATE` (then 128 MiB), which fails the attempt with
 `detached state budget`.
 
 **Decision:** no runner-config plumbing. Corpus runs execute in Docker with
@@ -100,7 +100,13 @@ does not lift it by itself.
 
 **Trigger:** if a real corpus bundle fails with `detached state budget`, raise
 the `MAX_STATE` constant (as A0.2 raised the entity table) and rely on the
-container limit. Until then nothing changes.
+container limit.
+
+**Triggered (2026-10-11):** the Valorant bundle `3864e…` (55 scopes) failed
+every economic group at startup under 128 MiB. `MAX_STATE` is now 512 MiB. The
+rerun committed, and its outputs matched an independent recomputation exactly.
+The bench runner container does not yet set a memory limit; the corpus runner
+must add one before relying on it.
 
 ## Part A. Game-state archive on the Universe VM
 
@@ -293,7 +299,7 @@ retirement.
 |---|---|
 | A0.1 merge the game-state pull | Done (#61) |
 | A0.2 raise the entity-table limit | Done (this branch) |
-| A0.3 detached state budget | Deferred (see trigger) |
+| A0.3 raise the detached state limit to 512 MiB | Done (this branch) |
 | Part C, moves first and edits after | Done (#62) |
 | Part A | Done (#62) |
 | **Operator:** deploy the game-state job on the VM and run its backfill | Done 2026-10-09 |
