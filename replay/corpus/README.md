@@ -18,7 +18,10 @@ bundle under `results_root/<corpus key[:16]>/<bundle>/`, and writes
    `excluded_groups`, and the rest of the bundle still runs.
 6. Run one bench replay with every group (`docs/LOCAL_REPLAY_BENCH_V1.md`).
    A failed strategy participant leaves `run/<attempt>/<group>/failure.json`.
-7. Commit the results.
+7. Commit the results: the bench output (without its mounted `in/` inputs), plus
+   the prepared `context/context.json` and `context/receipt.json` and, when game
+   state is prepared, `game_state/game_state.json`. These label the event and its
+   books downstream, and the work directory holding them is deleted.
 
 A SQLite ledger (`ledger`) makes the run resumable. A failed stage is recorded
 for that bundle and never stops the corpus. `--retry-failed` reruns failures.

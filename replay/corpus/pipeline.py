@@ -172,9 +172,14 @@ class Pipeline:
             if self.image_id is None and (work / "bench" / "image.id").exists():
                 self.image_id = (work / "bench" / "image.id").read_text().strip()
             status = json.loads((work / "bench" / "result.json").read_bytes())["status"]
+            kept = [("context/context.json", context / "context.json"),
+                    ("context/receipt.json", context / "receipt.json")]
+            if game_path is not None:
+                kept.append(("game_state/game_state.json", game_path))
             receipt_sha = _stage("commit", results.commit, work / "bench", self.results_dir(bundle_id),
                                  corpus_key=self.corpus_key, bundle_id=bundle_id, status=status,
-                                 bench_exit=exit_code, game_state=game_state, excluded_groups=excluded)
+                                 bench_exit=exit_code, game_state=game_state, excluded_groups=excluded,
+                                 inputs=kept)
             state = {"SUCCESS": "done", "GAME_STATE_UNAVAILABLE": "game_state_unavailable"}.get(status, "failed")
             return state, exit_code, receipt_sha, excluded
         finally:

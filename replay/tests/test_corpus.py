@@ -156,6 +156,20 @@ class ResultsTests(unittest.TestCase):
             (dest / "._result.json").write_text("macOS AppleDouble")   # ignored, as on exFAT
             results.verify(dest)
 
+    def test_commit_keeps_named_inputs_and_refuses_one_that_shadows_an_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, context = Path(tmp) / "bench", Path(tmp) / "context.json"
+            bench.mkdir(); (bench / "result.json").write_text("{}"); context.write_text("{}")
+            receipt = results.commit(bench, Path(tmp) / "r1", corpus_key="k", bundle_id="b1", status="SUCCESS",
+                                     bench_exit=0, game_state=None, inputs=[("context/context.json", context)])
+            self.assertTrue(receipt)
+            self.assertEqual([f["path"] for f in results.verify(Path(tmp) / "r1")["files"]],
+                             ["context/context.json", "result.json"])
+            with self.assertRaisesRegex(FileExistsError, "collides"):
+                results.commit(bench, Path(tmp) / "r2", corpus_key="k", bundle_id="b1", status="SUCCESS",
+                               bench_exit=0, game_state=None, inputs=[("result.json", context)])
+            self.assertFalse((Path(tmp) / "r2").exists())
+
 
 class SpecTests(unittest.TestCase):
     def test_closed_schema_and_corpus_tokens(self):
@@ -229,6 +243,7 @@ class PipelineTests(unittest.TestCase):
             calls["prepare"] += 1
             (root_dir / "context").mkdir()
             (root_dir / "context/receipt.json").write_text('{"snapshot_sha256": "' + "a" * 64 + '"}')
+            (root_dir / "context/context.json").write_text('{"context_version": 2}')
             recorded = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
             return {"plans": [], "config": {"start_ns": "1"}, "outcomes": recorded}
 
@@ -273,6 +288,14 @@ class PipelineTests(unittest.TestCase):
                                                "container": "/bench/in/derivatives"}])
             committed = results.verify(pipeline.results_dir("b1"))
             self.assertEqual(committed["game_state"], {"state": "unavailable", "reason": "no_fetch"})
+            # The prepared context and game state are deleted with the work directory, so
+            # the result keeps them: they label the books and events downstream.
+            kept = {f["path"] for f in committed["files"]}
+            self.assertLessEqual({"context/context.json", "context/receipt.json", "game_state/game_state.json"}, kept)
+            result = pipeline.results_dir("b1")
+            self.assertEqual((result / "context/context.json").read_text(), '{"context_version": 2}')
+            self.assertEqual((result / "game_state/game_state.json").read_text(),
+                             '{"state":"unavailable","reason":"no_fetch"}')
             self.assertFalse((root / "work/b1").exists())
 
     def test_corpus_skips_finished_records_failures_and_retries_on_request(self):

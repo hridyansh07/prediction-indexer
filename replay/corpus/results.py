@@ -32,16 +32,26 @@ def _copy(source, destination):
 
 
 def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_exit, game_state,
-           excluded_groups=()):
-    """Copy every regular file of a finished bench output, hash it, then write the receipt last."""
+           excluded_groups=(), inputs=()):
+    """Copy every regular file of a finished bench output, hash it, then write the receipt last.
+
+    `inputs` are (relative path, source) pairs kept beside the outputs: the prepared
+    context and game state, which the bench only mounts under in/.
+    """
     bench_output, destination = Path(bench_output), Path(destination)
     if destination.exists():
         raise FileExistsError(f"corpus result already exists: {destination}")
-    files = []
+    sources = {}
     for path in sorted(p for p in bench_output.rglob("*") if p.is_file() and not p.is_symlink()):
         relative = path.relative_to(bench_output).as_posix()
-        if relative.startswith("in/"):   # mounted inputs, not results
-            continue
+        if not relative.startswith("in/"):   # mounted inputs, not results
+            sources[relative] = path
+    for relative, path in inputs:
+        if relative in sources:
+            raise FileExistsError(f"corpus input collides with a bench output: {relative}")
+        sources[relative] = Path(path)
+    files = []
+    for relative, path in sorted(sources.items()):
         _copy(path, destination / relative)
         sha, length = _hash(destination / relative)
         files.append({"path": relative, "byte_length": length, "sha256": sha})
