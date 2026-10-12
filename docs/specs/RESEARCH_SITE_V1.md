@@ -1,6 +1,6 @@
 # Research site V1: research packs and the `/research` UI from corpus results
 
-Status: **proposed.** Base: `feat/corpus-runner` at `fd78f2e` (PR #66), because
+Status: **proposed.** Base: `feat/corpus-runner` at `7823586` (PR #66 with #65 merged), because
 the builder reads committed corpus results and verifies them with
 `replay.corpus.results.verify`, which is not on `master` yet.
 
@@ -590,6 +590,19 @@ routing table gains a row for research packs and the site.
 - Model overlays (`series`, `markers`) from research models.
 
 ## Open questions
+
+- **Raw-tile size before any publish.** The trial3 build is 498 MB for 4 events;
+  raw tiles dominate (one event's are 145 MB of its 181 MB, up to 14 MB decoded per
+  10-minute tile, about 1 MB gzip). At that rate 500 events are about 60 GB. It
+  matters only for publishing, which is out of scope for V1, and the format does
+  not change now. Options:
+  1. keep the format and rely on gzip or brotli transfer only (storage stays
+     about 60 GB; transfer is roughly 10 to 15 times smaller);
+  2. write raw tiles only near episodes and game facts, with 1 s tiles elsewhere;
+  3. a more compact raw row encoding (columnar arrays, time offsets from the tile
+     start, venue-time keys factored out);
+  4. no raw tiles in the published version; raw rows fetched on demand from a
+     server later.
 
 - Should a book that leaves and re-enters scope start a new path in tiles? This
   spec breaks the line (the state is unknown between scopes).

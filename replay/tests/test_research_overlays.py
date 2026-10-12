@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from fractions import Fraction
 from pathlib import Path
 
@@ -107,6 +109,34 @@ class GameTest(unittest.TestCase):
         self.assertEqual(game.game_json(incomplete, "archive", CONFIG["game_time_windows"])["state"], "incomplete")
         no_fetch = dict(incomplete, reason="no_fetch")
         self.assertEqual(game.game_json(no_fetch, "archive", CONFIG["game_time_windows"])["reason"], "no_fetch")
+
+
+class GameSourceTest(unittest.TestCase):
+    """Committed game_state.json first (pinned loader), then a local archive, else no_source."""
+
+    def event(self, root, *, context=True, committed=False):
+        if committed:
+            (root / "game_state").mkdir(parents=True, exist_ok=True)
+            (root / "game_state" / "game_state.json").write_text("{}")
+        return SimpleNamespace(root=root, context={} if context else None,
+                               result={"context": {"snapshot_sha256": "a" * 64}, "game_state_sha256": "b" * 64},
+                               game_state_document={"state": "ok"})
+
+    def test_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(game.prepared_document(self.event(root, context=False), root), (None, "no_context"))
+            self.assertEqual(game.prepared_document(self.event(root), None), (None, "no_archive"))
+            with mock.patch("replay.preparation.load_snapshot", return_value="ctx") as snapshot, \
+                    mock.patch("replay.game_state.load") as load, \
+                    mock.patch("replay.prepare_game_state.game_state_document", return_value={"state": "x"}) as archive:
+                committed = game.prepared_document(self.event(root, committed=True), root)
+                self.assertEqual(committed, ({"state": "ok"}, "committed"))
+                load.assert_called_once_with(root / "game_state" / "game_state.json", "b" * 64, "ctx")
+                archive.assert_not_called()
+                (root / "game_state" / "game_state.json").unlink()
+                self.assertEqual(game.prepared_document(self.event(root), root), ({"state": "x"}, "archive"))
+                self.assertEqual(snapshot.call_count, 2)
 
 
 if __name__ == "__main__":

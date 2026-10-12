@@ -172,7 +172,7 @@ def context_document(bundle_id):
 
 def corpus_result(key_dir, bundle_id, *, corpus_key=None, status="SUCCESS", groups=("profile", "cross", "coverage"),
                   excluded=(), failed_group=None, context=True, success_marker=True, attempts=(ATTEMPT,),
-                  checks=None, rows=None, episodes=None, commit=True, tamper_context=False):
+                  checks=None, rows=None, episodes=None, commit=True, tamper_context=False, game_state=None):
     """Write a bench output into a staging directory and commit it as the corpus runner does."""
     key_dir = Path(key_dir)
     corpus_key = corpus_key or (key_dir.name + "0" * (64 - len(key_dir.name)))
@@ -183,13 +183,22 @@ def corpus_result(key_dir, bundle_id, *, corpus_key=None, status="SUCCESS", grou
     if success_marker:
         write_json(staging / "run" / "SUCCESS.json", {"attempt": attempt})
     snapshot = b"{}\n"
+    # As the corpus runner does: the prepared context (and game state, when prepared)
+    # live outside the bench output and are committed beside it through `inputs`.
+    prepared = key_dir.parent / f".inputs-{key_dir.name}-{bundle_id}"
+    inputs = []
     if context:
         document = context_document(bundle_id)
         snapshot = (json.dumps(document, sort_keys=True) + "\n").encode()
-        (staging / "context").mkdir(parents=True)
-        (staging / "context" / "context.json").write_bytes(snapshot)
+        (prepared / "context").mkdir(parents=True)
+        (prepared / "context" / "context.json").write_bytes(snapshot)
         receipt_sha = hashlib.sha256(b"tampered" if tamper_context else snapshot).hexdigest()
-        write_json(staging / "context" / "receipt.json", {"version": 1, "snapshot_sha256": receipt_sha})
+        write_json(prepared / "context" / "receipt.json", {"version": 1, "snapshot_sha256": receipt_sha})
+        inputs += [("context/context.json", prepared / "context" / "context.json"),
+                   ("context/receipt.json", prepared / "context" / "receipt.json")]
+    if game_state is not None:
+        write_json(prepared / "game_state" / "game_state.json", game_state)
+        inputs.append(("game_state/game_state.json", prepared / "game_state" / "game_state.json"))
     snapshot_sha256 = hashlib.sha256(snapshot).hexdigest()
     result_groups = []
     for group in groups:
@@ -221,10 +230,15 @@ def corpus_result(key_dir, bundle_id, *, corpus_key=None, status="SUCCESS", grou
     if commit:
         corpus_results.commit(staging, destination, corpus_key=corpus_key, bundle_id=bundle_id, status=status,
                               bench_exit=0 if status == "SUCCESS" else 3, game_state=None,
-                              excluded_groups=[{"group": g, "reason": "entities.json over 8 MiB"} for g in excluded])
+                              excluded_groups=[{"group": g, "reason": "entities.json over 8 MiB"} for g in excluded],
+                              inputs=inputs)
     else:
+        for relative, source in inputs:
+            (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+            (staging / relative).write_bytes(Path(source).read_bytes())
         staging.rename(destination)
-    if staging.exists():
-        import shutil
-        shutil.rmtree(staging)
+    import shutil
+    for leftover in (staging, prepared):
+        if leftover.exists():
+            shutil.rmtree(leftover)
     return destination
