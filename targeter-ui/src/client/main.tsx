@@ -18,11 +18,19 @@ import {
   ReplayJobsPage,
   ReplayOutputPage,
 } from './replay';
+import { resolveCorpusBase } from './research/research-model';
 import { UniverseAuthProvider } from './universe-auth';
 import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
 const queryClient = createUniverseQueryClient();
+// The research routes always exist (a direct visit explains what is missing), but
+// the nav links to them only in builds that configure a research base.
+const RESEARCH_CONFIGURED =
+  resolveCorpusBase(
+    import.meta.env.VITE_CORPUS_BASE_URL as string | undefined,
+    import.meta.env.DEV,
+  ) !== '';
 const ResearchCorpusPage = lazy(() =>
   import('./research/research-corpus').then((m) => ({
     default: m.ResearchCorpusPage,
@@ -58,7 +66,7 @@ function App() {
           <NavLink to="/history">History</NavLink>
           <NavLink to="/decisions">Decisions</NavLink>
           <NavLink to="/replay">Replay</NavLink>
-          <NavLink to="/research">Research</NavLink>
+          {RESEARCH_CONFIGURED && <NavLink to="/research">Research</NavLink>}
         </nav>
         <AccountMenu />
       </header>
