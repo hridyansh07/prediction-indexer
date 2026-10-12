@@ -98,7 +98,11 @@ cursor. Start count and random attempt namespace are durable **before launch**.
 Every retry uses the original pins, empty books, sequence zero, fresh stream/state
 keys and fresh output directory. Failed outputs and small `result.json` diagnostics
 are retained. Child stdout/stderr are discarded rather than growing unbounded or
-being parsed as retry evidence.
+being parsed as retry evidence. When `REPLAY_PARTICIPANT_DIAGNOSTICS=1` is set
+(the local bench sets it; production doesn't), a failed strategy participant
+also writes a bounded `failure.json` in its participant directory, with the exit
+code, cause chain and traceback tail. It's for people only: the supervisor never
+reads it, and writing it never changes the exit code.
 
 A failed attempt counts as meaningful progress iff its slowest required group's
 completed sequence is **at least previous historical best + progress_margin**.

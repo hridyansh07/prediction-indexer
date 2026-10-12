@@ -192,7 +192,12 @@ Supply that selected directory as `fee_catalog_directory`, not `OUT_DIR`.
 4. Start the runner container on that network:
    - every mount from `mounts` is read-only, plus a single writable mount for
      `OUT_DIR`;
-   - the entrypoint is `python -m replay.bench.inside /bench/spec.resolved.json`.
+   - the entrypoint is `python -m replay.bench.inside /bench/spec.resolved.json`;
+   - the one environment variable is the literal `REPLAY_PARTICIPANT_DIAGNOSTICS=1`,
+     so a failed strategy participant writes
+     `OUT_DIR/run/<attempt>/<group>/failure.json` (exit code, cause chain, and
+     traceback, capped at 16 KiB). Container logs don't show participant output,
+     because the supervisor discards child stderr.
 5. Inside the container, `inside` does the following:
    1. Build the supervisor config from `base_run_config`. Set `strategies` to
       the declared groups and `transport.groups` to their names in order. Set a

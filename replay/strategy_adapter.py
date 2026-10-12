@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from replay.streams import Consumer, TransportError
@@ -85,14 +86,41 @@ def execute(root, attempt, group):
         c.close()
 
 
+DIAGNOSTICS_ENV = "REPLAY_PARTICIPANT_DIAGNOSTICS"
+MAX_DIAGNOSTIC_CHARS = 16384
+
+
+def diagnose(directory, code, error):
+    """Opt-in, bounded failure.json for a failed participant (the local bench sets it).
+
+    Child stderr stays discarded (docs/REPLAY_SUPERVISOR_V1.md); this small file is
+    for a person reading a failed run, never retry evidence. It must not change the
+    exit code, so any problem writing it is ignored.
+    """
+    if os.environ.get(DIAGNOSTICS_ENV) != "1":
+        return
+    try:
+        chain, seen = [], error
+        while seen is not None and len(chain) < 8:
+            chain.append({"type": type(seen).__name__, "message": str(seen)[:2000]})
+            seen = seen.__cause__ or seen.__context__
+        text = "".join(traceback.format_exception(error))
+        write_json_durable(directory / "failure.json", {
+            "version": 1, "exit": code, "errors": chain, "traceback": text[-MAX_DIAGNOSTIC_CHARS:]})
+    except BaseException:
+        pass
+
+
 def main():
     signal.signal(signal.SIGTERM, lambda *_: os._exit(21))
     try:
         execute(Path(sys.argv[1]), sys.argv[2], sys.argv[3])
-    except (TransportError, OSError):
+    except (TransportError, OSError) as error:
+        diagnose(Path(sys.argv[1]) / sys.argv[2] / sys.argv[3], 21, error)
         return 21
-    except BaseException:
+    except BaseException as error:
         # Includes SystemExit from hooks: exit(0) is not successful completion.
+        diagnose(Path(sys.argv[1]) / sys.argv[2] / sys.argv[3], 20, error)
         return 20
     return 0
 
