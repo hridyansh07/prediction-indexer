@@ -21,6 +21,7 @@ from replay.corpus.spec import substitute
 
 PUBLISHER, PYTHON = Path("/usr/local/bin/replay-publish"), Path("/usr/local/bin/python3.13")
 DERIVATIVES_MOUNT = "/bench/in/derivatives"
+OUTCOME_ATTEMPTS, OUTCOME_RETRY_SECONDS = 3, 60
 
 
 class StageError(RuntimeError):
@@ -91,12 +92,13 @@ class Pipeline:
     """Dependencies are injected so tests run without Universe, GCS, Rust or Docker."""
 
     def __init__(self, spec, *, corpus_key, config, canonical, history, game_store, image_id,
-                 ensure_bundle, prepare_stage, supervisor_config, prepare_game_state, run_bench):
+                 ensure_bundle, prepare_stage, supervisor_config, prepare_game_state, run_bench, sleep=time.sleep):
         self.spec, self.corpus_key, self.config = spec, corpus_key, config
         self.canonical, self.history, self.game_store = canonical, history, game_store
         self.image_id = image_id
         self.ensure_bundle, self.prepare_stage = ensure_bundle, prepare_stage
         self.supervisor_config, self.prepare_game_state, self.run_bench = supervisor_config, prepare_game_state, run_bench
+        self.sleep = sleep
 
     def results_dir(self, bundle_id):
         return Path(self.spec["results_root"]) / self.corpus_key[:16] / bundle_id
@@ -122,8 +124,7 @@ class Pipeline:
                            window_seconds=self.config.canonical_window_seconds)
             if not hasattr(ready, "pins"):
                 raise StageError("materialize", RuntimeError(f"bundle not ready: {ready}"))
-            snapshot = _stage("prepare", self.prepare_stage, work / "job", request, resolved, ready.receipt,
-                              ready.pins, self.config)
+            snapshot = self._prepare(work, request, resolved, ready)
             context = work / "job" / "context"
             game_path, game_state = None, None
             if self.spec["game_state"]["prepare"]:
@@ -178,6 +179,26 @@ class Pipeline:
             return state, exit_code, receipt_sha, excluded
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+    def _prepare(self, work, request, resolved, ready):
+        """Prepare the context; outcomes must come from Universe.
+
+        Preparation records UNAVAILABLE outcomes when Universe times out or errors,
+        and every outcome-dependent strategy then admits nothing. That is not a
+        result, so the context is discarded and prepared again, and the bundle
+        fails at stage "outcomes" if Universe never answers.
+        """
+        for attempt in range(1, OUTCOME_ATTEMPTS + 1):
+            snapshot = _stage("prepare", self.prepare_stage, work / "job", request, resolved, ready.receipt,
+                              ready.pins, self.config)
+            outcomes = snapshot.get("outcomes") or {}
+            if outcomes.get("provider") == "universe":
+                return snapshot
+            shutil.rmtree(work / "job" / "context")   # a present receipt would be reused as-is
+            if attempt < OUTCOME_ATTEMPTS:
+                self.sleep(OUTCOME_RETRY_SECONDS)
+        raise StageError("outcomes", RuntimeError(
+            f"{outcomes.get('unavailable', 'outcomes unavailable')} after {OUTCOME_ATTEMPTS} attempts"))
 
     def _run_config(self, job_id, request, ready, snapshot, context, work):
         import replay.jobs.stages as stages

@@ -16,7 +16,11 @@ from replay.corpus import results, spec as specs
 from replay.corpus.__main__ import corpus_key
 from replay.corpus.ledger import Ledger
 from replay.corpus.overlay import OverlayStore, VerifyingSink
-from replay.corpus.pipeline import Pipeline, StageError, preflight_groups, retired_bundles, run_corpus
+from replay.corpus.pipeline import (OUTCOME_ATTEMPTS, OUTCOME_RETRY_SECONDS, Pipeline, StageError,
+                                    preflight_groups, retired_bundles, run_corpus)
+from replay.outcome_model import UNAVAILABLE
+
+UNIVERSE_OUTCOMES = {"provider": "universe", "document": {}}
 
 
 def put(store, key, data):
@@ -208,10 +212,11 @@ class PipelineTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None):
+    def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None, outcomes=None):
         root = Path(tmp)
         spec = spec_document(root)
-        calls = {}
+        calls = {"prepare": 0}
+        outcomes = list(outcomes or [UNIVERSE_OUTCOMES])
 
         def ensure(bundle_id, interval, *, store, work_root, derivatives_root, materializer, window_seconds):
             if fail_stage == "materialize":
@@ -221,9 +226,11 @@ class PipelineTests(unittest.TestCase):
             return SimpleNamespace(receipt="receipt", pins=("pin",))
 
         def prepare(root_dir, request, resolved, receipt, pins, config):
+            calls["prepare"] += 1
             (root_dir / "context").mkdir()
             (root_dir / "context/receipt.json").write_text('{"snapshot_sha256": "' + "a" * 64 + '"}')
-            return {"plans": [], "config": {"start_ns": "1"}}
+            recorded = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+            return {"plans": [], "config": {"start_ns": "1"}, "outcomes": recorded}
 
         def game(context, out, *, store):
             out.mkdir(); (out / "game_state.json").write_text('{"state":"unavailable","reason":"no_fetch"}')
@@ -243,7 +250,7 @@ class PipelineTests(unittest.TestCase):
         pipeline = Pipeline(spec, corpus_key="f" * 64, config=config, canonical=LocalObjectStore(root / "canonical"),
                             history=history, game_store="gcs", image_id=None, ensure_bundle=ensure,
                             prepare_stage=prepare, supervisor_config=supervisor, prepare_game_state=game,
-                            run_bench=bench)
+                            run_bench=bench, sleep=lambda seconds: calls.setdefault("slept", []).append(seconds))
         return pipeline, calls, root
 
     def test_bundle_runs_end_to_end_with_pinned_inputs_and_cleans_up(self):
@@ -286,6 +293,32 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(ledger.state(ok.corpus_key, "b1")["state"], "done")
                 self.assertEqual(ledger.state(ok.corpus_key, "b1")["attempts"], 2)
                 self.assertEqual(run_corpus(ok, ledger, ["b1"], retry_failed=True, log=lambda m: None), (0, 1))
+
+    def test_unavailable_outcomes_fail_the_bundle_instead_of_committing_it(self):
+        # A Universe timeout records UNAVAILABLE outcomes; cross, multi and the covers then
+        # admit nothing, so committing the bundle as done would be a silent false negative.
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, calls, root = self.harness(tmp, outcomes=[UNAVAILABLE])
+            ledger = Ledger(root / "l.sqlite3")
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})):
+                run_corpus(pipeline, ledger, ["b1"], log=lambda m: None)
+            row = ledger.state(pipeline.corpus_key, "b1")
+            self.assertEqual((row["state"], row["stage"]), ("failed", "outcomes"))
+            self.assertIn("universe_outcomes_unavailable", row["detail"])
+            self.assertEqual(calls["prepare"], OUTCOME_ATTEMPTS)
+            self.assertNotIn("bench_spec", calls)
+            self.assertFalse(pipeline.results_dir("b1").exists())
+
+    def test_transient_unavailable_outcomes_are_retried_with_a_fresh_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, calls, root = self.harness(tmp, outcomes=[UNAVAILABLE, UNIVERSE_OUTCOMES])
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})):
+                state, _, _, _ = pipeline.run("b1")
+            self.assertEqual(state, "done")
+            self.assertEqual(calls["prepare"], 2)   # the first context was removed, not reused
+            self.assertEqual(calls["slept"], [OUTCOME_RETRY_SECONDS])
 
     def test_required_game_state_skip_is_its_own_final_state(self):
         with tempfile.TemporaryDirectory() as tmp:
