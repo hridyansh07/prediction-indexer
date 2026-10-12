@@ -76,6 +76,8 @@ their drawer closes.
 - `/replay/new` — authenticated desktop Replay request workflow
 - `/replay/admin` — admin-only allowlist management
 - `/replay/jobs/:jobId/output` — reserved Coming soon route
+- `/research` — corpus view over research tables (DuckDB-WASM over verified Parquet)
+- `/research/events/:bundleId` — event terminal over one research pack
 
 Replay production paths use Universe directly. URL fixture controls remain for
 design regression coverage: `?auth=entry`, `?auth=expired`, list
@@ -84,6 +86,20 @@ design regression coverage: `?auth=entry`, `?auth=expired`, list
 real sign-in entry route, these controls are disabled unless the explicit
 test-only `VITE_REPLAY_FIXTURES=true` build flag is present. Never set that flag
 in a production or Vercel environment.
+
+The research pages read static files built by `python -m replay.research build`
+([spec](../docs/specs/RESEARCH_SITE_V1.md)) from `VITE_CORPUS_BASE_URL`: they load
+`current.json`, then check every file's byte length and SHA-256 against its
+manifest before showing it. Nothing is computed in the browser beyond reshaping
+for display. For local work, serve a build output from the dev server:
+
+```bash
+RESEARCH_CORPUS_DIR=../.bench/research/out yarn workspace prediction-indexer-targeter-ui vite
+```
+
+`VITE_CORPUS_BASE_URL` defaults to `/corpus` in development, which that variable
+serves read-only. The research routes are lazy-loaded; DuckDB-WASM loads only on
+`/research`.
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.

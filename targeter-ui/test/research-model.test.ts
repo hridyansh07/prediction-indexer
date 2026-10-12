@@ -1,0 +1,496 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import {
+  chooseTier,
+  filterEpisodes,
+  fixedYRange,
+  formatOffset,
+  gameMarks,
+  gameSummaryAt,
+  gridsToChart,
+  histogram,
+  IdentityError,
+  knownAt,
+  legendGroups,
+  lensMarks,
+  maskAfter,
+  nextMoment,
+  rawToChart,
+  tilesInRange,
+  valuesAt,
+  verifyIdentity,
+  type EpisodeRow,
+  type GameDocument,
+  type GridDocument,
+  type IntervalItem,
+  type PackBook,
+  type PackScope,
+  type RawTile,
+} from '../src/client/research/research-model.js';
+
+// A hand-authored pack: capture starts at T0; scope 0 is [0, 900) s, scope 1 [1200, 1800) s.
+const T0 = 1_791_000_000_000_000_000n;
+const ns = (seconds: number) => String(T0 + BigInt(Math.round(seconds * 1e9)));
+
+const BOOKS: PackBook[] = [
+  {
+    book: 0,
+    instrument: 'kalshi:K',
+    orientation: 'outcome',
+    venue: 'kalshi',
+    market_id: 'kalshi:K',
+    market_type: 'series_moneyline',
+    label: 'series_moneyline · Cloud9',
+    claim_id: 'c1',
+    price_scale: 4,
+    quantity_scale: 2,
+  },
+  {
+    book: 1,
+    instrument: 'polymarket:1',
+    orientation: 'outcome',
+    venue: 'polymarket',
+    market_id: 'polymarket:9',
+    market_type: 'series_moneyline',
+    label: 'series_moneyline · Cloud9',
+    claim_id: 'c1',
+    price_scale: 4,
+    quantity_scale: 6,
+  },
+  {
+    book: 2,
+    instrument: 'polymarket:2',
+    orientation: 'outcome',
+    venue: 'polymarket',
+    market_id: 'polymarket:9',
+    market_type: 'series_moneyline',
+    label: 'series_moneyline · LYON',
+    claim_id: 'c2',
+    price_scale: 4,
+    quantity_scale: 6,
+  },
+  {
+    book: 3,
+    instrument: 'kalshi:M',
+    orientation: 'outcome',
+    venue: 'kalshi',
+    market_id: 'kalshi:M',
+    market_type: null,
+    label: 'kalshi:M',
+    claim_id: null,
+    price_scale: 4,
+    quantity_scale: 2,
+  },
+];
+const SCOPES: PackScope[] = [
+  { start_ns: ns(0), end_ns: ns(900), run_id: 'r0', scheduled_start_ns: null },
+  {
+    start_ns: ns(1200),
+    end_ns: ns(1800),
+    run_id: 'r1',
+    scheduled_start_ns: null,
+  },
+];
+
+function series(last: (number | null)[]) {
+  return { min: last, max: last, last };
+}
+
+const OVERVIEW: GridDocument = {
+  start_ns: ns(0),
+  end_ns: ns(1800),
+  bucket_ns: String(600n * 1_000_000_000n),
+  buckets: 3,
+  books: [
+    {
+      book: 0,
+      bid: series([4000, 3900, 6000]),
+      ask: series([4200, 4300, 6100]),
+      usable_ppm: [1_000_000, 0, 500_000],
+      trades: [0, 0, 1],
+      trade_qty: [0, 0, 500],
+    },
+    {
+      book: 1,
+      bid: series([5000, null, 5500]),
+      ask: series([5100, null, 5600]),
+      usable_ppm: [1_000_000, 0, 1_000_000],
+      trades: [1, 0, 0],
+      trade_qty: [2_000_000, 0, 0],
+    },
+    {
+      book: 2,
+      bid: series([null, null, null]),
+      ask: series([null, null, null]),
+      usable_ppm: [0, 0, 0],
+      trades: [0, 0, 0],
+      trade_qty: [0, 0, 0],
+    },
+    {
+      book: 3,
+      bid: series([1000, 1000, 1000]),
+      ask: series([null, null, null]),
+      usable_ppm: [1, 1, 1],
+      trades: [0, 0, 0],
+      trade_qty: [0, 0, 0],
+    },
+  ],
+};
+
+test('bucket paths break where a book has no usable time', () => {
+  const chart = gridsToChart([OVERVIEW], BOOKS, T0);
+  assert.deepEqual(chart.x, [300, 900, 1500]);
+  assert.deepEqual(chart.books[0].bid, [40, null, 60]);
+  assert.deepEqual(chart.books[0].mid, [41, null, 60.5]);
+  assert.deepEqual(chart.books[1].mid, [50.5, null, 55.5]);
+  assert.deepEqual(chart.books[2].mid, [null, null, null]);
+  assert.deepEqual(chart.books[3].mid, [null, null, null]); // one-sided book: no mid, bid stays
+  assert.deepEqual(chart.books[3].bid, [10, 10, 10]);
+  assert.equal(chart.stepped, false);
+});
+
+test('raw tiles become step lines that break on invalidation and at scope end', () => {
+  const tiles: RawTile[] = [
+    {
+      start_ns: ns(600),
+      end_ns: ns(1200),
+      initial: [
+        {
+          book: 0,
+          scope: 0,
+          since_ns: ns(61),
+          validity: 'usable',
+          bid: ['3900', '1'],
+          ask: ['4300', '1'],
+        },
+      ],
+      rows: [
+        {
+          type: 'top',
+          scope: 0,
+          book: 0,
+          t_ns: ns(700),
+          validity: 'unusable:connection_closed',
+          bid: null,
+          ask: null,
+        },
+        {
+          type: 'top',
+          scope: 0,
+          book: 1,
+          t_ns: ns(800),
+          validity: 'usable',
+          bid: ['5000', '1'],
+          ask: ['5200', '1'],
+        },
+        {
+          type: 'trade',
+          scope: 0,
+          book: 1,
+          t_ns: ns(801),
+          price: '5200',
+          qty: '1',
+        },
+      ],
+    },
+  ];
+  const chart = rawToChart(tiles, BOOKS, SCOPES, T0);
+  assert.deepEqual(chart.x, [600, 700, 800, 900]);
+  assert.deepEqual(chart.books[0].mid, [41, null, null, null]);
+  assert.deepEqual(chart.books[1].mid, [null, null, 51, null]); // breaks at scope end (900 s)
+  assert.equal(chart.stepped, true);
+  assert.deepEqual(valuesAt(chart, 850)[1], { bid: 50, ask: 52, mid: 51 });
+  assert.deepEqual(valuesAt(chart, 10)[1], { bid: null, ask: null, mid: null });
+  assert.deepEqual(maskAfter(chart, 700).books[1].mid, [
+    null,
+    null,
+    null,
+    null,
+  ]);
+});
+
+test('zoom tier follows the visible span', () => {
+  assert.equal(chooseTier(3 * 3600), 'overview');
+  assert.equal(chooseTier(2 * 3600), '1s');
+  assert.equal(chooseTier(601), '1s');
+  assert.equal(chooseTier(600), 'raw');
+  assert.equal(chooseTier(5), 'raw');
+  assert.deepEqual(tilesInRange(590, 1250, 10, ['0', '10', '20']), [
+    '0',
+    '10',
+    '20',
+  ]);
+  assert.deepEqual(tilesInRange(600, 1199, 10, ['0', '10', '20']), ['10']);
+  assert.deepEqual(tilesInRange(901, 1199, 10, ['0', '20']), []);
+});
+
+test('legend groups cross-venue twins under one claim', () => {
+  const groups = legendGroups(BOOKS);
+  assert.deepEqual(
+    groups.map((g) => [g.label, g.books.map((b) => b.book)]),
+    [
+      ['series_moneyline · Cloud9', [0, 1]],
+      ['series_moneyline · LYON', [2]],
+      ['kalshi:M', [3]],
+    ],
+  );
+  const noContext = BOOKS.map((b) => ({ ...b, claim_id: null }));
+  assert.equal(legendGroups(noContext).length, 4);
+});
+
+test('a hidden book never changes the y range', () => {
+  const chart = gridsToChart([OVERVIEW], BOOKS, T0);
+  const range = fixedYRange(chart);
+  assert.deepEqual(range, [7, 64]);
+  assert.deepEqual(fixedYRange({ x: [], books: [], stepped: false }), [0, 100]);
+});
+
+const GAME: GameDocument = {
+  state: 'ok',
+  reason: null,
+  source: { name: 'kalshi' },
+  competitors: {
+    home: { label: 'Cloud9', participant: 0 },
+    away: { label: 'LYON', participant: 1 },
+  },
+  events: [
+    {
+      kind: 'scheduled_start',
+      segment: null,
+      label: 'Scheduled start',
+      time_basis: 'scheduled',
+      source_ns: ns(100),
+      earliest_ns: ns(100),
+      latest_ns: ns(100),
+      exact: false,
+      known_at_ns: ns(100),
+      detail: {},
+    },
+    {
+      kind: 'segment_end',
+      segment: 1,
+      label: 'Map 1 end · Cloud9',
+      time_basis: 'kalshi_market_close',
+      source_ns: ns(500),
+      earliest_ns: ns(498),
+      latest_ns: ns(505),
+      exact: false,
+      known_at_ns: ns(505),
+      detail: {},
+    },
+    {
+      kind: 'settlement',
+      segment: 1,
+      label: 'Map 1 settled',
+      time_basis: 'market_settlement',
+      source_ns: ns(600),
+      earliest_ns: ns(600),
+      latest_ns: ns(600),
+      exact: true,
+      known_at_ns: ns(600),
+      detail: {},
+    },
+  ],
+};
+
+test('game marks: bracket for a window, diamond only when exact, dashed scheduled start', () => {
+  const marks = gameMarks(GAME.events, T0);
+  assert.deepEqual(
+    marks.map((m) => [m.shape, m.x0, m.x1]),
+    [
+      ['scheduled', 100, 100],
+      ['bracket', 498, 505],
+      ['diamond', 600, 600],
+    ],
+  );
+});
+
+test('as-of game state uses known_at, not the source time', () => {
+  assert.deepEqual(knownAt(GAME.events, T0 + 504n * 1_000_000_000n), []);
+  assert.equal(knownAt(GAME.events, T0 + 505n * 1_000_000_000n).length, 1);
+  assert.equal(
+    gameSummaryAt(GAME, T0 + 550n * 1_000_000_000n),
+    'Map 1 end · Cloud9',
+  );
+  assert.equal(gameSummaryAt(GAME, T0), 'Before the first known game fact');
+  assert.equal(
+    gameSummaryAt(
+      { ...GAME, state: 'no_source', reason: 'no_context', events: [] },
+      T0,
+    ),
+    'No game-state source (no_context)',
+  );
+});
+
+function item(id: string, start: number, end: number): IntervalItem {
+  return {
+    id,
+    start_ns: ns(start),
+    end_ns: ns(end),
+    books: [0, 1],
+    label: 'net',
+    censored: false,
+    end_reason: 'KILL_PRICE',
+    metrics: [
+      { name: 'duration', value: String((end - start) * 1000), unit: 'ms' },
+    ],
+    detail: { kind: 'net' },
+  };
+}
+
+test('sub-pixel episodes collapse into a density strip with counts', () => {
+  const items = [
+    item('a', 10, 10.001),
+    item('b', 10.002, 10.003),
+    item('c', 100, 200),
+    item('d', 5000, 5001),
+  ];
+  const marks = lensMarks(items, T0, [0, 1800], 900);
+  assert.deepEqual(
+    marks.map((m) =>
+      m.kind === 'item' ? ['item', m.item.id] : ['density', m.count, m.x0],
+    ),
+    [
+      ['item', 'c'],
+      ['density', 2, 0],
+    ],
+  );
+  const zoomed = lensMarks(items, T0, [9.999, 10.004], 1000);
+  assert.deepEqual(
+    zoomed.map((m) => m.kind),
+    ['item', 'item'],
+  );
+});
+
+test('next moment finds the next game fact, episode start or availability change', () => {
+  const items = [item('a', 50, 51)];
+  const availability = {
+    state: 'ok' as const,
+    books: [
+      {
+        book: 0,
+        intervals: [
+          {
+            start_ns: ns(0),
+            end_ns: ns(700),
+            scope: 0,
+            state: 'usable',
+            reason: null,
+          },
+          {
+            start_ns: ns(700),
+            end_ns: ns(900),
+            scope: 0,
+            state: 'unusable',
+            reason: 'connection_closed',
+          },
+        ],
+      },
+    ],
+  };
+  assert.equal(nextMoment(0, T0, GAME.events, items, availability), 50);
+  assert.equal(nextMoment(50, T0, GAME.events, items, availability), 100);
+  assert.equal(nextMoment(600, T0, GAME.events, items, availability), 700);
+  assert.equal(nextMoment(700, T0, GAME.events, items, availability), null);
+});
+
+test('filter counts report what the display filter hid', () => {
+  const rows: EpisodeRow[] = [
+    {
+      bundle_id: 'b1',
+      lens: 'cross',
+      kind: 'net',
+      duration_ms: 50,
+      net: 1,
+      quantity: 10,
+      game: 'lol',
+      venue_pair: 'kalshi+polymarket',
+    },
+    {
+      bundle_id: 'b1',
+      lens: 'cross',
+      kind: 'net',
+      duration_ms: 250,
+      net: 0.5,
+      quantity: 10,
+      game: 'lol',
+      venue_pair: 'kalshi+polymarket',
+    },
+    {
+      bundle_id: 'b2',
+      lens: 'cross',
+      kind: 'net',
+      duration_ms: 1000,
+      net: 3,
+      quantity: 10,
+      game: 'dota',
+      venue_pair: 'kalshi+polymarket',
+    },
+    {
+      bundle_id: 'b2',
+      lens: 'cross',
+      kind: 'gross',
+      duration_ms: 1000,
+      net: null,
+      quantity: null,
+      game: 'dota',
+      venue_pair: 'kalshi+polymarket',
+    },
+  ];
+  const base = {
+    lens: 'cross',
+    kind: 'net',
+    minDurationMs: 100,
+    minNet: null,
+    game: null,
+    venuePair: null,
+  };
+  assert.deepEqual(
+    (({ shown, hidden }) => [shown.length, hidden])(filterEpisodes(rows, base)),
+    [2, 1],
+  );
+  assert.deepEqual(
+    (({ shown, hidden }) => [shown.length, hidden])(
+      filterEpisodes(rows, { ...base, minNet: 1 }),
+    ),
+    [1, 2],
+  );
+  assert.deepEqual(
+    (({ shown, hidden }) => [shown.length, hidden])(
+      filterEpisodes(rows, { ...base, game: 'lol' }),
+    ),
+    [1, 1],
+  );
+  assert.deepEqual(
+    histogram([0.5, 1, 99, 100, 5000], [0, 1, 100]),
+    [0, 1, 2, 2],
+  );
+});
+
+test('manifest identity check rejects wrong length and wrong hash', async () => {
+  const bytes = new TextEncoder().encode('{"a":1}\n');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  await verifyIdentity(
+    bytes,
+    { sha256, byte_length: bytes.byteLength },
+    'x.json',
+  );
+  await assert.rejects(
+    verifyIdentity(bytes, { sha256, byte_length: 3 }, 'x.json'),
+    IdentityError,
+  );
+  await assert.rejects(
+    verifyIdentity(
+      bytes,
+      { sha256: '0'.repeat(64), byte_length: bytes.byteLength },
+      'x.json',
+    ),
+    /does not match the manifest/,
+  );
+});
+
+test('offsets format as +hh:mm:ss', () => {
+  assert.equal(formatOffset(3725), '+01:02:05');
+  assert.equal(formatOffset(0.25), '+00:00:00.250');
+});
