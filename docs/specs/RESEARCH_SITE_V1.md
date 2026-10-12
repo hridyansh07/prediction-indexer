@@ -144,8 +144,8 @@ Each lens of each event has exactly one state. None is dropped silently.
 
 | State | When | Carries |
 |---|---|---|
-| `ok` | `result.json` status `SUCCESS`, the group has a non-null reader receipt and every check passed | `semantic_sha256` from the group's `content_receipt.json` |
-| `failed` | anything else for a group the bench ran | `error`: the group's `failure.json` cause chain (`Type: message`, joined with ` <- `) when present, else `result.json` `error.type: error.message`, else `checks failed: <names>` |
+| `ok` | `result.json` status is not `FAILED`, the group has a non-null reader receipt, every check recorded for it passed, and the attempt is known | `semantic_sha256` from the group's reader receipt |
+| `failed` | anything else for a group the bench ran | `error`: `game_state_unavailable: <reason>` for a group the bench skipped for game state; else, for a `FAILED` bench or a missing receipt, the group's `failure.json` cause chain (`Type: message`, joined with ` <- `) when present, else `result.json` `error.type: error.message`; else `checks failed: <names>`; else the attempt error |
 | `excluded` | the group is in `corpus_receipt.json` `excluded_groups` | `reason` from the receipt |
 | `not_run` | the group is absent from both `result.json` groups and `excluded_groups` | — |
 
@@ -181,14 +181,19 @@ exists for every result, with or without context.
 
 ### 1.5 Game state
 
-`game.json` is built only when `--game-state DIR` is given, where `DIR` is a
-local root of the Part A archive layout (`gamestate/source=kalshi/...`), opened
-read-only through the `archive` local store. For a result with a valid context,
-the builder selects and verifies the event's best fetch with
-`gamestate.timeline.latest` and reshapes it with the same projection as
-`replay.prepare_game_state`, in memory, validated with
-`replay.game_state.validate`. Without `--game-state`, or without a context,
-`game.json` has state `no_source`. The corpus runs so far had
+Sources, in order, for a result with a valid context:
+
+1. the result's committed `game_state/game_state.json` (the corpus runner
+   commits it when `game_state.prepare` is true), checked with the SDK's pinned
+   loader `replay.game_state.load` against `result.json`'s `game_state_sha256`;
+2. `--game-state DIR`, a local root of the Part A archive layout
+   (`gamestate/source=kalshi/...`) opened through the `archive` local store: the
+   builder selects and verifies the event's best fetch and projects it in memory
+   with `replay.prepare_game_state.game_state_document`, the same code runner-side
+   preparation uses;
+3. otherwise `game.json` has state `no_source`.
+
+A result without a context always gets `no_source`. The corpus runs so far had
 `game_state.prepare: false`.
 
 ## 2. Build: research packs
@@ -224,8 +229,11 @@ OUT_DIR/
       tiles/1s/<minute>.json, tiles/raw/<minute>.json
 ```
 
-- `<version>` is the first 16 hex of the corpus manifest's SHA-256. The build is
-  deterministic: the same inputs and config give the same bytes and version.
+- `<version>` is the first 16 hex of the SHA-256 of the corpus manifest's
+  canonical bytes before `version` and the `viability.md` entry are added (the
+  report names the version, so it cannot be inside what the version hashes; it is
+  derived only from hashed files). The build is deterministic: the same inputs
+  and config give the same bytes and version.
 - The version is written to `OUT_DIR/.<version>.tmp`, every file fsynced, then
   renamed to `OUT_DIR/<version>` and the directory fsynced. An existing version
   directory is never rewritten: if it exists, the builder verifies every file
@@ -301,8 +309,8 @@ contributes nothing.
 state in force for a positive time inside the bucket:
 
 - `bid` and `ask` are each `[min, max, last]` in price atoms over those states'
-  non-null quotes, where `last` is the quote of the latest such state; `null`
-  when no such state has that side;
+  non-null quotes on that side, where `last` is the quote of the latest of them;
+  `null` when none has that side;
 - `usable_ppm` is the usable time inside the bucket in parts per million of the
   bucket's length (floor);
 - `trades` and `trade_qty` count the `trade` rows with `b0 <= t_ns < b1` and
@@ -396,17 +404,24 @@ nothing filtered:
 
 | File | One row per | Columns |
 |---|---|---|
-| `events.parquet` | Corpus result | `bundle_id`, `event_id`, `corpus_key`, `state` (`ok`, `uncommitted`, `receipt_invalid`, `context_invalid`), `pack` (`ok`, `no_profile`, or null), `context`, `game`, `title`, `capture_start_ns` (int64), `duration_s`, `venues`, `book_count`, `scope_count`, `game_state`, `bench_status`; per lens `<lens>_state`, `<lens>_error`, `<lens>_episodes`, `<lens>_headline`, `<lens>_max_net` |
-| `episodes.parquet` | Episode, every lens | `bundle_id`, `lens`, `episode_id`, `kind`, `start_ns`, `end_ns` (int64), `duration_ms` (float64), `books`, `markets`, `venues`, `venue_pair`, `censored`, `end_reason`, `net` (float64, null without a fill), `net_exact` (string), `net_unit`, `quantity` (float64), `seconds_to_capture_end`, `route_id`, `shares_leg_with`, `game`, `market_types` |
+| `events.parquet` | Corpus result | `bundle_id`, `event_id`, `corpus_key`, `state` (`ok`, `uncommitted`, `receipt_invalid`, `context_invalid`), `message`, `pack` (`ok`, `no_profile`, `build_failed`, or null), `pack_error`, `context`, `game`, `title`, `capture_start_ns` (int64), `duration_s`, `venues`, `book_count`, `scope_count`, `game_state`, `bench_status`; per lens `<lens>_state`, `<lens>_error`, `<lens>_episodes`, `<lens>_headline`, `<lens>_max_net` |
+| `episodes.parquet` | Episode, every lens | `bundle_id`, `lens`, `episode_id`, `kind`, `start_ns`, `end_ns` (int64), `duration_ms` (float64), `books`, `markets`, `venues`, `venue_pair`, `censored`, `end_reason`, `net` (float64, null without a fill), `net_exact` (string), `net_unit`, `quantity` (float64), `seconds_to_capture_end`, `route_id`, `shares_leg_with`, `dedup_group`, `game`, `market_types` |
 | `summary.json` | Lens | Fixed-edge histograms: episodes per event, duration (log edges, 1 ms to 1 h), net and quantity; each with and without the 100 ms filter; counts of events per lens state |
 
-- `shares_leg_with` counts the other episodes of the same event and lens that
-  overlap in time and buy the same `(instrument, orientation)` leg.
+- `shares_leg_with` counts the other episodes of the same event, lens and kind
+  that overlap in time and buy the same `(instrument, orientation)` leg.
+  `dedup_group` numbers the connected groups of that relation within the event,
+  lens and kind.
 - **Per route and deduplicated.** Per route counts every episode. Deduplicated
   counts the connected groups of episodes linked by "overlap and share a leg",
   so overlapping routes that walk one book side count once. Both are reported.
 - Parquet uses `pyarrow`, already a base dependency in `pyproject.toml`. Parquet
   files are written with fixed writer options so they are byte-deterministic.
+
+Per-event statistics count only events whose lens is `ok` **and** whose pack was
+built (episodes are read with the pack, because the profile maps legs to books).
+A pack that fails to build is recorded as `build_failed` with its error, the
+build continues, and the command exits 1.
 
 `viability.md` is a generated report answering the backend design's table:
 
