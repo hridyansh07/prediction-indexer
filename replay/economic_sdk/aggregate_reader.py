@@ -61,8 +61,8 @@ def _ns_map(value, allowed):
     return result
 
 
-def _table(root, name, files):
-    return document(root, name, files[name])
+def _table(root, name, files, limit=bounds.MAX_METADATA):
+    return document(root, name, files[name], limit)
 
 
 class GroupFacts:
@@ -372,7 +372,7 @@ def validate(directory, snapshot, manifest, strategy):
             budget.reserve(1024 * len(members), "reader state budget (layout)")
             for entity in members:
                 all_entities.setdefault(group, {})[entity.id] = entity
-        stored = obj(_table(root, group + "entities.json", files), "scopes")
+        stored = obj(_table(root, group + "entities.json", files, bounds.MAX_ENTITY_TABLE), "scopes")
         require(stored["scopes"] == [entity_rows({e.id: e for e in members}, group) for members in entities], "entity table")
         aggregates[group] = _group(
             root, group, names, files, entities, scopes, run_end, experiment, strategy, statuses,

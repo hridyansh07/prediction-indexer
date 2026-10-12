@@ -332,9 +332,12 @@ full slices, and `placebo_episodes.ndjson`. It is pinned byte for byte by
 file/profile initialization, layout-2 construction runs
 `replay.economic_sdk.entity_tables.preflight(strategy)`. It returns exact canonical
 bytes per real/control `entities.json`, including wrappers, scope/row separators,
-empty scopes, UTF-8 encoding and the final LF. Each table must fit the unchanged
-8 MiB `MAX_METADATA` limit; an oversized table names itself, its exact required
-bytes and the limit in a construction error. Preflight and final streaming commit
+empty scopes, UTF-8 encoding and the final LF. Each table must fit the 64 MiB
+`MAX_ENTITY_TABLE` limit; an oversized table names itself, its exact required
+bytes and the limit in a construction error. The limit is separate from the
+8 MiB `MAX_METADATA` that still bounds `reasons.json`, configurations, summaries
+and manifests, because every scope repeats its descriptors and a long event
+needs about 14–17 MB. Preflight and final streaming commit
 share the row/chunk encoder and resolve one scope at a time, without a new global
 descriptor cache. The final writer also verifies preflight length before rename.
 Layout 1 has no entity table and preserves the frozen complement V1 behavior.
@@ -533,7 +536,9 @@ Recursive size accounting is replaced by **count-based bounds**.
   - entities × kinds open episodes;
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
-  - the 128 MiB detached-state limit;
+  - the 512 MiB detached-state limit;
+  - the 64 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
+    one-record tables and documents;
   - the file, line and row limits of the complement spec.
 
   Exceeding any cap fails the attempt. Nothing is truncated.
