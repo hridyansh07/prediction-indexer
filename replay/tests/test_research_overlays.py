@@ -66,6 +66,10 @@ class OverlayTest(unittest.TestCase):
         net = [r for r in rows if r["kind"] == "net"]
         self.assertEqual([r["shares_leg_with"] for r in net], [1, 1, 0])
         self.assertEqual(len({r["dedup_group"] for r in net}), 2)
+        # Connected components: A~B and B~C put A and C in one group though they never overlap.
+        chain = [dict(self.items[0], id=i, start_ns=str(T0 + s * S), end_ns=str(T0 + e * S))
+                 for i, (s, e) in enumerate([(0, 10), (5, 20), (15, 30)])]
+        self.assertEqual(tables.overlap_links(chain), ([1, 2, 1], [0, 0, 0]))
         gross = [r for r in rows if r["kind"] == "gross"]
         self.assertEqual(gross[0]["shares_leg_with"], 0)
         self.assertEqual(net[0]["venue_pair"], "kalshi+polymarket")

@@ -424,8 +424,12 @@ nothing filtered:
   `dedup_group` numbers the connected groups of that relation within the event,
   lens and kind.
 - **Per route and deduplicated.** Per route counts every episode. Deduplicated
-  counts the connected groups of episodes linked by "overlap and share a leg",
-  so overlapping routes that walk one book side count once. Both are reported.
+  counts the **connected components** of episodes linked by "overlap in time and
+  buy a common leg", so overlapping routes that walk one book side count once.
+  The relation is closed transitively: if A overlaps B and B overlaps C, all
+  three are one group even when A and C never overlap. Deduplicated is therefore
+  a conservative lower bound, not a count of distinct opportunities. Both are
+  reported, and `viability.md` and the site say so.
 - Parquet uses `pyarrow`, already a base dependency in `pyproject.toml`. Parquet
   files are written with fixed writer options so they are byte-deterministic.
 

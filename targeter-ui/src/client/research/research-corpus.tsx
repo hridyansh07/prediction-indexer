@@ -193,6 +193,7 @@ function CorpusView(props: {
           <button
             type="button"
             className={dedup ? 'active' : ''}
+            title="Connected components of overlapping episodes that buy a common leg: a conservative lower bound, not a count of distinct opportunities"
             onClick={() => setDedup(true)}
           >
             Deduplicated

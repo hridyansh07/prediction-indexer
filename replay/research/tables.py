@@ -239,7 +239,9 @@ def viability(config, version, inputs, superseded, event_rows, episodes, summary
         lines.append("")
     lines += ["## Lenses", "",
               "Counts are of each lens's headline episode kind. *Per route* counts every episode; "
-              "*dedup* counts groups of overlapping episodes that buy a common leg once. Net is modeled "
+              "*dedup* (deduplicated) = connected components of overlapping episodes sharing a leg: if A "
+              "overlaps B and B overlaps C they are one group even when A and C never overlap, so dedup "
+              "is a conservative lower bound, not a count of distinct opportunities. Net is modeled "
               "apparent edge at episode open, not a return. Nothing is filtered except where a column says "
               "≥100 ms.", ""]
     for name, entry in summary["lenses"].items():

@@ -115,6 +115,7 @@ class BuildTest(unittest.TestCase):
         self.assertIn(self.version, report)
         self.assertIn(f"`{LOOSE}`: state `uncommitted`", report)
         self.assertIn("excluded: entities.json over 8 MiB", report)
+        self.assertIn("connected components of overlapping episodes sharing a leg", report)
 
     def test_events_index_matches_the_events_table(self):
         index = read_json(self.base / "events.json")
