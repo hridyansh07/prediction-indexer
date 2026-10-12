@@ -3,56 +3,34 @@ import { useQuery } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
 import { corpusFile, useCorpus, type Corpus } from './research-data';
 import {
-  filterEpisodes,
-  histogram,
-  median,
-  perEventCounts,
-  type EpisodeRow,
+  filterEvents,
+  sortEvents,
+  type CorpusSummary,
+  type EventsIndex,
+  type HistogramSpec,
+  type LensStateName,
+  type LensStats,
 } from './research-model';
 import './research.css';
 
-interface HistogramSpec {
-  edges: number[];
-  counts: number[];
-}
-
-interface LensSummary {
-  label: string;
-  adapter: string;
-  states: Record<string, number>;
-  headline_kind?: string;
-  value_unit?: string;
-  all?: { histograms: Record<string, HistogramSpec> };
-}
-
-interface Summary {
-  min_duration_ms: number;
-  events: Record<string, number>;
-  packs: number;
-  lenses: Record<string, LensSummary>;
-}
-
-type EventRow = Record<string, string | number | null | string[]>;
-
 const decoder = new TextDecoder();
 
-async function loadTables(corpus: Corpus) {
-  const summary = JSON.parse(
-    decoder.decode(await corpusFile(corpus, 'summary.json')),
-  ) as Summary;
-  const { openTables } = await import('./research-duckdb');
-  const tables = await openTables(corpus);
-  const events = await tables.query<EventRow>(
-    'SELECT * FROM events ORDER BY capture_start_ns NULLS LAST, bundle_id',
-  );
-  return { summary, tables, events };
+async function loadIndex(corpus: Corpus) {
+  const [summary, index] = await Promise.all([
+    corpusFile(corpus, 'summary.json'),
+    corpusFile(corpus, 'events.json'),
+  ]);
+  return {
+    summary: JSON.parse(decoder.decode(summary)) as CorpusSummary,
+    index: JSON.parse(decoder.decode(index)) as EventsIndex,
+  };
 }
 
 export function ResearchCorpusPage() {
   const corpus = useCorpus();
   const loaded = useQuery({
-    queryKey: ['research', corpus.data?.pointer.version ?? '', 'tables'],
-    queryFn: () => loadTables(corpus.data!),
+    queryKey: ['research', corpus.data?.pointer.version ?? '', 'index'],
+    queryFn: () => loadIndex(corpus.data!),
     enabled: corpus.data !== undefined,
     staleTime: Number.POSITIVE_INFINITY,
     retry: false,
@@ -64,8 +42,8 @@ export function ResearchCorpusPage() {
         <span className="eyebrow">RESEARCH · CORPUS</span>
         <h1>Events × lenses</h1>
         <p>
-          Every committed corpus result, every lens, from verified files.
-          Filters change the display only; the backend records every episode.
+          Every committed corpus result and every lens, from verified files. The
+          backend records every episode; the 100 ms view is a display filter.
         </p>
       </div>
       {error ? (
@@ -73,9 +51,7 @@ export function ResearchCorpusPage() {
           {(error as Error).message}
         </div>
       ) : !corpus.data || !loaded.data ? (
-        <div className="empty-state">
-          Loading and verifying the corpus tables…
-        </div>
+        <div className="empty-state">Loading and verifying the corpus…</div>
       ) : (
         <CorpusView corpus={corpus.data} {...loaded.data} />
       )}
@@ -86,107 +62,61 @@ export function ResearchCorpusPage() {
 const fmt = (value: number | null | undefined, digits = 2) =>
   value === null || value === undefined || Number.isNaN(value)
     ? '—'
-    : value.toLocaleString(undefined, { maximumFractionDigits: digits });
+    : value.toLocaleString('en-US', { maximumFractionDigits: digits });
+
+function utcDate(ns: string | null): string {
+  if (ns === null) return '—';
+  return new Date(Number(BigInt(ns) / 1_000_000n))
+    .toISOString()
+    .slice(0, 16)
+    .replace('T', ' ');
+}
 
 function CorpusView(props: {
   corpus: Corpus;
-  summary: Summary;
-  tables: Awaited<ReturnType<typeof loadTables>>['tables'];
-  events: EventRow[];
+  summary: CorpusSummary;
+  index: EventsIndex;
 }) {
-  const { corpus, summary, events } = props;
-  const lenses = Object.entries(summary.lenses).filter(
-    ([, l]) => l.adapter === 'sdk_episodes',
-  );
+  const { corpus, summary, index } = props;
+  const lenses = index.lenses.filter((l) => l.adapter === 'sdk_episodes');
   const [lens, setLens] = useState(
-    lenses.find(([n]) => n === 'cross')?.[0] ?? lenses[0]?.[0] ?? '',
+    lenses.find((l) => l.lens === 'cross')?.lens ?? lenses[0]?.lens ?? '',
   );
-  const [minDuration, setMinDuration] = useState(summary.min_duration_ms);
-  const [minNet, setMinNet] = useState<string>('');
-  const [game, setGame] = useState<string>('');
-  const [venuePair, setVenuePair] = useState<string>('');
+  const [minimum, setMinimum] = useState(true);
   const [dedup, setDedup] = useState(false);
+  const [query, setQuery] = useState('');
+  const [game, setGame] = useState('');
+  const [lensState, setLensState] = useState<LensStateName | ''>('');
   const [sort, setSort] = useState<{ key: string; desc: boolean }>({
     key: 'capture_start_ns',
     desc: false,
   });
   const navigate = useNavigate();
-  const lensInfo = summary.lenses[lens];
-  const kind = lensInfo?.headline_kind ?? 'net';
-
-  const episodes = useQuery({
-    queryKey: ['research', corpus.pointer.version, 'episodes', lens, kind],
-    queryFn: () =>
-      props.tables.query<EpisodeRow & { dedup_group: number }>(
-        'SELECT bundle_id, lens, kind, duration_ms, net, quantity, game, venue_pair, dedup_group FROM episodes WHERE lens = ? AND kind = ?',
-        lens,
-        kind,
-      ),
-    staleTime: Number.POSITIVE_INFINITY,
-    enabled: lens !== '',
-  });
-
+  const info = summary.lenses[lens];
+  const stats: LensStats | undefined = minimum ? info?.min_100ms : info?.all;
   const games = [
     ...new Set(
-      events
+      index.events
         .map((e) => e.game)
         .filter((g): g is string => typeof g === 'string'),
     ),
   ].sort();
-  const pairs = [
-    ...new Set((episodes.data ?? []).map((e) => e.venue_pair)),
-  ].sort();
-  const counted = events
-    .filter(
-      (e) =>
-        e.pack === 'ok' &&
-        e[`${lens}_state`] === 'ok' &&
-        (game === '' || e.game === game),
-    )
-    .map((e) => e.bundle_id as string);
   const filtered = useMemo(
     () =>
-      filterEpisodes(episodes.data ?? [], {
-        lens,
-        kind,
-        minDurationMs: minDuration,
-        minNet: minNet === '' ? null : Number(minNet),
+      filterEvents(index.events, {
+        query,
         game: game || null,
-        venuePair: venuePair || null,
+        lens,
+        lensState: lensState || null,
       }),
-    [episodes.data, lens, kind, minDuration, minNet, game, venuePair],
+    [index.events, query, game, lens, lensState],
   );
-  const shown = filtered.shown as (EpisodeRow & { dedup_group: number })[];
-  const unit = dedup
-    ? [
-        ...new Map(
-          shown.map((r) => [`${r.bundle_id}:${r.dedup_group}`, r]),
-        ).values(),
-      ]
-    : shown;
-  const perEvent = perEventCounts(unit, counted);
-  const edges = lensInfo?.all?.histograms ?? {};
-  const nets = shown.map((r) => r.net).filter((n): n is number => n !== null);
-
-  const sorted = [...events].sort((a, b) => {
-    const x = a[sort.key];
-    const y = b[sort.key];
-    const order =
-      x === y
-        ? 0
-        : x === null || x === undefined
-          ? 1
-          : y === null || y === undefined
-            ? -1
-            : x < y
-              ? -1
-              : 1;
-    return sort.desc ? -order : order;
-  });
-  const header = (key: string, label: string) => (
+  const rows = sortEvents(filtered.shown, sort.key, sort.desc);
+  const header = (key: string, label: string, title?: string) => (
     <button
       type="button"
       className="sort"
+      title={title}
       onClick={() =>
         setSort((s) => ({ key, desc: s.key === key ? !s.desc : true }))
       }
@@ -195,10 +125,22 @@ function CorpusView(props: {
       {sort.key === key ? (sort.desc ? ' ↓' : ' ↑') : ''}
     </button>
   );
+  const episodes = stats ? (dedup ? stats.dedup_episodes : stats.episodes) : 0;
+  const before = dedup ? info?.all?.dedup_episodes : info?.all?.episodes;
+  const mean = stats
+    ? dedup
+      ? stats.dedup_per_event_mean
+      : stats.per_event_mean
+    : null;
+  const median = stats
+    ? dedup
+      ? stats.dedup_per_event_median
+      : stats.per_event_median
+    : null;
 
   return (
     <>
-      <p className="muted small">
+      <p className="muted small corpus-meta">
         Version <code>{corpus.pointer.version}</code> · inputs{' '}
         {corpus.manifest.inputs
           .map((i) => `${i.key_prefix} (${i.bundles})`)
@@ -207,61 +149,39 @@ function CorpusView(props: {
           ` · ${corpus.manifest.superseded.length} superseded results`}{' '}
         · events{' '}
         {Object.entries(summary.events)
-          .map(([k, v]) => `${k} ${v}`)
+          .filter(([, v]) => v > 0)
+          .map(([k, v]) => `${k.replace('_', ' ')} ${v}`)
           .join(', ')}{' '}
         · packs {summary.packs}
       </p>
-      <div className="research-filters" role="group" aria-label="Filters">
+
+      <div className="research-filters" role="group" aria-label="Lens">
         <label>
           Lens{' '}
           <select value={lens} onChange={(e) => setLens(e.target.value)}>
-            {lenses.map(([name, l]) => (
-              <option key={name} value={name}>
+            {lenses.map((l) => (
+              <option key={l.lens} value={l.lens}>
                 {l.label}
               </option>
             ))}
           </select>
         </label>
-        <label>
-          Game{' '}
-          <select value={game} onChange={(e) => setGame(e.target.value)}>
-            <option value="">All</option>
-            {games.map((g) => (
-              <option key={g}>{g}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Venues{' '}
-          <select
-            value={venuePair}
-            onChange={(e) => setVenuePair(e.target.value)}
+        <div className="segmented" role="group" aria-label="Duration filter">
+          <button
+            type="button"
+            className={minimum ? 'active' : ''}
+            onClick={() => setMinimum(true)}
           >
-            <option value="">All</option>
-            {pairs.map((p) => (
-              <option key={p}>{p}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Min duration (ms){' '}
-          <input
-            type="number"
-            min={0}
-            value={minDuration}
-            onChange={(e) => setMinDuration(Number(e.target.value) || 0)}
-          />
-        </label>
-        <label>
-          Min net{' '}
-          <input
-            type="number"
-            step="0.01"
-            value={minNet}
-            placeholder="none"
-            onChange={(e) => setMinNet(e.target.value)}
-          />
-        </label>
+            ≥ {summary.min_duration_ms} ms
+          </button>
+          <button
+            type="button"
+            className={!minimum ? 'active' : ''}
+            onClick={() => setMinimum(false)}
+          >
+            All durations
+          </button>
+        </div>
         <div className="segmented" role="group" aria-label="Count">
           <button
             type="button"
@@ -280,167 +200,208 @@ function CorpusView(props: {
         </div>
       </div>
 
-      <div className="stat-row">
-        <Stat
-          label="Events counted"
-          value={String(counted.length)}
-          note={`lens ok and pack built · states ${Object.entries(
-            lensInfo?.states ?? {},
-          )
-            .map(([k, v]) => `${k} ${v}`)
-            .join(', ')}`}
-        />
-        <Stat
-          label={`Episodes (${kind}${dedup ? ', dedup' : ''})`}
-          value={String(unit.length)}
-          note={`${filtered.hidden} hidden by filter`}
-        />
-        <Stat
-          label="Mean per event"
-          value={fmt(
-            perEvent.length
-              ? perEvent.reduce((a, b) => a + b, 0) / perEvent.length
-              : null,
-          )}
-          note={`median ${fmt(median(perEvent))}`}
-        />
-        <Stat
-          label="Events with ≥1"
-          value={
-            perEvent.length
-              ? `${Math.round((perEvent.filter((n) => n > 0).length / perEvent.length) * 100)}%`
-              : '—'
-          }
-          note={`${perEvent.filter((n) => n > 0).length} of ${perEvent.length}`}
-        />
-        <Stat
-          label={`Net total (modeled, ${lensInfo?.value_unit ?? ''})`}
-          value={fmt(nets.reduce((a, b) => a + b, 0))}
-          note={`largest ${fmt(nets.length ? Math.max(...nets) : null)}`}
-        />
-      </div>
-
-      <div className="histograms">
-        <Histogram
-          title="Episodes per event"
-          spec={edges.per_event}
-          values={perEvent}
-        />
-        <Histogram
-          title="Duration (ms)"
-          spec={edges.duration_ms}
-          values={shown.map((r) => r.duration_ms)}
-          marker={100}
-        />
-        <Histogram
-          title={`Net (${lensInfo?.value_unit ?? ''}, modeled)`}
-          spec={edges.net}
-          values={nets}
-        />
-        <Histogram
-          title="Quantity (contracts)"
-          spec={edges.quantity}
-          values={shown
-            .map((r) => r.quantity)
-            .filter((q): q is number => q !== null)}
-        />
-      </div>
-
-      <div className="research-table" role="table" aria-label="Events">
-        <div className="row head" role="row">
-          <span>{header('title', 'Event')}</span>
-          <span>{header('game', 'Game')}</span>
-          <span>{header('capture_start_ns', 'Date (UTC)')}</span>
-          <span>Venues · books</span>
-          <span>Context · game</span>
-          {lenses.map(([name, l]) => (
-            <span key={name} title={l.label}>
-              {header(`${name}_headline`, name.replace('_', ' '))}
-            </span>
-          ))}
-        </div>
-        {sorted.map((e) => {
-          const open = e.pack === 'ok';
-          return (
-            <div
-              key={e.bundle_id as string}
-              role="row"
-              className={`row${open ? ' link' : ''}`}
-              onClick={() =>
-                open && navigate(`/research/events/${e.bundle_id}`)
+      {stats && info ? (
+        <>
+          <div className="stat-row">
+            <Stat
+              label="Events counted"
+              value={String(stats.events)}
+              note={`lens ok and pack built · ${Object.entries(info.states)
+                .filter(([, v]) => v > 0)
+                .map(([k, v]) => `${k.replace('_', ' ')} ${v}`)
+                .join(', ')}`}
+            />
+            <Stat
+              label={`${info.headline_kind} episodes${dedup ? ' (dedup)' : ''}`}
+              value={String(episodes)}
+              note={
+                minimum
+                  ? `${(before ?? 0) - episodes} hidden by the ${summary.min_duration_ms} ms filter`
+                  : 'no duration filter'
               }
-            >
-              <span>
-                {open ? (
-                  <Link
-                    to={`/research/events/${e.bundle_id}`}
-                    onClick={(ev) => ev.stopPropagation()}
-                  >
-                    {e.title ?? e.bundle_id}
-                  </Link>
-                ) : (
-                  (e.title ?? e.bundle_id)
-                )}
-                {e.state !== 'ok' || e.pack !== 'ok' ? (
-                  <span className="reason">
-                    {String(e.state)}
-                    {e.pack ? ` · ${e.pack}` : ''}
-                    {e.message || e.pack_error
-                      ? `: ${e.message ?? e.pack_error}`
-                      : ''}
-                  </span>
-                ) : null}
-              </span>
-              <span>{e.game ?? '—'}</span>
-              <span className="mono">
-                {typeof e.capture_start_ns === 'number'
-                  ? new Date(e.capture_start_ns / 1e6)
-                      .toISOString()
-                      .slice(0, 16)
-                      .replace('T', ' ')
-                  : '—'}
-              </span>
-              <span>
-                {Array.isArray(e.venues) ? e.venues.join(', ') : '—'} ·{' '}
-                {e.book_count ?? '—'}
-              </span>
-              <span>
-                <span className={`state-badge state-${e.context}`}>
-                  {String(e.context)}
-                </span>{' '}
-                <span className={`state-badge state-${e.game_state ?? 'none'}`}>
-                  {String(e.game_state ?? '—')}
-                </span>
-              </span>
-              {lenses.map(([name]) => {
-                const state = e[`${name}_state`] as string;
-                return (
-                  <span key={name}>
-                    {state === 'ok' ? (
-                      <>
-                        {e[`${name}_headline`] ?? '—'}
-                        {typeof e[`${name}_max_net`] === 'number' ? (
-                          <span className="muted">
-                            {' '}
-                            · max {fmt(e[`${name}_max_net`] as number)}
-                          </span>
-                        ) : null}
-                      </>
-                    ) : (
-                      <span
-                        className={`state-badge state-${state}`}
-                        title={(e[`${name}_error`] as string) ?? undefined}
-                      >
-                        {state.replace('_', ' ')}
-                      </span>
-                    )}
-                  </span>
-                );
-              })}
-            </div>
-          );
-        })}
+            />
+            <Stat
+              label="Per event"
+              value={fmt(mean)}
+              note={`mean · median ${fmt(median)}`}
+            />
+            <Stat
+              label="Events with ≥1"
+              value={
+                stats.share_with_one === null
+                  ? '—'
+                  : `${Math.round(stats.share_with_one * 100)}%`
+              }
+              note={`${stats.events_with_one} of ${stats.events}`}
+            />
+            <Stat
+              label={`Net total · ${info.value_unit ?? ''}`}
+              value={fmt(stats.net_total)}
+              note={`modeled at open · largest ${fmt(stats.net_max)}`}
+            />
+          </div>
+          <div className="histograms">
+            <Histogram
+              title="Episodes per event"
+              spec={stats.histograms.per_event}
+            />
+            <Histogram
+              title="Duration (ms)"
+              spec={stats.histograms.duration_ms}
+              marker={summary.min_duration_ms}
+            />
+            <Histogram
+              title={`Net (${info.value_unit ?? ''}, modeled)`}
+              spec={stats.histograms.net}
+            />
+            <Histogram
+              title="Quantity (contracts)"
+              spec={stats.histograms.quantity}
+            />
+          </div>
+        </>
+      ) : (
+        <div className="empty-state">This lens has no statistics.</div>
+      )}
+
+      <div className="research-filters" role="group" aria-label="Events filter">
+        <label>
+          Search{' '}
+          <input
+            className="wide"
+            value={query}
+            placeholder="title or bundle"
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        <label>
+          Game{' '}
+          <select value={game} onChange={(e) => setGame(e.target.value)}>
+            <option value="">All</option>
+            {games.map((g) => (
+              <option key={g}>{g}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Lens state{' '}
+          <select
+            value={lensState}
+            onChange={(e) => setLensState(e.target.value as LensStateName | '')}
+          >
+            <option value="">Any</option>
+            {(['ok', 'failed', 'excluded', 'not_run'] as const).map((s) => (
+              <option key={s} value={s}>
+                {s.replace('_', ' ')}
+              </option>
+            ))}
+          </select>
+        </label>
+        <span className="muted small">
+          {rows.length} shown
+          {filtered.hidden > 0 && ` · ${filtered.hidden} hidden by filter`}
+        </span>
       </div>
+
+      <div className="research-table-wrap">
+        <div className="research-table" role="table" aria-label="Events">
+          <div className="row head" role="row">
+            <span>{header('title', 'Event')}</span>
+            <span>{header('game', 'Game')}</span>
+            <span>{header('capture_start_ns', 'Start (UTC)')}</span>
+            <span>{header('book_count', 'Books')}</span>
+            <span>Context · game state</span>
+            {lenses.map((l) => (
+              <span key={l.lens}>
+                {header(
+                  `${l.lens}_headline`,
+                  l.lens.replace('_', ' '),
+                  l.label,
+                )}
+              </span>
+            ))}
+          </div>
+          {rows.map((e) => {
+            const open = e.pack === 'ok';
+            const problem =
+              e.state !== 'ok' || e.pack !== 'ok'
+                ? `${e.state}${e.pack ? ` · ${e.pack}` : ''}${e.message || e.pack_error ? `: ${e.message ?? e.pack_error}` : ''}`
+                : null;
+            return (
+              <div
+                key={e.bundle_id}
+                role="row"
+                className={`row${open ? ' link' : ''}`}
+                onClick={() =>
+                  open && navigate(`/research/events/${e.bundle_id}`)
+                }
+              >
+                <span>
+                  {open ? (
+                    <Link
+                      to={`/research/events/${e.bundle_id}`}
+                      onClick={(ev) => ev.stopPropagation()}
+                    >
+                      {e.title ?? e.bundle_id}
+                    </Link>
+                  ) : (
+                    (e.title ?? e.bundle_id)
+                  )}
+                  {e.title !== e.bundle_id && (
+                    <span className="reason mono">{e.bundle_id}</span>
+                  )}
+                  {problem && <span className="reason">{problem}</span>}
+                </span>
+                <span>{e.game ?? '—'}</span>
+                <span className="mono">{utcDate(e.capture_start_ns)}</span>
+                <span>
+                  {e.book_count ?? '—'}
+                  {e.venues && (
+                    <span className="reason">{e.venues.join(', ')}</span>
+                  )}
+                </span>
+                <span>
+                  <span className={`state-badge state-${e.context}`}>
+                    context {e.context}
+                  </span>
+                  <span
+                    className={`state-badge state-${e.game_state ?? 'none'}`}
+                  >
+                    {(e.game_state ?? '—').replace('_', ' ')}
+                  </span>
+                </span>
+                {lenses.map((l) => {
+                  const state = String(e[`${l.lens}_state`]);
+                  const maxNet = e[`${l.lens}_max_net`];
+                  return (
+                    <span key={l.lens}>
+                      {state === 'ok' ? (
+                        <>
+                          {e[`${l.lens}_headline`] ?? '—'}
+                          {typeof maxNet === 'number' && (
+                            <span className="reason">max {fmt(maxNet)}</span>
+                          )}
+                        </>
+                      ) : (
+                        <span
+                          className={`state-badge state-${state}`}
+                          title={String(e[`${l.lens}_error`] ?? '')}
+                        >
+                          {state.replace('_', ' ')}
+                        </span>
+                      )}
+                    </span>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <p className="muted small">
+        Lens columns count the headline episode kind per event, all durations.
+        Hover a failed or excluded badge for its reason.
+      </p>
     </>
   );
 }
@@ -464,34 +425,35 @@ function Stat({
 }
 
 function edgeLabel(value: number): string {
-  return value >= 1000 ? `${value / 1000}k` : String(value);
+  if (value >= 1_000_000) return `${value / 1_000_000}M`;
+  if (value >= 1000) return `${value / 1000}k`;
+  return String(value);
 }
 
 function Histogram({
   title,
   spec,
-  values,
   marker,
 }: {
   title: string;
   spec?: HistogramSpec;
-  values: number[];
   marker?: number;
 }) {
   if (!spec) return null;
-  const counts = histogram(values, spec.edges);
+  const { counts, edges } = spec;
   const max = Math.max(1, ...counts);
   const width = 320;
   const height = 110;
   const bar = width / counts.length;
   const labels = counts.map((_, i) =>
     i === 0
-      ? `< ${edgeLabel(spec.edges[0])}`
-      : i === spec.edges.length
-        ? `≥ ${edgeLabel(spec.edges[i - 1])}`
-        : `${edgeLabel(spec.edges[i - 1])}–${edgeLabel(spec.edges[i])}`,
+      ? `< ${edgeLabel(edges[0])}`
+      : i === edges.length
+        ? `≥ ${edgeLabel(edges[i - 1])}`
+        : `${edgeLabel(edges[i - 1])}–${edgeLabel(edges[i])}`,
   );
-  const markerIndex = marker === undefined ? -1 : spec.edges.indexOf(marker);
+  const markerIndex = marker === undefined ? -1 : edges.indexOf(marker);
+  const total = counts.reduce((a, b) => a + b, 0);
   return (
     <figure className="histogram">
       <figcaption>{title}</figcaption>
@@ -507,13 +469,11 @@ function Histogram({
               <rect
                 x={i * bar + 1}
                 y={height - h}
-                width={bar - 2}
+                width={Math.max(1, bar - 2)}
                 height={Math.max(h, count ? 1 : 0)}
                 rx={2}
                 className="bar"
-              >
-                <title>{`${labels[i]}: ${count}`}</title>
-              </rect>
+              />
               <rect
                 x={i * bar}
                 y={0}
@@ -528,14 +488,12 @@ function Histogram({
         })}
         {markerIndex >= 0 && (
           <line
-            x1={(markerIndex + 1) * bar}
-            x2={(markerIndex + 1) * bar}
+            x1={markerIndex * bar + bar}
+            x2={markerIndex * bar + bar}
             y1={0}
             y2={height}
             className="marker"
-          >
-            <title>{`${marker} ms`}</title>
-          </line>
+          />
         )}
         <line x1={0} x2={width} y1={height} y2={height} className="baseline" />
         <text x={0} y={height + 14} className="axis">
@@ -545,7 +503,7 @@ function Histogram({
           {labels[labels.length - 1]}
         </text>
       </svg>
-      <span className="muted small">{values.length} values</span>
+      <span className="muted small">{total} values · hover a bar</span>
     </figure>
   );
 }

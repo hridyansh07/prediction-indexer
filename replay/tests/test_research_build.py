@@ -115,6 +115,14 @@ class BuildTest(unittest.TestCase):
         self.assertIn(f"`{LOOSE}`: state `uncommitted`", report)
         self.assertIn("excluded: entities.json over 8 MiB", report)
 
+    def test_events_index_matches_the_events_table(self):
+        index = read_json(self.base / "events.json")
+        table = pq.read_table(self.base / "events.parquet").to_pylist()
+        self.assertEqual([e["bundle_id"] for e in index["events"]], [r["bundle_id"] for r in table])
+        self.assertEqual(index["events"][0]["capture_start_ns"], str(table[0]["capture_start_ns"]))
+        self.assertEqual([lens["lens"] for lens in index["lenses"]], list(CONFIG["lenses"]))
+        self.assertIn("events.json", read_json(self.base / "manifest.json")["files"])
+
     def test_verify_json(self):
         checks = read_json(self.base / "verify.json")["checks"]
         self.assertIn({"bundle_id": LOOSE, "check": "corpus_receipt", "pass": False,

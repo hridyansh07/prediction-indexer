@@ -136,7 +136,7 @@
 }
 .research-legend {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
   gap: 6px 16px;
   padding: 12px 0;
   border-top: 1px solid var(--line);
@@ -212,7 +212,7 @@
 }
 .research-details {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   gap: 24px;
   padding: 16px 0;
   border-top: 1px solid var(--line);
@@ -332,20 +332,18 @@ dl dd {
 .research-table {
   display: grid;
   border-top: 1px solid var(--line);
-  overflow-x: auto;
   font-size: 13px;
 }
 .research-table .row {
   display: grid;
-  grid-template-columns: minmax(180px, 2fr) 120px 120px 130px 130px repeat(
-      5,
-      minmax(80px, 1fr)
-    );
+  grid-template-columns:
+    minmax(160px, 2fr) 110px 120px 110px 130px
+    repeat(5, minmax(70px, 1fr));
   gap: 10px;
   align-items: center;
   padding: 8px 4px;
   border-bottom: 1px solid var(--line);
-  min-width: 1080px;
+  min-width: 1060px;
 }
 .research-table .row.head {
   color: var(--muted);
@@ -368,4 +366,56 @@ dl dd {
   font: inherit;
   cursor: pointer;
   text-align: left;
+}
+.research-filters input.wide {
+  width: 220px;
+}
+.research-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.corpus-meta code {
+  font-size: 11px;
+}
+.episode-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.episode-nav button {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 10px;
+  background: var(--surface-raised);
+  cursor: pointer;
+  font-size: 12px;
+}
+.episode-nav button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* Long instrument and bundle ids (78-digit Polymarket tokens) wrap instead of
+   widening the page. */
+.research-heading h1,
+.research-crumbs {
+  overflow-wrap: anywhere;
+}
+.readout {
+  table-layout: fixed;
+}
+.readout th:first-child,
+.readout td:first-child {
+  width: 46%;
+  overflow-wrap: anywhere;
+}
+.readout td {
+  overflow-wrap: anywhere;
+}
+.research-heading h1.untitled {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: clamp(20px, 3vw, 28px);
+  letter-spacing: 0;
 }

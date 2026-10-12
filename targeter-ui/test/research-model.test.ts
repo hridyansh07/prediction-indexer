@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   chooseTier,
-  filterEpisodes,
+  displayLabel,
+  filterEvents,
   fixedYRange,
   formatOffset,
   gameMarks,
   gameSummaryAt,
   gridsToChart,
-  histogram,
   IdentityError,
   knownAt,
   legendGroups,
@@ -17,10 +17,11 @@ import {
   maskAfter,
   nextMoment,
   rawToChart,
+  sortEvents,
   tilesInRange,
   valuesAt,
   verifyIdentity,
-  type EpisodeRow,
+  type EventRow,
   type GameDocument,
   type GridDocument,
   type IntervalItem,
@@ -244,6 +245,8 @@ test('a hidden book never changes the y range', () => {
   const range = fixedYRange(chart);
   assert.deepEqual(range, [7, 64]);
   assert.deepEqual(fixedYRange({ x: [], books: [], stepped: false }), [0, 100]);
+  // Zoomed to the last bucket only: the range follows the visible span.
+  assert.deepEqual(fixedYRange(chart, [0, 1000]), [7, 54]);
 });
 
 const GAME: GameDocument = {
@@ -395,76 +398,67 @@ test('next moment finds the next game fact, episode start or availability change
   assert.equal(nextMoment(700, T0, GAME.events, items, availability), null);
 });
 
-test('filter counts report what the display filter hid', () => {
-  const rows: EpisodeRow[] = [
-    {
-      bundle_id: 'b1',
-      lens: 'cross',
-      kind: 'net',
-      duration_ms: 50,
-      net: 1,
-      quantity: 10,
-      game: 'lol',
-      venue_pair: 'kalshi+polymarket',
-    },
-    {
-      bundle_id: 'b1',
-      lens: 'cross',
-      kind: 'net',
-      duration_ms: 250,
-      net: 0.5,
-      quantity: 10,
-      game: 'lol',
-      venue_pair: 'kalshi+polymarket',
-    },
-    {
-      bundle_id: 'b2',
-      lens: 'cross',
-      kind: 'net',
-      duration_ms: 1000,
-      net: 3,
-      quantity: 10,
-      game: 'dota',
-      venue_pair: 'kalshi+polymarket',
-    },
-    {
-      bundle_id: 'b2',
-      lens: 'cross',
-      kind: 'gross',
-      duration_ms: 1000,
-      net: null,
-      quantity: null,
-      game: 'dota',
-      venue_pair: 'kalshi+polymarket',
-    },
+function event(
+  bundle: string,
+  title: string,
+  game: string | null,
+  cross: string,
+  start: string | null,
+): EventRow {
+  return {
+    bundle_id: bundle,
+    event_id: null,
+    corpus_key: null,
+    state: 'ok',
+    message: null,
+    pack: 'ok',
+    pack_error: null,
+    context: 'missing',
+    game,
+    title,
+    capture_start_ns: start,
+    duration_s: 1,
+    venues: ['kalshi'],
+    book_count: 3,
+    scope_count: 1,
+    game_state: 'no_source',
+    bench_status: 'SUCCESS',
+    cross_state: cross,
+    cross_headline: 1,
+  } as EventRow;
+}
+
+test('event filters report how many rows they hid', () => {
+  const rows = [
+    event(
+      'bundle_a',
+      'Cloud9 vs LYON',
+      'league_of_legends',
+      'ok',
+      '1791000000000000000',
+    ),
+    event('bundle_b', 'bundle_b', null, 'failed', null),
+    event('bundle_c', 'G2 vs M8', 'valorant', 'ok', '1790000000000000000'),
   ];
-  const base = {
-    lens: 'cross',
-    kind: 'net',
-    minDurationMs: 100,
-    minNet: null,
-    game: null,
-    venuePair: null,
+  const base = { query: '', game: null, lens: 'cross', lensState: null };
+  const count = (f: typeof base | Record<string, unknown>) => {
+    const { shown, hidden } = filterEvents(
+      rows,
+      f as Parameters<typeof filterEvents>[1],
+    );
+    return [shown.map((r) => r.bundle_id), hidden];
   };
+  assert.deepEqual(count(base), [['bundle_a', 'bundle_b', 'bundle_c'], 0]);
+  assert.deepEqual(count({ ...base, lensState: 'failed' }), [['bundle_b'], 2]);
+  assert.deepEqual(count({ ...base, game: 'valorant' }), [['bundle_c'], 2]);
+  assert.deepEqual(count({ ...base, query: 'lyon' }), [['bundle_a'], 2]);
   assert.deepEqual(
-    (({ shown, hidden }) => [shown.length, hidden])(filterEpisodes(rows, base)),
-    [2, 1],
+    sortEvents(rows, 'capture_start_ns', false).map((r) => r.bundle_id),
+    ['bundle_c', 'bundle_a', 'bundle_b'],
   );
   assert.deepEqual(
-    (({ shown, hidden }) => [shown.length, hidden])(
-      filterEpisodes(rows, { ...base, minNet: 1 }),
-    ),
-    [1, 2],
-  );
-  assert.deepEqual(
-    (({ shown, hidden }) => [shown.length, hidden])(
-      filterEpisodes(rows, { ...base, game: 'lol' }),
-    ),
-    [1, 1],
-  );
-  assert.deepEqual(
-    histogram([0.5, 1, 99, 100, 5000], [0, 1, 100]),
-    [0, 1, 2, 2],
+    sortEvents(rows, 'capture_start_ns', true).map((r) => r.bundle_id),
+    ['bundle_a', 'bundle_c', 'bundle_b'],
   );
 });
 
@@ -493,4 +487,17 @@ test('manifest identity check rejects wrong length and wrong hash', async () => 
 test('offsets format as +hh:mm:ss', () => {
   assert.equal(formatOffset(3725), '+01:02:05');
   assert.equal(formatOffset(0.25), '+00:00:00.250');
+});
+
+test('long instrument ids are abbreviated for display only', () => {
+  const token = 'polymarket:' + '1'.repeat(30) + '987654';
+  assert.equal(
+    displayLabel({ ...BOOKS[1], label: token }),
+    'polymarket:111111…987654',
+  );
+  assert.equal(displayLabel(BOOKS[0]), 'series_moneyline · Cloud9');
+  assert.equal(
+    displayLabel({ ...BOOKS[0], label: 'kalshi:KXLOLGAME-X' }),
+    'kalshi:KXLOLGAME-X',
+  );
 });

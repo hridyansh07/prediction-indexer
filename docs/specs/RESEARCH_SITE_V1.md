@@ -31,8 +31,9 @@ These carry over from cb53652 §0, adapted:
 
 1. **Python computes; the site is static.** Nothing in the site computes
    economics, masks or book state. It renders built files.
-2. **No new API server.** The site reads static files from one base URL. The
-   corpus tables are queried with DuckDB in the browser.
+2. **No new API server, no query engine in the browser.** The site reads static
+   JSON files from one base URL. The Parquet tables are for offline analysis
+   only (DuckDB-WASM was dropped by the user's decision).
 3. **The backend records; the frontend filters.** The builder applies no
    depth, value or latency threshold. A minimum episode duration (default
    100 ms) and a minimum net are display filters.
@@ -221,7 +222,8 @@ OUT_DIR/
   <version>/
     manifest.json                      corpus manifest
     verify.json
-    events.parquet, episodes.parquet, summary.json, viability.md
+    events.parquet, episodes.parquet       offline analysis only
+    events.json, summary.json, viability.md
     events/<bundle_id>/
       manifest.json                    pack manifest
       overview.json, availability.json, game.json
@@ -406,6 +408,7 @@ nothing filtered:
 |---|---|---|
 | `events.parquet` | Corpus result | `bundle_id`, `event_id`, `corpus_key`, `state` (`ok`, `uncommitted`, `receipt_invalid`, `context_invalid`), `message`, `pack` (`ok`, `no_profile`, `build_failed`, or null), `pack_error`, `context`, `game`, `title`, `capture_start_ns` (int64), `duration_s`, `venues`, `book_count`, `scope_count`, `game_state`, `bench_status`; per lens `<lens>_state`, `<lens>_error`, `<lens>_episodes`, `<lens>_headline`, `<lens>_max_net` |
 | `episodes.parquet` | Episode, every lens | `bundle_id`, `lens`, `episode_id`, `kind`, `start_ns`, `end_ns` (int64), `duration_ms` (float64), `books`, `markets`, `venues`, `venue_pair`, `censored`, `end_reason`, `net` (float64, null without a fill), `net_exact` (string), `net_unit`, `quantity` (float64), `seconds_to_capture_end`, `route_id`, `shares_leg_with`, `dedup_group`, `game`, `market_types` |
+| `events.json` | Corpus result | The `events.parquet` rows for the site, `capture_start_ns` as a decimal string, plus the lens list (name, label, adapter) |
 | `summary.json` | Lens | Fixed-edge histograms: episodes per event, duration (log edges, 1 ms to 1 h), net and quantity; each with and without the 100 ms filter; counts of events per lens state |
 
 - `shares_leg_with` counts the other episodes of the same event, lens and kind
@@ -467,8 +470,8 @@ Existing routes are unchanged. The nav gains "Research".
 - Load `current.json`, then the corpus manifest, then pack manifests. Every
   file fetch checks byte length and SHA-256 (`crypto.subtle`) against its
   manifest. A mismatch shows an error state; data is never shown unverified.
-- The corpus tables load in **DuckDB-WASM** over the Parquet files, after the
-  same identity check. Queries are fixed templates with bound parameters.
+- The corpus view reads only `summary.json` and `events.json`, after the same
+  identity check. Sorting and filtering are client-side over that index.
 - **Local development:** `RESEARCH_CORPUS_DIR=<OUT_DIR>` makes the Vite dev
   server serve that directory read-only under `/corpus/`, and
   `VITE_CORPUS_BASE_URL` defaults to `/corpus` in development. `/research`
@@ -477,13 +480,15 @@ Existing routes are unchanged. The nav gains "Research".
 
 ### 5.2 Corpus view
 
-- **Headline**, from `summary.json` and DuckDB: events, mean and median
-  headline episodes per event, share of events with at least one, total net;
-  per lens, with a per-route / deduplicated toggle.
-- **Filters:** game, venue pair, lens, minimum duration (default 100 ms) and
-  minimum net. Filters change the display only and show "n hidden by filter".
-- **Distributions:** episodes per event, duration (log scale, with the 100 ms
-  line), net and quantity.
+- **Headline**, from `summary.json`: events counted, mean and median headline
+  episodes per event, share of events with at least one, total and largest
+  net; per lens, with a per-route / deduplicated toggle and a ≥ 100 ms / all
+  durations toggle (the two precomputed views), showing how many episodes the
+  100 ms filter hides.
+- **Distributions** from `summary.json`'s fixed-edge histograms: episodes per
+  event, duration (with the 100 ms line), net and quantity.
+- **Event filters** over `events.json`: search, game and lens state. They
+  change the display only and show "n hidden by filter".
 - **Events table:** title, game, date, venues, books, context and game-state
   badges, per-lens episode count and max net, and a lens state badge (`failed`
   and `excluded` show their reason). Sortable. A row with a pack opens the
@@ -535,7 +540,7 @@ Budgets:
 
 `node --test` view-model tests (offline, a hand-authored pack): bucket-to-path
 breaks at gaps; the zoom-tier choice; the twin grouping; the game bracket and
-as-of logic; the overlay density collapse; filter counts; the manifest identity
+as-of logic; the overlay density collapse; event filter counts and sorting; the manifest identity
 check.
 
 ## 6. Tests and acceptance

@@ -168,6 +168,7 @@ def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=prin
             "events.parquet": tables.parquet_bytes(event_rows, tables.event_schema(list(config["lenses"]))),
             "episodes.parquet": tables.parquet_bytes(episodes, tables.EPISODE_SCHEMA),
             "verify.json": dumps({"verify_version": 1, "checks": checks}),
+            "events.json": dumps(tables.events_index(config, event_rows)),
         }
         summary = tables.summarize(config, event_rows, episodes)
         tables_out["summary.json"] = dumps(summary)

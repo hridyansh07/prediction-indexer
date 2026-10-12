@@ -480,14 +480,25 @@ export function maskAfter(data: ChartData, t: number): ChartData {
   };
 }
 
-/** A y range in cents across every book and bucket, so hiding a book never rescales. */
-export function fixedYRange(data: ChartData): [number, number] {
+/**
+ * A y range in cents across every book (hidden or not) within the visible span, so
+ * hiding a book never rescales the chart, while zooming in does.
+ */
+export function fixedYRange(
+  data: ChartData,
+  view?: [number, number],
+): [number, number] {
   let lo = Infinity;
   let hi = -Infinity;
   for (const book of data.books) {
     for (const values of [book.bid, book.ask]) {
-      for (const v of values) {
-        if (v === null) continue;
+      for (let i = 0; i < values.length; i += 1) {
+        const v = values[i];
+        if (
+          v === null ||
+          (view && (data.x[i] < view[0] || data.x[i] > view[1]))
+        )
+          continue;
         lo = Math.min(lo, v);
         hi = Math.max(hi, v);
       }
@@ -539,6 +550,15 @@ export function legendGroups(books: PackBook[]): LegendGroup[] {
     }
   }
   return groups;
+}
+
+/** A display label: long instrument ids (78-digit Polymarket tokens) are abbreviated; the full id stays in the manifest. */
+export function displayLabel(book: PackBook): string {
+  const label = book.label;
+  const match = /^([a-z]+):(\d{20,})$/.exec(label);
+  return match
+    ? `${match[1]}:${match[2].slice(0, 6)}…${match[2].slice(-6)}`
+    : label;
 }
 
 export function twinCount(books: PackBook[]): number {
@@ -669,70 +689,120 @@ export function nextMoment(
   return best;
 }
 
-// ---------------------------------------------------------------- corpus filters
+// ---------------------------------------------------------------- corpus index
 
-export interface EpisodeRow {
+export interface HistogramSpec {
+  edges: number[];
+  counts: number[];
+}
+
+export interface LensStats {
+  events: number;
+  episodes: number;
+  dedup_episodes: number;
+  events_with_one: number;
+  share_with_one: number | null;
+  per_event_mean: number | null;
+  per_event_median: number | null;
+  dedup_per_event_mean: number | null;
+  dedup_per_event_median: number | null;
+  net_total: number;
+  net_max: number | null;
+  histograms: Record<
+    'per_event' | 'duration_ms' | 'net' | 'quantity',
+    HistogramSpec
+  >;
+}
+
+export interface LensSummary {
+  label: string;
+  adapter: string;
+  states: Record<LensStateName, number>;
+  headline_kind?: string;
+  value_unit?: string;
+  all?: LensStats;
+  min_100ms?: LensStats;
+}
+
+export interface CorpusSummary {
+  summary_version: number;
+  min_duration_ms: number;
+  events: Record<string, number>;
+  packs: number;
+  lenses: Record<string, LensSummary>;
+}
+
+export type EventRow = {
   bundle_id: string;
-  lens: string;
-  kind: string;
-  duration_ms: number;
-  net: number | null;
-  quantity: number | null;
+  event_id: string | null;
+  corpus_key: string | null;
+  state: string;
+  message: string | null;
+  pack: string | null;
+  pack_error: string | null;
+  context: string;
   game: string | null;
-  venue_pair: string;
+  title: string | null;
+  capture_start_ns: string | null;
+  duration_s: number | null;
+  venues: string[] | null;
+  book_count: number | null;
+  scope_count: number | null;
+  game_state: string | null;
+  bench_status: string | null;
+} & Record<string, string | number | string[] | null>;
+
+export interface EventsIndex {
+  events_version: number;
+  lenses: { lens: string; label: string; adapter: string }[];
+  events: EventRow[];
 }
 
-export interface EpisodeFilter {
-  lens: string;
-  kind: string;
-  minDurationMs: number;
-  minNet: number | null;
+export interface EventFilter {
+  query: string;
   game: string | null;
-  venuePair: string | null;
+  lens: string;
+  lensState: LensStateName | null;
 }
 
-/** The display filter: rows shown and how many the filter hid (never silently). */
-export function filterEpisodes(
-  rows: EpisodeRow[],
-  filter: EpisodeFilter,
-): { shown: EpisodeRow[]; hidden: number } {
-  const scoped = rows.filter(
-    (r) =>
-      r.lens === filter.lens &&
-      r.kind === filter.kind &&
-      (filter.game === null || r.game === filter.game) &&
-      (filter.venuePair === null || r.venue_pair === filter.venuePair),
+/** The display filter over the events table: rows shown and how many it hid (never silently). */
+export function filterEvents(
+  rows: EventRow[],
+  filter: EventFilter,
+): { shown: EventRow[]; hidden: number } {
+  const query = filter.query.trim().toLowerCase();
+  const shown = rows.filter(
+    (row) =>
+      (filter.game === null || row.game === filter.game) &&
+      (filter.lensState === null ||
+        row[`${filter.lens}_state`] === filter.lensState) &&
+      (!query ||
+        `${row.title ?? ''} ${row.bundle_id} ${row.game ?? ''}`
+          .toLowerCase()
+          .includes(query)),
   );
-  const shown = scoped.filter(
-    (r) =>
-      r.duration_ms >= filter.minDurationMs &&
-      (filter.minNet === null || (r.net !== null && r.net >= filter.minNet)),
-  );
-  return { shown, hidden: scoped.length - shown.length };
+  return { shown, hidden: rows.length - shown.length };
 }
 
-/** Counts per ``[edges[i], edges[i+1])`` with underflow and overflow buckets, as summary.json. */
-export function histogram(values: number[], edges: number[]): number[] {
-  const counts = new Array(edges.length + 1).fill(0);
-  for (const value of values) {
-    let index = 0;
-    while (index < edges.length && value >= edges[index]) index += 1;
-    counts[index] += 1;
-  }
-  return counts;
-}
-
-export function perEventCounts(rows: EpisodeRow[], events: string[]): number[] {
-  const counts = new Map(events.map((e) => [e, 0]));
-  for (const row of rows)
-    if (counts.has(row.bundle_id))
-      counts.set(row.bundle_id, (counts.get(row.bundle_id) ?? 0) + 1);
-  return events.map((e) => counts.get(e) ?? 0);
-}
-
-export function median(values: number[]): number | null {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const m = sorted.length >> 1;
-  return sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+/** Stable sort with nulls last in either direction; nanosecond strings compare as integers. */
+export function sortEvents(
+  rows: EventRow[],
+  key: string,
+  desc: boolean,
+): EventRow[] {
+  const value = (row: EventRow) => {
+    const v = row[key];
+    if (v === null || v === undefined) return null;
+    if (key.endsWith('_ns') && typeof v === 'string') return BigInt(v);
+    return Array.isArray(v) ? v.join(',') : v;
+  };
+  return rows
+    .map((row, index) => ({ row, index, v: value(row) }))
+    .sort((a, b) => {
+      if (a.v === null || b.v === null)
+        return a.v === b.v ? a.index - b.index : a.v === null ? 1 : -1;
+      const order = a.v < b.v ? -1 : a.v > b.v ? 1 : 0;
+      return (desc ? -order : order) || a.index - b.index;
+    })
+    .map((entry) => entry.row);
 }

@@ -76,7 +76,7 @@ their drawer closes.
 - `/replay/new` — authenticated desktop Replay request workflow
 - `/replay/admin` — admin-only allowlist management
 - `/replay/jobs/:jobId/output` — reserved Coming soon route
-- `/research` — corpus view over research tables (DuckDB-WASM over verified Parquet)
+- `/research` — corpus view: lens statistics from `summary.json`, events from `events.json`
 - `/research/events/:bundleId` — event terminal over one research pack
 
 Replay production paths use Universe directly. URL fixture controls remain for
@@ -98,8 +98,22 @@ RESEARCH_CORPUS_DIR=../.bench/research/out yarn workspace prediction-indexer-tar
 ```
 
 `VITE_CORPUS_BASE_URL` defaults to `/corpus` in development, which that variable
-serves read-only. The research routes are lazy-loaded; DuckDB-WASM loads only on
-`/research`.
+serves read-only. The research routes are lazy-loaded. The Parquet tables in a
+build are for offline analysis; the site does not read them.
+
+An opt-in end-to-end test drives the production build in the system Chrome
+(playwright-core, no browser download) against a real research build and a local
+fixture Universe; it is not part of `yarn test`:
+
+```bash
+RESEARCH_CORPUS_DIR=../.bench/research/out yarn workspace prediction-indexer-targeter-ui e2e:research
+```
+
+It checks every event page (console and request errors, a drawn chart, the
+legend, lens states, first and last episodes per lens, raw-tile zoom, cursor
+readouts against the JSON files, playback, 390 px layout and the 3 MB first-paint
+budget) and the existing routes, and writes screenshots and `report.json` to
+`E2E_OUTPUT` (default: a temporary directory).
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.

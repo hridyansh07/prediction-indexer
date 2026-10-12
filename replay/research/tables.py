@@ -119,6 +119,16 @@ def event_schema(lenses):
     return pa.schema(fields)
 
 
+def events_index(config, event_rows):
+    """``events.json``: the events table for the site, with nanosecond times as decimal strings."""
+    rows = [{**row, "capture_start_ns": None if row["capture_start_ns"] is None else str(row["capture_start_ns"])}
+            for row in event_rows]
+    return {"events_version": 1,
+            "lenses": [{"lens": name, "label": lens["label"], "adapter": lens["adapter"]}
+                       for name, lens in config["lenses"].items()],
+            "events": rows}
+
+
 def parquet_bytes(rows, schema):
     table = pa.Table.from_pylist(rows, schema=schema)
     sink = io.BytesIO()

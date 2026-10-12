@@ -29,6 +29,7 @@ interface Props {
   onReset: () => void;
   onLayout: (layout: PlotLayout) => void;
   onHover?: (t: number | null) => void;
+  tier?: string;
 }
 
 // Tick steps in seconds that read as clock times, from 1 ms to 6 h.
@@ -220,24 +221,31 @@ export function ResearchChart(props: Props) {
       instance.destroy();
       plot.current = null;
     };
-    // Rebuilt when the data or the drawing style changes; view and cursor only redraw.
+    // Rebuilt when the data or the drawing style changes; the view, y range and
+    // cursor update the existing plot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    props.data,
-    props.styles,
-    props.hidden,
-    props.highlight,
-    props.midOnly,
-    props.yRange,
-  ]);
+  }, [props.data, props.styles, props.hidden, props.highlight, props.midOnly]);
 
   useEffect(() => {
-    plot.current?.setScale('x', { min: props.view[0], max: props.view[1] });
-  }, [props.view]);
+    const instance = plot.current;
+    if (!instance) return;
+    instance.batch(() => {
+      instance.setScale('x', { min: props.view[0], max: props.view[1] });
+      instance.setScale('y', { min: props.yRange[0], max: props.yRange[1] });
+    });
+  }, [props.view, props.yRange]);
 
   useEffect(() => {
     plot.current?.redraw(false);
   }, [props.cursor]);
 
-  return <div className="research-chart" ref={host} />;
+  return (
+    <div
+      className="research-chart"
+      ref={host}
+      data-tier={props.tier}
+      data-stepped={String(props.data.stepped)}
+      data-points={props.data.x.length}
+    />
+  );
 }

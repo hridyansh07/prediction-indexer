@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueries } from '@tanstack/react-query';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import {
   packFile,
   researchKeys,
@@ -16,6 +16,7 @@ import {
 } from './research-chart';
 import {
   chooseTier,
+  displayLabel,
   fixedYRange,
   formatOffset,
   formatUtc,
@@ -178,11 +179,21 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
   const okLenses = Object.entries(pack.lenses).filter(
     ([, l]) => l.state === 'ok' && l.overlay,
   );
-  const [lens, setLens] = useState<string>(
-    () => (okLenses.find(([n]) => n === 'cross') ?? okLenses[0])?.[0] ?? '',
-  );
+  const [params] = useSearchParams();
+  const [lens, setLens] = useState<string>(() => {
+    const asked = params.get('lens');
+    if (asked !== null && (asked === '' || okLenses.some(([n]) => n === asked)))
+      return asked;
+    return (okLenses.find(([n]) => n === 'cross') ?? okLenses[0])?.[0] ?? '';
+  });
   const [view, setViewState] = useState<[number, number]>(full);
-  const [cursor, setCursor] = useState<number | null>(null);
+  // ?t=<seconds since capture start> sets the cursor, so a moment can be linked.
+  const [cursor, setCursor] = useState<number | null>(() => {
+    const t = Number(params.get('t'));
+    return params.get('t') !== null && Number.isFinite(t)
+      ? Math.max(0, Math.min(end, t))
+      : null;
+  });
   const [hover, setHover] = useState<number | null>(null);
   const [hidden, setHidden] = useState<Set<number>>(() => new Set());
   const [midOnly, setMidOnly] = useState(false);
@@ -250,8 +261,8 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
     [baseChart, fullHistory, cursor],
   );
   const yRange = useMemo<[number, number]>(
-    () => (overviewChart ? fixedYRange(overviewChart) : [0, 100]),
-    [overviewChart],
+    () => (baseChart ? fixedYRange(baseChart, view) : [0, 100]),
+    [baseChart, view],
   );
   const styles = useMemo(() => bookStyles(pack.books), [pack.books]);
   const highlight = useMemo(
@@ -343,6 +354,14 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
     }
   };
 
+  const selectedIndex = selected
+    ? items.findIndex((item) => item.id === selected.id)
+    : -1;
+  const stepEpisode = (index: number) => {
+    if (items.length)
+      selectEpisode(items[Math.max(0, Math.min(items.length - 1, index))]);
+  };
+
   const readoutAt = hover ?? cursor;
   const readout =
     chart && readoutAt !== null ? valuesAt(chart, readoutAt) : null;
@@ -358,7 +377,9 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
         <span className="eyebrow">
           EVENT RESEARCH · {pack.game ?? 'game unknown'}
         </span>
-        <h1>{pack.title}</h1>
+        <h1 className={pack.title === pack.bundle_id ? 'untitled' : undefined}>
+          {pack.title}
+        </h1>
         <p>
           {pack.books.length} books ·{' '}
           {new Set(pack.books.map((b) => b.venue)).size} venues ·{' '}
@@ -447,6 +468,7 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
             onReset={() => setView(full)}
             onLayout={setLayout}
             onHover={setHover}
+            tier={tileKind && tilesReady ? tier : 'overview'}
           />
         ) : (
           <div className="empty-state">Loading the overview…</div>
@@ -492,6 +514,7 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
           max={end}
           step={Math.max(0.001, end / 5000)}
           value={cursor ?? 0}
+          data-cursor={cursor ?? ''}
           aria-label="Cursor"
           onChange={(e) => setCursor(Number(e.target.value))}
         />
@@ -547,10 +570,10 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
                 />
                 <Swatch style={styles[book.book]} />
                 <span>
-                  <span className="legend-label">
+                  <span className="legend-label" title={book.instrument}>
                     {group.books.length > 1
-                      ? (book.market_id ?? book.label)
-                      : book.label}
+                      ? (book.market_id ?? displayLabel(book))
+                      : displayLabel(book)}
                   </span>
                   <span className="legend-venue">
                     {book.venue}
@@ -611,9 +634,12 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
                     <tr
                       key={b.book}
                       className={highlight?.has(b.book) ? 'highlight' : ''}
+                      data-book={b.book}
+                      data-bid={readout[b.book].bid ?? ''}
+                      data-ask={readout[b.book].ask ?? ''}
                     >
-                      <td>
-                        <Swatch style={styles[b.book]} /> {b.label}
+                      <td title={b.instrument}>
+                        <Swatch style={styles[b.book]} /> {displayLabel(b)}
                       </td>
                       <td>{b.venue}</td>
                       <td>{cents(readout[b.book].bid)}</td>
@@ -633,6 +659,36 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
                 ? lensState.label
                 : 'No lens'}
           </h3>
+          {lensState && items.length > 0 && (
+            <div className="episode-nav" role="group" aria-label="Episodes">
+              <button type="button" onClick={() => stepEpisode(0)}>
+                First
+              </button>
+              <button
+                type="button"
+                disabled={selectedIndex <= 0}
+                onClick={() => stepEpisode(selectedIndex - 1)}
+              >
+                Previous
+              </button>
+              <span className="mono small">
+                {selectedIndex >= 0 ? selectedIndex + 1 : '—'} / {items.length}
+              </span>
+              <button
+                type="button"
+                disabled={selectedIndex >= items.length - 1}
+                onClick={() => stepEpisode(selectedIndex + 1)}
+              >
+                Next
+              </button>
+              <button
+                type="button"
+                onClick={() => stepEpisode(items.length - 1)}
+              >
+                Last
+              </button>
+            </div>
+          )}
           {selected ? (
             <EpisodePanel
               item={selected}
@@ -643,8 +699,9 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
             />
           ) : lensState ? (
             <p className="muted">
-              {items.length} episodes. Click one in the lens track. Net values
-              are modeled apparent edge at open, not returns.
+              {items.length} episodes, in time order. Click one in the lens
+              track or step through them. Net values are modeled apparent edge
+              at open, not returns.
             </p>
           ) : (
             <p className="muted">Choose a lens to overlay its episodes.</p>
@@ -669,7 +726,7 @@ function LensStates({ pack }: { pack: PackManifest }) {
             />
             {state.state === 'ok' &&
               state.episodes !== undefined &&
-              ` ${state.episodes} episodes`}
+              ` ${state.episodes} episode${state.episodes === 1 ? '' : 's'}`}
             {(state.error || state.reason) && (
               <span className="reason">{state.error ?? state.reason}</span>
             )}
@@ -729,7 +786,11 @@ function EpisodePanel(props: {
       ))}
       <div>
         <dt>Books</dt>
-        <dd>{item.books.map((b) => pack.books[b]?.label).join(' + ')}</dd>
+        <dd>
+          {item.books
+            .map((b) => (pack.books[b] ? displayLabel(pack.books[b]) : b))
+            .join(' + ')}
+        </dd>
       </div>
       {Object.entries(detail)
         .filter(([k]) => k !== 'legs' && k !== 'end_books' && k !== 'kind')
