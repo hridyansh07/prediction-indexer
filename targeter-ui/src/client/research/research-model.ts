@@ -166,6 +166,8 @@ export interface GameEvent {
   latest_ns: string;
   exact: boolean;
   known_at_ns: string;
+  /** 'provisional' until windows are calibrated from the corpus; null without a window. */
+  window_status: 'provisional' | 'calibrated' | null;
   detail: Record<string, unknown>;
 }
 
@@ -177,6 +179,10 @@ export interface GameDocument {
     string,
     { label: string | null; participant: number | null } | null
   > | null;
+  windows: {
+    status: 'provisional' | 'calibrated';
+    bases: Record<string, unknown>;
+  };
   events: GameEvent[];
 }
 
@@ -589,6 +595,26 @@ export interface GameMark {
 }
 
 /** A bracket spans the window; a diamond only when exact; a scheduled start is a dashed line. */
+/** The hover text for a game mark; a provisional window says it is not calibrated. */
+export function gameMarkTitle(mark: GameMark, captureStartNs: bigint): string {
+  const event = mark.event;
+  const lines = [
+    event.label,
+    `${event.time_basis} · source ${formatOffset(offsetSeconds(event.source_ns, captureStartNs))}`,
+  ];
+  if (event.window_status !== null) {
+    lines.push(
+      `window ${formatOffset(mark.x0)} – ${formatOffset(mark.x1)}` +
+        (event.window_status === 'provisional'
+          ? ' (provisional starting value, not calibrated from the corpus)'
+          : ' (calibrated)'),
+    );
+  }
+  if (event.detail && Object.keys(event.detail).length)
+    lines.push(JSON.stringify(event.detail));
+  return lines.join('\n');
+}
+
 export function gameMarks(
   events: GameEvent[],
   captureStartNs: bigint,

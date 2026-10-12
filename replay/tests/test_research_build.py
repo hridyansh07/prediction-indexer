@@ -75,6 +75,7 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(pack["lenses"]["complement"], {"label": "Same-venue complement", "state": "not_run"})
         self.assertEqual(pack["unmapped_groups"], ["coverage"])
         self.assertEqual(pack["game_state"]["state"], "no_source")
+        self.assertEqual(pack["game_state"]["windows"], "provisional")
         self.assertEqual(pack["tiles"]["1s"], ["0", "10", "20"])
         availability = read_json(self.base / "events" / OK / "availability.json")
         self.assertEqual([len(b["intervals"]) for b in availability["books"]], [2, 0, 0])

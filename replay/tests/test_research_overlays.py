@@ -102,6 +102,11 @@ class GameTest(unittest.TestCase):
         scheduled = by_kind["scheduled_start"]
         self.assertEqual((scheduled["exact"], scheduled["known_at_ns"]), (False, str(T0)))
         self.assertEqual(by_kind["match_end"]["detail"]["score"], {"home": 1, "away": 3})
+        self.assertEqual({e["kind"]: e["window_status"] for e in events},
+                         {"scheduled_start": None, "segment_start": "provisional", "segment_end": "provisional",
+                          "settlement": None, "match_end": "provisional"})
+        document = game.game_json(self.DOCUMENT, "archive", CONFIG["game_time_windows"], "provisional")
+        self.assertEqual(document["windows"]["status"], "provisional")
 
     def test_states(self):
         self.assertEqual(game.game_json(None, "no_context", CONFIG["game_time_windows"])["state"], "no_source")

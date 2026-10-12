@@ -21,6 +21,7 @@ import {
   formatOffset,
   formatUtc,
   gameMarks,
+  gameMarkTitle,
   gameSummaryAt,
   gridsToChart,
   knownAt,
@@ -899,7 +900,7 @@ function Tracks(props: TrackProps) {
             const x0 = toPx(mark.x0);
             const x1 = toPx(mark.x1);
             if (x1 < 0 || x0 > width) return null;
-            const title = `${mark.event.label}\n${mark.event.time_basis} · source ${formatOffset(offsetSeconds(mark.event.source_ns, start))}\nwindow ${formatOffset(mark.x0)} – ${formatOffset(mark.x1)}${mark.event.detail && Object.keys(mark.event.detail).length ? `\n${JSON.stringify(mark.event.detail)}` : ''}`;
+            const title = gameMarkTitle(mark, start);
             const faded =
               known !== null &&
               mark.shape !== 'scheduled' &&

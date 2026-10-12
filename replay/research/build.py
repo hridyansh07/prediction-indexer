@@ -73,7 +73,7 @@ def build_pack(event, root, config, game_state_root):
     pack.put("overview.json", overview)
     pack.put("availability.json", availability_document(profile, books))
     document, how = game.prepared_document(event, game_state_root)
-    game_json = game.game_json(document, how, config["game_time_windows"])
+    game_json = game.game_json(document, how, config["game_time_windows"], config["game_time_windows_status"])
     pack.put("game.json", game_json)
 
     lenses, rows = {}, []
@@ -92,7 +92,8 @@ def build_pack(event, root, config, game_state_root):
         "pack_version": PACK_VERSION, **header, "bundle_id": event.bundle_id, "context": event.context_state,
         "capture_start_ns": str(capture_start), "capture_end_ns": str(capture_end), "scopes": scopes,
         "books": books, "lenses": lenses, "unmapped_groups": event.unmapped_groups,
-        "game_state": {"state": game_json["state"], "reason": game_json["reason"], "file": "game.json"},
+        "game_state": {"state": game_json["state"], "reason": game_json["reason"], "file": "game.json",
+                       "windows": config["game_time_windows_status"]},
         "provenance": {"corpus_key": event.corpus_key, "corpus_receipt_sha256": event.receipt_sha256,
                        "attempt": event.attempt, "snapshot_sha256": event.result["context"]["snapshot_sha256"],
                        "source_commit": event.result["image"].get("source_commit"),

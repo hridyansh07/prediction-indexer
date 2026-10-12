@@ -8,6 +8,7 @@ import {
   fixedYRange,
   formatOffset,
   gameMarks,
+  gameMarkTitle,
   gameSummaryAt,
   gridsToChart,
   IdentityError,
@@ -258,6 +259,7 @@ const GAME: GameDocument = {
     home: { label: 'Cloud9', participant: 0 },
     away: { label: 'LYON', participant: 1 },
   },
+  windows: { status: 'provisional', bases: {} },
   events: [
     {
       kind: 'scheduled_start',
@@ -269,6 +271,7 @@ const GAME: GameDocument = {
       latest_ns: ns(100),
       exact: false,
       known_at_ns: ns(100),
+      window_status: null,
       detail: {},
     },
     {
@@ -281,6 +284,7 @@ const GAME: GameDocument = {
       latest_ns: ns(505),
       exact: false,
       known_at_ns: ns(505),
+      window_status: 'provisional',
       detail: {},
     },
     {
@@ -293,6 +297,7 @@ const GAME: GameDocument = {
       latest_ns: ns(600),
       exact: true,
       known_at_ns: ns(600),
+      window_status: null,
       detail: {},
     },
   ],
@@ -512,4 +517,13 @@ test('an empty VITE_CORPUS_BASE_URL falls back to /corpus in dev only', () => {
     resolveCorpusBase('https://cdn.example/corpus/', false),
     'https://cdn.example/corpus',
   );
+});
+
+test('a provisional game window says so in its hover text', () => {
+  const [, bracket, diamond] = gameMarks(GAME.events, T0);
+  assert.match(
+    gameMarkTitle(bracket, T0),
+    /provisional starting value, not calibrated/,
+  );
+  assert.doesNotMatch(gameMarkTitle(diamond, T0), /window/);
 });

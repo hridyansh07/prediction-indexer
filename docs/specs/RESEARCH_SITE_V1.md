@@ -124,6 +124,7 @@ group names to lenses:
     "close_minus_duration": {"before_ms": 2000, "after_ms": 65000},
     "kalshi_milestone_end": {"before_ms": 2000, "after_ms": 5000}
   },
+  "game_time_windows_status": "provisional",
   "overview_max_buckets": 2048,
   "tile_minutes": 10
 }
@@ -135,6 +136,11 @@ group names to lenses:
   (`net`, the fill kind, for the fill lenses). Every kind is still recorded.
 - `value_scale` and `value_unit` read a fill result's `value` (the strategy's
   `fill_value`, scale 36 in the valuation's quote asset).
+- `game_time_windows` are cb53652 §A3's starting values, not yet calibrated from
+  the corpus (that measurement is a follow-up). `game_time_windows_status` is
+  `provisional` until it is `calibrated`; the status is carried into `game.json`,
+  each windowed event and the pack manifest, and the site says a provisional
+  window is not calibrated, so a bracket is never read as calibrated.
 - Groups the config does not map (`coverage`, which is being dropped from the
   corpus) are listed per event under `unmapped_groups`. They are not lenses.
   The LP screen is not a lens.
@@ -277,7 +283,8 @@ No absolute local path is written anywhere in a version.
              "multi": {"state": "excluded", "label": "...", "reason": "..."},
              "cover_same": {"state": "not_run", "label": "..."}},
   "unmapped_groups": ["coverage"],
-  "game_state": {"state": "ok|incomplete|no_source", "file": "game.json"},
+  "game_state": {"state": "ok|incomplete|no_source", "reason": "...", "file": "game.json",
+                 "windows": "provisional|calibrated"},
   "provenance": {"corpus_key": "...", "corpus_receipt_sha256": "...", "attempt": "...",
                  "snapshot_sha256": "...", "source_commit": "...", "source_dirty": false,
                  "bench_status": "SUCCESS"},
@@ -346,9 +353,10 @@ book's own `(instrument, orientation)` (entity `book:<sha256>`), in order:
 ### 2.6 `game.json`
 
 `{"game_version": 1, "state": "ok|incomplete|no_source", "reason", "source",
-"competitors", "events": [...]}`. Each event is
+"competitors", "windows": {"status", "bases"}, "events": [...]}`. Each event is
 `{kind, segment, label, time_basis, source_ns, earliest_ns, latest_ns, exact,
-known_at_ns, detail}`:
+known_at_ns, window_status, detail}`, where `window_status` is the config's
+`game_time_windows_status` for a windowed event and `null` otherwise:
 
 | Prepared fact | `kind` | `time_basis` | Window |
 |---|---|---|---|

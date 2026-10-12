@@ -37,8 +37,12 @@ def _side(competitors, side):
     return None if entry is None else entry.get("label") or side
 
 
-def game_events(document, windows):
-    """Every fact of a prepared document as a windowed game event, in time order."""
+def game_events(document, windows, status="provisional"):
+    """Every fact of a prepared document as a windowed game event, in time order.
+
+    ``window_status`` says whether a window is calibrated or still the provisional
+    starting value from the config; an exact or scheduled time has no window.
+    """
     events = []
 
     def add(kind, segment, label, basis, source_ns, detail):
@@ -52,7 +56,8 @@ def game_events(document, windows):
         events.append({"kind": kind, "segment": segment, "label": label, "time_basis": basis,
                        "source_ns": str(source_ns), "earliest_ns": str(source_ns - before),
                        "latest_ns": str(latest), "exact": basis == "market_settlement",
-                       "known_at_ns": str(latest), "detail": detail})
+                       "known_at_ns": str(latest), "window_status": None if window is None else status,
+                       "detail": detail})
 
     competitors = document.get("competitors")
     noun = (document.get("segment_kind") or "segment").capitalize()
@@ -77,14 +82,16 @@ def game_events(document, windows):
     return events
 
 
-def game_json(document, how, windows):
+def game_json(document, how, windows, status="provisional"):
+    window_info = {"status": status, "bases": windows}
     if document is None:
         return {"game_version": GAME_VERSION, "state": "no_source", "reason": how, "source": None,
-                "competitors": None, "events": []}
+                "competitors": None, "windows": window_info, "events": []}
     if document["state"] == "ok":
         state, reason = "ok", None
     else:
         state = "incomplete" if document["reason"] == "incomplete" else "no_source"
         reason = document["reason"]
     return {"game_version": GAME_VERSION, "state": state, "reason": reason, "source": document.get("source"),
-            "competitors": document.get("competitors"), "events": game_events(document, windows)}
+            "competitors": document.get("competitors"), "windows": window_info,
+            "events": game_events(document, windows, status)}

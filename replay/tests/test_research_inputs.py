@@ -119,6 +119,10 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ResearchError):
             research_config.validate(value)
         value = self.config()
+        value["game_time_windows_status"] = "measured"
+        with self.assertRaises(ResearchError):
+            research_config.validate(value)
+        value = self.config()
         del value["lenses"]["profile"]
         with self.assertRaises(ResearchError):
             research_config.validate(value)

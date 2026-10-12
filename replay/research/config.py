@@ -8,7 +8,9 @@ from pathlib import Path
 
 from replay.research.jsonio import ResearchError, require
 
-FIELDS = {"research_version", "lenses", "game_time_windows", "overview_max_buckets", "tile_minutes"}
+FIELDS = {"research_version", "lenses", "game_time_windows", "game_time_windows_status", "overview_max_buckets",
+          "tile_minutes"}
+WINDOW_STATUSES = ("provisional", "calibrated")
 PROFILE_FIELDS = {"group", "adapter", "label"}
 EPISODE_FIELDS = PROFILE_FIELDS | {"headline_kind", "value_scale", "value_unit"}
 WINDOW_BASES = ("kalshi_market_close", "close_minus_duration", "kalshi_milestone_end")
@@ -70,6 +72,8 @@ def validate(value):
         _closed(window, {"before_ms", "after_ms"}, f"game_time_windows.{basis}")
         _count(window["before_ms"], f"{basis}.before_ms", 0, 86_400_000)
         _count(window["after_ms"], f"{basis}.after_ms", 0, 86_400_000)
+    require(config["game_time_windows_status"] in WINDOW_STATUSES,
+            f"game_time_windows_status must be one of {WINDOW_STATUSES}")
     _count(config["overview_max_buckets"], "overview_max_buckets", 16, 100_000)
     _count(config["tile_minutes"], "tile_minutes", 1, 1440)
     return config

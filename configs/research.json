@@ -18,6 +18,7 @@
     "close_minus_duration": {"before_ms": 2000, "after_ms": 65000},
     "kalshi_milestone_end": {"before_ms": 2000, "after_ms": 5000}
   },
+  "game_time_windows_status": "provisional",
   "overview_max_buckets": 2048,
   "tile_minutes": 10
 }
