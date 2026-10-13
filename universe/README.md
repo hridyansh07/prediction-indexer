@@ -308,6 +308,7 @@ Two independent SQLite files:
 | `derive/` | `projection.py`, `market_projection.py`, `event_identity.py`: bundle history and market projections, identity allocation |
 | `claims/` | `claim_projection.py`, `outcomes.py`: claim reconstruction and the ingestion equivalence check; bundle outcomes read |
 | `api/` | `server.py` (application and HTTP handler), `routes.py` (the ordered route table), `framing.py` (validation, cursors, body framing, error mapping, response budget), `rate_limit.py`, `replay_jobs.py` (auth and job endpoints) |
+| `tools/` | `rebuild_diff.py`: read-only comparison of two Event Universe SQLite files (standalone, imports nothing from Universe) |
 | `jobs/` | `store.py` (durable Replay jobs store) and `auth.py` (SIWE sessions, allowlist); retiring with the jobs UI |
 
 Dependencies point one way: `derive` imports nothing else from Universe;
