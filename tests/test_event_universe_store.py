@@ -1722,9 +1722,9 @@ class EventUniverseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     application.get(path)
 
-    def test_fresh_database_uses_canonical_schema_v6(self) -> None:
+    def test_fresh_database_uses_canonical_schema_v7(self) -> None:
         with sqlite3.connect(self.database.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
             tables = {
                 row[0]
                 for row in connection.execute(

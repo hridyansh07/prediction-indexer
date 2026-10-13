@@ -167,6 +167,26 @@ the claims invent is a guessed equivalence and rejects the run
 `universe_run_projections.claim_relation_shortfall` (and bundles that cannot be
 rebuilt in `unreconstructed_bundles`), visible rather than raised.
 
+### Totals direction corrections (projection version 4)
+
+Universe projects markets from the archived reports' stored catalogue
+parameters, and an old targeter parser could read a Kalshi totals `direction`
+from a team name ("ThunderTalk" as `under`). Projection version 4 re-derives
+`direction` for `kalshi` `total_maps`/`total_goals` markets with the fixed
+whole-word rule from the archived row's own title, first outcome label and event
+participants, and records every difference in
+`universe_run_projection_corrections` (`report_value`, `projected_value`,
+`rule_id`; part of the projection identity). A direction the fixed rule cannot
+find is removed, so the market yields no claim. A corrected market gets a
+different canonical market ID than under version 3. Relations naming a corrected
+market are verified against relationships re-derived from the corrected bundle
+rather than the report's. Archived reports stay untouched. No in-place migration
+exists: the previous schema-v6 file is the rollback and the backup, and version 4
+needs an oldest-first rebuild into a new file. Spec:
+[`docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md`](../docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md);
+compare an old and a rebuilt file read-only with
+`python -m universe.tools.rebuild_diff OLD.sqlite NEW.sqlite`.
+
 ## HTTP API
 
 All responses are strict JSON (sorted keys, `Cache-Control: no-store`) and must
@@ -251,12 +271,12 @@ are exempt. Exceeding the limit returns 429 with `Retry-After`.
 Two independent SQLite files:
 
 - **Event Universe database** (`database_path`): `universe/schema/schema.sql`,
-  `PRAGMA user_version = 6`. There are no in-place migrations. Startup validates
+  `PRAGMA user_version = 7`. There are no in-place migrations. Startup validates
   the stored schema object-for-object against `schema.sql`; any other version or
   modified schema fails with an instruction to stop Universe, remove the SQLite
   file and its WAL/SHM siblings, and run an oldest-first backfill from the
   archive. Tables: `targeter_runs` (exact manifest/report identities),
-  `universe_run_projections`, `umbrella_events`, `venue_events`,
+  `universe_run_projections`, `universe_run_projection_corrections`, `umbrella_events`, `venue_events`,
   `event_observations`, `event_identity_lineage`, `universe_sync_failures`,
   `canonical_markets`, `venue_markets`, `candidate_decisions`,
   `selected_market_occurrences`, `claim_classes`, `claim_relations`,

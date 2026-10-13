@@ -10,7 +10,7 @@ from typing import Iterator
 from universe.store.records import EvidenceConflict
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "schema.sql"
 REBUILD_INSTRUCTION = (
     "remove the rebuildable SQLite file and run backfill from the immutable archive"
