@@ -237,6 +237,69 @@ async function cursorValue(page: Page): Promise<number> {
   );
 }
 
+async function readLayers(page: Page) {
+  return page.$$eval('.research-layers .lens-chip-wrap', (wraps) =>
+    wraps.map((wrap) => {
+      const button = wrap.querySelector('button')!;
+      return {
+        lens: wrap.getAttribute('data-lens') ?? '',
+        disabled: button.disabled,
+        on: button.getAttribute('aria-pressed') === 'true',
+        text: (wrap as HTMLElement).innerText,
+      };
+    }),
+  );
+}
+
+/** Click chips until exactly ``wanted`` layers are on. */
+async function setLayers(page: Page, wanted: string[]) {
+  for (const chip of await readLayers(page)) {
+    if (chip.on !== wanted.includes(chip.lens))
+      await page
+        .locator(`.lens-chip-wrap[data-lens="${chip.lens}"] button`)
+        .click();
+  }
+  await page.waitForFunction(
+    (names) =>
+      [...document.querySelectorAll('.lens-track')]
+        .map((t) => t.getAttribute('data-lens'))
+        .join(',') === names.join(','),
+    wanted,
+    { timeout: 15_000 },
+  );
+  await sleep(150);
+}
+
+async function trackLenses(page: Page) {
+  return page.$$eval('.lens-track', (tracks) =>
+    tracks.map((t) => t.getAttribute('data-lens') ?? ''),
+  );
+}
+
+async function listedEpisodes(page: Page) {
+  return page.$$eval('.episode-list button', (rows) =>
+    rows.map(
+      (r) => `${r.getAttribute('data-lens')}:${r.getAttribute('data-episode')}`,
+    ),
+  );
+}
+
+/** The expected merged order: start time, then layer (pack lens) order, then file order. */
+function mergedKeys(lenses: string[], overlays: Record<string, Json[]>) {
+  return lenses
+    .flatMap((lens, layer) =>
+      overlays[lens].map((item) => ({
+        key: `${lens}:${item.id}`,
+        start: BigInt(item.start_ns),
+        layer,
+      })),
+    )
+    .sort((a, b) =>
+      a.start !== b.start ? (a.start < b.start ? -1 : 1) : a.layer - b.layer,
+    )
+    .map((e) => e.key);
+}
+
 async function readout(page: Page) {
   return page.$$eval('table.readout tbody tr', (rows) =>
     rows.map((row) => ({
@@ -505,42 +568,81 @@ async function eventPage(
     fullPage: true,
   });
 
-  // c) lens selector.
-  const options = await page.$$eval(
-    '.research-toolbar select option',
-    (nodes) =>
-      nodes.map((n) => ({
-        value: (n as HTMLOptionElement).value,
-        disabled: (n as HTMLOptionElement).disabled,
-        text: n.textContent ?? '',
-      })),
-  );
+  // c) lens layers: one chip per lens; ok lenses switch on, the rest show their state.
+  const chips = await readLayers(page);
   const lenses = Object.entries(pack.lenses as Record<string, Json>).filter(
     ([name]) => name !== 'profile',
   );
   const okNames = lenses
     .filter(([, l]) => l.state === 'ok' && l.overlay)
-    .map(([n]) => n)
-    .sort();
-  const enabled = options
-    .filter((o) => o.value && !o.disabled)
-    .map((o) => o.value)
-    .sort();
+    .map(([n]) => n);
+  const overlays: Record<string, Json[]> = Object.fromEntries(
+    okNames.map((n) => [
+      n,
+      readJson(path.join(packDir, 'overlays', `${n}.json`)).items as Json[],
+    ]),
+  );
+  const enabled = chips.filter((c) => !c.disabled).map((c) => c.lens);
   check(
     report,
-    'lens selector enables exactly the ok lenses',
-    JSON.stringify(enabled) === JSON.stringify(okNames),
-    { enabled, okNames },
+    'a chip per lens; exactly the ok lenses can be switched on',
+    chips.length === lenses.length &&
+      JSON.stringify(enabled) === JSON.stringify(okNames),
+    { chips: chips.map((c) => c.lens), enabled, okNames },
   );
-  for (const [name, state] of lenses.filter(
-    ([, l]) => l.state === 'failed' || l.state === 'excluded',
-  )) {
-    const option = options.find((o) => o.value === name);
+  const defaults = okNames.includes('cross') ? ['cross'] : okNames.slice(0, 1);
+  check(
+    report,
+    'default layers: cross only',
+    JSON.stringify(chips.filter((c) => c.on).map((c) => c.lens)) ===
+      JSON.stringify(defaults) &&
+      JSON.stringify(await trackLenses(page)) === JSON.stringify(defaults),
+    { on: chips.filter((c) => c.on).map((c) => c.lens) },
+  );
+  for (const [name, state] of lenses.filter(([, l]) => l.state !== 'ok')) {
+    const chip = chips.find((c) => c.lens === name);
     const reason = String(state.error ?? state.reason ?? '').slice(0, 40);
     check(
       report,
-      `${name} disabled with its reason`,
-      !!option && option.disabled && option.text.includes(reason),
+      `${name} chip disabled with its state and reason`,
+      !!chip &&
+        chip.disabled &&
+        chip.text.toLowerCase().includes(state.state.replace('_', ' ')) &&
+        chip.text.includes(reason),
+      { chip },
+    );
+  }
+
+  // Context labels: real title, market labels and the context's market status.
+  if (pack.context === 'ok') {
+    const heading = await page.locator('.research-heading h1').innerText();
+    const labels = await page.$$eval('.legend-entry .legend-label', (nodes) =>
+      nodes.map((n) => n.textContent ?? ''),
+    );
+    check(
+      report,
+      'title and book labels come from the context, not the degrade path',
+      heading === pack.title &&
+        !heading.includes(bundle) &&
+        pack.books.every((b: Json) => b.label !== b.instrument) &&
+        labels.some((l) => pack.books.some((b: Json) => l === b.label)),
+      { heading },
+    );
+    const statuses = await page.$$eval('.legend-entry', (entries) =>
+      entries.map(
+        (e) => e.querySelector('.market-status')?.textContent ?? null,
+      ),
+    );
+    const wanted = pack.books
+      .map((b: Json) => b.market_status)
+      .filter((v: string | null) => v)
+      .sort();
+    check(
+      report,
+      "legend shows every book's market status",
+      JSON.stringify(statuses.filter((v) => v).sort()) ===
+        JSON.stringify(wanted),
+      { statuses: [...new Set(statuses)] },
     );
   }
 
@@ -579,16 +681,21 @@ async function eventPage(
     );
   }
 
-  // d) e) each ok lens: first and last episode; raw zoom around a short one.
+  // d) e) each ok lens alone: first and last episode; raw zoom around a short one.
   let zoomShot = false;
   for (const name of okNames) {
-    const overlay = readJson(path.join(packDir, 'overlays', `${name}.json`));
-    const items: Json[] = overlay.items;
+    const items = mergedKeys([name], overlays).map(
+      (key) => overlays[name].find((i) => `${name}:${i.id}` === key)!,
+    );
+    await setLayers(page, [name]);
     if (!items.length) {
-      check(report, `${name}: lens with no episodes still selectable`, true);
+      check(
+        report,
+        `${name}: a layer with no episodes can be switched on`,
+        (await listedEpisodes(page)).length === 0,
+      );
       continue;
     }
-    await page.selectOption('.research-toolbar select', name);
     await page.waitForSelector('.episode-nav', { timeout: 15_000 });
     for (const [label, item] of [
       ['First', items[0]],
@@ -675,6 +782,114 @@ async function eventPage(
       });
       check(report, `${name}: zoom back out to the overview`, true);
     }
+  }
+
+  // k) layers stack and come off: cross + another lens, then cross off.
+  const withEpisodes = okNames.filter((n) => overlays[n].length > 0);
+  const second = withEpisodes.includes('multi')
+    ? 'multi'
+    : withEpisodes.find((n) => n !== 'cross');
+  if (withEpisodes.includes('cross') && second) {
+    const pair = okNames.filter((n) => n === 'cross' || n === second);
+    await setLayers(page, pair);
+    await page.locator('button', { hasText: 'Reset zoom' }).click();
+    const listed = await listedEpisodes(page);
+    const expectedPair = mergedKeys(pair, overlays);
+    check(
+      report,
+      `cross + ${second}: one track per layer, every episode listed in time order`,
+      JSON.stringify(await trackLenses(page)) === JSON.stringify(pair) &&
+        JSON.stringify(listed) === JSON.stringify(expectedPair),
+      { tracks: await trackLenses(page), listed: listed.length },
+    );
+    check(
+      report,
+      `cross + ${second}: shareable URL`,
+      new URL(page.url()).searchParams.get('lenses') === pair.join(','),
+      { url: page.url() },
+    );
+    await page
+      .locator(`.episode-list button[data-lens="${second}"]`)
+      .first()
+      .click();
+    await page.waitForSelector('dl.episode');
+    const panel = await page.locator('dl.episode').innerText();
+    check(
+      report,
+      `${second}: clicking a listed episode selects it`,
+      panel.includes(pack.lenses[second].label),
+    );
+    await page.locator('button', { hasText: 'Reset zoom' }).click();
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await sleep(300);
+    await page.screenshot({
+      path: path.join(OUTPUT, `${bundle}-layers.png`),
+      fullPage: true,
+    });
+    // Turning the second layer off removes its track, its episodes and its selection.
+    await setLayers(page, ['cross']);
+    const afterOff = await listedEpisodes(page);
+    check(
+      report,
+      `${second} off: its track, episodes and selection disappear`,
+      JSON.stringify(await trackLenses(page)) === '["cross"]' &&
+        afterOff.length === overlays.cross.length &&
+        afterOff.every((k) => k.startsWith('cross:')) &&
+        (await page.locator('dl.episode').count()) === 0,
+      { afterOff: afterOff.length },
+    );
+    // Cross off with the other on: the cross overlay and episodes are gone.
+    await setLayers(page, [second]);
+    const crossOff = await listedEpisodes(page);
+    check(
+      report,
+      `cross off: only ${second} remains`,
+      JSON.stringify(await trackLenses(page)) === JSON.stringify([second]) &&
+        crossOff.length === overlays[second].length &&
+        crossOff.every((k) => k.startsWith(`${second}:`)),
+      { crossOff: crossOff.length },
+    );
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await sleep(300);
+    await page.screenshot({
+      path: path.join(OUTPUT, `${bundle}-cross-off.png`),
+      fullPage: true,
+    });
+    // A shared link restores the set, order-independent; the older ?lens= still works.
+    const shared = await browser.newPage({
+      viewport: { width: 1440, height: 1100 },
+    });
+    watch(shared, report);
+    for (const [query, wanted] of [
+      [`lenses=${[...pair].reverse().join(',')},bogus`, pair],
+      [`lens=${second}`, [second]],
+      ['lenses=', []],
+    ] as const) {
+      await shared.goto(`${BASE}/research/events/${bundle}?${query}`);
+      await shared.waitForSelector('.research-layers', { timeout: 30_000 });
+      await shared
+        .waitForFunction(
+          (names) =>
+            [...document.querySelectorAll('.lens-track')]
+              .map((t) => t.getAttribute('data-lens'))
+              .join(',') === names.join(','),
+          [...wanted],
+          { timeout: 15_000 },
+        )
+        .catch(() => null);
+      const on = (await readLayers(shared))
+        .filter((c) => c.on)
+        .map((c) => c.lens);
+      check(
+        report,
+        `?${query} opens with ${wanted.join(',') || 'no layer'}`,
+        JSON.stringify(on) === JSON.stringify(wanted) &&
+          JSON.stringify(await trackLenses(shared)) === JSON.stringify(wanted),
+        { on },
+      );
+    }
+    await shared.close();
+    await setLayers(page, ['cross']);
   }
 
   // g) playback.

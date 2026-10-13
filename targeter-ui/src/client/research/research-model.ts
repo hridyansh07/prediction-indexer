@@ -47,6 +47,8 @@ export interface PackBook {
   venue: string;
   market_id: string | null;
   market_type: string | null;
+  /** The venue's status string in the context snapshot, verbatim; null without context. */
+  market_status?: string | null;
   label: string;
   claim_id: string | null;
   price_scale: number;
@@ -702,6 +704,64 @@ export function lensMarks(
 
 export function metric(item: IntervalItem, name: string): Metric | undefined {
   return item.metrics.find((m) => m.name === name);
+}
+
+// ---------------------------------------------------------------- lens layers
+
+/**
+ * Active lens layers from ``?lenses=a,b`` (order-independent; unknown or unavailable
+ * names ignored; empty for none) or the older ``?lens=a``. With neither, ``cross``
+ * if available, else the first available lens. Returned in ``available`` order.
+ */
+export function parseLayers(
+  params: URLSearchParams,
+  available: string[],
+): string[] {
+  const many = params.get('lenses');
+  const one = params.get('lens');
+  const asked =
+    many !== null
+      ? many.split(',').map((name) => name.trim())
+      : one !== null
+        ? [one]
+        : available.includes('cross')
+          ? ['cross']
+          : available.slice(0, 1);
+  return available.filter((name) => asked.includes(name));
+}
+
+/** Search params with ``lenses`` set to ``layers`` and the older ``lens`` removed. */
+export function withLayers(
+  params: URLSearchParams,
+  layers: string[],
+): URLSearchParams {
+  const next = new URLSearchParams(params);
+  next.delete('lens');
+  next.set('lenses', layers.join(','));
+  return next;
+}
+
+export interface LayerEpisode {
+  key: string;
+  lens: string;
+  item: IntervalItem;
+}
+
+/** Episodes of every layer in time order: start, then layer order, then file order. */
+export function mergeEpisodes(
+  layers: { lens: string; items: IntervalItem[] }[],
+): LayerEpisode[] {
+  const merged = layers.flatMap(({ lens, items }, layer) =>
+    items.map((item) => ({
+      layer,
+      start: BigInt(item.start_ns),
+      episode: { key: `${lens}:${item.id}`, lens, item },
+    })),
+  );
+  merged.sort((a, b) =>
+    a.start !== b.start ? (a.start < b.start ? -1 : 1) : a.layer - b.layer,
+  );
+  return merged.map((m) => m.episode);
 }
 
 // ---------------------------------------------------------------- moments

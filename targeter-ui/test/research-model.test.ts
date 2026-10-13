@@ -16,13 +16,16 @@ import {
   legendGroups,
   lensMarks,
   maskAfter,
+  mergeEpisodes,
   nextMoment,
+  parseLayers,
   rawToChart,
   resolveCorpusBase,
   sortEvents,
   tilesInRange,
   valuesAt,
   verifyIdentity,
+  withLayers,
   type EventRow,
   type GameDocument,
   type GridDocument,
@@ -369,6 +372,65 @@ test('sub-pixel episodes collapse into a density strip with counts', () => {
   assert.deepEqual(
     zoomed.map((m) => m.kind),
     ['item', 'item'],
+  );
+});
+
+test('lens layers come from ?lenses=, the older ?lens=, or default to cross', () => {
+  const available = ['complement', 'cross', 'multi'];
+  const layers = (query: string, from = available) =>
+    parseLayers(new URLSearchParams(query), from);
+  assert.deepEqual(layers(''), ['cross']);
+  assert.deepEqual(layers('', ['multi', 'complement']), ['multi']);
+  assert.deepEqual(layers('', []), []);
+  // Order-independent, returned in lens order; unknown or unavailable names ignored.
+  assert.deepEqual(layers('lenses=multi,cross'), ['cross', 'multi']);
+  assert.deepEqual(layers('lenses=multi,bogus,cover_same'), ['multi']);
+  assert.deepEqual(layers('lenses='), []);
+  assert.deepEqual(layers('lens=multi'), ['multi']);
+  assert.deepEqual(layers('lens='), []);
+  assert.deepEqual(layers('lens=bogus'), []);
+  // ?lenses= wins over ?lens=, and writing layers drops ?lens= and keeps the rest.
+  assert.deepEqual(layers('lens=complement&lenses=multi'), ['multi']);
+  const next = withLayers(new URLSearchParams('lens=cross&t=12'), [
+    'cross',
+    'multi',
+  ]);
+  assert.equal(next.toString(), 't=12&lenses=cross%2Cmulti');
+  assert.deepEqual(parseLayers(next, available), ['cross', 'multi']);
+  assert.deepEqual(
+    parseLayers(withLayers(next, []), available),
+    [],
+    'turning every layer off is a shareable empty set',
+  );
+});
+
+test('episodes of every active layer merge in time order, tagged with their lens', () => {
+  const cross = [item('x1', 10, 20), item('x2', 50, 60), item('x3', 50, 51)];
+  const multi = [item('m1', 5, 6), item('m2', 50, 55)];
+  const merged = mergeEpisodes([
+    { lens: 'cross', items: cross },
+    { lens: 'multi', items: multi },
+  ]);
+  assert.deepEqual(
+    merged.map((e) => e.key),
+    ['multi:m1', 'cross:x1', 'cross:x2', 'cross:x3', 'multi:m2'],
+  );
+  assert.equal(merged[0].item, multi[0]);
+  // Turning a layer off removes exactly its episodes.
+  const crossOnly = mergeEpisodes([{ lens: 'cross', items: cross }]);
+  assert.deepEqual(
+    crossOnly.map((e) => e.key),
+    ['cross:x1', 'cross:x2', 'cross:x3'],
+  );
+  assert.deepEqual(mergeEpisodes([]), []);
+  // The same episode id in two lenses stays two distinct rows.
+  const twice = mergeEpisodes([
+    { lens: 'cross', items: [item('same', 1, 2)] },
+    { lens: 'multi', items: [item('same', 1, 2)] },
+  ]);
+  assert.deepEqual(
+    twice.map((e) => e.key),
+    ['cross:same', 'multi:same'],
   );
 });
 

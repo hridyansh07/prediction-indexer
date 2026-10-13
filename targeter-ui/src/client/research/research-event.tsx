@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
 import { useQueries } from '@tanstack/react-query';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import {
@@ -28,17 +36,21 @@ import {
   legendGroups,
   lensMarks,
   maskAfter,
+  mergeEpisodes,
   metric,
   nextMoment,
   offsetSeconds,
+  parseLayers,
   rawToChart,
   tilesInRange,
   valuesAt,
+  withLayers,
   type AvailabilityDocument,
   type ChartData,
   type GameDocument,
   type GridDocument,
   type IntervalItem,
+  type LayerEpisode,
   type OverlayDocument,
   type PackBook,
   type PackManifest,
@@ -62,6 +74,24 @@ const VENUE_DASH: Record<string, number[]> = {
   polymarket: [],
   limitless: [2, 3],
 };
+// One fixed colour per lens layer, from the same reference ramps; layers are drawn on
+// their own labelled rows, never on the price lines.
+const LENS_COLORS: Record<string, string> = {
+  complement: '#c98500',
+  cross: '#199e70',
+  multi: '#3987e5',
+  cover_same: '#d55181',
+  cover_cross: '#9085e9',
+};
+const LENS_SHORT: Record<string, string> = {
+  complement: 'Compl.',
+  cross: 'Cross',
+  multi: 'Multi',
+  cover_same: 'Cov. S',
+  cover_cross: 'Cov. X',
+};
+const lensColor = (lens: string) => LENS_COLORS[lens] ?? '#9595a3';
+const lensShort = (lens: string) => LENS_SHORT[lens] ?? lens.slice(0, 6);
 const TILE_MINUTES = 10;
 const SPEEDS = [1, 10, 60, 300];
 
@@ -173,20 +203,43 @@ function useTiles(
   });
 }
 
+function useOverlays(corpus: Corpus, pack: PackManifest, layers: string[]) {
+  return useQueries({
+    queries: layers.map((lens) => {
+      const name = pack.lenses[lens].overlay ?? '';
+      return {
+        queryKey: researchKeys.file(
+          corpus.pointer.version,
+          pack.bundle_id,
+          name,
+        ),
+        queryFn: () => packFile<OverlayDocument>(corpus, pack, name),
+        staleTime: Number.POSITIVE_INFINITY,
+        gcTime: 10 * 60_000,
+        retry: false,
+      };
+    }),
+  });
+}
+
 function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
   const start = BigInt(pack.capture_start_ns);
   const end = offsetSeconds(pack.capture_end_ns, start);
   const full: [number, number] = useMemo(() => [0, end], [end]);
-  const okLenses = Object.entries(pack.lenses).filter(
-    ([, l]) => l.state === 'ok' && l.overlay,
+  const available = useMemo(
+    () =>
+      Object.entries(pack.lenses)
+        .filter(([, l]) => l.state === 'ok' && l.overlay)
+        .map(([name]) => name),
+    [pack.lenses],
   );
-  const [params] = useSearchParams();
-  const [lens, setLens] = useState<string>(() => {
-    const asked = params.get('lens');
-    if (asked !== null && (asked === '' || okLenses.some(([n]) => n === asked)))
-      return asked;
-    return (okLenses.find(([n]) => n === 'cross') ?? okLenses[0])?.[0] ?? '';
-  });
+  // The URL holds the active layers (?lenses=a,b), so a view can be shared.
+  const [params, setParams] = useSearchParams();
+  const layersKey = parseLayers(params, available).join(',');
+  const layers = useMemo(
+    () => (layersKey ? layersKey.split(',') : []),
+    [layersKey],
+  );
   const [view, setViewState] = useState<[number, number]>(full);
   // ?t=<seconds since capture start> sets the cursor, so a moment can be linked.
   const [cursor, setCursor] = useState<number | null>(() => {
@@ -199,7 +252,7 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
   const [hidden, setHidden] = useState<Set<number>>(() => new Set());
   const [midOnly, setMidOnly] = useState(false);
   const [fullHistory, setFullHistory] = useState(true);
-  const [selected, setSelected] = useState<IntervalItem | null>(null);
+  const [selected, setSelected] = useState<LayerEpisode | null>(null);
   const [layout, setLayout] = useState<PlotLayout>({ left: 52, width: 800 });
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(60);
@@ -212,11 +265,31 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
     'availability.json',
   );
   const game = usePackFile<GameDocument>(corpus, pack, 'game.json');
-  const overlay = usePackFile<OverlayDocument>(
-    corpus,
-    pack,
-    lens ? (pack.lenses[lens].overlay ?? null) : null,
+  const overlays = useOverlays(corpus, pack, layers);
+  const overlayError = overlays.find((o) => o.error)?.error as
+    | Error
+    | undefined;
+  const overlayStamp = overlays.map((o) => o.dataUpdatedAt).join(',');
+  const episodes = useMemo(
+    () =>
+      mergeEpisodes(
+        layers.map((lens, i) => ({
+          lens,
+          items: overlays[i]?.data?.items ?? [],
+        })),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [layersKey, overlayStamp],
   );
+  const items = useMemo(() => episodes.map((e) => e.item), [episodes]);
+  const toggleLayer = (lens: string) => {
+    const on = layers.includes(lens);
+    const next = available.filter((l) =>
+      l === lens ? !on : layers.includes(l),
+    );
+    if (on && selected?.lens === lens) setSelected(null);
+    setParams(withLayers(params, next), { replace: true });
+  };
 
   const setView = useCallback(
     ([a, b]: [number, number]) => {
@@ -267,10 +340,9 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
   );
   const styles = useMemo(() => bookStyles(pack.books), [pack.books]);
   const highlight = useMemo(
-    () => (selected ? new Set(selected.books) : null),
+    () => (selected ? new Set(selected.item.books) : null),
     [selected],
   );
-  const items = useMemo(() => overlay.data?.items ?? [], [overlay.data]);
   const unusableEverywhere = useMemo(() => {
     const set = new Set<number>();
     overview.data?.books.forEach(
@@ -331,14 +403,17 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
     }
   }, [playing, cursor, view, span, setView]);
 
-  const selectEpisode = (item: IntervalItem) => {
-    setSelected(item);
-    const s = offsetSeconds(item.start_ns, start);
-    const e = offsetSeconds(item.end_ns, start);
-    const pad = Math.max(2, (e - s) * 2);
-    setView([s - pad, e + pad]);
-    setCursor(s);
-  };
+  const selectEpisode = useCallback(
+    (episode: LayerEpisode) => {
+      setSelected(episode);
+      const s = offsetSeconds(episode.item.start_ns, start);
+      const e = offsetSeconds(episode.item.end_ns, start);
+      const pad = Math.max(2, (e - s) * 2);
+      setView([s - pad, e + pad]);
+      setCursor(s);
+    },
+    [start, setView],
+  );
 
   const jumpNext = () => {
     const next = nextMoment(
@@ -356,21 +431,27 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
   };
 
   const selectedIndex = selected
-    ? items.findIndex((item) => item.id === selected.id)
+    ? episodes.findIndex((e) => e.key === selected.key)
     : -1;
   const stepEpisode = (index: number) => {
-    if (items.length)
-      selectEpisode(items[Math.max(0, Math.min(items.length - 1, index))]);
+    if (episodes.length)
+      selectEpisode(
+        episodes[Math.max(0, Math.min(episodes.length - 1, index))],
+      );
   };
 
   const readoutAt = hover ?? cursor;
   const readout =
     chart && readoutAt !== null ? valuesAt(chart, readoutAt) : null;
   const toPx = (t: number) => ((t - view[0]) / span) * layout.width;
-  const lensState = lens ? pack.lenses[lens] : null;
   const groups = legendGroups(pack.books);
   const firstPaintError =
-    overview.error ?? availability.error ?? game.error ?? overlay.error;
+    overview.error ?? availability.error ?? game.error ?? overlayError;
+  const trackLayers = layers.map((lens, i) => ({
+    lens,
+    label: pack.lenses[lens].label,
+    items: overlays[i]?.data?.items ?? [],
+  }));
 
   return (
     <>
@@ -395,29 +476,51 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
         )}
       </div>
 
-      <div className="research-toolbar">
-        <label>
-          Research lens{' '}
-          <select
-            value={lens}
-            onChange={(e) => {
-              setLens(e.target.value);
-              setSelected(null);
-            }}
-          >
-            <option value="">No lens</option>
-            {Object.entries(pack.lenses)
-              .filter(([name]) => name !== 'profile')
-              .map(([name, state]) => (
-                <option key={name} value={name} disabled={state.state !== 'ok'}>
+      <div
+        className="research-layers"
+        role="group"
+        aria-label="Research lens layers"
+      >
+        <span className="layers-title">Lens layers</span>
+        {Object.entries(pack.lenses)
+          .filter(([name]) => name !== 'profile')
+          .map(([name, state]) => {
+            const usable = available.includes(name);
+            const on = layers.includes(name);
+            const why = state.error ?? state.reason ?? null;
+            return (
+              <span key={name} className="lens-chip-wrap" data-lens={name}>
+                <button
+                  type="button"
+                  className={`lens-chip${on ? ' on' : ''}`}
+                  aria-pressed={on}
+                  disabled={!usable}
+                  title={state.label}
+                  style={{ '--lens': lensColor(name) } as CSSProperties}
+                  onClick={() => toggleLayer(name)}
+                >
+                  <span className="lens-dot" aria-hidden="true" />
                   {state.label}
-                  {state.state === 'ok'
-                    ? ` (${state.episodes ?? 0})`
-                    : ` — ${state.state.replace('_', ' ')}${state.error || state.reason ? `: ${(state.error ?? state.reason ?? '').slice(0, 80)}` : ''}`}
-                </option>
-              ))}
-          </select>
-        </label>
+                  {usable && (
+                    <span className="lens-count">{state.episodes ?? 0}</span>
+                  )}
+                </button>
+                {state.state !== 'ok' && (
+                  <>
+                    <StateBadge state={state.state} title={why} />
+                    {why && (
+                      <span className="lens-why" title={why}>
+                        {why.length > 60 ? `${why.slice(0, 60)}…` : why}
+                      </span>
+                    )}
+                  </>
+                )}
+              </span>
+            );
+          })}
+      </div>
+
+      <div className="research-toolbar">
         <label className="check">
           <input
             type="checkbox"
@@ -481,9 +584,8 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
           view={view}
           start={start}
           game={game.data}
-          lensLabel={lensState?.label ?? null}
-          items={items}
-          selected={selected}
+          layers={trackLayers}
+          selectedKey={selected?.key ?? null}
           onSelect={selectEpisode}
           onZoom={setView}
           availability={availability.data}
@@ -578,6 +680,15 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
                   </span>
                   <span className="legend-venue">
                     {book.venue}
+                    {book.market_status && (
+                      <span
+                        className="market-status"
+                        data-status={book.market_status}
+                        title="Market status in the committed context snapshot"
+                      >
+                        {book.market_status}
+                      </span>
+                    )}
                     {unusableEverywhere.has(book.book) && (
                       <StateBadge state="no_usable_time" />
                     )}
@@ -654,13 +765,14 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
         </section>
         <section>
           <h3>
-            {selected
-              ? 'Selected episode'
-              : lensState
-                ? lensState.label
-                : 'No lens'}
+            Episodes{' '}
+            <span className="muted small">
+              {layers.length === 0
+                ? '· no layer on'
+                : `· ${episodes.length} across ${layers.map((l) => lensShort(l)).join(', ')}`}
+            </span>
           </h3>
-          {lensState && items.length > 0 && (
+          {episodes.length > 0 && (
             <div className="episode-nav" role="group" aria-label="Episodes">
               <button type="button" onClick={() => stepEpisode(0)}>
                 First
@@ -673,39 +785,50 @@ function Terminal({ corpus, pack }: { corpus: Corpus; pack: PackManifest }) {
                 Previous
               </button>
               <span className="mono small">
-                {selectedIndex >= 0 ? selectedIndex + 1 : '—'} / {items.length}
+                {selectedIndex >= 0 ? selectedIndex + 1 : '—'} /{' '}
+                {episodes.length}
               </span>
               <button
                 type="button"
-                disabled={selectedIndex >= items.length - 1}
+                disabled={selectedIndex >= episodes.length - 1}
                 onClick={() => stepEpisode(selectedIndex + 1)}
               >
                 Next
               </button>
               <button
                 type="button"
-                onClick={() => stepEpisode(items.length - 1)}
+                onClick={() => stepEpisode(episodes.length - 1)}
               >
                 Last
               </button>
             </div>
           )}
+          {layers.length === 0 ? (
+            <p className="muted">
+              Switch on a lens layer to overlay its episodes.
+            </p>
+          ) : (
+            <EpisodeList
+              episodes={episodes}
+              selectedKey={selected?.key ?? null}
+              start={start}
+              onSelect={selectEpisode}
+            />
+          )}
           {selected ? (
             <EpisodePanel
-              item={selected}
-              lens={lens}
+              episode={selected}
               pack={pack}
               corpus={corpus}
               start={start}
             />
-          ) : lensState ? (
-            <p className="muted">
-              {items.length} episodes, in time order. Click one in the lens
-              track or step through them. Net values are modeled apparent edge
-              at open, not returns.
-            </p>
           ) : (
-            <p className="muted">Choose a lens to overlay its episodes.</p>
+            layers.length > 0 && (
+              <p className="muted">
+                Click an episode in a lens row or the list, or step through
+                them. Net values are modeled apparent edge at open, not returns.
+              </p>
+            )
           )}
           <LensStates pack={pack} />
         </section>
@@ -744,21 +867,82 @@ function LensStates({ pack }: { pack: PackManifest }) {
   );
 }
 
+const EpisodeList = memo(function EpisodeList(props: {
+  episodes: LayerEpisode[];
+  selectedKey: string | null;
+  start: bigint;
+  onSelect: (episode: LayerEpisode) => void;
+}) {
+  const list = useRef<HTMLOListElement>(null);
+  // Keep the selected row in view inside the list, without scrolling the page.
+  useEffect(() => {
+    const box = list.current;
+    const row = box?.querySelector<HTMLElement>('[aria-current="true"]');
+    if (!box || !row) return;
+    if (row.offsetTop < box.scrollTop) box.scrollTop = row.offsetTop;
+    else if (
+      row.offsetTop + row.offsetHeight >
+      box.scrollTop + box.clientHeight
+    )
+      box.scrollTop = row.offsetTop + row.offsetHeight - box.clientHeight;
+  }, [props.selectedKey]);
+  return (
+    <ol className="episode-list" ref={list} aria-label="Episodes in time order">
+      {props.episodes.map((episode) => {
+        const s = offsetSeconds(episode.item.start_ns, props.start);
+        const net = metric(episode.item, 'net');
+        const current = episode.key === props.selectedKey;
+        return (
+          <li key={episode.key}>
+            <button
+              type="button"
+              aria-current={current ? 'true' : undefined}
+              data-lens={episode.lens}
+              data-episode={episode.item.id}
+              onClick={() => props.onSelect(episode)}
+            >
+              <span
+                className="lens-tag"
+                style={{ '--lens': lensColor(episode.lens) } as CSSProperties}
+              >
+                {lensShort(episode.lens)}
+              </span>
+              <span className="mono">{formatOffset(s)}</span>
+              <span className="episode-kind">{episode.item.label}</span>
+              <span className="mono episode-net">
+                {net ? `${net.value} ${net.unit}` : '—'}
+              </span>
+            </button>
+          </li>
+        );
+      })}
+    </ol>
+  );
+});
+
 function EpisodePanel(props: {
-  item: IntervalItem;
-  lens: string;
+  episode: LayerEpisode;
   pack: PackManifest;
   corpus: Corpus;
   start: bigint;
 }) {
-  const { item, pack, start } = props;
+  const { pack, start } = props;
+  const { item, lens } = props.episode;
   const s = offsetSeconds(item.start_ns, start);
   const detail = item.detail as Record<string, unknown>;
   return (
     <dl className="episode">
       <div>
         <dt>Lens</dt>
-        <dd>{pack.lenses[props.lens]?.label}</dd>
+        <dd>
+          <span
+            className="lens-tag"
+            style={{ '--lens': lensColor(lens) } as CSSProperties}
+          >
+            {lensShort(lens)}
+          </span>{' '}
+          {pack.lenses[lens]?.label}
+        </dd>
       </div>
       <div>
         <dt>Kind</dt>
@@ -789,7 +973,14 @@ function EpisodePanel(props: {
         <dt>Books</dt>
         <dd>
           {item.books
-            .map((b) => (pack.books[b] ? displayLabel(pack.books[b]) : b))
+            .map((b) => {
+              const book = pack.books[b];
+              if (!book) return String(b);
+              const status = book.market_status
+                ? ` (${book.market_status})`
+                : '';
+              return `${displayLabel(book)} · ${book.venue}${status}`;
+            })
             .join(' + ')}
         </dd>
       </div>
@@ -808,10 +999,9 @@ function EpisodePanel(props: {
         <dd className="mono small">
           corpus {String(pack.provenance.corpus_key ?? '').slice(0, 16)} ·
           semantic{' '}
-          {String(pack.lenses[props.lens]?.semantic_sha256 ?? '').slice(0, 12)}{' '}
-          · snapshot{' '}
-          {String(pack.provenance.snapshot_sha256 ?? '').slice(0, 12)} · version{' '}
-          {props.corpus.pointer.version}
+          {String(pack.lenses[lens]?.semantic_sha256 ?? '').slice(0, 12)} ·
+          snapshot {String(pack.provenance.snapshot_sha256 ?? '').slice(0, 12)}{' '}
+          · version {props.corpus.pointer.version}
         </dd>
       </div>
       {metric(item, 'net') === undefined && (
@@ -828,10 +1018,9 @@ interface TrackProps {
   view: [number, number];
   start: bigint;
   game: GameDocument | undefined;
-  lensLabel: string | null;
-  items: IntervalItem[];
-  selected: IntervalItem | null;
-  onSelect: (item: IntervalItem) => void;
+  layers: { lens: string; label: string; items: IntervalItem[] }[];
+  selectedKey: string | null;
+  onSelect: (episode: LayerEpisode) => void;
   onZoom: (view: [number, number]) => void;
   availability: AvailabilityDocument | undefined;
   books: PackBook[];
@@ -844,7 +1033,6 @@ const ROW = 22;
 function Tracks(props: TrackProps) {
   const { left, width, toPx, start, view } = props;
   const marks = props.game ? gameMarks(props.game.events, start) : [];
-  const lens = lensMarks(props.items, start, view, width);
   const known =
     props.game && props.cursor !== null
       ? new Set(
@@ -956,53 +1144,31 @@ function Tracks(props: TrackProps) {
           })}
         </svg>
       </div>
-      <div className="track">
-        <span className="track-label" style={{ left: -left, width: left }}>
-          Lens
-        </span>
-        <svg width={width} height={ROW} role="img" aria-label="Lens episodes">
-          {props.lensLabel === null && (
+      {props.layers.length === 0 && (
+        <div className="track">
+          <span className="track-label" style={{ left: -left, width: left }}>
+            Lens
+          </span>
+          <svg width={width} height={ROW} role="img" aria-label="Lens layers">
             <text x={6} y={15} className="track-state">
-              No lens selected
+              No lens layer on
             </text>
-          )}
-          {lens.map((mark, i) =>
-            mark.kind === 'item' ? (
-              <rect
-                key={mark.item.id}
-                x={clip(mark.x0)}
-                y={4}
-                width={Math.max(2, clip(mark.x1) - clip(mark.x0))}
-                height={14}
-                rx={2}
-                className={`episode-mark${props.selected?.id === mark.item.id ? ' selected' : ''}${mark.item.detail.kind === 'gross' ? ' gross' : ''}`}
-                onClick={() => props.onSelect(mark.item)}
-              >
-                <title>{`${mark.item.label} · ${mark.item.metrics.map((m) => `${m.name} ${m.value} ${m.unit}`).join(' · ')}`}</title>
-              </rect>
-            ) : (
-              <g key={`d${i}`}>
-                <rect
-                  x={mark.x0}
-                  y={6}
-                  width={mark.x1 - mark.x0}
-                  height={10}
-                  className="density"
-                  opacity={Math.min(1, 0.3 + mark.count / 10)}
-                  onClick={() =>
-                    props.onZoom([
-                      view[0] + (mark.x0 / width) * (view[1] - view[0]) - 1,
-                      view[0] + (mark.x1 / width) * (view[1] - view[0]) + 1,
-                    ])
-                  }
-                >
-                  <title>{`${mark.count} episodes too short to draw at this zoom; click to zoom in`}</title>
-                </rect>
-              </g>
-            ),
-          )}
-        </svg>
-      </div>
+          </svg>
+        </div>
+      )}
+      {props.layers.map((layer) => (
+        <LensTrack
+          key={layer.lens}
+          {...layer}
+          left={left}
+          width={width}
+          view={view}
+          start={start}
+          selectedKey={props.selectedKey}
+          onSelect={props.onSelect}
+          onZoom={props.onZoom}
+        />
+      ))}
       <div className="track">
         <span className="track-label" style={{ left: -left, width: left }}>
           Books
@@ -1037,6 +1203,84 @@ function Tracks(props: TrackProps) {
           })}
         </svg>
       </div>
+    </div>
+  );
+}
+
+function LensTrack(props: {
+  lens: string;
+  label: string;
+  items: IntervalItem[];
+  left: number;
+  width: number;
+  view: [number, number];
+  start: bigint;
+  selectedKey: string | null;
+  onSelect: (episode: LayerEpisode) => void;
+  onZoom: (view: [number, number]) => void;
+}) {
+  const { lens, left, width, view } = props;
+  const marks = lensMarks(props.items, props.start, view, width);
+  const clip = (x: number) => Math.max(0, Math.min(width, x));
+  const color = lensColor(lens);
+  return (
+    <div className="track lens-track" data-lens={lens}>
+      <span
+        className="track-label"
+        style={{ left: -left, width: left }}
+        title={props.label}
+      >
+        {lensShort(lens)}
+      </span>
+      <svg
+        width={width}
+        height={ROW}
+        role="img"
+        aria-label={`${props.label} episodes`}
+      >
+        {marks.map((mark, i) => {
+          if (mark.kind === 'density') {
+            return (
+              <rect
+                key={`d${i}`}
+                x={mark.x0}
+                y={6}
+                width={mark.x1 - mark.x0}
+                height={10}
+                className="density"
+                fill={color}
+                opacity={Math.min(1, 0.3 + mark.count / 10)}
+                onClick={() =>
+                  props.onZoom([
+                    view[0] + (mark.x0 / width) * (view[1] - view[0]) - 1,
+                    view[0] + (mark.x1 / width) * (view[1] - view[0]) + 1,
+                  ])
+                }
+              >
+                <title>{`${mark.count} ${props.label} episodes too short to draw at this zoom; click to zoom in`}</title>
+              </rect>
+            );
+          }
+          const key = `${lens}:${mark.item.id}`;
+          const selected = key === props.selectedKey;
+          return (
+            <rect
+              key={key}
+              x={clip(mark.x0)}
+              y={4}
+              width={Math.max(2, clip(mark.x1) - clip(mark.x0))}
+              height={14}
+              rx={2}
+              className={`episode-mark${selected ? ' selected' : ''}`}
+              fill={selected ? undefined : color}
+              opacity={mark.item.detail.kind === 'gross' && !selected ? 0.5 : 1}
+              onClick={() => props.onSelect({ key, lens, item: mark.item })}
+            >
+              <title>{`${props.label} · ${mark.item.label} · ${mark.item.metrics.map((m) => `${m.name} ${m.value} ${m.unit}`).join(' · ')}`}</title>
+            </rect>
+          );
+        })}
+      </svg>
     </div>
   );
 }

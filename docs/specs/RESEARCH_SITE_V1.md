@@ -171,10 +171,13 @@ Metadata comes from the result's committed `context/context.json`:
 - `title` is the outcomes document's participants joined with ` vs `, else the
   bundle id. `game` is the bundle evidence's `game` (all occurrences agree,
   else `mixed`). `event_id` (Universe) is the outcomes document's `event_id`.
-- Per written book: `venue`, `market_id`, `market_type`, `label`
-  (`<market type> · <outcome label>`), `claim_id` and `price_scale`, from the
-  outcomes document's market row and the scopes' `outcome_books` entry for the
-  book's `(instrument, orientation)` with `negated: false`.
+- Per written book: `venue`, `market_id`, `market_type`, `market_status`,
+  `label` (`<market type> · <outcome label>`), `claim_id` and `price_scale`,
+  from the outcomes document's market row and the scopes' `outcome_books` entry
+  for the book's `(instrument, orientation)` with `negated: false`.
+  `market_status` is the venue's status string as the context snapshot recorded
+  it (for example `determined`, `active`, `open`, `closed`), copied verbatim; it
+  is one value per market, not a history.
 
 **Degrade path (no `context/`).** Results committed before PR #66 have no
 context. The pack is still built: `title` is the bundle id, `game` is `null`,
@@ -275,7 +278,7 @@ No absolute local path is written anywhere in a version.
   "capture_start_ns": "...", "capture_end_ns": "...",
   "scopes": [{"start_ns": "...", "end_ns": "...", "run_id": "...", "scheduled_start_ns": "... or null"}],
   "books": [{"book": 0, "instrument": "...", "orientation": "outcome", "venue": "kalshi",
-             "market_id": "...", "market_type": "... or null", "label": "...",
+             "market_id": "...", "market_type": "... or null", "market_status": "... or null", "label": "...",
              "claim_id": "... or null", "price_scale": 4, "quantity_scale": 2}],
   "lenses": {"cross": {"state": "ok", "label": "...", "semantic_sha256": "...",
                        "overlay": "overlays/cross.json", "episodes": 12},
@@ -518,15 +521,27 @@ As cb53652 §D3, which follows the prototype's interaction design:
   overview is used; from 2 h to 10 min the 1 s tiles; 10 min or less the raw
   tiles as step lines. Tiles are fetched lazily, verified and cached.
 - **Legend:** a checkbox per book with a stable colour; hiding a book never
-  rescales the chart; twins sit together under one claim label; venue on every
-  entry; `context: missing` says labels are instrument ids.
+  rescales the chart; twins sit together under one claim label; venue and the
+  context's `market_status` on every entry (two twins in different states, say
+  `determined` and `open`, are visible at a glance); `context: missing` says
+  labels are instrument ids.
 - **Tracks** on the same time axis: **game** (bracket from `earliest_ns` to
   `latest_ns`, a diamond only when `exact`, a dashed line for a scheduled
-  start); **lens** (the selected lens's intervals; at wide zoom, sub-pixel
-  episodes collapse into a density strip with counts); **books** (unusable
-  intervals per book, hatched, reason on hover).
-- **Lens selector:** "No lens" or any lens with `state: ok`; failed and excluded
-  lenses appear disabled with their reason; `not_run` is listed as such.
+  start); **one row per active lens layer** (its intervals in the layer's
+  colour, so overlapping episodes of different lenses stay readable; at wide
+  zoom, sub-pixel episodes collapse into a density strip with counts);
+  **books** (unusable intervals per book, hatched, reason on hover).
+- **Lens layers:** one toggle chip per lens with an overlay, each with its own
+  fixed colour; any number can be on at once. A lens whose state is not `ok`
+  cannot be switched on, and its chip shows its state (`failed`, `excluded`,
+  `not_run`) with the reason. The active set is in the URL as
+  `?lenses=cross,multi` (a comma list, order-independent, unknown or non-ok
+  names ignored, empty for none); the older `?lens=<name>` maps to one layer.
+  With neither, `cross` is on (else the first `ok` lens).
+- **Episode list:** the episodes of every active layer in time order, each
+  tagged with its lens and colour, with First / Previous / Next / Last over the
+  merged list. Turning a layer off removes its row, its episodes and, if the
+  selected episode was one of them, the selection.
 - **Episode selection:** zooms to the interval with padding and highlights its
   books; the details panel shows lens, kind, duration, end reason, censored,
   every metric with its unit, the detail fields and provenance (corpus key,
@@ -546,13 +561,14 @@ As cb53652 §D3, which follows the prototype's interaction design:
 Budgets:
 
 - the first paint of an event fetches at most 3 MB decoded (manifest, overview,
-  availability, game and the selected overlay); the acceptance reports both the
-  decoded and gzip sizes for the largest event;
+  availability, game and the overlays of the default layers); the acceptance
+  reports both the decoded and gzip sizes for the largest event;
 - pan and zoom stay smooth with 30 books at 2,048 points.
 
 `node --test` view-model tests (offline, a hand-authored pack): bucket-to-path
 breaks at gaps; the zoom-tier choice; the twin grouping; the game bracket and
-as-of logic; the overlay density collapse; event filter counts and sorting; the manifest identity
+as-of logic; the overlay density collapse; the layer URL parsing and the
+merged episode order; event filter counts and sorting; the manifest identity
 check.
 
 ## 6. Tests and acceptance
