@@ -616,6 +616,8 @@ routing table gains a row for research packs and the site.
 - Publishing (cb53652 §B5) to a public bucket with the pointer last.
 - `calibration.json`, once the corpus has game state.
 - Model overlays (`series`, `markers`) from research models.
+- A virtualised episode list. The merged list renders every row; 2,819 rows
+  (e27350b7 cross) are fine, but an event with tens of thousands is not.
 
 ## Open questions
 
