@@ -69,18 +69,16 @@ export function ResearchChart(props: Props) {
         points: { show: false },
       } as const;
       const bidIndex = series.length;
-      series.push({
-        ...base,
-        label: `bid ${index}`,
-        stroke: 'transparent',
-        width: 0,
-      });
-      series.push({
-        ...base,
-        label: `ask ${index}`,
-        stroke: 'transparent',
-        width: 0,
-      });
+      // Thin bid and ask edges, so a one-sided book (no mid) is still drawn.
+      const edge = midOnly
+        ? { stroke: 'transparent', width: 0 }
+        : {
+            stroke: alpha(style.color, dim ? 0.15 : 0.55),
+            width: 1,
+            dash: style.dash,
+          };
+      series.push({ ...base, label: `bid ${index}`, ...edge });
+      series.push({ ...base, label: `ask ${index}`, ...edge });
       series.push({
         ...base,
         label: `mid ${index}`,
