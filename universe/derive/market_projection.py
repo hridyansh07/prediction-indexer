@@ -19,6 +19,8 @@ RELATION_GENERATION_VERSION = 1
 # teams (docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md).
 TOTALS_DIRECTION_RULE_ID = "kalshi-totals-direction-v1"
 _TOTALS_TYPES = frozenset({"total_maps", "total_goals"})
+# The reviewed scope of the rule. It must only grow by an explicit decision.
+TOTALS_DIRECTION_VENUES = frozenset({"kalshi"})
 
 _SYMMETRIC = {"IDENTITY", "MUTUAL_EXCLUSION", "OVERLAP"}
 _DIRECTED = {"IMPLICATION", "REVERSE_IMPLICATION"}
@@ -722,7 +724,10 @@ def _corrected_totals_parameters(
     outcome label as the yes subtitle (only when both labels were published),
     and the event's participants. The raw subtitle is not archived.
     """
-    if source.get("venue") != "kalshi" or source.get("market_type") not in _TOTALS_TYPES:
+    if (
+        source.get("venue") not in TOTALS_DIRECTION_VENUES
+        or source.get("market_type") not in _TOTALS_TYPES
+    ):
         return parameters
     title = source.get("title")
     labels = source.get("outcome_labels")

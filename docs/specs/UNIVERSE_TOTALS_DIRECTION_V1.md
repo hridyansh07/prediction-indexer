@@ -24,8 +24,9 @@ as evidence.
 
 ### Scope
 
-Only `venue == "kalshi"` markets whose `market_type` is `total_maps` or
-`total_goals`. Every other venue, market type and field projects exactly as v3.
+Only markets whose venue is in the single constant `TOTALS_DIRECTION_VENUES`,
+currently `{kalshi}`, and whose `market_type` is `total_maps` or `total_goals`.
+Every other venue, market type and field projects exactly as v3.
 Polymarket and Limitless are deliberately not corrected (see Known gaps).
 
 ### Rule `kalshi-totals-direction-v1`
@@ -88,8 +89,40 @@ new file. To roll back, stop Universe and run the v3 code against the old file.
 ## Known gaps
 
 - Polymarket and Limitless totals are not corrected by this rule, by decision.
-- Affected Polymarket/Limitless totals found by the totals scan: (to be listed
-  here later).
+- Scan result: a scan of all 1,223 bundles and 1,057 totals claims found exactly
+  7 inverted claims, in 6 bundles. All are Kalshi `total_maps` markets labelled
+  "Over N" that were stored as under. These are the expected corrections, and
+  the acceptance set for the rebuild diff:
+  - bundle_7eadbbc9be7138c1a36c0964: kalshi:KXLOLTOTALMAPS-26AUG280500IGTT-4
+    (Over 3.5) and kalshi:KXLOLTOTALMAPS-26AUG280500IGTT-5 (Over 4.5); team
+    "ThunderTalk Gaming"
+  - bundle_6724a13e0c07d5ee5ff643c4: kalshi:KXCS2TOTALMAPS-26SEP281600MIBRUND-3
+    (Over 2.5); team "underw0rld"
+  - bundle_2bd68b388bb9628bad6ad6f8: kalshi:KXCS2TOTALMAPS-26SEP171945YOUUND-3;
+    "underw0rld"
+  - bundle_c3449808ec0bfd3a0b0d3807: kalshi:KXCS2TOTALMAPS-26SEP141945QUINUND-3;
+    "underw0rld"
+  - bundle_82a8b36b01284882c50d3cca: kalshi:KXCS2TOTALMAPS-26SEP010500GROTHU-3;
+    "THUNDER dOWNUNDER"
+  - bundle_10ed769064dd5d86dfcbb083: kalshi:KXCS2TOTALMAPS-26AUG300500GROTHU-3;
+    "THUNDER dOWNUNDER"
+
+  No Polymarket claim was wrong; the "Overtake" events are fine. A correction
+  outside this set after the rebuild needs review before the rebuilt file is
+  adopted. One case to watch is a direction removed because only the unarchived
+  raw subtitle stated it.
+- Limitless (uncorrected, pending a scope decision): soccer `total_goals`
+  markets in Sunderland events are stored as `{"direction": "under", "line": 2.5,
+  "published_line": 3}`. These are the "3 or more goals" market, that is over
+  2.5, flipped by "Sunderland".
+  - Confirmed in bundle_718135a9426746093f1e744a (Universe market:8637f100…),
+    bundle_87498ed23545abc32b6b8aa9 (market:f13b7a80…) and
+    bundle_2853dd2c1412a175d147471c (market:867f9dcc…).
+  - The claim for limitless:387279 in bundle_718135a9… is the low-score set.
+  - Its outcome labels are "Yes"/"No", so the label scan could not see it.
+  - The rule does not correct it until the user decides. Including it means
+    adding `limitless` to `TOTALS_DIRECTION_VENUES`, a matching regression, and
+    widening the corrections table's `rule_id` CHECK.
 - Kalshi markets whose direction came only from the raw subtitle lose it and
   produce no claim until a later archive-side fix exists.
 
