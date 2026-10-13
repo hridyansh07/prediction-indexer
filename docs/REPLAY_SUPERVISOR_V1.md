@@ -38,10 +38,10 @@ The transport's optional `publish_batch_entries` (an integer 1–1024; absent me
 the publisher default of 100) sizes the publisher's buffer only. It is not in the
 expected initial record, but like every transport field it is part of the run
 identity when present. A `run.json` written before the field existed still
-validates. Replay jobs pass their limits preset's value; the narrow bundle entry
+validates. Replay jobs pass their limits preset's value (`small` uses 1024); the narrow bundle entry
 point below does not set it and so uses 100.
 Groups must match strategy keys exactly; `.`, `..`, `publisher`, `ready`,
-`publisher.json`, `result.json`, and `interrupted.json` are reserved.
+`publisher.json`, `publisher.stderr.txt`, `result.json`, and `interrupted.json` are reserved.
 The config is limited to 1 MiB, validated before launching, copied durably as
 `run.json`, and SHA-256 bound to every checkpoint and completion marker.
 Validation independently recomputes the typed composite normalizer descriptor,
@@ -64,7 +64,9 @@ Each importable factory receives deeply immutable context with `run_id`,
 `attempt_id`, `group`, `identity`, strategy `config`, and `output_directory`.
 It returns an object implementing `__call__(cut)` and `finish()`.
 The adapter delivers initial, cut, and terminal records from `replay.streams`,
-reading whole-entry batches (default 128 MiB budget) and ACKing each batch once
+reading up to 1024 whole entries per poll with a byte budget of
+`max(128 MiB, 1024 × max_entry_bytes)` (1 GiB at a 1 MiB entry cap),
+and ACKing each batch once
 after every callback in it returned. Books and cut bodies are live, in-place views
 valid only during that callback; a strategy must copy anything it keeps (see the
 zero-copy hook contract in [REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md)).
@@ -97,8 +99,12 @@ run start time, and active attempt ID/progress. It contains no books or resume
 cursor. Start count and random attempt namespace are durable **before launch**.
 Every retry uses the original pins, empty books, sequence zero, fresh stream/state
 keys and fresh output directory. Failed outputs and small `result.json` diagnostics
-are retained. Child stdout/stderr are discarded rather than growing unbounded or
-being parsed as retry evidence. When `REPLAY_PARTICIPANT_DIAGNOSTICS=1` is set
+are retained. Child stdout and strategy stderr are discarded. Publisher stderr
+is drained with bounded memory and its last 16 KiB is durably written as
+`<attempt-id>/publisher.stderr.txt` after child teardown, on success or failure.
+This raw-byte diagnostic is never parsed as retry evidence and changes no
+identity, receipt or semantic hash. A supervisor crash before teardown may leave
+no stderr file. When `REPLAY_PARTICIPANT_DIAGNOSTICS=1` is set
 (the local bench sets it; production doesn't), a failed strategy participant
 also writes a bounded `failure.json` in its participant directory, with the exit
 code, cause chain and traceback tail. It's for people only: the supervisor never

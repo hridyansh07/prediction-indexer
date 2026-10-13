@@ -136,12 +136,15 @@ class ResultsTests(unittest.TestCase):
             (bench / "run/x/output").mkdir(parents=True); (bench / "in/derivatives").mkdir(parents=True)
             (bench / "result.json").write_text('{"status":"SUCCESS"}')
             (bench / "run/x/output/rows.ndjson").write_text("a\n")
+            (bench / "run/x/publisher.stderr.txt").write_bytes(b"diagnostic\xff\n")
             (bench / "in/derivatives/big").write_text("mounted input")
             sha = results.commit(bench, dest, corpus_key="k", bundle_id="b1", status="SUCCESS", bench_exit=0,
                                  game_state={"state": "ok", "reason": None})
             receipt = results.verify(dest)
             self.assertEqual(hashlib.sha256((dest / results.RECEIPT).read_bytes()).hexdigest(), sha)
-            self.assertEqual([f["path"] for f in receipt["files"]], ["result.json", "run/x/output/rows.ndjson"])
+            self.assertEqual([f["path"] for f in receipt["files"]],
+                             ["result.json", "run/x/output/rows.ndjson", "run/x/publisher.stderr.txt"])
+            self.assertEqual((dest / "run/x/publisher.stderr.txt").read_bytes(), b"diagnostic\xff\n")
             with self.assertRaises(FileExistsError):
                 results.commit(bench, dest, corpus_key="k", bundle_id="b1", status="SUCCESS", bench_exit=0,
                                game_state=None)

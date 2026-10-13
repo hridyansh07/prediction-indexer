@@ -259,6 +259,19 @@ class ProtocolTests(unittest.TestCase):
         _, cuts = apply_all(self, values)
         assert_contract(self, cuts)
 
+    def test_stream_json_rejects_constants_and_invalid_utf8_and_poisons(self):
+        values = records()
+        wire = encoded(values[1])
+        for value in (b"NaN", b"Infinity", b"-Infinity", b'"\xff"'):
+            d = decoder(values)
+            d.apply(encoded(values[0]))
+            # Put the malformed JSON in a body field outside the O(1) guard set,
+            # so only the parser (not an unrelated identity guard) rejects it.
+            raw = wire[:-2] + b',"diagnostic":' + value + b'}}'
+            with self.subTest(value=value), self.assertRaisesRegex(ProtocolError, "malformed JSON"):
+                d.apply(raw)
+            self.assertTrue(d.poisoned)
+
     def test_books_are_live_in_place_and_read_only_mappings(self):
         values = records()
         d = decoder(values)
@@ -419,7 +432,7 @@ class ProtocolTests(unittest.TestCase):
         terminal["body"]["cuts"] = "5"
         with self.assertRaisesRegex(ProtocolError, "terminal count"):
             d.apply(encoded(terminal))
-        for raw in [b'{"version":"1","version":"1"}', b"[", b"NaN", b"\xff"]:
+        for raw in [b'{"version":"1","version":"1"}', b"[", b"NaN", b"Infinity", b"-Infinity", b"\xff"]:
             with self.assertRaises(ProtocolError):
                 decoder(values).apply(raw)
 

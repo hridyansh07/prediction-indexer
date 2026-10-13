@@ -221,7 +221,7 @@ class SupervisorStageTests(unittest.TestCase):
             )
             self.assertEqual(document["transport"]["groups"], ["bundle_coverage"])
             # The preset's publisher batch size flows into the transport config.
-            self.assertEqual(document["transport"]["publish_batch_entries"], 100)
+            self.assertEqual(document["transport"]["publish_batch_entries"], 1024)
 
 
 class ArchiveConflictTests(unittest.TestCase):

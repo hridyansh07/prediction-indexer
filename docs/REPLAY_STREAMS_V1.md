@@ -111,7 +111,9 @@ consumer ship in one image, and a version-1 publisher or consumer is rejected at
 envelope version check.
 
 **Decoder guard set.** Each record is size-checked against `max_entry_bytes` and
-parsed with plain `json.loads` (no duplicate-key or constant hooks). The decoder
+parsed with `orjson.loads` (no duplicate-key hooks; NaN, Infinity and invalid UTF-8
+are rejected). The strict `decode()` used for configs and output readers retains
+its duplicate-key and constant hooks. The decoder
 then checks only O(1) facts: closed envelope, `version == "1"`, run/attempt
 identity, contiguous stream sequence, and per transition: planned book key,
 `previous_revision ==` local revision and `revision == previous + 1`, known decision
@@ -186,9 +188,12 @@ Connect/read/write timeouts are finite. Python uses redis-py with zero retry;
 Rust uses synchronous redis crate commands with no retry. Every SDK poll batches
 `XREADGROUP GROUP ... worker COUNT ... BLOCK ... STREAMS ... >`. Batch count ×
 max entry bytes must fit the local byte budget before reading. The default budget
-is 128 MiB; by default the count is `min(1024, budget // max_entry_bytes)` (128
-entries at a 1 MiB cap). The supervisor adapter uses the same default, raised to
-one entry when the entry cap exceeds it. One cut is one
+is 128 MiB for standalone `Consumer` callers; by default the count is
+`min(1024, budget // max_entry_bytes)` (128 entries at a 1 MiB cap). The supervisor
+adapter explicitly polls up to 1024 entries with a byte budget of
+`max(128 MiB, 1024 × max_entry_bytes)` (1 GiB at the small preset's 1 MiB cap).
+This is a worst-case per-poll payload bound, not a preallocation or a change to
+the Redis retained queue cap. One cut is one
 entry and cannot be split. Publisher bounds entries at buffer insert; the Redis
 script also checks every entry's size and the retained payload byte total before
 any XADD. An entry above `max_entry_bytes` can never fit and remains a fatal
@@ -218,6 +223,8 @@ of the Rust publisher; `RedisSink` is the Redis/Lua adapter behind the
 is one more adapter. The publisher inserts each encoded record (initial, cuts,
 terminal) in wire order. `publish_batch_entries` (`batch`, 1–1024, default 100)
 sets the drain point and the hard capacity `ceil(1.25 × batch)` (125 for 100).
+The replay runner's `small` preset sets 1024 (hard capacity 1280); omitting the
+field still uses 100 for backward compatibility.
 Single-threaded semantics:
 
 - On reaching `batch` buffered entries, one **non-blocking** drain appends as many
@@ -257,7 +264,9 @@ attempt as a `Resource` failure.
 On exit after terminal or failure the CLI prints one stderr diagnostic line,
 `replay-publish: queue_full_waits=N wait_ms=M batches=B mean_batch_entries=X`
 (blocking-drain backoff sleeps, their total time, append calls that wrote at least
-one entry, and entries per such call); it is not persisted or parsed.
+one entry, and entries per such call). The supervisor durably retains the last
+16 KiB of publisher stderr in `publisher.stderr.txt` in the attempt directory;
+it is diagnostic only, never parsed or bound into semantic hashes or receipts.
 Redis maxmemory bounds stream/node/group/hash overhead beyond the payload byte budget.
 Risk/walker limits independently bound the one in-flight cut and retained books;
 consumers retain current books and one bounded batch, not history. Returned cuts

@@ -359,6 +359,7 @@ class BudgetTests(unittest.TestCase):
             "publisher",
             "ready",
             "publisher.json",
+            "publisher.stderr.txt",
             "result.json",
             "interrupted.json",
         ):
@@ -394,6 +395,39 @@ class BudgetTests(unittest.TestCase):
         bad["transport"]["publish_batch"] = 100
         with self.assertRaises(ProtocolError):
             s.validate(bad)
+
+
+class PublisherDiagnosticsTests(unittest.TestCase):
+    def test_stderr_tail_is_bounded_raw_bytes_on_exit_and_deadline(self):
+        payload = bytes(range(256)) * 1024 + b"publisher diagnostic tail\xff\n"
+        for code in (0, 20, 21, None):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                executable = root / "publisher"
+                executable.write_text(
+                    f"#!{sys.executable}\nimport sys, time\n"
+                    f"sys.stderr.buffer.write({payload!r})\nsys.stderr.buffer.flush()\n"
+                    + ("time.sleep(10)\n" if code is None else f"sys.exit({code})\n")
+                )
+                executable.chmod(0o700)
+                c = config(str(executable))
+                c["limits"]["stall_seconds"] = 1
+                st = state()
+                st["active"] = {"id": "a" * 32, "progress": -1}
+                with (root / ".lock").open("a+b") as lock:
+                    result, fatal, interrupted = s.attempt(
+                        root, c, st, Mock(), lock.fileno(), "redis://unused"
+                    )
+                directory = root / st["active"]["id"]
+                self.assertEqual(
+                    (directory / "publisher.stderr.txt").read_bytes(), payload[-16384:]
+                )
+                self.assertFalse(interrupted)
+                self.assertEqual(result["outcome"], "deadline" if code is None else
+                                 "missing_ready" if code == 0 else "participant_failure")
+                self.assertEqual(fatal, code in (0, 20))
+                self.assertEqual(result["identity"], s.identity(c))
+                self.assertFalse(any(directory.glob(".*.open")))
 
 
 class Strategy:
@@ -572,6 +606,7 @@ class SubprocessTests(unittest.TestCase):
         receipt = s.run(c, root, URL)
         self.assertEqual(s.read_success(root), receipt)
         self.assertEqual(s.run(c, root, URL), receipt)
+        self.assertTrue((root / receipt["attempt"] / "publisher.stderr.txt").is_file())
         for group, location in receipt["outputs"].items():
             seq = (root / location / "sequences.txt").read_text().splitlines()
             self.assertEqual(seq, [str(i) for i in range(len(records()))])

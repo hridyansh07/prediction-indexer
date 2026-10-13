@@ -237,7 +237,7 @@ def pairs(values):
 
 def decode(data, limit):
     """Strict JSON for configuration/output readers: duplicate keys and NaN or
-    Infinity constants are rejected. The stream Decoder uses plain json.loads."""
+    Infinity constants are rejected. The stream Decoder uses orjson.loads."""
     require(type(data) is bytes and len(data) <= limit, "entry limit")
     try:
         return json.loads(
@@ -517,9 +517,11 @@ class Decoder:
             raise
 
     def _apply(self, data):
+        import orjson  # Optional replay-redis dependency; strict readers need only stdlib.
+
         require(type(data) is bytes and len(data) <= self.limit, "entry limit")
         try:
-            r = json.loads(data)
+            r = orjson.loads(data)
         except (ValueError, UnicodeError, RecursionError) as e:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)

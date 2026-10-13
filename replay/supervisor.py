@@ -28,21 +28,25 @@ def fsync_directory(path):
         os.close(fd)
 
 
-def write_json_durable(path, value):
+def write_bytes_durable(path, data):
     # Same discipline as archive.common.durable, without importing archive's
     # package initializer (which imports capture-only, uninstalled splices).
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.open")
     try:
         with temporary.open("xb") as f:
-            f.write(
-                (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
-            )
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temporary, path)
         fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_json_durable(path, value):
+    write_bytes_durable(
+        path, (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+    )
 
 
 def read(path):
@@ -250,6 +254,7 @@ def validate(config):
             "publisher",
             "ready",
             "publisher.json",
+            "publisher.stderr.txt",
             "result.json",
             "interrupted.json",
         },
@@ -562,6 +567,9 @@ def stop(children, timeout):
         p.wait()
 
 
+MAX_PUBLISHER_STDERR_BYTES = 16 * 1024
+
+
 def attempt(root, config, state, redis, lock_fd, url):
     import redis as redis_module
 
@@ -572,6 +580,7 @@ def attempt(root, config, state, redis, lock_fd, url):
     t = {**config["transport"], "attempt_id": a["id"]}
     write_json_durable(directory / "publisher.json", t)
     children = {}
+    publisher_stderr = bytearray()
     limits = config["limits"]
     started = last_progress = time.monotonic()
     terminal = None
@@ -593,12 +602,30 @@ def attempt(root, config, state, redis, lock_fd, url):
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if name == "publisher" else subprocess.DEVNULL,
             start_new_session=True,
             pass_fds=(lock_fd,),
             preexec_fn=parent_death,
             env={**os.environ, "REDIS_URL": url},
         )
+        if name == "publisher":
+            os.set_blocking(children[name].stderr.fileno(), False)
+
+    def drain_stderr():
+        process = children.get("publisher")
+        if process is None:
+            return
+        # Bound each poll's work as well as retained memory. No reader thread:
+        # participants are launched with preexec_fn in a single-threaded runner.
+        for _ in range(16):
+            try:
+                chunk = os.read(process.stderr.fileno(), MAX_PUBLISHER_STDERR_BYTES)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            publisher_stderr.extend(chunk)
+            del publisher_stderr[:-MAX_PUBLISHER_STDERR_BYTES]
 
     try:
         launch(
@@ -611,6 +638,7 @@ def attempt(root, config, state, redis, lock_fd, url):
         )
         joined = False
         while True:
+            drain_stderr()
             codes = {name: p.poll() for name, p in children.items()}
             if any(code is not None and code != 0 for code in codes.values()):
                 raise AttemptFailure(
@@ -716,6 +744,11 @@ def attempt(root, config, state, redis, lock_fd, url):
         interrupted = True
     finally:
         stop(children, limits["stop_seconds"])
+        # All writers are stopped; the remaining pipe payload fits in one drain.
+        drain_stderr()
+        if "publisher" in children:
+            children["publisher"].stderr.close()
+        write_bytes_durable(directory / "publisher.stderr.txt", publisher_stderr)
     codes = {name: p.returncode for name, p in children.items()}
     # A late fatal exit must never be hidden by a transport error or Redis ACKs.
     fatal = fatal or any(c > 0 and c != 21 for c in codes.values())

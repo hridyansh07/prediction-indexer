@@ -14,6 +14,9 @@ from replay.streams.protocol import freeze, require
 from replay.supervisor import identity, initial, read, validate, write_json_durable
 
 
+CONSUMER_BATCH_ENTRIES = 1024
+
+
 class HookFailure(Exception):
     pass
 
@@ -59,8 +62,9 @@ def execute(root, attempt, group):
         group=group,
         initial=initial(config),
         timeout=t["command_timeout_ms"] / 1000,
-        # Whole-entry batches up to 128 MiB (at least one entry); one ACK each.
-        batch_bytes=max(DEFAULT_BATCH_BYTES, t["max_entry_bytes"]),
+        # Whole-entry batches: 1 GiB at the 1 MiB entry cap; one ACK each.
+        batch_entries=CONSUMER_BATCH_ENTRIES,
+        batch_bytes=max(DEFAULT_BATCH_BYTES, CONSUMER_BATCH_ENTRIES * t["max_entry_bytes"]),
     )
     deadline = time.monotonic() + config["limits"]["attempt_seconds"]
     try:
