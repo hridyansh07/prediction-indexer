@@ -15,12 +15,12 @@ MARKET_TEMPLATE_VERSION = 1
 OUTCOME_SPACE_VERSION = 1
 RELATION_GENERATION_VERSION = 1
 
-# Kalshi totals whose `direction` was read by substring over a text naming both
-# teams (docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md).
-TOTALS_DIRECTION_RULE_ID = "kalshi-totals-direction-v1"
+# Totals whose `direction` was read by substring over a text naming both teams
+# (docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md).
+TOTALS_DIRECTION_RULE_ID = "totals-direction-v1"
 _TOTALS_TYPES = frozenset({"total_maps", "total_goals"})
 # The reviewed scope of the rule. It must only grow by an explicit decision.
-TOTALS_DIRECTION_VENUES = frozenset({"kalshi"})
+TOTALS_DIRECTION_VENUES = frozenset({"kalshi", "limitless"})
 
 _SYMMETRIC = {"IDENTITY", "MUTUAL_EXCLUSION", "OVERLAP"}
 _DIRECTED = {"IMPLICATION", "REVERSE_IMPLICATION"}
@@ -717,12 +717,14 @@ def _corrected_totals_parameters(
     participants: list[str],
     corrections: dict[tuple[str, str, str], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Re-derive a Kalshi totals direction with the fixed whole-word rule.
+    """Re-derive a totals direction with the fixed whole-word rule.
 
-    Only `direction` of a Kalshi `total_maps`/`total_goals` market is touched.
-    The inputs are what the archived row still carries: its title, the first
-    outcome label as the yes subtitle (only when both labels were published),
-    and the event's participants. The raw subtitle is not archived.
+    Only `direction` of a Kalshi or Limitless `total_maps`/`total_goals` market
+    is touched. The inputs are what the archived row still carries: its title,
+    the event's participants and, for Kalshi only, the first outcome label as
+    the yes subtitle (when both labels were published). The Limitless adapter
+    fed the rule no subtitle fields, so none are supplied for it. The raw
+    subtitle is not archived.
     """
     if (
         source.get("venue") not in TOTALS_DIRECTION_VENUES
@@ -738,7 +740,13 @@ def _corrected_totals_parameters(
         raise MarketProjectionError(
             f"market {source.get('target_id')} direction must be text"
         )
-    raw = {"yes_sub_title": labels[0]} if len(labels) == 2 and isinstance(labels[0], str) else {}
+    raw = (
+        {"yes_sub_title": labels[0]}
+        if source["venue"] == "kalshi"
+        and len(labels) == 2
+        and isinstance(labels[0], str)
+        else {}
+    )
     derived = market_parameters(
         str(source["market_type"]),
         title=title,

@@ -191,7 +191,7 @@ CREATE TABLE universe_run_projection_corrections (
     field TEXT NOT NULL CHECK(field = 'direction'),
     report_value TEXT,
     projected_value TEXT,
-    rule_id TEXT NOT NULL CHECK(rule_id = 'kalshi-totals-direction-v1'),
+    rule_id TEXT NOT NULL CHECK(rule_id = 'totals-direction-v1'),
     CHECK(report_value IS NOT projected_value),
     PRIMARY KEY (run_id, venue, venue_market_id, field)
 ) STRICT;

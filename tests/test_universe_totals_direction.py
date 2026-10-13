@@ -1,4 +1,4 @@
-"""Universe projection v4: Kalshi totals direction re-derived from the market's words.
+"""Universe projection v4: Kalshi and Limitless totals direction re-derived from the market's words.
 
 Contract-shaped, offline. See docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md.
 """
@@ -30,7 +30,7 @@ from universe.store import UniverseStore
 
 KALSHI_TOTAL = "kalshi:KXLOLTOTALMAPS-26AUG280500IGTT-4"
 PM_TOTAL = "polymarket:totals-bo5"
-RULE_ID = "kalshi-totals-direction-v1"
+RULE_ID = "totals-direction-v1"
 
 
 def _digest(value) -> str:
@@ -125,6 +125,111 @@ def _thundertalk(stored_direction="under"):
     return report, events, markets
 
 
+LIMITLESS_TOTAL = "limitless:total-goals"
+PM_GOALS = "polymarket:goals-ou"
+
+
+def _soccer_totals(
+    title="Sunderland and Arsenal have 3 or more total goals?",
+    participants=("Sunderland", "Arsenal"),
+    stored_direction="under",
+):
+    """A soccer bundle with a Limitless "N or more total goals?" market.
+
+    The Limitless market carries no over/under field: its labels are Yes/No and
+    the direction came from the title alone. The report's relationships are
+    derived from the stored parameters, as the targeter recorded them.
+    """
+    report = _selection_report(R1, G1)
+    candidate = report["candidates"][0]
+    candidate.update(
+        sport="soccer",
+        game=None,
+        topology=None,
+        participants=list(participants),
+        participant_keys=[p.casefold() for p in participants],
+        event_refs=["polymarket:event-b", "limitless:event-c"],
+        market_ids=[LIMITLESS_TOTAL, PM_GOALS],
+        eligible_market_ids=[LIMITLESS_TOTAL, PM_GOALS],
+    )
+    candidate["relationship_analysis"]["relationships"] = []
+    candidate["admission"]["moneyline_volume_usd_by_venue"] = {"polymarket": 30_000}
+    targets = report["selection"]["targets"]
+    targets["kalshi"] = []
+    targets["limitless"] = [
+        dict(targets["polymarket"][0], target_id=LIMITLESS_TOTAL,
+             canonical_class="soccer.total_goals", subscription_ids=["lm-slug"])
+    ]
+    targets["polymarket"][0].update(
+        target_id=PM_GOALS, canonical_class="soccer.total_goals"
+    )
+    events, markets = _catalog_rows(report)
+    for event in events:
+        event.update(
+            sport="soccer", game=None, topology=None, format=None,
+            participants=list(participants),
+            participant_keys=[p.casefold() for p in participants],
+        )
+    base = markets[0]
+    limitless = copy.deepcopy(base)
+    limitless.update(
+        target_id=LIMITLESS_TOTAL,
+        venue="limitless",
+        venue_market_id=LIMITLESS_TOTAL.split(":", 1)[1],
+        venue_event_id="event-c",
+        canonical_class="soccer.total_goals",
+        market_type="total_goals",
+        scope="regulation_fulltime",
+        title=title,
+        subscription_ids=["lm-slug"],
+        outcome_labels=["Yes", "No"],
+        parameters={
+            "direction": stored_direction,
+            "line": 2.5,
+            "published_line": 3,
+        },
+    )
+    polymarket = copy.deepcopy(base)
+    polymarket.update(
+        target_id=PM_GOALS,
+        venue="polymarket",
+        venue_market_id=PM_GOALS.split(":", 1)[1],
+        venue_event_id="event-b",
+        canonical_class="soccer.total_goals",
+        market_type="total_goals",
+        scope="regulation_fulltime",
+        title="Total Goals: O/U 2.5",
+        subscription_ids=["pm-over", "pm-under"],
+        outcome_labels=["Over", "Under"],
+        parameters={"line": 2.5},
+    )
+    markets[:] = [limitless, polymarket]
+    projected = project_market_universe(
+        report, catalog_events=events, catalog_markets=markets
+    )
+    stored = {m["target_id"]: m["parameters"] for m in markets}
+    for row in projected["venue_markets"]:
+        row["parameters"] = stored[f"{row['venue']}:{row['venue_market_id']}"]
+    bundle = rebuild_bundle(
+        projected["events"][0], projected["venue_events"], projected["venue_markets"]
+    )
+    assert bundle is not None
+    candidate["relationship_analysis"]["relationships"] = [
+        r.as_record() for r in derive_bundle_relationships(bundle).relationships
+    ]
+    return report, events, markets
+
+
+def _over_goal_keys() -> set[str]:
+    """Scores with three or more total goals on the 0..8 happy-path grid."""
+    return {
+        f"score:{home}-{away}"
+        for home in range(9)
+        for away in range(9)
+        if home + away >= 3
+    }
+
+
 def _over_keys() -> set[str]:
     space = build_series_space("b", best_of=5, home="IG", away="ThunderTalk")
     keys = {o.key for o in space.outcomes if o.payload["maps_played"] > 3.5}
@@ -199,6 +304,96 @@ class TotalsDirectionTests(unittest.TestCase):
         self.assertEqual(
             by_market[KALSHI_TOTAL]["claims"][0]["claim_id"],
             by_market[PM_TOTAL]["claims"][0]["claim_id"],
+        )
+
+    def _limitless_claim_keys(self, doc):
+        by_market = {m["market_id"]: m for m in doc["markets"]}
+        claims = {c["claim_id"]: set(c["outcome_keys"]) for c in doc["claims"]}
+        return claims[by_market[LIMITLESS_TOTAL]["claims"][0]["claim_id"]]
+
+    def test_limitless_three_or_more_goals_is_not_read_as_under_from_sunderland(self):
+        report, events, markets = _soccer_totals()
+        self.assertTrue(
+            any(
+                r["relationship"] == "MUTUAL_EXCLUSION"
+                for r in report["candidates"][0]["relationship_analysis"][
+                    "relationships"
+                ]
+            ),
+            "fixture must record relations consistent with the wrong direction",
+        )
+        self._ingest(report, events, markets)
+
+        doc = self.db.bundle_outcomes("bundle-1")
+        keys = self._limitless_claim_keys(doc)
+        self.assertIn("score:2-1", keys)
+        self.assertNotIn("score:1-1", keys)
+        self.assertEqual(keys, _over_goal_keys())
+
+        with closing(sqlite3.connect(self.db.path)) as c:
+            corrections = c.execute(
+                """SELECT venue, venue_market_id, field, report_value,
+                          projected_value, rule_id
+                   FROM universe_run_projection_corrections"""
+            ).fetchall()
+            stored = json.loads(
+                c.execute(
+                    "SELECT parameters_json FROM venue_markets WHERE venue = 'limitless'"
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            corrections,
+            [
+                (
+                    "limitless",
+                    LIMITLESS_TOTAL.split(":", 1)[1],
+                    "direction",
+                    "under",
+                    "over",
+                    RULE_ID,
+                )
+            ],
+        )
+        # Only direction is overridden: the threshold and published boundary stay.
+        self.assertEqual(
+            stored, {"direction": "over", "line": 2.5, "published_line": 3}
+        )
+
+    def test_limitless_projection_changes_only_direction(self):
+        report, events, markets = _soccer_totals()
+        projection = project_market_universe(
+            report, catalog_events=events, catalog_markets=markets
+        )
+        row = next(r for r in projection["venue_markets"] if r["venue"] == "limitless")
+        self.assertEqual(
+            row["parameters"],
+            {"direction": "over", "line": 2.5, "published_line": 3},
+        )
+        self.assertEqual(
+            [(c["venue"], c["report_value"], c["projected_value"], c["rule_id"])
+             for c in projection["corrections"]],
+            [("limitless", "under", "over", RULE_ID)],
+        )
+
+    def test_limitless_title_without_a_direction_word_in_a_team_name_is_untouched(self):
+        report, events, markets = _soccer_totals(
+            title="Arsenal and Chelsea have 3 or more total goals?",
+            participants=("Arsenal", "Chelsea"),
+            stored_direction="over",
+        )
+        projection = project_market_universe(
+            report, catalog_events=events, catalog_markets=markets
+        )
+        self.assertEqual(projection["corrections"], [])
+        row = next(r for r in projection["venue_markets"] if r["venue"] == "limitless")
+        self.assertEqual(
+            row["parameters"],
+            {"direction": "over", "line": 2.5, "published_line": 3},
+        )
+        self._ingest(report, events, markets)
+        self.assertEqual(
+            self._limitless_claim_keys(self.db.bundle_outcomes("bundle-1")),
+            _over_goal_keys(),
         )
 
     def test_a_corrected_market_gets_a_different_canonical_id(self):
