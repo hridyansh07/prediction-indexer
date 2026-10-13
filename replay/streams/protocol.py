@@ -12,6 +12,10 @@ import re
 from types import MappingProxyType
 
 
+# Load the optional replay dependency once, only when a stream decoder is built.
+_orjson = None
+
+
 class ProtocolError(Exception):
     """Deterministic invalid input, sequence, revision, or lifecycle."""
 
@@ -487,6 +491,10 @@ class Decoder:
     """
 
     def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes):
+        global _orjson
+        if _orjson is None:
+            import orjson as _orjson
+
         self.run_id, self.attempt_id = run_id, attempt_id
         self._expected = decode(json.dumps(expected_initial).encode(), max_entry_bytes)
         self.limit = max_entry_bytes
@@ -517,11 +525,9 @@ class Decoder:
             raise
 
     def _apply(self, data):
-        import orjson  # Optional replay-redis dependency; strict readers need only stdlib.
-
         require(type(data) is bytes and len(data) <= self.limit, "entry limit")
         try:
-            r = orjson.loads(data)
+            r = _orjson.loads(data)
         except (ValueError, UnicodeError, RecursionError) as e:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)
