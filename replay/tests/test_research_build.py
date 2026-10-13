@@ -69,6 +69,8 @@ class BuildTest(unittest.TestCase):
         self.assertEqual([b["label"] for b in pack["books"]],
                          ["series_moneyline · Cloud9", "series_moneyline · Cloud9", "series_moneyline · LYON"])
         self.assertEqual(pack["books"][0]["claim_id"], pack["books"][1]["claim_id"])
+        # Status as the context snapshot recorded it; absent in the outcomes row means null.
+        self.assertEqual([b["market_status"] for b in pack["books"]], ["determined", None, None])
         self.assertNotEqual(pack["books"][1]["claim_id"], pack["books"][2]["claim_id"])
         self.assertEqual(pack["lenses"]["cross"]["state"], "ok")
         self.assertEqual(pack["lenses"]["cross"]["episodes"], 4)
@@ -85,7 +87,7 @@ class BuildTest(unittest.TestCase):
         pack = read_json(self.base / "events" / BARE / "manifest.json")
         self.assertEqual((pack["title"], pack["game"], pack["context"], pack["event_id"]), (BARE, None, "missing", None))
         self.assertEqual(pack["books"][0]["label"], KALSHI)
-        self.assertTrue(all(b["claim_id"] is None for b in pack["books"]))
+        self.assertTrue(all(b["claim_id"] is None and b["market_status"] is None for b in pack["books"]))
 
     def test_events_table_lists_every_result(self):
         rows = {r["bundle_id"]: r for r in pq.read_table(self.base / "events.parquet").to_pylist()}

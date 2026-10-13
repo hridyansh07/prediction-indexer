@@ -163,6 +163,7 @@ def context_document(bundle_id):
             "bundle_id": bundle_id, "event_id": "event:d1:" + "f" * 64, "participants": ["Cloud9", "LYON"],
             "markets": [
                 {"market_id": KALSHI, "market_type": "series_moneyline", "outcome_labels": ["Cloud9", "Cloud9"],
+                 "market_status": "determined",
                  "claims": [{"claim_id": claims["k"], "claim_key": "claim=0"}], "venue": "kalshi"},
                 {"market_id": "polymarket:9", "market_type": "series_moneyline", "outcome_labels": ["Cloud9", "LYON"],
                  "claims": [{"claim_id": claims["k"], "claim_key": "claim=0"},

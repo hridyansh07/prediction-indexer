@@ -63,6 +63,7 @@ def book_rows(transition_books, context):
         rows.append({"book": index, "instrument": book["instrument"], "orientation": book["orientation"],
                      "venue": book["venue"], "market_id": book.get("market_id"),
                      "market_type": None if market is None else market.get("market_type"),
+                     "market_status": None if market is None else market.get("market_status"),
                      "label": label, "claim_id": claim_id,
                      "price_scale": int(book["price_scale"]), "quantity_scale": int(book["quantity_scale"])})
     return rows
