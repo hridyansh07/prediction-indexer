@@ -90,6 +90,10 @@ Exit codes are the same for every command:
 6. **Cleanup.**
    - Containers and networks the bench created are removed in a `finally`
      path, on every exit, including failures and interrupts.
+   - After cleanup and evidence (`result.json`, `orchestration.json`) are written,
+     `run_bench` re-raises a `KeyboardInterrupt` that occurred anywhere, including
+     during a cleanup step, so a calling orchestrator stops instead of reading an
+     ordinary exit 3. The bench CLI catches it and still exits 3.
    - An image the bench built is removed after the run unless `--keep-image`
      is given.
    - Ownership labels are verified before collecting logs or removing a resource;
@@ -402,7 +406,8 @@ economic figures of its own.
 - Docker orchestration, with the Docker client injected as a fake:
   - unique names;
   - read-only mounts;
-  - cleanup on success, on failure and on `KeyboardInterrupt`;
+  - cleanup on success, on failure and on `KeyboardInterrupt` (which is re-raised
+    after cleanup; the CLI returns 3);
   - removal limited to bench-created objects;
   - image kept with `--keep-image`;
   - cache pruned only with the flag.
