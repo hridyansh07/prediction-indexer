@@ -170,11 +170,12 @@ rebuilt in `unreconstructed_bundles`), visible rather than raised.
 ### Totals direction corrections (projection version 4)
 
 Universe projects markets from the archived reports' stored catalogue
-parameters, and an old targeter parser could read a Kalshi totals `direction`
-from a team name ("ThunderTalk" as `under`). Projection version 4 re-derives
-`direction` for `kalshi` `total_maps`/`total_goals` markets with the fixed
-whole-word rule from the archived row's own title, first outcome label and event
-participants, and records every difference in
+parameters, and an old targeter parser could read a Kalshi or Limitless totals
+`direction` from a team name ("ThunderTalk" or "Sunderland" as `under`).
+Projection version 4 re-derives `direction` for `kalshi` and `limitless`
+`total_maps`/`total_goals` markets with the fixed whole-word rule from the
+archived row's own title and event participants (plus, for Kalshi, the first
+outcome label as the yes subtitle), changes nothing else, and records every difference in
 `universe_run_projection_corrections` (`report_value`, `projected_value`,
 `rule_id`; part of the projection identity). A direction the fixed rule cannot
 find is removed, so the market yields no claim. A corrected market gets a

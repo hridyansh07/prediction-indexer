@@ -9,9 +9,10 @@ names both teams, so "ThunderTalk" or "Sunderland" read as `under` and
 "Overtake" as `over`. Commit `b6ab54d` fixed the parser (whole words, team names
 removed first). Universe still projects markets from the archived Targeter v3
 reports' stored catalogue `parameters`, and the claim engine reads
-`parameters.direction` for single-token Kalshi totals. History therefore holds
-wrong claims: `KXLOLTOTALMAPS-26AUG280500IGTT-4` ("Over 3.5 maps", IG vs
-ThunderTalk) expresses the under set.
+`parameters.direction` for single-token Kalshi and Limitless totals. History
+therefore holds wrong claims: `KXLOLTOTALMAPS-26AUG280500IGTT-4` ("Over 3.5
+maps", IG vs ThunderTalk) expresses the under set, and the Limitless "Sunderland
+and Arsenal have 3 or more total goals?" market the low-score set.
 
 ## Decision
 
@@ -25,14 +26,16 @@ as evidence.
 ### Scope
 
 Only markets whose venue is in the single constant `TOTALS_DIRECTION_VENUES`,
-currently `{kalshi}`, and whose `market_type` is `total_maps` or `total_goals`.
-Every other venue, market type and field projects exactly as v3.
-Polymarket and Limitless are deliberately not corrected (see Known gaps).
+currently `{kalshi, limitless}`, and whose `market_type` is `total_maps` or
+`total_goals`. Every other venue, market type and field projects exactly as v3.
+Polymarket is deliberately not corrected (see Known gaps).
 
-### Rule `kalshi-totals-direction-v1`
+### Rule `totals-direction-v1`
 
 Call the fixed `targeter.v2.parsing.products.market_parameters` for the market
 and take only its `direction`; override only that one field of `parameters`.
+`line`, `published_line` and every other parameter keep the reported value; a
+Limitless "3 or more goals" market keeps `line` 2.5 and `published_line` 3.
 When the fixed rule finds no direction the field is removed and no claim is
 made (fail closed). A removed direction is a visible false negative, never a
 guess.
@@ -42,15 +45,20 @@ guess.
 | Targeter input at report time | In the archived normalized row? |
 |---|---|
 | `title` (raw `title`, else raw `subtitle`, else ticker) | yes, `title` |
-| raw `subtitle` as its own field | NO (not serialized; survives only when it was the title fallback) |
-| raw `yes_sub_title` | partly: `outcome_labels[0]` when both labels were present (`len == 2`); with one label it cannot be told from `no_sub_title`, so it is not used |
-| raw `no_sub_title` | yes, `outcome_labels[1]`, not read by the rule |
+| raw `subtitle` as its own field (Kalshi) | NO (not serialized; survives only when it was the title fallback) |
+| raw `yes_sub_title` (Kalshi) | partly: `outcome_labels[0]` when both labels were present (`len == 2`); with one label it cannot be told from `no_sub_title`, so it is not used |
+| raw `no_sub_title` (Kalshi) | yes, `outcome_labels[1]`, not read by the rule |
 | `groupItemTitle` (Polymarket only) | not applicable |
+| Limitless `title` | yes, `title` (the adapter passes the market `title`, else the id) |
+| Limitless raw subtitle fields | none exist: the adapter passes its full raw market, but the rule only reads `subtitle`, `yes_sub_title` and `groupItemTitle`, none of which the Limitless adapter or its tests use |
+| Limitless labels (`outcomeTokens`, else "Yes"/"No") | yes, `outcome_labels`, not read by the rule |
 | event participants | yes: the catalogue event row's `participants`, else the candidate's |
 | raw `floor_strike` / `cap_strike` | NO (`CanonicalMarket.raw` is not serialized); they affect only `line`, which is not touched |
 
-The re-derivation therefore calls the rule with `title`, `participants` and
-`raw={"yes_sub_title": outcome_labels[0]}`. The lost raw subtitle can only turn a
+The re-derivation therefore calls the rule with `title`, `participants` and, for
+Kalshi, `raw={"yes_sub_title": outcome_labels[0]}`. For Limitless it passes
+`raw={}`: the adapter fed the rule the title alone, so no "Yes" is injected as a
+subtitle. The lost raw subtitle can only turn a
 direction found at report time into "none" (never invent one); that case is
 removed and counted like any other correction.
 
@@ -67,7 +75,7 @@ SHA-256 covers them, and persists them in
 `universe_run_projection_corrections` (STRICT; primary key `run_id, venue,
 venue_market_id, field`; `run_id` references `targeter_runs` ON DELETE CASCADE):
 `venue`, `venue_market_id`, `field` (`direction`), `report_value` (nullable),
-`projected_value` (nullable), `rule_id` (`kalshi-totals-direction-v1`).
+`projected_value` (nullable), `rule_id` (`totals-direction-v1`).
 
 ### Claim verification
 
@@ -88,7 +96,7 @@ new file. To roll back, stop Universe and run the v3 code against the old file.
 
 ## Known gaps
 
-- Polymarket and Limitless totals are not corrected by this rule, by decision.
+- Polymarket totals are not corrected by this rule, by decision.
 - Scan result: a scan of all 1,223 bundles and 1,057 totals claims found exactly
   7 inverted claims, in 6 bundles. All are Kalshi `total_maps` markets labelled
   "Over N" that were stored as under. These are the expected corrections, and
@@ -107,22 +115,24 @@ new file. To roll back, stop Universe and run the v3 code against the old file.
   - bundle_10ed769064dd5d86dfcbb083: kalshi:KXCS2TOTALMAPS-26AUG300500GROTHU-3;
     "THUNDER dOWNUNDER"
 
+  Limitless soccer `total_goals` markets in Sunderland events were stored as
+  `{"direction": "under", "line": 2.5, "published_line": 3}`: the "3 or more
+  goals" market, over 2.5, flipped by "Sunderland". Each is expected
+  under -> over, with `line` and `published_line` unchanged:
+  - bundle_718135a9426746093f1e744a: limitless:387279 (Universe market:8637f100...)
+  - bundle_87498ed23545abc32b6b8aa9: Universe market:f13b7a80...
+  - bundle_2853dd2c1412a175d147471c: Universe market:867f9dcc...
+
+  Two further Sunderland bundles, 6f8f27cd... and 5ea86a10... (prefixes only),
+  were not inspected. By the rule alone: a Limitless `total_goals` market whose
+  title names Sunderland in an "N or more total goals" form with a stored
+  `under` is corrected the same way; one whose stored direction is already right
+  is not. The rebuild diff confirms or rules out each.
+
   No Polymarket claim was wrong; the "Overtake" events are fine. A correction
   outside this set after the rebuild needs review before the rebuilt file is
   adopted. One case to watch is a direction removed because only the unarchived
   raw subtitle stated it.
-- Limitless (uncorrected, pending a scope decision): soccer `total_goals`
-  markets in Sunderland events are stored as `{"direction": "under", "line": 2.5,
-  "published_line": 3}`. These are the "3 or more goals" market, that is over
-  2.5, flipped by "Sunderland".
-  - Confirmed in bundle_718135a9426746093f1e744a (Universe market:8637f100…),
-    bundle_87498ed23545abc32b6b8aa9 (market:f13b7a80…) and
-    bundle_2853dd2c1412a175d147471c (market:867f9dcc…).
-  - The claim for limitless:387279 in bundle_718135a9… is the low-score set.
-  - Its outcome labels are "Yes"/"No", so the label scan could not see it.
-  - The rule does not correct it until the user decides. Including it means
-    adding `limitless` to `TOTALS_DIRECTION_VENUES`, a matching regression, and
-    widening the corrections table's `rule_id` CHECK.
 - Kalshi markets whose direction came only from the raw subtitle lose it and
   produce no claim until a later archive-side fix exists.
 
