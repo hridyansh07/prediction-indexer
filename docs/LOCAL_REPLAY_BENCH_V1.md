@@ -209,10 +209,14 @@ Supply that selected directory as `fee_catalog_directory`, not `OUT_DIR`.
       `limits.attempts = 1` (an override cannot enable retries).
    2. Write `OUT_DIR/input.json`.
    3. Call `replay.supervisor.run(config, OUT_DIR/run, redis_url)`.
-   4. For each group, call its `reader(OUT_DIR/run, name)`, which must require
-      supervisor SUCCESS (every existing `read_completed` does). Write the
-      returned receipt, and the summary when present, to
-      `OUT_DIR/groups/<name>/`.
+   4. For each group, call the SDK completed-reader dispatcher with its configured
+      reader. For shipped readers, the writer has already run full independent
+      semantic validation before terminal ACK; this post-SUCCESS read binds the
+      supervisor, receipt, configuration, manifest/summary digests and all stored
+      file hashes/lengths without repeating semantics. Custom readers retain
+      their original call. Write the returned receipt, and the summary when
+      present, to `OUT_DIR/groups/<name>/`. Explicit `deep=True` audits call the
+      configured reader unchanged (Economic SDK S6b).
    5. For each group, run its `checks` (§6), writing
       `OUT_DIR/groups/<name>/checks/<check>.json`.
    6. Write `OUT_DIR/result.json` (§7).
