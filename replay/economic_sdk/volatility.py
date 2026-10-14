@@ -34,9 +34,15 @@ class VolatilityRecorder(Stream):
         self.cost = accumulator_cost(self.config)
         self.pairs, self.unavailable = pair_tables(
             snapshot, self.table, enabled=self.config["gap_pairs"] is not None)
+        # The existing per-series reservation includes totals and fixed lookup
+        # state: two index slots per pair, scale factors and doubled thresholds.
+        # Pending samples and bucket occurrences keep their separate charges.
         self.budget.charge(bounds.json_cost(self.pairs) + bounds.json_cost(self.unavailable)
                            + (len(self.table) + len(self.pairs)) * self.cost,
                            "volatility state budget")
+        self.price_factors = tuple((10 ** max(4 - int(b["price_scale"]), 0),
+                                    10 ** max(int(b["price_scale"]) - 4, 0)) for b in self.table)
+        self.jump_thresholds = tuple(2 * j for j in self.jumps)
         self.totals = {(kind, i): self._new() for kind, count in
                        (("book", len(self.table)), ("gap", len(self.pairs))) for i in range(count)}
         self.scope = -1
@@ -65,17 +71,21 @@ class VolatilityRecorder(Stream):
         native = {(b["instrument"], b["orientation"]) for m in scope["members"] for b in m["books"]}
         self.tops = {i: (None, None, None) for i, b in enumerate(self.table)
                      if (b["instrument"], b["orientation"]) in native}
-        self.active_pairs = [p for p in self.pairs if p["scope"] == self.scope]
+        self.pairs_by_book = {i: [] for i in self.tops}
         self.values = {("book", i): None for i in self.tops}
-        self.values.update({("gap", p["pair"]): None for p in self.active_pairs})
+        for pair in self.pairs:
+            if pair["scope"] == self.scope:
+                self.pairs_by_book[pair["book_a"]].append(pair["pair"])
+                self.pairs_by_book[pair["book_b"]].append(pair["pair"])
+                self.values["gap", pair["pair"]] = None
 
     def _price(self, value, book):
         if value is None:
             return None
-        price, scale = int(value[0]), int(self.table[book]["price_scale"])
-        if scale <= 4:
-            return price * 10 ** (4 - scale)
-        divisor = 10 ** (scale - 4)
+        price = int(value[0])
+        multiplier, divisor = self.price_factors[book]
+        if divisor == 1:
+            return price * multiplier
         require(price % divisor == 0, "volatility scale-4 precision")
         return price // divisor
 
@@ -108,7 +118,8 @@ class VolatilityRecorder(Stream):
             accumulator = self._row((time - self.begin_ns) // self.width, ("book", book))
             accumulator["top_updates"] += 1
             accumulator["mid_changes"] += int(old is not None and mid is not None and old != mid)
-        for pair in self.active_pairs:
+        for index in self.pairs_by_book[book]:
+            pair = self.pairs[index]
             a, b = self._ask(pair["book_a"], pair["side_a"]), self._ask(pair["book_b"], pair["side_b"])
             self.values["gap", pair["pair"]] = None if a is None or b is None else 2 * (a + b)
 
@@ -144,8 +155,8 @@ class VolatilityRecorder(Stream):
                     stats[1] += delta
                     stats[2] += delta * delta
                     stats[3] = max(stats[3], delta)
-                    for j, threshold in enumerate(self.jumps):
-                        stats[4][j] += int(delta >= 2 * threshold)
+                    for j, threshold in enumerate(self.jump_thresholds):
+                        stats[4][j] += int(delta >= threshold)
             if due == self.next_sample:
                 bucket = (due - self.begin_ns) // self.width
                 for key, value in self.values.items():
@@ -175,6 +186,10 @@ class VolatilityRecorder(Stream):
         last = ((at - self.begin_ns - self.horizons[-1]) // self.width - 1)
         if closing:
             last = (self.end_ns - self.begin_ns - 1) // self.width
+        elif last <= self.flushed:
+            # _row rejects already-flushed buckets, so no newly eligible rows
+            # can appear until this watermark advances. Closing always drains.
+            return
         keys = sorted(identity for identity in self.rows if identity[0] <= last)
         for bucket, key in keys:
             row = self.rows.pop((bucket, key))

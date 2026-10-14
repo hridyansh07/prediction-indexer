@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 from encoder import encode_stream
 from replay.economic_sdk import bounds
-from replay.economic_sdk.profile_policy import VOLATILITY_FILE, profile_files, profile_identity, profile_policy
+from replay.economic_sdk.profile_policy import (
+    LEVELS_FILE, TRANSITIONS_FILE, VOLATILITY_FILE, profile_files, profile_identity, profile_policy,
+)
 from replay.economic_sdk.profile_stream_io import stream_lines
 from replay.economic_sdk.transitions_reader import tables
 from replay.economic_sdk.volatility_format import accumulator_cost, pair_tables
@@ -93,18 +95,45 @@ class Case(unittest.TestCase):
         return result, [json.loads(line) for line in stream_lines(
             h.profile_output / VOLATILITY_FILE, entry["logical"], entry["stored"], 1024 * 1024, "volatility")]
 
+    def golden_profiles(self):
+        profile = policy(sample_ms=2, horizons_ms=[1, 3, 13], bucket_ms=6)
+        profile["groups"] = sorted(profile["groups"] + ["availability", "levels"])
+        fixtures = Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures"
+        for name in ("strategy-full.ndjson", "strategy-sparse.ndjson"):
+            tape = [time_scale(json.loads(line)) for line in (fixtures / name).read_bytes().splitlines()]
+            h = self.harness(profile, scopes=True, lower_bound="expand_to_window_start",
+                             pin=tape[0]["body"]["pins"][0], wire_records=tape)
+            yield name, h
+        h = self.harness(profile, mixed=True, scopes=True, lower_bound="expand_to_window_start")
+        for key, bid, ask in ((KO, 600, None), (KC, 450, None), (PM, 400, 500), (PM2, 400, 430)):
+            ladder(h, 5 * MS, *key, bids=((bid, M),), asks=() if ask is None else ((ask, M),))
+        send(h, 10 * MS, (PM, operations(op(PM, "bid", 400, "increase", M))))
+        ladder(h, 13 * MS + 7, PM2[0], bids=((400, M),), asks=((480, M),))
+        send(h, 15 * MS, (KC, invalid()))
+        send(h, 16 * MS, (KO, invalid()))
+        ladder(h, 17 * MS, *KO, bids=((600, M),))
+        ladder(h, 18 * MS, *KC, bids=((450, M),))
+        ladder(h, 22 * MS, PM[0], bids=((430, M),), asks=((480, M),))
+        ladder(h, 22 * MS, PM[0], bids=((400, M),), asks=((500, M),))
+        send(h, 24 * MS, (PM2, invalid()))
+        ladder(h, 26 * MS, PM2[0], bids=((400, M),), asks=((430, M),))
+        h.group(29 * MS, trades=("applied", "observed", "duplicate"))
+        ladder(h, 36 * MS, PM[0], bids=(), asks=((500, M),))
+        h.finish()
+        yield "mixed-scopes", h
+
     @staticmethod
     def book(result, key=PM):
         return next(i for i, b in enumerate(result["summary"]["transition_books"])
                     if (b["instrument"], b["orientation"]) == key)
 
     @staticmethod
-    def rewrite(h, result, rows):
+    def rewrite(h, result, rows, name=VOLATILITY_FILE):
         logical = b"".join(encoded(row) + b"\n" for row in rows)
-        with (h.profile_output / VOLATILITY_FILE).open("wb") as sink:
+        with (h.profile_output / name).open("wb") as sink:
             identity = encode_stream(io.BytesIO(logical), sink)
         manifest = copy.deepcopy(result["manifest"])
-        manifest["files"][VOLATILITY_FILE] = {
+        manifest["files"][name] = {
             "logical": {"sha256": identity.logical.sha256, "byte_length": identity.logical.byte_length,
                         "records": identity.logical.line_count},
             "stored": {"sha256": identity.stored.sha256, "byte_length": identity.stored.byte_length}}
@@ -406,13 +435,59 @@ class ReaderAndBoundsTests(Case):
             self.assertEqual(total["horizons"]["100"]["n"], 0)
 
     def test_native_scale4_conversion_and_visible_precision_failure(self):
-        h = self.harness()
-        v = h.profile.collector.volatility
-        self.assertEqual(v._price(["123", "1"], 0), 1230)
-        v.table[0]["price_scale"] = "5"
-        self.assertEqual(v._price(["12340", "1"], 0), 1234)
+        for scale, bid, ask, spread2 in ((3, 123, 130, 140), (4, 1234, 1300, 132), (5, 12340, 13000, 132)):
+            h = self.harness(price_scales={"polymarket": scale})
+            ladder(h, 10 * MS, PM[0], bids=((bid, M),), asks=((ask, M),))
+            result, rows = self.rows(h)
+            rows = [r for r in rows if r["type"] == "book" and r["book"] == self.book(result)]
+            self.assertEqual(sum(r["samples"] for r in rows), 30)
+            self.assertEqual(sum(int(r["spread_sum2"]) for r in rows), 30 * spread2)
+        h = self.harness(price_scales={"polymarket": 5})
         with self.assertRaisesRegex(ProtocolError, "precision"):
-            v._price(["12341", "1"], 0)
+            ladder(h, 10 * MS, PM[0], bids=((12341, M),), asks=((13000, M),))
+        self.assertTrue(h.profile.poisoned)
+
+    def test_strict_stream_failures_precede_earlier_volatility_failures(self):
+        for name, expected in ((TRANSITIONS_FILE, "closed schema"),
+                               (LEVELS_FILE, "replayed ladder differs from the top row")):
+            profile = policy(bucket_ms=2)
+            profile["groups"] = sorted(profile["groups"] + ["levels"])
+            h = self.harness(profile)
+            ladder(h, 10 * MS, PM[0], bids=((400, M),), asks=((450, M),))
+            ladder(h, 35 * MS, PM[0], bids=((410, M),), asks=((460, M),))
+            result, rows = self.rows(h)
+            rows[0]["spread_sum2"] = "1"
+            manifest = self.rewrite(h, result, rows)
+            entry = manifest["files"][name]
+            stream = [json.loads(line) for line in stream_lines(
+                h.profile_output / name, entry["logical"], entry["stored"], 1024 * 1024, name)]
+            original = copy.deepcopy(stream)
+            if name == TRANSITIONS_FILE:
+                stream[-1]["extra"] = 0
+            else:
+                stream[-1]["asks"][0][0] = "461"
+            manifest = self.rewrite(h, {"manifest": manifest}, stream, name)
+            with self.subTest(stream=name), self.assertRaisesRegex(ProtocolError, expected):
+                validate_content(h.profile_output, h.profile.snapshot, manifest)
+            manifest = self.rewrite(h, {"manifest": manifest}, original, name)
+            with self.assertRaisesRegex(ProtocolError, "volatility row recomputation"):
+                validate_content(h.profile_output, h.profile.snapshot, manifest)
+
+    def test_fixed_lookup_state_fits_existing_total_reservation(self):
+        # Count repeated objects per occurrence, including both reverse-index
+        # slots of a pair. No identity deduplication can hide cache memory.
+        def size(value):
+            return sys.getsizeof(value) + (
+                sum(size(k) + size(v) for k, v in value.items()) if type(value) is dict else
+                sum(size(v) for v in value) if type(value) in (tuple, list) else 0)
+
+        for horizons, jumps in (([1], [1]), (list(range(1, 9)), list(range(1, 7)))):
+            h = self.harness(policy(horizons_ms=horizons, jump_atoms=jumps), mixed=True, scopes=True)
+            ladder(h, 10 * MS, PM[0], bids=((400, M),), asks=((450, M),))
+            v = h.profile.collector.volatility
+            held = (v.totals, v.price_factors, v.jump_thresholds, v.pairs_by_book, v.tops, v.values)
+            self.assertLessEqual(size(held), (len(v.table) + len(v.pairs)) * v.cost)
+            h.finish()
 
     def test_real_full_and_sparse_tapes_equal_nonempty_volatility_bytes(self):
         fixtures = Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures"
@@ -425,6 +500,17 @@ class ReaderAndBoundsTests(Case):
             self.assertGreater(entry["logical"]["records"], 0)
             payloads.append((h.profile_output / VOLATILITY_FILE).read_bytes())
         self.assertEqual(*payloads)
+
+    def test_volatility_enabled_profile_matches_base_revision_output_hashes(self):
+        # Every file, including both frame identities and the run-bound receipt,
+        # recorded before the S4/S6a changes on b970e703 with the same codec.
+        golden = json.loads((Path(__file__).parent / "fixtures/volatility_v1_golden.json").read_bytes())
+        for name, h in self.golden_profiles():
+            with self.subTest(tape=name):
+                read_provisional(h.profile_output, h.root / "context", expected_sha256=h.sha)
+                hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                          for p in h.profile_output.iterdir() if p.is_file()}
+                self.assertEqual(hashes, golden[name])
 
     def test_volatility_disabled_matches_every_base_revision_output_byte(self):
         # Recorded from a clean git archive of 365d2f68 with the same codec.

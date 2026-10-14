@@ -232,8 +232,9 @@ class _Layout:
 class _Tops:
     """Row-by-row checks of ``transitions.ndjson.zst``; yields one group per cut."""
 
-    def __init__(self, root, layout, identity, facts, groups):
+    def __init__(self, root, layout, identity, facts, groups, on_top=None):
         self.layout, self.facts, self.groups = layout, facts, groups
+        self.on_top = on_top
         self.logical, self.stored = identity_record(identity)
         self.path = Path(root) / TRANSITIONS_FILE
         require(self.path.is_file() and not self.path.is_symlink(), "regular transitions required")
@@ -302,6 +303,8 @@ class _Tops:
         state.last, state.at = top, t
         self.types["top"] = self.types.get("top", 0) + 1
         self.causes[cause] = self.causes.get(cause, 0) + 1
+        if self.on_top is not None:
+            self.on_top(row)
         return {"type": "top", "scope": scope, "book": book, "cut": cut, "cause": cause,
                 "bid": bid, "ask": ask}
 
@@ -524,17 +527,18 @@ def _drain(groups):
         pass
 
 
-def validate_streams(root, snapshot, files, policy, facts, groups):
+def validate_streams(root, snapshot, files, policy, facts, groups, *, on_top=None):
     """Check the stream files against the snapshot, policy and the profile rows' ``facts``.
 
     Returns the summary additions. ``facts`` carries, per (scope, book key), the
     profile's state durations, bucket-open quotes and per-bucket activity counts;
-    each cross-check applies only when its group produced them.
+    each cross-check applies only when its group produced them. ``on_top`` sees
+    each strictly parsed top row in file order, without retaining it here.
     """
     layout = _Layout(snapshot, policy)
     tops = levels = None
     if "transitions" in groups:
-        tops = _Tops(root, layout, files[TRANSITIONS_FILE], facts, groups)
+        tops = _Tops(root, layout, files[TRANSITIONS_FILE], facts, groups, on_top)
     if "levels" in groups:
         levels = _Levels(root, layout, files[LEVELS_FILE])
     if tops is not None and levels is not None:
