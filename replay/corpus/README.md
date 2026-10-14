@@ -39,7 +39,7 @@ disposable per-bundle path:
 
 ```json
 "derivative_cache": {
-  "root": "/home/hridyansh/pi-data/corpus/derivative-cache-t3",
+  "root": "/srv/replay/derivative-cache",
   "max_bytes": 21474836480
 }
 ```
