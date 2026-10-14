@@ -325,14 +325,15 @@ class IngestTransactions:
                 projection_row_count=market_row_count,
                 occurrences=normalized,
             )
-            connection.executemany(
-                """INSERT INTO market_execution_terms(
-                       run_id, venue, venue_market_id, taker_delay_ms, observed_at
-                   ) VALUES (?, ?, ?, ?, ?)""",
-                ((run_id, term["venue"], term["venue_market_id"],
-                  term["taker_delay_ms"], term["observed_at"])
-                 for term in normalized_terms),
-            )
+            if normalized_terms:
+                connection.executemany(
+                    """INSERT INTO market_execution_terms(
+                           run_id, venue, venue_market_id, taker_delay_ms, observed_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    ((run_id, term["venue"], term["venue_market_id"],
+                      term["taker_delay_ms"], term["observed_at"])
+                     for term in normalized_terms),
+                )
             for value in normalized:
                 context = value["context"]
                 context_sha256 = value["context_sha256"]

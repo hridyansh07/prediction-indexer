@@ -73,6 +73,21 @@ def _logical_size(item: RunObject) -> int:
     return item.logical.byte_length
 
 
+def _execution_term_items(manifest: RunManifest) -> list[RunObject]:
+    items = [
+        item for item in manifest.objects
+        if item.file in {
+            f"target_records_{venue}.ndjson{suffix}"
+            for venue in ("kalshi", "polymarket", "limitless")
+            for suffix in ("", ".zst")
+        }
+    ]
+    for item in manifest.objects:
+        if item.file.startswith("target_records_") and item not in items:
+            raise UniverseSyncError(f"target record artifact filename is invalid: {item.key}")
+    return items
+
+
 @dataclass
 class SyncResult:
     discovered: int = 0
@@ -828,20 +843,35 @@ class UniverseSync:
             for occurrence in projected
             for target in occurrence["targets"]
         }
+        term_bytes = sum(_logical_size(item) for item in _execution_term_items(manifest))
+        if catalog_bytes + term_bytes > MAX_CATALOG_BYTES_PER_RUN:
+            raise UniverseSyncError(
+                f"normalized artifacts for run {manifest.run_id} exceed "
+                f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
+            )
+        terms = self._read_execution_terms(manifest, bound_expectations, selected)
+        return _VerifiedRun(
+            manifest,
+            manifest_stored,
+            report_item,
+            report,
+            market_projection,
+            projected,
+            retirements,
+            catalog_bytes + term_bytes,
+            len(catalog_events) + len(catalog_markets) + len(rule_templates) + len(terms),
+            terms,
+        )
+
+    def _read_execution_terms(
+        self, manifest: RunManifest, bound_expectations: Mapping[str, ObjectExpectation],
+        selected: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
         # Read the run's own evidence, including retained selections. Copying
         # an origin's old delay would invent a current observation.
-        term_items = [
-            item for item in manifest.objects
-            if item.file in {
-                f"target_records_{venue}.ndjson{suffix}"
-                for venue in ("kalshi", "polymarket", "limitless")
-                for suffix in ("", ".zst")
-            }
-        ]
-        if any(item.file.startswith("target_records_") and item not in term_items for item in manifest.objects):
-            raise UniverseSyncError("target record artifact filename is invalid")
+        term_items = _execution_term_items(manifest)
         term_bytes = sum(_logical_size(item) for item in term_items)
-        if catalog_bytes + term_bytes > MAX_CATALOG_BYTES_PER_RUN:
+        if term_bytes > MAX_CATALOG_BYTES_PER_RUN:
             raise UniverseSyncError(
                 f"normalized artifacts for run {manifest.run_id} exceed "
                 f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
@@ -851,7 +881,7 @@ class UniverseSync:
         for item in term_items:
             venue = item.file.removeprefix("target_records_").split(".", 1)[0]
             if venue in seen_venues:
-                raise UniverseSyncError(f"target record artifacts repeat venue {venue}")
+                raise UniverseSyncError(f"target record artifacts repeat venue {venue}: {item.key}")
             seen_venues.add(venue)
             previous_id = ""
 
@@ -868,23 +898,12 @@ class UniverseSync:
                 if manifest.input_complete:
                     target = selected.get(target_id)
                     if target is None or sorted(row["subscription_ids"]) != sorted(target["subscription_ids"]):
-                        raise UniverseSyncError(f"target record {target_id} disagrees with selected subscriptions")
+                        raise UniverseSyncError(f"target record {target_id} disagrees with selected subscriptions: {item.key}")
                     terms.append(term)
                 return False
 
             self._read_ndjson(item, bound_expectations[item.key], keep=retain)
-        return _VerifiedRun(
-            manifest,
-            manifest_stored,
-            report_item,
-            report,
-            market_projection,
-            projected,
-            retirements,
-            catalog_bytes + term_bytes,
-            len(catalog_events) + len(catalog_markets) + len(rule_templates) + len(terms),
-            tuple(sorted(terms, key=lambda term: (term["venue"], term["venue_market_id"]))),
-        )
+        return tuple(sorted(terms, key=lambda term: (term["venue"], term["venue_market_id"])))
 
     def _read_run_manifest(
         self, key: str, *, expected_sha256: str | None
