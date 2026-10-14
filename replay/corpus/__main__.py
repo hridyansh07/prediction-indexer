@@ -49,6 +49,19 @@ def _context(spec, allow_dirty):
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except KeyboardInterrupt as interrupt:
+        # Ctrl-C or `docker kill --signal=INT`: the bench has already cleaned up. The bundle's
+        # ledger row stays `running` and nothing was committed, so the next run redoes it.
+        bundle = getattr(interrupt, "bundle_id", None)
+        print("interrupted" + (f" while running bundle {bundle}; it is left 'running' and will be redone"
+                               " on the next run" if bundle else "; no bundle was running"),
+              file=sys.stderr, flush=True)
+        return 130
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("run", "status", "verify"))
     parser.add_argument("spec", type=Path)

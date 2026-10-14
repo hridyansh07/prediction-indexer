@@ -115,6 +115,28 @@ docker compose -f compose.corpus.yaml run --rm corpus status "$CORPUS_ROOT/corpu
 docker compose -f compose.corpus.yaml run --rm corpus verify "$CORPUS_ROOT/corpus/smoke-spec.json"
 ```
 
+### Stopping a run
+
+Killing only the compose client (Ctrl-C on `docker compose run`) does not stop the
+run: the orchestrator keeps going inside the container. Run with a fixed name and
+signal the container from another shell:
+
+```bash
+docker compose -f compose.corpus.yaml run --rm --name corpus-run corpus run "$CORPUS_ROOT/corpus/smoke-spec.json"
+docker kill --signal=INT corpus-run   # clean stop
+docker stop corpus-run                # SIGINT, then SIGKILL after the 2 minute grace period
+```
+
+The compose file sets `init: true` (tini forwards the signal to the orchestrator),
+`stop_signal: SIGINT` and `stop_grace_period: 2m`. On SIGINT the current bundle's
+bench removes its containers, network and image, and writes `result.json` and
+`orchestration.json`. The corpus then stops with exit 130. That bundle's ledger
+row stays `running` and no result or receipt is committed for it, so the next run
+redoes it (`attempts` is incremented). The bundle's scratch work directory is
+deleted, including the interrupted bench output; the redo recreates it from nothing.
+A SIGKILL (grace period exceeded) skips cleanup: remove leftover `bench-corpus-*`
+containers and networks by hand, then rerun.
+
 The container uses host networking, so `universe_base_url` can point at a
 Universe tunnel on the host's loopback (for example
 `ssh -f -N -L 18080:127.0.0.1:8080 <universe host>`).

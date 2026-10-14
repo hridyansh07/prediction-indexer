@@ -458,6 +458,42 @@ class PipelineTests(unittest.TestCase):
                 run_corpus(pipeline, ledger, ["b1"], log=lambda m: None)
             self.assertEqual(ledger.state(pipeline.corpus_key, "b1")["state"], "game_state_unavailable")
 
+    def test_interrupt_stops_the_corpus_and_leaves_the_bundle_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, calls, root = self.harness(tmp)
+            started = []
+
+            def interrupted(spec_path, out, *, keep_image, label):
+                started.append(spec_path)
+                out.mkdir(); (out / "result.json").write_text(json.dumps({"status": "FAILED"}))
+                raise KeyboardInterrupt
+
+            pipeline.run_bench = interrupted
+            ledger = Ledger(root / "l.sqlite3")
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_corpus(pipeline, ledger, ["b1", "b2"], log=lambda m: None)
+            self.assertEqual(caught.exception.bundle_id, "b1")
+            row = ledger.state(pipeline.corpus_key, "b1")
+            self.assertEqual((row["state"], row["attempts"], row["bench_exit"], row["receipt_sha256"]),
+                             ("running", 1, None, None))
+            self.assertFalse(pipeline.results_dir("b1").exists())
+            self.assertIsNone(ledger.state(pipeline.corpus_key, "b2"))
+            self.assertEqual(len(started), 1)
+            self.assertFalse((root / "work/b1").exists())   # scratch is rebuilt from nothing on the redo
+
+    def test_main_exits_130_naming_the_bundle_left_running(self):
+        from replay.corpus import __main__ as entry
+        interrupt = KeyboardInterrupt()
+        interrupt.bundle_id = "b1"
+        err = io.StringIO()
+        with patch.object(entry, "_main", side_effect=interrupt), patch("sys.stderr", err):
+            self.assertEqual(entry.main(["run", "spec.json"]), 130)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("b1", err.getvalue())
+        self.assertIn("running", err.getvalue())
+
     def test_stage_error_names_the_stage(self):
         error = StageError("bench", ValueError("x"))
         self.assertEqual((error.stage, str(error)), ("bench", "bench: ValueError: x"))

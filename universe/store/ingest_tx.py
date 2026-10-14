@@ -705,6 +705,18 @@ class IngestTransactions:
                 projection_row_count, shortfall, unreconstructed,
             ),
         )
+        for correction in raw_projection["corrections"]:
+            connection.execute(
+                """INSERT INTO universe_run_projection_corrections(
+                       run_id, venue, venue_market_id, field,
+                       report_value, projected_value, rule_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, correction["venue"], correction["venue_market_id"],
+                    correction["field"], correction["report_value"],
+                    correction["projected_value"], correction["rule_id"],
+                ),
+            )
 
     def _insert_claims(
         self,

@@ -254,7 +254,11 @@ class Pipeline:
 
 
 def run_corpus(pipeline, ledger, bundles, *, retry_failed=False, log=print):
-    """Sequential, resumable: finished bundles are skipped; failures are recorded, never fatal."""
+    """Sequential, resumable: finished bundles are skipped; failures are recorded, never fatal.
+
+    An interrupt is not a failure. It stops the corpus with the bundle's row still `running`
+    and nothing committed, so the next run redoes that bundle.
+    """
     done = skipped = 0
     for index, bundle_id in enumerate(bundles, 1):
         row = ledger.state(pipeline.corpus_key, bundle_id)
@@ -283,6 +287,9 @@ def run_corpus(pipeline, ledger, bundles, *, retry_failed=False, log=print):
             ledger.finish(pipeline.corpus_key, bundle_id, "failed", seconds=time.monotonic() - started,
                           stage=error.stage, detail=detail)
             log(f"[{index}/{len(bundles)}] {bundle_id} FAILED at {error.stage}: {error}")
+        except KeyboardInterrupt as interrupt:
+            interrupt.bundle_id = bundle_id
+            raise
         done += 1
         if pipeline.image_id is not None:
             ledger.set_meta("image_id:" + pipeline.corpus_key, pipeline.image_id)
