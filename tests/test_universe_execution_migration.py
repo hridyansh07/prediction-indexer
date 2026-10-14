@@ -114,7 +114,8 @@ class ExecutionMigrationTests(unittest.TestCase):
         db.initialize()
         with closing(db.connect(readonly=True)) as c:
             self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 8)
-        self.seed([(_thundertalk(), {}, False)], version=6)
+        fixture = _thundertalk()
+        self.seed([(fixture, {"polymarket": [target_row(fixture[0])]}, False)], version=6)
         migrate(self.source, self.dest, to=7, code_revision="test-revision")
         with closing(sqlite3.connect(self.dest)) as c:
             self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 7)
@@ -124,6 +125,12 @@ class ExecutionMigrationTests(unittest.TestCase):
             self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._schema_objects(expected))
         with self.assertRaisesRegex(EvidenceConflict, "unsupported Event Universe schema version 7"):
             UniverseStore(self.dest).initialize()
+        v7 = self.dest
+        self.dest = self.root / "m1-upgraded.sqlite"
+        summary = migrate(v7, self.dest, to=8, code_revision="test-revision", objects=self.objects)[0]
+        self.assertEqual(summary["migration_id"], "m2-execution-terms")
+        self.assertEqual(summary["rows_written"], 1)
+        self.assert_equivalent(self.fresh())
 
     def test_v6_to_v8_equals_fresh_ingestion_all_venues_missing_artifact_and_legacy_run(self):
         first = three_venue_fixture()
