@@ -43,21 +43,25 @@ FILL_STATE = 240    # one entity's open fill state: start, state and ladder epoc
 
 def json_cost(value):
     """Closed-form cost of a small JSON-shaped value (strings, ints, lists, dicts)."""
+    kind = type(value)
+    if kind is str:
+        return STR + 4 * len(value)
+    if kind is int:
+        return INT + value.bit_length() // 8
+    if kind is dict:
+        return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
+    if kind is list or kind is tuple:
+        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
+    if kind is bool or value is None:
+        return SMALL
     if isinstance(value, LazyAssessmentIds):
         # Captured immutable order inputs plus the worst-case eager debug IDs
         # and materialized IDs. Never traverse the shared engine/catalog or
         # materialize a handle just to account its retained state.
         return (512 + json_cost(value.request.retained_inputs)
                 + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
-    kind = type(value)
-    if kind is str:
-        return STR + 4 * len(value)
-    if kind is int:
-        return INT + value.bit_length() // 8
     if isinstance(value, Mapping):
         return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
-    if kind in (list, tuple):
-        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
     return SMALL
 
 
