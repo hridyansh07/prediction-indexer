@@ -4,6 +4,13 @@
 #   CORPUS_UID=$(id -u) CORPUS_GID=$(id -g) DOCKER_GID=$(getent group docker | cut -d: -f3) \
 #   docker compose -f compose.corpus.yaml run --rm corpus run SPEC
 #
+# Stopping: killing only the compose client does not stop the run. Give the container a
+# name and signal it from another shell (replay/corpus/README.md):
+#   ... run --rm --name corpus-run corpus run SPEC
+#   docker kill --signal=INT corpus-run     # or: docker stop corpus-run
+# init (tini) forwards the signal to the orchestrator, which lets the current bundle's
+# bench clean up, leaves its ledger row `running` (redone next run) and exits 130.
+#
 # The runner starts each bundle's bench containers through the host daemon, and
 # the daemon resolves bind mounts on the host. So the data root and the checkout
 # are mounted at the same path inside and outside, and every path in a corpus
@@ -14,6 +21,10 @@ services:
       context: .
       dockerfile: docker/corpus-runner.Dockerfile
     image: prediction-indexer-corpus:local
+    init: true
+    stop_signal: SIGINT
+    # Bench cleanup removes the bench containers, network and image before exit.
+    stop_grace_period: 2m
     user: "${CORPUS_UID:?}:${CORPUS_GID:?}"
     group_add:
       - "${DOCKER_GID:?}"
