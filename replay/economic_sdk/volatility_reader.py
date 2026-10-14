@@ -9,12 +9,12 @@ import heapq
 from pathlib import Path
 
 from replay.economic_sdk import bounds
-from replay.economic_sdk.profile_policy import TRANSITIONS_FILE, VOLATILITY_FILE, VOLATILITY_MAX_LINE
+from replay.economic_sdk.profile_policy import VOLATILITY_FILE, VOLATILITY_MAX_LINE
 from replay.economic_sdk.profile_stream_io import stream_lines
 from replay.economic_sdk.transitions_reader import identity_record, tables
 from replay.economic_sdk.volatility_format import MAX_BUCKETS, MAX_PAIRS, MAX_PENDING, accumulator_cost
 from replay.preparation import encoded
-from replay.streams.protocol import decode, require
+from replay.streams.protocol import require
 
 
 def _pair_evidence(snapshot, books, enabled):
@@ -285,23 +285,40 @@ class _Reconstruction:
         return result
 
 
-def validate_volatility(root, snapshot, files, policy):
-    """Call after strict transitions validation; both committed frames are verified again."""
-    path = Path(root) / VOLATILITY_FILE
-    require(path.is_file() and not path.is_symlink(), "regular volatility required")
-    logical, stored = identity_record(files[VOLATILITY_FILE])
-    output = stream_lines(path, logical, stored, VOLATILITY_MAX_LINE, "volatility")
-    t_logical, t_stored = identity_record(files[TRANSITIONS_FILE])
-    transitions = stream_lines(Path(root) / TRANSITIONS_FILE, t_logical, t_stored, bounds.MAX_LINE, "transitions")
+def validate_volatility(root, snapshot, files, policy, validate_transitions):
+    """Reconstruct from the strict reader's same-pass tops, not writer values.
+
+    Defer the first volatility failure until all transitions/levels checks pass,
+    preserving the former strict-streams-before-volatility failure order. Only
+    bounded reconstruction state is retained, never a tape of transition rows.
+    """
+    output = None
+    failure = None
     try:
-        reconstruction = _Reconstruction(snapshot, policy, output)
-        for line in transitions:
-            row = decode(line, bounds.MAX_LINE)
-            if row["type"] == "top":
+        try:
+            path = Path(root) / VOLATILITY_FILE
+            require(path.is_file() and not path.is_symlink(), "regular volatility required")
+            logical, stored = identity_record(files[VOLATILITY_FILE])
+            output = stream_lines(path, logical, stored, VOLATILITY_MAX_LINE, "volatility")
+            reconstruction = _Reconstruction(snapshot, policy, output)
+        except Exception as error:
+            failure = error.with_traceback(None)
+
+        def observe(row):
+            nonlocal failure
+            if failure is not None:
+                return
+            try:
                 reconstruction.top(row)
+            except Exception as error:
+                failure = error.with_traceback(None)
+
+        streams = validate_transitions(on_top=observe)
+        if failure is not None:
+            raise failure
         result = reconstruction.finish()
         require(reconstruction.rows == logical["records"], "volatility record count")
-        return result
+        return streams, result
     finally:
-        transitions.close()
-        output.close()
+        if output is not None:
+            output.close()

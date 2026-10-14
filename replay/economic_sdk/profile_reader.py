@@ -318,9 +318,15 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
                         "availability/profile usable time")
         availability = duration_rows(durations)
 
-    streams = None
+    streams = volatility = None
     if groups & {"transitions", "levels"}:
-        streams = validate_streams(root, snapshot, files, policy, facts, groups)
+        def read_streams(*, on_top=None):
+            return validate_streams(root, snapshot, files, policy, facts, groups, on_top=on_top)
+
+        if "volatility" in groups:
+            streams, volatility = validate_volatility(root, snapshot, files, policy, read_streams)
+        else:
+            streams = read_streams()
 
     result = {"version": 1, "experiment_sha256": experiment_sha256, "policy": policy,
               "books": [{"scope": scope, "instrument": key[0], "orientation": key[1],
@@ -332,8 +338,8 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
         result["availability_durations"] = availability
     if streams is not None:
         result.update(streams)
-    if "volatility" in groups:
-        result["volatility"] = validate_volatility(root, snapshot, files, policy)
+    if volatility is not None:
+        result["volatility"] = volatility
     return result
 
 
