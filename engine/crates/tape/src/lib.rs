@@ -1,18 +1,19 @@
 //! Pull traversal of pinned normalized derivatives, never canonical or venue JSON.
 //! Groups are immutable evidence, not book mutations. A future cursor must apply
 //! each complete group before a strategy can inspect books or skip evaluation.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use replay_domain::{
-    BookEvent, BookKey, ContinuityVerdict, EventAddress, EventHeader, FaultImpact, InstrumentId,
-    LaneId, SegmentEvent, SegmentRecord,
+    BookEvent, BookKey, ContinuityVerdict, EventAddress, EventHeader, LaneId, SegmentEvent,
+    SegmentRecord,
 };
 pub use replay_materialize::{
-    CoverageEvidence, LaneCoverage, LaneState, SourceFault, SourceFaultReason,
+    CoverageEvidence, LaneCoverage, LaneState, ScopeFilter, SourceFault, SourceFaultReason,
 };
 pub use replay_materialize::{DerivativeMetadata, DerivativePin, PinnedDerivative, ReadLimits};
 use replay_materialize::{
     RejectDisposition, SourceDelivery, VerifiedWindowReader, inspect_pinned, open_pinned,
+    open_pinned_scoped,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,40 +21,6 @@ pub enum LowerBoundPolicy {
     Clip,
     ExpandToWindowStart,
     RequireWindowBoundary,
-}
-
-/// Explicit resolver inputs. No inference from lane names or prior messages.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopeFilter {
-    pub instruments: BTreeSet<InstrumentId>,
-    pub lanes: BTreeSet<LaneId>,
-}
-
-impl ScopeFilter {
-    fn impact(&self, impact: &FaultImpact) -> bool {
-        match impact {
-            FaultImpact::Instrument(id) => self.instruments.contains(id),
-            FaultImpact::RequestedVenueBooks(venue) | FaultImpact::AuditCoverageOnly(venue) => self
-                .instruments
-                .iter()
-                .any(|id| id.as_str().split_once(':').unwrap().0 == venue),
-            FaultImpact::UnattributedLane(_) => true,
-        }
-    }
-    fn event(&self, record: &SegmentRecord) -> bool {
-        match record.event() {
-            SegmentEvent::Book(BookEvent::Full(book)) => {
-                self.instruments.contains(book.instrument())
-            }
-            SegmentEvent::Book(BookEvent::Delta(book)) => {
-                self.instruments.contains(book.instrument())
-            }
-            SegmentEvent::Trade(trade) => self.instruments.contains(trade.instrument()),
-            SegmentEvent::AuditAnchor(anchor) => self.instruments.contains(anchor.instrument()),
-            SegmentEvent::Control(_) => self.lanes.contains(record.header().address().lane()),
-            SegmentEvent::NormalizationFault(fault) => self.impact(fault.impact()),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +183,7 @@ pub struct DerivativeWalker {
     counts: WalkCounts,
     poisoned: bool,
     exhausted: bool,
+    input_filter: bool,
 }
 
 impl DerivativeWalker {
@@ -312,7 +280,21 @@ impl DerivativeWalker {
             counts: WalkCounts::default(),
             poisoned: false,
             exhausted: false,
+            input_filter: true,
         })
+    }
+
+    /// Full-body reference path for debug/test equivalence checks. Filtering,
+    /// grouping, evidence and counts are otherwise identical to `open`.
+    #[doc(hidden)]
+    pub fn open_without_input_filter(
+        inputs: Vec<PinnedDerivative>,
+        request: WalkRequest,
+        limits: ReadLimits,
+    ) -> Result<Self, String> {
+        let mut walker = Self::open(inputs, request, limits)?;
+        walker.input_filter = false;
+        Ok(walker)
     }
 
     pub fn next_item(&mut self) -> Result<Option<WalkItem>, String> {
@@ -371,7 +353,11 @@ impl DerivativeWalker {
                     return Ok(None);
                 }
                 let (input, expected) = &self.windows[self.index];
-                let reader = open_pinned(input, &self.limits)?;
+                let reader = if self.input_filter {
+                    open_pinned_scoped(input, &self.limits, self.request.scope.clone())?
+                } else {
+                    open_pinned(input, &self.limits)?
+                };
                 if reader.metadata() != expected {
                     return Err("derivative metadata changed since planning".into());
                 }
@@ -414,12 +400,7 @@ impl DerivativeWalker {
                     self.limits.max_group_records,
                     "group records",
                 )?;
-                group.last = current
-                    .records()
-                    .last()
-                    .map(|r| r.header().address())
-                    .unwrap_or(current.header().address())
-                    .clone();
+                group.last = current.last_event_address().clone();
                 if let Some(delivery) = self.filter(&current)? {
                     group.deliveries.push(delivery);
                 }
@@ -474,7 +455,7 @@ impl DerivativeWalker {
             )?;
             add(
                 &mut self.counts.excluded_events,
-                delivery.records().len() as u64,
+                delivery.event_count(),
                 u64::MAX,
                 "excluded events",
             )?;
@@ -512,7 +493,7 @@ impl DerivativeWalker {
         )?;
         add(
             &mut self.counts.excluded_events,
-            (delivery.records().len() - records.len()) as u64,
+            delivery.event_count() - records.len() as u64,
             u64::MAX,
             "excluded events",
         )?;
