@@ -10,7 +10,7 @@ from typing import Iterator
 from universe.store.records import EvidenceConflict
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "schema.sql"
 REBUILD_INSTRUCTION = (
     "run python -m universe migrate into a new file, or remove the rebuildable "
@@ -54,19 +54,22 @@ class Connection:
         }
 
     @classmethod
-    def _expected_schema(cls) -> dict[tuple[str, str], str]:
+    def _expected_schema(cls, version: int = SCHEMA_VERSION) -> dict[tuple[str, str], str]:
         with closing(sqlite3.connect(":memory:")) as expected:
             expected.execute("PRAGMA foreign_keys = ON")
             expected.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            if version == 7:
+                expected.execute("DROP TABLE market_execution_terms")
+                expected.execute("DROP INDEX selected_market_occurrences_bundle")
             return cls._schema_objects(expected)
 
     @classmethod
-    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
+    def _validate_schema(cls, connection: sqlite3.Connection, version: int = SCHEMA_VERSION) -> None:
         actual = cls._schema_objects(connection)
-        expected = cls._expected_schema()
+        expected = cls._expected_schema(version)
         if actual != expected:
             raise EvidenceConflict(
-                f"database contains an invalid Event Universe schema v{SCHEMA_VERSION}; "
+                f"database contains an invalid Event Universe schema v{version}; "
                 f"{REBUILD_INSTRUCTION}"
             )
         if connection.execute(

@@ -25,7 +25,7 @@ from archive.storage.base import (
     ObjectStore,
 )
 from archive.storage.verification import verify_metadata_objects
-from encoder import StoredIdentity
+from encoder import CodecError, StoredIdentity
 from targeter.v2.manifest import (
     RunManifest,
     RunManifestError,
@@ -902,7 +902,10 @@ class UniverseSync:
                     terms.append(term)
                 return False
 
-            self._read_ndjson(item, bound_expectations[item.key], keep=retain)
+            try:
+                self._read_ndjson(item, bound_expectations[item.key], keep=retain)
+            except CodecError as error:
+                raise UniverseSyncError(f"{item.key}: {error}") from error
         return tuple(sorted(terms, key=lambda term: (term["venue"], term["venue_market_id"])))
 
     def _read_run_manifest(

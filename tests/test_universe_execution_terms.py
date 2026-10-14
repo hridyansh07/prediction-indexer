@@ -38,7 +38,7 @@ def target_row(report, venue="polymarket", *, record=None):
     }
 
 
-def publish_terms(store, report, rows, *, compressed=False, raw_payload=None):
+def publish_terms(store, report, rows, *, compressed=False, raw_payload=None, catalog_rows=None):
     """Extend the shared manifest fixture before its immutable publication."""
     original = fixtures._put
 
@@ -80,7 +80,7 @@ def publish_terms(store, report, rows, *, compressed=False, raw_payload=None):
         return original(store, key, payload, **kwargs)
 
     with patch.object(fixtures, "_put", side_effect=put):
-        return fixtures._publish_run(store, report)
+        return fixtures._publish_run(store, report, catalog_rows=catalog_rows)
 
 
 class ExecutionTermsTests(unittest.TestCase):
@@ -124,7 +124,7 @@ class ExecutionTermsTests(unittest.TestCase):
         self.assertEqual(self.terms("kalshi:series"), {"status": "observed", "changes": [{"from": fixtures.G1, "taker_delay_ms": None}]})
         self.assertEqual(self.terms("polymarket:map-one"), {"status": "unavailable", "changes": []})
         with closing(self.db.connect(readonly=True)) as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertIn("STRICT", c.execute("SELECT sql FROM sqlite_master WHERE name='market_execution_terms'").fetchone()[0])
         self.assertTrue(self.sync.audit_run(fixtures.R1)["ok"])
 

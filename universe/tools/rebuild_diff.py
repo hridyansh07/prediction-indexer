@@ -133,19 +133,19 @@ def _migrations(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def _execution_term_observations(connection: sqlite3.Connection) -> dict[str, Any]:
-    # Discover the isolated table by its contract, without inventing the absent
-    # EXECUTION_DELAY_SDK_V1 §1.2 table name. All tables are compared regardless.
+    # Include historical tables with this contract as well as the v8 table.
+    # Every row is observed evidence; null delay is not unavailable evidence.
     result = {}
     for table, columns in _tables(connection).items():
         if not {"venue", "venue_market_id", "taker_delay_ms", "observed_at"} <= set(columns):
             continue
-        by_venue = {venue: {"rows": 0, "observed": 0, "unavailable": 0}
+        by_venue = {venue: {"rows": 0, "observed": 0, "null": 0}
                     for venue in ("kalshi", "limitless", "polymarket")}
         for row in connection.execute(
-            f"SELECT venue, COUNT(*), SUM(taker_delay_ms IS NOT NULL), SUM(taker_delay_ms IS NULL) "
+            f"SELECT venue, COUNT(*), COUNT(*), SUM(taker_delay_ms IS NULL) "
             f"FROM {_identifier(table)} GROUP BY venue ORDER BY venue"
         ):
-            by_venue[row[0]] = dict(zip(("rows", "observed", "unavailable"), row[1:]))
+            by_venue[row[0]] = dict(zip(("rows", "observed", "null"), row[1:]))
         result[table] = {"by_venue": by_venue}
     return result
 

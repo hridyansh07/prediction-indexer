@@ -79,7 +79,7 @@ class RebuildDiffTests(unittest.TestCase):
         self.assertEqual((self._stat(self.old), self._stat(self.new)), before)
 
         self.assertEqual(report["old"], {"user_version": 6, "projection_versions": [3]})
-        self.assertEqual(report["new"], {"user_version": 7, "projection_versions": [4]})
+        self.assertEqual(report["new"], {"user_version": 8, "projection_versions": [4]})
         changed = report["venue_markets"]["changed"]
         self.assertEqual(list(changed), [KALSHI_TOTAL])
         self.assertEqual(changed[KALSHI_TOTAL]["parameters"]["old"]["direction"], "under")
@@ -180,8 +180,8 @@ class RebuildDiffTests(unittest.TestCase):
             c.commit()
         status, report = self._equivalence()
         self.assertEqual(status, 1)
-        terms = report["execution_terms"]["new"]["execution_terms"]
-        self.assertEqual(terms["by_venue"]["polymarket"], {"rows": 3, "observed": 2, "unavailable": 1})
+        terms = report["execution_term_observations"]["new"]["execution_terms"]
+        self.assertEqual(terms["by_venue"]["polymarket"], {"rows": 3, "observed": 3, "null": 1})
         self.assertEqual(terms["by_venue"]["kalshi"]["rows"], 0)
         self.assertEqual(terms["by_venue"]["limitless"]["rows"], 0)
         self.assertEqual(report["table_differences"]["execution_terms"]["only_in_new"], 3)

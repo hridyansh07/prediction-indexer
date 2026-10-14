@@ -27,8 +27,10 @@ from universe.store import EvidenceConflict, SCHEMA_PATH, UniverseStore
 
 def _v6_schema():
     sql = SCHEMA_PATH.read_text()
-    for table in ("universe_migrations", "universe_run_projection_corrections"):
+    for table in ("universe_migrations", "universe_run_projection_corrections", "market_execution_terms"):
         sql = re.sub(rf"CREATE TABLE {table} \(.*?\) STRICT;", "", sql, flags=re.S)
+    for index in ("market_execution_terms_market", "selected_market_occurrences_bundle"):
+        sql = re.sub(rf"CREATE INDEX {index}\s+.*?;", "", sql, flags=re.S)
     sql = sql.replace("CHECK(projection_version IN (3, 4))", "CHECK(projection_version = 3)")
     return sql.replace("CHECK(projection_version = 4)", "CHECK(projection_version = 3)")
 
@@ -157,7 +159,7 @@ class MigrationsTests(unittest.TestCase):
         self.assertEqual(summary["markets_changed"], {"kalshi": 1, "limitless": 0})
         with closing(sqlite3.connect(self.dest)) as c:
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
-            self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema())
+            self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema(7))
 
     def test_contextless_membership_fallback_is_bounded_to_market_span(self):
         fixture = self.unselected_source(self.fixture)
@@ -212,7 +214,7 @@ class MigrationsTests(unittest.TestCase):
                          [(r["projection_version"], r["projection_sha256"]) for r in projections])
         self.assertEqual(migrated_projections[0]["projection_row_count"], projections[0]["projection_row_count"] + 1)
         with closing(sqlite3.connect(self.dest)) as c:
-            self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema())
+            self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema(7))
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         for table in ("canonical_markets", "venue_markets", "selected_market_occurrences",
@@ -220,7 +222,8 @@ class MigrationsTests(unittest.TestCase):
                       "universe_run_projection_corrections"):
             self.assertEqual(_rows(self.dest, table), _rows(rebuilt.path, table), table)
         migrated = UniverseStore(self.dest)
-        migrated.initialize()
+        with closing(migrated.connect(readonly=True)) as c:
+            migrated._validate_schema(c, 7)
         self.assertEqual(migrated.bundle_outcomes("bundle-1"), rebuilt.bundle_outcomes("bundle-1"))
         self.assertEqual(summary["markets_changed"], {"kalshi": 1, "limitless": 0})
         self.assertEqual(summary["participants_source"], {"context": 1, "umbrella": 0})
@@ -322,8 +325,9 @@ class MigrationsTests(unittest.TestCase):
         with closing(sqlite3.connect(self.dest)) as c:
             c.execute("DELETE FROM universe_migrations")
             c.commit()
-        with self.assertRaisesRegex(EvidenceConflict, "projection v3.*m1-totals-direction"):
-            db.initialize()
+        with closing(db.connect(readonly=True)) as c:
+            with self.assertRaisesRegex(EvidenceConflict, "projection v3.*m1-totals-direction"):
+                db._validate_schema(c, 7)
 
     def test_new_runs_still_write_v4_and_stale_message_names_both_paths(self):
         with self.assertRaisesRegex(EvidenceConflict, "migrate.*backfill"):
@@ -454,17 +458,18 @@ class MigrationsTests(unittest.TestCase):
             for source in sources
         ])
 
-    def test_m2_stub_preserves_m1_and_explains_missing_contract(self):
-        # The base and delegating conversation lack the authoritative §1.2.
+    def test_m2_archive_failure_preserves_committed_m1(self):
         output = []
-        with self.assertRaisesRegex(EvidenceConflict, "m2.*EXECUTION_DELAY_SDK_V1.*1.2"):
-            self.migrate(8, progress=output.append)
+        with mock.patch("universe.ingest.migrations.build_store", side_effect=EvidenceConflict("m2 archive unavailable")):
+            with self.assertRaisesRegex(EvidenceConflict, "m2 archive unavailable"):
+                self.migrate(8, progress=output.append)
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0]["migration_id"], "m1-totals-direction")
         with closing(sqlite3.connect(self.dest)) as c:
             self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 7)
         self.assertEqual([r["migration_id"] for r in _rows(self.dest, "universe_migrations")], ["m1-totals-direction"])
-        UniverseStore(self.dest).initialize()
+        with closing(sqlite3.connect(self.dest)) as c:
+            UniverseStore._validate_schema(c, 7)
 
     def test_summary_counts_changed_claim_rows_not_insert_attempts(self):
         old = {table: {tuple(row.items()) for row in _rows(self.source, table)}

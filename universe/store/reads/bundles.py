@@ -87,7 +87,9 @@ class BundleReads:
                    WHERE selected.bundle_id = ?
                    ORDER BY run.generated_at_ns, run.run_id,
                             terms.venue, terms.venue_market_id""", (bundle_id,),
-            ):
+            ) if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'market_execution_terms' AND type = 'table'"
+            ).fetchone() else ():
                 mid = term["venue"] + ":" + term["venue_market_id"]
                 if mid not in execution_terms:
                     entry = {"status": "observed", "changes": []}

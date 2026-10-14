@@ -11,28 +11,38 @@ import subprocess
 import sys
 import time
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
+from archive.storage.base import ObjectStore, ObjectStoreError
+from archive.storage.factory import build_store
+from archive.storage.verification import verify_metadata_objects
 from universe.derive.market_projection import (
     TOTALS_DIRECTION_VENUES, _corrected_totals_parameters, _event_participants,
     _relation_member, canonical_market_id,
 )
+from universe.ingest.sync import UniverseSync, UniverseSyncError, _execution_term_items, _logical_size
 from universe.store import EvidenceConflict, SCHEMA_PATH, UniverseStore
 from universe.store.records import _canonical_json_value, _seen_run_ids, _venue_market_record
 
 
 M1 = "m1-totals-direction"
 M2 = "m2-execution-terms"
+M2_CHECKPOINT = "m2_execution_terms_checkpoint"
+M2_CHECKPOINT_SQL = (
+    "CREATE TABLE m2_execution_terms_checkpoint ("
+    "run_id TEXT PRIMARY KEY, state_json TEXT NOT NULL CHECK(json_valid(state_json))) STRICT"
+)
 
 
-def _schema_sql(table: str) -> str:
+def _schema_sql(name: str, kind: str = "table") -> str:
     # Validation normalizes whitespace, but executable SQL must preserve newlines
     # terminating -- comments. SQLite itself parses the resource, not a splitter.
     with closing(sqlite3.connect(":memory:")) as c:
         c.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        return c.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()[0]
+        return c.execute("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?", (kind, name)).fetchone()[0]
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
@@ -47,7 +57,7 @@ def _validate_v6(c: sqlite3.Connection) -> None:
         raise EvidenceConflict("m1 requires user_version 6")
     if c.execute("SELECT 1 FROM universe_run_projections WHERE projection_version <> 3 LIMIT 1").fetchone():
         raise EvidenceConflict("m1 requires every market projection row at version 3")
-    expected = UniverseStore._expected_schema()
+    expected = UniverseStore._expected_schema(7)
     del expected["table", "universe_migrations"]
     del expected["table", "universe_run_projection_corrections"]
     key = ("table", "universe_run_projections")
@@ -403,8 +413,99 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     }
 
 
+def _stage_m2(c: sqlite3.Connection, db: UniverseStore, objects: ObjectStore,
+              binding: dict[str, Any], *, resume: bool) -> None:
+    if resume:
+        schema = UniverseStore._schema_objects(c)
+        expected = UniverseStore._expected_schema(7)
+        expected["table", M2_CHECKPOINT] = M2_CHECKPOINT_SQL
+        if schema != expected:
+            raise EvidenceConflict("resume requires the exact m2 checkpoint schema")
+        header = c.execute(f"SELECT state_json FROM {M2_CHECKPOINT} WHERE run_id = ''").fetchone()
+        if header is None or json.loads(header[0]) != binding:
+            raise EvidenceConflict("resume identity disagrees with source, target, or code revision")
+    else:
+        UniverseStore._validate_schema(c, 7)
+        with c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(M2_CHECKPOINT_SQL)
+            c.execute(f"INSERT INTO {M2_CHECKPOINT} VALUES ('', ?)", (_canonical_json_value(binding),))
+    reader = UniverseSync(db, objects)
+    for run in c.execute(
+        f"""SELECT r.* FROM targeter_runs r WHERE input_complete = 1
+            AND NOT EXISTS (SELECT 1 FROM {M2_CHECKPOINT} p WHERE p.run_id = r.run_id)
+            ORDER BY generated_at_ns, run_id"""
+    ).fetchall():
+        key = run["manifest_key"]
+        try:
+            manifest, stored = reader._read_run_manifest(key, expected_sha256=run["manifest_sha256"])
+            if (stored.byte_length != run["manifest_byte_length"] or manifest.run_id != run["run_id"]
+                    or manifest.generated_at != run["generated_at"] or not manifest.input_complete):
+                raise EvidenceConflict(f"run manifest {key} disagrees with stored run identity")
+            items = _execution_term_items(manifest)
+            metadata = verify_metadata_objects(objects, (item.expectation() for item in items))
+            bound = {
+                item.key: replace(item.expectation(), provider_checksum=observed.provider_checksum,
+                                  provider_checksum_algorithm=observed.provider_checksum_algorithm)
+                for item, observed in zip(items, metadata, strict=True)
+            }
+            selected = {}
+            # Use each run's saved subscriptions, not venue_markets' latest row.
+            for occurrence in c.execute(
+                "SELECT context_sha256 FROM selection_occurrences WHERE run_id = ? ORDER BY bundle_id",
+                (run["run_id"],),
+            ):
+                for target in db._context(c, occurrence[0], bounded=False)["targets"]:
+                    selected[target["target_id"]] = target
+            terms = reader._read_execution_terms(manifest, bound, selected)
+            present = {item.file.removeprefix("target_records_").split(".", 1)[0] for item in items}
+            state = {"terms": terms, "missing_venues": sorted({"kalshi", "limitless", "polymarket"} - present),
+                     "artifact_objects": len(items), "decoded_bytes": sum(_logical_size(item) for item in items)}
+        except (UniverseSyncError, ObjectStoreError) as error:
+            raise EvidenceConflict(f"{key}: {error}") from error
+        # Preparatory evidence, not the versioned projection. Each fully verified
+        # run is durable; no partial artifact or partially processed run is saved.
+        with c:
+            c.execute(f"INSERT INTO {M2_CHECKPOINT} VALUES (?, ?)",
+                      (run["run_id"], _canonical_json_value(state)))
+
+
+def _m2(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
+    c.execute(_schema_sql("market_execution_terms"))
+    c.execute(_schema_sql("market_execution_terms_market", "index"))
+    c.execute(_schema_sql("selected_market_occurrences_bundle", "index"))
+    missing = {venue: 0 for venue in ("kalshi", "limitless", "polymarket")}
+    counts = {venue: {"observed": 0, "null": 0} for venue in missing}
+    total = runs = artifact_objects = decoded_bytes = 0
+    for checkpoint in c.execute(f"SELECT * FROM {M2_CHECKPOINT} WHERE run_id != '' ORDER BY run_id"):
+        run_id, state = checkpoint["run_id"], json.loads(checkpoint["state_json"])
+        # Bundle entries (unlike market-projection hashes) are fully retained.
+        # Verify the old identity before including execution terms in its hash.
+        if not db._audit_run(c, run_id)["ok"]:
+            raise EvidenceConflict(f"cannot reconstruct bundle projection for run {run_id}")
+        for term in state["terms"]:
+            c.execute("INSERT INTO market_execution_terms VALUES (?, ?, ?, ?, ?)",
+                      (run_id, term["venue"], term["venue_market_id"], term["taker_delay_ms"], term["observed_at"]))
+            counts[term["venue"]]["observed"] += 1
+            counts[term["venue"]]["null"] += term["taker_delay_ms"] is None
+            total += 1
+        audit = db._audit_run(c, run_id)
+        c.execute("UPDATE targeter_runs SET projection_sha256 = ?, projection_row_count = ? WHERE run_id = ?",
+                  (audit["actual_sha256"], audit["actual_row_count"], run_id))
+        for venue in state["missing_venues"]:
+            missing[venue] += 1
+        runs += 1
+        artifact_objects += state["artifact_objects"]
+        decoded_bytes += state["decoded_bytes"]
+    c.execute(f"DROP TABLE {M2_CHECKPOINT}")
+    return {"migration_id": M2, "from_user_version": 7, "to_user_version": 8,
+            "runs_processed": runs, "rows_written": total, "runs_lacking_artifact": missing,
+            "by_venue": counts, "artifact_objects": artifact_objects, "decoded_bytes": decoded_bytes}
+
+
 def migrate(source: Path, destination: Path, *, to: int, code_revision: str,
             inputs: dict[str, Path] | None = None,
+            objects: ObjectStore | None = None, resume: bool = False,
             progress: Callable[[dict[str, Any]], None] | None = None) -> list[dict[str, Any]]:
     source, destination = Path(source), Path(destination)
     if not source.is_file() or source.resolve() == destination.resolve():
@@ -415,16 +516,23 @@ def migrate(source: Path, destination: Path, *, to: int, code_revision: str,
     if inputs:
         raise EvidenceConflict("m1 declares no inputs")
     with closing(_open_readonly(source)) as original:
-        version = original.execute("PRAGMA user_version").fetchone()[0]
+        version = source_version = original.execute("PRAGMA user_version").fetchone()[0]
         if version not in (6, 7) or to not in (7, 8) or to <= version:
             raise EvidenceConflict("only consecutive upward migrations from v6 or v7 to v7 or v8 are supported")
-        if destination.exists():
+        if resume and (to != 8 or not destination.is_file()):
+            raise EvidenceConflict("--resume requires an existing m2 destination and --to 8")
+        if destination.exists() and not resume:
             raise EvidenceConflict("DEST already exists; refusing to overwrite it")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("xb"):
-            pass
+        if not resume:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("xb"):
+                pass
         with closing(sqlite3.connect(destination)) as c:
-            original.backup(c)
+            if not resume:
+                original.backup(c)
+            version = c.execute("PRAGMA user_version").fetchone()[0]
+            if resume and version != 7:
+                raise EvidenceConflict("--resume requires a v7 m2 destination")
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA journal_mode = DELETE")
             c.execute("PRAGMA synchronous = FULL")
@@ -436,21 +544,20 @@ def migrate(source: Path, destination: Path, *, to: int, code_revision: str,
             results = []
             db = UniverseStore(destination)
             while version < to:
+                if version == 7:
+                    _stage_m2(c, db, objects if objects is not None else build_store((destination.parent,)),
+                              {"source": str(source.resolve()), "source_user_version": source_version,
+                               "to_user_version": to, "code_revision": code_revision}, resume=resume)
                 try:
                     c.execute("BEGIN IMMEDIATE")
                     if version == 6:
                         summary = _m1(c, db)
                     else:
-                        # Do not invent the isolated table's name/types/identity
-                        # or timestamp contract while the normative §1.2 is absent.
-                        raise EvidenceConflict(
-                            "m2-execution-terms unavailable: EXECUTION_DELAY_SDK_V1 §1.2 "
-                            "table contract is missing from this base; migrate --to 7"
-                        )
+                        summary = _m2(c, db)
                     c.execute("INSERT INTO universe_migrations VALUES (?, ?, ?, ?, ?, ?, ?)",
                               (summary["migration_id"], version, version + 1, code_revision, "{}",
                                _canonical_json_value(summary), time.time_ns()))
-                    UniverseStore._validate_schema(c)
+                    UniverseStore._validate_schema(c, version + 1)
                     if c.execute("PRAGMA foreign_key_check").fetchone():
                         raise EvidenceConflict("migration failed foreign_key_check")
                     c.execute(f"PRAGMA user_version = {version + 1}")
@@ -471,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--input", action="append", default=[])
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     try:
         inputs = {}
@@ -490,9 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise EvidenceConflict("migration image requires UNIVERSE_CODE_REVISION (full git commit)") from error
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise EvidenceConflict("UNIVERSE_CODE_REVISION must be a full git commit")
-        migrate(args.source, args.destination, to=args.to, inputs=inputs, code_revision=revision,
+        migrate(args.source, args.destination, to=args.to, inputs=inputs, code_revision=revision, resume=args.resume,
                 progress=lambda row: print(_canonical_json_value(row), flush=True))
-    except (EvidenceConflict, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+    except (EvidenceConflict, ObjectStoreError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)
         return 1
     return 0
