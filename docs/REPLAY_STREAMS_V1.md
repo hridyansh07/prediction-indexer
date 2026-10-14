@@ -561,8 +561,13 @@ the summed field lengths.
 With all sections declared, cut bodies reassemble exactly to V3, with each
 dependency restored on its original transition and on `Book.dependency`.
 Without `events`, body indexing and `.get()` for either event array raise
-`ProtocolError`; without `deps`, `Book.dependency` and transition dependency
-access raise, including default-returning accessors. Skipped malformed blobs
+`ProtocolError`. This is one body-only dict subclass; transitions remain plain
+dicts. Without `deps`, `Book.dependency` still raises `ProtocolError`, and
+transition dependency indexing raises `KeyError` because the key is absent.
+A static replay source test forbids consumer transition dependency reads,
+including `.get("dependency")`, rather than wrapping every transition to guard
+default-returning accessors. Nested record dependencies are publisher-trusted;
+the decoder does not scan transitions to reject them. Skipped malformed blobs
 are deliberately not detected by groups that did not declare them. Parsed
 sections must have their section shape and dependency alignment; existing
 publisher-trusted nested semantics are unchanged.
