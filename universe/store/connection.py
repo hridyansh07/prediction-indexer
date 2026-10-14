@@ -13,7 +13,8 @@ from universe.store.records import EvidenceConflict
 SCHEMA_VERSION = 7
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "schema.sql"
 REBUILD_INSTRUCTION = (
-    "remove the rebuildable SQLite file and run backfill from the immutable archive"
+    "run python -m universe migrate into a new file, or remove the rebuildable "
+    "SQLite file and run backfill from the immutable archive"
 )
 
 
@@ -68,6 +69,13 @@ class Connection:
                 f"database contains an invalid Event Universe schema v{SCHEMA_VERSION}; "
                 f"{REBUILD_INSTRUCTION}"
             )
+        if connection.execute(
+            "SELECT 1 FROM universe_run_projections WHERE projection_version = 3 LIMIT 1"
+        ).fetchone() and not connection.execute(
+            "SELECT 1 FROM universe_migrations WHERE migration_id = 'm1-totals-direction' "
+            "AND from_user_version = 6 AND to_user_version = 7"
+        ).fetchone():
+            raise EvidenceConflict("projection v3 rows require m1-totals-direction")
 
     @staticmethod
     def _execute_statements(connection: sqlite3.Connection, path: Path) -> None:

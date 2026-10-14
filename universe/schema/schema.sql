@@ -168,7 +168,7 @@ CREATE TABLE event_identity_lineage (
 
 CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    projection_version INTEGER NOT NULL CHECK(projection_version = 4),
+    projection_version INTEGER NOT NULL CHECK(projection_version IN (3, 4)),
     projection_sha256 TEXT NOT NULL,
     projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0),
     -- Claims are recomputed from the run's own projection, and where that
@@ -194,6 +194,16 @@ CREATE TABLE universe_run_projection_corrections (
     rule_id TEXT NOT NULL CHECK(rule_id = 'totals-direction-v1'),
     CHECK(report_value IS NOT projected_value),
     PRIMARY KEY (run_id, venue, venue_market_id, field)
+) STRICT;
+
+CREATE TABLE universe_migrations (
+    migration_id TEXT PRIMARY KEY,
+    from_user_version INTEGER NOT NULL,
+    to_user_version INTEGER NOT NULL,
+    code_revision TEXT NOT NULL,
+    inputs_json TEXT NOT NULL CHECK(json_valid(inputs_json)),
+    summary_json TEXT NOT NULL CHECK(json_valid(summary_json)),
+    applied_at_ns INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE umbrella_events (

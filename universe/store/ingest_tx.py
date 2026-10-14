@@ -41,11 +41,17 @@ class IngestTransactions:
     def known_manifest(self, key: str, sha256: str) -> bool:
         with closing(self.connect(readonly=True)) as connection:
             row = connection.execute(
-                "SELECT manifest_sha256 FROM targeter_runs WHERE manifest_key = ?",
+                "SELECT r.run_id, r.manifest_sha256, p.projection_version "
+                "FROM targeter_runs r LEFT JOIN universe_run_projections p USING(run_id) "
+                "WHERE manifest_key = ?",
                 (key,),
             ).fetchone()
         if row is None:
             return False
+        if row["projection_version"] == 3:
+            raise EvidenceConflict(
+                f"run {row['run_id']} was migrated from projection v3; rebuild to re-ingest it"
+            )
         if row["manifest_sha256"] != sha256:
             raise EvidenceConflict(f"immutable manifest {key!r} changed identity")
         return True
@@ -188,6 +194,14 @@ class IngestTransactions:
         }
 
         with self.write_transaction() as connection:
+            prior = connection.execute(
+                "SELECT projection_version FROM universe_run_projections WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if prior is not None and prior["projection_version"] == 3:
+                raise EvidenceConflict(
+                    f"run {run_id} was migrated from projection v3; rebuild to re-ingest it"
+                )
             lineage = connection.execute(
                 "SELECT state FROM event_identity_lineage WHERE singleton = 1"
             ).fetchone()
