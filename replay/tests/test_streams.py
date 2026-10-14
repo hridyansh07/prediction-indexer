@@ -1,3 +1,4 @@
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -591,21 +592,60 @@ class SectionTests(unittest.TestCase):
                             self.assertEqual(thaw(cut.body), old["body"])
                         if cut.kind == "cut":
                             if "events" not in sections:
+                                self.assertIsInstance(cut.body, dict)
                                 for name in ("market_events", "control_events"):
                                     with self.assertRaisesRegex(ProtocolError, "undeclared section"):
                                         cut.body[name]
                                     with self.assertRaisesRegex(ProtocolError, "undeclared section"):
                                         cut.body.get(name, [])
-                            for t in old["body"]["book_transitions"]:
+                                self.assertEqual(cut.body.get("absent", 42), 42)
+                                with self.assertRaises(KeyError):
+                                    cut.body["absent"]
+                            for original, t in zip(old["body"]["book_transitions"], cut.body["book_transitions"]):
+                                self.assertIs(type(t), dict)
                                 book = cut.books[(t["key"]["instrument"], t["key"]["orientation"])]
                                 if "deps" in sections:
-                                    self.assertEqual(book.dependency, t["dependency"])
+                                    self.assertEqual(book.dependency, original["dependency"])
                                 else:
+                                    with self.assertRaises(KeyError):
+                                        t["dependency"]
                                     with self.assertRaisesRegex(ProtocolError, "undeclared section"):
                                         getattr(book, "dependency", None)
                 d.finish()  # Includes the unmodified Rust terminal books digest.
             count += len(values)
         self.assertEqual(count, 79)
+
+    def test_only_protocol_reassembly_reads_transition_dependencies(self):
+        def reads(tree):
+            found = []
+            for node in ast.walk(tree):
+                key = None
+                if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                    key = node.slice
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and node.func.attr in {"get", "pop", "setdefault", "__getitem__"} and node.args):
+                    key = node.args[0]
+                if isinstance(key, ast.Constant) and key.value == "dependency":
+                    found.append(node.lineno)
+            return found
+
+        # Ensure the scanner rejects both direct and default-returning reads,
+        # but not the assignment used to reassemble declared dependencies.
+        self.assertEqual(reads(ast.parse("t['dependency']\nt.get('dependency', None)\nt['dependency'] = None")), [1, 2])
+        root = Path(__file__).resolve().parents[1]
+        violations = []
+        for path in sorted(root.rglob("*.py")):
+            if "tests" in path.relative_to(root).parts:
+                continue
+            tree = ast.parse(path.read_text(), filename=str(path))
+            allowed = set()
+            if path == root / "streams/protocol.py":
+                decoder = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Decoder")
+                allowed = {node.lineno for method in decoder.body
+                           if isinstance(method, ast.FunctionDef) and method.name in {"_sections", "_cut"}
+                           for node in ast.walk(method) if hasattr(node, "lineno")}
+            violations.extend(f"{path.relative_to(root)}:{line}" for line in reads(tree) if line not in allowed)
+        self.assertEqual(violations, [], "transition dependency reads require a deps declaration")
 
     def test_skipped_malformed_sections_are_not_parsed_but_declared_ones_fail(self):
         values = records()
@@ -642,7 +682,8 @@ class SectionTests(unittest.TestCase):
     def test_section_shapes_and_dependency_alignment_fail_closed(self):
         values = records()
         for changes in ({b"extra": b"{}"}, {b"deps": b"[null]"},
-                        {b"events": b'{"unknown":[]}'}, {b"deps": b"{}"}):
+                        {b"events": b'{"unknown":[]}'}, {b"deps": b"{}"},
+                        {b"events": None}, {b"deps": "[]"}, {b"record": bytearray(b"{}")}):
             d = decoder(values)
             d.apply(fields(values[0]))
             entry = {**fields(values[1]), **changes}

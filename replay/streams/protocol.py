@@ -9,7 +9,6 @@ import hashlib
 import heapq
 import json
 import re
-from collections.abc import Mapping
 from types import MappingProxyType
 
 
@@ -273,23 +272,20 @@ def declared_sections(sections):
     return sections
 
 
-class _SectionBody(Mapping):
-    """Missing capabilities raise even through Mapping.get(key, default)."""
+class _SectionBody(dict):
+    """Guard only omitted events; present-key indexing uses dict's C path."""
 
-    __slots__ = ("_body", "_blocked")
+    __slots__ = ()
 
-    def __init__(self, body, blocked):
-        self._body, self._blocked = body, blocked
+    def __missing__(self, key):
+        if key in ("market_events", "control_events"):
+            raise ProtocolError("undeclared section: " + key)
+        raise KeyError(key)
 
-    def __getitem__(self, key):
-        require(key not in self._blocked, "undeclared section: " + str(key))
-        return self._body[key]
-
-    def __iter__(self):
-        return iter(self._body)
-
-    def __len__(self):
-        return len(self._body)
+    def get(self, key, default=None):
+        if key in ("market_events", "control_events"):
+            raise ProtocolError("undeclared section: " + key)
+        return dict.get(self, key, default)
 
 
 SIDES = {"bid": 0, "ask": 1}
@@ -574,11 +570,12 @@ class Decoder:
         # Raw record bytes remain convenient for initial/terminal offline callers.
         fields = {b"record": data} if type(data) is bytes else data
         require(type(fields) is dict and b"record" in fields
-                and set(fields) <= {b"record", b"events", b"deps"}, "entry fields")
-        require(all(type(v) is bytes for v in fields.values())
-                and sum(map(len, fields.values())) <= self.limit, "entry limit")
+                and len(fields) == 1 + (b"events" in fields) + (b"deps" in fields), "entry fields")
+        record, events, deps = fields[b"record"], fields.get(b"events", b""), fields.get(b"deps", b"")
+        require(type(record) is bytes and type(events) is bytes and type(deps) is bytes
+                and len(record) + len(events) + len(deps) <= self.limit, "entry limit")
         try:
-            r = _orjson.loads(fields[b"record"])
+            r = _orjson.loads(record)
         except (ValueError, UnicodeError, RecursionError) as e:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)
@@ -592,7 +589,7 @@ class Decoder:
         require(r["sequence"] == str(seq), "stream sequence gap or duplicate")
         kind, b = r["kind"], r["body"]
         if kind != "cut":
-            require(set(fields) == {b"record"}, "entry fields")
+            require(len(fields) == 1, "entry fields")
         if seq == 0:
             self._initial(kind, b)
             risk_sequence = 0
@@ -619,9 +616,8 @@ class Decoder:
         return Cut(seq, risk_sequence, kind, b, self._view)
 
     def _sections(self, body, fields):
-        require(not ({"market_events", "control_events"} & body.keys()), "events in record")
+        require("market_events" not in body and "control_events" not in body, "events in record")
         transitions = body["book_transitions"]
-        require(all("dependency" not in t for t in transitions), "deps in record")
         if "events" in self.sections:
             if b"events" in fields:
                 try:
@@ -632,7 +628,7 @@ class Decoder:
                         and set(events) <= {"market_events", "control_events"}, "events fields")
                 body.update(events)
         else:
-            body = _SectionBody(body, {"market_events", "control_events"})
+            body = _SectionBody(body)
         require(b"deps" in fields, "missing deps")
         if "deps" in self.sections:
             try:
@@ -642,10 +638,6 @@ class Decoder:
             require(type(deps) is list and len(deps) == len(transitions), "deps alignment")
             for transition, dependency in zip(transitions, deps):
                 transition["dependency"] = dependency
-        else:
-            # Guard transition access as well as Book.dependency. Never retain
-            # raw skipped blobs or replace missing evidence with null/empty data.
-            transitions[:] = [_SectionBody(t, {"dependency"}) for t in transitions]
         return body
 
     def _initial(self, kind, b):
