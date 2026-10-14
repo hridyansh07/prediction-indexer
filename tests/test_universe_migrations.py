@@ -98,7 +98,10 @@ class MigrationsTests(unittest.TestCase):
         summary = self.migrate()[0]
         self.assertEqual((self.source.read_bytes(), self.source.stat().st_mtime_ns), before)
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).digest(), hashlib.sha256(before[0]).digest())
-        self.assertEqual(_rows(self.dest, "universe_run_projections"), projections)
+        migrated_projections = _rows(self.dest, "universe_run_projections")
+        self.assertEqual([(r["projection_version"], r["projection_sha256"]) for r in migrated_projections],
+                         [(r["projection_version"], r["projection_sha256"]) for r in projections])
+        self.assertEqual(migrated_projections[0]["projection_row_count"], projections[0]["projection_row_count"] + 1)
         with closing(sqlite3.connect(self.dest)) as c:
             self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema())
             self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
@@ -350,6 +353,10 @@ class MigrationsTests(unittest.TestCase):
         self.migrate()
         for table in ("canonical_markets", "claim_classes", "market_claims", "claim_relations"):
             self.assertEqual(_rows(self.dest, table), _rows(rebuilt.path, table), table)
+        # A2's existing over and A1's corrected over now share a canonical row:
+        # one extra correction minus one canonical row, not blindly +1.
+        self.assertEqual([row["projection_row_count"] for row in _rows(self.dest, "universe_run_projections")],
+                         [row["projection_row_count"] for row in _rows(rebuilt.path, "universe_run_projections")])
 
     def test_command_records_revision_in_an_image_without_git(self):
         from universe.__main__ import main

@@ -334,7 +334,10 @@ exact candidate membership is unavailable, and the summary names those markets.
 in `market_claims` and `claim_relations`, not upsert attempts.
 
 Projection v3 rows retain their original hashes and require an m1 metadata row at
-startup; new ingestion writes v4. A rebuilt database has an empty migration table.
+startup; new ingestion writes v4. m1 adjusts `projection_row_count` by the new
+correction rows plus each candidate's canonical merge/split delta, so that count
+matches a rebuild; its summary records the nonzero per-run deltas. It does not
+recompute the v3 hash. A rebuilt database has an empty migration table.
 `/healthz` lists applied migration IDs, ordered by destination version.
 
 Build the Universe image with `UNIVERSE_CODE_REVISION=$(git rev-parse HEAD)`

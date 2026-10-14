@@ -137,6 +137,8 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     old_markets: set[tuple[str, int, int]] = set()
     before_members: set[tuple[Any, ...]] = set()
     before_relations: set[tuple[Any, ...]] = set()
+    before_canonical_counts: dict[tuple[str, str], int] = {}
+    row_count_deltas: dict[str, int] = {}
     affected_shapes: set[str] = set()
     correction_count = 0
     fallback_markets = []
@@ -165,6 +167,14 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
             continue
         changed[venue] += 1
         if row["event_id"] not in affected_events:
+            for decision in c.execute(
+                "SELECT * FROM candidate_decisions WHERE event_id = ? ORDER BY run_id, bundle_id",
+                (row["event_id"],),
+            ).fetchall():
+                before = _bundle_projection(c, db, decision, [])
+                before_canonical_counts[decision["run_id"], decision["bundle_id"]] = len({
+                    market["market_id"] for market in before["venue_markets"]
+                })
             before_members.update(tuple(r) for r in c.execute(
                 "SELECT * FROM market_claims WHERE event_id = ?", (row["event_id"],),
             ))
@@ -235,6 +245,7 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
             c.execute("INSERT INTO universe_run_projection_corrections VALUES (?, ?, ?, ?, ?, ?, ?)",
                       (run_id, venue, native, "direction", correction["report_value"], correction["projected_value"], correction["rule_id"]))
             correction_count += 1
+            row_count_deltas[run_id] = row_count_deltas.get(run_id, 0) + 1
 
     # The wrong canonical/claim may still be shared by a genuinely under
     # market. Its bounds must lose the corrected market, not retain its span.
@@ -268,9 +279,19 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
             raise EvidenceConflict(f"cannot reconstruct claims for event {event_id}")
         for decision in decisions:
             projection = _bundle_projection(c, db, decision, list(corrections.values()))
+            # Only corrections and canonical deduplication change the market
+            # projection's row count. Its original v3 hash/version still stand.
+            run_id = decision["run_id"]
+            row_count_deltas[run_id] = row_count_deltas.get(run_id, 0) + len({
+                market["market_id"] for market in projection["venue_markets"]
+            }) - before_canonical_counts[run_id, decision["bundle_id"]]
             _, unreconstructed = db._insert_claims(c, decision["run_id"], projection, projection)
             if unreconstructed:
                 raise EvidenceConflict(f"cannot reconstruct claims for bundle {decision['bundle_id']}")
+
+    for run_id, delta in sorted(row_count_deltas.items()):
+        c.execute("UPDATE universe_run_projections SET projection_row_count = projection_row_count + ? WHERE run_id = ?",
+                  (delta, run_id))
 
     for claim_id in sorted(old_claims):
         members = c.execute(
@@ -294,6 +315,7 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
         "correction_rows_written": correction_count,
         "claims_rewritten": len(before_members ^ after_members),
         "relations_rewritten": len(before_relations ^ after_relations),
+        "projection_row_count_deltas": {run: delta for run, delta in sorted(row_count_deltas.items()) if delta},
         "correction_membership_fallback": fallback_markets,
         "changed": [{"market": f"{value['venue']}:{value['venue_market_id']}",
                      "report_value": value["report_value"], "projected_value": value["projected_value"]}
