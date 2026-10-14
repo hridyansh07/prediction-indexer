@@ -35,6 +35,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     STRATEGY,
     TRANSITIONS_FILE,
     V2_GROUPS,
+    VOLATILITY_FILE,
     pairs_of,
     profile_files,
     profile_identity,
@@ -42,6 +43,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
 )
 from replay.economic_sdk.levels import LevelRecorder
 from replay.economic_sdk.transitions import TransitionRecorder
+from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
@@ -152,6 +154,11 @@ class Collector:
             self.levels = LevelRecorder(snapshot, self.plans, self.policy, self.counterpart,
                                         root, self.budget)
         self.streams = tuple(s for s in (self.transitions, self.levels) if s is not None)
+        self.volatility = None
+        if "volatility" in self.groups:
+            self.volatility = VolatilityRecorder(snapshot, self.plans, self.policy, self.counterpart,
+                                                 root, self.budget)
+            self.transitions.on_top = self.volatility.top
         if self.availability is not None:
             self.budget.charge(len(entities(snapshot)) * 2048, "profile state budget")
 
@@ -313,6 +320,8 @@ class Collector:
         self._advance(end)
         for stream in self.streams:
             stream.flush(self.sequence)
+        if self.volatility is not None:
+            self.volatility.terminal()
         self._close_scope(end, "RUN_END")
         if self.availability is not None:
             self.availability.terminal(end)
@@ -670,4 +679,6 @@ class Collector:
             files[TRANSITIONS_FILE] = self.transitions.finish()
         if self.levels is not None:
             files[LEVELS_FILE] = self.levels.finish()
+        if self.volatility is not None:
+            files[VOLATILITY_FILE] = self.volatility.finish()
         return files

@@ -523,6 +523,16 @@ for row, (bids, asks) in iter_levels(out / "levels.ndjson.zst"):
     depth = sum(q for _, q in bids[:3])
 ```
 
+The standalone profile additionally supports `volatility`, requiring `transitions`
+and its own closed policy block. It samples on a scope-relative clock and records
+exact scale-4 doubled-mid and complete-set gap move statistics without new wire
+retention boundaries. Its reader independently rebuilds every row and mask pair
+from verified transitions and the prepared snapshot. Unknown masks remain visible;
+prices needing rounding fail. See the [supplied volatility specification](specs/MARKET_VOLATILITY_V1.md)
+and [implementation contract](specs/MARKET_VOLATILITY_V1_CONTRACT.md) for row shapes,
+units and bounded state. Without the group, policy identities and output bytes
+are unchanged. Retained five-bundle acceptance remains pending.
+
 ## 8. Retained-state bounds
 
 Recursive size accounting is replaced by **count-based bounds**.
