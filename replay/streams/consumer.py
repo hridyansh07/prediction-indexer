@@ -38,7 +38,7 @@ class Consumer:
         require(0 < timeout <= 60)
         obj(
             initial,
-            "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes",
+            "pins start_ns end_ns lower_bound plans groups retain_boundaries_ns retain_shift_offsets_ns max_entry_bytes max_queue_bytes",
         )
         entry = uint(initial["max_entry_bytes"])
         if batch_entries is None:
