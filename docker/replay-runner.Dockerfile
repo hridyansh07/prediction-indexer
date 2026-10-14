@@ -7,9 +7,9 @@ COPY encoder/rust/ encoder/rust/
 COPY ingester/ ingester/
 COPY engine/ engine/
 COPY replay/streams/attempt.lua replay/streams/attempt.lua
-RUN RUSTFLAGS="${RUSTFLAGS}" nice -n 15 cargo build --locked --release --manifest-path engine/Cargo.toml \
+RUN RUSTFLAGS="${RUSTFLAGS}" cargo build --locked --release --manifest-path engine/Cargo.toml \
       -p replay-transport --bin replay-publish \
-    && RUSTFLAGS="${RUSTFLAGS}" nice -n 15 cargo build --locked --release --manifest-path engine/Cargo.toml \
+    && RUSTFLAGS="${RUSTFLAGS}" cargo build --locked --release --manifest-path engine/Cargo.toml \
       -p replay-normalizers --example materialize_range
 
 FROM python:3.13-slim-bookworm
@@ -48,10 +48,10 @@ COPY configs/replay_runner.json /etc/prediction-indexer/replay_runner.json
 COPY --from=rust-builder /build/engine/target/release/replay-publish /usr/local/bin/replay-publish
 COPY --from=rust-builder /build/engine/target/release/examples/materialize_range /usr/local/bin/materialize_range
 
-RUN nice -n 15 python -m pip install ".[replay-redis]" \
+RUN python -m pip install ".[replay-redis]" \
     && test -x /usr/local/bin/replay-publish \
-    && nice -n 15 materialize_range --describe >/tmp/materializer-descriptor.json \
-    && nice -n 15 python -c "import json,replay.jobs,replay.ops; json.load(open('/tmp/materializer-descriptor.json'))" \
+    && materialize_range --describe >/tmp/materializer-descriptor.json \
+    && python -c "import json,replay.jobs,replay.ops; json.load(open('/tmp/materializer-descriptor.json'))" \
     && rm /tmp/materializer-descriptor.json
 
 LABEL org.opencontainers.image.revision=${REPLAY_IMAGE_REVISION}
