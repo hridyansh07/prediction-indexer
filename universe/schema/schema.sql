@@ -168,7 +168,7 @@ CREATE TABLE event_identity_lineage (
 
 CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    projection_version INTEGER NOT NULL CHECK(projection_version = 3),
+    projection_version INTEGER NOT NULL CHECK(projection_version = 4),
     projection_sha256 TEXT NOT NULL,
     projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0),
     -- Claims are recomputed from the run's own projection, and where that
@@ -179,6 +179,21 @@ CREATE TABLE universe_run_projections (
     claim_relation_shortfall INTEGER NOT NULL
         CHECK(claim_relation_shortfall >= 0),
     unreconstructed_bundles INTEGER NOT NULL CHECK(unreconstructed_bundles >= 0)
+) STRICT;
+
+-- A field Universe projected differently from the archived report's stored
+-- catalogue value (docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md). The archived
+-- report stays untouched; this is the visible difference. NULL means absent.
+CREATE TABLE universe_run_projection_corrections (
+    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
+    venue TEXT NOT NULL,
+    venue_market_id TEXT NOT NULL,
+    field TEXT NOT NULL CHECK(field = 'direction'),
+    report_value TEXT,
+    projected_value TEXT,
+    rule_id TEXT NOT NULL CHECK(rule_id = 'totals-direction-v1'),
+    CHECK(report_value IS NOT projected_value),
+    PRIMARY KEY (run_id, venue, venue_market_id, field)
 ) STRICT;
 
 CREATE TABLE umbrella_events (

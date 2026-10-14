@@ -3,7 +3,7 @@
 Three SQL resources, owned by [`universe/`](../README.md):
 
 - [`schema.sql`](schema.sql): the Event Universe projection database,
-  `PRAGMA user_version = 6`. It is a rebuildable query index with no in-place
+  `PRAGMA user_version = 7`. It is a rebuildable query index with no in-place
   migration; startup compares the stored schema object-for-object against this
   file and fails with a rebuild instruction (stop Universe, remove the SQLite
   file and its WAL/SHM siblings, run an oldest-first backfill) for any other
