@@ -3,7 +3,7 @@
 Three SQL resources, owned by [`universe/`](../README.md):
 
 - [`schema.sql`](schema.sql): the Event Universe projection database,
-  `PRAGMA user_version = 7`. It is a rebuildable query index. **Schema changes
+  `PRAGMA user_version = 8`. It is a rebuildable query index. **Schema changes
   ship with an offline migration under
   [Universe offline migrations V1](../../docs/specs/UNIVERSE_MIGRATIONS_V1.md)
   or require a rebuild. A migration never runs inside the server and never
@@ -15,15 +15,15 @@ Three SQL resources, owned by [`universe/`](../README.md):
   cannot be re-ingested; ordinary incremental sync skips an unchanged manifest,
   while force/audit and backfill still conflict. Fresh ingestion writes 4.
   A rebuild has no migration rows. An older v7 file without these objects requires
-  a rebuild. m2 remains an
-  aborting stub pending the missing `EXECUTION_DELAY_SDK_V1` §1.2 table contract;
-  this resource does not define or claim to support v8.
-  Version 7 includes `market_execution_terms`, keyed by selected
+  a rebuild. m1's v7 output has no execution-terms table or execution-specific
+  indexes. m2 migrates exact v7 to v8, adding `market_execution_terms`, keyed by selected
   `(run_id, venue, venue_market_id)`, with nullable `taker_delay_ms` and exact
   `observed_at`. No row means unavailable evidence; a row with a null delay is
   an observation with unknown terms. These rows are included in the run's
-  projection identity and audit, and ship in the same rebuild as the totals
-  direction correction. Outcomes version 2 exposes their collapsed history;
+  bundle projection identity and audit; m2 can recompute this identity from
+  retained rows without changing the unreconstructable market-projection hash.
+  m2 checkpoint preparation is resumable; final commit drops its checkpoint table.
+  Fresh rebuilds and ingestion write v8. Outcomes version 2 exposes collapsed history;
   [`EXECUTION_DELAY_V1.md`](../../docs/specs/EXECUTION_DELAY_V1.md) owns its contract.
 - [`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql):
   additive component schemas initialized in the durable Replay database

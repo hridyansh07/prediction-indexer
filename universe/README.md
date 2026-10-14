@@ -33,10 +33,12 @@ fields are rejected.
 | `python -m universe sync` | One-shot incremental ingestion of newly committed runs |
 | `python -m universe backfill` | One-shot oldest-first backfill of `backfill.generated_start` to `backfill.generated_end` (both required) |
 | `python -m universe backup` | Online-backup the SQLite file, upload it immutably under `backup.object_prefix`, print path, key, SHA-256, length |
-| `python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--input NAME=PATH ...]` | Offline SQLite backup into a new file, then consecutive migration transactions; currently m1 (6 → 7) |
+| `python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--resume]` | Offline SQLite backup into a new file; m1 (6 → 7) and m2 (7 → 8) |
 
 Servers and jobs take no options; everything comes from the config. `migrate`
 takes explicit paths, never loads that config, and m1 uses no archive or network.
+m2 uses the same exported `ARCHIVE_*` environment and verified ObjectStore path
+as sync, fetching only manifests and target records for all three venues.
 
 `compose.universe.yaml` runs `event-universe` (the server) and the profile
 `jobs` services `event-universe-sync`, `event-universe-backfill` and
@@ -300,7 +302,7 @@ are exempt. Exceeding the limit returns 429 with `Retry-After`.
 Two independent SQLite files:
 
 - **Event Universe database** (`database_path`): `universe/schema/schema.sql`,
-  `PRAGMA user_version = 7`. **Schema changes ship with an offline migration
+  `PRAGMA user_version = 8`. **Schema changes ship with an offline migration
   under [Universe offline migrations V1](../docs/specs/UNIVERSE_MIGRATIONS_V1.md)
   or require a rebuild. A migration never runs inside the server and never
   modifies the live file.** Startup validates the stored schema object-for-object
@@ -319,8 +321,9 @@ Two independent SQLite files:
   committed reports. Backup uses SQLite's online backup API followed by
   `integrity_check`. `market_execution_terms` is STRICT and holds one nullable
   delay plus observation timestamp per selected `(run, venue, venue_market_id)`;
-  a missing row remains distinct from a row with unknown delay. This ships in
-  the same unreleased version-7 rebuild as totals-direction corrections.
+  a missing row remains distinct from a row with unknown delay. v7 is exactly
+  m1 output (totals corrections, migration metadata and relaxed projection CHECK),
+  with no execution-terms objects. v8 adds the terms table and indexes.
 - **Replay database** (`replay.database_path`, `jobs.sqlite3`): additive,
   non-rebuildable. `schema/replay_auth.sql` (`sessions`, `allowlist`,
   `allowlist_events`) and `schema/replay_jobs.sql` (job rows, idempotency
@@ -335,6 +338,7 @@ Two independent SQLite files:
 
 ```bash
 python -m universe migrate --to 7 SOURCE.sqlite3 DEST.sqlite3
+.venv/bin/python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3
 python -m universe.tools.rebuild_diff SOURCE.sqlite3 DEST.sqlite3
 ```
 
@@ -345,8 +349,8 @@ uses one transaction, validates the schema and foreign keys, records a STRICT
 commit. Failure rolls back that step, retaining the previous version in `DEST`;
 already committed steps remain. The command prints the same JSON summary it
 stores. It refuses downward migration, files older than v6, skipped versions,
-and undeclared inputs. Delete only your failed disposable destination before a
-retry; never overwrite the source.
+and undeclared inputs. m2 resumes its existing destination only with `--resume`;
+otherwise retry using a new disposable destination. Never overwrite the source.
 
 m1 requires exact schema v6 and all market projections at v3. It reuses the
 totals projector and claim reconstruction, preserving market hashes, volumes,
@@ -390,15 +394,35 @@ Build the Universe image with `UNIVERSE_CODE_REVISION=$(git rev-parse HEAD)`
 for migration metadata; a source checkout can resolve it through Git instead.
 A missing/invalid image revision aborts before copying.
 
-**m2 (7 → 8) is an explicit aborting stub.** The requested base lacks
-`docs/specs/EXECUTION_DELAY_SDK_V1.md` §1.2, including the table name, full column
-and timestamp contract. No guessed execution-terms table is installed. `--to 8`
-fails nonzero; from v6 it first commits m1 and leaves a valid v7 destination,
-while from v7 it leaves the copied v7 file unchanged. Artifact acquisition,
-delay/null conversion, missing-artifact summaries, identity/malformed checks,
-checkpoint/resume, v8 startup and served execution terms remain unimplemented.
-New-run execution-term ingestion is outside this task. Supply the authoritative
-§1.2 before implementing m2; m1 can ship alone as the specification permits.
+**m2 (7 → 8)** reads each complete run's verified manifest and only its
+`target_records_{polymarket,kalshi,limitless}.ndjson[.zst]` artifacts. It reuses
+sync's strict reader and `universe/derive/execution_terms.py` unchanged: valid
+Polymarket integer seconds become milliseconds, invalid/missing values are
+observed-null, and Kalshi/Limitless rows are observed-null. Missing artifacts or
+market rows contribute no observation. Catalogues are never retrieved. Malformed
+or identity-mismatched artifacts abort with their key named.
+
+Verified rows and absent-venue/size counts are checkpointed per run in STRICT
+`m2_execution_terms_checkpoint`. Resume against the same snapshot and revision:
+
+```bash
+.venv/bin/python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3 --resume
+```
+
+The final transaction creates the v8 table/indexes, inserts FK-bound rows,
+verifies and recomputes the fully retained bundle projection hashes/counts,
+drops the checkpoint, validates schema/FKs, records metadata and sets version 8.
+Market-projection hashes remain unchanged. The summary includes rows written,
+complete runs processed, missing artifacts per venue, observed/null rows per
+venue, target-record object count and decoded bytes. Null counts are a subset
+of observed counts, never unavailable evidence. From v6, `--to 8` runs m1 then
+m2; a failed m2 leaves committed m1 and resumable v7 preparation. The current
+server rejects v7 until it is migrated to v8.
+
+Use the same exported `ARCHIVE_BACKEND`, `ARCHIVE_ROOT`, `ARCHIVE_STORE_ID`,
+`ARCHIVE_DURABILITY` and `ARCHIVE_GCS_BUCKET` configuration as sync. The migration
+does not load dotenv or server config. Tests use only small disposable local
+archives; production object counts/bytes must be estimated from manifests.
 
 ### Short-range equivalence, without remote access
 
@@ -406,8 +430,10 @@ Use a **disposable local** contract-shaped archive and a half-open range that
 contains both a corrected Kalshi bundle and a corrected Limitless bundle. Build
 two identity-empty files oldest-first with identical `backfill.generated_start`
 and `backfill.generated_end` config bounds: one with v6 code, then migrate it to
-v7; the other with this code. Use the same local evidence and include any origin
-dependencies. Never use the real archive/object store for tests.
+v8; the other with this code. Include all three venues' target records, a run
+missing one venue artifact and a pre-target-records run. Use the same local
+evidence and include any origin dependencies. Never use the real archive/object
+store for tests.
 
 The comparison command accepts the bounds explicitly and reads only the two
 prepared SQLite files; it does not perform backfill or access any object store:
@@ -427,12 +453,15 @@ differences before optionally rerunning with
 `universe_run_projection_corrections`. Every other table must still match.
 Rows stream in SQLite sort order; reports retain at most 20 differing samples
 per side/table. Keep both files and the comparison JSON as proof artifacts.
+`execution_terms` retains observed/unavailable market lists and new-file row
+counts from the execution-delay integration. `execution_term_observations` adds
+old/new per-venue rows, observed counts (all rows), and null subsets.
 
 The ordinary full-file diff also lists migration rows and discovers execution
 tables by their `venue`, `venue_market_id`, `taker_delay_ms`, `observed_at` columns,
-reporting observed/unavailable counts per venue. Zero rows means unknown, not
-zero delay. This diagnostic support does not implement m2. The real acceptance
-set and a v8 equivalence run remain operator gates, not unit-test claims.
+reporting observed rows and their null subset per venue. Zero rows means no
+evidence, not zero delay. The real acceptance set and a production-range v8
+equivalence run remain operator gates, not unit-test claims.
 Rebuild remains canonical when migration inputs are unavailable or short-range
 serving equivalence cannot be shown.
 

@@ -577,16 +577,17 @@ file.** Stale startup errors name both migration and backfill. A rebuild remains
 canonical when the migration's inputs are unavailable from the database or small
 archived artifacts, or serving equivalence cannot be shown on a short range.
 
-For an offline migration (currently m1, v6 → v7):
+For an offline migration (m1, v6 → v7, then m2, v7 → v8):
 
 1. Build the new image with `UNIVERSE_CODE_REVISION=$(git rev-parse HEAD)` so
    migration metadata identifies its full commit. Pause sync and game-state cron
    entries and wait for running jobs. Do not allow writers during the snapshot
    and review period; the API may keep reading the live file.
-2. Run `python -m universe migrate --to 7 SOURCE.sqlite3 DEST.sqlite3` into a
-   new file under `/srv/event-universe/build7/`. SQLite's online backup includes
+2. Run `python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3` into a
+   new disposable file. SQLite's online backup includes
    committed WAL content; do not copy only the main file. m1 requires no archive
-   credentials or inputs. Keep the printed JSON summary and run
+   inputs; m2 uses the same exported `ARCHIVE_*` environment as sync and reads
+   only manifests and all three venues' target records. Keep each JSON summary and run
    `python -m universe.tools.rebuild_diff SOURCE.sqlite3 DEST.sqlite3`.
    Verify the reviewed totals acceptance set (16 Kalshi and 4 Limitless, all
    under → over, including unselected candidates), no unrelated market/claim/bundle
@@ -601,8 +602,10 @@ For an offline migration (currently m1, v6 → v7):
    `event-universe`. Checkpoint/close the live database before moving it (do not
    leave live WAL/SHM siblings attached to the replacement). Preserve it as
    `event-universe.sqlite3.v6-retired`, move the migrated file into place, and
-   start the new image. Confirm `/healthz` lists `m1-totals-direction` and the
-   corrected bundle outcomes show `over`. Point paused cron entries at the new
+   start the new image. Confirm `/healthz` lists `m1-totals-direction` and
+   `m2-execution-terms`, corrected bundle outcomes show `over`, and outcomes v2
+   terms match source observations, including null versus absent evidence.
+   Point paused cron entries at the new
    tag, unpause them, and restore the scheduler.
 4. Rollback: pause/drain writers and the scheduler, stop Universe, preserve the
    replacement for investigation, restore the retired file, and start the
@@ -610,14 +613,26 @@ For an offline migration (currently m1, v6 → v7):
    Replay/auth/jobs database.
 
 Every step is one transaction; a failed step leaves `DEST` at its previous
-version, while `SOURCE` stays unchanged. Existing destinations are refused.
+version, while `SOURCE` stays unchanged. m2 preparatory checkpoints commit per
+verified run; its versioned projection commits in one final transaction. Existing
+destinations are refused unless explicitly resuming m2 with `--resume`.
 Projection-v3 runs retain their hashes and fail visibly on re-ingestion; a
 rebuild is required to replay those old ranges. Ordinary incremental sync skips
 unchanged v3 manifests without failures; forced audits and backfill do not.
-m1 can ship alone. m2 (v7 → v8)
-is a documented aborting stub because this base lacks the execution-terms §1.2
-contract; `--to 8` cannot deploy v8. From v6 it commits m1 then exits nonzero at
-m2 with the destination still v7. Do not interpret that failure as success at v8.
+m1-only output stays v7, without execution terms, and needs the prior v7 image;
+this integration's server requires v8. m2 upgrades an m1-only v7 file or follows
+m1 when `--to 8` starts from v6. A failed m2 leaves a v7 snapshot and checkpoint
+preparation, not a serving v8 file. Resume with the same source, destination and
+code revision:
+
+```bash
+.venv/bin/python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3 --resume
+```
+
+Review m2's rows written, absent artifacts per venue, observed/null row counts,
+artifact objects and decoded bytes. Null rows are observed evidence; no artifact
+or market row means unavailable. Estimate production cost from manifest entries;
+no production object-count or runtime estimate was measured by offline fixtures.
 
 A schema change without a usable migration, or a full historical rebuild, is:
 stop the Replay scheduler first and

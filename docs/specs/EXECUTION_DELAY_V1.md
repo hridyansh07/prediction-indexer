@@ -66,11 +66,11 @@ keeps the venue's raw record for every selected market on every run. The terms a
   run's `target_records_*` artifacts through the same verified-identity path.
 - It stores one row per (run, venue, venue_market_id): `taker_delay_ms` (nullable)
   and `observed_at` (the record's `observed_at`).
-- It is a new STRICT table in the rebuildable Event Universe database. Build on
-  `fix/universe-totals-direction` (head `aee4002`) and stay inside the same unreleased
-  schema `user_version` 7 bump
-  ([UNIVERSE_TOTALS_DIRECTION_V1.md](UNIVERSE_TOTALS_DIRECTION_V1.md)), so both changes
-  ship in **one** rebuild. `universe.tools.rebuild_diff` also reports this table: rows
+- It is a new STRICT table in the rebuildable Event Universe database. The
+  [offline migration integration](UNIVERSE_MIGRATIONS_V1.md) supersedes the original
+  unreleased-v7 rebuild plan: v7 remains exactly m1 totals-direction output, and
+  v8 adds execution terms. Fresh ingestion/rebuild writes v8; m2 migrates 7 → 8
+  with the same derivation and value rules. `universe.tools.rebuild_diff` reports rows
   in the new file per venue, and markets whose terms are `observed` against
   `unavailable`.
 - A malformed target-record artifact is a sync failure, as for catalogue artifacts.

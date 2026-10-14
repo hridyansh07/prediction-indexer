@@ -7,8 +7,9 @@ migrations:
 
 - **m1** totals direction: schema `user_version` 6 → 7
   ([UNIVERSE_TOTALS_DIRECTION_V1.md](UNIVERSE_TOTALS_DIRECTION_V1.md)).
-- **m2** execution terms: 7 → 8 ([EXECUTION_DELAY_SDK_V1.md](EXECUTION_DELAY_SDK_V1.md)
-  §1).
+- **m2** execution terms: 7 → 8 ([EXECUTION_DELAY_V1.md](EXECUTION_DELAY_V1.md)
+  §1.1–1.2). The offline migration schema split supersedes that spec's original
+  unreleased-v7 rebuild plan: v7 is exactly m1 output; execution terms start at v8.
 
 ## 0. Why
 
@@ -17,8 +18,8 @@ migrations:
   2% of its rows. Each projection change would cost that again.
 - **The changes are small.** m1 changes the `direction` of a handful of the 2,260
   Kalshi/Limitless totals markets, and every input it needs is already in the
-  database. m2 needs only the runs' `target_records_polymarket` artifacts: about
-  70 KB per run, against about 33 MB for that run's Polymarket catalogue.
+  database. m2 needs only the runs' target-record artifacts for all three venues,
+  not their much larger catalogues.
 - **What stays the same:**
   - The archive is still the evidence.
   - A full rebuild remains valid and remains the canonical path.
@@ -32,7 +33,7 @@ migrations:
 ### 1.1 Command
 
 ```
-python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--input NAME=PATH ...]
+python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--resume]
 ```
 
 - **Offline and copy-based.** It copies `SOURCE` to `DEST` with the SQLite online
@@ -41,7 +42,8 @@ python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--input NAME=PATH
   `SOURCE` is never opened for writing.
 - **One transaction per step.** A step's last statement sets `PRAGMA user_version`.
   A failed step rolls back, leaves `DEST` at the previous version and exits
-  nonzero.
+  nonzero. m2 first commits verified-run checkpoints (§3.1); its versioned schema,
+  rows and migration metadata still commit in one transaction.
 - **No skipping.** Each step is a pure function of the database and its declared
   inputs. A step whose precondition fails (§2.1, §3.1) aborts.
 - **The summary.** It prints one JSON summary per step and stores it in
@@ -74,17 +76,21 @@ projected market document: the projection version plus its venue-market rows,
 including that run's volumes. The database keeps only the latest volumes, so a
 migration cannot recompute these hashes.
 
-- **The CHECK changes** from `projection_version = 4` to `IN (3, 4)`. Rows ingested
+- **The CHECK changes** from `projection_version = 3` to `IN (3, 4)`. Rows ingested
   under v3 keep version 3 and their hash. New ingestion still writes 4.
 - **Version 3 rows require m1.** A version-3 row is legal only when
   `universe_migrations` holds `m1-totals-direction`. Startup validation checks this.
-- **Re-ingestion of a version-3 run fails visibly.** Re-ingesting one, by backfill
-  over an old range or by a sync replay, raises
+- **Re-ingestion of a version-3 run fails visibly.** Backfill re-ingestion and
+  force/audit raise
   `EvidenceConflict("run … was migrated from projection v3; rebuild to re-ingest it")`.
-  It is never skipped silently, and never compared against a v4 hash.
-- **`/v1/runs/<id>` verification** (`universe/store/reads/runs.py`) is unaffected. It
-  checks the bundle projection (`targeter_runs.projection_*`, `PROJECTION_VERSION`),
-  not the market projection.
+  Ordinary incremental sync skips unchanged manifests, as before migration;
+  changed identities conflict before any projection-version check. A v3 hash is
+  never compared against a v4 hash.
+- **`/v1/runs/<id>` verification** (`universe/store/reads/runs.py`) checks the bundle
+  projection (`targeter_runs.projection_*`, `PROJECTION_VERSION`), not the market
+  projection. m2 can fully reconstruct this identity from retained bundle rows
+  and the new terms, so it verifies the old identity and updates its hash/count
+  to match fresh v8 ingestion. Market-projection v3 hashes remain unchanged.
 
 ## 2. m1: totals direction (6 → 7)
 
@@ -98,7 +104,8 @@ The step creates exactly the v7 objects: `universe_run_projection_corrections` a
 the changed `universe_run_projections` CHECK. SQLite cannot alter a CHECK, so that
 table is recreated and copied. It also creates `universe_migrations`. The resulting
 schema must equal `schema.sql` at v7, apart from the relaxed CHECK and the
-migrations table. A test compares `sqlite_master`.
+migrations table. No execution-terms table or execution-specific indexes exist
+at v7. A test compares `sqlite_master`.
 
 ### 2.3 Data
 
@@ -146,31 +153,49 @@ Anything else stops the deployment until it has been reviewed.
 ### 3.1 Source
 
 - **Archived target records only.** For every run in `targeter_runs` with
-  `input_complete = 1`, read its manifest and fetch only
-  `target_records_polymarket.ndjson[.zst]`, through the existing verified-identity
-  ObjectStore path. Catalogues are never fetched.
-- **Value rules** are EXECUTION_DELAY_SDK_V1 §1.1 unchanged:
-  - `taker_delay_ms = record.secondsDelay × 1000`;
-  - a missing, non-integer or negative value is null;
-  - Kalshi and Limitless have no rows, which means unknown.
-- **A run whose manifest has no `target_records_polymarket` artifact** contributes no
-  observation. It is counted in the summary, never treated as 0.
+  `input_complete = 1`, read its manifest and fetch the run's
+  `target_records_<venue>` artifacts for all venues
+  (`target_records_{polymarket,kalshi,limitless}.ndjson[.zst]`), through the existing
+  verified-identity ObjectStore path. Catalogues are never fetched, even for
+  metadata verification.
+- **Value rules** are [EXECUTION_DELAY_V1 §1.1–1.2](EXECUTION_DELAY_V1.md#11-source)
+  unchanged. m2 reuses sync's verified reader and `target_record_terms` derivation:
+  - Polymarket: `taker_delay_ms = record.secondsDelay × 1000`; a missing,
+    non-integer (including boolean) or negative value is null;
+  - Kalshi/Limitless: one observed-null row per market present in the records.
+    Null is an observation with unknown delay; absence is no evidence.
+- **A run whose manifest lacks a venue's target-record artifact** contributes no
+  observation for that venue. Count it per venue in the summary; never treat it
+  as 0 or null. A present artifact missing a selected market's row also contributes
+  no observation for that market.
 - **A malformed or identity-mismatched artifact** aborts the step, with its key named.
-- **Resume:** a checkpoint table, dropped at commit, records the runs processed, so
-  an interrupted step resumes without refetching. The step's outcome must not
-  depend on interruption.
-- **Expected cost:** about 5,400 small objects, about 0.4 GB, read from the
-  server's own region with no egress charge. That's minutes to about an hour on the
-  e2-small.
+- **Resume:** STRICT `m2_execution_terms_checkpoint` stores each fully verified
+  run's derived rows, missing venues and artifact sizes. A header binds the source
+  path/version, target version and code revision. `--resume` continues the same
+  destination snapshot without refetching completed runs, and refuses a different
+  binding or schema. Final commit drops the checkpoint table. Interruption must
+  not change the rows or summary counts.
+- **Summary:** rows written, complete runs processed, runs lacking artifacts per
+  venue, observed rows and their null subset per venue, artifact object count and
+  decoded bytes. No row is labelled observed merely because a market was selected.
+- **Expected cost:** one manifest read per complete run, plus about one object per
+  venue artifact present per run (at most three). Kalshi/Limitless records are
+  small; estimate object count and stored/decoded bytes from the manifests, not
+  catalogue sizes or a Polymarket-only extrapolation. No production manifests
+  were measured for this integration. The summary reports actual target-record
+  objects and decoded bytes; it excludes manifest reads.
 
 ### 3.2 Schema and data
 
-- The step creates the execution-terms table EXECUTION_DELAY_SDK_V1 §1.2 defines:
+- The step creates the STRICT `market_execution_terms` table and indexes from
+  EXECUTION_DELAY_V1 §1.2:
   one row per (run, venue, venue_market_id), with `taker_delay_ms` and
-  `observed_at`.
+  `observed_at`. Its foreign key limits rows to `selected_market_occurrences`.
 - It fills the table from §3.1 and sets `user_version` 8.
-- Ingestion of new runs fills the same table from the same artifact, so a rebuild at
-  v8 and a migration to v8 produce the same rows.
+- Ingestion of new runs fills the same table with d0517ea sync semantics, including
+  Kalshi/Limitless observed-null rows, so fresh v8 ingestion and migration produce
+  identical rows and outcomes v2 documents. `migrate --to 8` from v6 runs m1 then
+  m2; a failed m2 leaves committed m1 and a v7 destination.
 
 ### 3.3 Not the public API
 
@@ -187,6 +212,26 @@ It is not the source, for three reasons:
 `universe.tools.check_execution_terms` (optional) compares a sample of migrated
 markets with the API and only reports. It writes nothing.
 
+### 3.4 Command and environment
+
+With the same archive environment already exported as for sync:
+
+```bash
+.venv/bin/python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3
+```
+
+After interruption, with the same source, destination and code revision:
+
+```bash
+.venv/bin/python -m universe migrate --to 8 SOURCE.sqlite3 DEST.sqlite3 --resume
+```
+
+The command calls the same ObjectStore factory as sync. It reads `ARCHIVE_BACKEND`,
+`ARCHIVE_ROOT`, `ARCHIVE_STORE_ID`, `ARCHIVE_DURABILITY` and `ARCHIVE_GCS_BUCKET`
+according to the selected backend; it never loads dotenv or server config.
+`UNIVERSE_CODE_REVISION` identifies the code (a checkout may resolve it from Git).
+m1 alone needs no archive environment. Tests use disposable local stores only.
+
 ## 4. Proof
 
 1. **Equivalence on a short range.** Choose a half-open range of a few dozen runs
@@ -200,13 +245,15 @@ markets with the API and only reports. It writes nothing.
      - `indexed_at_ns`.
    - If §2.3's fallback for correction membership applies, its differences are
      listed and accepted only if they are confined to `universe_run_projection_corrections`.
-   - This is an offline test against the archive. Its two files and the comparison
-     output are kept as evidence.
+   - This is an offline test against hand-built local archive fixtures. Its two
+     files and the comparison output are kept as evidence.
 2. **Full file.** `rebuild_diff live.sqlite3 migrated.sqlite3`:
    - the totals changes equal §2.4;
    - there is no other `venue_markets`, `claim_*` or bundle change;
-   - the execution-terms table has rows for Polymarket only, with observed and
-     unavailable counts per venue.
+   - the execution-terms table has ingestion-equivalent rows for all venues, with
+     observed/null counts per venue and no fabricated missing observations.
+     `rebuild_diff.execution_terms` lists observed/unavailable markets;
+     `execution_term_observations` reports old/new row counts and null subsets.
 3. **Served documents.**
    - On the migrated file, served locally: the outcomes documents of the corrected
      bundles show `over`.
@@ -233,7 +280,8 @@ markets with the API and only reports. It writes nothing.
    start the new image. Point the cron entries at the new tag and unpause them.
 4. **Rollback:** stop, restore the retired file, and start the previous image.
 
-m1 can ship alone (to 7) before A2 lands. m2 then migrates 7 → 8 the same way.
+m1 output remains v7 and is readable by the prior v7 image; this integration's
+server requires v8. m2 upgrades an m1-only v7 file to v8 the same way.
 
 ## 6. Rules after this spec
 

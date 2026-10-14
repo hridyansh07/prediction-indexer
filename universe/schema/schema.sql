@@ -385,7 +385,7 @@ CREATE INDEX selected_market_occurrences_canonical
     );
 
 -- Absence of a row is unavailable source evidence; NULL is an observation
--- whose venue taker delay is unknown. Both survive the v7 rebuild distinctly.
+-- whose venue taker delay is unknown. Both survive the v8 rebuild distinctly.
 CREATE TABLE market_execution_terms (
     run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
     venue TEXT NOT NULL,
