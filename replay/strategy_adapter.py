@@ -1,6 +1,7 @@
 """Strategy process entry point; factory(context) returns callable + finish()."""
 
 import os
+import json
 import signal
 import sys
 import time
@@ -11,6 +12,7 @@ from replay.streams import Consumer, TransportError
 from replay.streams.consumer import DEFAULT_BATCH_BYTES
 from replay.strategies import load_entrypoint
 from replay.streams.protocol import freeze, require
+from replay.strategy_sdk import stream_sections
 from replay.supervisor import identity, initial, read, validate, write_json_durable
 
 
@@ -21,10 +23,13 @@ class HookFailure(Exception):
     pass
 
 
-def execute(root, attempt, group):
+def execute(root, attempt, group, sections=None):
     config = validate(read(root / "run.json"))
     t = config["transport"]
     spec = config["strategies"][group]
+    required_sections = stream_sections(spec)
+    if sections is not None:
+        require(frozenset(sections) == required_sections, "section declaration binding")
     directory = root / attempt / group
     factory = load_entrypoint(spec["factory"])
     context = freeze(
@@ -61,6 +66,7 @@ def execute(root, attempt, group):
         attempt_id=attempt,
         group=group,
         initial=initial(config),
+        sections=required_sections,
         timeout=t["command_timeout_ms"] / 1000,
         # Whole-entry batches: 1 GiB at the 1 MiB entry cap; one ACK each.
         batch_entries=CONSUMER_BATCH_ENTRIES,
@@ -118,7 +124,8 @@ def diagnose(directory, code, error):
 def main():
     signal.signal(signal.SIGTERM, lambda *_: os._exit(21))
     try:
-        execute(Path(sys.argv[1]), sys.argv[2], sys.argv[3])
+        execute(Path(sys.argv[1]), sys.argv[2], sys.argv[3],
+                json.loads(sys.argv[4]) if len(sys.argv) > 4 else None)
     except (TransportError, OSError) as error:
         diagnose(Path(sys.argv[1]) / sys.argv[2] / sys.argv[3], 21, error)
         return 21

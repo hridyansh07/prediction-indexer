@@ -14,7 +14,7 @@ from unittest.mock import patch, Mock
 
 from replay import supervisor as s
 from replay.streams import ProtocolError, TransportError
-from replay.tests.test_streams import records
+from replay.tests.test_streams import fields, records
 
 URL = os.environ.get("REPLAY_REDIS_URL")
 
@@ -545,11 +545,11 @@ def fake_publisher(path, ready, mode):
         value["attempt_id"] = c["attempt_id"]
     if mode == "liveness":
         values[-1]["body"]["risk_cuts"] = "10"
-    entries = [json.dumps(value) for value in values]
+    entries = [fields(value) for value in values]
     if mode == "waiting":
         # Every entry fits alone, but not the whole attempt: the publisher must
         # wait for both groups to ACK, exactly as the Rust publisher does.
-        r.hset(k[1], "limit", max(len(e) for e in entries))
+        r.hset(k[1], "limit", max(sum(map(len, e.values())) for e in entries))
     backoff, waited = 0.001, False
     for value, entry in zip(values, entries):
         seq = int(value["sequence"])
@@ -568,7 +568,7 @@ def fake_publisher(path, ready, mode):
                 str(seq + 1),
                 "1" if value["kind"] == "terminal" else "0",
                 json.dumps([value["body"].get("risk_sequence", "")]),
-                entry,
+                *(entry.get(name, b"") for name in (b"record", b"events", b"deps")),
             )
             if reply == 1:
                 backoff = 0.001

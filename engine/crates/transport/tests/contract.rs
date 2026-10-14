@@ -395,6 +395,13 @@ fn golden_wire_from_real_materializer_walker_and_risk() {
         std::fs::write(&path, &bytes).unwrap();
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+    // Exercise actual retention -> V4 encoding -> buffering, not only wire::cut.
+    // Capture independently reassembles and normalizes only the version tag.
+    let sink = Capture::default();
+    let capture = sink.clone();
+    let mut publisher = Publisher::with_sink(sink, c, RiskLimits::default()).unwrap();
+    while publisher.step().unwrap() {}
+    assert_eq!(format!("{}\n", capture.0.borrow().join("\n")), bytes);
     let operations = &values[3]["body"]["book_transitions"][0]["decision"];
     assert_eq!(operations["kind"], "operations");
     assert!(operations.get("bids").is_none());
@@ -422,7 +429,7 @@ impl StreamSink for Capture {
     fn append(
         &mut self,
         first: u64,
-        entries: &[String],
+        entries: &[wire::Fields],
         _: &[Option<u64>],
         _: bool,
     ) -> replay_transport::Result<usize> {
@@ -430,7 +437,12 @@ impl StreamSink for Capture {
         if self.2.get() {
             return Ok(0);
         }
-        self.0.borrow_mut().extend_from_slice(entries);
+        self.0.borrow_mut().extend(entries.iter().map(|fields| {
+            let mut record = reassemble(fields);
+            assert_eq!(record["version"], "4");
+            record["version"] = json!("3");
+            record.to_string()
+        }));
         Ok(entries.len())
     }
     fn liveness(&mut self, risk: u64) -> replay_transport::Result<()> {
@@ -441,6 +453,59 @@ impl StreamSink for Capture {
         Ok(BTreeMap::new())
     }
     fn poison(&mut self) {}
+}
+
+fn reassemble(fields: &wire::Fields) -> Value {
+    let mut record: Value = serde_json::from_str(&fields.record).unwrap();
+    let body = record["body"].as_object_mut().unwrap();
+    if let Some(events) = &fields.events {
+        let events: serde_json::Map<String, Value> = serde_json::from_str(events).unwrap();
+        body.extend(events);
+    }
+    if let Some(deps) = &fields.deps {
+        let deps: Vec<Value> = serde_json::from_str(deps).unwrap();
+        let transitions = body["book_transitions"].as_array_mut().unwrap();
+        assert_eq!(deps.len(), transitions.len());
+        for (transition, dependency) in transitions.iter_mut().zip(deps) {
+            assert!(transition.get("dependency").is_none());
+            transition["dependency"] = dependency;
+        }
+    }
+    record
+}
+
+#[test]
+fn v4_reassembles_every_v3_fixture_exactly() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut entries = 0;
+    for path in std::fs::read_dir(fixtures).unwrap() {
+        let path = path.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let old: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(old["version"], "3");
+            let mut next = old.clone();
+            next["version"] = json!("4");
+            let fields = wire::Fields::encode(next);
+            let record: Value = serde_json::from_str(&fields.record).unwrap();
+            if record["kind"] == "cut" {
+                assert!(record["body"].get("market_events").is_none());
+                assert!(record["body"].get("control_events").is_none());
+                assert!(fields.deps.is_some());
+            } else {
+                assert!(fields.events.is_none() && fields.deps.is_none());
+            }
+            let mut restored = reassemble(&fields);
+            restored["version"] = json!("3");
+            assert_eq!(restored, old, "{}", path.display());
+            assert_eq!(restored.to_string(), line, "canonical bytes");
+            entries += 1;
+        }
+    }
+    assert!(entries > 0);
+    println!("v3/v4 exact reassembly: {entries} fixture records");
 }
 
 #[test]
@@ -1052,8 +1117,15 @@ fn full_queue_case(url: &str, batch: usize) {
         .iter()
         .map(|v| serde_json::to_string(v).unwrap())
         .collect();
-    assert!(expected[..3].iter().map(String::len).sum::<usize>() <= c.max_queue_bytes);
-    assert!(expected[..4].iter().map(String::len).sum::<usize>() > c.max_queue_bytes);
+    let sizes: Vec<_> = records(&f, &c)
+        .into_iter()
+        .map(|mut record| {
+            record["version"] = json!("4");
+            wire::Fields::encode(record).len()
+        })
+        .collect();
+    assert!(sizes[..3].iter().sum::<usize>() <= c.max_queue_bytes);
+    assert!(sizes[..4].iter().sum::<usize>() > c.max_queue_bytes);
     let keys = c.keys();
     let mut admin = redis::Client::open(url.as_str())
         .unwrap()
@@ -1138,13 +1210,19 @@ fn full_queue_case(url: &str, batch: usize) {
                 .unwrap();
             for (id, fields) in reply.into_iter().flatten().flat_map(|(_, ids)| ids) {
                 idle = false;
-                let record = fields["record"].clone();
+                let mut record = reassemble(&wire::Fields {
+                    record: fields["record"].clone(),
+                    events: fields.get("events").cloned(),
+                    deps: fields.get("deps").cloned(),
+                });
+                assert_eq!(record["version"], "4");
+                record["version"] = json!("3");
                 let previous = if done.is_empty() {
                     "-1".to_string()
                 } else {
                     done.len().to_string()
                 };
-                done.push(record);
+                done.push(record.to_string());
                 let acked: u64 = script
                     .key(&keys[0])
                     .key(&keys[1])

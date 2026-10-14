@@ -1,4 +1,4 @@
-//! Wire V3 uses JSON strings for every integer, including domain integers.
+//! Wire V4 uses JSON strings for every integer, including domain integers.
 use replay_domain::{BookKey, ContractOrientation};
 use replay_risk::{
     CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut, RiskEngine, Validity,
@@ -6,6 +6,57 @@ use replay_risk::{
 use replay_tape::{DerivativePin, SourceFaultReason};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// One Redis entry. Limits count the sum of field values, not just `record`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fields {
+    pub record: String,
+    pub events: Option<String>,
+    pub deps: Option<String>,
+}
+
+impl Fields {
+    /// Called only after retention. Keep the original cut encoder as the single
+    /// source of truth, then move observations/dependencies into their sections.
+    pub fn encode(mut envelope: Value) -> Self {
+        let (events, deps) = if envelope["kind"] == "cut" {
+            let body = envelope["body"].as_object_mut().unwrap();
+            let mut events = serde_json::Map::new();
+            for name in ["market_events", "control_events"] {
+                if let Some(value) = body.remove(name) {
+                    events.insert(name.into(), value);
+                }
+            }
+            let deps: Vec<_> = body["book_transitions"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .map(|t| t.as_object_mut().unwrap().remove("dependency").unwrap())
+                .collect();
+            (
+                (!events.is_empty()).then(|| Value::Object(events).to_string()),
+                Some(Value::Array(deps).to_string()),
+            )
+        } else {
+            (None, None)
+        };
+        Self {
+            record: envelope.to_string(),
+            events,
+            deps,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.record.len()
+            + self.events.as_ref().map_or(0, String::len)
+            + self.deps.as_ref().map_or(0, String::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 pub fn exact(mut value: Value) -> Value {
     match &mut value {

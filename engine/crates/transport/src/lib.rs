@@ -434,7 +434,7 @@ impl<S: StreamSink> Publisher<S> {
             } else {
                 None
             },
-            record: serde_json::to_string(&record).unwrap(),
+            fields: wire::Fields::encode(record),
             terminal: kind == "terminal",
         })
     }
@@ -447,7 +447,7 @@ impl<S: StreamSink> Publisher<S> {
         self.buffer.stats()
     }
     fn record(&self, kind: &str, body: Value) -> Value {
-        json!({"version":"3","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
+        json!({"version":"4","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
     }
     /// Buffers one cut, or EOF terminal. Returns false only after terminal,
     /// and only once every buffered entry, terminal included, is appended.

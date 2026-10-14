@@ -10,9 +10,13 @@ from pathlib import Path
 
 from replay.streams import Consumer, ProtocolError, TransportError
 from replay.streams.consumer import SCRIPT
-from replay.tests.test_streams import assert_contract, encoded, held, records
+from replay.tests.test_streams import assert_contract, encoded, fields, held, records
 
 URL = os.environ.get("REPLAY_REDIS_URL")
+
+
+def payload_size(record):
+    return sum(map(len, fields(record).values()))
 
 
 @unittest.skipUnless(URL, "requires explicitly disposable REPLAY_REDIS_URL >=8.2")
@@ -56,7 +60,7 @@ class RedisTests(unittest.TestCase):
             str(seq + 1) if first is None else first,
             "1" if values[-1]["kind"] == "terminal" else "0",
             json.dumps([r["body"].get("risk_sequence", "") for r in values]),
-            *(encoded(r) for r in values),
+            *(fields(r).get(name, b"") for r in values for name in (b"record", b"events", b"deps")),
         )
 
     def append_reply(self, values, **kwargs):
@@ -125,12 +129,12 @@ class RedisTests(unittest.TestCase):
 
     def test_slow_group_unread_protection_last_ack_delete_and_hook_order(self):
         self.publish()
-        total = sum(len(encoded(r)) for r in self.values)
+        total = sum(payload_size(r) for r in self.values)
         self.assertEqual(int(self.redis.hget(self.keys[1], "bytes")), total)
         self.assertEqual(
             self.sizes(),
             {
-                f"size:{i + 1}".encode(): len(encoded(r))
+                f"size:{i + 1}".encode(): payload_size(r)
                 for i, r in enumerate(self.values)
             },
         )
@@ -210,7 +214,7 @@ class RedisTests(unittest.TestCase):
         # The last group's ACK deletes and releases exactly the stored sizes.
         self.redis.xreadgroup("slow", "worker", {self.keys[0]: ">"}, count=2)
         self.assertEqual(self.ack("slow", "-1", "2", b"1-0", b"2-0"), 2)
-        released = len(encoded(self.values[0])) + len(encoded(self.values[1]))
+        released = payload_size(self.values[0]) + payload_size(self.values[1])
         self.assertEqual(
             int(self.redis.hget(self.keys[1], "bytes")), int(bytes_before) - released
         )
@@ -372,7 +376,7 @@ class RedisTests(unittest.TestCase):
         self.assertEqual(self.append_reply(batch), 0)
         slow.poll(lambda _: None)
         self.assertEqual(self.redis.hget(self.keys[1], "bytes"), b"0")
-        self.redis.hset(self.keys[1], "limit", sum(len(encoded(r)) for r in batch))
+        self.redis.hset(self.keys[1], "limit", sum(payload_size(r) for r in batch))
         self.assertEqual(self.append_reply(batch), 2)
         self.assertEqual(self.redis.hget(self.keys[1], "published"), b"3")
 
@@ -383,16 +387,16 @@ class RedisTests(unittest.TestCase):
         ids = [i.decode() for i, _ in self.redis.xrange(self.keys[0])]
         self.assertEqual(ids, [f"{s}-0" for s in range(1, n + 1)])
         self.assertEqual(
-            [f[b"record"] for _, f in self.redis.xrange(self.keys[0])],
-            [encoded(r) for r in self.values],
+            [f for _, f in self.redis.xrange(self.keys[0])],
+            [fields(r) for r in self.values],
         )
         self.assertEqual(
             self.sizes(),
-            {f"size:{i + 1}".encode(): len(encoded(r)) for i, r in enumerate(self.values)},
+            {f"size:{i + 1}".encode(): payload_size(r) for i, r in enumerate(self.values)},
         )
         self.assertEqual(
             int(self.redis.hget(self.keys[1], "bytes")),
-            sum(len(encoded(r)) for r in self.values),
+            sum(payload_size(r) for r in self.values),
         )
         self.assertEqual(self.redis.hget(self.keys[1], "published"), str(n).encode())
         self.assertEqual(self.redis.hget(self.keys[1], "terminal"), str(n).encode())
@@ -407,7 +411,7 @@ class RedisTests(unittest.TestCase):
     def test_longest_prefix_is_appended_and_terminal_waits_for_its_entry(self):
         self.publish(self.values[:1])
         rest = self.values[1:]
-        sizes = [len(encoded(r)) for r in rest]
+        sizes = [payload_size(r) for r in rest]
         retained = int(self.redis.hget(self.keys[1], "bytes"))
         # Room for exactly the first two entries of the batch, one byte short
         # of the third: the queue is partly full.
@@ -430,7 +434,7 @@ class RedisTests(unittest.TestCase):
             slow.poll(lambda _: None)
             self.assertEqual(self.redis.hget(self.keys[1], "bytes"), b"0")
             # The whole queue holds only the batch's first entry.
-            self.redis.hset(self.keys[1], "limit", len(encoded(remaining[0])))
+            self.redis.hset(self.keys[1], "limit", payload_size(remaining[0]))
             appended = self.append_reply(remaining)
             self.assertEqual(appended, 1)
             self.assertEqual(self.redis.hget(self.keys[1], "terminal"),
@@ -473,8 +477,8 @@ class RedisTests(unittest.TestCase):
         before = self.state()
         # An entry above the per-entry cap anywhere in the batch can never fit:
         # an error, and the entries before it are not written either.
-        self.redis.hset(self.keys[1], "entry", len(encoded(self.values[1])))
-        self.assertGreater(len(encoded(self.values[2])), len(encoded(self.values[1])))
+        self.redis.hset(self.keys[1], "entry", payload_size(self.values[1]))
+        self.assertGreater(payload_size(self.values[2]), payload_size(self.values[1]))
         with self.assertRaisesRegex(redis.ResponseError, "REPLAY resource_limit"):
             self.append_reply(self.values[1:3])
         self.assertEqual(self.redis.xlen(self.keys[0]), 1)
