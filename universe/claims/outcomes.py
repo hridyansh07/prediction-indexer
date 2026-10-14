@@ -49,7 +49,8 @@ def _tokens(market, claims):
     return []
 
 
-def bundle_document(event, venue_events, venue_markets, *, recorded_claim_matches):
+def bundle_document(event, venue_events, venue_markets, *, recorded_claim_matches,
+                    execution_terms=None):
     """No I/O or selection exclusions; the caller owns bounded, consistent reads."""
     from universe.store import DetailTooLarge
 
@@ -152,10 +153,13 @@ def bundle_document(event, venue_events, venue_markets, *, recorded_claim_matche
                 "reason": reason,
                 "claims": refs if status == "MASKED" else [],
                 "tokens": tokens if status == "MASKED" else [],
+                "execution_terms": (execution_terms or {}).get(mid, {
+                    "status": "unavailable", "changes": []
+                }),
             }
         )
     return {
-        "version": 1,
+        "version": 2,
         "bundle_id": event["source_bundle_id"],
         "event_id": event["event_id"],
         "identities": {

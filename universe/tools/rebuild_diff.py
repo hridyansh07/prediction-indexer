@@ -5,8 +5,9 @@
 Prints one deterministic JSON report (sorted keys): venue markets whose
 parameters or canonical market ID differ, markets present in only one file,
 market claims that moved, the bundles those touch, and the corrections the new
-file recorded. It reads only columns that schema v6/projection v3 and schema
-v7/projection v4 share, never validates the schema, and never writes: both files
+file recorded, plus execution-terms coverage in the new file. Market comparison
+uses columns that schema v6/projection v3 and schema v7/projection v4 share;
+optional new tables are read only when present. It never validates the schema or writes: both files
 open with ``mode=ro`` and ``PRAGMA query_only = ON``.
 """
 
@@ -110,6 +111,30 @@ def _versions(connection: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _execution_terms(connection: sqlite3.Connection) -> dict[str, Any]:
+    markets = set(_markets(connection))
+    if _has(connection, "market_execution_terms"):
+        observed = {
+            (row["venue"], row["venue_market_id"])
+            for row in connection.execute(
+                "SELECT DISTINCT venue, venue_market_id FROM market_execution_terms"
+            )
+        }
+        counts = {
+            row["venue"]: row["rows"]
+            for row in connection.execute(
+                "SELECT venue, COUNT(*) AS rows FROM market_execution_terms GROUP BY venue ORDER BY venue"
+            )
+        }
+    else:
+        observed, counts = set(), {}
+    return {
+        "rows_by_venue": counts,
+        "observed": sorted(_name(key) for key in markets & observed),
+        "unavailable": sorted(_name(key) for key in markets - observed),
+    }
+
+
 def _name(key: tuple[str, ...]) -> str:
     return ":".join(key[:2]) + ("#" + key[2] if len(key) > 2 and key[2] else "")
 
@@ -167,6 +192,7 @@ def diff(old: sqlite3.Connection, new: sqlite3.Connection) -> dict[str, Any]:
         },
         "bundles_affected": bundles,
         "new_corrections": _corrections(new),
+        "execution_terms": _execution_terms(new),
     }
 
 

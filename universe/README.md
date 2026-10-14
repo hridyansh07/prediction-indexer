@@ -49,7 +49,11 @@ The only admitted commit marker is
 accepts manifest version 2 carrying one Targeter v3 shadow selection report;
 run ID, generated time, completeness and strategy version must agree. It also
 reads the manifest-owned normalized event/market NDJSON needed to resolve
-candidate references.
+candidate references, plus each run's `target_records_<venue>.ndjson[.zst]`
+execution-terms evidence. Target-record rows are closed, sorted and unique,
+cross-checked against selected subscriptions, and verified against their record
+and historical projection hashes. A missing artifact or selected row contributes
+no observation; malformed target records reject the run transaction.
 
 Object access is provider-neutral and verified by the shared archive and encoder
 packages: metadata via `verify_metadata_objects` in manifest order, bounded JSON
@@ -57,11 +61,13 @@ via `archive.read_verified_json`, NDJSON via `ArchivedObjectByteStreamer`.
 Universe does not implement store reads, checksums, or Zstandard decoding.
 
 Bounds (`universe/ingest/sync.py`): manifest 16 MiB; selection report 128 MiB; selected
-normalized catalogue artifacts 128 MiB decoded per run (warning at 96 MiB); one
+normalized catalogue and target-record artifacts 128 MiB decoded per run
+(warning at 96 MiB); one
 NDJSON row 4 MiB; 100,000 catalogue references per report. Only artifacts for
 venues referenced by complete-run candidates are retrieved; their stored/logical
 identities and line counts are still verified, but only referenced rows are
-retained. Invalid NDJSON framing rejects the containing artifact.
+retained. All committed target-record artifacts are read and validated. Invalid
+NDJSON framing, duplicate JSON keys, or non-finite JSON rejects the artifact.
 
 Incomplete and complete-empty runs are recorded in `targeter_runs` but create no
 event, market, decision or claim rows.
@@ -79,7 +85,8 @@ observation is an upper bound; a clamp is not an exact event end.
 Each admitted run and both projections are written in one `BEGIN IMMEDIATE`
 transaction (foreign keys on, WAL, `synchronous=FULL`). A projection identity
 over the resolved rows detects changed re-ingestion; re-ingesting the same run
-is idempotent.
+is idempotent. Execution terms participate in that identity and the SQLite-only
+audit; archive audit additionally retrieves and revalidates their exact source.
 
 **Incremental sync** (`UniverseSync.sync`) advances a high-water date
 independently of bad manifests. Failures go to the durable
@@ -251,6 +258,18 @@ repeat of an earlier submission; new jobs naming it are refused.
 
 `GET /v1/targeter/cadence` and `/v1/relations/<id>` no longer exist (404).
 
+The outcomes document is version 2. Each market adds closed `execution_terms`
+with `status: observed|unavailable` and `changes: [{from, taker_delay_ms}]`.
+Only the bundle's selection runs contribute, in `generated_at` order; equal
+delays collapse, including changes to and from unknown (`null`). `from` is the
+source row's exact `observed_at`; a non-increasing change chain fails closed.
+Missing source observations produce `unavailable` and an empty list. Polymarket
+non-negative integer `secondsDelay` becomes milliseconds; other or invalid
+delay values are observed `null`. Before the first change the delay is unknown.
+Strict preparation readers continue accepting version-1 outcomes as unavailable
+terms. The full mechanism contract is
+[`EXECUTION_DELAY_V1.md`](../docs/specs/EXECUTION_DELAY_V1.md).
+
 ## Authentication and rate limiting
 
 `universe/jobs/auth.py` implements SIWE: the server issues a nonce (kept in process
@@ -280,13 +299,16 @@ Two independent SQLite files:
   `universe_run_projections`, `universe_run_projection_corrections`, `umbrella_events`, `venue_events`,
   `event_observations`, `event_identity_lineage`, `universe_sync_failures`,
   `canonical_markets`, `venue_markets`, `candidate_decisions`,
-  `selected_market_occurrences`, `claim_classes`, `claim_relations`,
+  `selected_market_occurrences`, `market_execution_terms`, `claim_classes`, `claim_relations`,
   `market_claims`, `checkpoints`, and the bundle history tables
   (`bundle_contexts`, `context_*`, `selection_occurrences`,
   `bundle_retirements`) backing `/v1/bundles`, `/v1/selections` and run detail.
   `context_relationships` feeds `context_sha256` and is part of the identity of
   committed reports. Backup uses SQLite's online backup API followed by
-  `integrity_check`.
+  `integrity_check`. `market_execution_terms` is STRICT and holds one nullable
+  delay plus observation timestamp per selected `(run, venue, venue_market_id)`;
+  a missing row remains distinct from a row with unknown delay. This ships in
+  the same unreleased version-7 rebuild as totals-direction corrections.
 - **Replay database** (`replay.database_path`, `jobs.sqlite3`): additive,
   non-rebuildable. `schema/replay_auth.sql` (`sessions`, `allowlist`,
   `allowlist_events`) and `schema/replay_jobs.sql` (job rows, idempotency
@@ -319,10 +341,14 @@ imports `derive` and `claims`; `ingest` imports `store`, `derive` and `claims`;
 and `config`. Nothing below `api`/`ingest` imports them.
 `tests/test_universe_layout.py` asserts this.
 
+`rebuild_diff` additionally reports the new file's execution-terms row counts
+per venue and lists markets with observed and unavailable terms. It also works
+when the old file predates the terms table.
+
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest tests.test_event_universe_store tests.test_universe_outcomes tests.test_universe_layout
+.venv/bin/python -m unittest tests.test_event_universe_store tests.test_universe_outcomes tests.test_universe_execution_terms tests.test_universe_layout
 ```
 
 `tests/generate_event_universe_contract.py` emits real application responses used

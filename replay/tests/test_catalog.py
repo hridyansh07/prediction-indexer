@@ -113,6 +113,7 @@ class ProjectionTests(unittest.TestCase):
             ("clobTokenIds", '["other", "no"]'),
             ("description", "Resolves against the Coinbase TWAP."),
             ("feesEnabled", True),
+            ("secondsDelay", 3),
         ):
             with self.subTest(field=field):
                 self.assertNotEqual(
@@ -143,7 +144,7 @@ class ProjectionTests(unittest.TestCase):
         self.assertIsNone(projection_sha256("kalshi", self.RECORD))
 
     def test_projection_id_is_versioned(self) -> None:
-        self.assertEqual(projection_id("polymarket"), "polymarket.v1")
+        self.assertEqual(projection_id("polymarket"), "polymarket.v2")
         self.assertEqual(projection_id("limitless"), "limitless.v1")
 
 

@@ -8,6 +8,7 @@ from contextlib import closing
 from typing import Any
 
 from universe.store import limits
+from universe.derive.execution_terms import ExecutionTermsError, observation_ns
 from universe.store.records import (
     BundleEventConflict,
     DetailTooLarge,
@@ -72,6 +73,45 @@ class BundleReads:
                     market[field] = json.loads(market.pop(field + "_json"))
                 market["accepting_orders"] = bool(market["accepting_orders"])
 
+            execution_terms = {}
+            execution_bytes = 2
+            # The stream is sorted by generation time, and only this bundle's
+            # selected runs contribute. Absence is not an observed null.
+            for term in connection.execute(
+                """SELECT terms.venue, terms.venue_market_id,
+                          terms.taker_delay_ms, terms.observed_at
+                   FROM selected_market_occurrences selected
+                   JOIN market_execution_terms terms
+                     USING(run_id, venue, venue_market_id)
+                   JOIN targeter_runs run USING(run_id)
+                   WHERE selected.bundle_id = ?
+                   ORDER BY run.generated_at_ns, run.run_id,
+                            terms.venue, terms.venue_market_id""", (bundle_id,),
+            ):
+                mid = term["venue"] + ":" + term["venue_market_id"]
+                if mid not in execution_terms:
+                    entry = {"status": "observed", "changes": []}
+                    execution_bytes += len(_canonical_json_value({mid: entry}).encode("utf-8")) - 2
+                    if execution_terms:
+                        execution_bytes += 1
+                    execution_terms[mid] = entry
+                entry = execution_terms[mid]
+                changes = entry["changes"]
+                if not changes or term["taker_delay_ms"] != changes[-1]["taker_delay_ms"]:
+                    try:
+                        observed_ns = observation_ns(term["observed_at"])
+                        if changes and observed_ns <= observation_ns(changes[-1]["from"]):
+                            raise EvidenceConflict("execution terms change points are not strictly time ordered")
+                    except ExecutionTermsError as error:
+                        raise EvidenceConflict(str(error)) from error
+                    change = {"from": term["observed_at"], "taker_delay_ms": term["taker_delay_ms"]}
+                    execution_bytes += len(_canonical_json_value(change).encode("utf-8")) + bool(changes)
+                    changes.append(change)
+                    # Bound serialized growth while streaming observations;
+                    # repeating unchanged terms retains no additional state.
+                    if execution_bytes > limits.EVENT_UNIVERSE_RESPONSE_BUDGET_BYTES:
+                        raise DetailTooLarge("bundle outcomes execution terms exceeds the response budget")
+
             def matches(venue, native, claim_key, claim_id):
                 # EXISTS is indexed and bounded even when a market has many eras.
                 row = connection.execute(
@@ -84,6 +124,7 @@ class BundleReads:
 
             return _bounded_detail(bundle_document(
                 event, venue_events, markets, recorded_claim_matches=matches,
+                execution_terms=execution_terms,
             ), "bundle outcomes")
 
     def list_selections(
