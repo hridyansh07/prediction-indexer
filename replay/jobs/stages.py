@@ -361,8 +361,11 @@ class HistoryClient:
         require(type(value["continuity_selected"]) is bool)
         if value["continuity_disposition"] is not None:
             choice(value["continuity_disposition"], "held_current_candidate retained")
-        for field in ("sport", "game", "topology", "activation_at", "capture_start_at"):
+        for field in ("sport", "activation_at", "capture_start_at"):
             require(type(value[field]) is str and bool(value[field]))
+        # Optional in the Universe context: a non-esports event has no game or topology.
+        for field in ("game", "topology"):
+            require(value[field] is None or (type(value[field]) is str and bool(value[field])))
         source = obj(value["source"], "manifest_key manifest_sha256 report_key report_sha256")
         HistoryClient._source(value["run_id"], source)
         origin = obj(
