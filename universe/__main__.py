@@ -14,8 +14,11 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "migrate":
+        from universe.ingest.migrations import main as migrate
+        return migrate(argv[1:])
     if len(argv) != 1 or argv[0] not in COMMANDS:
-        print("usage: python -m universe {" + ",".join(COMMANDS) + "}", file=sys.stderr)
+        print("usage: python -m universe {" + ",".join(COMMANDS) + ",migrate}", file=sys.stderr)
         return 2
     return COMMANDS[argv[0]]() or 0
 

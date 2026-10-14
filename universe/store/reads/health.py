@@ -18,6 +18,9 @@ class HealthReads:
         )
         with closing(self.connect(readonly=True)) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            migrations = [row[0] for row in connection.execute(
+                "SELECT migration_id FROM universe_migrations ORDER BY to_user_version, migration_id"
+            )]
             counts = {
                 table: int(
                     connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -74,6 +77,7 @@ class HealthReads:
         return {
             "status": "degraded" if pending_failures else "ok",
             "schema_version": version,
+            "migrations": migrations,
             "latest_run": latest_record,
             "counts": counts,
             "sync": {"pending_failures": pending_failures},

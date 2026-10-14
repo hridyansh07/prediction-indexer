@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from archive.storage.base import normalize_key
 from universe.claims.claim_projection import project_claims
 from universe.derive.event_identity import EventIdentityError, resolve_market_projection
+from universe.derive.execution_terms import ExecutionTermsError, observation_ns
 from universe.derive.market_projection import MARKET_PROJECTION_VERSION, MarketProjectionError
 from universe.derive.projection import PROJECTION_VERSION
 from universe.store.connection import REBUILD_INSTRUCTION
@@ -38,16 +39,23 @@ from universe.store.records import (
 
 
 class IngestTransactions:
-    def known_manifest(self, key: str, sha256: str) -> bool:
+    def known_manifest(self, key: str, sha256: str, *, reingest: bool = False) -> bool:
         with closing(self.connect(readonly=True)) as connection:
             row = connection.execute(
-                "SELECT manifest_sha256 FROM targeter_runs WHERE manifest_key = ?",
+                """SELECT r.run_id, r.manifest_sha256, p.projection_version
+                   FROM targeter_runs AS r
+                   LEFT JOIN universe_run_projections AS p USING (run_id)
+                   WHERE r.manifest_key = ?""",
                 (key,),
             ).fetchone()
         if row is None:
             return False
         if row["manifest_sha256"] != sha256:
             raise EvidenceConflict(f"immutable manifest {key!r} changed identity")
+        if reingest and row["projection_version"] == 3:
+            raise EvidenceConflict(
+                f"run {row['run_id']} was migrated from projection v3; rebuild to re-ingest it"
+            )
         return True
 
     def latest_run(self) -> dict[str, Any] | None:
@@ -99,6 +107,7 @@ class IngestTransactions:
         occurrences: Iterable[Mapping[str, Any]],
         retirements: Iterable[Mapping[str, Any]],
         identity_backfill: bool = False,
+        execution_terms: Iterable[Mapping[str, Any]] = (),
     ) -> str:
         """Atomically append one verified run and its lifecycle projection."""
         run_id = _nonempty(run_id, "run_id")
@@ -155,12 +164,39 @@ class IngestTransactions:
             raise EvidenceConflict(f"run {run_id} selects and retires the same bundle")
         if not input_complete and (normalized or normalized_retirements):
             raise EvidenceConflict("incomplete Targeter runs cannot admit lifecycle rows")
+        normalized_terms = []
+        selected_targets = {
+            (target["venue"], target["target_id"].split(":", 1)[1])
+            for occurrence in normalized
+            for target in occurrence["context"]["targets"]
+        }
+        for term in execution_terms:
+            if not isinstance(term, Mapping) or set(term) != {
+                "venue", "venue_market_id", "taker_delay_ms", "observed_at"
+            }:
+                raise EvidenceConflict("execution terms fields are invalid")
+            value = dict(term)
+            key = (value["venue"], value["venue_market_id"])
+            if key not in selected_targets:
+                raise EvidenceConflict("execution terms market was not selected")
+            delay = value["taker_delay_ms"]
+            if delay is not None and (type(delay) is not int or not 0 <= delay < (1 << 63)):
+                raise EvidenceConflict("execution terms taker_delay_ms is invalid")
+            try:
+                observation_ns(value["observed_at"])
+            except ExecutionTermsError as error:
+                raise EvidenceConflict(str(error)) from error
+            normalized_terms.append(value)
+        normalized_terms.sort(key=lambda term: (term["venue"], term["venue_market_id"]))
+        if len({(term["venue"], term["venue_market_id"]) for term in normalized_terms}) != len(normalized_terms):
+            raise EvidenceConflict("execution terms repeat a selected market")
         projection_entries = [
             *(_projection_entry(value) for value in normalized),
             *(
                 _retirement_projection_entry(value)
                 for value in normalized_retirements
             ),
+            *({"execution_terms": term} for term in normalized_terms),
         ]
         projection_sha256 = _records_sha256(projection_entries)
         generated_at_ns = _timestamp_ns(generated_at)
@@ -188,6 +224,14 @@ class IngestTransactions:
         }
 
         with self.write_transaction() as connection:
+            prior = connection.execute(
+                "SELECT projection_version FROM universe_run_projections WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if prior is not None and prior["projection_version"] == 3:
+                raise EvidenceConflict(
+                    f"run {run_id} was migrated from projection v3; rebuild to re-ingest it"
+                )
             lineage = connection.execute(
                 "SELECT state FROM event_identity_lineage WHERE singleton = 1"
             ).fetchone()
@@ -231,6 +275,13 @@ class IngestTransactions:
                     raise EvidenceConflict(
                         f"Targeter run {run_id} market projection conflicts with prior ingestion"
                     )
+                stored_terms = [dict(row) for row in connection.execute(
+                    """SELECT venue, venue_market_id, taker_delay_ms, observed_at
+                       FROM market_execution_terms WHERE run_id = ?
+                       ORDER BY venue, venue_market_id""", (run_id,),
+                )]
+                if stored_terms != normalized_terms:
+                    raise EvidenceConflict(f"Targeter run {run_id} execution terms conflict with prior ingestion")
                 return "skipped"
 
             indexed_at_ns = time.time_ns()
@@ -274,6 +325,15 @@ class IngestTransactions:
                 projection_row_count=market_row_count,
                 occurrences=normalized,
             )
+            if normalized_terms:
+                connection.executemany(
+                    """INSERT INTO market_execution_terms(
+                           run_id, venue, venue_market_id, taker_delay_ms, observed_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    ((run_id, term["venue"], term["venue_market_id"],
+                      term["taker_delay_ms"], term["observed_at"])
+                     for term in normalized_terms),
+                )
             for value in normalized:
                 context = value["context"]
                 context_sha256 = value["context_sha256"]
