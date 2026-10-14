@@ -204,6 +204,34 @@ class SpecTests(unittest.TestCase):
             self.assertNotEqual(base, corpus_key(spec, **{**args, "materializer_describe": b"v7"}))
             self.assertNotEqual(base, corpus_key(spec, **{**args, "source": {"commit": "abd", "dirty": False}}))
             self.assertEqual(base, corpus_key(spec_document(root, work_root="/elsewhere"), **args))
+            self.assertEqual(base, corpus_key(spec_document(root, derivative_cache={"root": "/cache", "max_bytes": 100}),
+                                              **args))
+
+    def test_derivative_cache_is_optional_closed_writable_and_disjoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("runner.json", "materializer"):
+                (root / name).write_text("{}")
+            (root / "canonical").mkdir()
+            path = root / "s.json"
+            cache = {"root": str(root / "cache"), "max_bytes": 1000}
+            path.write_text(json.dumps(spec_document(root, derivative_cache=cache)))
+            self.assertEqual(specs.load(path)["derivative_cache"], cache)
+            bad = [None, {**cache, "extra": 1}, {"root": "relative", "max_bytes": 1000},
+                   *({**cache, "max_bytes": n} for n in (True, 0, -1, 1.5))]
+            for name in ("canonical", "work", "results"):
+                bad.extend(({**cache, "root": str(root / name)}, {**cache, "root": str(root / name / "cache")}))
+            bad.append({**cache, "root": str(root)})
+            alias = root / "alias"
+            alias.symlink_to(root / "canonical", target_is_directory=True)
+            bad.append({**cache, "root": str(alias / "cache")})
+            (root / "file").write_text("not a directory")
+            bad.append({**cache, "root": str(root / "file")})
+            for value in bad:
+                with self.subTest(cache=value):
+                    path.write_text(json.dumps(spec_document(root, derivative_cache=value)))
+                    with self.assertRaisesRegex(ValueError, "derivative_cache"):
+                        specs.load(path)
 
 
 class FakeOpener:
@@ -235,9 +263,11 @@ class PipelineTests(unittest.TestCase):
         retention.start()
         self.addCleanup(retention.stop)
 
-    def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None, outcomes=None):
+    def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None, outcomes=None, cache=None):
         root = Path(tmp)
         spec = spec_document(root)
+        if cache is not None:
+            spec["derivative_cache"] = cache
         calls = {"prepare": 0}
         outcomes = list(outcomes or [UNIVERSE_OUTCOMES])
 
@@ -250,6 +280,7 @@ class PipelineTests(unittest.TestCase):
 
         def prepare(root_dir, request, resolved, receipt, pins, config):
             calls["prepare"] += 1
+            calls["pins"] = pins
             (root_dir / "context").mkdir()
             (root_dir / "context/receipt.json").write_text('{"snapshot_sha256": "' + "a" * 64 + '"}')
             (root_dir / "context/context.json").write_text('{"context_version": 2}')
@@ -265,6 +296,7 @@ class PipelineTests(unittest.TestCase):
 
         def bench(spec_path, out, *, keep_image, label):
             calls["bench_spec"] = json.loads(Path(spec_path).read_bytes())
+            calls["run_config"] = json.loads(Path(calls["bench_spec"]["base_run_config"]).read_bytes())
             out.mkdir(); (out / "image.id").write_text("sha256:img\n")
             (out / "result.json").write_text(json.dumps({"status": bench_status}))
             return 0 if bench_status == "SUCCESS" else 2
@@ -339,6 +371,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual((row["state"], row["stage"]), ("failed", "outcomes"))
             self.assertIn("universe_outcomes_unavailable", row["detail"])
             self.assertEqual(calls["prepare"], OUTCOME_ATTEMPTS)
+            self.assertEqual(calls["slept"], [5, 15])
             self.assertNotIn("bench_spec", calls)
             self.assertFalse(pipeline.results_dir("b1").exists())
 
@@ -350,7 +383,71 @@ class PipelineTests(unittest.TestCase):
                 state, _, _, _ = pipeline.run("b1")
             self.assertEqual(state, "done")
             self.assertEqual(calls["prepare"], 2)   # the first context was removed, not reused
-            self.assertEqual(calls["slept"], [OUTCOME_RETRY_SECONDS])
+            self.assertEqual(calls["slept"], [OUTCOME_RETRY_SECONDS[0]])
+
+    def test_mixed_cache_mounts_ledger_diagnostics_and_lease_cleanup(self):
+        from archive.archiver.canonical import CanonicalArchiver
+        from replay.jobs.bundle import ensure_bundle
+        from replay.tests.test_bundle_cache import MATERIALIZER
+        from tests.archive_fixtures import WINDOW_SECONDS, write_canonical_receipt
+        if not MATERIALIZER.is_file():
+            self.skipTest("build the materialize_range example first")
+        width = WINDOW_SECONDS * 1_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline, calls, _ = self.harness(tmp, cache={"root": str(root / "cache"), "max_bytes": 100_000_000})
+            for start in (0, width):
+                receipt = write_canonical_receipt(root / "source", window_start_ns=start, evidence_lines=0)
+                self.assertEqual(CanonicalArchiver(root / "source", pipeline.canonical).archive_window(receipt).status,
+                                 "archived")
+            cache = pipeline.derivative_cache
+            with cache.lease() as lease:
+                seed = ensure_bundle("seed", (0, width), store=OverlayStore(pipeline.canonical, VerifyingSink()),
+                                     work_root=root / "seed", derivatives_root=root / "seed-private",
+                                     materializer=MATERIALIZER, window_seconds=WINDOW_SECONDS, derivative_cache=lease)
+            cache.max_bytes = cache.total_bytes() + 1000
+            pipeline.ensure_bundle = ensure_bundle
+            pipeline.spec["materializer"] = str(MATERIALIZER)
+            pipeline.history.resolve = lambda *args: SimpleNamespace(window_interval=(0, 2 * width))
+            pipeline.supervisor_config = lambda *args, **kw: {
+                "transport": {"inputs": [{"directory": str(p.directory)} for p in args[4]]}}
+            old_bench = pipeline.run_bench
+
+            def bench(*args, **kwargs):
+                # No Docker/bench is run: prove the cache lease still spans this boundary.
+                leased = [json.loads(p.read_bytes()) for p in cache.leases.glob("*.json")]
+                self.assertEqual(len(leased), 1)
+                self.assertIn(seed.pins[0].address, leased[0]["addresses"])
+                for pin in calls["pins"]:
+                    self.assertTrue((pin.directory / "receipt.json").is_file())
+                return old_bench(*args, **kwargs)
+
+            pipeline.run_bench = bench
+            ledger = Ledger(root / "l.sqlite3")
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})):
+                self.assertEqual(run_corpus(pipeline, ledger, ["b1"], log=lambda m: None), (1, 0))
+            self.assertEqual(ledger.state(pipeline.corpus_key, "b1")["state"], "done")
+            detail = json.loads(ledger.state(pipeline.corpus_key, "b1")["detail"])["derivative_cache"]
+            self.assertEqual(detail, {"hits": 1, "misses": 1,
+                             "cache_bypass": [{"window_start_ns": width, "reason": "live_leases"}]})
+            self.assertEqual(calls["bench_spec"]["mounts"], [
+                {"host": str(cache.derivatives), "container": "/bench/in/derivatives"},
+                {"host": str(root / "work/b1/derivatives"), "container": "/bench/in/private-derivatives"}])
+            directories = [p["directory"] for p in calls["run_config"]["transport"]["inputs"]]
+            self.assertEqual(directories, ["/bench/in/derivatives/" + p.address if index == 0
+                                           else "/bench/in/private-derivatives/" + p.address
+                                           for index, p in enumerate(calls["pins"])])
+            self.assertFalse(list(cache.leases.iterdir()))
+            self.assertFalse((root / "work/b1").exists())
+            self.assertTrue(seed.pins[0].directory.exists())
+            # Failure also releases its lease and retains diagnostics in the ledger.
+            pipeline.prepare_stage = lambda *args: (_ for _ in ()).throw(RuntimeError("prepare failed"))
+            with patch("replay.jobs.contracts.parse_request", return_value="request"):
+                run_corpus(pipeline, ledger, ["b2"], log=lambda m: None)
+            self.assertEqual(ledger.state(pipeline.corpus_key, "b2")["stage"], "prepare")
+            self.assertIn("derivative_cache", json.loads(ledger.state(pipeline.corpus_key, "b2")["detail"]))
+            self.assertFalse(list(cache.leases.iterdir()))
 
     def test_required_game_state_skip_is_its_own_final_state(self):
         with tempfile.TemporaryDirectory() as tmp:

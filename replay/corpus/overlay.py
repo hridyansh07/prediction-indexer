@@ -17,6 +17,7 @@ class OverlayStore:
         self.base, self.layer = base, layer
         self.store_id = f"overlay:{layer.store_id}+{base.store_id}"
         self.durability = layer.durability
+        self.discard_verified_derivatives = getattr(layer, "discard_verified_derivatives", False)
 
     def _owner(self, key):
         return self.layer if self.layer.head(key) is not None else self.base
@@ -62,6 +63,7 @@ class VerifyingSink:
 
     store_id = "corpus-verifying-sink"
     durability = None
+    discard_verified_derivatives = True
 
     def put_immutable(self, key, reader, expected_identity, *, content_type=None, content_encoding=None):
         import hashlib
