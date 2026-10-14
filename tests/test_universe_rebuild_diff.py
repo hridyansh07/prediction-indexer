@@ -104,6 +104,88 @@ class RebuildDiffTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 c.execute("DELETE FROM targeter_runs")
 
+    def _same_files(self):
+        with closing(sqlite3.connect(self.new)) as source, closing(sqlite3.connect(self.old)) as target:
+            source.backup(target)
+        with closing(sqlite3.connect(self.old)) as c:
+            c.execute("PRAGMA ignore_check_constraints = ON")
+            c.execute("UPDATE universe_run_projections SET projection_version = 3, projection_sha256 = ?", ("d" * 64,))
+            c.execute("UPDATE targeter_runs SET indexed_at_ns = 42")
+            c.execute("INSERT INTO universe_migrations VALUES ('m1-totals-direction', 6, 7, ?, '{}', '{}', 1)", ("c" * 40,))
+            c.commit()
+
+    def _equivalence(self, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = rebuild_diff.main([
+                "--equivalence", "--generated-start", "2026-01-01T00:00:00Z",
+                "--generated-end", "2026-01-02T00:00:00Z", *extra,
+                str(self.old), str(self.new),
+            ])
+        return result, json.loads(out.getvalue())
+
+    def test_equivalence_compares_every_table_with_only_spec_exclusions(self):
+        self._same_files()
+        before = self._stat(self.old), self._stat(self.new)
+        status, report = self._equivalence()
+        self.assertEqual(status, 0)
+        self.assertTrue(report["equivalence"]["equal"])
+        self.assertEqual(report["equivalence"]["runs_in_range"], 1)
+        self.assertEqual(report["universe_migrations"]["old"][0]["migration_id"], "m1-totals-direction")
+        self.assertEqual(report["universe_migrations"]["new"], [])
+        self.assertEqual((self._stat(self.old), self._stat(self.new)), before)
+        with closing(sqlite3.connect(self.new)) as c:
+            c.execute("UPDATE targeter_runs SET strategy_version = 9")
+            c.commit()
+        status, report = self._equivalence()
+        self.assertEqual(status, 1)
+        self.assertFalse(report["equivalence"]["equal"])
+        self.assertEqual(report["table_differences"]["targeter_runs"]["only_in_old"], 1)
+        self.assertEqual(report["table_differences"]["targeter_runs"]["only_in_new"], 1)
+
+    def test_equivalence_fallback_is_explicit_and_confined_to_corrections(self):
+        self._same_files()
+        with closing(sqlite3.connect(self.old)) as c:
+            c.execute("DELETE FROM universe_run_projection_corrections")
+            c.commit()
+        self.assertEqual(self._equivalence()[0], 1)
+        status, report = self._equivalence("--accept-correction-membership-fallback")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["equivalence"]["accepted_differences"], ["universe_run_projection_corrections"])
+        self.assertEqual(report["table_differences"]["universe_run_projection_corrections"]["only_in_new"], 1)
+        with closing(sqlite3.connect(self.old)) as c:
+            c.execute("UPDATE venue_markets SET volume_total = 987")
+            c.commit()
+        self.assertEqual(self._equivalence("--accept-correction-membership-fallback")[0], 1)
+
+    def test_equivalence_checks_half_open_bounds_and_rejects_empty_range(self):
+        self._same_files()
+        for start, end in (("2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z"),
+                           ("2027-01-01T00:00:00Z", "2027-01-02T00:00:00Z")):
+            with self.subTest(start=start):
+                out, error = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(error):
+                    result = rebuild_diff.main([
+                        "--equivalence", "--generated-start", start, "--generated-end", end,
+                        str(self.old), str(self.new),
+                    ])
+                self.assertNotEqual(result, 0)
+
+    def test_reports_execution_table_nulls_and_detects_an_uncompared_table(self):
+        self._same_files()
+        with closing(sqlite3.connect(self.new)) as c:
+            c.execute("CREATE TABLE execution_terms (run_id TEXT, venue TEXT, venue_market_id TEXT, taker_delay_ms INTEGER, observed_at TEXT, PRIMARY KEY(run_id, venue, venue_market_id)) STRICT")
+            c.executemany("INSERT INTO execution_terms VALUES ('r', 'polymarket', ?, ?, ?)",
+                          [("m1", 0, "2026-01-01T00:00:00Z"), ("m2", 2000, "2026-01-01T00:00:00Z"), ("m3", None, None)])
+            c.commit()
+        status, report = self._equivalence()
+        self.assertEqual(status, 1)
+        terms = report["execution_terms"]["new"]["execution_terms"]
+        self.assertEqual(terms["by_venue"]["polymarket"], {"rows": 3, "observed": 2, "unavailable": 1})
+        self.assertEqual(terms["by_venue"]["kalshi"]["rows"], 0)
+        self.assertEqual(terms["by_venue"]["limitless"]["rows"], 0)
+        self.assertEqual(report["table_differences"]["execution_terms"]["only_in_new"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

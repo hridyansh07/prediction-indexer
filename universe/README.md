@@ -33,8 +33,10 @@ fields are rejected.
 | `python -m universe sync` | One-shot incremental ingestion of newly committed runs |
 | `python -m universe backfill` | One-shot oldest-first backfill of `backfill.generated_start` to `backfill.generated_end` (both required) |
 | `python -m universe backup` | Online-backup the SQLite file, upload it immutably under `backup.object_prefix`, print path, key, SHA-256, length |
+| `python -m universe migrate --to N SOURCE.sqlite3 DEST.sqlite3 [--input NAME=PATH ...]` | Offline SQLite backup into a new file, then consecutive migration transactions; currently m1 (6 → 7) |
 
-Each command takes no options; everything comes from the config.
+Servers and jobs take no options; everything comes from the config. `migrate`
+takes explicit paths, never loads that config, and m1 uses no archive or network.
 
 `compose.universe.yaml` runs `event-universe` (the server) and the profile
 `jobs` services `event-universe-sync`, `event-universe-backfill` and
@@ -79,7 +81,9 @@ observation is an upper bound; a clamp is not an exact event end.
 Each admitted run and both projections are written in one `BEGIN IMMEDIATE`
 transaction (foreign keys on, WAL, `synchronous=FULL`). A projection identity
 over the resolved rows detects changed re-ingestion; re-ingesting the same run
-is idempotent.
+is idempotent, except a migrated market-projection v3 run: it fails with
+`run … was migrated from projection v3; rebuild to re-ingest it`, including
+the sync manifest-known fast path. New runs still ingest at v4.
 
 **Incremental sync** (`UniverseSync.sync`) advances a high-water date
 independently of bad manifests. Failures go to the durable
@@ -181,9 +185,9 @@ outcome label as the yes subtitle), changes nothing else, and records every diff
 find is removed, so the market yields no claim. A corrected market gets a
 different canonical market ID than under version 3. Relations naming a corrected
 market are verified against relationships re-derived from the corrected bundle
-rather than the report's. Archived reports stay untouched. No in-place migration
-exists: the previous schema-v6 file is the rollback and the backup, and version 4
-needs an oldest-first rebuild into a new file. Spec:
+rather than the report's. Archived reports stay untouched. The previous schema-v6
+file is the rollback and the backup. Either migrate it offline to v7 or perform
+an oldest-first rebuild into a new file. Spec:
 [`docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md`](../docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md);
 compare an old and a rebuilt file read-only with
 `python -m universe.tools.rebuild_diff OLD.sqlite NEW.sqlite`.
@@ -272,12 +276,15 @@ are exempt. Exceeding the limit returns 429 with `Retry-After`.
 Two independent SQLite files:
 
 - **Event Universe database** (`database_path`): `universe/schema/schema.sql`,
-  `PRAGMA user_version = 7`. There are no in-place migrations. Startup validates
-  the stored schema object-for-object against `schema.sql`; any other version or
-  modified schema fails with an instruction to stop Universe, remove the SQLite
-  file and its WAL/SHM siblings, and run an oldest-first backfill from the
-  archive. Tables: `targeter_runs` (exact manifest/report identities),
-  `universe_run_projections`, `universe_run_projection_corrections`, `umbrella_events`, `venue_events`,
+  `PRAGMA user_version = 7`. **Schema changes ship with an offline migration
+  under [Universe offline migrations V1](../docs/specs/UNIVERSE_MIGRATIONS_V1.md)
+  or require a rebuild. A migration never runs inside the server and never
+  modifies the live file.** Startup validates the stored schema object-for-object
+  against `schema.sql`; a stale version or modified schema fails with an
+  instruction naming both offline migration and oldest-first backfill. An old
+  v7 file without this specification's objects requires a rebuild.
+  Tables: `targeter_runs` (exact manifest/report identities),
+  `universe_run_projections`, `universe_run_projection_corrections`, `universe_migrations`, `umbrella_events`, `venue_events`,
   `event_observations`, `event_identity_lineage`, `universe_sync_failures`,
   `canonical_markets`, `venue_markets`, `candidate_decisions`,
   `selected_market_occurrences`, `claim_classes`, `claim_relations`,
@@ -297,15 +304,99 @@ Two independent SQLite files:
   persisted. Never place these records in the rebuildable Event Universe
   database or remove them during a rebuild.
 
+### Offline migration and its limits
+
+```bash
+python -m universe migrate --to 7 SOURCE.sqlite3 DEST.sqlite3
+python -m universe.tools.rebuild_diff SOURCE.sqlite3 DEST.sqlite3
+```
+
+`SOURCE` opens read-only and SQLite's online backup API takes a consistent
+snapshot, including committed WAL content. `DEST` must not exist. Each step
+uses one transaction, validates the schema and foreign keys, records a STRICT
+`universe_migrations` row, then sets `user_version` as its last statement before
+commit. Failure rolls back that step, retaining the previous version in `DEST`;
+already committed steps remain. The command prints the same JSON summary it
+stores. It refuses downward migration, files older than v6, skipped versions,
+and undeclared inputs. Delete only your failed disposable destination before a
+retry; never overwrite the source.
+
+m1 requires exact schema v6 and all market projections at v3. It reuses the
+totals projector and claim reconstruction, preserving market hashes, volumes,
+bundle evidence, and source identities. Complete stored contexts supply ordered
+participants and candidate membership; unavailable/ambiguous participants or
+unreconstructable affected candidate bundles abort with their identity. The v6
+index does not preserve venue-specific catalogue participant labels or contexts
+for unselected bundles, so serving equivalence must be checked before deployment,
+not assumed. Correction membership falls back to selected occurrences only when
+exact candidate membership is unavailable, and the summary names those markets.
+`claims_rewritten` and `relations_rewritten` count removed plus added row values
+in `market_claims` and `claim_relations`, not upsert attempts.
+
+Projection v3 rows retain their original hashes and require an m1 metadata row at
+startup; new ingestion writes v4. A rebuilt database has an empty migration table.
+`/healthz` lists applied migration IDs, ordered by destination version.
+
+Build the Universe image with `UNIVERSE_CODE_REVISION=$(git rev-parse HEAD)`
+(Compose forwards it as a build argument). The image retains that full commit
+for migration metadata; a source checkout can resolve it through Git instead.
+A missing/invalid image revision aborts before copying.
+
+**m2 (7 → 8) is an explicit aborting stub.** The requested base lacks
+`docs/specs/EXECUTION_DELAY_SDK_V1.md` §1.2, including the table name, full column
+and timestamp contract. No guessed execution-terms table is installed. `--to 8`
+fails nonzero; from v6 it first commits m1 and leaves a valid v7 destination,
+while from v7 it leaves the copied v7 file unchanged. Artifact acquisition,
+delay/null conversion, missing-artifact summaries, identity/malformed checks,
+checkpoint/resume, v8 startup and served execution terms remain unimplemented.
+New-run execution-term ingestion is outside this task. Supply the authoritative
+§1.2 before implementing m2; m1 can ship alone as the specification permits.
+
+### Short-range equivalence, without remote access
+
+Use a **disposable local** contract-shaped archive and a half-open range that
+contains both a corrected Kalshi bundle and a corrected Limitless bundle. Build
+two identity-empty files oldest-first with identical `backfill.generated_start`
+and `backfill.generated_end` config bounds: one with v6 code, then migrate it to
+v7; the other with this code. Use the same local evidence and include any origin
+dependencies. Never use the real archive/object store for tests.
+
+The comparison command accepts the bounds explicitly and reads only the two
+prepared SQLite files; it does not perform backfill or access any object store:
+
+```bash
+python -m universe.tools.rebuild_diff --equivalence \
+  --generated-start "$START" --generated-end "$END" \
+  MIGRATED.sqlite3 REBUILT.sqlite3 > equivalence.json
+```
+
+It compares every table row-for-row, excluding only `universe_migrations`,
+`indexed_at_ns`, and the market projection's version/hash. It rejects empty
+ranges and reports outside-range origin runs. Exit 0 means equality; exit 1
+means differences; exit 2 means invalid inputs. Inspect the listed correction
+differences before optionally rerunning with
+`--accept-correction-membership-fallback`; this can accept differences only in
+`universe_run_projection_corrections`. Every other table must still match.
+Rows stream in SQLite sort order; reports retain at most 20 differing samples
+per side/table. Keep both files and the comparison JSON as proof artifacts.
+
+The ordinary full-file diff also lists migration rows and discovers execution
+tables by their `venue`, `venue_market_id`, `taker_delay_ms`, `observed_at` columns,
+reporting observed/unavailable counts per venue. Zero rows means unknown, not
+zero delay. This diagnostic support does not implement m2. The real acceptance
+set and a v8 equivalence run remain operator gates, not unit-test claims.
+Rebuild remains canonical when migration inputs are unavailable or short-range
+serving equivalence cannot be shown.
+
 ## File layout
 
 | Path | Role |
 |---|---|
-| `__main__.py`, `commands.py` | `python -m universe {serve,sync,backfill,backup}` |
+| `__main__.py`, `commands.py` | `python -m universe {serve,sync,backfill,backup,migrate}` |
 | `config.py` | Closed JSON config |
 | `schema/` | `schema.sql`, `replay_auth.sql`, `replay_jobs.sql` |
 | `store/` | `UniverseStore` facade over `connection.py` (open, pragmas, schema validation), `ingest_tx.py` (the admitted-run write transaction, checkpoints, sync-failure ledger), `reads/` (`health`, `runs`, `events`, `markets`, `claims`, `bundles`), `backup.py`, shared row helpers in `records.py` and response limits in `limits.py` |
-| `ingest/` | `sync.py`, `backfill.py`: verified archive retrieval, ingestion, retry ledger |
+| `ingest/` | `sync.py`, `backfill.py`: verified archive retrieval, ingestion, retry ledger; `migrations.py`: offline copy-based migrations |
 | `derive/` | `projection.py`, `market_projection.py`, `event_identity.py`: bundle history and market projections, identity allocation |
 | `claims/` | `claim_projection.py`, `outcomes.py`: claim reconstruction and the ingestion equivalence check; bundle outcomes read |
 | `api/` | `server.py` (application and HTTP handler), `routes.py` (the ordered route table), `framing.py` (validation, cursors, body framing, error mapping, response budget), `rate_limit.py`, `replay_jobs.py` (auth and job endpoints) |
