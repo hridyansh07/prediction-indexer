@@ -16,7 +16,7 @@ COPY encoder/rust/ encoder/rust/
 COPY ingester/ ingester/
 COPY engine/ engine/
 COPY replay/streams/attempt.lua replay/streams/attempt.lua
-RUN RUSTFLAGS="${RUSTFLAGS}" cargo build --locked --release --manifest-path engine/Cargo.toml \
+RUN RUSTFLAGS="${RUSTFLAGS}" nice -n 15 cargo build --locked --release --manifest-path engine/Cargo.toml \
       -p replay-normalizers --example materialize_range
 
 FROM python:3.13-slim-bookworm
@@ -49,11 +49,11 @@ COPY archive/ ./archive/
 COPY targeter/ ./targeter/
 COPY universe/ ./universe/
 # Dependencies only. The package itself is the mounted checkout, so drop it.
-RUN python -m pip install ".[replay-redis]" \
+RUN nice -n 15 python -m pip install ".[replay-redis]" \
     && python -m pip uninstall -y prediction-indexer \
     && rm -rf /opt/dependencies
 
 COPY --from=rust-builder /build/engine/target/release/examples/materialize_range /usr/local/bin/materialize_range
-RUN materialize_range --describe >/dev/null && docker --version && docker buildx version
+RUN nice -n 15 materialize_range --describe >/dev/null && docker --version && docker buildx version
 
 ENTRYPOINT ["python", "-m", "replay.corpus"]
