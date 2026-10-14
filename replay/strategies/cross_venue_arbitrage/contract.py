@@ -110,7 +110,8 @@ def assess_net(bridge, *, size, time, fee_legs, account=ACCOUNT, **identity):
     """
     try:
         orders, missing = bridge.assess_orders(direction="BUY", size=size, time=time,
-                                               legs=tuple(fee_legs), account=account, **identity)
+                                               legs=tuple(fee_legs), account=account,
+                                               defer_ids=True, **identity)
     except FeeEconomicsUnavailable as error:
         orders, missing = (None,) * len(fee_legs), ("fee_economics_unavailable:" + str(error),)
     unknown, assumptions, evidence = list(missing), {"PER_LEVEL_DECLARED_PARTITION_ESTIMATE"}, set()
@@ -121,7 +122,7 @@ def assess_net(bridge, *, size, time, fee_legs, account=ACCOUNT, **identity):
         if order is None:
             continue
         e, results = order
-        leg["assessment_ids"] = [r.identity for r in results]
+        leg["assessment_ids"] = results.identities
         cash, received = 0, 0
         known = True
         for r in results:

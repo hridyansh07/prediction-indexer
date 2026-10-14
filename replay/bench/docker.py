@@ -127,6 +127,8 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
                 '--tmpfs', '/tmp:rw,nosuid,noexec,size=1g', '--entrypoint', 'python',
                 # A fixed literal, not a forwarded host value: failed participants leave failure.json.
                 '--env', 'REPLAY_PARTICIPANT_DIAGNOSTICS=1']
+        if os.environ.get('REPLAY_FEE_CROSSCHECK') == '1':
+            args += ['--env', 'REPLAY_FEE_CROSSCHECK=1']
         args += _mount(root, '/bench', readonly=False)
         args += _mount(Path(spec['context_directory']).resolve(), '/bench/context')
         if spec.get('game_state_path') is not None:
