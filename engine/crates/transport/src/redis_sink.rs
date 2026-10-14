@@ -111,7 +111,13 @@ impl StreamSink for RedisSink {
         let _: String = self.eval(&["setup", &groups, &queue, &entry], &[])?;
         Ok(())
     }
-    fn append(&mut self, first: u64, entries: &[String], terminal: bool) -> Result<usize> {
+    fn append(
+        &mut self,
+        first: u64,
+        entries: &[String],
+        risk_sequences: &[Option<u64>],
+        terminal: bool,
+    ) -> Result<usize> {
         // Redis entry IDs are wire sequence + 1; `published` is -1 before initial.
         let previous = if first == 0 {
             "-1".to_string()
@@ -120,7 +126,14 @@ impl StreamSink for RedisSink {
         };
         let id = first.checked_add(1).ok_or(Error::Resource)?.to_string();
         let flag = if terminal { "1" } else { "0" };
-        let reply: redis::Value = self.eval(&["append", &previous, &id, flag], entries)?;
+        let risks = serde_json::to_string(
+            &risk_sequences
+                .iter()
+                .map(|s| s.map(|v| v.to_string()).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let reply: redis::Value = self.eval(&["append", &previous, &id, flag, &risks], entries)?;
         match reply {
             redis::Value::Int(n) if n >= 0 && (n as u64) <= entries.len() as u64 => Ok(n as usize),
             _ => Err(Error::Protocol("append reply".into())),
@@ -128,6 +141,10 @@ impl StreamSink for RedisSink {
     }
     fn progress(&mut self) -> Result<BTreeMap<String, String>> {
         self.eval(&["check"], &[])
+    }
+    fn liveness(&mut self, risk_sequence: u64) -> Result<()> {
+        let _: String = self.eval(&["liveness", &risk_sequence.to_string()], &[])?;
+        Ok(())
     }
     fn poison(&mut self) {
         let _: redis::RedisResult<()> = redis::cmd("HSET")

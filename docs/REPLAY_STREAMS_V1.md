@@ -111,7 +111,9 @@ consumer ship in one image, and a version-1 publisher or consumer is rejected at
 envelope version check.
 
 **Decoder guard set.** Each record is size-checked against `max_entry_bytes` and
-parsed with plain `json.loads` (no duplicate-key or constant hooks). The decoder
+parsed with `orjson.loads` (no duplicate-key hooks; NaN, Infinity and invalid UTF-8
+are rejected). The strict `decode()` used for configs and output readers retains
+its duplicate-key and constant hooks. The decoder
 then checks only O(1) facts: closed envelope, `version == "1"`, run/attempt
 identity, contiguous stream sequence, and per transition: planned book key,
 `previous_revision ==` local revision and `revision == previous + 1`, known decision
@@ -186,9 +188,12 @@ Connect/read/write timeouts are finite. Python uses redis-py with zero retry;
 Rust uses synchronous redis crate commands with no retry. Every SDK poll batches
 `XREADGROUP GROUP ... worker COUNT ... BLOCK ... STREAMS ... >`. Batch count ×
 max entry bytes must fit the local byte budget before reading. The default budget
-is 128 MiB; by default the count is `min(1024, budget // max_entry_bytes)` (128
-entries at a 1 MiB cap). The supervisor adapter uses the same default, raised to
-one entry when the entry cap exceeds it. One cut is one
+is 128 MiB for standalone `Consumer` callers; by default the count is
+`min(1024, budget // max_entry_bytes)` (128 entries at a 1 MiB cap). The supervisor
+adapter explicitly polls up to 1024 entries with a byte budget of
+`max(128 MiB, 1024 × max_entry_bytes)` (1 GiB at the small preset's 1 MiB cap).
+This is a worst-case per-poll payload bound, not a preallocation or a change to
+the Redis retained queue cap. One cut is one
 entry and cannot be split. Publisher bounds entries at buffer insert; the Redis
 script also checks every entry's size and the retained payload byte total before
 any XADD. An entry above `max_entry_bytes` can never fit and remains a fatal
@@ -218,6 +223,8 @@ of the Rust publisher; `RedisSink` is the Redis/Lua adapter behind the
 is one more adapter. The publisher inserts each encoded record (initial, cuts,
 terminal) in wire order. `publish_batch_entries` (`batch`, 1–1024, default 100)
 sets the drain point and the hard capacity `ceil(1.25 × batch)` (125 for 100).
+The replay runner's `small` preset sets 1024 (hard capacity 1280); omitting the
+field still uses 100 for backward compatibility.
 Single-threaded semantics:
 
 - On reaching `batch` buffered entries, one **non-blocking** drain appends as many
@@ -257,7 +264,9 @@ attempt as a `Resource` failure.
 On exit after terminal or failure the CLI prints one stderr diagnostic line,
 `replay-publish: queue_full_waits=N wait_ms=M batches=B mean_batch_entries=X`
 (blocking-drain backoff sleeps, their total time, append calls that wrote at least
-one entry, and entries per such call); it is not persisted or parsed.
+one entry, and entries per such call). The supervisor durably retains the last
+16 KiB of publisher stderr in `publisher.stderr.txt` in the attempt directory;
+it is diagnostic only, never parsed or bound into semantic hashes or receipts.
 Redis maxmemory bounds stream/node/group/hash overhead beyond the payload byte budget.
 Risk/walker limits independently bound the one in-flight cut and retained books;
 consumers retain current books and one bounded batch, not history. Returned cuts
@@ -418,3 +427,105 @@ the setup maxmemory guard, publisher poisoning/no terminal, and actual Rust CLI
 → Redis → two Python consumers. They do not certify production deployment,
 availability, adversarial Redis mutation, global exactly-once effects, or a retry
 supervisor.
+
+## Wire version 3
+
+This amendment supersedes the V1/V2 envelope, initial and terminal schemas and
+the all-cuts publication rule above. The envelope version is the string `"3"`.
+V3 rejects V2 at the envelope check; V2 rejects V3 there too. There is no negotiated
+fallback. Canonical integer strings and the encoder's sorted object-key order
+remain unchanged.
+
+Risk still counts every cut, starting at 1. The publisher validates Risk's
+`cut.sequence()` against a separate `risk_sequence` counter **before encoding**.
+Wire `sequence` counts only published cuts, contiguously from 1. Every published
+cut body additionally contains `risk_sequence`, a canonical u64 decimal string.
+The initial cut exposes Risk sequence 0. Terminal body is the closed object
+`{cuts, risk_cuts, books_sha256}`: `cuts` counts published cuts, `risk_cuts` is
+`finished.cuts()`, and `risk_cuts - cuts` proves how many were omitted. The final
+books digest is unchanged. The terminal Cut exposes Risk sequence `risk_cuts + 1`.
+All Redis entry IDs, ACK contiguity, progress, completion counts and receipts
+(including `content_receipt.terminal`) remain wire-based. Semantic row `cut`
+fields and economic Context/fee order identities use Risk sequences.
+
+The transport config and initial body require `retain_boundaries_ns` and
+`retain_shift_offsets_ns`. Each is sorted numerically, unique, and contains only
+canonical u64 strings; their caps are 100,000 boundaries and 128 offsets. The
+initial binding and supervisor run identity bind both lists. Configuration
+builders union the actual participating groups' SDK retention requirements:
+requested start, every prepared scope end, pinned game releases and declared
+game timer deadlines, and every configured `time_shift` offset. Consumers check
+coverage at initial/bind time: economic runtimes and market_profile reject a
+missing required value with `ProtocolError("v3 retention does not cover ...")`.
+
+Effective time is exactly CutClock time: `max(raw, start)`, where raw is
+`origin.start_ns` for windows and `origin.visible_ns` for groups. Retain a cut if:
+
+1. **R1:** it has market events, book transitions or control events, or is a
+   window cut. Every window is retained, including empty windows.
+2. **R2:** it is the first cut strictly later than the latest staging base.
+   Initial sets the base to start; R1, R3 and R4 cuts reset it. An R2-only cut
+   consumes the pending flush but does not reset the base.
+3. **R3:** it is the first cut at/after any fixed retention boundary.
+4. **R4:** it is the first cut at/after any due shift deadline. The publisher's
+   min-heap schedules `start + s` and `effective_time + s` for every offset and
+   every published book-transition cut, popping all deadlines at/before the
+   current time. Deadlines outside the run are unnecessary; overflow cannot
+   create an in-run deadline. The heap is bounded to 1,000,000 entries, with a
+   typed resource failure rather than dropping a deadline.
+
+Conservative extra retention is intentional: retain every pre-start cut (the
+SDK stages every entity there), and the first raw-at/after-start cut (lazy profile
+openings). Both reset the staging base. A group cut satisfying none of these
+rules is omitted without calling `wire::cut`.
+
+### Empty-cut effects audited for semantic byte identity
+
+* Economic Runtime's initial/pre-start entity staging, `_flush_stage` and ring
+  commits use R2 and the conservative pre-start rule. The flushing cut's original
+  Risk sequence reaches Context, fee order keys and assessment identities.
+* Scope advancement stages entered entities; profile/levels/transitions scope
+  opening rows carry the crossing Risk sequence. R3 retains every scope end;
+  requested-start retention covers lazy openings. R2 retains their next flush.
+* Pinned game releases and strategies' explicitly declared game timers are fixed
+  from the prepared timeline and policy before playback: R3, followed by R2.
+* Time-shift rings and dependency timers are book-relative, not fixed absolute
+  times: R4 retains their crossings, followed by R2. The union includes all groups.
+* Profile buckets, survival histograms, incidents and economic/availability
+  intervals integrate exact boundary times inside `_advance`/close; they do not
+  need a cut at each bucket edge. Scope changes use R3, book changes and window
+  evidence use R1. Terminal closes the remaining intervals at run end.
+* Trades, control observations, invalidations and recovery are nonempty R1 cuts.
+  Availability/bundle coverage have no per-empty-cut semantic counter. Their
+  wire counters reach only attempt-bound receipts.
+* Repository economic strategies (complement, multi-market and cross-venue)
+  consume Runtime Context, not their own cut counters or undeclared timers.
+  Terminal Risk count preserves final semantic cut labels; receipt terminals
+  remain wire transport facts.
+
+The Rust-generated full and sparse fixture streams are consumed independently by
+the economic runtime (known fees, time-shift controls, embedded profile) and
+standalone profile (availability, levels, transitions). Tests compare every
+semantic output file, including compressed bytes, manifests and semantic hashes;
+only attempt-bound content receipts differ. They report retained/total cut ratio.
+
+### Liveness without additional wire records
+
+`LIVENESS_MS = 1000` is a named publisher constant. At step boundaries, an oldest
+buffered entry aged at least this interval triggers the existing non-blocking
+drain even below `publish_batch_entries`. Hard capacity and blocking drains retain
+their existing behavior; a FULL reply cannot turn scanning into heartbeat progress.
+
+The state hash has `risk_progress`, initially `"0"`. `append` receives one Risk
+sequence string per entry (empty for initial/terminal), validates strict increase
+without Lua floating-point conversion, and stores the last **accepted** cut's
+Risk sequence. Omitted scanning progress uses `liveness <risk_sequence>` at most
+once per LIVENESS_MS, and only with an empty publisher buffer. The op requires a
+canonical u64 strictly greater than the stored value and rejects poisoned or
+terminal attempts. It only HSETs `risk_progress`: no stream entry, byte or size
+accounting changes. `check` returns this named field; it is not a completion fact.
+
+The decoder checks in O(1) that cut Risk sequence strictly increases and is at
+least wire sequence. At terminal it requires `cuts == wire sequence - 1`,
+`risk_cuts >= cuts`, and `risk_cuts >= last Risk sequence`, plus the existing final
+book digest. All existing wire contiguity checks remain unchanged.

@@ -55,6 +55,7 @@ class RedisTests(unittest.TestCase):
             ("-1" if seq == 0 else str(seq)) if previous is None else previous,
             str(seq + 1) if first is None else first,
             "1" if values[-1]["kind"] == "terminal" else "0",
+            json.dumps([r["body"].get("risk_sequence", "") for r in values]),
             *(encoded(r) for r in values),
         )
 
@@ -64,6 +65,26 @@ class RedisTests(unittest.TestCase):
 
     def publish_reply(self, r):
         return self.append_reply([r])
+
+    def test_liveness_only_updates_risk_progress_and_rejects_invalid_or_closed(self):
+        self.publish(self.values[:1])
+        before = self.state()
+        stream = self.redis.xrange(self.keys[0])
+        self.redis.eval(SCRIPT, 2, *self.keys, "liveness", "9007199254740993")
+        after = self.state()
+        self.assertEqual(after.pop(b"risk_progress"), b"9007199254740993")
+        before.pop(b"risk_progress")
+        self.assertEqual(before, after)
+        self.assertEqual(self.redis.xrange(self.keys[0]), stream)
+        for risk in ("9007199254740993", "9007199254740992", "01", str(2**64)):
+            with self.subTest(risk=risk), self.assertRaisesRegex(Exception, "risk_progress"):
+                self.redis.eval(SCRIPT, 2, *self.keys, "liveness", risk)
+        self.redis.hset(self.keys[1], "terminal", "2")
+        with self.assertRaisesRegex(Exception, "terminal"):
+            self.redis.eval(SCRIPT, 2, *self.keys, "liveness", "9007199254740994")
+        self.redis.hset(self.keys[1], mapping={"terminal": "", "poisoned": "1"})
+        with self.assertRaisesRegex(Exception, "poisoned"):
+            self.redis.eval(SCRIPT, 2, *self.keys, "liveness", "9007199254740994")
 
     def publish(self, values=None):
         values = self.values if values is None else values

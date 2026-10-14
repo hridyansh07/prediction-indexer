@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = []
-replay-redis = ["redis>=6.4,<7"]
+replay-redis = ["redis[hiredis]>=6.4,<7", "orjson>=3.11,<4"]
 
 [tool.setuptools.packages.find]
 include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*", "gamestate*"]

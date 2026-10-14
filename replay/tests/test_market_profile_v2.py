@@ -9,7 +9,7 @@ from pathlib import Path
 
 from replay.economic_sdk.profile import Collector, profile_files, profile_policy
 from replay.preparation import load_snapshot
-from replay.streams.protocol import ProtocolError
+from replay.streams.protocol import Decoder, ProtocolError
 from replay.strategies.market_profile.strategy import validate_content
 from replay.tests.economic_scenarios import M, PROFILE_POLICY, ladder, v2_policy
 from replay.tests.test_same_venue_complement import Harness as ComplementHarness
@@ -58,6 +58,50 @@ class Case(unittest.TestCase):
 
 
 class AvailabilityParityTests(Case):
+    def test_real_rust_full_and_sparse_wire_have_byte_identical_semantic_outputs(self):
+        fixtures = Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures"
+        tapes = [[json.loads(line) for line in (fixtures / name).read_bytes().splitlines()]
+                 for name in ("strategy-full.ndjson", "strategy-sparse.ndjson")]
+        full, sparse = tapes
+        total, retained = int(full[-1]["body"]["cuts"]), int(sparse[-1]["body"]["cuts"])
+        self.assertLess(retained, total)
+        print(f"v3 fixture retained/total cuts: {retained}/{total} ({retained / total:.1%})")
+        profile = v2("availability", "levels", "transitions")
+        policy = v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                           controls_episodes=True, controls_slices=True, audit_intervals=True,
+                           profile=PROFILE_POLICY)
+        for name, factory, kwargs, output_attr in (
+                ("economic", ComplementHarness, {"known": True, "policy": policy}, "output"),
+                ("profile", Harness, {"policy": profile}, "profile_output")):
+            outputs = []
+            receipts = []
+            for index, tape in enumerate(tapes):
+                h = factory(self.sub(f"{name}-{index}"), scopes=True, lower_bound="expand_to_window_start",
+                            pin=tape[0]["body"]["pins"][0], wire_records=tape, **kwargs)
+                root = getattr(h, output_attr)
+                outputs.append({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*")
+                                if p.is_file() and p.name != "content_receipt.json"})
+                receipts.append(json.loads((root / "content_receipt.json").read_bytes()))
+                self.assertTrue(json.loads((root / "manifest.json").read_bytes())["files"])
+            with self.subTest(strategy=name):
+                self.assertEqual(outputs[0], outputs[1])
+                self.assertEqual(receipts[0]["semantic_sha256"], receipts[1]["semantic_sha256"])
+                self.assertNotEqual(receipts[0]["terminal"], receipts[1]["terminal"])
+
+    def test_initial_fails_fast_for_missing_scope_or_shift_coverage(self):
+        for index, (factory, field, missing, kwargs) in enumerate((
+                (Harness, "retain_boundaries_ns", "23", {}),
+                (ComplementHarness, "retain_shift_offsets_ns", "5",
+                 {"policy": v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}])}))):
+            h = factory(self.sub(f"missing-{index}"), scopes=True, defer_initial=True, **kwargs)
+            writers = h.profile.collector.writers if factory is Harness else h.strategy.writers
+            for writer in writers.values():
+                self.addCleanup(writer.stream.close)
+            h.initial[field].remove(missing)
+            h.decoder = Decoder("coverage-test", h.context["attempt_id"], h.initial, 65536)
+            with self.subTest(field=field), self.assertRaisesRegex(ProtocolError, "v3 retention does not cover"):
+                h.send("initial", h.initial)
+
     def test_availability_rows_and_durations_equal_bundle_coverage(self):
         for index, kwargs in enumerate((
                 {}, {"mixed": True}, {"mixed": True, "scopes": True},

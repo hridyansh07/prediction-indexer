@@ -54,12 +54,14 @@ class MarketProfile:
             require(cut.sequence == self.sequence + 1, "profile sequence")
             self.sequence = cut.sequence
             if cut.kind == "initial":
+                from replay.economic_sdk.retention import check, required
+                check(cut.body, required(self.snapshot))
                 self.input.bind(cut.body)
                 self.collector.initial(cut, self.clock.start)
                 return
             require(self.input.bound, "missing initial")
             if cut.kind == "terminal":
-                self.collector.terminal(self.clock.terminal(), cut.sequence)
+                self.collector.terminal(self.clock.terminal(), cut.risk_sequence)
                 self.terminal = True
                 return
             require(cut.kind == "cut")

@@ -1,4 +1,4 @@
-//! Wire V1 uses JSON strings for every integer, including domain integers.
+//! Wire V3 uses JSON strings for every integer, including domain integers.
 use replay_domain::{BookKey, ContractOrientation};
 use replay_risk::{
     CutOrigin, Decision, Disposition, MarketEvent, Reason, Reference, RiskCut, RiskEngine, Validity,
@@ -115,8 +115,7 @@ pub fn cut(c: &RiskCut) -> Value {
         let dependency = t.view.dependency().map(|d| json!({"epoch":d.epoch,"anchor":reference(&d.anchor),"through":reference(&d.through)}));
         json!({"key":key(&t.key),"previous_revision":t.previous_revision,"revision":t.view.revision(),"dependency":dependency,"decision":decision})
     }).collect();
-    let mut value =
-        json!({"origin":origin(c.origin()),"market_events":events,"book_transitions":transitions});
+    let mut value = json!({"origin":origin(c.origin()),"risk_sequence":c.sequence(),"market_events":events,"book_transitions":transitions});
     if !controls.is_empty() {
         value
             .as_object_mut()
@@ -178,7 +177,7 @@ fn join<'a>(levels: impl Iterator<Item = (&'a i64, &'a u64)>) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
-/// Closed terminal body: the cut count and the final book digest.
-pub fn terminal(cuts: u64, books_sha256: String) -> Value {
-    json!({"cuts": cuts.to_string(), "books_sha256": books_sha256})
+/// Closed terminal body: published and Risk cut counts and final book digest.
+pub fn terminal(cuts: u64, risk_cuts: u64, books_sha256: String) -> Value {
+    json!({"cuts": cuts.to_string(), "risk_cuts":risk_cuts.to_string(), "books_sha256": books_sha256})
 }

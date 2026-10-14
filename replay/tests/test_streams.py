@@ -54,6 +54,7 @@ def held(cut):
     """Explicit copy of a cut under the zero-copy hook contract."""
     return SimpleNamespace(
         sequence=cut.sequence,
+        risk_sequence=cut.risk_sequence,
         kind=cut.kind,
         body=thaw(cut.body),
         books={k: Held(book) for k, book in cut.books.items()},
@@ -111,6 +112,47 @@ def apply_all(test, values):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_v3_risk_sequence_and_terminal_bounds(self):
+        values = records()
+        for record in values:
+            if record["kind"] == "cut":
+                record["body"]["risk_sequence"] = str(2 * int(record["sequence"]))
+        values[-1]["body"]["risk_cuts"] = "100"
+        _, cuts = apply_all(self, values)
+        self.assertEqual(cuts[0].risk_sequence, 0)
+        self.assertEqual(cuts[1].risk_sequence, 2)
+        self.assertEqual(cuts[-1].risk_sequence, 101)
+        for version in ("1", "2"):
+            with self.subTest(version=version), self.assertRaisesRegex(ProtocolError, "version"):
+                decoder(values).apply(encoded({**values[0], "version": version}))
+        for risk in ("0", "1", "2", "02", str(2**64), 4):
+            d = decoder(values)
+            for r in values[:2]:
+                d.apply(encoded(r))
+            bad = copy.deepcopy(values[2])
+            bad["body"]["risk_sequence"] = risk
+            with self.subTest(risk=risk), self.assertRaises(ProtocolError):
+                d.apply(encoded(bad))
+        for field, value in (("cuts", "0"), ("risk_cuts", "0"), ("risk_cuts", "7")):
+            d = decoder(values)
+            for r in values[:-1]:
+                d.apply(encoded(r))
+            bad = copy.deepcopy(values[-1])
+            bad["body"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ProtocolError):
+                d.apply(encoded(bad))
+
+    def test_retention_lists_are_closed_canonical_sorted_and_bounded(self):
+        values = records()
+        for field in ("retain_boundaries_ns", "retain_shift_offsets_ns"):
+            for invalid in (["01"], [1], ["2", "1"], ["1", "1"], [str(2**64)], None):
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(ProtocolError):
+                    bad = [{**values[0], "body": {**values[0]["body"], field: invalid}}]
+                    decoder(bad).apply(encoded(bad[0]))
+        with self.assertRaises(ProtocolError):
+            bad = [{**values[0], "body": {**values[0]["body"], "retain_shift_offsets_ns": [str(i) for i in range(129)]}}]
+            decoder(bad).apply(encoded(bad[0]))
+
     def test_venue_time_closed_schema_and_exact_wire_integers(self):
         valid = {
             "event_ns": "1669149841123456000",
@@ -259,6 +301,19 @@ class ProtocolTests(unittest.TestCase):
         _, cuts = apply_all(self, values)
         assert_contract(self, cuts)
 
+    def test_stream_json_rejects_constants_and_invalid_utf8_and_poisons(self):
+        values = records()
+        wire = encoded(values[1])
+        for value in (b"NaN", b"Infinity", b"-Infinity", b'"\xff"'):
+            d = decoder(values)
+            d.apply(encoded(values[0]))
+            # Put the malformed JSON in a body field outside the O(1) guard set,
+            # so only the parser (not an unrelated identity guard) rejects it.
+            raw = wire[:-2] + b',"diagnostic":' + value + b'}}'
+            with self.subTest(value=value), self.assertRaisesRegex(ProtocolError, "malformed JSON"):
+                d.apply(raw)
+            self.assertTrue(d.poisoned)
+
     def test_books_are_live_in_place_and_read_only_mappings(self):
         values = records()
         d = decoder(values)
@@ -368,7 +423,7 @@ class ProtocolTests(unittest.TestCase):
             ("sequence", "2"),
             ("sequence", "03"),
             ("version", "1"),
-            ("version", "3"),
+            ("version", "2"),
             ("run_id", "other"),
             ("attempt_id", "other"),
             ("kind", "initial"),
@@ -419,7 +474,7 @@ class ProtocolTests(unittest.TestCase):
         terminal["body"]["cuts"] = "5"
         with self.assertRaisesRegex(ProtocolError, "terminal count"):
             d.apply(encoded(terminal))
-        for raw in [b'{"version":"1","version":"1"}', b"[", b"NaN", b"\xff"]:
+        for raw in [b'{"version":"1","version":"1"}', b"[", b"NaN", b"Infinity", b"-Infinity", b"\xff"]:
             with self.assertRaises(ProtocolError):
                 decoder(values).apply(raw)
 
@@ -431,6 +486,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(d.books[("kalshi:A", "outcome")].validity, "unusable")
         bad = copy.deepcopy(values[3])
         bad["sequence"] = "6"
+        bad["body"]["risk_sequence"] = "6"
         bad["body"]["book_transitions"] = bad["body"]["book_transitions"][:1]
         bad["body"]["book_transitions"][0].update(previous_revision="3", revision="4")
         with self.assertRaisesRegex(ProtocolError, "unusable"):
@@ -489,6 +545,7 @@ class ProtocolTests(unittest.TestCase):
             retained = []
             for count in range(1, 1201):
                 change["sequence"] = str(count + 2)
+                change["body"]["risk_sequence"] = str(count + 2)
                 transition["previous_revision"] = str(count)
                 transition["revision"] = str(count + 1)
                 d.apply(encoded(change))
@@ -526,6 +583,8 @@ class InPlaceBook:
                 }
             ],
             "groups": ["g"],
+            "retain_boundaries_ns": [],
+            "retain_shift_offsets_ns": [],
             "max_entry_bytes": "1048576",
             "max_queue_bytes": "1048576",
         }
@@ -537,10 +596,12 @@ class InPlaceBook:
         return self.decoder.books[("kalshi:X", "outcome")]
 
     def send(self, kind, body):
+        if kind == "cut":
+            body = {**body, "risk_sequence": str(self.decoder.sequence + 1)}
         return self.decoder.apply(
             encoded(
                 {
-                    "version": "2",
+                    "version": "3",
                     "run_id": "r",
                     "attempt_id": "a",
                     "sequence": str(self.decoder.sequence + 1),

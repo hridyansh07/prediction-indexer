@@ -685,6 +685,8 @@ def supervisor_config(
         },
     }
     try:
+        from replay.economic_sdk.retention import for_groups
+        document["transport"].update(for_groups(snapshot, document["strategies"].values()))
         validate_supervisor(document)
     except OSError as error:
         raise StageFailure("resource_exhausted", str(error)) from error

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 FIELDS = {"version", "universe_base_url", "runner_config", "canonical_store", "work_root", "results_root",
@@ -11,14 +12,14 @@ GROUP_FIELDS = {"name", "factory", "reader", "config", "checks", "compare"}
 CORPUS_TOKENS = {"@corpus:fees", "@corpus:valuation"}
 
 
-def _closed(value, fields, label):
-    if type(value) is not dict or set(value) != set(fields):
+def _closed(value, fields, label, optional=frozenset()):
+    if type(value) is not dict or not set(fields) <= set(value) or set(value) - set(fields) - set(optional):
         raise ValueError(f"{label}: expected exactly {sorted(fields)}")
     return value
 
 
 def load(path):
-    spec = _closed(json.loads(Path(path).read_bytes()), FIELDS, "corpus spec")
+    spec = _closed(json.loads(Path(path).read_bytes()), FIELDS, "corpus spec", {"derivative_cache"})
     if spec["version"] != 1:
         raise ValueError("corpus spec version")
     for key in ("runner_config", "canonical_store", "materializer"):
@@ -45,6 +46,24 @@ def load(path):
         if group["name"] in names:
             raise ValueError(f"duplicate group {group['name']}")
         names.add(group["name"])
+    if "derivative_cache" in spec:
+        cache = _closed(spec["derivative_cache"], {"root", "max_bytes"}, "derivative_cache")
+        if type(cache["max_bytes"]) is not int or cache["max_bytes"] <= 0:
+            raise ValueError("derivative_cache.max_bytes must be a positive integer")
+        if type(cache["root"]) is not str or not Path(cache["root"]).is_absolute():
+            raise ValueError("derivative_cache.root must be an absolute local directory")
+        root = Path(cache["root"]).resolve()
+        for name in ("canonical_store", "results_root", "work_root"):
+            other = Path(spec[name]).resolve()
+            if root.is_relative_to(other) or other.is_relative_to(root):
+                raise ValueError(f"derivative_cache.root must not overlap {name}")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=root):
+                pass
+        except OSError as error:
+            raise ValueError("derivative_cache.root must be a writable local directory") from error
+        cache["root"] = str(root)
     return spec
 
 

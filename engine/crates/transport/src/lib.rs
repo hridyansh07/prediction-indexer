@@ -10,11 +10,20 @@ pub use redis_sink::RedisSink;
 use replay_domain::*;
 use replay_materialize::{ReadLimits, inspect_pinned};
 use replay_normalizers::CanonicalNormalizerIdentity;
-use replay_risk::{BookPlan, RiskEngine, RiskLimits};
+use replay_risk::{BookPlan, CutOrigin, RiskCut, RiskEngine, RiskLimits};
 use replay_tape::{DerivativePin, LowerBoundPolicy, PinnedDerivative};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+    time::Instant,
+};
+
+pub const LIVENESS_MS: u64 = 1000;
+pub const MAX_RETAIN_BOUNDARIES: usize = 100_000;
+pub const MAX_RETAIN_OFFSETS: usize = 128;
+const MAX_RETAIN_DEADLINES: usize = 1_000_000;
 
 /// Stream/node/group/hash overhead was measured at ~22% of payload; Redis
 /// `maxmemory` must be at least 13/10 of the payload budget at setup.
@@ -106,6 +115,8 @@ pub struct Config {
     pub lower_bound: String,
     pub plans: Vec<Plan>,
     pub groups: Vec<String>,
+    pub retain_boundaries_ns: Vec<String>,
+    pub retain_shift_offsets_ns: Vec<String>,
     pub command_timeout_ms: u64,
     pub max_entry_bytes: usize,
     pub max_queue_bytes: usize,
@@ -129,6 +140,21 @@ impl Config {
     /// Completes all caller-controlled derivative/normalizer/plan checks before
     /// a Redis client is constructed or any Redis command can be issued.
     pub fn validate(&self) -> Result<()> {
+        for (values, cap) in [
+            (&self.retain_boundaries_ns, MAX_RETAIN_BOUNDARIES),
+            (&self.retain_shift_offsets_ns, MAX_RETAIN_OFFSETS),
+        ] {
+            if values.len() > cap {
+                return Err(Error::Protocol("retention list limit".into()));
+            }
+            let numbers = values
+                .iter()
+                .map(|v| integer(v))
+                .collect::<Result<Vec<_>>>()?;
+            if numbers.windows(2).any(|v| v[0] >= v[1]) {
+                return Err(Error::Protocol("retention list order".into()));
+            }
+        }
         let valid = |s: &str| {
             !s.is_empty()
                 && s.len() <= 128
@@ -209,7 +235,7 @@ impl Config {
     pub fn initial(&self) -> Value {
         let pins: Vec<_> = self.inputs.iter().map(|i| json!({"derivative_address":i.derivative_address,"receipt_sha256":i.receipt_sha256})).collect();
         wire::exact(
-            json!({"pins":pins,"start_ns":self.start_ns,"end_ns":self.end_ns,"lower_bound":self.lower_bound,"plans":self.plans,"groups":self.groups,"max_entry_bytes":self.max_entry_bytes,"max_queue_bytes":self.max_queue_bytes}),
+            json!({"pins":pins,"start_ns":self.start_ns,"end_ns":self.end_ns,"lower_bound":self.lower_bound,"plans":self.plans,"groups":self.groups,"retain_boundaries_ns":self.retain_boundaries_ns,"retain_shift_offsets_ns":self.retain_shift_offsets_ns,"max_entry_bytes":self.max_entry_bytes,"max_queue_bytes":self.max_queue_bytes}),
         )
     }
     pub fn keys(&self) -> [String; 2] {
@@ -235,8 +261,88 @@ pub struct Publisher<S: StreamSink = RedisSink> {
     engine: Option<RiskEngine>,
     buffer: PublishBuffer<S>,
     sequence: u64,
+    risk_sequence: u64,
+    retention: Retention,
+    last_liveness: Instant,
     poisoned: bool,
     terminal: bool,
+}
+
+/// Ordered, deduplicated deadline queue. All decisions precede wire encoding.
+struct Retention {
+    start: u64,
+    end: u64,
+    offsets: Vec<u64>,
+    deadlines: BinaryHeap<Reverse<u64>>,
+    base: u64,
+    flush_pending: bool,
+    gated: bool,
+}
+impl Retention {
+    fn new(config: &Config) -> Result<Self> {
+        let start = integer(&config.start_ns)?;
+        let mut value = Self {
+            start,
+            end: integer(&config.end_ns)?,
+            offsets: config
+                .retain_shift_offsets_ns
+                .iter()
+                .map(|s| integer(s))
+                .collect::<Result<_>>()?,
+            deadlines: config
+                .retain_boundaries_ns
+                .iter()
+                .map(|s| integer(s).map(Reverse))
+                .collect::<Result<_>>()?,
+            base: start,
+            flush_pending: true,
+            gated: false,
+        };
+        value.schedule(start)?;
+        Ok(value)
+    }
+    fn schedule(&mut self, time: u64) -> Result<()> {
+        for offset in &self.offsets {
+            if let Some(due) = time.checked_add(*offset).filter(|due| *due < self.end) {
+                self.deadlines.push(Reverse(due));
+            }
+        }
+        if self.deadlines.len() > MAX_RETAIN_DEADLINES {
+            return Err(Error::Resource);
+        }
+        Ok(())
+    }
+    fn retain(&mut self, cut: &RiskCut) -> Result<bool> {
+        let (raw, window) = match cut.origin() {
+            CutOrigin::Window { start_ns, .. } => (*start_ns, true),
+            CutOrigin::Group { visible_ns, .. } => (*visible_ns, false),
+        };
+        let time = raw.max(self.start);
+        let nonempty = !cut.market_events().is_empty()
+            || !cut.book_transitions().is_empty()
+            || !cut.control_events().is_empty();
+        let crossed = self.deadlines.peek().is_some_and(|due| due.0 <= time);
+        while self.deadlines.peek().is_some_and(|due| due.0 <= time) {
+            self.deadlines.pop();
+        }
+        // Pre-start callbacks stage every entity. The first raw >= start also
+        // flushes lazy profile openings, even when effective time stays start.
+        let staging = window || nonempty || crossed || raw < self.start || !self.gated;
+        if raw >= self.start {
+            self.gated = true;
+        }
+        let flush = self.flush_pending && time > self.base;
+        if staging {
+            self.base = time;
+            self.flush_pending = true;
+        } else if flush {
+            self.flush_pending = false;
+        }
+        if !cut.book_transitions().is_empty() {
+            self.schedule(time)?;
+        }
+        Ok(staging || flush)
+    }
 }
 fn risk_engine(config: &Config, limits: RiskLimits) -> Result<RiskEngine> {
     let policy = match config.lower_bound.as_str() {
@@ -292,10 +398,13 @@ impl<S: StreamSink> Publisher<S> {
             config.max_queue_bytes,
         );
         let mut p = Self {
+            retention: Retention::new(&config)?,
             config,
             engine: Some(engine),
             buffer,
             sequence: 0,
+            risk_sequence: 0,
+            last_liveness: Instant::now(),
             poisoned: false,
             terminal: false,
         };
@@ -320,6 +429,11 @@ impl<S: StreamSink> Publisher<S> {
         let record = self.record(kind, body);
         self.buffer.insert(Entry {
             sequence: self.sequence,
+            risk_sequence: if kind == "cut" {
+                Some(self.risk_sequence)
+            } else {
+                None
+            },
             record: serde_json::to_string(&record).unwrap(),
             terminal: kind == "terminal",
         })
@@ -333,7 +447,7 @@ impl<S: StreamSink> Publisher<S> {
         self.buffer.stats()
     }
     fn record(&self, kind: &str, body: Value) -> Value {
-        json!({"version":"2","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
+        json!({"version":"3","run_id":self.config.run_id,"attempt_id":self.config.attempt_id,"sequence":self.sequence.to_string(),"kind":kind,"body":body})
     }
     /// Buffers one cut, or EOF terminal. Returns false only after terminal,
     /// and only once every buffered entry, terminal included, is appended.
@@ -357,19 +471,39 @@ impl<S: StreamSink> Publisher<S> {
             .unwrap()
             .next_cut()
             .map_err(Error::Risk)?;
-        self.sequence = self.sequence.checked_add(1).ok_or(Error::Resource)?;
         if let Some(cut) = cut {
-            if cut.sequence() != self.sequence {
+            self.risk_sequence = self.risk_sequence.checked_add(1).ok_or(Error::Resource)?;
+            if cut.sequence() != self.risk_sequence {
                 return Err(Error::Protocol("risk sequence".into()));
             }
-            self.insert("cut", wire::cut(&cut))?;
+            let retained = self.retention.retain(&cut)?;
+            if retained {
+                self.sequence = self.sequence.checked_add(1).ok_or(Error::Resource)?;
+                self.insert("cut", wire::cut(&cut))?;
+            }
+            self.buffer.flush_due()?;
+            if !retained
+                && self.buffer.buffered() == 0
+                && self.last_liveness.elapsed().as_millis() >= u128::from(LIVENESS_MS)
+            {
+                self.buffer.sink_mut().liveness(self.risk_sequence)?;
+                self.last_liveness = Instant::now();
+            }
             Ok(true)
         } else {
             let engine = self.engine.take().unwrap();
             // Read-only view of final Risk books, taken before finish consumes it.
             let books_sha256 = wire::books_sha256(&engine);
             let finished = engine.finish().map_err(Error::Risk)?;
-            self.insert("terminal", wire::terminal(finished.cuts(), books_sha256))?;
+            if finished.cuts() != self.risk_sequence {
+                return Err(Error::Protocol("risk count".into()));
+            }
+            let cuts = self.sequence;
+            self.sequence = self.sequence.checked_add(1).ok_or(Error::Resource)?;
+            self.insert(
+                "terminal",
+                wire::terminal(cuts, finished.cuts(), books_sha256),
+            )?;
             self.buffer.flush()?;
             self.terminal = true;
             Ok(false)

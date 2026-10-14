@@ -108,4 +108,11 @@ def factory(strategy_class):
     def build(context):
         return Runtime(strategy_class(context["config"]), context)
 
+    def retention(config, snapshot):
+        from replay.economic_sdk.retention import configured
+        strategy = strategy_class(config)
+        game = strategy.requirements(strategy.snapshot, strategy.experiment.policy).game
+        return configured(snapshot, config, timers=game.timers if game is not None else ())
+
+    build.retention = retention
     return build

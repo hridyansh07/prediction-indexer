@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from replay.economic_fills import Fill
 from replay.fees import FeeEngine, Policy, Resolver
 from replay.fees.artifacts import load_catalog, parse_canonical
+from replay.fees.lazy import LazyAssessmentIds
+from replay.strategy_sdk import plain
+from replay.streams.protocol import freeze
 from replay.fees.domain import (
     AccountClass,
     Asset,
@@ -52,6 +59,83 @@ class FeeEconomicsUnavailable(ValueError):
     """Native notional cannot be represented by the Fee SDK at its pinned scale."""
 
 
+@dataclass(frozen=True, slots=True)
+class _OrderInputs:
+    engine: FeeEngine
+    resolver: Resolver
+    experiment: str
+    scope: int
+    basket: object
+    direction: str
+    size: int
+    key: tuple
+    time: int
+    sequence: int
+    context: Context
+    economics: InstrumentEconomics
+    levels: tuple
+
+    @property
+    def retained_inputs(self):
+        # Engine, resolver, context and economics are shared configuration, not
+        # newly allocated per-observation state. Charge the captured inputs.
+        return (self.experiment, self.scope, self.basket, self.direction, self.size,
+                self.key, self.time, self.sequence, self.levels,
+                self.context.market, self.context.instrument, self.context.orientation,
+                self.context.account, self.context.subaccount)
+
+    def assessments(self):
+        order_material = {
+            "experiment": self.experiment, "scope": self.scope, "basket": plain(self.basket),
+            "direction": self.direction, "size": self.size, "key": self.key,
+            "time": self.time, "sequence": self.sequence,
+        }
+        order_key = hashlib.sha256(
+            json.dumps(order_material, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        fills, economics = [], self.economics
+        for fill_index, (price_atoms, quantity_atoms) in enumerate(self.levels):
+            price = QuotePrice(price_atoms, economics.price_scale)
+            quantity = Quantity(quantity_atoms, economics.quantity_scale)
+            try:
+                notional = Notional(economics.quote, fixed(
+                    price.value * quantity.value, economics.quote_scale))
+            except ValueError as error:
+                raise FeeEconomicsUnavailable("fill notional is not exactly representable") from error
+            fills.append(HypotheticalFill(
+                f"{order_key}:{fill_index}", self.context,
+                economics, Side[self.direction], price,
+                Probability(price_atoms, economics.price_scale), quantity, notional,
+                self.time, Role.TAKER, order_key, fill_index, fill_index == 0,
+                counterfactual_revision=order_key,
+            ))
+        return self.engine.assess_many(
+            tuple(fills), self.resolver if self.engine.resolver is None else None)
+
+
+class _FeeAmounts(NamedTuple):
+    """Only amount/label results: never fills, resolutions, order state or IDs."""
+    charges: tuple
+    net_deltas: tuple | None
+    unknowns: tuple
+    assumptions: tuple
+    evidence: object
+
+
+def _amounts(results):
+    return tuple(_FeeAmounts(r.charges, r.net_deltas, r.unknowns, r.assumptions, r.evidence)
+                 for r in results)
+
+
+@dataclass(frozen=True, slots=True)
+class _AmountOrder:
+    amounts: tuple
+    identities: LazyAssessmentIds
+
+    def __iter__(self):
+        return iter(self.amounts)
+
+
 class FeeBridge:
     def __init__(self, fees_config: dict, plans: list[dict]):
         if type(fees_config) is not dict or set(fees_config) != _FEE_FIELDS:
@@ -78,8 +162,15 @@ class FeeBridge:
             limitless_sell_bps=fees_config["limitless_sell_bps"],
         )
         self._engine = FeeEngine(policy, Resolver(catalog, reference_time=reference))
+        self._resolver = self._engine.resolver
         self.engine_identity = self._engine.identity
         self.catalog_identity = catalog.identity
+        self._amount_memo = OrderedDict()
+        self._selection_memo = OrderedDict()
+        self._contexts = OrderedDict()
+        self._memo_limit = 1_048_576
+        self._memo_hits = self._memo_misses = 0
+        self._crosscheck = os.environ.get("REPLAY_FEE_CROSSCHECK") == "1"
 
         assets = {}
         if type(fees_config["assets"]) is not dict:
@@ -134,6 +225,7 @@ class FeeBridge:
                 raise ValueError("binding conflicts with plan, asset, or unit payout")
             bindings[key] = economics
         self._bindings = bindings
+        self._economics_ids = {key: e.identity for key, e in bindings.items()}
         self.semantic_config = {
             key: fees_config[key] for key in sorted(_FEE_FIELDS - {"catalog_directory"})
         }
@@ -143,11 +235,82 @@ class FeeBridge:
         """Semantic fee configuration suitable for the parent's experiment hash."""
         return self.semantic_config
 
+    @property
+    def memo_diagnostics(self):
+        """Runtime diagnostics only; never included in semantic configuration/output."""
+        total = self._memo_hits + self._memo_misses
+        return {"hits": self._memo_hits, "misses": self._memo_misses,
+                "entries": len(self._amount_memo),
+                "hit_rate": self._memo_hits / total if total else 0}
+
+    def _context(self, venue, native_market, native_instrument, orientation, account):
+        key = (venue, native_market, native_instrument, orientation, account)
+        context = self._contexts.get(key)
+        if context is None:
+            context = Context(venue, Product.CLOB, native_market, None, None, None,
+                              native_instrument, orientation, account, "hypothetical")
+            self._contexts[key] = context
+            if len(self._contexts) > 1024:
+                self._contexts.popitem(last=False)
+        else:
+            self._contexts.move_to_end(key)
+        return context
+
+    def _schedule_key(self, context, time):
+        # Use the resolver's actual selection time. Historical intervals can change
+        # mid-bundle; frozen snapshots must NOT activate those changes in fill time.
+        resolver = self._resolver
+        at = resolver.reference_time if resolver.reference_time is not None else time
+        memo = self._selection_memo
+        cached = memo.get(context)
+        if cached is not None and cached[0] <= at and (cached[1] is None or at < cached[1]):
+            memo.move_to_end(context)
+            return cached[2]
+        resolved = resolver.resolve(context, time)
+        key = (resolved.catalog_identity, resolved.platform.identity,
+               resolved.account.identity if self._engine.policy.include_account_rebates else None)
+        memo[context] = (at, resolved.next_boundary, key)
+        if len(memo) > 1024:
+            memo.popitem(last=False)
+        return key
+
+    def _memo_order(self, request):
+        key = (self.engine_identity, self._economics_ids[request.key], request.context,
+               self._schedule_key(request.context, request.time), Side[request.direction],
+               Role.TAKER, request.levels)
+        amounts = self._amount_memo.get(key)
+        eager = None
+        if amounts is None:
+            self._memo_misses += 1
+            eager = request.assessments()
+            amounts = _amounts(eager)
+            self._amount_memo[key] = amounts
+            if len(self._amount_memo) > self._memo_limit:
+                self._amount_memo.popitem(last=False)
+        else:
+            self._memo_hits += 1
+            self._amount_memo.move_to_end(key)
+            if self._crosscheck:
+                eager = request.assessments()
+                if amounts != _amounts(eager):
+                    raise AssertionError("fee amount memo crosscheck mismatch")
+        expected = None
+        if self._crosscheck:
+            expected = tuple(r.identity for r in eager)
+        identities = LazyAssessmentIds(request, expected)
+        if self._crosscheck:
+            # Check even evaluations whose payload is discarded before a write.
+            identities.materialize()
+        return _AmountOrder(amounts, identities)
+
     def assess_orders(self, *, experiment: str, scope: int, basket: dict, direction: str,
-               size: int, time: int, sequence: int, legs: tuple, account="same_venue_complement_v1") -> tuple:
+               size: int, time: int, sequence: int, legs: tuple, account="same_venue_complement_v1",
+               defer_ids=False) -> tuple:
         """Return native per-order assessments; the caller owns basket payout.
 
         Missing bindings retain a None slot and a visible reason per leg.
+        The default retains the public FeeAssessment API. Strategy evaluation
+        opts into amount-only orders and deferred identities with defer_ids.
         """
         if direction not in {"BUY", "SELL"} or type(legs) is not tuple or not legs:
             raise ValueError("invalid fee scenario")
@@ -177,34 +340,13 @@ class FeeBridge:
                 raise ValueError("unsupported leg venue") from error
             native_market = leg["market_id"].removeprefix(venue_name + ":")
             native_instrument = key[0].removeprefix(venue_name + ":")
-            order_material = {
-                "experiment": experiment, "scope": scope, "basket": basket,
-                "direction": direction, "size": size, "key": key,
-                "time": time, "sequence": sequence,
-            }
-            order_key = hashlib.sha256(
-                json.dumps(order_material, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            fills = []
-            for fill_index, (price_atoms, quantity_atoms) in enumerate(fill_value.taken):
-                price = QuotePrice(price_atoms, economics.price_scale)
-                quantity = Quantity(quantity_atoms, economics.quantity_scale)
-                notional_value = price.value * quantity.value
-                try:
-                    notional = Notional(economics.quote, fixed(notional_value, economics.quote_scale))
-                except ValueError as error:
-                    raise FeeEconomicsUnavailable("fill notional is not exactly representable") from error
-                fills.append(HypotheticalFill(
-                    f"{order_key}:{fill_index}",
-                    Context(venue, Product.CLOB, native_market, None, None, None,
-                            native_instrument, key[1], account,
-                            "hypothetical"),
-                    economics, Side[direction], price,
-                    Probability(price_atoms, economics.price_scale), quantity, notional,
-                    time, Role.TAKER, order_key, fill_index, fill_index == 0,
-                    counterfactual_revision=order_key,
-                ))
-            prepared.append((economics, self._engine.assess_many(tuple(fills))))
+            request = _OrderInputs(
+                self._engine, self._resolver, experiment, scope, freeze(plain(basket)),
+                direction, size, key, time, sequence,
+                self._context(venue, native_market, native_instrument, key[1], account),
+                economics, fill_value.taken)
+            results = self._memo_order(request) if defer_ids else request.assessments()
+            prepared.append((economics, results))
         return tuple(prepared), tuple(reasons)
 
     def economics(self, key):
@@ -215,11 +357,11 @@ class FeeBridge:
                size: int, time: int, sequence: int, legs: tuple) -> dict:
         prepared, reasons = self.assess_orders(
             experiment=experiment, scope=scope, basket=basket, direction=direction,
-            size=size, time=time, sequence=sequence, legs=legs)
+            size=size, time=time, sequence=sequence, legs=legs, defer_ids=True)
         if reasons:
             return self._unknown(reasons, [[] for _ in legs])
 
-        assessments = [[result.identity for result in results] for _, results in prepared]
+        assessments = [results.identities for _, results in prepared]
         all_results = [result for _, results in prepared for result in results]
         unknowns = [unknown for result in all_results for unknown in result.unknowns]
         if unknowns or any(result.net_deltas is None for result in all_results):

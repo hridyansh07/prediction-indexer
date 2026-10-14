@@ -42,6 +42,7 @@ from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_co
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, GameRequirement, Observation
 from replay.economic_sdk.game import ANCHORS, Timeline, binding as game_binding, episode_game, game_policy
 from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
+from replay.fees.lazy import assessment_json
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
@@ -154,6 +155,9 @@ class Runtime:
             for anchor, offset in timers:
                 require(anchor in ANCHORS and type(offset) is int and 0 <= offset <= 2**64 - 1,
                         "game timer anchor/offset")
+        from replay.economic_sdk.retention import required
+        self.retention = required(self.snapshot, experiment.policy, timeline=self.game,
+                                  timers=self.game_requirement.timers if self.game_requirement else ())
         if self.legacy:
             self.layout_files = Layout(experiment)
             names = self.layout_files.files
@@ -211,6 +215,7 @@ class Runtime:
 
         self.scope = 0
         self.sequence = -1
+        self.risk_sequence = 0
         self.views = {}
         self.view_costs = {}
         self.entities = {}
@@ -254,8 +259,11 @@ class Runtime:
             require(not self.poisoned and not self.terminal, "closed economic strategy")
             require(cut.sequence == self.sequence + 1, "economic sequence")
             self.sequence = cut.sequence
+            self.risk_sequence = cut.risk_sequence
             if cut.kind == "initial":
                 require(cut.sequence == 0)
+                from replay.economic_sdk.retention import check
+                check(cut.body, self.retention)
                 self.strategy.bind(cut.body)
                 start = self.clock.start
                 for key, builder in self.builders.items():
@@ -278,7 +286,7 @@ class Runtime:
                 self._advance(end)
                 self._close_scope(end, "RUN_END", True)
                 if self.profile is not None:
-                    self.profile.terminal(end)
+                    self.profile.terminal(end, cut.risk_sequence)
                 self.terminal = True
                 return
             require(cut.kind == "cut")
@@ -650,7 +658,7 @@ class Runtime:
         return spread, index
 
     def _fresh(self, entity, views):
-        context = Context(self.staged_time, self.sequence, self.scope,
+        context = Context(self.staged_time, self.risk_sequence, self.scope,
                           self.experiment.experiment_sha256, self.game.view if self.game is not None else None)
         observation = self.strategy.evaluate(entity, views, context)
         require(type(observation) is Observation and observation.status in self.statuses,
@@ -829,7 +837,8 @@ class Runtime:
 
     def _check_retained_slice(self, quotes, payload):
         # Checked for the initial and every replacement slice, before retention.
-        require(len(encoded({"consumed": quotes_json(quotes), "open_values": payload}))
+        require(len(encoded({"consumed": quotes_json(quotes),
+                             "open_values": assessment_json(payload, placeholders=True)}))
                 + 1024 <= bounds.MAX_LINE, "slice retained line budget")
 
     def _open_episode(self, key, time, observation, skew, priced=None):
@@ -918,7 +927,7 @@ class Runtime:
                 "episode_id": identity, "kind": episode.kind, "end_reason": reason,
                 "censored": censored, "consumed": quotes_json(episode.quotes),
                 "survival_ns": str(survival), "viable_tiers": viable,
-                "open_values": episode.slice_values, "opening_skew_bucket": episode.slice_skew,
+                "open_values": assessment_json(episode.slice_values), "opening_skew_bucket": episode.slice_skew,
             }
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
             self.writers[self.layout_files.name("slices", entity.cls)].append(row)
@@ -932,7 +941,7 @@ class Runtime:
         if group + "slices.ndjson" in self.writers:
             self.writers[group + "slices.ndjson"].append(row)
         if entity.cls == REAL and self.experiment.audit_intervals:
-            row = row | {"quotes": quotes_json(episode.quotes), "values": episode.slice_values}
+            row = row | {"quotes": quotes_json(episode.quotes), "values": assessment_json(episode.slice_values)}
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
             self.writers["audit/slices.ndjson"].append(row)
 
@@ -993,7 +1002,7 @@ class Runtime:
                     "opening_slice_survival_ns": str(episode.opening_survival or 0),
                     "viable_tiers": [t for t in self.tiers if t in episode.viable],
                     "qualified_ns": {t: str(v) for t, v in episode.qualified.items()},
-                    "open_values": episode.open_values,
+                    "open_values": assessment_json(episode.open_values),
                     "opening_skew_bucket": episode.opening_skew,
                 } | {"max_" + name: value for name, value in episode.maxima.items()}
                 self.writers[self.layout_files.name("episodes", entity.cls)].append(row)
@@ -1015,9 +1024,9 @@ class Runtime:
                 "open": {"value_class": episode.open_class,
                          "reasons": [self._reason(r) for r in episode.open_reasons],
                          "leg_skew_ns": str(skew_ns), "skew_bucket": skew_bucket,
-                         "values": episode.open_values, "quotes": quotes_json(episode.open_quotes)},
+                         "values": assessment_json(episode.open_values), "quotes": quotes_json(episode.open_quotes)},
                 "maxima": episode.maxima,
-                "at_max": {"values": episode.at_max[0], "quotes": quotes_json(episode.at_max[1])},
+                "at_max": {"values": assessment_json(episode.at_max[0]), "quotes": quotes_json(episode.at_max[1])},
             }
             if episode.fill is not None:
                 episode.fill.json["end_books"] = end_books(

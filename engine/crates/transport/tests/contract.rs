@@ -4,7 +4,7 @@ mod support;
 use replay_domain::*;
 use replay_risk::{RiskEngine, RiskLimits};
 use replay_tape::LowerBoundPolicy;
-use replay_transport::{Config, Input, Plan, wire};
+use replay_transport::{Config, Input, Plan, Publisher, StreamSink, wire};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use support::*;
@@ -155,6 +155,8 @@ fn config(f: &Fixture) -> Config {
             })
             .collect(),
         groups: vec!["fast".into(), "slow".into()],
+        retain_boundaries_ns: vec!["0".into(), "100".into()],
+        retain_shift_offsets_ns: vec![],
         command_timeout_ms: 1000,
         max_entry_bytes: 65536,
         max_queue_bytes: 1_048_576,
@@ -175,7 +177,7 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
         RiskLimits::default(),
     )
     .unwrap();
-    let wrap = |seq: u64, kind: &str, body: Value| json!({"version":"2","run_id":c.run_id,"attempt_id":c.attempt_id,"sequence":seq.to_string(),"kind":kind,"body":body});
+    let wrap = |seq: u64, kind: &str, body: Value| json!({"version":"3","run_id":c.run_id,"attempt_id":c.attempt_id,"sequence":seq.to_string(),"kind":kind,"body":body});
     let mut output = vec![wrap(0, "initial", c.initial())];
     while let Some(cut) = engine.next_cut().unwrap() {
         output.push(wrap(cut.sequence(), "cut", wire::cut(&cut)));
@@ -185,7 +187,7 @@ fn records(f: &Fixture, c: &Config) -> Vec<Value> {
     output.push(wrap(
         done.cuts() + 1,
         "terminal",
-        wire::terminal(done.cuts(), books),
+        wire::terminal(done.cuts(), done.cuts(), books),
     ));
     output
 }
@@ -405,6 +407,236 @@ fn golden_wire_from_real_materializer_walker_and_risk() {
         values[7]["body"]["control_events"][0]["event"],
         json!({"kind":"metadata_changed","from":"before","to":"after"})
     );
+}
+
+#[derive(Clone, Default)]
+struct Capture(
+    std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+    std::rc::Rc<std::cell::Cell<bool>>,
+);
+impl StreamSink for Capture {
+    fn setup(&mut self, _: &[String], _: usize, _: usize) -> replay_transport::Result<()> {
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        first: u64,
+        entries: &[String],
+        _: &[Option<u64>],
+        _: bool,
+    ) -> replay_transport::Result<usize> {
+        assert_eq!(first as usize, self.0.borrow().len());
+        if self.2.get() {
+            return Ok(0);
+        }
+        self.0.borrow_mut().extend_from_slice(entries);
+        Ok(entries.len())
+    }
+    fn liveness(&mut self, risk: u64) -> replay_transport::Result<()> {
+        self.1.borrow_mut().push(risk);
+        Ok(())
+    }
+    fn progress(&mut self) -> replay_transport::Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
+    fn poison(&mut self) {}
+}
+
+#[test]
+fn empty_windows_are_always_published_and_terminal_counts_include_omissions() {
+    let make = |start, end| {
+        Fixture::new(
+            start,
+            end,
+            start.max(1) as i64,
+            (start + 1..end)
+                .map(|t| row("x", t, vec![full("kalshi:unplanned", &[], &[])]))
+                .collect(),
+            |_| {},
+        )
+    };
+    let first = make(0, 20);
+    let second = make(20, 40);
+    let mut c = config(&first);
+    c.plans.retain(|p| p.lane.as_str() == "x");
+    c.end_ns = "40".into();
+    c.retain_boundaries_ns = vec![];
+    c.inputs.push(Input {
+        directory: second.pin.directory.clone(),
+        derivative_address: second.pin.pin.derivative_address.clone(),
+        receipt_sha256: second.pin.pin.receipt_sha256,
+    });
+    let sink = Capture::default();
+    let capture = sink.clone();
+    let mut p = Publisher::with_sink(sink, c, RiskLimits::default()).unwrap();
+    while p.step().unwrap() {}
+    let values: Vec<Value> = capture
+        .0
+        .borrow()
+        .iter()
+        .map(|r| serde_json::from_str(r).unwrap())
+        .collect();
+    let cuts = &values[1..values.len() - 1];
+    assert_eq!(
+        cuts.iter()
+            .map(|r| r["body"]["risk_sequence"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["1", "2", "21", "22"]
+    );
+    assert_eq!(
+        cuts.iter()
+            .filter(|r| r["body"]["origin"]["kind"] == "window")
+            .count(),
+        2
+    );
+    assert!(
+        cuts.iter().all(|r| r["body"]["market_events"] == json!([])
+            && r["body"]["book_transitions"] == json!([]))
+    );
+    assert_eq!(values.last().unwrap()["body"]["cuts"], "4");
+    assert_eq!(values.last().unwrap()["body"]["risk_cuts"], "40");
+}
+
+#[test]
+fn liveness_requires_an_empty_buffer_and_is_throttled() {
+    for blocked in [false, true] {
+        let f = Fixture::new(
+            0,
+            40,
+            1,
+            (1..40)
+                .map(|t| row("x", t, vec![full("kalshi:unplanned", &[], &[])]))
+                .collect(),
+            |_| {},
+        );
+        let mut c = config(&f);
+        c.end_ns = "40".into();
+        c.retain_boundaries_ns = vec![];
+        let sink = Capture::default();
+        let capture = sink.clone();
+        let mut p = Publisher::with_sink(sink, c, RiskLimits::default()).unwrap();
+        capture.2.set(blocked);
+        p.step().unwrap();
+        p.step().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(
+            replay_transport::LIVENESS_MS,
+        ));
+        p.step().unwrap();
+        p.step().unwrap();
+        assert_eq!(*capture.1.borrow(), if blocked { vec![] } else { vec![3] });
+    }
+}
+
+#[test]
+fn sparse_strategy_wire_preserves_boundary_and_shift_triggers() {
+    let mut rows = vec![];
+    for time in 1..40 {
+        let events = match time {
+            12 => vec![
+                full("polymarket:123", &[(35, 10)], &[(40, 10)]),
+                full("polymarket:987", &[(40, 10)], &[(45, 10)]),
+            ],
+            3 | 28 => vec![full("polymarket:123", &[(35, 10)], &[(40, 10)])],
+            4 | 29 => vec![full("polymarket:987", &[(40, 10)], &[(45, 10)])],
+            _ => vec![full("polymarket:unplanned", &[(11, 1)], &[])],
+        };
+        rows.push(row("explicit-polymarket", time, events));
+    }
+    let f = Fixture::new(0, 40, 1, rows, |_| {});
+    let mut c = config(&f);
+    c.start_ns = "10".into();
+    c.end_ns = "40".into();
+    c.lower_bound = "expand_to_window_start".into();
+    c.groups = vec!["coverage".into()];
+    c.retain_boundaries_ns = vec!["10".into(), "23".into(), "40".into()];
+    c.retain_shift_offsets_ns = vec!["5".into()];
+    c.plans = ["polymarket:123", "polymarket:987"]
+        .into_iter()
+        .map(|name| Plan {
+            instrument: id(name),
+            orientation: ContractOrientation::Outcome,
+            lane: LaneId::new("explicit-polymarket").unwrap(),
+            venue: "polymarket".into(),
+            price_scale: "2".into(),
+            quantity_scale: "0".into(),
+        })
+        .collect();
+    let sink = Capture::default();
+    let capture = sink.clone();
+    let mut publisher = Publisher::with_sink(sink, c.clone(), RiskLimits::default()).unwrap();
+    while publisher.step().unwrap() {}
+    let sparse: Vec<Value> = capture
+        .0
+        .borrow()
+        .iter()
+        .map(|r| serde_json::from_str(r).unwrap())
+        .collect();
+    let mut engine = RiskEngine::open(
+        vec![f.pin.clone()],
+        10,
+        40,
+        LowerBoundPolicy::ExpandToWindowStart,
+        vec![
+            plan("polymarket:123", "explicit-polymarket"),
+            plan("polymarket:987", "explicit-polymarket"),
+        ],
+        RiskLimits::default(),
+    )
+    .unwrap();
+    let wrap = |seq: u64, kind: &str, body: Value| {
+        json!({"version":"3", "run_id":c.run_id, "attempt_id":c.attempt_id,
+        "sequence":seq.to_string(), "kind":kind, "body":body})
+    };
+    let mut full = vec![wrap(0, "initial", c.initial())];
+    while let Some(cut) = engine.next_cut().unwrap() {
+        full.push(wrap(cut.sequence(), "cut", wire::cut(&cut)));
+    }
+    let books = wire::books_sha256(&engine);
+    let done = engine.finish().unwrap();
+    full.push(wrap(
+        done.cuts() + 1,
+        "terminal",
+        wire::terminal(done.cuts(), done.cuts(), books),
+    ));
+    let terminal = &sparse.last().unwrap()["body"];
+    assert_eq!(terminal["risk_cuts"], "40");
+    assert!(terminal["cuts"].as_str().unwrap().parse::<u64>().unwrap() < done.cuts());
+    for (i, record) in sparse.iter().enumerate() {
+        assert_eq!(record["sequence"], i.to_string());
+    }
+    let kept: Vec<u64> = sparse
+        .iter()
+        .filter(|r| r["kind"] == "cut")
+        .map(|r| {
+            r["body"]["risk_sequence"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    // All pre-start cuts, initial/window, requested-start, scope, shift and flush crossings.
+    for sequence in [1, 2, 3, 4, 5, 10, 11, 13, 14, 16, 17, 18, 19, 24, 25] {
+        assert!(kept.contains(&sequence), "missing {sequence}");
+    }
+    assert!(!kept.contains(&21));
+    for (name, records) in [
+        ("strategy-full.ndjson", full),
+        ("strategy-sparse.ndjson", sparse),
+    ] {
+        let bytes: String = records
+            .iter()
+            .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+            .collect();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        if std::env::var_os("REPLAY_UPDATE_GOLDEN").is_some() {
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+    }
 }
 
 #[test]

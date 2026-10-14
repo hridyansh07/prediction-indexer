@@ -252,7 +252,7 @@ class Collector:
         if self.staged is not None and time > self.staged:
             self._commit()
         # Scopes opened by this advance write their rows from the state before this cut.
-        self.sequence = cut.sequence
+        self.sequence = cut.risk_sequence
         self._advance(time)
         for stream in self.streams:
             stream.cut(cut, raw, time, self.rows, self.scope)

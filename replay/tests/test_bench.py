@@ -229,6 +229,19 @@ class BenchTests(unittest.TestCase):
             self.assertFalse(any(args[:2] in (['image', 'rm'], ['builder', 'prune']) for args, _ in fake.calls))
         self.assertEqual(len(set(names)), 4)
 
+    def test_fee_crosscheck_forwarding_is_literal_and_opt_in(self):
+        for index, value in enumerate((None, '', '0', 'true', '1 ', '1')):
+            fake = FakeDocker()
+            with patch.dict(os.environ, {}, clear=True):
+                if value is not None:
+                    os.environ['REPLAY_FEE_CROSSCHECK'] = value
+                self.assertEqual(self._docker(self.root / ('crosscheck' + str(index)), fake), 0)
+            runner = next(args for args, _ in fake.calls if args[0] == 'create'
+                          and args[args.index('--name') + 1].endswith('-runner'))
+            env = [runner[i + 1] for i, arg in enumerate(runner) if arg == '--env']
+            self.assertEqual(env, ['REPLAY_PARTICIPANT_DIAGNOSTICS=1']
+                             + (['REPLAY_FEE_CROSSCHECK=1'] if value == '1' else []))
+
     def _assert_evidence(self, output, fake):
         self.assertEqual(fake.objects, {})
         self.assertEqual(read_json(output / 'result.json')['status'], 'FAILED')
