@@ -14,16 +14,17 @@ against your pinned plan scales; they are illustrative research settings.
 
 ## Policy version 2
 
-A version-2 policy has the same closed fields. Its `groups` may also contain
-`availability`, `levels` and `transitions`, which are allowed only here (the
+A version-2 policy keeps the original fields. Its `groups` may also contain
+`availability`, `levels`, `transitions` and `volatility`, which are allowed only here (the
 standalone group); an embedded profile that requests any of them fails at
 construction. A version-1 policy writes exactly the files and bytes it always
-did. Example: [config.v2.example.json](config.v2.example.json) (every group on).
+did. Example: [config.v2.example.json](config.v2.example.json) (the original v2 groups).
 Specification: [MARKET_PROFILE_V2](../../../docs/specs/MARKET_PROFILE_V2.md).
 
 The file set follows the policy: `incidents.ndjson`, `pair_profile.ndjson` and
 `profile.ndjson`, plus `availability.ndjson`, `transitions.ndjson.zst` and
-`levels.ndjson.zst` when those groups are on. The manifest `version` is 2 for a
+`levels.ndjson.zst` when those groups are on, and `volatility.ndjson.zst` when
+volatility is on. The manifest `version` is 2 for a
 version-2 policy; each `.ndjson.zst` entry is `{logical: {sha256, byte_length,
 records}, stored: {sha256, byte_length}}` and the other entries are unchanged.
 
@@ -81,6 +82,34 @@ Notes on what the rows do and do not say:
   `activity` and are `null` without it.
 - A Kalshi Yes book whose `complement` is invalidated stays usable: its `top` row
   and `ladder` keep the bids and lose the projected asks.
+
+## Volatility
+
+The standalone-only `volatility` group requires `transitions` and a closed
+`policy.volatility` object. Example:
+[config.volatility.example.json](config.volatility.example.json).
+It samples usable two-sided books on a scope-relative clock, accumulates exact
+spread sums and horizon move/jump statistics, and integrates exact two-sided
+durations. Sampling catches up before later state changes and reads the final
+state after all equal-time cuts; it adds no sparse-wire retention grid.
+
+With `gap_pairs: "outcome_complements"`, scope-pinned exhaustive masks establish
+different-market complete-set pairs. Kalshi contributes Yes and projected No
+asks. Unknown masks remain visible in `summary.volatility.unavailable`.
+The summary includes all book and pair totals and the pair/mask identity table.
+
+Prices convert exactly from native scales to scale 4. Mids and combined gap
+costs are doubled before horizon deltas, so `sqrt(sum_sq4 / n) / 2` is RMS in
+scale-4 atoms; jumps compare with twice their configured atom thresholds.
+A quote requiring rounding fails visibly. The independent reader verifies both
+frames and reconstructs every volatility row and total from transitions and
+snapshot masks, without importing the collector. Files use the shared one-frame
+streaming encoder and a 1 MiB line bound.
+
+The [supplied spec](../../../docs/specs/MARKET_VOLATILITY_V1.md) and
+[precise contract](../../../docs/specs/MARKET_VOLATILITY_V1_CONTRACT.md) document
+row shapes, timing, units and resource limits. Five-bundle acceptance and the
+comparison with delayed-fill leg loss remain pending retained inputs.
 
 Factory: `replay.strategies.market_profile:build`.
 Completed bench reader: `replay.strategies.market_profile:read_completed`.

@@ -16,6 +16,7 @@ from replay.economic_sdk.profile import (
     STRATEGY,
     TRANSITIONS_FILE,
     LEVELS_FILE,
+    VOLATILITY_FILE,
     Collector,
     profile_files,
     profile_identity,
@@ -80,6 +81,9 @@ class MarketProfile:
                         "policy": self.policy, "experiment_sha256": self.experiment_sha256,
                         "files": files}
             summary = validate_content(self.root, self.snapshot, manifest)
+            if self.collector.volatility is not None:
+                require(summary["volatility"] == self.collector.volatility.summary(),
+                        "volatility collector/reader totals")
             write_json_durable(self.root / "summary.json", summary)
             manifest["summary_sha256"] = digest(summary)
             write_json_durable(self.root / "manifest.json", manifest)
@@ -113,7 +117,7 @@ def _manifest(value, complete):
             "profile experiment identity")
     names, files = profile_files(policy), value["files"]
     require(type(files) is dict and set(files) == set(names), "output file set")
-    framed = (TRANSITIONS_FILE, LEVELS_FILE)
+    framed = (TRANSITIONS_FILE, LEVELS_FILE, VOLATILITY_FILE)
     check_files({k: v for k, v in files.items() if k not in framed},
                 tuple(n for n in names if n not in framed))
     for name in framed:

@@ -220,6 +220,7 @@ class TransitionRecorder(Stream):
                          max_bytes=TRANSITIONS_MAX_BYTES, max_line=bounds.MAX_LINE)
         self.state = {}   # planned key -> (validity, best bid, best ask), as of the last cut
         self.last = {}    # written key -> (validity, bid, ask) of the previous row in the open scope
+        self.on_top = None  # optional same-pass observer; never retains the row
 
     # -- state ---------------------------------------------------------------------
     def initial(self, cut, scoped):
@@ -256,7 +257,12 @@ class TransitionRecorder(Stream):
 
     def _opening(self, scope, key, at, sequence):
         top = self.last[key] = self._top(key)
-        self.writer.append(self._top_row(scope, key, sequence, at, "open", top, {}))
+        self._write_top(self._top_row(scope, key, sequence, at, "open", top, {}))
+
+    def _write_top(self, row):
+        self.writer.append(row)
+        if self.on_top is not None:
+            self.on_top(row)
 
     def cut(self, cut, raw, time, scoped, scope):
         sequence = cut.risk_sequence
@@ -284,8 +290,8 @@ class TransitionRecorder(Stream):
                 top = self._top(key)
                 if top != self.last[key] or cause != "operations":
                     self.last[key] = top
-                    self.writer.append(self._top_row(scope, key, sequence, time, cause, top,
-                                                     venue_keys(clocks.get(key, ()))))
+                    self._write_top(self._top_row(scope, key, sequence, time, cause, top,
+                                                 venue_keys(clocks.get(key, ()))))
             for observation in trades.get(key, ()):
                 value = observation["event"]["value"]
                 clock = value.get("venue_time")
