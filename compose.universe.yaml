@@ -3,6 +3,8 @@ name: prediction-indexer-universe
 x-universe-build: &universe-build
   context: .
   dockerfile: docker/universe.Dockerfile
+  args:
+    UNIVERSE_CODE_REVISION: "${UNIVERSE_CODE_REVISION:-}"
 
 x-universe-config-environment: &universe-config-environment
   ARCHIVE_BACKEND: "${ARCHIVE_BACKEND:-local}"

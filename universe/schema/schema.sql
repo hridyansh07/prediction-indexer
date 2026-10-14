@@ -168,7 +168,7 @@ CREATE TABLE event_identity_lineage (
 
 CREATE TABLE universe_run_projections (
     run_id TEXT PRIMARY KEY REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
-    projection_version INTEGER NOT NULL CHECK(projection_version = 4),
+    projection_version INTEGER NOT NULL CHECK(projection_version IN (3, 4)),
     projection_sha256 TEXT NOT NULL,
     projection_row_count INTEGER NOT NULL CHECK(projection_row_count >= 0),
     -- Claims are recomputed from the run's own projection, and where that
@@ -194,6 +194,16 @@ CREATE TABLE universe_run_projection_corrections (
     rule_id TEXT NOT NULL CHECK(rule_id = 'totals-direction-v1'),
     CHECK(report_value IS NOT projected_value),
     PRIMARY KEY (run_id, venue, venue_market_id, field)
+) STRICT;
+
+CREATE TABLE universe_migrations (
+    migration_id TEXT PRIMARY KEY,
+    from_user_version INTEGER NOT NULL,
+    to_user_version INTEGER NOT NULL,
+    code_revision TEXT NOT NULL,
+    inputs_json TEXT NOT NULL CHECK(json_valid(inputs_json)),
+    summary_json TEXT NOT NULL CHECK(json_valid(summary_json)),
+    applied_at_ns INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE umbrella_events (
@@ -367,10 +377,27 @@ CREATE INDEX selected_market_occurrences_event
     ON selected_market_occurrences(event_id, run_id, venue, venue_market_id);
 CREATE INDEX selected_market_occurrences_market
     ON selected_market_occurrences(venue, venue_market_id, run_id);
+CREATE INDEX selected_market_occurrences_bundle
+    ON selected_market_occurrences(bundle_id, run_id, venue, venue_market_id);
 CREATE INDEX selected_market_occurrences_canonical
     ON selected_market_occurrences(
         market_id, market_template_version, outcome_space_version, run_id
     );
+
+-- Absence of a row is unavailable source evidence; NULL is an observation
+-- whose venue taker delay is unknown. Both survive the v8 rebuild distinctly.
+CREATE TABLE market_execution_terms (
+    run_id TEXT NOT NULL REFERENCES targeter_runs(run_id) ON DELETE CASCADE,
+    venue TEXT NOT NULL,
+    venue_market_id TEXT NOT NULL,
+    taker_delay_ms INTEGER CHECK(taker_delay_ms IS NULL OR taker_delay_ms >= 0),
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, venue, venue_market_id),
+    FOREIGN KEY(run_id, venue, venue_market_id)
+        REFERENCES selected_market_occurrences(run_id, venue, venue_market_id)
+) STRICT;
+CREATE INDEX market_execution_terms_market
+    ON market_execution_terms(venue, venue_market_id, run_id);
 
 -- A claim is the outcome subset a market resolves YES on, inside one outcome
 -- space shape. `analysis.masks.relationship` reads the two subsets and no other
