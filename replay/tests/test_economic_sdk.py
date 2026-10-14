@@ -2,22 +2,48 @@
 
 import dataclasses
 import json
+import random
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 from replay.strategies.same_venue_complement.output import _skew_artifact, validate_content
 from replay.economic_fills import Fill, walk
 from replay.economic_intervals import CutClock
 from replay.economic_sdk import EVALUATED, Observation, bounds
+from replay.economic_sdk.bounds import CONTAINER, INT, SLOT, SMALL, STR
 from replay.economic_sdk.views import BookView, unavailable_view
+from replay.fees.lazy import LazyAssessmentIds, assessment_json
 from replay.preparation import load_snapshot
 from replay.strategies.same_venue_complement.strategy import SameVenueComplement, build
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import M, ladder, operations, v2_policy
 from replay.tests.test_same_venue_complement import Harness
+
+
+# Verbatim b970e70 implementation; recursive calls stay on this reference.
+def json_cost(value):
+    """Closed-form cost of a small JSON-shaped value (strings, ints, lists, dicts)."""
+    if isinstance(value, LazyAssessmentIds):
+        # Captured immutable order inputs plus the worst-case eager debug IDs
+        # and materialized IDs. Never traverse the shared engine/catalog or
+        # materialize a handle just to account its retained state.
+        return (512 + json_cost(value.request.retained_inputs)
+                + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
+    kind = type(value)
+    if kind is str:
+        return STR + 4 * len(value)
+    if kind is int:
+        return INT + value.bit_length() // 8
+    if isinstance(value, Mapping):
+        return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
+    if kind in (list, tuple):
+        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
+    return SMALL
 
 
 def deep_size(value, seen=None):
@@ -115,6 +141,38 @@ class SharedViewTests(Base):
             operations(h, 15, "polymarket:123", "outcome", "bid", 401, M)
             self.assertGreater(evaluate.call_count, 0)
         h.finish()
+
+    def test_same_time_restaging_can_mutate_nested_payload_handles(self):
+        # S1c's no-mutation precondition does not hold for all accepted payloads:
+        # observation equality compares lazy IDs with eager IDs and materializes
+        # the new handle after evaluate returns, before the stage is flushed.
+        with patch.dict("os.environ", REPLAY_FEE_CROSSCHECK="0"):
+            h = self.harness(known=True, policy=v2_policy())
+        original = h.strategy.strategy.evaluate
+        eager = True
+        captured = []
+
+        def evaluate(entity, views, context):
+            observation = original(entity, views, context)
+            if observation.payload is not None:
+                if eager:
+                    return dataclasses.replace(observation, payload=assessment_json(observation.payload))
+                handles = observation.payload["assessments"]
+                self.assertTrue(all(isinstance(ids, LazyAssessmentIds) and ids._ids is None
+                                    for ids in handles))
+                captured.append(observation)
+            return observation
+
+        with patch.object(h.strategy.strategy, "evaluate", side_effect=evaluate):
+            h.window(); h.quote(12, 0); h.quote(12, 1)
+            eager = False
+            # Same gross value, different consumed quantity and order identity.
+            h.quote(12, 0, quantity=6 * M)
+            self.assertEqual(h.strategy.staged_time, 12)
+            self.assertTrue(captured)
+            self.assertTrue(any(ids._ids is not None for observation in captured
+                                for ids in observation.payload["assessments"]))
+        h.finish()  # the mixed representation remains valid for the strict reader
 
     def test_cached_positive_updates_skew_without_evaluation_or_slice_changes(self):
         # A pure gross-only evaluator: no fee assessment or context-dependent identity.
@@ -542,6 +600,55 @@ class ComplementV2Tests(Base):
         self.assertFalse(_skew_artifact({"0": 7, "2": 7}, policy))
         self.assertFalse(_skew_artifact({"1": 7}, policy))
         self.assertFalse(_skew_artifact({"2": 0}, policy))
+
+
+class JsonCostTests(unittest.TestCase):
+    def test_generated_trees_match_the_old_cost_without_materializing_ids(self):
+        class IntSubclass(int):
+            pass
+
+        class StrSubclass(str):
+            pass
+
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class TupleSubclass(tuple):
+            pass
+
+        def forbidden_assessments():
+            raise AssertionError("accounting must not materialize lazy IDs")
+
+        handles = [LazyAssessmentIds(SimpleNamespace(
+            retained_inputs={"order": "α" * 64, "levels": ((19, 29),)},
+            levels=tuple(range(size)), assessments=forbidden_assessments))
+            for size in (0, 1, 7)]
+        leaves = [None, False, True, 0, -1, 2**119, -(2**2048), "", "α🧮" * 19,
+                  IntSubclass(2**200), StrSubclass("αβ"), ListSubclass([2**140]),
+                  TupleSubclass(("nested", False)), *handles]
+        rng = random.Random(19)
+
+        def tree(depth):
+            if not depth or rng.randrange(3) == 0:
+                return rng.choice(leaves)
+            kind = rng.choice((list, tuple, dict, DictSubclass, MappingProxyType))
+            children = [tree(depth - 1) for _ in range(rng.randrange(5))]
+            if kind in (list, tuple):
+                return kind(children)
+            keys = ("α", "🧮", -2, 2**140, (1, False))
+            return kind({keys[i]: child for i, child in enumerate(children)})
+
+        shared = {"repeated": ["α", True, handles[-1]]}
+        values = leaves + [[], (), {}, DictSubclass(shared), MappingProxyType(shared),
+                           (False, 2**140), [shared, shared]]
+        values.extend(tree(4) for _ in range(2000))
+        for index, value in enumerate(values):
+            with self.subTest(tree=index, kind=type(value).__name__):
+                self.assertEqual(bounds.json_cost(value), json_cost(value))
+        self.assertTrue(all(ids._ids is None for ids in handles))
 
 
 class BoundTests(unittest.TestCase):
