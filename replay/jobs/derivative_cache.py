@@ -135,8 +135,8 @@ class DerivativeCache:
             return None
 
     def total_bytes(self):
-        # Includes index and lease JSON, not just compressed derivative payloads.
-        return bundle._tree_bytes(self.root, 2**63 - 1)
+        # Capacity covers immutable derivatives and indexes, not mutable bookkeeping.
+        return sum(bundle._tree_bytes(path, 2**63 - 1) for path in (self.derivatives, self.index))
 
     def _evict(self, required, protected=frozenset()):
         live = self._live_addresses() | set(protected)
@@ -241,9 +241,7 @@ class WindowLease:
             entry = self.cache._read_entry(path)
             if entry is not None and entry != document:
                 raise bundle.BundleFailure("integrity_failure", "immutable window index conflict")
-            next_addresses = self.addresses | {source.address}
-            lease_growth = len(_json_bytes({"pid": os.getpid(), "addresses": sorted(next_addresses)})) - self.path.stat().st_size
-            required = (0 if existing else size) + (0 if entry else len(_json_bytes(document))) + lease_growth
+            required = (0 if existing else size) + (0 if entry else len(_json_bytes(document)))
             if reason is None and self.cache._evict(required, {source.address}):
                 pin = existing or bundle._install_local(source.directory, source.address, source.receipt_sha256,
                                                        self.cache.derivatives, materializer, scratch,

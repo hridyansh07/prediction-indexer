@@ -49,7 +49,9 @@ Use a dedicated writable local directory, disjoint from `canonical_store`,
 and directory fsync. The cache need not share a filesystem with `work_root`.
 In Docker the cache path must also be visible to the orchestrator and host
 daemon (normally under the mounted `CORPUS_ROOT`). `max_bytes` is a positive
-integer, in bytes; this example allows 20 GiB.
+integer, in bytes; this example allows 20 GiB of immutable derivative files
+plus immutable index JSON. Mutable lease, lock and touch bookkeeping is excluded
+from this cap.
 
 `index/<key hash>.json` maps exact window bounds, canonical receipt SHA-256 and
 the complete `materialize_range --describe` Producer to a derivative address
@@ -72,7 +74,7 @@ commit, removing it in `finally`. Each lease inode is flocked: stale dead-proces
 leases are reclaimed without relying on PIDs shared across container namespaces.
 Touch files record entry LRU. Under exclusive `root/lock`, startup reclaims crash
 stages and trims old unleased entries; after misses have materialized, admission
-counts exact derivative, index and lease bytes, evicts unleased LRU entries and
+counts exact derivative and index bytes, evicts unleased LRU entries and
 installs atomically. No eviction is performed by that bundle during its bench;
 other lanes may evict only addresses outside live leases.
 

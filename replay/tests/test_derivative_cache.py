@@ -222,6 +222,39 @@ class WindowCacheTests(unittest.TestCase):
             self.assertLessEqual(self.cache.total_bytes(), self.cache.max_bytes)
             self.assertTrue(first.directory.exists())
 
+    def test_exact_capacity_excludes_bookkeeping_and_bypasses_excess_admissions(self):
+        with self.cache.lease() as seed:
+            measured = self.ensure("measure", lease=seed).pins[0]
+        capacity = (sum((measured.directory / name).stat().st_size for name in bundle.DERIVATIVE_FILES)
+                    + sum(path.stat().st_size for path in self.cache.index.glob("*.json")))
+        self.cache = DerivativeCache(self.root / "bounded", capacity)
+        with self.cache.lease() as first:
+            admitted = self.ensure("exact", lease=first).pins[0]
+            self.assertTrue(admitted.directory.is_relative_to(self.cache.derivatives))
+            self.assertEqual(admitted[1:], measured[1:])
+            self.assertEqual(self.cache.total_bytes(), capacity)
+            with self.cache.lease() as second:
+                warm = self.ensure("second-lane", lease=second).pins[0]
+                self.assertEqual(warm, admitted)
+                self.assertEqual(second.diagnostics["hits"], 1)
+                self.assertEqual(self.cache.total_bytes(), capacity)
+                # Actual lease JSON grew, but no immutable cache content did.
+                self.assertGreater(sum(path.stat().st_size for path in self.cache.root.rglob("*")
+                                       if path.is_file()), capacity)
+                private = self.ensure("excess", 1, 2, lease=second).pins[0]
+                self.assertTrue(private.directory.is_relative_to(self.root / "excess" / "derivatives"))
+                self.assertEqual(second.diagnostics["cache_bypass"][0]["window_start_ns"], BASE_NS + WIDTH)
+                self.assertEqual(self.cache.total_bytes(), capacity)
+                self.assertTrue(admitted.directory.exists())
+        self.assertEqual(self.cache.total_bytes(), capacity)
+        # One byte short must bypass, even with no competing live addresses.
+        self.cache = DerivativeCache(self.root / "one-byte-short", capacity - 1)
+        with self.cache.lease() as lease:
+            private = self.ensure("short", lease=lease).pins[0]
+            self.assertTrue(private.directory.is_relative_to(self.root / "short" / "derivatives"))
+            self.assertEqual(lease.diagnostics["cache_bypass"], [{"window_start_ns": BASE_NS, "reason": "max_bytes"}])
+            self.assertEqual(self.cache.total_bytes(), 0)
+
     def test_oversized_derivative_bypasses_without_populating_index(self):
         self.cache.max_bytes = 1000
         expected = self.ensure("small")
