@@ -87,6 +87,14 @@ class RunReads:
                     "retirement_disposition": row["disposition"],
                 }
             )
+        entries.extend(
+            {"execution_terms": dict(row)}
+            for row in connection.execute(
+                """SELECT venue, venue_market_id, taker_delay_ms, observed_at
+                   FROM market_execution_terms WHERE run_id = ?
+                   ORDER BY venue, venue_market_id""", (run_id,),
+            )
+        )
         actual_sha256 = _records_sha256(entries)
         ok = (
             run["projection_version"] == PROJECTION_VERSION

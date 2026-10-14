@@ -18,6 +18,13 @@ Three SQL resources, owned by [`universe/`](../README.md):
   a rebuild. m2 remains an
   aborting stub pending the missing `EXECUTION_DELAY_SDK_V1` §1.2 table contract;
   this resource does not define or claim to support v8.
+  Version 7 includes `market_execution_terms`, keyed by selected
+  `(run_id, venue, venue_market_id)`, with nullable `taker_delay_ms` and exact
+  `observed_at`. No row means unavailable evidence; a row with a null delay is
+  an observation with unknown terms. These rows are included in the run's
+  projection identity and audit, and ship in the same rebuild as the totals
+  direction correction. Outcomes version 2 exposes their collapsed history;
+  [`EXECUTION_DELAY_V1.md`](../../docs/specs/EXECUTION_DELAY_V1.md) owns its contract.
 - [`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql):
   additive component schemas initialized in the durable Replay database
   (`replay.database_path`, `jobs.sqlite3`). They hold bearer-session digests, the

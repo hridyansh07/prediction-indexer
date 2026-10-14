@@ -1837,7 +1837,7 @@ class TargetRecordArtifactTests(unittest.TestCase):
             self.assertIsNone(kalshi["projection_id"])
             self.assertIsNone(kalshi["projection_sha256"])
             polymarket = self._rows(result.directory, "polymarket")[0]
-            self.assertEqual(polymarket["projection_id"], "polymarket.v1")
+            self.assertEqual(polymarket["projection_id"], "polymarket.v2")
             self.assertIsNotNone(polymarket["projection_sha256"])
 
     def test_a_subscribed_market_with_no_record_is_reported_not_skipped(self) -> None:

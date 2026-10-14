@@ -132,7 +132,7 @@ def _migrations(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     )]
 
 
-def _execution_terms(connection: sqlite3.Connection) -> dict[str, Any]:
+def _execution_term_observations(connection: sqlite3.Connection) -> dict[str, Any]:
     # Discover the isolated table by its contract, without inventing the absent
     # EXECUTION_DELAY_SDK_V1 §1.2 table name. All tables are compared regardless.
     result = {}
@@ -206,6 +206,30 @@ def _bound_ns(value: str) -> int:
     return ((delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds) * 1000
 
 
+def _execution_terms(connection: sqlite3.Connection) -> dict[str, Any]:
+    markets = set(_markets(connection))
+    if _has(connection, "market_execution_terms"):
+        observed = {
+            (row["venue"], row["venue_market_id"])
+            for row in connection.execute(
+                "SELECT DISTINCT venue, venue_market_id FROM market_execution_terms"
+            )
+        }
+        counts = {
+            row["venue"]: row["rows"]
+            for row in connection.execute(
+                "SELECT venue, COUNT(*) AS rows FROM market_execution_terms GROUP BY venue ORDER BY venue"
+            )
+        }
+    else:
+        observed, counts = set(), {}
+    return {
+        "rows_by_venue": counts,
+        "observed": sorted(_name(key) for key in markets & observed),
+        "unavailable": sorted(_name(key) for key in markets - observed),
+    }
+
+
 def _name(key: tuple[str, ...]) -> str:
     return ":".join(key[:2]) + ("#" + key[2] if len(key) > 2 and key[2] else "")
 
@@ -264,7 +288,10 @@ def diff(old: sqlite3.Connection, new: sqlite3.Connection) -> dict[str, Any]:
         "bundles_affected": bundles,
         "new_corrections": _corrections(new),
         "universe_migrations": {"old": _migrations(old), "new": _migrations(new)},
-        "execution_terms": {"old": _execution_terms(old), "new": _execution_terms(new)},
+        "execution_term_observations": {
+            "old": _execution_term_observations(old), "new": _execution_term_observations(new),
+        },
+        "execution_terms": _execution_terms(new),
     }
 
 
