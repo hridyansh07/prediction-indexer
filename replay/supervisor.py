@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from replay.streams.protocol import Decoder, ProtocolError, decode, obj, require
+from replay.streams.protocol import Decoder, ProtocolError, decode, obj, require, uint
 
 
 def fsync_directory(path):
@@ -213,7 +213,8 @@ def _validate_input_binding(pin, descriptor):
 def initial(config):
     t = config["transport"]
     return {
-        **{k: t[k] for k in ("start_ns", "end_ns", "lower_bound", "plans", "groups")},
+        **{k: t[k] for k in ("start_ns", "end_ns", "lower_bound", "plans", "groups",
+                             "retain_boundaries_ns", "retain_shift_offsets_ns")},
         "pins": [
             {k: p[k] for k in ("derivative_address", "receipt_sha256")}
             for p in t["inputs"]
@@ -228,7 +229,7 @@ def validate(config):
     require(config["version"] == 1)
     for name in ("publisher", "python"):
         require(type(config[name]) is str and Path(config[name]).is_absolute())
-    fields = "run_id scope normalizer inputs start_ns end_ns lower_bound plans groups command_timeout_ms max_entry_bytes max_queue_bytes"
+    fields = "run_id scope normalizer inputs start_ns end_ns lower_bound plans groups retain_boundaries_ns retain_shift_offsets_ns command_timeout_ms max_entry_bytes max_queue_bytes"
     # Optional publisher buffering size: absent means the publisher default of
     # 100, so run.json written before the field existed still validates. It
     # never reaches the initial record; run identity hashes it like any field.
@@ -321,7 +322,7 @@ def validate(config):
     Decoder(t["run_id"], "validation", expected, t["max_entry_bytes"]).apply(
         json.dumps(
             {
-                "version": "2",
+                "version": "3",
                 "run_id": t["run_id"],
                 "attempt_id": "validation",
                 "sequence": "0",
@@ -396,6 +397,9 @@ def keys(config, attempt):
 
 def failed(state, progress, limits, fatal=False):
     """Compare with the historical high water mark, never the last attempt."""
+    active = state["active"]
+    if active is not None and active["retry_progress"] >= 0:
+        progress = max(progress, active["retry_progress"])
     state["stagnant"] = (
         0
         if progress >= state["best"] + limits["progress_margin"]
@@ -420,17 +424,18 @@ def read_state(root, digest):
         read(root / "state.json"),
         "version identity attempts best stagnant started active fatal",
     )
-    require(s["version"] == 1 and s["identity"] == digest, "checkpoint identity")
+    require(s["version"] == 2 and s["identity"] == digest, "checkpoint identity")
     for k in ("attempts", "stagnant"):
         require(type(s[k]) is int and s[k] >= 0)
     require(type(s["best"]) is int and s["best"] >= -1 and type(s["fatal"]) is bool)
     require(type(s["started"]) in (int, float) and math.isfinite(s["started"]))
     if s["active"] is not None:
-        a = obj(s["active"], "id progress")
+        a = obj(s["active"], "id progress retry_progress")
         require(
             type(a["id"]) is str and re.fullmatch(r"[0-9a-f]{32}", a["id"]) is not None
         )
         require(type(a["progress"]) is int and a["progress"] >= -1)
+        require(type(a["retry_progress"]) is int and a["retry_progress"] >= -1)
     return s
 
 
@@ -670,7 +675,7 @@ def attempt(root, config, state, redis, lock_fd, url):
             if joined:
                 # Named fields only: the state hash also holds one `size:<seq>`
                 # field per retained entry, which HGETALL would copy each poll.
-                fields = ["published", "terminal", "poisoned"] + [
+                fields = ["published", "terminal", "poisoned", "risk_progress"] + [
                     f"done:{g}" for g in t["groups"]
                 ]
                 p = {
@@ -699,6 +704,11 @@ def attempt(root, config, state, redis, lock_fd, url):
                 require(progress >= a["progress"], "progress regressed")
                 if progress > a["progress"]:
                     a["progress"] = progress
+                    last_progress = time.monotonic()
+                    write_json_durable(root / "state.json", state)
+                risk_progress = uint(p["risk_progress"])
+                if progress == int(p["published"]) and risk_progress > a["retry_progress"]:
+                    a["retry_progress"] = risk_progress
                     last_progress = time.monotonic()
                     write_json_durable(root / "state.json", state)
                 if p.get("poisoned") != "0":
@@ -801,7 +811,7 @@ def run(config, root, url):
         else:
             require(not any(p.is_dir() for p in root.iterdir()), "missing checkpoint")
             state = {
-                "version": 1,
+                "version": 2,
                 "identity": digest,
                 "attempts": 0,
                 "best": -1,
@@ -848,7 +858,7 @@ def run(config, root, url):
                 write_json_durable(root / "state.json", state)
             while allowed(state, limits):
                 state["attempts"] += 1
-                state["active"] = {"id": uuid.uuid4().hex, "progress": -1}
+                state["active"] = {"id": uuid.uuid4().hex, "progress": -1, "retry_progress": -1}
                 # Budget and namespace become durable BEFORE any process launch.
                 write_json_durable(root / "state.json", state)
                 result, fatal, interrupted = attempt(

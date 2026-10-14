@@ -196,6 +196,7 @@ class SupervisorStageTests(unittest.TestCase):
             snapshot = {
                 "config": {"start_ns": str(receipt.start_ns), "end_ns": str(receipt.windows[0].window_end_ns)},
                 "plans": (),
+                "scopes": [{"end_ns": str(receipt.windows[0].window_end_ns)}],
             }
             with mock.patch.object(stages, "snapshot_sha256", return_value="9" * 64), mock.patch.object(
                 stages, "validate_supervisor"
@@ -220,6 +221,9 @@ class SupervisorStageTests(unittest.TestCase):
                 {"version", "snapshot_directory", "snapshot_sha256"},
             )
             self.assertEqual(document["transport"]["groups"], ["bundle_coverage"])
+            self.assertEqual(document["transport"]["retain_boundaries_ns"],
+                             [str(receipt.start_ns), str(receipt.windows[0].window_end_ns)])
+            self.assertEqual(document["transport"]["retain_shift_offsets_ns"], [])
             # The preset's publisher batch size flows into the transport config.
             self.assertEqual(document["transport"]["publish_batch_entries"], 1024)
 

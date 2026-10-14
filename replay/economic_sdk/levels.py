@@ -175,7 +175,7 @@ class LevelRecorder(Stream):
                 if delta]
 
     def cut(self, cut, raw, time, scoped, scope):
-        sequence = cut.sequence
+        sequence = cut.risk_sequence
         gated = raw >= self.start
         if gated:
             self.flush(sequence)

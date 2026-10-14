@@ -128,7 +128,8 @@ def config(publisher="/unused"):
             "inputs": [metadata_pin()],
             **{
                 k: body[k]
-                for k in ("start_ns", "end_ns", "lower_bound", "plans", "groups")
+                for k in ("start_ns", "end_ns", "lower_bound", "plans", "groups",
+                          "retain_boundaries_ns", "retain_shift_offsets_ns")
             },
             "command_timeout_ms": 500,
             "max_entry_bytes": int(body["max_entry_bytes"]),
@@ -157,7 +158,7 @@ def config(publisher="/unused"):
 
 def state():
     return {
-        "version": 1,
+        "version": 2,
         "identity": "unused",
         "attempts": 0,
         "best": -1,
@@ -175,6 +176,15 @@ class BudgetTests(unittest.TestCase):
         preflight = patch.object(s, "_strict_metadata_preflight")
         preflight.start()
         self.addCleanup(preflight.stop)
+
+    def test_retry_uses_caught_up_risk_high_water_without_losing_ack_progress(self):
+        x = state()
+        x.update(best=100, stagnant=1, active={"id": "a" * 32, "progress": 2, "retry_progress": 105})
+        s.failed(x, 2, config()["limits"])
+        self.assertEqual((x["best"], x["stagnant"]), (105, 0))
+        x["active"] = {"id": "b" * 32, "progress": 110, "retry_progress": 0}
+        s.failed(x, 110, config()["limits"])
+        self.assertEqual((x["best"], x["stagnant"]), (110, 0))
 
     def test_source_evidence_profile_accepts_both_supported_event_schemas(self):
         descriptor = s.normalizer_descriptor(normalizer())
@@ -324,7 +334,7 @@ class BudgetTests(unittest.TestCase):
             x.update(
                 identity=s.identity(c),
                 attempts=1,
-                active={"id": "a" * 32, "progress": 9},
+                active={"id": "a" * 32, "progress": 9, "retry_progress": -1},
             )
             s.write_json_durable(root / "run.json", c)
             s.write_json_durable(root / "state.json", x)
@@ -413,7 +423,7 @@ class PublisherDiagnosticsTests(unittest.TestCase):
                 c = config(str(executable))
                 c["limits"]["stall_seconds"] = 1
                 st = state()
-                st["active"] = {"id": "a" * 32, "progress": -1}
+                st["active"] = {"id": "a" * 32, "progress": -1, "retry_progress": -1}
                 with (root / ".lock").open("a+b") as lock:
                     result, fatal, interrupted = s.attempt(
                         root, c, st, Mock(), lock.fileno(), "redis://unused"
@@ -448,8 +458,8 @@ class Strategy:
         if mode == "stall":
             (self.path.parent / "pid").write_text(str(os.getpid()))
             time.sleep(10)
-        if mode == "slow_progress":
-            time.sleep(0.15)
+        if mode == "slow_progress" and cut.kind != "initial":
+            time.sleep(0.6)
         if mode == "ack_ambiguity":
             from replay.streams import Consumer
 
@@ -533,6 +543,8 @@ def fake_publisher(path, ready, mode):
         values = values[:-1]
     for value in values:
         value["attempt_id"] = c["attempt_id"]
+    if mode == "liveness":
+        values[-1]["body"]["risk_cuts"] = "10"
     entries = [json.dumps(value) for value in values]
     if mode == "waiting":
         # Every entry fits alone, but not the whole attempt: the publisher must
@@ -541,6 +553,10 @@ def fake_publisher(path, ready, mode):
     backoff, waited = 0.001, False
     for value, entry in zip(values, entries):
         seq = int(value["sequence"])
+        if mode == "liveness" and value["kind"] == "terminal":
+            for risk in (8, 9, 10):
+                time.sleep(1)
+                r.eval(SCRIPT, 2, *k, "liveness", str(risk))
         while True:
             # A one-entry batch append: 1 appended, 0 is the FULL reply.
             reply = r.eval(
@@ -551,6 +567,7 @@ def fake_publisher(path, ready, mode):
                 "-1" if seq == 0 else str(seq),
                 str(seq + 1),
                 "1" if value["kind"] == "terminal" else "0",
+                json.dumps([value["body"].get("risk_sequence", "")]),
                 entry,
             )
             if reply == 1:
@@ -564,7 +581,7 @@ def fake_publisher(path, ready, mode):
                 waited = True
             time.sleep(backoff)
             backoff = min(backoff * 2, 0.05)
-        if mode == "waiting" and seq == 0:
+        if mode in ("waiting", "liveness") and seq == 0:
             # Consumers start only after ready; they must drain the queue.
             Path(ready).touch()
     if mode != "waiting":
@@ -594,8 +611,9 @@ class SubprocessTests(unittest.TestCase):
     def config(self, mode="normal"):
         exe = self.root / "publisher-executable"
         exe.write_text(
-            f"#!{sys.executable}\nfrom replay.tests.test_supervisor import fake_publisher\nimport sys\n"
+            f"#!{sys.executable}\nimport sys\n"
             "if sys.argv[1] == '--validate-only': sys.exit(0)\n"
+            "from replay.tests.test_supervisor import fake_publisher\n"
             f"sys.exit(fake_publisher(sys.argv[1], sys.argv[2], {mode!r}))\n"
         )
         exe.chmod(0o700)
@@ -681,11 +699,12 @@ class SubprocessTests(unittest.TestCase):
                         )
 
     def test_waiting_publisher_with_progressing_consumer_is_not_a_stall(self):
-        # Total slow-group work (~1.35 s) exceeds stall_seconds, so success
+        # Total slow-group work (4.8 s) exceeds stall_seconds, so success
         # proves each ACK, not publisher activity, resets the stall clock.
+        # Allow subprocess/import startup at nice 15 before the first ACK.
         c, root = self.config("waiting"), self.root / "waiting-progress"
         c["strategies"]["slow"]["config"]["mode"] = "slow_progress"
-        c["limits"].update(stall_seconds=1.0, attempts=1)
+        c["limits"].update(stall_seconds=3, attempts=1, attempt_seconds=10)
         receipt = s.run(c, root, URL)
         self.assertEqual(s.read_success(root), receipt)
         self.assertTrue((self.root / f"waited-{receipt['attempt']}").exists())
@@ -695,10 +714,19 @@ class SubprocessTests(unittest.TestCase):
                 [str(i) for i in range(len(records()))],
             )
 
+    def test_risk_advancing_empty_stretch_longer_than_stall_completes(self):
+        c, root = self.config("liveness"), self.root / "empty-stretch"
+        c["limits"].update(stall_seconds=2, attempts=1, attempt_seconds=8)
+        started = time.monotonic()
+        receipt = s.run(c, root, URL)
+        self.assertGreater(time.monotonic() - started, 3)
+        self.assertEqual(s.read_success(root), receipt)
+        self.assertEqual(receipt["terminal"], len(records()))
+
     def test_waiting_publisher_with_stalled_consumer_hits_stall_deadline(self):
         c, root = self.config("waiting"), self.root / "waiting-stall"
         c["strategies"]["slow"]["config"]["mode"] = "stall"
-        c["limits"].update(stall_seconds=0.6, attempts=1)
+        c["limits"].update(stall_seconds=2, attempts=1)
         started = time.monotonic()
         with self.assertRaises(s.AttemptFailure) as e:
             s.run(c, root, URL)

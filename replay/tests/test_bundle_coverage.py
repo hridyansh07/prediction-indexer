@@ -34,6 +34,8 @@ class Harness:
         attempt="a" * 32,
         lower_bound="clip",
         pin=None,
+        wire_records=None,
+        defer_initial=False,
     ):
         self.root = root
         d = detail()
@@ -112,16 +114,29 @@ class Harness:
             "max_entry_bytes": "65536",
             "max_queue_bytes": "1048576",
         }
+        from replay.economic_sdk.retention import configured
+        self.initial.update(copy.deepcopy(getattr(self.strategy, "retention", None) or configured(self.snapshot, {})))
+        if wire_records is not None:
+            self.initial = wire_records[0]["body"]
         self.decoder = Decoder("coverage-test", attempt, self.initial, 65536)
         self.seq = 0
         self.pin = self.initial["pins"][0]
-        self.send("initial", self.initial)
+        if wire_records is None and not defer_initial:
+            self.send("initial", self.initial)
+        elif wire_records is not None:
+            for record in wire_records:
+                cut = self.decoder.apply(encoded({**record, "run_id": "coverage-test", "attempt_id": attempt}))
+                self.strategy(cut)
+            self.decoder.finish()
+            self.strategy.finish()
 
     def send(self, kind, body):
+        if kind == "cut":
+            body = {**body, "risk_sequence": str(self.seq)}
         cut = self.decoder.apply(
             encoded(
                 {
-                    "version": "2",
+                    "version": "3",
                     "run_id": "coverage-test",
                     "attempt_id": self.context["attempt_id"],
                     "sequence": str(self.seq),
@@ -227,7 +242,7 @@ class Harness:
         # Hand-authored decisions: the expected final digest is the local state.
         return self.send(
             "terminal",
-            {"cuts": str(self.seq - 1), "books_sha256": books_sha256(self.decoder.books)},
+            {"cuts": str(self.seq - 1), "risk_cuts": str(self.seq - 1), "books_sha256": books_sha256(self.decoder.books)},
         )
 
     def finish(self):

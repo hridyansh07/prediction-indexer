@@ -151,6 +151,8 @@ class Pipeline:
             if not groups:
                 raise StageError("preflight", RuntimeError(f"every group refused: {excluded}"))
             document = _stage("run_config", self._run_config, job_id, request, ready, snapshot, context, work)
+            from replay.economic_sdk.retention import for_groups
+            document["transport"].update(for_groups(snapshot, [dict(g, config=resolve(g["config"])) for g in groups]))
             (work / "run.json").write_text(json.dumps(document, indent=1))
             bench_spec = {
                 "version": 1,

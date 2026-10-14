@@ -259,7 +259,7 @@ class TransitionRecorder(Stream):
         self.writer.append(self._top_row(scope, key, sequence, at, "open", top, {}))
 
     def cut(self, cut, raw, time, scoped, scope):
-        sequence = cut.sequence
+        sequence = cut.risk_sequence
         gated = raw >= self.start
         if gated:
             self.flush(sequence)

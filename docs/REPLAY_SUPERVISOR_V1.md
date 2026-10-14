@@ -254,3 +254,47 @@ and independently reads the success marker. Run via:
 cargo test --manifest-path engine/Cargo.toml -p replay-transport \
   --test contract -- --ignored --test-threads=1 --nocapture
 ```
+
+## Wire version 3 retention and liveness amendment
+
+Transport and initial schemas now require `retain_boundaries_ns` and
+`retain_shift_offsets_ns`; their validation and R1–R4 retention rules are defined
+in the [stream v3 amendment](REPLAY_STREAMS_V1.md#wire-version-3). Jobs and corpus
+builders use the SDK retention helper to union the actual groups' scope ends,
+game releases/timer declarations and time-shift offsets. The narrow bundle helper
+uses its strategy's prepared snapshot when supplied; without a snapshot it has
+only the requested start, not any implicit strategy-specific time authority.
+Economic/profile consumers independently reject insufficient retention coverage.
+These lists are initial-bound and hashed into the supervisor run identity.
+
+The publisher's named `LIVENESS_MS = 1000` flushes an aged buffer through the
+existing non-blocking drain. An empty-buffer publisher scanning omitted cuts may
+issue `liveness <risk_sequence>` at most once per interval. This strictly
+increasing canonical-u64 op updates only the state hash's `risk_progress`; it
+rejects poisoned/terminal attempts. Appends also set that field to their last
+accepted cut's Risk sequence. There are no heartbeat stream records.
+
+The supervisor reads `risk_progress` with its existing fixed-field HMGET. The
+stall clock resets on minimum consumer ACK advancement, or on Risk progress
+advancement **only while min(done) == published**. A publisher behind unACKed
+entries cannot use scan progress to mask a stuck consumer. Initial/terminal
+publication, `done:<group>`, result progress and all completion receipts remain
+wire/Redis-entry counts, exactly as before.
+
+Checkpoint `state.json` is now closed version 2: active attempt fields are
+`{id, progress, retry_progress}`. `progress` remains the minimum ACK count;
+`retry_progress` is the caught-up Risk high-water, initially -1. It is persisted
+with each advance, including before an interruption. Retry stagnation compares
+the larger of this Risk high-water and the existing ACK-based fallback against
+the historical best plus `progress_margin`. Keeping the fallback prevents a
+stale initial Risk value from erasing genuine ACK progress after backlog. The
+numeric margin is unchanged, now in Risk-cut units whenever Risk progress is
+available. `no_progress`, attempts and other budgets are unchanged. Old
+checkpoints/configurations are not resumed as v3 attempts.
+
+Disposable-server tests cover an empty scan lasting three seconds with a
+two-second stall limit, a full queue with a stuck consumer that still times out,
+canonical/monotonic/poisoned/terminal liveness rejection, and unchanged completion
+counts. Rust checks lone-cut age flushing and that a buffered/backlogged publisher
+cannot issue heartbeats. These are synthetic correctness tests, not replay/corpus
+benchmarks.

@@ -228,6 +228,12 @@ class PipelineTests(unittest.TestCase):
         patcher = patch("replay.corpus.pipeline.preflight_groups", side_effect=lambda groups, resolve: (groups, []))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # This orchestration fixture mocks preparation, fees and game evidence;
+        # it cannot declare real SDK timers. Retention itself has SDK tests.
+        retention = patch("replay.economic_sdk.retention.for_groups", return_value={
+            "retain_boundaries_ns": ["1"], "retain_shift_offsets_ns": []})
+        retention.start()
+        self.addCleanup(retention.stop)
 
     def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None, outcomes=None):
         root = Path(tmp)

@@ -154,6 +154,9 @@ class Runtime:
             for anchor, offset in timers:
                 require(anchor in ANCHORS and type(offset) is int and 0 <= offset <= 2**64 - 1,
                         "game timer anchor/offset")
+        from replay.economic_sdk.retention import required
+        self.retention = required(self.snapshot, experiment.policy, timeline=self.game,
+                                  timers=self.game_requirement.timers if self.game_requirement else ())
         if self.legacy:
             self.layout_files = Layout(experiment)
             names = self.layout_files.files
@@ -211,6 +214,7 @@ class Runtime:
 
         self.scope = 0
         self.sequence = -1
+        self.risk_sequence = 0
         self.views = {}
         self.view_costs = {}
         self.entities = {}
@@ -254,8 +258,11 @@ class Runtime:
             require(not self.poisoned and not self.terminal, "closed economic strategy")
             require(cut.sequence == self.sequence + 1, "economic sequence")
             self.sequence = cut.sequence
+            self.risk_sequence = cut.risk_sequence
             if cut.kind == "initial":
                 require(cut.sequence == 0)
+                from replay.economic_sdk.retention import check
+                check(cut.body, self.retention)
                 self.strategy.bind(cut.body)
                 start = self.clock.start
                 for key, builder in self.builders.items():
@@ -278,7 +285,7 @@ class Runtime:
                 self._advance(end)
                 self._close_scope(end, "RUN_END", True)
                 if self.profile is not None:
-                    self.profile.terminal(end)
+                    self.profile.terminal(end, cut.risk_sequence)
                 self.terminal = True
                 return
             require(cut.kind == "cut")
@@ -650,7 +657,7 @@ class Runtime:
         return spread, index
 
     def _fresh(self, entity, views):
-        context = Context(self.staged_time, self.sequence, self.scope,
+        context = Context(self.staged_time, self.risk_sequence, self.scope,
                           self.experiment.experiment_sha256, self.game.view if self.game is not None else None)
         observation = self.strategy.evaluate(entity, views, context)
         require(type(observation) is Observation and observation.status in self.statuses,
