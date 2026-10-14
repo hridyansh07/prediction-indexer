@@ -43,10 +43,16 @@ Traversal decodes each snapshot file once with the codec's structural decoder
 bytes, output bound, final LF, stored SHA-256/length, decoded length and LF
 count). Unscoped reads parse each line into its final typed record
 (`SegmentRecord::from_json` and the closed reject and source types). Scoped reads
-always validate JSON syntax, schema version, the complete header/address and
-provenance/continuity, event kind (including book/control subkind), and instrument
-or fault impact/lane. The body remains a borrowed `RawValue` until the scope
-decision; only selected bodies become typed events. Rejects and source evidence
+validate schema version, the complete header/address and provenance/continuity,
+event kind (including book/control subkind), and instrument or fault impact/lane.
+Canonical excluded book/trade/anchor/control events use an allocation-free header
+scanner and exact selection prefixes; their bodies are not lexed. Text views point
+into the reader's unchanged current-line buffer until evidence checks finish.
+Profile-2 deliveries retain the already decoded source header, without allocating
+event `record_id` or lane strings for excluded children. Both provenance hashes
+are still decoded: source and child equality require them. Selected bodies,
+normalization faults, escaped strings and any prefix/terminator/layout mismatch
+use T4's serde header/`RawValue`/projection path. Rejects and source evidence
 still decode fully, and fault/reject pairing checks the header, reject ID and
 impact even for excluded faults. One parsed header feeds every evidence check:
 child order, exact reject provenance, one-to-one fault/reject pairing, one disposition per source,
@@ -82,14 +88,28 @@ frame digest without repeating the decoded-side digest.
   Verification proves the committed interpretation, not that a normalizer was
   correct; a wrong derivative needs a corrected normalizer and a new pin.
 
-Excluded body schema checks may be skipped only because the derivative's complete
+Excluded body syntax and schema checks may be skipped only because the derivative's complete
 typed bodies were validated when built (or independently audited on download),
-and the receipt-pinned stored SHA-256 binds those exact bytes. Malformed JSON,
-headers, kinds or selection evidence still fail, including clipped tails; scoped
-reading is not an independent body-schema audit of newly supplied bytes. Risk's
+and the receipt-pinned stored SHA-256 binds those exact bytes. T4b deliberately
+replaces T4's hot-read malformed-excluded-JSON rejection: a byte change fails the
+stored-frame digest (also in clipped tails); Audit and `--inspect-pin` still reject
+malformed JSON anywhere. A freshly forged pin is not an audited installation.
+Headers, kinds and selection evidence still validate, with serde fallback when
+the canonical scanner cannot recognize them. Scoped reading is not an independent
+body audit of newly supplied bytes. Risk's
 continuity and duplicate decisions use the source header's verdict and connection
 epoch, not excluded book hashes or venue sequences. Scope changes no materializer
 output bytes or persisted schema.
+
+For excluded events, ordering/grouping/coverage consume canonical sequence, child
+index, lane, delivery index, visible time and tie tag; retained references also
+carry order time. Source/child equality additionally compares record ID and all
+provenance fields (source digest, source line, content hash, continuity). Counts and
+budgets use every line/child, not just kept bodies. Epochs come from the source
+sidecar. Fault reject IDs and impacts retain T4's exact reject pairing. Neither
+Risk nor evidence needs excluded book/trade/anchor payloads beyond instrument
+selection. The diagnostic `DerivativeWalker::open_without_input_fastpath` retains
+T4 projection parsing; `open_without_input_filter` retains full typed parsing.
 
 ### Limits (`ReadLimits::default()`)
 

@@ -1,7 +1,7 @@
-//! Scope decisions shared by the event reader and walker. Excluded bodies stay
-//! borrowed JSON: the build/audit and receipt-bound stored SHA-256 prove their
-//! domain schema. Syntax, version, header, kind and selection evidence are still
-//! validated on every read. No event bytes bypass VerifiedLines or its decoder.
+//! Scope decisions shared by the event reader and walker. Build/audit and the
+//! receipt-bound stored SHA-256 prove excluded bodies; canonical prefixes can
+//! avoid lexing them. This projection is the syntax-checking T4 fallback for
+//! faults and unrecognized layouts. No bytes bypass VerifiedLines or its decoder.
 use std::collections::BTreeSet;
 
 use replay_domain::{BookEvent, FaultImpact, InstrumentId, LaneId, SegmentEvent, SegmentRecord};

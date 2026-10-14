@@ -998,6 +998,14 @@ fn input_filter_matches_full_decode_groups_deliveries_and_counts() {
                     DerivativeWalker::open(inputs.clone(), req.clone(), ReadLimits::default())
                         .unwrap(),
                 );
+                let (projection, projection_status, projection_done) = drain(
+                    DerivativeWalker::open_without_input_fastpath(
+                        inputs.clone(),
+                        req.clone(),
+                        ReadLimits::default(),
+                    )
+                    .unwrap(),
+                );
                 let (full, full_status, full_done) = drain(
                     DerivativeWalker::open_without_input_filter(
                         inputs.clone(),
@@ -1007,6 +1015,18 @@ fn input_filter_matches_full_decode_groups_deliveries_and_counts() {
                     .unwrap(),
                 );
                 assert_eq!(fast, full);
+                assert_eq!(projection, full);
+                assert_eq!(projection_done.counts(), full_done.counts());
+                assert_eq!(
+                    projection_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>(),
+                    full_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>()
+                );
                 assert_eq!(fast_done.counts(), full_done.counts());
                 assert_eq!(fast_done.counts().source_deliveries, 13);
                 assert_eq!(fast_done.counts().rejected_sources, 4);
@@ -1097,12 +1117,6 @@ fn input_filter_rejects_unplanned_malformed_headers_json_and_selection() {
             "\"instrument\":\"bad\"",
             "invalid normalized event",
         ),
-        ("\"bids\":[]", "\"bids\":[,]", "invalid normalized event"),
-        (
-            "\"bids\":[]",
-            "\"bids\":[\"bad\\x\"]",
-            "invalid normalized event",
-        ),
     ] {
         let out = TempDir::new("input-filter-malformed-out").unwrap();
         let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
@@ -1135,40 +1149,186 @@ fn input_filter_rejects_unplanned_malformed_headers_json_and_selection() {
 }
 
 #[test]
-fn input_filter_skips_only_excluded_body_schema_and_keeps_source_epoch() {
+fn input_filter_does_not_lex_pinned_excluded_bodies_and_keeps_source_epoch() {
     let source = TempDir::new("input-filter-schema").unwrap();
-    let out = TempDir::new("input-filter-schema-out").unwrap();
     canonical(source.path(), 0, 10, 1, &[row("kalshi", 1, "book")], true);
-    let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
-    rewrite(&mut input, "events.ndjson.zst", |text| {
-        // Valid JSON, invalid FullBook schema: the derivative's body validity
-        // belongs to build/audit, whereas scoped traversal still checks syntax.
-        *text = text.replace("\"bids\":[]", "\"bids\":false");
-    });
-    let mut req = request(0, 10);
-    req.scope.instruments.clear();
-    let (groups, _, done) = drain(
-        DerivativeWalker::open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap(),
+    for body in ["false", "[,]", "[\"bad\\x\"]"] {
+        let out = TempDir::new("input-filter-schema-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            // Rebind intentionally invalid test bytes to distinguish hot selection
+            // from independent audit. Real installations must build/audit first.
+            *text = text.replace("\"bids\":[]", &format!("\"bids\":{body}"));
+        });
+        let mut req = request(0, 10);
+        req.scope.instruments.clear();
+        let (groups, _, done) = drain(
+            DerivativeWalker::open(vec![input.clone()], req.clone(), ReadLimits::default())
+                .unwrap(),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].last().event_index(), 1);
+        assert_eq!(groups[0].deliveries()[0].connection_epoch(), Some("e"));
+        assert!(groups[0].deliveries()[0].records().is_empty());
+        assert_eq!(done.counts().included_sources, 1);
+        assert_eq!(done.counts().included_events, 0);
+        assert_eq!(done.counts().excluded_events, 2);
+        fails_without_completion(
+            DerivativeWalker::open_without_input_filter(
+                vec![input.clone()],
+                req,
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
+        fails_without_completion(
+            DerivativeWalker::open(vec![input.clone()], request(0, 10), ReadLimits::default())
+                .unwrap(),
+        );
+        assert!(replay_materialize::verify_derivative(&input.directory).is_err());
+        if body != "false" {
+            fails_without_completion(
+                DerivativeWalker::open_without_input_fastpath(
+                    vec![input],
+                    {
+                        let mut req = request(0, 10);
+                        req.scope.instruments.clear();
+                        req
+                    },
+                    ReadLimits::default(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+}
+
+#[test]
+fn input_fastpath_falls_back_for_noncanonical_and_escaped_selection() {
+    let source = TempDir::new("input-fastpath-fallback").unwrap();
+    canonical(
+        source.path(),
+        0,
+        10,
+        1,
+        &[
+            row("kalshi", 1, "controls"),
+            row("kalshi", 2, "mixed"),
+            row("polymarket", 2, "mixed"),
+            row("kalshi", 3, "instrument_reject"),
+        ],
+        true,
     );
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].last().event_index(), 1);
-    assert_eq!(groups[0].deliveries()[0].connection_epoch(), Some("e"));
-    assert!(groups[0].deliveries()[0].records().is_empty());
-    assert_eq!(done.counts().included_sources, 1);
-    assert_eq!(done.counts().included_events, 0);
-    assert_eq!(done.counts().excluded_events, 2);
-    fails_without_completion(
-        DerivativeWalker::open_without_input_filter(
-            vec![input.clone()],
-            req,
-            ReadLimits::default(),
-        )
-        .unwrap(),
-    );
-    fails_without_completion(
-        DerivativeWalker::open(vec![input.clone()], request(0, 10), ReadLimits::default()).unwrap(),
-    );
-    assert!(replay_materialize::verify_derivative(&input.directory).is_err());
+    for spelling in ["whitespace", "escaped_instrument", "escaped_header"] {
+        let out = TempDir::new("input-fastpath-fallback-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            *text = match spelling {
+                "whitespace" => text.replace("{\"schema_version\":", "{ \"schema_version\": "),
+                "escaped_instrument" => text.replace(
+                    "\"instrument\":\"kalshi:A\"",
+                    "\"instrument\":\"kalshi:\\u0041\"",
+                ),
+                _ => text.replace("\"lane\":\"kalshi\"", "\"lane\":\"kal\\u0073hi\""),
+            };
+        });
+        for selected in [false, true] {
+            let mut req = request(0, 10);
+            if !selected {
+                req.scope.instruments.clear();
+                req.scope.lanes.clear();
+            }
+            let (full, full_status, full_done) = drain(
+                DerivativeWalker::open_without_input_filter(
+                    vec![input.clone()],
+                    req.clone(),
+                    ReadLimits::default(),
+                )
+                .unwrap(),
+            );
+            for open in [
+                DerivativeWalker::open,
+                DerivativeWalker::open_without_input_fastpath,
+            ] {
+                let (actual, status, done) =
+                    drain(open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap());
+                assert_eq!(actual, full, "{spelling}, selected={selected}");
+                assert_eq!(done.counts(), full_done.counts());
+                assert_eq!(
+                    status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>(),
+                    full_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn input_fastpath_preserves_complete_excluded_header_equality() {
+    let source = TempDir::new("input-fastpath-header").unwrap();
+    canonical(source.path(), 0, 10, 1, &[row("kalshi", 1, "book")], true);
+    for field in [
+        "record_id",
+        "source_segment_sha256",
+        "source_line_number",
+        "content_hash",
+        "continuity",
+        "lane",
+        "delivery_index",
+        "visible_tie_group",
+    ] {
+        let out = TempDir::new("input-fastpath-header-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            // Keep the exact canonical spelling, but change child 1 only so
+            // source evidence and the first child remain a contrary control.
+            let mut lines: Vec<_> = text.lines().map(str::to_owned).collect();
+            let mut record: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+            let header = &mut record["header"];
+            let target = match field {
+                "source_segment_sha256" | "source_line_number" | "content_hash" | "continuity" => {
+                    &mut header["provenance"][field]
+                }
+                "lane" | "delivery_index" => &mut header["address"][field],
+                _ => &mut header[field],
+            };
+            let before = serde_json::to_string(target).unwrap();
+            let after = match field {
+                "record_id" | "lane" => json!("other"),
+                "source_segment_sha256" | "content_hash" => json!("0".repeat(64)),
+                "source_line_number" | "delivery_index" => json!(2),
+                "continuity" => json!("duplicate"),
+                _ => json!(1),
+            };
+            lines[1] = lines[1].replacen(
+                &format!("\"{field}\":{before}"),
+                &format!("\"{field}\":{after}"),
+                1,
+            );
+            *text = format!("{}\n", lines.join("\n"));
+        });
+        let mut req = request(0, 10);
+        req.scope.instruments.clear();
+        for open in [
+            DerivativeWalker::open,
+            DerivativeWalker::open_without_input_fastpath,
+            DerivativeWalker::open_without_input_filter,
+        ] {
+            let (_, error) = fails_without_completion(
+                open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap(),
+            );
+            assert_eq!(
+                error, "normalized children disagree on source header or index",
+                "{field}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1385,6 +1545,13 @@ fn codec_and_pin_corruption_never_becomes_eof() {
         if mutation == "checksum" {
             assert!(open_pinned(&input, &ReadLimits::default()).is_ok());
             let error = read_fails_without_completion(&input);
+            assert!(error.contains("events.ndjson.zst"), "{error}");
+            let mut req = request(0, 10);
+            req.scope.instruments.clear();
+            req.scope.lanes.clear();
+            let (_, error) = fails_without_completion(
+                DerivativeWalker::open(vec![input.clone()], req, ReadLimits::default()).unwrap(),
+            );
             assert!(error.contains("events.ndjson.zst"), "{error}");
         } else {
             assert!(
@@ -1962,6 +2129,14 @@ fn mixed_profiles_preserve_pins_but_cannot_mint_complete_source_capability() {
             )
             .unwrap(),
         );
+        let (projection, _, projection_done) = drain(
+            DerivativeWalker::open_without_input_fastpath(
+                vec![new.clone(), old.clone()],
+                req.clone(),
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
         let (full, _, full_done) = drain(
             DerivativeWalker::open_without_input_filter(
                 vec![new.clone(), old.clone()],
@@ -1971,6 +2146,8 @@ fn mixed_profiles_preserve_pins_but_cannot_mint_complete_source_capability() {
             .unwrap(),
         );
         assert_eq!(fast, full); // schema 3/profile 1 and schema 4/profile 2
+        assert_eq!(projection, full);
+        assert_eq!(projection_done.counts(), full_done.counts());
         assert_eq!(fast_done.counts(), full_done.counts());
     }
     let (groups, statuses, done) = drain(

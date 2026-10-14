@@ -13,7 +13,7 @@ pub use replay_materialize::{
 pub use replay_materialize::{DerivativeMetadata, DerivativePin, PinnedDerivative, ReadLimits};
 use replay_materialize::{
     RejectDisposition, SourceDelivery, VerifiedWindowReader, inspect_pinned, open_pinned,
-    open_pinned_scoped,
+    open_pinned_scoped, open_pinned_scoped_without_fastpath,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +184,7 @@ pub struct DerivativeWalker {
     poisoned: bool,
     exhausted: bool,
     input_filter: bool,
+    input_fastpath: bool,
 }
 
 impl DerivativeWalker {
@@ -281,6 +282,7 @@ impl DerivativeWalker {
             poisoned: false,
             exhausted: false,
             input_filter: true,
+            input_fastpath: true,
         })
     }
 
@@ -294,6 +296,18 @@ impl DerivativeWalker {
     ) -> Result<Self, String> {
         let mut walker = Self::open(inputs, request, limits)?;
         walker.input_filter = false;
+        Ok(walker)
+    }
+
+    /// T4 projection reference; downstream filtering/evidence is unchanged.
+    #[doc(hidden)]
+    pub fn open_without_input_fastpath(
+        inputs: Vec<PinnedDerivative>,
+        request: WalkRequest,
+        limits: ReadLimits,
+    ) -> Result<Self, String> {
+        let mut walker = Self::open(inputs, request, limits)?;
+        walker.input_fastpath = false;
         Ok(walker)
     }
 
@@ -354,7 +368,15 @@ impl DerivativeWalker {
                 }
                 let (input, expected) = &self.windows[self.index];
                 let reader = if self.input_filter {
-                    open_pinned_scoped(input, &self.limits, self.request.scope.clone())?
+                    if self.input_fastpath {
+                        open_pinned_scoped(input, &self.limits, self.request.scope.clone())?
+                    } else {
+                        open_pinned_scoped_without_fastpath(
+                            input,
+                            &self.limits,
+                            self.request.scope.clone(),
+                        )?
+                    }
                 } else {
                     open_pinned(input, &self.limits)?
                 };

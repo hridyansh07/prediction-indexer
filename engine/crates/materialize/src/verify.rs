@@ -8,9 +8,10 @@ use prediction_encoder::{
     LogicalIdentity as CodecLogicalIdentity, StoredIdentity as CodecStoredIdentity,
     StreamingDecoder, StructuralDecoder, StructuralIdentity,
 };
-use replay_domain::{EventHeader, RawSegmentRecord, SegmentEvent, SegmentRecord};
+use replay_domain::{RawSegmentRecord, SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
 
+use super::input::{ParsedHeader, excluded_header};
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
 use super::scope::{EventProjection, ScopeFilter};
 use super::{DERIVATIVE_MANIFEST_FILE, DERIVATIVE_RECEIPT_FILE, DerivativeSpec};
@@ -32,7 +33,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct ParsedEvent {
-    pub(crate) header: EventHeader,
+    pub(crate) header: ParsedHeader,
     pub(crate) record: Option<SegmentRecord>,
     pub(crate) fault: Option<Binding>,
 }
@@ -217,10 +218,22 @@ pub(crate) fn parse_event(
     counts: &mut VerificationCounts,
     mode: ReadMode,
     schema_version: u16,
-    scope: Option<&ScopeFilter>,
+    scope: Option<(&ScopeFilter, bool)>,
 ) -> Result<ParsedEvent, String> {
     let invalid = |error| format!("invalid normalized event: {error}");
-    let (version, parsed) = if let Some(scope) = scope {
+    let scanned =
+        scope.and_then(|(scope, fast)| fast.then(|| excluded_header(line, scope)).flatten());
+    let (version, parsed) = if let Some((version, header)) = scanned {
+        debug_assert_eq!(mode, ReadMode::PinnedReplay);
+        (
+            version,
+            ParsedEvent {
+                header,
+                record: None,
+                fault: None,
+            },
+        )
+    } else if let Some((scope, _)) = scope {
         debug_assert_eq!(mode, ReadMode::PinnedReplay);
         let raw = RawSegmentRecord::from_json(line).map_err(invalid)?;
         let projection: EventProjection = serde_json::from_str(raw.event_json())
@@ -250,7 +263,7 @@ pub(crate) fn parse_event(
         (
             version,
             ParsedEvent {
-                header,
+                header: ParsedHeader::Typed(header),
                 record,
                 fault,
             },
@@ -276,7 +289,7 @@ pub(crate) fn parse_event(
         (
             record.schema_version(),
             ParsedEvent {
-                header: record.header().clone(),
+                header: ParsedHeader::Typed(record.header().clone()),
                 record: Some(record),
                 fault,
             },
@@ -285,10 +298,7 @@ pub(crate) fn parse_event(
     if version != schema_version {
         return Err("normalized event schema disagrees with manifest".into());
     }
-    let current = (
-        parsed.header.address().canonical_seq(),
-        parsed.header.address().event_index(),
-    );
+    let current = (parsed.header.sequence(), parsed.header.index());
     verify_event_order(*previous, current)?;
     *previous = Some(current);
     counts.event_lines += 1;
@@ -528,6 +538,10 @@ impl VerifiedLines {
             line: Vec::new(),
             max_line_bytes,
         })
+    }
+
+    pub(crate) fn current_line(&self) -> &[u8] {
+        &self.line[..self.line.len() - 1]
     }
 
     pub(crate) fn next_line(&mut self) -> Result<Option<&[u8]>, String> {

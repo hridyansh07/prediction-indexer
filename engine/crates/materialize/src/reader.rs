@@ -1,7 +1,7 @@
 //! Pinned, privately snapshotted derivative reads. No canonical input is reopened.
 //! Optional scope decodes only selected event bodies. Every line still passes
-//! syntax/header/order/evidence checks and the unchanged byte-verifying decoder.
-//! Excluded body schemas were validated at build/audit and are receipt-bound by
+//! header/order/evidence checks and the unchanged byte-verifying decoder.
+//! Excluded bodies were validated at build/audit and are receipt-bound by
 //! stored SHA-256; independent audits always deserialize every body.
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -234,7 +234,7 @@ struct Deliveries {
     previous_reject_seq: Option<i64>,
     checks: DeliveryChecks,
     mode: ReadMode,
-    scope: Option<ScopeFilter>,
+    scope: Option<(ScopeFilter, bool)>,
 }
 
 impl Deliveries {
@@ -243,7 +243,7 @@ impl Deliveries {
         manifest: &DerivativeManifest,
         limits: &ReadLimits,
         mode: ReadMode,
-        scope: Option<ScopeFilter>,
+        scope: Option<(ScopeFilter, bool)>,
     ) -> Result<Self, String> {
         Ok(Self {
             events: VerifiedLines::open_limit(
@@ -292,7 +292,7 @@ impl Deliveries {
                     &mut self.counts,
                     self.mode,
                     self.manifest.normalized_schema_version,
-                    self.scope.as_ref(),
+                    self.scope.as_ref().map(|(scope, fast)| (scope, *fast)),
                 )?,
                 line.len() as u64 + 1,
             )),
@@ -322,10 +322,7 @@ impl Deliveries {
             self.read_reject()?;
             self.primed = true;
         }
-        let event_seq = self
-            .event
-            .as_ref()
-            .map(|(r, _)| r.header.address().canonical_seq());
+        let event_seq = self.event.as_ref().map(|(r, _)| r.header.sequence());
         let reject_seq = self
             .reject
             .as_ref()
@@ -342,25 +339,21 @@ impl Deliveries {
                 return Ok(None);
             }
         };
-        let header = if event_seq == Some(seq) {
-            self.event.as_ref().unwrap().0.header.clone()
+        let index = if event_seq == Some(seq) {
+            self.event.as_ref().unwrap().0.header.index()
         } else {
-            self.reject.as_ref().unwrap().0.header().clone()
+            self.reject
+                .as_ref()
+                .unwrap()
+                .0
+                .header()
+                .address()
+                .event_index()
         };
-        if header.address().event_index() != 0 {
+        if index != 0 {
             return Err("source must start at event index zero".into());
         }
-        let mut delivery = SourceDelivery {
-            last_event_address: header.address().clone(),
-            header,
-            connection_epoch: None,
-            records: Vec::new(),
-            event_count: 0,
-            disposition: None,
-            logical_bytes: 0,
-            record_count: 0,
-        };
-        if let Some(sources) = &mut self.sources {
+        let source = if let Some(sources) = &mut self.sources {
             let bytes = sources
                 .next_line()?
                 .ok_or("missing source evidence record")?;
@@ -370,25 +363,67 @@ impl Deliveries {
                 crate::verify::probe::canonical_check();
             }
             let source = crate::evidence::SourceEvidence::decode(bytes, canonical)?;
-            if source.header != delivery.header {
+            let agrees = if event_seq == Some(seq) {
+                self.event
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .header
+                    .same_source(&source.header, self.events.current_line())
+            } else {
+                self.reject.as_ref().unwrap().0.header() == &source.header
+            };
+            if !agrees {
                 return Err("source evidence header disagrees with delivery".into());
             }
-            add_size(
-                &mut delivery.logical_bytes,
-                bytes.len() as u64 + 1,
-                self.limits.max_group_bytes,
-            )?;
-            delivery.connection_epoch = Some(source.connection_epoch);
-        }
+            Some((source, bytes.len() as u64 + 1))
+        } else {
+            None
+        };
+        // Profile 2 already owns the exact source header. Excluded event views
+        // compare against it without allocating record_id/lane for each child.
+        let (header, connection_epoch, logical_bytes) = if let Some((source, bytes)) = source {
+            (source.header, Some(source.connection_epoch), bytes)
+        } else if event_seq == Some(seq) {
+            (
+                self.event
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .header
+                    .to_owned(self.events.current_line()),
+                None,
+                0,
+            )
+        } else {
+            (self.reject.as_ref().unwrap().0.header().clone(), None, 0)
+        };
+        let mut delivery = SourceDelivery {
+            last_event_address: header.address().clone(),
+            header,
+            connection_epoch,
+            records: Vec::new(),
+            event_count: 0,
+            disposition: None,
+            logical_bytes: 0,
+            record_count: 0,
+        };
+        add_size(
+            &mut delivery.logical_bytes,
+            logical_bytes,
+            self.limits.max_group_bytes,
+        )?;
         let mut faults = Vec::new();
         while self
             .event
             .as_ref()
-            .is_some_and(|(r, _)| r.header.address().canonical_seq() == seq)
+            .is_some_and(|(r, _)| r.header.sequence() == seq)
         {
             let (record, bytes) = self.event.take().unwrap();
-            if !same_source(&delivery.header, &record.header)
-                || u64::from(record.header.address().event_index()) != delivery.event_count
+            if !record
+                .header
+                .same_source(&delivery.header, self.events.current_line())
+                || u64::from(record.header.index()) != delivery.event_count
             {
                 return Err("normalized children disagree on source header or index".into());
             }
@@ -399,7 +434,7 @@ impl Deliveries {
             )?;
             add_size(&mut delivery.record_count, 1, self.limits.max_group_records)?;
             delivery.event_count += 1;
-            delivery.last_event_address = record.header.address().clone();
+            delivery.last_event_address = delivery.header.address().child(record.header.index());
             if let Some(fault) = record.fault {
                 faults.push(fault);
             }
@@ -455,15 +490,6 @@ impl Deliveries {
         }
         Ok(())
     }
-}
-
-fn same_source(a: &EventHeader, b: &EventHeader) -> bool {
-    a.order_ns() == b.order_ns()
-        && a.visible_ns() == b.visible_ns()
-        && a.visible_tie_group() == b.visible_tie_group()
-        && a.record_id() == b.record_id()
-        && a.provenance() == b.provenance()
-        && a.address().child(b.address().event_index()) == *b.address()
 }
 
 pub fn add_size(total: &mut u64, amount: u64, maximum: u64) -> Result<(), String> {
@@ -667,6 +693,25 @@ pub fn open_pinned_scoped(
     limits: &ReadLimits,
     scope: ScopeFilter,
 ) -> Result<VerifiedWindowReader, String> {
+    open_scoped(input, limits, scope, true)
+}
+
+/// T4 projection reference for fast/full equivalence checks.
+#[doc(hidden)]
+pub fn open_pinned_scoped_without_fastpath(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: ScopeFilter,
+) -> Result<VerifiedWindowReader, String> {
+    open_scoped(input, limits, scope, false)
+}
+
+fn open_scoped(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: ScopeFilter,
+    fast: bool,
+) -> Result<VerifiedWindowReader, String> {
     limits.validate()?;
     if scope.instruments.len().saturating_add(scope.lanes.len()) > limits.max_scope_entries {
         return Err("scope exceeds entry limit".into());
@@ -680,7 +725,7 @@ pub fn open_pinned_scoped(
     {
         add_size(&mut bytes, len as u64, limits.max_metadata_bytes)?;
     }
-    open_pinned_inner(input, limits, Some(scope), |_, _| {})
+    open_pinned_inner(input, limits, Some((scope, fast)), |_, _| {})
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -701,7 +746,7 @@ pub(crate) fn open_pinned_with_checkpoint(
 fn open_pinned_inner(
     input: &PinnedDerivative,
     limits: &ReadLimits,
-    scope: Option<ScopeFilter>,
+    scope: Option<(ScopeFilter, bool)>,
     mut checkpoint: impl FnMut(ReadCheckpoint, &Path),
 ) -> Result<VerifiedWindowReader, String> {
     let metadata = inspect_pinned(input, limits)?;

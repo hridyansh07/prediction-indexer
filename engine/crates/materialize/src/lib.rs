@@ -6,6 +6,7 @@
 
 mod candidate;
 mod evidence;
+mod input;
 mod profile1;
 mod reader;
 mod schema;
@@ -40,6 +41,7 @@ pub use evidence::{CoverageEvidence, LaneCoverage, LaneState, SourceFault, Sourc
 pub use reader::{
     DerivativeMetadata, FinishedWindow, PinnedDerivative, ReadLimits, SourceDelivery,
     VerifiedWindowReader, inspect_pinned, open_pinned, open_pinned_scoped,
+    open_pinned_scoped_without_fastpath,
 };
 pub use schema::{
     CompressedOutput, CompressionContract, DerivativeCounts, DerivativeManifest, DerivativeReceipt,
