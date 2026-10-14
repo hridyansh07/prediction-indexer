@@ -82,8 +82,12 @@ Each admitted run and both projections are written in one `BEGIN IMMEDIATE`
 transaction (foreign keys on, WAL, `synchronous=FULL`). A projection identity
 over the resolved rows detects changed re-ingestion; re-ingesting the same run
 is idempotent, except a migrated market-projection v3 run: it fails with
-`run … was migrated from projection v3; rebuild to re-ingest it`, including
-the sync manifest-known fast path. New runs still ingest at v4.
+`run … was migrated from projection v3; rebuild to re-ingest it` on actual
+re-ingestion, forced audit, or backfill. Ordinary incremental sync still skips
+an existing run when its manifest SHA-256 matches; discovering unchanged old
+manifests is not re-ingestion and does not degrade health. A changed manifest
+still conflicts. New runs ingest at v4. This distinction supersedes the initial
+migration spec's blanket prohibition on sync skipping migrated runs.
 
 **Incremental sync** (`UniverseSync.sync`) advances a high-water date
 independently of bad manifests. Failures go to the durable
@@ -323,13 +327,31 @@ retry; never overwrite the source.
 
 m1 requires exact schema v6 and all market projections at v3. It reuses the
 totals projector and claim reconstruction, preserving market hashes, volumes,
-bundle evidence, and source identities. Complete stored contexts supply ordered
-participants and candidate membership; unavailable/ambiguous participants or
-unreconstructable affected candidate bundles abort with their identity. The v6
-index does not preserve venue-specific catalogue participant labels or contexts
-for unselected bundles, so serving equivalence must be checked before deployment,
-not assumed. Correction membership falls back to selected occurrences only when
-exact candidate membership is unavailable, and the summary names those markets.
+bundle evidence, and source identities. Participants come from complete contexts,
+falling back to `umbrella_events.participants_json` for unselected candidates.
+Both paths pass through `_event_participants`; missing participants or a
+disagreement between stored sources aborts with the market identity. The summary's
+`participants_source` counts examined markets using `context` versus `umbrella`.
+
+All candidates project markets, even with `eligible = selected = 0`. Correction
+membership uses complete contexts when available, otherwise positive membership
+in candidate eligible IDs or market exclusions. When those rows cannot prove
+exact membership, corrections use that event's candidate-decision runs within
+the market's inclusive first/last-seen span, and
+`correction_membership_fallback` names the markets. It does not fall back to
+selected occurrences, which omit unselected candidates.
+
+Context-less claims use stored event/market rows within their seen spans,
+umbrella participants, and each candidate's market exclusions through the same
+ingestion claim functions. Missing report relations are explicitly unavailable,
+not an empty verified relation set: preserve existing claim relations touching
+the event and their claim-class endpoints, emit no new relations for that event,
+and list it under `relations_not_rederived`. This visible gap does not abort m1.
+The v6 index does not retain every candidate's exact market list or venue-specific
+participant labels, so serving equivalence remains a deployment check, not an
+assumption. The reviewed full-file expectation is 16 Kalshi and 4 Limitless
+corrections, all under → over, including unselected Kalshi candidates; verify
+that on the production copy rather than treating unit fixtures as acceptance.
 `claims_rewritten` and `relations_rewritten` count removed plus added row values
 in `market_claims` and `claim_relations`, not upsert attempts.
 

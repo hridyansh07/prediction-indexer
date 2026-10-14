@@ -92,7 +92,13 @@ def project_claims(
 
     Raises ``MarketProjectionError`` when the recomputed claims assert a
     cross-venue relation the report did not record.
+
+    Offline migration may supply ``relations=None`` when v6 did not retain
+    the candidate's report context. Derive its market claims, but neither
+    verify nor emit relations without that evidence. Ingestion's closed
+    projection validator requires a list, so it never takes this path.
     """
+    verification_available = projection["relations"] is not None
     # One raw projection event is one candidate bundle, which is the unit the
     # targeter derives relationships over. `event_id_for_bundle` maps that
     # bundle onto the umbrella event the resolved projection assigned it, so a
@@ -147,7 +153,7 @@ def project_claims(
             (row["venue"], row["venue_market_id"])
             for row in venue_markets.get(event_id, ())
         } & corrected
-        if touched:
+        if touched and verification_available:
             analysis = derive_bundle_relationships(
                 bundle, excluded_market_ids=exclusions.get(event_id, frozenset())
             )
@@ -213,16 +219,16 @@ def project_claims(
 
     recorded = [
         row
-        for row in projection["relations"]
+        for row in projection["relations"] or ()
         if not any(
             (member["venue"], member["venue_market_id"]) in rederived_markets
             for member in row["members"]
         )
     ] + rederived
-    shortfall = verify_claims(implied, recorded)
+    shortfall = verify_claims(implied, recorded) if verification_available else 0
     return {
         "claims": [claims[key] for key in sorted(claims)],
-        "claim_relations": [relations[key] for key in sorted(relations)],
+        "claim_relations": [relations[key] for key in sorted(relations)] if verification_available else [],
         "market_claims": [market_claims[key] for key in sorted(market_claims)],
         "relation_shortfall": shortfall,
         "unreconstructed_bundles": unreconstructed,

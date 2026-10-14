@@ -588,10 +588,15 @@ For an offline migration (currently m1, v6 → v7):
    committed WAL content; do not copy only the main file. m1 requires no archive
    credentials or inputs. Keep the printed JSON summary and run
    `python -m universe.tools.rebuild_diff SOURCE.sqlite3 DEST.sqlite3`.
-   Verify the known totals acceptance set, no unrelated market/claim/bundle
+   Verify the reviewed totals acceptance set (16 Kalshi and 4 Limitless, all
+   under → over, including unselected candidates), no unrelated market/claim/bundle
    changes, schema/integrity, and the documented short-range equivalence command
    in [`universe/README.md`](../universe/README.md). Unit fixtures are not proof
    of the real acceptance set. Abort deployment on any unreviewed change.
+   Review `participants_source`, `correction_membership_fallback`, and
+   `relations_not_rederived`: unavailable candidate verification context preserves
+   existing claim relations and their endpoints, rather than inventing new edges
+   or aborting the whole migration. These gaps remain operator review items.
 3. Disable the Replay scheduler and drain any lock holder before stopping
    `event-universe`. Checkpoint/close the live database before moving it (do not
    leave live WAL/SHM siblings attached to the replacement). Preserve it as
@@ -607,7 +612,9 @@ For an offline migration (currently m1, v6 → v7):
 Every step is one transaction; a failed step leaves `DEST` at its previous
 version, while `SOURCE` stays unchanged. Existing destinations are refused.
 Projection-v3 runs retain their hashes and fail visibly on re-ingestion; a
-rebuild is required to replay those old ranges. m1 can ship alone. m2 (v7 → v8)
+rebuild is required to replay those old ranges. Ordinary incremental sync skips
+unchanged v3 manifests without failures; forced audits and backfill do not.
+m1 can ship alone. m2 (v7 → v8)
 is a documented aborting stub because this base lacks the execution-terms §1.2
 contract; `--to 8` cannot deploy v8. From v6 it commits m1 then exits nonzero at
 m2 with the destination still v7. Do not interpret that failure as success at v8.

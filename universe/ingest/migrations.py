@@ -65,13 +65,23 @@ def _contexts(c: sqlite3.Connection, row: sqlite3.Row) -> list[str]:
     )]
 
 
-def _context_participants(c: sqlite3.Connection, context: str, market: str) -> list[str]:
-    names = [row[0] for row in c.execute(
+def _participants(c: sqlite3.Connection, row: sqlite3.Row,
+                  contexts: list[str]) -> tuple[list[str], str]:
+    market = f"{row['venue']}:{row['venue_market_id']}"
+    umbrella = c.execute("SELECT participants_json FROM umbrella_events WHERE event_id = ?",
+                         (row["event_id"],)).fetchone()
+    sources = [("context", [r[0] for r in c.execute(
         "SELECT name FROM context_participants WHERE context_sha256 = ? ORDER BY position", (context,),
-    )]
-    if len(names) != 2 or any(not name for name in names):
+    )]) for context in contexts]
+    if umbrella is not None:
+        sources.append(("umbrella", json.loads(umbrella[0])))
+    available = [(source, _event_participants(None, names)) for source, names in sources if names]
+    if not available or any(len(names) != 2 or any(not isinstance(n, str) or not n for n in names)
+                            for _, names in available):
         raise EvidenceConflict(f"cannot reconstruct participants for {market}")
-    return _event_participants(None, names)
+    if any(names != available[0][1] for _, names in available):
+        raise EvidenceConflict(f"participants disagree for {market}")
+    return available[0][1], available[0][0]
 
 
 def _merge_spans(c: sqlite3.Connection, members: list[sqlite3.Row]) -> tuple[str, str]:
@@ -82,6 +92,46 @@ def _merge_spans(c: sqlite3.Connection, members: list[sqlite3.Row]) -> tuple[str
     return first, last
 
 
+def _candidate_projection(c: sqlite3.Connection, decision: sqlite3.Row,
+                          corrections: list[dict[str, Any]]) -> dict[str, Any]:
+    """Unselected candidates have decisions and markets, but no saved report context."""
+    umbrella = c.execute("SELECT * FROM umbrella_events WHERE event_id = ?",
+                         (decision["event_id"],)).fetchone()
+    event = {
+        "event_id": decision["event_id"], "source_bundle_id": decision["bundle_id"],
+        **{key: umbrella[key] for key in ("sport", "game", "topology", "activation_at")},
+        "participants": _event_participants(None, json.loads(umbrella["participants_json"])),
+        "participant_keys": json.loads(umbrella["participant_keys_json"]),
+    }
+    observation = c.execute(
+        "SELECT observed_activation_at FROM event_observations WHERE run_id = ? AND bundle_id = ? AND event_id = ?",
+        (decision["run_id"], decision["bundle_id"], decision["event_id"]),
+    ).fetchone()
+    if observation is not None:
+        event["activation_at"] = observation[0]
+    # v6 retains only bounds, not a complete market list for every candidate.
+    # Never extend a market's claims outside its stored observation span.
+    markets = [_venue_market_record(row) for row in c.execute(
+        """SELECT m.* FROM venue_markets m
+           JOIN targeter_runs first ON first.run_id = m.first_seen_run_id
+           JOIN targeter_runs last ON last.run_id = m.last_seen_run_id
+           JOIN targeter_runs r ON r.run_id = ?
+           WHERE m.event_id = ? AND (r.generated_at_ns, r.run_id)
+               BETWEEN (first.generated_at_ns, first.run_id) AND (last.generated_at_ns, last.run_id)
+           ORDER BY m.venue, m.venue_market_id""", (decision["run_id"], decision["event_id"]),
+    )]
+    references = {(row["venue"], row["venue_event_id"]) for row in markets}
+    events = [dict(row) for row in c.execute(
+        "SELECT * FROM venue_events WHERE event_id = ? ORDER BY venue, venue_event_id", (decision["event_id"],),
+    ) if (row["venue"], row["venue_event_id"]) in references]
+    return {
+        "events": [event], "venue_events": events, "venue_markets": markets,
+        "decisions": [{"event_id": decision["event_id"], "market_exclusions": json.loads(decision["market_exclusions_json"])}],
+        # None means unavailable, unlike an explicitly empty report relation list.
+        "relations": None, "corrections": corrections,
+    }
+
+
 def _bundle_projection(c: sqlite3.Connection, db: UniverseStore, decision: sqlite3.Row,
                        corrections: list[dict[str, Any]]) -> dict[str, Any]:
     occurrence = c.execute(
@@ -89,7 +139,7 @@ def _bundle_projection(c: sqlite3.Connection, db: UniverseStore, decision: sqlit
         "AND occurrence_kind = 'complete'", (decision["run_id"], decision["bundle_id"]),
     ).fetchone()
     if occurrence is None:
-        raise EvidenceConflict(f"cannot reconstruct candidate bundle {decision['bundle_id']} in run {decision['run_id']}")
+        return _candidate_projection(c, decision, corrections)
     context = db._context(c, occurrence[0], bounded=False)
     event = {
         "event_id": decision["event_id"], "source_bundle_id": decision["bundle_id"],
@@ -120,6 +170,33 @@ def _bundle_projection(c: sqlite3.Connection, db: UniverseStore, decision: sqlit
     }
 
 
+def _correction_runs(c: sqlite3.Connection, row: sqlite3.Row) -> tuple[set[str], bool]:
+    name = f"{row['venue']}:{row['venue_market_id']}"
+    runs: set[str] = set()
+    fallback = False
+    for decision in c.execute(
+        """SELECT d.*, s.context_sha256, m.target_id FROM candidate_decisions d
+           JOIN targeter_runs r USING(run_id)
+           JOIN targeter_runs first ON first.run_id = ?
+           JOIN targeter_runs last ON last.run_id = ?
+           LEFT JOIN selection_occurrences s ON s.run_id = d.run_id AND s.bundle_id = d.bundle_id
+               AND s.occurrence_kind = 'complete'
+           LEFT JOIN context_markets m ON m.context_sha256 = s.context_sha256 AND m.target_id = ?
+           WHERE d.event_id = ? AND (r.generated_at_ns, r.run_id)
+               BETWEEN (first.generated_at_ns, first.run_id) AND (last.generated_at_ns, last.run_id)
+           ORDER BY d.run_id, d.bundle_id""",
+        (row["first_seen_run_id"], row["last_seen_run_id"], name, row["event_id"]),
+    ):
+        if decision["context_sha256"] is not None:
+            if decision["target_id"] is not None:
+                runs.add(decision["run_id"])
+        else:
+            known = set(json.loads(decision["eligible_market_ids_json"]) or ()) | set(json.loads(decision["market_exclusions_json"]) or ())
+            runs.add(decision["run_id"])
+            fallback |= name not in known
+    return runs, fallback
+
+
 def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     _validate_v6(c)
     c.execute("ALTER TABLE universe_run_projections RENAME TO old_run_projections")
@@ -140,6 +217,9 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     before_canonical_counts: dict[tuple[str, str], int] = {}
     row_count_deltas: dict[str, int] = {}
     affected_shapes: set[str] = set()
+    participants_source = {"context": 0, "umbrella": 0}
+    relations_not_rederived: set[str] = set()
+    protected_claims: set[str] = set()
     correction_count = 0
     fallback_markets = []
     rows = c.execute(
@@ -151,18 +231,13 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
         name = f"{venue}:{native}"
         examined[venue] += 1
         contexts = _contexts(c, row)
-        if not contexts:
-            raise EvidenceConflict(f"cannot reconstruct participants or membership for {name}")
+        participants, origin = _participants(c, row, contexts)
+        participants_source[origin] += 1
         parameters = json.loads(row["parameters_json"])
         source = {**dict(row), "target_id": name, "outcome_labels": json.loads(row["outcome_labels_json"])}
-        derived = []
-        for context in contexts:
-            derived.append(_corrected_totals_parameters(
-                source, parameters, participants=_context_participants(c, context, name), corrections=corrections,
-            ))
-        if any(value != derived[0] for value in derived):
-            raise EvidenceConflict(f"ambiguous participants for {name}")
-        corrected = derived[0]
+        corrected = _corrected_totals_parameters(
+            source, parameters, participants=participants, corrections=corrections,
+        )
         if corrected == parameters:
             continue
         changed[venue] += 1
@@ -172,9 +247,21 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
                 (row["event_id"],),
             ).fetchall():
                 before = _bundle_projection(c, db, decision, [])
+                if before["relations"] is None:
+                    relations_not_rederived.add(row["event_id"])
                 before_canonical_counts[decision["run_id"], decision["bundle_id"]] = len({
                     market["market_id"] for market in before["venue_markets"]
                 })
+            if row["event_id"] in relations_not_rederived:
+                # Relations are global claim edges. Retain both endpoints of
+                # every existing edge touching this event, even if a corrected
+                # market was the last market referencing its old claim.
+                for relation in c.execute(
+                    """SELECT left_claim_id, right_claim_id FROM claim_relations r
+                       WHERE EXISTS (SELECT 1 FROM market_claims m WHERE m.event_id = ?
+                           AND m.claim_id IN (r.left_claim_id, r.right_claim_id))""", (row["event_id"],),
+                ):
+                    protected_claims.update(relation)
             before_members.update(tuple(r) for r in c.execute(
                 "SELECT * FROM market_claims WHERE event_id = ?", (row["event_id"],),
             ))
@@ -226,20 +313,9 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
                AND NOT EXISTS (SELECT 1 FROM selected_market_occurrences s WHERE s.market_id = canonical_markets.market_id)""",
             (row["market_id"],),
         )
-        # Complete candidate contexts give exact membership, including unselected
-        # siblings. Retained-only evidence uses the explicitly allowed fallback.
-        run_ids = {r[0] for r in c.execute(
-            """SELECT d.run_id FROM candidate_decisions d JOIN selection_occurrences s
-               ON s.run_id = d.run_id AND s.bundle_id = d.bundle_id
-               JOIN context_markets m ON m.context_sha256 = s.context_sha256
-               WHERE d.event_id = ? AND m.target_id = ? AND s.occurrence_kind = 'complete'""",
-            (row["event_id"], name),
-        )}
-        if not run_ids:
+        run_ids, fallback = _correction_runs(c, row)
+        if fallback:
             fallback_markets.append(name)
-            run_ids = {r[0] for r in c.execute(
-                "SELECT run_id FROM selected_market_occurrences WHERE venue = ? AND venue_market_id = ?", (venue, native),
-            )}
         correction = corrections[venue, native, "direction"]
         for run_id in sorted(run_ids):
             c.execute("INSERT INTO universe_run_projection_corrections VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -267,7 +343,7 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     # Retire only old subsets no other market expresses. Shared, content-addressed
     # claims and their algebra remain valid in unaffected bundles.
     for claim_id in sorted(old_claims):
-        if not c.execute("SELECT 1 FROM market_claims WHERE claim_id = ? LIMIT 1", (claim_id,)).fetchone():
+        if claim_id not in protected_claims and not c.execute("SELECT 1 FROM market_claims WHERE claim_id = ? LIMIT 1", (claim_id,)).fetchone():
             c.execute("DELETE FROM claim_relations WHERE left_claim_id = ? OR right_claim_id = ?", (claim_id, claim_id))
             c.execute("DELETE FROM claim_classes WHERE claim_id = ?", (claim_id,))
     for event_id in sorted(affected_events):
@@ -279,6 +355,8 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
             raise EvidenceConflict(f"cannot reconstruct claims for event {event_id}")
         for decision in decisions:
             projection = _bundle_projection(c, db, decision, list(corrections.values()))
+            if event_id in relations_not_rederived:
+                projection["relations"] = None
             # Only corrections and canonical deduplication change the market
             # projection's row count. Its original v3 hash/version still stand.
             run_id = decision["run_id"]
@@ -312,6 +390,8 @@ def _m1(c: sqlite3.Connection, db: UniverseStore) -> dict[str, Any]:
     return {
         "migration_id": M1, "from_user_version": 6, "to_user_version": 7,
         "markets_examined": examined, "markets_changed": changed,
+        "participants_source": participants_source,
+        "relations_not_rederived": sorted(relations_not_rederived),
         "correction_rows_written": correction_count,
         "claims_rewritten": len(before_members ^ after_members),
         "relations_rewritten": len(before_relations ^ after_relations),

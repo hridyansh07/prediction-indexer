@@ -12,8 +12,10 @@ Three SQL resources, owned by [`universe/`](../README.md):
   oldest-first backfill for a stale version or modification. m1 migrates exact
   v6 to v7, including STRICT `universe_migrations` and a market projection CHECK
   allowing `(3, 4)`. Version-3 rows require `m1-totals-direction` metadata and
-  cannot be re-ingested; fresh ingestion writes 4. A rebuild has no migration
-  rows. An older v7 file without these objects requires a rebuild. m2 remains an
+  cannot be re-ingested; ordinary incremental sync skips an unchanged manifest,
+  while force/audit and backfill still conflict. Fresh ingestion writes 4.
+  A rebuild has no migration rows. An older v7 file without these objects requires
+  a rebuild. m2 remains an
   aborting stub pending the missing `EXECUTION_DELAY_SDK_V1` §1.2 table contract;
   this resource does not define or claim to support v8.
 - [`replay_auth.sql`](replay_auth.sql) and [`replay_jobs.sql`](replay_jobs.sql):

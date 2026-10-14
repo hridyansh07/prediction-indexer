@@ -10,16 +10,18 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from tests.test_event_universe_store import G1, G2, R1, R2
+from archive.storage import INDEPENDENT, LocalObjectStore
+from tests.test_event_universe_store import G1, G2, G3, R1, R2, R3, _publish_run
 from tests.test_universe_totals_direction import (
     KALSHI_TOTAL, LIMITLESS_TOTAL, PM_TOTAL, _soccer_totals, _thundertalk,
 )
 from universe.derive import market_projection
 from universe.derive.projection import project_selected_bundles
-from universe.ingest.sync import _complete_context
+from universe.ingest.sync import UniverseSync, _complete_context
 from universe.store import EvidenceConflict, SCHEMA_PATH, UniverseStore
 
 
@@ -88,6 +90,113 @@ class MigrationsTests(unittest.TestCase):
         from universe.ingest.migrations import migrate
         return migrate(self.source, self.dest, to=to, code_revision="test-revision", **kwargs)
 
+    def unselected_source(self, fixture):
+        fixture = copy.deepcopy(fixture)
+        fixture[0]["selection"] = {
+            "bundle_ids": [], "bundle_count": 0,
+            "targets": {"kalshi": [], "polymarket": [], "limitless": []},
+        }
+        fixture[0]["candidates"][0]["eligible"] = False
+        self.source.unlink()
+        with closing(sqlite3.connect(self.source)) as c:
+            c.executescript(_v6_schema())
+            c.execute("PRAGMA user_version = 6")
+        _ingest(UniverseStore(self.source), fixture, v3=True)
+        self.assertEqual(_rows(self.source, "selection_occurrences"), [])
+        return fixture
+
+    def test_unselected_candidate_uses_umbrella_participants_and_rewrites_claims(self):
+        from targeter.v2.relationships import derive_bundle_relationships
+        from universe.claims.claim_projection import rebuild_bundle
+        fixture = copy.deepcopy(self.fixture)
+        candidate = fixture[0]["candidates"][0]
+        # A different totals line gives the old under claim relations, but
+        # does not share its identity. Preserving edges must keep its endpoint
+        # even after the corrected market no longer references that claim.
+        other = copy.deepcopy(next(r for r in fixture[2] if r["target_id"] == PM_TOTAL))
+        other.update(target_id="polymarket:other-line", venue_market_id="other-line",
+                     title="Games Total: O/U 4.5", parameters={"line": 4.5},
+                     subscription_ids=["other-over", "other-under"])
+        fixture[2].append(other)
+        candidate["market_ids"].append(other["target_id"])
+        candidate["eligible_market_ids"] = candidate["market_ids"]
+        candidate["market_exclusions"] = {PM_TOTAL: ["unsupported_semantics"]}
+        with mock.patch("universe.derive.market_projection._corrected_totals_parameters",
+                        side_effect=lambda source, parameters, **kwargs: parameters):
+            projection = market_projection.project_market_universe(fixture[0], catalog_events=fixture[1], catalog_markets=fixture[2])
+        bundle = rebuild_bundle(projection["events"][0], projection["venue_events"], projection["venue_markets"])
+        candidate["relationship_analysis"]["relationships"] = [r.as_record() for r in
+            derive_bundle_relationships(bundle, excluded_market_ids=frozenset({PM_TOTAL})).relationships]
+        fixture = self.unselected_source(fixture)
+        before = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        old_relations = _rows(self.source, "claim_relations")
+        old_claims = _rows(self.source, "market_claims")
+        old_claim = next(r["claim_id"] for r in old_claims
+                         if f"{r['venue']}:{r['venue_market_id']}" == KALSHI_TOTAL)
+        self.assertEqual(sum(r["claim_id"] == old_claim for r in old_claims), 1)
+        self.assertTrue(any(old_claim in (r["left_claim_id"], r["right_claim_id"]) for r in old_relations))
+        rebuilt = UniverseStore(self.root / "rebuilt.sqlite3")
+        rebuilt.initialize()
+        _ingest(rebuilt, fixture)
+        summary = self.migrate()[0]
+        self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), before)
+        for table in ("venue_markets", "canonical_markets", "market_claims",
+                      "universe_run_projection_corrections"):
+            self.assertEqual(_rows(self.dest, table), _rows(rebuilt.path, table), table)
+        corrected = next(r for r in _rows(self.dest, "market_claims")
+                         if f"{r['venue']}:{r['venue_market_id']}" == KALSHI_TOTAL)
+        claim = next(r for r in _rows(self.dest, "claim_classes") if r["claim_id"] == corrected["claim_id"])
+        self.assertEqual(claim["outcome_key_count"], 18)
+        self.assertFalse(any(f"{r['venue']}:{r['venue_market_id']}" == PM_TOTAL
+                             for r in _rows(self.dest, "market_claims")))
+        self.assertEqual(_rows(self.dest, "claim_relations"), old_relations)
+        self.assertIn(old_claim, [r["claim_id"] for r in _rows(self.dest, "claim_classes")])
+        self.assertEqual(summary["participants_source"], {"context": 0, "umbrella": 1})
+        self.assertEqual(summary["correction_membership_fallback"], [])
+        self.assertEqual(summary["relations_not_rederived"], [_rows(self.source, "umbrella_events")[0]["event_id"]])
+        self.assertEqual(summary["markets_changed"], {"kalshi": 1, "limitless": 0})
+        with closing(sqlite3.connect(self.dest)) as c:
+            self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(UniverseStore._schema_objects(c), UniverseStore._expected_schema())
+
+    def test_contextless_membership_fallback_is_bounded_to_market_span(self):
+        fixture = self.unselected_source(self.fixture)
+        # Totals absent from both eligible IDs and exclusions have no exact
+        # membership record. Candidate runs within their seen span are fallback.
+        second = copy.deepcopy(fixture)
+        second[0].update(run_id=R2, generated_at=G2)
+        second[0]["candidates"][0].update(eligible_market_ids=None, market_exclusions=None)
+        _ingest(UniverseStore(self.source), second, v3=True)
+        third = copy.deepcopy(fixture)
+        third[0].update(run_id=R3, generated_at=G3)
+        third[0]["candidates"][0]["market_ids"].remove(KALSHI_TOTAL)
+        relations = third[0]["candidates"][0]["relationship_analysis"]["relationships"]
+        relations[:] = [r for r in relations if not r["left"].startswith(KALSHI_TOTAL)
+                        and not r["right"].startswith(KALSHI_TOTAL)]
+        third[2][:] = [r for r in third[2] if r["target_id"] != KALSHI_TOTAL]
+        _ingest(UniverseStore(self.source), third, v3=True)
+        earlier = copy.deepcopy(third)
+        earlier[0].update(run_id="20260101T000000.000000Z", generated_at="2026-01-01T00:00:00Z")
+        _ingest(UniverseStore(self.source), earlier, v3=True)
+        summary = self.migrate()[0]
+        self.assertEqual(summary["correction_membership_fallback"], [KALSHI_TOTAL])
+        self.assertEqual([r["run_id"] for r in _rows(self.dest, "universe_run_projection_corrections")], [R1, R2])
+        claim = next(r for r in _rows(self.dest, "market_claims") if r["venue"] == "kalshi" and r["venue_market_id"] == KALSHI_TOTAL.split(":", 1)[1])
+        self.assertEqual((claim["first_seen_run_id"], claim["last_seen_run_id"]), (R1, R2))
+
+    def test_context_and_umbrella_participants_disagreement_rolls_back(self):
+        with closing(sqlite3.connect(self.source)) as c:
+            # The title still derives over with either list: disagreement must
+            # abort even when the corrected parameters happen to agree.
+            c.execute("UPDATE umbrella_events SET participants_json = ?", (json.dumps(["IG", "Different Team"]),))
+            c.commit()
+        before = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(EvidenceConflict, "participants.*disagree.*" + KALSHI_TOTAL):
+            self.migrate()
+        self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), before)
+        with closing(sqlite3.connect(self.dest)) as c:
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 6)
+
     def test_m1_matches_rebuild_schema_data_and_served_claims_without_writing_source(self):
         # An unselected total is nevertheless a candidate market in its context.
         before = self.source.read_bytes(), self.source.stat().st_mtime_ns
@@ -114,6 +223,8 @@ class MigrationsTests(unittest.TestCase):
         migrated.initialize()
         self.assertEqual(migrated.bundle_outcomes("bundle-1"), rebuilt.bundle_outcomes("bundle-1"))
         self.assertEqual(summary["markets_changed"], {"kalshi": 1, "limitless": 0})
+        self.assertEqual(summary["participants_source"], {"context": 1, "umbrella": 0})
+        self.assertEqual(summary["relations_not_rederived"], [])
         self.assertEqual(summary["changed"], [{"market": KALSHI_TOTAL, "report_value": "under", "projected_value": "over"}])
         record = _rows(self.dest, "universe_migrations")[0]
         self.assertEqual(record["migration_id"], "m1-totals-direction")
@@ -155,7 +266,9 @@ class MigrationsTests(unittest.TestCase):
     def test_abort_after_a_correction_rolls_back_all_schema_and_data(self):
         # The first market can be changed before the second fails reconstruction.
         with closing(sqlite3.connect(self.source)) as c:
-            c.execute("INSERT INTO venue_markets SELECT venue, 'zz-missing', venue_event_id, event_id, market_id, market_template_version, outcome_space_version, canonical_class, market_type, scope, title, parameters_json, subscription_ids_json, outcome_labels_json, status, accepting_orders, rules_hash, rule_template_id, source_ref, created_at, volume_24h, volume_total, volume_total_usd, liquidity, first_seen_run_id, last_seen_run_id FROM venue_markets WHERE venue_market_id = ?", (KALSHI_TOTAL.split(":", 1)[1],))
+            c.execute("INSERT INTO umbrella_events SELECT event_id || '-missing', identity_version, identity_activation_date, identity_ordinal + 1, sport, game, topology, activation_at, activation_at_ns, '[]', participant_keys_json, first_seen_run_id, last_seen_run_id FROM umbrella_events")
+            c.execute("INSERT INTO venue_events SELECT venue, 'missing-event', event_id || '-missing', title, league, status, source_ref, format, fragment_type, first_seen_run_id, last_seen_run_id FROM venue_events WHERE venue = 'kalshi'")
+            c.execute("INSERT INTO venue_markets SELECT venue, 'zz-missing', 'missing-event', event_id || '-missing', market_id, market_template_version, outcome_space_version, canonical_class, market_type, scope, title, parameters_json, subscription_ids_json, outcome_labels_json, status, accepting_orders, rules_hash, rule_template_id, source_ref, created_at, volume_24h, volume_total, volume_total_usd, liquidity, first_seen_run_id, last_seen_run_id FROM venue_markets WHERE venue_market_id = ?", (KALSHI_TOTAL.split(":", 1)[1],))
             c.commit()
         before = _rows(self.source, "venue_markets")
         with self.assertRaisesRegex(EvidenceConflict, "kalshi:zz-missing"):
@@ -178,6 +291,7 @@ class MigrationsTests(unittest.TestCase):
     def test_missing_participants_names_market_and_aborts(self):
         with closing(sqlite3.connect(self.source)) as c:
             c.execute("DELETE FROM context_participants")
+            c.execute("UPDATE umbrella_events SET participants_json = '[]'")
             c.commit()
         with self.assertRaisesRegex(EvidenceConflict, "participants.*" + KALSHI_TOTAL):
             self.migrate()
@@ -291,12 +405,42 @@ class MigrationsTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceConflict, "exact Event Universe v6 schema"):
             self.migrate()
 
-    def test_known_manifest_does_not_silently_skip_v3(self):
+    def test_known_v3_manifest_skips_only_matching_identity(self):
         self.migrate()
         db = UniverseStore(self.dest)
         run = _rows(self.dest, "targeter_runs")[0]
-        with self.assertRaisesRegex(EvidenceConflict, "^run " + R1 + " was migrated from projection v3; rebuild to re-ingest it$"):
-            db.known_manifest(run["manifest_key"], run["manifest_sha256"])
+        self.assertTrue(db.known_manifest(run["manifest_key"], run["manifest_sha256"]))
+        with self.assertRaisesRegex(EvidenceConflict, "immutable manifest .* changed identity"):
+            db.known_manifest(run["manifest_key"], "c" * 64)
+
+    def test_incremental_sync_skips_migrated_day_but_audit_and_backfill_conflict(self):
+        objects = LocalObjectStore(self.root / "objects", store_id="archive", durability=INDEPENDENT)
+        sources = []
+        for run_id, generated in ((R1, G1), (R2, G2)):
+            fixture = copy.deepcopy(self.fixture)
+            fixture[0].update(run_id=run_id, generated_at=generated)
+            if run_id == R2:
+                _ingest(UniverseStore(self.source), fixture, v3=True)
+            sources.append(_publish_run(objects, fixture[0], catalog_rows=fixture[1:]))
+        with closing(sqlite3.connect(self.source)) as c:
+            for source in sources:
+                c.execute("UPDATE targeter_runs SET manifest_sha256 = ? WHERE run_id = ?",
+                          (source["manifest_sha256"], source["run_id"]))
+            c.execute("INSERT INTO event_identity_lineage VALUES (1, '2026-01-01T00:00:00Z', '2026-01-01T00:11:00Z', 'complete')")
+            c.commit()
+        self.migrate()
+        db = UniverseStore(self.dest)
+        sync = UniverseSync(db, objects)
+        result = sync.sync(now=datetime(2026, 1, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual((result.discovered, result.skipped, result.ingested), (2, 2, 0))
+        self.assertEqual((result.failure_count, result.pending_failures, result.failures), (0, 0, []))
+        conflict = "^run " + R1 + " was migrated from projection v3; rebuild to re-ingest it$"
+        with self.assertRaisesRegex(EvidenceConflict, conflict):
+            sync.audit_run(R1)
+        backfill = sync.backfill_range(datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                       datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc))
+        self.assertEqual((backfill.skipped, backfill.failure_count), (0, 2))
+        self.assertIn("was migrated from projection v3; rebuild to re-ingest it", backfill.failures[0])
 
     def test_m2_stub_preserves_m1_and_explains_missing_contract(self):
         # The base and delegating conversation lack the authoritative §1.2.

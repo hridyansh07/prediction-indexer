@@ -455,7 +455,7 @@ class UniverseSync:
             raise UniverseSyncError(
                 f"run manifest {key} identity disagrees with continuity origin"
             )
-        if not force and self.database.known_manifest(key, metadata.sha256):
+        if not force and not identity_backfill and self.database.known_manifest(key, metadata.sha256):
             return "skipped", None
         if key in stack:
             raise UniverseSyncError(f"continuity origin cycle reaches {key}")
