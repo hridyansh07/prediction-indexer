@@ -410,8 +410,14 @@ class MigrationsTests(unittest.TestCase):
         db = UniverseStore(self.dest)
         run = _rows(self.dest, "targeter_runs")[0]
         self.assertTrue(db.known_manifest(run["manifest_key"], run["manifest_sha256"]))
-        with self.assertRaisesRegex(EvidenceConflict, "immutable manifest .* changed identity"):
-            db.known_manifest(run["manifest_key"], "c" * 64)
+        with self.assertRaises(EvidenceConflict) as conflict:
+            db.known_manifest(run["manifest_key"], run["manifest_sha256"], reingest=True)
+        self.assertEqual(str(conflict.exception),
+                         f"run {run['run_id']} was migrated from projection v3; rebuild to re-ingest it")
+        for reingest in (False, True):
+            with self.subTest(reingest=reingest):
+                with self.assertRaisesRegex(EvidenceConflict, "immutable manifest .* changed identity"):
+                    db.known_manifest(run["manifest_key"], "c" * 64, reingest=reingest)
 
     def test_incremental_sync_skips_migrated_day_but_audit_and_backfill_conflict(self):
         objects = LocalObjectStore(self.root / "objects", store_id="archive", durability=INDEPENDENT)
@@ -431,16 +437,22 @@ class MigrationsTests(unittest.TestCase):
         self.migrate()
         db = UniverseStore(self.dest)
         sync = UniverseSync(db, objects)
-        result = sync.sync(now=datetime(2026, 1, 1, 1, tzinfo=timezone.utc))
+        with mock.patch.object(objects, "open_verified", side_effect=AssertionError("unexpected verified object read")):
+            result = sync.sync(now=datetime(2026, 1, 1, 1, tzinfo=timezone.utc))
         self.assertEqual((result.discovered, result.skipped, result.ingested), (2, 2, 0))
         self.assertEqual((result.failure_count, result.pending_failures, result.failures), (0, 0, []))
         conflict = "^run " + R1 + " was migrated from projection v3; rebuild to re-ingest it$"
         with self.assertRaisesRegex(EvidenceConflict, conflict):
             sync.audit_run(R1)
-        backfill = sync.backfill_range(datetime(2026, 1, 1, tzinfo=timezone.utc),
-                                       datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc))
+        with mock.patch.object(objects, "open_verified", side_effect=AssertionError("unexpected verified object read")):
+            backfill = sync.backfill_range(datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                           datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc))
         self.assertEqual((backfill.skipped, backfill.failure_count), (0, 2))
-        self.assertIn("was migrated from projection v3; rebuild to re-ingest it", backfill.failures[0])
+        self.assertEqual(backfill.failures, [
+            f"{source['manifest_key']}: EvidenceConflict: run {source['run_id']} "
+            "was migrated from projection v3; rebuild to re-ingest it"
+            for source in sources
+        ])
 
     def test_m2_stub_preserves_m1_and_explains_missing_contract(self):
         # The base and delegating conversation lack the authoritative §1.2.
