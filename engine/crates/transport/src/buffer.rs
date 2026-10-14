@@ -9,7 +9,7 @@
 //! where a blocking drain appends everything with the queue-full backoff.
 //! `flush` (initial and terminal) is the same blocking drain. Buffering never
 //! changes delivered content, order, or sequence numbers.
-use crate::{Error, LIVENESS_MS, Result};
+use crate::{Error, LIVENESS_MS, Result, wire::Fields};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -48,7 +48,7 @@ pub trait StreamSink {
     fn append(
         &mut self,
         first: u64,
-        entries: &[String],
+        entries: &[Fields],
         risk_sequences: &[Option<u64>],
         terminal: bool,
     ) -> Result<usize>;
@@ -64,7 +64,7 @@ pub trait StreamSink {
 pub struct Entry {
     pub sequence: u64,
     pub risk_sequence: Option<u64>,
-    pub record: String,
+    pub fields: Fields,
     pub terminal: bool,
 }
 
@@ -90,7 +90,7 @@ pub struct PublishStats {
 
 pub struct PublishBuffer<S: StreamSink> {
     sink: S,
-    entries: Vec<String>,
+    entries: Vec<Fields>,
     risk_sequences: Vec<Option<u64>>,
     queued_at: Vec<Instant>,
     /// Wire sequence of `entries[0]` (equivalently, of the next append).
@@ -161,10 +161,10 @@ impl<S: StreamSink> PublishBuffer<S> {
         if self.terminal || entry.sequence != self.next {
             return Err(Error::Protocol("buffer sequence".into()));
         }
-        if entry.record.len() > self.max_entry_bytes {
+        if entry.fields.len() > self.max_entry_bytes {
             return Err(Error::Resource);
         }
-        self.entries.push(entry.record);
+        self.entries.push(entry.fields);
         self.risk_sequences.push(entry.risk_sequence);
         self.queued_at.push(Instant::now());
         self.next = self.next.checked_add(1).ok_or(Error::Resource)?;
@@ -268,7 +268,7 @@ mod tests {
         limit: usize,
         entry_cap: usize,
         retained: usize,
-        stream: Vec<String>,
+        stream: Vec<Fields>,
         terminal: Option<u64>,
         /// Per-call caps consumed in order; `None` once exhausted = unlimited.
         caps: Vec<usize>,
@@ -294,7 +294,7 @@ mod tests {
         fn append(
             &mut self,
             first: u64,
-            entries: &[String],
+            entries: &[Fields],
             _: &[Option<u64>],
             terminal: bool,
         ) -> Result<usize> {
@@ -342,7 +342,10 @@ mod tests {
         Entry {
             sequence,
             risk_sequence: Some(sequence),
-            record: format!("{sequence:04}"),
+            fields: Fields {
+                record: format!("{sequence:04}"),
+                ..Fields::default()
+            },
             terminal: false,
         }
     }
@@ -350,8 +353,8 @@ mod tests {
         let limit = fake.limit;
         PublishBuffer::with_sleep(fake, batch, 4, limit, record_sleep)
     }
-    fn expected(n: u64) -> Vec<String> {
-        (0..n).map(|s| format!("{s:04}")).collect()
+    fn expected(n: u64) -> Vec<Fields> {
+        (0..n).map(|s| entry(s).fields).collect()
     }
 
     #[test]
@@ -517,7 +520,10 @@ mod tests {
         let oversized = Entry {
             sequence: 1,
             risk_sequence: Some(1),
-            record: "12345".into(),
+            fields: Fields {
+                record: "12345".into(),
+                ..Fields::default()
+            },
             terminal: false,
         };
         assert!(matches!(b.insert(oversized), Err(Error::Resource)));
@@ -540,6 +546,39 @@ mod tests {
         b.flush().unwrap();
         assert_eq!(b.sink.stream, expected(3));
         sleeps();
+    }
+
+    #[test]
+    fn section_bytes_are_summed_before_retention_and_for_append_prefixes() {
+        let make = |sequence| Entry {
+            sequence,
+            risk_sequence: Some(sequence),
+            fields: Fields {
+                record: "rr".into(),
+                events: Some("eee".into()),
+                deps: Some("d".into()),
+            },
+            terminal: false,
+        };
+        // Each field fits by itself, but the six-byte entry must fail at five.
+        let mut rejected = PublishBuffer::with_sleep(Fake::new(11), 2, 5, 11, record_sleep);
+        assert!(matches!(rejected.insert(make(0)), Err(Error::Resource)));
+        assert_eq!(rejected.buffered(), 0);
+        assert!(rejected.sink.calls.is_empty());
+
+        let mut accepted = PublishBuffer::with_sleep(Fake::new(11), 2, 6, 11, record_sleep);
+        accepted.insert(make(0)).unwrap();
+        accepted.insert(make(1)).unwrap();
+        assert_eq!(
+            accepted.sink.calls,
+            vec![(0, 1, false, 1), (1, 1, false, 0)]
+        );
+        assert_eq!(accepted.sink.retained, 6);
+        assert_eq!(accepted.buffered(), 1);
+        accepted.sink.consume_all();
+        accepted.flush().unwrap();
+        assert_eq!(accepted.sink.stream, vec![make(0).fields, make(1).fields]);
+        assert!(sleeps().is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-"""Replay wire V3. All wire integers are canonical unsigned strings.
+"""Replay wire V4. All wire integers are canonical unsigned strings.
 
 The strict helpers below (closed objects, canonical integers, duplicate-key
 rejection) remain the reusable validators for configuration and output files.
@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import json
 import re
+from collections.abc import Mapping
 from types import MappingProxyType
 
 
@@ -262,6 +263,35 @@ INITIAL_FIELDS = (
     "pins start_ns end_ns lower_bound plans groups retain_boundaries_ns retain_shift_offsets_ns max_entry_bytes max_queue_bytes"
 )
 ENVELOPE_FIELDS = "version run_id attempt_id sequence kind body"
+SECTIONS = frozenset(("record", "events", "deps"))
+_UNDECLARED = object()
+
+
+def declared_sections(sections):
+    sections = frozenset(sections)
+    require("record" in sections and sections <= SECTIONS, "section declaration")
+    return sections
+
+
+class _SectionBody(Mapping):
+    """Missing capabilities raise even through Mapping.get(key, default)."""
+
+    __slots__ = ("_body", "_blocked")
+
+    def __init__(self, body, blocked):
+        self._body, self._blocked = body, blocked
+
+    def __getitem__(self, key):
+        require(key not in self._blocked, "undeclared section: " + str(key))
+        return self._body[key]
+
+    def __iter__(self):
+        return iter(self._body)
+
+    def __len__(self):
+        return len(self._body)
+
+
 SIDES = {"bid": 0, "ask": 1}
 # Dense price arrays cost 16 * (10**scale + 1) bytes per initialized book
 # (Kalshi/Polymarket scale 4: ~160 KiB; Limitless scale 3: ~16 KiB). Larger
@@ -296,7 +326,7 @@ class Book:
     __slots__ = (
         "revision",
         "validity",
-        "dependency",
+        "_dependency",
         "as_of",
         "reason",
         "_limit",
@@ -306,15 +336,21 @@ class Book:
         "_best",
     )
 
-    def __init__(self, price_scale):
+    def __init__(self, price_scale, *, deps=True):
         self.revision = 0
         self.validity = "not_initialized"
-        self.dependency = self.as_of = self.reason = None
+        self._dependency = None if deps else _UNDECLARED
+        self.as_of = self.reason = None
         self._limit = 10**price_scale
         self._dense = price_scale <= DENSE_MAX_PRICE_SCALE
         self._quantities = None  # allocated by the first snapshot
         self._occupied = (set(), set())
         self._best = [None, None]
+
+    @property
+    def dependency(self):
+        require(self._dependency is not _UNDECLARED, "undeclared section: deps")
+        return self._dependency
 
     def __repr__(self):
         return (
@@ -498,12 +534,13 @@ class Decoder:
     publisher ships in the same image and is trusted for everything else.
     """
 
-    def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes):
+    def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes, *, sections=SECTIONS):
         global _orjson
         if _orjson is None:
             import orjson as _orjson
 
         self.run_id, self.attempt_id = run_id, attempt_id
+        self.sections = declared_sections(sections)
         self._expected = decode(json.dumps(expected_initial).encode(), max_entry_bytes)
         self.limit = max_entry_bytes
         self._books = {}
@@ -534,14 +571,19 @@ class Decoder:
             raise
 
     def _apply(self, data):
-        require(type(data) is bytes and len(data) <= self.limit, "entry limit")
+        # Raw record bytes remain convenient for initial/terminal offline callers.
+        fields = {b"record": data} if type(data) is bytes else data
+        require(type(fields) is dict and b"record" in fields
+                and set(fields) <= {b"record", b"events", b"deps"}, "entry fields")
+        require(all(type(v) is bytes for v in fields.values())
+                and sum(map(len, fields.values())) <= self.limit, "entry limit")
         try:
-            r = _orjson.loads(data)
+            r = _orjson.loads(fields[b"record"])
         except (ValueError, UnicodeError, RecursionError) as e:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)
         require(
-            r["version"] == "3"
+            r["version"] == "4"
             and r["run_id"] == self.run_id
             and r["attempt_id"] == self.attempt_id,
             "identity/version",
@@ -549,6 +591,8 @@ class Decoder:
         seq = self.sequence + 1
         require(r["sequence"] == str(seq), "stream sequence gap or duplicate")
         kind, b = r["kind"], r["body"]
+        if kind != "cut":
+            require(set(fields) == {b"record"}, "entry fields")
         if seq == 0:
             self._initial(kind, b)
             risk_sequence = 0
@@ -568,10 +612,41 @@ class Decoder:
             require(kind == "cut", "record kind")
             risk_sequence = uint(b["risk_sequence"])
             require(risk_sequence > self.risk_sequence and risk_sequence >= seq, "risk sequence")
+            b = self._sections(b, fields)
             self._cut(b)
         self.sequence = seq
         self.risk_sequence = risk_sequence
         return Cut(seq, risk_sequence, kind, b, self._view)
+
+    def _sections(self, body, fields):
+        require(not ({"market_events", "control_events"} & body.keys()), "events in record")
+        transitions = body["book_transitions"]
+        require(all("dependency" not in t for t in transitions), "deps in record")
+        if "events" in self.sections:
+            if b"events" in fields:
+                try:
+                    events = _orjson.loads(fields[b"events"])
+                except (ValueError, UnicodeError, RecursionError) as e:
+                    raise ProtocolError("malformed JSON") from e
+                require(type(events) is dict and bool(events)
+                        and set(events) <= {"market_events", "control_events"}, "events fields")
+                body.update(events)
+        else:
+            body = _SectionBody(body, {"market_events", "control_events"})
+        require(b"deps" in fields, "missing deps")
+        if "deps" in self.sections:
+            try:
+                deps = _orjson.loads(fields[b"deps"])
+            except (ValueError, UnicodeError, RecursionError) as e:
+                raise ProtocolError("malformed JSON") from e
+            require(type(deps) is list and len(deps) == len(transitions), "deps alignment")
+            for transition, dependency in zip(transitions, deps):
+                transition["dependency"] = dependency
+        else:
+            # Guard transition access as well as Book.dependency. Never retain
+            # raw skipped blobs or replace missing evidence with null/empty data.
+            transitions[:] = [_SectionBody(t, {"dependency"}) for t in transitions]
+        return body
 
     def _initial(self, kind, b):
         """Sequence 0 only: complete closed validation of the pinned plan."""
@@ -598,7 +673,7 @@ class Decoder:
                 uint(p["price_scale"], 18),
                 uint(p["quantity_scale"], 18),
             )
-            books[k] = Book(self._plans[k][0])
+            books[k] = Book(self._plans[k][0], deps="deps" in self.sections)
         require(books)
         self._books.update(books)
 
@@ -623,17 +698,20 @@ class Decoder:
             if kind == "operations":
                 require(book.validity == "usable", "operations on unusable book")
                 book._operations(d["operations"])
-                book.dependency = t["dependency"]
+                if "deps" in self.sections:
+                    book._dependency = t["dependency"]
             elif kind == "snapshot":
                 book._snapshot(d["bids"], d["asks"])
                 book.validity = "usable"
-                book.dependency = t["dependency"]
+                if "deps" in self.sections:
+                    book._dependency = t["dependency"]
                 book.reason = None
             else:
                 require(kind == "invalidation", "unknown decision")
                 book._clear()
                 book.validity = "unusable"
-                book.dependency = None
+                if "deps" in self.sections:
+                    book._dependency = None
                 book.reason = d["reason"]
             book.revision = revision
             book.as_of = origin

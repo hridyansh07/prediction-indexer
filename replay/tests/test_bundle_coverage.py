@@ -16,7 +16,8 @@ from replay.strategies.bundle_coverage.output import (
 )
 from replay.preparation import encoded, prepare
 from replay.strategy_sdk import plain
-from replay.streams.protocol import Decoder, ProtocolError, books_sha256, freeze
+from replay.streams.protocol import SECTIONS, Decoder, ProtocolError, books_sha256, freeze
+from replay.tests.test_streams import fields
 from replay.tests.test_preparation import G2, R1, R2, config, detail
 from replay.tests.test_supervisor import config as supervisor_config, metadata_pin
 
@@ -36,6 +37,7 @@ class Harness:
         pin=None,
         wire_records=None,
         defer_initial=False,
+        sections=SECTIONS,
     ):
         self.root = root
         d = detail()
@@ -118,14 +120,14 @@ class Harness:
         self.initial.update(copy.deepcopy(getattr(self.strategy, "retention", None) or configured(self.snapshot, {})))
         if wire_records is not None:
             self.initial = wire_records[0]["body"]
-        self.decoder = Decoder("coverage-test", attempt, self.initial, 65536)
+        self.decoder = Decoder("coverage-test", attempt, self.initial, 65536, sections=sections)
         self.seq = 0
         self.pin = self.initial["pins"][0]
         if wire_records is None and not defer_initial:
             self.send("initial", self.initial)
         elif wire_records is not None:
             for record in wire_records:
-                cut = self.decoder.apply(encoded({**record, "run_id": "coverage-test", "attempt_id": attempt}))
+                cut = self.decoder.apply(fields({**record, "version": "4", "run_id": "coverage-test", "attempt_id": attempt}))
                 self.strategy(cut)
             self.decoder.finish()
             self.strategy.finish()
@@ -134,9 +136,9 @@ class Harness:
         if kind == "cut":
             body = {**body, "risk_sequence": str(self.seq)}
         cut = self.decoder.apply(
-            encoded(
+            fields(
                 {
-                    "version": "3",
+                    "version": "4",
                     "run_id": "coverage-test",
                     "attempt_id": self.context["attempt_id"],
                     "sequence": str(self.seq),

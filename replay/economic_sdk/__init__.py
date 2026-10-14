@@ -114,5 +114,9 @@ def factory(strategy_class):
         game = strategy.requirements(strategy.snapshot, strategy.experiment.policy).game
         return configured(snapshot, config, timers=game.timers if game is not None else ())
 
+    def sections(config):
+        return frozenset(("record", "events")) if config.get("policy", {}).get("profile") is not None else frozenset(("record",))
+
+    build.sections = sections
     build.retention = retention
     return build

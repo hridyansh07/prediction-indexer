@@ -49,16 +49,17 @@ end
 if op == 'append' then
     -- ARGV: previous published entry sequence ('-1' before initial), first
     -- entry sequence, terminal flag ('1' when the last entry is terminal),
-    -- then JSON risk-sequence strings (empty for initial/terminal) and entries.
+    -- then JSON risk-sequence strings (empty for initial/terminal), followed by
+    -- record/events/deps triples (empty string means absent optional section).
     -- Appends the longest prefix
     -- that fits under the queue byte limit and returns its length; 0 is the
     -- non-error FULL reply. Every check precedes every write.
     local previous, first, last_terminal = ARGV[2], ARGV[3], ARGV[4]
-    local n = #ARGV - 5
+    local n = (#ARGV - 5) / 3
     local s = redis.call('HMGET', state, 'poisoned', 'published', 'terminal', 'entry', 'bytes', 'limit', 'risk_progress')
     -- Poisoned first, so a failed attempt still stops a waiting publisher.
     if s[1] ~= '0' then return fail('poisoned') end
-    if n < 1 or s[2] ~= previous or s[3] ~= '' then return fail('sequence') end
+    if n < 1 or n ~= math.floor(n) or s[2] ~= previous or s[3] ~= '' then return fail('sequence') end
     local risks = cjson.decode(ARGV[5])
     if #risks ~= n then return fail('risk_progress') end
     local risk = s[7]
@@ -74,7 +75,8 @@ if op == 'append' then
     -- An entry larger than the per-entry cap can never fit: fatal.
     local cap, sizes = tonumber(s[4]), {}
     for i=1,n do
-        sizes[i] = string.len(ARGV[5 + i])
+        local at = 6 + (i - 1) * 3
+        sizes[i] = string.len(ARGV[at]) + string.len(ARGV[at + 1]) + string.len(ARGV[at + 2])
         if sizes[i] > cap then return fail('resource_limit') end
     end
     -- A full queue is not an error: append only the prefix that fits. The
@@ -88,7 +90,17 @@ if op == 'append' then
     local fields, total = {}, 0
     for i=1,k do
         local id = string.format('%d', start + i - 1)
-        redis.call('XADD', stream, id .. '-0', 'record', ARGV[5 + i])
+        local at = 6 + (i - 1) * 3
+        local entry = {'record', ARGV[at]}
+        if ARGV[at + 1] ~= '' then
+            entry[#entry + 1] = 'events'
+            entry[#entry + 1] = ARGV[at + 1]
+        end
+        if ARGV[at + 2] ~= '' then
+            entry[#entry + 1] = 'deps'
+            entry[#entry + 1] = ARGV[at + 2]
+        end
+        redis.call('XADD', stream, id .. '-0', unpack(entry))
         fields[#fields + 1] = 'size:' .. id
         fields[#fields + 1] = sizes[i]
         total = total + sizes[i]

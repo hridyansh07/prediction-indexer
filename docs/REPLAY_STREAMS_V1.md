@@ -529,3 +529,50 @@ The decoder checks in O(1) that cut Risk sequence strictly increases and is at
 least wire sequence. At terminal it requires `cuts == wire sequence - 1`,
 `risk_cuts >= cuts`, and `risk_cuts >= last Risk sequence`, plus the existing final
 book digest. All existing wire contiguity checks remain unchanged.
+
+## Wire version 4: declared sections
+
+V4 supersedes V3's envelope version and single-field encoding. There is no
+cross-version fallback. One retained cut is still one Redis entry, with UTF-8
+JSON fields:
+
+- `record`: the version-`"4"` envelope, Risk sequence, complete origin and ordered
+  authoritative transitions (keys, revisions and complete decisions). No event
+  arrays or transition dependencies.
+- `events`: an object containing the original `market_events` and optional
+  `control_events`, preserving presence, order and every leaf. Absent only when
+  neither array was present in the original body.
+- `deps`: the dependencies (including nulls), aligned one-to-one with transition
+  order. Present on cuts, including `[]` for a cut without transitions.
+
+Initial and terminal entries have `record` only; their complete bodies are
+unchanged. Retention runs on the original Risk cut before any projection,
+including control-only cuts. The final-book digest, revisions, Risk/wire
+sequences, ACKs and completion semantics are unchanged.
+
+`Consumer(..., sections=...)` passes the group's declaration to `Decoder`.
+`record` is required. The default is all three sections. Only declared sections
+are parsed; all field values still count toward the aggregate entry, queue,
+publisher-call and consumer-batch byte limits. `append` now takes fixed triples
+`record events deps` per entry after its risk-sequence array; an empty argument
+means an absent optional field. Stored `size:*` values and last-ACK release use
+the summed field lengths.
+
+With all sections declared, cut bodies reassemble exactly to V3, with each
+dependency restored on its original transition and on `Book.dependency`.
+Without `events`, body indexing and `.get()` for either event array raise
+`ProtocolError`; without `deps`, `Book.dependency` and transition dependency
+access raise, including default-returning accessors. Skipped malformed blobs
+are deliberately not detected by groups that did not declare them. Parsed
+sections must have their section shape and dependency alignment; existing
+publisher-trusted nested semantics are unchanged.
+
+Declarations are resolved before participant launch by `strategy_sdk.stream_sections`:
+economic SDK factories declare `record`, adding `events` when `policy.profile`
+is non-null; standalone profile and bundle coverage declare `record + events`.
+Other/custom factories default to all sections, or may expose `sections(config)`.
+The adapter binds the launch declaration to the independently resolved one.
+No strategy package or semantic output identity is changed by declarations.
+This avoids JSON decoding, not Redis/socket transfer: XREADGROUP still receives
+every field. Frozen V3 fixtures remain the reassembly oracle, not a supported
+input version for the V4 decoder.

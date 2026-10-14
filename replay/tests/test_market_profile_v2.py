@@ -58,6 +58,26 @@ class Case(unittest.TestCase):
 
 
 class AvailabilityParityTests(Case):
+    def test_declared_sections_preserve_every_group_output_byte(self):
+        from replay.streams.protocol import SECTIONS
+        from replay.tests.test_bundle_coverage import Harness as CoverageHarness
+
+        tape = [json.loads(line) for line in
+                (Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures/strategy-sparse.ndjson").read_bytes().splitlines()]
+        for name, factory, kwargs, output_attr, declared in (
+                ("economic", ComplementHarness, {"known": True, "policy": v2_policy()}, "output", {"record"}),
+                ("embedded", ComplementHarness, {"known": True, "policy": v2_policy(profile=PROFILE_POLICY)}, "output", {"record", "events"}),
+                ("profile", Harness, {"policy": v2("availability", "levels", "transitions")}, "profile_output", {"record", "events"}),
+                ("coverage", CoverageHarness, {}, "output", {"record", "events"})):
+            outputs = []
+            for index, sections in enumerate((SECTIONS, declared)):
+                h = factory(self.sub(f"{name}-sections-{index}"), scopes=True, lower_bound="expand_to_window_start",
+                            pin=tape[0]["body"]["pins"][0], wire_records=tape, sections=sections, **kwargs)
+                root = getattr(h, output_attr)
+                outputs.append({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            with self.subTest(group=name):
+                self.assertEqual(outputs[0], outputs[1])  # Includes receipts and stored compressed bytes.
+
     def test_real_rust_full_and_sparse_wire_have_byte_identical_semantic_outputs(self):
         fixtures = Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures"
         tapes = [[json.loads(line) for line in (fixtures / name).read_bytes().splitlines()]
