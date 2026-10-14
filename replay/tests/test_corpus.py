@@ -173,6 +173,206 @@ class ResultsTests(unittest.TestCase):
                                bench_exit=0, game_state=None, inputs=[("result.json", context)])
             self.assertFalse((Path(tmp) / "r2").exists())
 
+    def test_deep_prerequisites_and_readonly_original_image_runner(self):
+        from replay.corpus import deep
+        from replay.bench.docker import DockerError
+        from replay.tests.test_bundle_coverage import Harness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bench = root / "bench"
+            bench.mkdir()
+            h = Harness(bench)
+            h.window(); h.finish()
+            image, fees, address = "sha256:" + "a" * 64, "b" * 64, "d" * 64
+            source = root / "cache/derivatives" / address
+            source.mkdir(parents=True)
+            receipt = {}
+            for kind in ("manifest", "events", "rejects", "sources"):
+                name = "manifest.json" if kind == "manifest" else kind + ".ndjson.zst"
+                payload = b"{}" if kind == "manifest" else kind.encode()
+                (source / name).write_bytes(payload)
+                identity = {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload)}
+                receipt[kind] = {"file": name, **identity} if kind == "manifest" else {"file": name, "stored": identity}
+            raw = json.dumps(receipt).encode()
+            (source / "receipt.json").write_bytes(raw)
+            groups = [{"name": "a", "reader": "replay.strategies.bundle_coverage:read_completed"},
+                      {"name": "b", "reader": "replay.strategies.market_profile:read_completed"}]
+            (bench / "image.id").write_text(image)
+            (bench / "game_state").mkdir()
+            (bench / "game_state/game_state.json").write_bytes(b"{}")
+            (bench / "result.json").write_text(json.dumps({"image": {"id": image},
+                "context": {"snapshot_sha256": h.sha}, "fee_catalog_identity": fees,
+                "game_state_sha256": hashlib.sha256(b"{}").hexdigest()}))
+            (bench / "spec.resolved.json").write_text(json.dumps({"groups": groups}))
+            (bench / "run").mkdir()
+            (bench / "run/run.json").write_text(json.dumps({"strategies": {"a": {}, "b": {}},
+                "transport": {"inputs": [{"derivative_address": address,
+                    "directory": "/bench/in/private-derivatives/" + address,
+                    "receipt_sha256": hashlib.sha256(raw).hexdigest()}]}, "limits": {"run_seconds": 100}}))
+            dest = root / "results/b1"
+            results.commit(bench, dest, corpus_key="k", bundle_id="b1", status="SUCCESS", bench_exit=0,
+                           game_state=None)
+            spec = {"fees": {"template_catalog": str(root / "fees")},
+                    "derivative_cache": {"root": str(root / "cache")}}
+            reports = [{"group": "a", "status": "PASS"}, {"group": "b", "status": "PASS"}]
+            calls = []
+
+            class Docker:
+                def run(self, args, **kwargs):
+                    if args[0] != "image":
+                        raise AssertionError("only an injected runner may launch")
+                    return image
+
+            def runner(args, *, timeout):
+                calls.append(args)
+                self.assertEqual(timeout, 160)
+                mounts = [args[i + 1] for i, arg in enumerate(args) if arg == "--mount"]
+                self.assertTrue(all(m.endswith(",readonly") for m in mounts))
+                self.assertTrue(any("dst=/bench/run," in m for m in mounts))
+                self.assertTrue(any("dst=/bench/context," in m for m in mounts))
+                self.assertTrue(any("dst=/bench/game_state.json," in m for m in mounts))
+                self.assertTrue(any("dst=/bench/fees/" + fees + "," in m for m in mounts))
+                self.assertTrue(any("dst=/bench/in/private-derivatives/" + address + "," in m for m in mounts))
+                self.assertFalse(any("dst=/bench," in m for m in mounts))
+                self.assertEqual(args[args.index("--pull") + 1], "never")
+                self.assertEqual(args[args.index("--network") + 1], "none")
+                self.assertEqual(json.loads(args[-1]), groups)
+                self.assertEqual(args[args.index("-c") - 1], image)
+                compile(args[args.index("-c") + 1], "deep-entry", "exec")
+                return json.dumps(reports)
+
+            catalog_loader = lambda _: SimpleNamespace(identity=fees)
+            self.assertEqual(deep.audit(dest, spec, docker=Docker(), runner=runner,
+                                        catalog_loader=catalog_loader), reports)
+            (bench / "image.id").unlink()   # run_bench omits this when reusing an image
+            reused = root / "results/b2"
+            results.commit(bench, reused, corpus_key="k", bundle_id="b2", status="SUCCESS", bench_exit=0,
+                           game_state=None)
+            self.assertEqual(deep.audit(reused, spec, docker=Docker(), runner=runner,
+                                        catalog_loader=catalog_loader), reports)
+            # Missing environment cases do not launch anything or modify evidence.
+            bad_image = SimpleNamespace(run=lambda *a, **kw: (_ for _ in ()).throw(DockerError("absent")))
+            with self.assertRaisesRegex(deep.MissingPrerequisite, "deep: missing prerequisite image " + image):
+                deep.audit(dest, spec, docker=bad_image, runner=runner, catalog_loader=catalog_loader)
+            with self.assertRaisesRegex(deep.MissingPrerequisite, "deep: missing prerequisite fees " + fees):
+                deep.audit(dest, spec, docker=Docker(), runner=runner,
+                           catalog_loader=lambda _: SimpleNamespace(identity="c" * 64))
+            (source / "manifest.json").unlink()
+            with self.assertRaisesRegex(deep.MissingPrerequisite, "deep: missing prerequisite derivative " + address):
+                deep.audit(dest, spec, docker=Docker(), runner=runner, catalog_loader=catalog_loader)
+            self.assertEqual(len(calls), 2)
+            results.verify(dest)
+
+    def test_deep_calls_configured_readers_unchanged_and_continues_after_a_group_failure(self):
+        from replay.corpus.deep import _script
+        seen = []
+
+        def importer(reference):
+            def reader(directory, group):
+                seen.append((reference, directory, group))
+                if group == "a":
+                    raise ValueError("bad semantics")
+                return {"receipt": {}, "manifest": {}, "summary": {}}
+            return reader
+
+        groups = [{"name": "a", "reader": "original:a"}, {"name": "b", "reader": "original:b"}]
+        out = io.StringIO()
+        # Execute the exact source sent into recorded images, not another reader.
+        with patch("replay.strategies.load_entrypoint", side_effect=importer), \
+             patch("sys.argv", ["-c", json.dumps(groups)]), patch("sys.stdout", out):
+            exec(compile(_script(), "deep-entry", "exec"), {})
+        self.assertEqual(seen, [("original:a", Path("/bench/run"), "a"),
+                                ("original:b", Path("/bench/run"), "b")])
+        reports = json.loads(out.getvalue())
+        self.assertEqual([r["status"] for r in reports], ["FAIL", "PASS"])
+        self.assertEqual(reports[0]["error"], "ValueError: bad semantics")
+
+    def test_deep_subset_sampling_and_each_bundle_report_are_isolated(self):
+        from replay.corpus.__main__ import verify_deep
+        from replay.corpus.deep import MissingPrerequisite
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bench = root / "bench"
+            bench.mkdir(); (bench / "result.json").write_text("{}")
+            for name in ("a", "b", "c", "d", "e"):
+                results.commit(bench, root / "results" / name, corpus_key="k", bundle_id=name,
+                               status="SUCCESS", bench_exit=0, game_state=None)
+            (root / "results/uncommitted").mkdir()
+            seen = []
+
+            def audit(directory, spec):
+                seen.append(directory.name)
+                if directory.name in ("a", "b", "c"):
+                    raise MissingPrerequisite({"a": "image", "b": "derivative", "c": "fees"}[directory.name], "pin")
+                if directory.name == "d":
+                    raise ValueError("invalid result")
+                return [{"group": "g", "status": "PASS"}]
+
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                self.assertEqual(verify_deep(root / "results", {}, auditor=audit), 1)
+            self.assertEqual(seen, ["a", "b", "c", "d", "e"])
+            for name, kind in (("a", "image"), ("b", "derivative"), ("c", "fees")):
+                self.assertIn(f"{name} deep: missing prerequisite {kind} pin", out.getvalue())
+            self.assertIn("e deep: g PASS", out.getvalue())
+            self.assertIn("deep verified 1, failed 1, missing prerequisites 3", out.getvalue())
+            seen.clear()
+            with patch("sys.stdout", io.StringIO()):
+                self.assertEqual(verify_deep(root / "results", {}, bundles=["b", "a", "b"], auditor=audit), 2)
+            self.assertEqual(seen, ["a", "b"])
+            seen.clear()
+            with patch("sys.stdout", io.StringIO()):
+                verify_deep(root / "results", {}, sample=2, auditor=audit)
+            # random.Random(0) over a sorted five-element population chooses d/e.
+            self.assertEqual(seen, ["d", "e"])
+            seen.clear()
+            with patch("sys.stdout", io.StringIO()):
+                verify_deep(root / "results", {}, sample=2, seed=0, auditor=audit)
+            self.assertEqual(seen, ["d", "e"])
+            seen.clear()
+            with patch("sys.stdout", io.StringIO()):
+                verify_deep(root / "results", {}, sample=2, seed=1, auditor=audit)
+            self.assertEqual(seen, ["a", "b"])
+
+    def test_deep_cli_routes_subsets_without_writes_and_plain_verify_stays_rehash_only(self):
+        from replay.corpus import __main__ as entry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("runner.json", "materializer"):
+                (root / name).write_text("{}")
+            (root / "canonical").mkdir()
+            cache = root / "absent-cache"
+            spec = spec_document(root, derivative_cache={"root": str(cache), "max_bytes": 1000})
+            path = root / "spec.json"
+            path.write_text(json.dumps(spec))
+            bench = root / "bench"
+            bench.mkdir(); (bench / "result.json").write_text("{}")
+            key = "a" * 64
+            for name in ("a", "b", "c"):
+                results.commit(bench, root / "results" / key[:16] / name, corpus_key=key, bundle_id=name,
+                               status="SUCCESS", bench_exit=0, game_state=None)
+            seen = []
+
+            def auditor(directory, spec):
+                seen.append(directory.name)
+                return [{"group": "g", "status": "PASS"}]
+
+            with patch.object(entry, "_context", return_value=(key, b"{}")), \
+                 patch("replay.corpus.deep.audit", side_effect=auditor), patch("sys.stdout", io.StringIO()):
+                self.assertEqual(entry.main(["verify", str(path), "--deep", "--bundle", "b", "--bundle", "c"]), 0)
+                self.assertEqual(seen, ["b", "c"])
+                self.assertFalse(cache.exists())
+                self.assertFalse(Path(spec["ledger"]).exists())
+                seen.clear()
+                self.assertEqual(entry.main(["verify", str(path), "--deep", "--sample", "1", "--seed", "1"]), 0)
+                self.assertEqual(seen, ["a"])
+                seen.clear()
+                self.assertEqual(entry.main(["verify", str(path)]), 0)
+                self.assertEqual(seen, [])
+
 
 class SpecTests(unittest.TestCase):
     def test_closed_schema_and_corpus_tokens(self):
