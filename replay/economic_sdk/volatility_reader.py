@@ -103,6 +103,8 @@ class _Reconstruction:
             require(len(self.buckets) < MAX_BUCKETS, "volatility reader bucket budget")
             self.budget.charge(self.cost, "volatility reader state budget")
             self.buckets[identity] = self._blank()
+            end = min(self.start + (bucket + 1) * self.width, self.end)
+            self.next_flush = min(self.next_flush, end + self.offsets[-1])
         return self.buckets[identity]
 
     def _enter(self):
@@ -110,6 +112,7 @@ class _Reconstruction:
         scope = self.snapshot["scopes"][self.scope]
         self.start, self.end = int(scope["start_ns"]), int(scope["end_ns"])
         self.clock = self.grid = self.start
+        self.next_flush = self.end + self.offsets[-1]
         self.destinations = [self.start + h for h in self.offsets]
         self.state = {i: (False, None, None) for i in self.memberships[self.scope]}
         self.scoped_pairs = [p for p in self.pairs if p["scope"] == self.scope]
@@ -235,10 +238,16 @@ class _Reconstruction:
                     for k, v in stat.items()} for h, stat in row["horizons"].items()}
 
     def flush(self, time, closing=False):
+        # Only a newly eligible bucket can change a non-closing drain. The
+        # scalar watermark fits the existing accumulator reservation.
+        if not closing and time < self.next_flush:
+            return
+        self.next_flush = self.end + self.offsets[-1]
         for identity in sorted(self.buckets):
             bucket, key = identity
             end = min(self.start + (bucket + 1) * self.width, self.end)
             if not closing and end + self.offsets[-1] > time:
+                self.next_flush = min(self.next_flush, end + self.offsets[-1])
                 continue
             row = self.buckets.pop(identity)
             self.budget.release(self.cost)
