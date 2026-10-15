@@ -1,6 +1,6 @@
-//! Canonical-prefix scanner used only for excluded, receipt-pinned events.
+//! Canonical-prefix classification of receipt-pinned events.
 //! This is not a JSON parser. Any layout/selection mismatch takes the existing
-//! serde path; untouched body bytes rely on the stored-frame digest at EOF.
+//! serde path; excluded body bytes rely on the stored-frame digest at EOF.
 use std::ops::Range;
 
 use replay_domain::{CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader, LaneId};
@@ -93,7 +93,12 @@ impl ScannedHeader {
     }
 }
 
-pub(crate) fn excluded_header(line: &[u8], scope: &ScopeFilter) -> Option<(u16, ParsedHeader)> {
+pub(crate) enum ScannedEvent {
+    Selected,
+    Excluded(u16, ParsedHeader),
+}
+
+pub(crate) fn classify_event(line: &[u8], scope: &ScopeFilter) -> Option<ScannedEvent> {
     let mut s = Scanner { line, offset: 0 };
     s.exact(b"{\"schema_version\":")?;
     let version = u16::try_from(s.number()?).ok()?;
@@ -196,9 +201,9 @@ pub(crate) fn excluded_header(line: &[u8], scope: &ScopeFilter) -> Option<(u16, 
         scope.lanes.contains(lane_text)
     };
     if keep {
-        return None; // Kept events retain the complete T4 typed-body path.
+        return Some(ScannedEvent::Selected);
     }
-    Some((
+    Some(ScannedEvent::Excluded(
         version,
         ParsedHeader::Scanned(ScannedHeader {
             visible_ns,

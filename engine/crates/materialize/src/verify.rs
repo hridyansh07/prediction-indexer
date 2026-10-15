@@ -11,7 +11,7 @@ use prediction_encoder::{
 use replay_domain::{RawSegmentRecord, SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::input::{ParsedHeader, excluded_header};
+use super::input::{ParsedHeader, ScannedEvent, classify_event};
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
 use super::scope::{EventProjection, ScopeFilter};
 use super::{DERIVATIVE_MANIFEST_FILE, DERIVATIVE_RECEIPT_FILE, DerivativeSpec};
@@ -210,8 +210,8 @@ pub(crate) enum ReadMode {
 
 /// Parses one normalized event line and checks canonical child order. `Audit`
 /// also proves the line's canonical encoding. An unscoped `PinnedReplay` uses
-/// one typed pass; a scoped read validates a header and borrowed body projection
-/// before constructing only the selected typed bodies.
+/// one typed pass. A recognized selected event uses scoped typed decoding;
+/// unrecognized layouts, faults and decode failures retain the projection path.
 pub(crate) fn parse_event(
     line: &[u8],
     previous: &mut Option<(i64, u32)>,
@@ -222,8 +222,25 @@ pub(crate) fn parse_event(
 ) -> Result<ParsedEvent, String> {
     let invalid = |error| format!("invalid normalized event: {error}");
     let scanned =
-        scope.and_then(|(scope, fast)| fast.then(|| excluded_header(line, scope)).flatten());
-    let (version, parsed) = if let Some((version, header)) = scanned {
+        scope.and_then(|(scope, fast)| fast.then(|| classify_event(line, scope)).flatten());
+    // A failed typed attempt must not replace the fallback's ordered validation
+    // or its body-relative diagnostics, even when the prefix was recognized.
+    let selected = if matches!(scanned, Some(ScannedEvent::Selected)) {
+        SegmentRecord::from_json_scoped(line).ok()
+    } else {
+        None
+    };
+    let (version, parsed) = if let Some(record) = selected {
+        debug_assert_eq!(mode, ReadMode::PinnedReplay);
+        (
+            record.schema_version(),
+            ParsedEvent {
+                header: ParsedHeader::Typed(record.header().clone()),
+                record: Some(record),
+                fault: None,
+            },
+        )
+    } else if let Some(ScannedEvent::Excluded(version, header)) = scanned {
         debug_assert_eq!(mode, ReadMode::PinnedReplay);
         (
             version,

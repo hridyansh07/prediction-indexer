@@ -107,6 +107,21 @@ impl SegmentRecord {
         })
     }
 
+    /// Single-pass selected-body decode for the pinned scoped reader. Unlike
+    /// the unscoped decoder, this also rejects unknown fields on the event,
+    /// book and control wrappers, as the scoped selection projection does.
+    /// On failure the reader must use its projection fallback to preserve the
+    /// original validation order and diagnostic text.
+    pub fn from_json_scoped(bytes: &[u8]) -> Result<Self, DomainError> {
+        let (schema_version, header, event) = parse_json(bytes, ScopedEventSeed)?;
+        event.validate()?;
+        Ok(Self {
+            schema_version,
+            header,
+            event,
+        })
+    }
+
     fn from_wire(wire: SegmentRecordWire) -> Result<Self, DomainError> {
         if !supported_schema(wire.schema_version) {
             return Err(DomainError::UnsupportedSchemaVersion(wire.schema_version));
@@ -332,6 +347,122 @@ impl<'de> serde::de::DeserializeSeed<'de> for EventSeed {
     }
 }
 
+// Reuse the existing payload types (including frozen schema 3); only wrapper
+// validation differs from the unscoped decoder. No RawValue or Value tree.
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ScopedEvent<B, T> {
+    Control(ClosedWrapper<ControlEvent>),
+    Book(ClosedWrapper<B>),
+    AuditAnchor(AuditAnchor),
+    NormalizationFault(NormalizationFault),
+    Trade(T),
+}
+
+struct ScopedEventSeed(u16);
+impl<'de> serde::de::DeserializeSeed<'de> for ScopedEventSeed {
+    type Value = SegmentEvent;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        if self.0 == crate::SEGMENT_SCHEMA_V3 {
+            use super::schema3;
+            let event =
+                match ScopedEvent::<schema3::Book, schema3::Trade>::deserialize(deserializer)? {
+                    ScopedEvent::Control(v) => schema3::Event::Control(v.0),
+                    ScopedEvent::Book(v) => schema3::Event::Book(v.0),
+                    ScopedEvent::AuditAnchor(v) => schema3::Event::AuditAnchor(v),
+                    ScopedEvent::NormalizationFault(v) => schema3::Event::NormalizationFault(v),
+                    ScopedEvent::Trade(v) => schema3::Event::Trade(v),
+                };
+            event.try_into().map_err(serde::de::Error::custom)
+        } else {
+            Ok(
+                match ScopedEvent::<BookEvent, TradeEvent>::deserialize(deserializer)? {
+                    ScopedEvent::Control(v) => SegmentEvent::Control(v.0),
+                    ScopedEvent::Book(v) => SegmentEvent::Book(v.0),
+                    ScopedEvent::AuditAnchor(v) => SegmentEvent::AuditAnchor(v),
+                    ScopedEvent::NormalizationFault(v) => SegmentEvent::NormalizationFault(v),
+                    ScopedEvent::Trade(v) => SegmentEvent::Trade(v),
+                },
+            )
+        }
+    }
+}
+
+struct ClosedWrapper<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ClosedWrapper<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WrapperVisitor<T>(core::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for WrapperVisitor<T> {
+            type Value = ClosedWrapper<T>;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("a closed kind/value wrapper")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(WrapperMap(
+                    map,
+                )))
+                .map(ClosedWrapper)
+            }
+        }
+
+        deserializer.deserialize_map(WrapperVisitor(core::marker::PhantomData))
+    }
+}
+
+// Guard only this wrapper's keys. The domain's existing decoder still owns
+// duplicates, variants and payload validation, with no stricter leaf schema.
+struct WrapperMap<A>(A);
+
+impl<'de, A: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for WrapperMap<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Kind,
+            Value,
+        }
+
+        self.0
+            .next_key::<Field>()?
+            .map(|field| {
+                let key = match field {
+                    Field::Kind => "kind",
+                    Field::Value => "value",
+                };
+                seed.deserialize(serde::de::value::StrDeserializer::<A::Error>::new(key))
+            })
+            .transpose()
+    }
+
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0.next_value_seed(seed)
+    }
+}
+
 impl Serialize for SegmentRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -344,5 +475,73 @@ impl Serialize for SegmentRecord {
             record.serialize_field("event", &self.event)?;
         }
         record.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CanonicalProvenance, ContinuityVerdict, ContractOrientation, EventAddress, FullBook,
+        InstrumentId, LaneId, Sha256,
+    };
+
+    #[test]
+    fn scoped_decode_closes_wrappers_without_changing_unscoped_decode() {
+        let header = EventHeader::new(
+            1,
+            1,
+            None,
+            EventAddress::new(1, LaneId::new("x").unwrap(), 1, 0).unwrap(),
+            "record-1",
+            CanonicalProvenance::new(
+                Sha256::digest(b"source"),
+                1,
+                Sha256::digest(b"content"),
+                ContinuityVerdict::Continuous,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for event in [
+            SegmentEvent::Book(BookEvent::Full(
+                FullBook::new(
+                    InstrumentId::new("kalshi:A").unwrap(),
+                    ContractOrientation::Outcome,
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )),
+            SegmentEvent::Control(ControlEvent::ConnectionClosed { epoch: "e".into() }),
+        ] {
+            let record = SegmentRecord::new(header.clone(), event).unwrap();
+            let canonical = String::from_utf8(record.to_canonical_json()).unwrap();
+            for version in [crate::SEGMENT_SCHEMA_V3, crate::SEGMENT_SCHEMA_V4] {
+                let line = if version == crate::SEGMENT_SCHEMA_V3 {
+                    canonical
+                        .replacen("\"schema_version\":4", "\"schema_version\":3", 1)
+                        .replace(",\"venue_time\":null", "")
+                } else {
+                    canonical.clone()
+                };
+                let decoded = SegmentRecord::from_json_scoped(line.as_bytes()).unwrap();
+                assert_eq!(decoded, SegmentRecord::from_json(line.as_bytes()).unwrap());
+                assert_eq!(decoded.to_canonical_json(), line.as_bytes());
+                // An extra key after the value keeps the canonical selection
+                // prefix intact. Both wrapper depths must still reject it.
+                for depth in [2, 3] {
+                    let invalid = format!(
+                        "{},\"extra\":{{}}{}",
+                        &line[..line.len() - depth],
+                        "}".repeat(depth)
+                    );
+                    assert!(SegmentRecord::from_json(invalid.as_bytes()).is_ok());
+                    assert!(SegmentRecord::from_json_scoped(invalid.as_bytes()).is_err());
+                }
+            }
+        }
     }
 }
