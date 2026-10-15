@@ -27,10 +27,34 @@ A SQLite ledger (`ledger`) makes the run resumable. A failed stage is recorded
 for that bundle and never stops the corpus. `--retry-failed` reruns failures.
 The retired-bundle list is cached next to the ledger as `retired-bundles.json`.
 
-The corpus key binds the groups, image source commit, materializer, runner
-config, fees and limits, so results from different inputs never mix. A dirty
-checkout changes the key and is refused unless you pass `--allow-dirty`. Commit
-before a real run.
+The version-2 corpus key binds each group's canonical factory reference and
+declared `STRATEGY_VERSION`, the shared `REPLAY_SEMANTICS_VERSION`, the materializer
+describe, the verbatim groups and `game_state`. Git commit/dirty state, Dockerfile,
+runner config, Universe URL, fees and limits do not define this semantic key.
+Bundle selectors, paths and the derivative cache also stay out of it. A dirty
+checkout is still refused unless you pass `--allow-dirty`; commit before a real
+run. The source commit remains the bench image's `REPLAY_IMAGE_REVISION` and is
+recorded with the dirty flag as best-effort ledger provenance in `source:<key>`,
+next to `image_id:<key>`. A different recorded source commit warns, but does not
+fail or change result bytes.
+
+## Version-bump rule
+
+- **Bump `STRATEGY_VERSION`** in the strategy package for any change that can
+  alter that strategy's outputs.
+- **Bump `REPLAY_SEMANTICS_VERSION`** in `replay/semantics.py` for any such change
+  in shared layers: the economic SDK, streams, strategy SDK, adapter, supervisor,
+  and Rust publisher, Risk and wire output semantics.
+- **Byte-identical performance changes bump nothing.** Proof is the byte-identity
+  validation.
+- **A new corpus key means a separate corpus run.** Results are never mixed
+  across keys.
+
+`replay/tests/test_strategy_versions.py` guards deterministic fixture outputs for
+every shipped strategy against `strategy_version_digests.json`. After an
+intentional output change, bump the appropriate version and update the digest
+table; the test module includes the command to print it. These small offline
+fixtures do not replace byte-identity validation of performance changes.
 
 ## Verification and deep audits
 
@@ -57,8 +81,8 @@ derivative or fee catalog identity mismatch reports
 does not invalidate its result. Context/game-state prerequisites are also
 checked. Exit status is **0** for a complete passing audit, **1** for any result
 failure, or **2** when only missing prerequisites prevent completion. The spec
-and source/tool inputs still identify the corpus key; use the original inputs
-to select an older corpus.
+and declared strategy/shared versions and materializer still identify the corpus
+key; use the original semantic inputs to select an older corpus.
 
 ## Optional persistent derivative cache
 
