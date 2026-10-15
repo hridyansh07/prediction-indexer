@@ -11,6 +11,7 @@ _LADDER_SIDES = {"ask": "ask", "bid": "bid", "kalshi_complement_ask": "bid",
                  "kalshi_complement_bid": "ask"}
 
 _NO_LADDERS = {}
+_NO_AGES = {}
 
 
 class BookView:
@@ -22,15 +23,17 @@ class BookView:
 
     __slots__ = ("validity", "reason", "last_change", "bid_present", "ask_present",
                  "best_bid", "best_ask", "fills", "transformed", "levels", "crossed",
-                 "ladders")
+                 "ladders", "best_changes")
 
     def __init__(self, validity, reason, last_change, bid_present, ask_present,
-                 best_bid, best_ask, fills, transformed, levels, ladders=_NO_LADDERS):
+                 best_bid, best_ask, fills, transformed, levels, ladders=_NO_LADDERS,
+                 best_changes=_NO_AGES):
         self.validity, self.reason, self.last_change = validity, reason, last_change
         self.bid_present, self.ask_present = bid_present, ask_present
         self.best_bid, self.best_ask = best_bid, best_ask
         self.fills, self.transformed, self.levels = fills, transformed, levels
         self.ladders = ladders
+        self.best_changes = best_changes
         # The book's own best bid strictly above its best ask.
         self.crossed = (best_bid is not None and best_ask is not None
                         and best_bid[0] > best_ask[0])
@@ -85,9 +88,9 @@ class ViewBuilder:
     """Builds views for one book key from its static union requirement."""
 
     __slots__ = ("sides", "sizes", "sizes_atoms", "transforms", "unit", "ladders",
-                 "ladder_sides")
+                 "ladder_sides", "ages")
 
-    def __init__(self, requirement, plan):
+    def __init__(self, requirement, plan, *, ages=False):
         quantity_unit = 10 ** int(plan["quantity_scale"])
         self.sides = requirement.sides
         self.sizes = requirement.sizes_contracts
@@ -95,6 +98,7 @@ class ViewBuilder:
         self.transforms = requirement.transforms
         self.unit = 10 ** int(plan["price_scale"])
         self.ladders = requirement.ladders
+        self.ages = ages
         # A retained ladder depends on every level of its side, so that side is
         # never reused merely because a touched price lies beyond consumed depth.
         self.ladder_sides = frozenset(_LADDER_SIDES[source] for source in self.ladders)
@@ -172,9 +176,28 @@ class ViewBuilder:
                     else complement_ladder(retained[side], self.unit))
         for ladder in retained.values():
             levels += len(ladder)
+        best_changes = {
+            source: (prior.best_changes[source] if prior is not None
+                     and prior.ladders[source][:1] == retained[source][:1]
+                     else last_change if book.validity != "not_initialized" else None)
+            for source in self.ladders} if self.ages else _NO_AGES
         return BookView(book.validity, plain(book.reason), last_change,
                         presence.get("bid", False), presence.get("ask", False),
-                        best.get("bid"), best.get("ask"), fills, transformed, levels, retained)
+                        best.get("bid"), best.get("ask"), fills, transformed, levels, retained,
+                        best_changes)
+
+
+def quote_ages(sources, views, time):
+    """Ages of each walked ladder's own committed best-level change."""
+    rows = []
+    for source, view in zip(sources, views):
+        best = view.best_changes[source]
+        book = None if view.validity == "not_initialized" else time - view.last_change
+        require(book is None or book >= 0, "quote age before book update")
+        require(best is None or time >= best, "quote age before best update")
+        rows.append({"book_ns": None if book is None else str(book),
+                     "best_ns": None if best is None else str(time - best)})
+    return rows
 
 
 def touched_sides(cut):

@@ -41,7 +41,7 @@ from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, 
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, GameRequirement, Observation
 from replay.economic_sdk.game import ANCHORS, Timeline, binding as game_binding, episode_game, game_policy
-from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
+from replay.economic_sdk.views import ViewBuilder, quote_ages, touched_sides, unavailable_view
 from replay.fees.lazy import assessment_json
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
@@ -184,7 +184,8 @@ class Runtime:
         self.builders = {}
         for key, requirement in sorted(requirements.books.items()):
             require(key in self.plans and type(requirement) is BookRequirement, "book requirement")
-            self.builders[key] = ViewBuilder(requirement, self.plans[key])
+            self.builders[key] = ViewBuilder(requirement, self.plans[key],
+                                             ages=self.fill is not None and self.fill.probes is not None)
         self.profile = None
         if requirements.profile is not None:
             from replay.economic_sdk.profile import Collector
@@ -243,6 +244,12 @@ class Runtime:
         self.fill_state = {}
         self.fill_ns = {}
         self.epochs = {}
+        self.probes = None
+        self.age_commits = {}
+        self.age_staged_books = set()
+        if self.fill is not None and self.fill.probes is not None:
+            from replay.economic_sdk.probes import Manager
+            self.probes = Manager(self)
         self.terminal = self.finished = self.poisoned = False
 
     @property
@@ -285,6 +292,8 @@ class Runtime:
                 self._flush_stage()
                 self._advance(end)
                 self._close_scope(end, "RUN_END", True)
+                if self.probes is not None:
+                    self.probes.terminal(end)
                 if self.profile is not None:
                     self.profile.terminal(end, cut.risk_sequence)
                 self.terminal = True
@@ -315,7 +324,7 @@ class Runtime:
                 self._select(key, sides, time, affected, skew_only)
             # A changed time-shift book must reach its ring at this exact time,
             # even when no entity is staged now.
-            if affected or self.staged_books:
+            if affected or self.staged_books or self.probes is not None:
                 self._stage(time, affected)
             # Resolve every economic dependency first: another changed leg in
             # this cut may require evaluation rather than a skew-only refresh.
@@ -389,6 +398,22 @@ class Runtime:
 
     # -- views and history ---------------------------------------------------
     def _set_view(self, key, view):
+        if self.probes is not None:
+            # Every same-time intermediate compares with the last *committed*
+            # best quote, so a changed-then-restored best has no apparent age reset.
+            previous = self.age_commits.get(key)
+            sources = self.builders[key].ladders
+            if previous is not None:
+                old_best, old_changes = previous
+                view.best_changes = {
+                    source: (old_changes[source] if old_best[source] == (
+                        view.ladders[source][0] if view.ladders[source] else None)
+                        else view.last_change) for source in sources}
+            else:
+                self.budget.charge(bounds.SLOT + bounds.age_commit_cost(len(sources)))
+                self.age_commits[key] = ({source: view.ladders[source][0] if view.ladders[source] else None
+                                          for source in sources}, dict(view.best_changes))
+            self.age_staged_books.add(key)
         if self.fill is not None and view.ladders:
             prior = self.views.get(key)
             if prior is None or any(ladder is not prior.ladders.get(source)
@@ -517,6 +542,13 @@ class Runtime:
                 check_spec(spec, entity)
                 for key, source in zip(entity.legs, spec.sources):
                     require(source in self.builders[key].ladders, "fill ladder not retained")
+                    if self.probes is not None:
+                        from replay.economic_sdk.probes import EXIT_SOURCE
+                        require(EXIT_SOURCE[source] in self.builders[key].ladders,
+                                "probe exit ladder not retained")
+                        venue = self.plans[key]["venue"]
+                        require(venue in self.fill.probes.unknown_taker_delay_ms,
+                                "probe unknown taker delay missing venue")
                 maxima = tuple(10 ** int(self.plans[key]["price_scale"]) for key in entity.legs)
                 specs[entity.id] = (spec, maxima)
                 cost += bounds.SLOT + bounds.json_cost([list(spec.sources), list(spec.units),
@@ -552,9 +584,16 @@ class Runtime:
             if boundary is None and due is None and release is None and game_due is None:
                 break
             at = min(x for x in (boundary, release, game_due, due) if x is not None)
+            if self.probes is not None:
+                self.probes.before(at)
             affected = set()
             if boundary == at:
                 self._close_scope(at, "SCOPE_END", False)
+                if self.probes is not None:
+                    # Every pending old-scope event at its upper bound is a
+                    # censor or an unconfirmed decision, independent of books.
+                    # Release it before the next scope can consume its capacity.
+                    self.probes.committed(at)
                 for _ in self.clock.advance(at):
                     pass
                 self.scope = self.clock.scope
@@ -580,9 +619,13 @@ class Runtime:
                 # A quiet interval starts with the last observed prices, before
                 # the already-decoded future cut refreshes projections.
                 self._flush_stage()
+                if self.probes is not None:
+                    self.probes.committed(at)
                 entered = set()
             else:
                 entered = affected
+        if self.probes is not None:
+            self.probes.before(time)
         self.clock.time = time
         return entered
 
@@ -723,6 +766,13 @@ class Runtime:
             self._ring_append(key, time, self.views[key])
         self.staged_books.clear()
         self.staged_time = None
+        if self.probes is not None:
+            for key in self.age_staged_books:
+                view = self.views[key]
+                self.age_commits[key] = ({source: view.ladders[source][0] if view.ladders[source] else None
+                                          for source in self.builders[key].ladders}, dict(view.best_changes))
+            self.age_staged_books.clear()
+            self.probes.committed(time)
 
     # -- intervals, episodes and slices ---------------------------------------
     def _commit(self, entity, time, value):
@@ -792,6 +842,8 @@ class Runtime:
                        tuple(view.ladders[source] for view, source in zip(views, spec.sources)),
                        maxima, lambda steps, legs: strategy.fill_value(entity, steps, legs, time))
         if priced.state == FILL_LIVE:
+            if self.probes is not None:
+                priced.json["ages"] = quote_ages(spec.sources, views, time)
             self._open_episode(key, time, observation, skew, priced)
         self._fill_state(entity.id, time, priced.state, epochs)
 
@@ -878,6 +930,11 @@ class Runtime:
                 "open episode bound")
         self.budget.charge(episode.cost)
         self.episodes[key] = episode
+        if priced is not None and self.probes is not None:
+            spec, maxima = self.fill_specs[key[0]]
+            self.probes.add(episode_id(self.scope, key[0], key[1], time), self.entities[key[0]],
+                            spec, maxima, time, int(self.clock.scopes[self.scope]["end_ns"]),
+                            priced, priced.json["ages"])
 
     def _update_episode(self, episode, time, observation, skew):
         payload = observation.payload
@@ -986,6 +1043,8 @@ class Runtime:
             entities[item[0][0]].order, item[0][1], self.episodes[item[0]].start))
         for key, end, reason, censored in closures:
             episode = self.episodes.pop(key)
+            if episode.fill is not None and self.probes is not None:
+                self.probes.close(episode_id(self.scope, episode.entity, episode.kind, episode.start), end)
             self.budget.release(episode.cost + (len(episode.skew_points) - 1) * (bounds.PAIR + bounds.SLOT)
                                 if not self.legacy else episode.cost)
             self._emit_slice(episode, end, reason, censored)
@@ -1169,6 +1228,7 @@ class Runtime:
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
             self.memo.clear(); self.reasons.clear()
             self.game = None; self.game_timers.clear(); self.game_entities.clear()
+            self.probes = None; self.age_commits.clear(); self.age_staged_books.clear()
             self.budget = None
             summary = strategy.validate(self.root, snapshot, manifest)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")

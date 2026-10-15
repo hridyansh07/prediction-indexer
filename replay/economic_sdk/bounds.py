@@ -22,6 +22,7 @@ MAX_ENTITY_TABLE = 64 * 1024 * 1024
 MAX_STATE = 512 * 1024 * 1024
 MAX_CONSUMED_LEVELS = 1024
 MAX_SKEW_POINTS = 100_000
+MAX_PENDING_PROBES = 100_000
 
 # Per-object upper bounds (64-bit CPython 3.11+), with allocator slack.
 INT = 48            # an int below 2**120
@@ -87,7 +88,29 @@ def view_cost(view, sizes):
     sides = len(view.fills) + len(view.transformed)
     return (VIEW + sides * CONTAINER + fills_cost(sides * sizes, view.levels)
             + (json_cost(view.reason) if view.reason is not None else 0) + 2 * PAIR
-            + len(view.ladders) * (CONTAINER + SLOT))
+            + len(view.ladders) * (CONTAINER + SLOT)
+            + (age_timestamps_cost(len(view.best_changes)) if view.best_changes else 0))
+
+
+def age_timestamps_cost(ladders):
+    """One last book update and one best-change integer per declared ladder.
+
+    Exit ladders count. Map containers/keys are charged separately from the
+    exact ``1 + L`` timestamp reservation; L is at most four.
+    """
+    return ((1 + ladders) * INT + CONTAINER
+            + ladders * (SLOT + STR + 4 * len("kalshi_complement_ask")))
+
+
+def age_commit_cost(ladders):
+    """Same-time comparison baseline, including replacement allocation overlap.
+
+    The baseline owns only each declared ladder's best pair and timestamp,
+    never its full depth. Reserve the previous and replacement baseline while
+    a stage is committing so temporary dictionary copies remain bounded too.
+    """
+    return 2 * (CONTAINER + 2 * SLOT + 2 * CONTAINER + ladders * (
+        2 * SLOT + 2 * (STR + 4 * len("kalshi_complement_ask")) + PAIR + INT))
 
 
 def live_fill_cost(priced):
@@ -98,6 +121,16 @@ def live_fill_cost(priced):
 
 def fill_state_cost(legs):
     return FILL_STATE + CONTAINER + legs * (SLOT + INT)
+
+
+def probe_cost(entity, legs, levels):
+    """One pending scenario, including copied decision, fills and arrival exit depth.
+
+    Reserve both object state and canonical row strings before adding a probe;
+    arithmetic is bounded separately to 80 decimal digits per output scalar.
+    """
+    return (4096 + json_cost(entity.descriptor) + json_cost(entity.legs)
+            + legs * (4096 + levels * (4 * (PAIR + SLOT) + 4 * (STR + 4 * 80))))
 
 
 def quotes_cost(quotes):

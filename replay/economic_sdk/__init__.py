@@ -8,7 +8,7 @@ slices, controls, bounded output and the independent reader.
 from replay.economic_sdk.types import (
     ADMISSIONS, CONTROL, DEPTH_LIMITED, EVALUATED, ONE_SIDED, REAL, SDK_STATUSES, UNUSABLE,
     Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSizing, FillSpec,
-    GameRequirement, Observation, Requirements,
+    GameRequirement, Observation, ProbePolicy, Requirements,
 )
 from replay.economic_sdk.views import BookView
 
@@ -16,7 +16,7 @@ __all__ = [
     "ADMISSIONS", "CONTROL", "DEPTH_LIMITED", "EVALUATED", "ONE_SIDED", "REAL",
     "SDK_STATUSES", "UNUSABLE", "Basket", "BookRequirement", "BookView", "Context",
     "Control", "Experiment", "FillPolicy", "FillSizing", "FillSpec", "Observation",
-    "GameRequirement", "Requirements", "Strategy", "factory",
+    "GameRequirement", "ProbePolicy", "Requirements", "Strategy", "factory",
 ]
 
 
@@ -68,6 +68,15 @@ class Strategy:
         fill the episode carries and its start time.
         """
         raise NotImplementedError
+
+    def fill_delays(self, entity, time_ns):
+        """Pure per-leg taker delays in ns, or ``None`` when unknown.
+
+        The default reads the pinned outcomes document. A strategy may override
+        this hook; runtime and independent readers call the same pure contract.
+        """
+        from replay.economic_sdk.execution_terms import execution_delays
+        return execution_delays(self.snapshot, entity.legs, time_ns)
 
     def manifest(self, files, instantaneous):
         raise NotImplementedError
