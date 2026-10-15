@@ -6,6 +6,7 @@ Only a horizon's unfinished destinations and buckets are retained.
 """
 
 import heapq
+from array import array
 
 from replay.economic_sdk import bounds
 from replay.economic_sdk.profile_policy import (
@@ -35,7 +36,8 @@ class VolatilityRecorder(Stream):
         self.pairs, self.unavailable = pair_tables(
             snapshot, self.table, enabled=self.config["gap_pairs"] is not None)
         # The existing per-series reservation includes totals and fixed lookup
-        # state: two index slots per pair, scale factors and doubled thresholds.
+        # state: two index slots per pair, scale factors, doubled thresholds,
+        # one duration clock and one unadmitted-duration slot per series.
         # Pending samples and bucket occurrences keep their separate charges.
         self.budget.charge(bounds.json_cost(self.pairs) + bounds.json_cost(self.unavailable)
                            + (len(self.table) + len(self.pairs)) * self.cost,
@@ -78,6 +80,8 @@ class VolatilityRecorder(Stream):
                 self.pairs_by_book[pair["book_a"]].append(pair["pair"])
                 self.pairs_by_book[pair["book_b"]].append(pair["pair"])
                 self.values["gap", pair["pair"]] = None
+        self.duration_at = array("Q", [self.begin_ns]) * len(self.totals)
+        self.duration_new = set()
 
     def _price(self, value, book):
         if value is None:
@@ -113,7 +117,8 @@ class VolatilityRecorder(Stream):
         old = self._mid(self.tops[book])
         top = (row["validity"] == "usable", self._price(row["bid"], book), self._price(row["ask"], book))
         self.tops[book] = top
-        mid = self.values["book", book] = self._mid(top)
+        mid = self._mid(top)
+        self._set_value(("book", book), mid)
         if row["cause"] != "open":
             accumulator = self._row((time - self.begin_ns) // self.width, ("book", book))
             accumulator["top_updates"] += 1
@@ -121,19 +126,54 @@ class VolatilityRecorder(Stream):
         for index in self.pairs_by_book[book]:
             pair = self.pairs[index]
             a, b = self._ask(pair["book_a"], pair["side_a"]), self._ask(pair["book_b"], pair["side_b"])
-            self.values["gap", pair["pair"]] = None if a is None or b is None else 2 * (a + b)
+            self._set_value(("gap", pair["pair"]), None if a is None or b is None else 2 * (a + b))
+
+    def _duration_index(self, key):
+        return key[1] if key[0] == "book" else len(self.table) + key[1]
+
+    def _set_value(self, key, value):
+        old = self.values[key]
+        if ((old is None) != (value is None)
+                or (key[0] == "gap" and old is not None and value is not None
+                    and (old < 20000) != (value < 20000))):
+            self._settle(key, self.at)
+            index = self._duration_index(key)
+            if value is None:
+                self.duration_new.discard(index)
+            elif old is None:
+                self.duration_new.add(index)
+        # Numerical moves within one duration condition still refresh every
+        # sample and horizon endpoint, without settling the unchanged condition.
+        self.values[key] = value
+
+    def _settle(self, key, until):
+        index = self._duration_index(key)
+        start, value = self.duration_at[index], self.values[key]
+        if value is not None and start < until:
+            row = self.rows[(start - self.begin_ns) // self.width, key]
+            row["duration"] += until - start
+            if key[0] == "gap" and value < 20000:
+                row["below"] += until - start
+        self.duration_at[index] = until
 
     def _integrate(self, until):
         while self.at < until:
             bucket = (self.at - self.begin_ns) // self.width
-            end = min(until, self.begin_ns + (bucket + 1) * self.width)
-            dt = end - self.at
-            for key, value in self.values.items():
-                if value is not None:
-                    row = self._row(bucket, key)
-                    row["duration"] += dt
-                    if key[0] == "gap" and value < 20000:
-                        row["below"] += dt
+            boundary = self.begin_ns + (bucket + 1) * self.width
+            end = min(until, boundary)
+            # Admit at the first positive interval, just as eager integration
+            # did. Canonical keys have the same order as self.values: books,
+            # then pairs. Lazy arithmetic must not defer or reorder charges.
+            for index in sorted(self.duration_new):
+                key = (("book", index) if index < len(self.table)
+                       else ("gap", index - len(self.table)))
+                self._row(bucket, key)
+            self.duration_new.clear()
+            if end == boundary or end == self.end_ns:
+                for key, value in self.values.items():
+                    if value is not None:
+                        self._settle(key, end)
+                        self.duration_new.add(self._duration_index(key))
             self.at = end
 
     def _advance_before(self, until):
