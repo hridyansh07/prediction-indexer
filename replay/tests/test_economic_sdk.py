@@ -728,6 +728,20 @@ class BoundTests(unittest.TestCase):
                         (10**6, 10**12), (10**6, 10**12), fills, transformed, levels)
         self.assertGreaterEqual(bounds.view_cost(view, sizes), deep_size(view))
         self.assertGreaterEqual(bounds.view_cost(unavailable_view(0), 1), deep_size(unavailable_view(0)))
+        # Minimal views have less allocator slack than large ladders. Include
+        # the new projection-unit/pair-count fields and A1's four age ladders.
+        from replay.economic_sdk import BookRequirement
+        from replay.economic_sdk.views import ViewBuilder
+        transforms = ("kalshi_complement_ask", "kalshi_complement_bid")
+        for sides, extra in ((("bid",), ()), (("ask", "bid"), transforms)):
+            for depth in (0, 1, 7):
+                with self.subTest(sides=sides, depth=depth):
+                    book = SimpleNamespace(validity="usable", reason=None,
+                        levels=lambda side: tuple((300 + i, 10**6) for i in range(depth)))
+                    builder = ViewBuilder(BookRequirement(sides, (1,), transforms=extra,
+                        ladders=sides + extra), {"price_scale": "3", "quantity_scale": "6"}, ages=True)
+                    actual = builder.build(book, 10**18)
+                    self.assertGreaterEqual(bounds.view_cost(actual, 1), deep_size(actual))
 
     def test_observation_episode_and_fingerprint_costs_are_conservative(self):
         payload = {"gap_gross": "9" * 40, "gap_net": "-" + "9" * 40, "gross_scale": 9, "net_scale": 18,

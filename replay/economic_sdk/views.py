@@ -23,11 +23,11 @@ class BookView:
 
     __slots__ = ("validity", "reason", "last_change", "bid_present", "ask_present",
                  "best_bid", "best_ask", "fills", "transformed", "levels", "crossed",
-                 "ladders", "best_changes", "projection_unit")
+                 "ladders", "best_changes", "projection_unit", "pair_counts")
 
     def __init__(self, validity, reason, last_change, bid_present, ask_present,
                  best_bid, best_ask, fills, transformed, levels, ladders=_NO_LADDERS,
-                 best_changes=_NO_AGES, projection_unit=None):
+                 best_changes=_NO_AGES, projection_unit=None, pair_counts=None):
         self.validity, self.reason, self.last_change = validity, reason, last_change
         self.bid_present, self.ask_present = bid_present, ask_present
         self.best_bid, self.best_ask = best_bid, best_ask
@@ -35,6 +35,11 @@ class BookView:
         self.ladders = ladders
         self.best_changes = best_changes
         self.projection_unit = projection_unit
+        # Compact native bid/ask subtotals. Transforms keep their source's
+        # pair count; VIEW's existing reservation covers these scalar slots.
+        self.pair_counts = (pair_counts if pair_counts is not None else tuple(
+            sum(len(f.taken) + len(f.consumed) for f in fills.get(side, {}).values())
+            for side in ("bid", "ask")))
         # The book's own best bid strictly above its best ask.
         self.crossed = (best_bid is not None and best_ask is not None
                         and best_bid[0] > best_ask[0])
@@ -117,6 +122,7 @@ class ViewBuilder:
         reuse = (prior is not None and sides is not None and book.validity == "usable"
                  and prior.validity == "usable")
         fills, presence, best, levels = {}, {}, {}, 0
+        pair_counts = [0, 0]
         retained = {} if self.ladders else _NO_LADDERS
         for side in self.sides:
             if reuse and (side not in sides or (side not in self.ladder_sides
@@ -126,6 +132,7 @@ class ViewBuilder:
                 best[side] = prior.best_bid if side == "bid" else prior.best_ask
                 if side in self.ladder_sides:
                     retained[side] = prior.ladders[side]
+                pair_counts[side == "ask"] = prior.pair_counts[side == "ask"]
             else:
                 side_levels, side_fills = read_side(book, side, self.sizes_atoms)
                 if side in self.ladder_sides:
@@ -146,16 +153,19 @@ class ViewBuilder:
                     old = prior.best_bid if side == "bid" else prior.best_ask
                     if old == best[side]:
                         best[side] = old
-            levels += sum(len(f.taken) + len(f.consumed) for f in fills[side].values())
+                pair_counts[side == "ask"] = sum(
+                    len(f.taken) + len(f.consumed) for f in fills[side].values())
+            levels += pair_counts[side == "ask"]
         transformed = {}
         if "kalshi_complement_ask" in self.transforms:
             transformed["kalshi_complement_ask"] = self._project(
                 fills["bid"], prior, "bid", "kalshi_complement_ask")
+            # Preserve A1's doubling of the *entire* native subtotal, not just bids.
             levels *= 2
         if "kalshi_complement_bid" in self.transforms:
             transformed["kalshi_complement_bid"] = self._project(
                 fills["ask"], prior, "ask", "kalshi_complement_bid")
-            levels += sum(len(f.taken) + len(f.consumed) for f in fills["ask"].values())
+            levels += pair_counts[1]
         for transform, side in (("kalshi_complement_ask", "bid"), ("kalshi_complement_bid", "ask")):
             if transform in self.ladders:
                 # Reused while its source ladder is the identical object.
@@ -174,7 +184,7 @@ class ViewBuilder:
         return BookView(book.validity, plain(book.reason), last_change,
                         presence.get("bid", False), presence.get("ask", False),
                         best.get("bid"), best.get("ask"), fills, transformed, levels, retained,
-                        best_changes, self.unit)
+                        best_changes, self.unit, tuple(pair_counts))
 
     def _project(self, fills, prior, side, transform):
         previous = (prior.transformed.get(transform) if prior is not None

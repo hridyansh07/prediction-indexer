@@ -588,6 +588,26 @@ class FillConstructionTests(Base):
         self.assertEqual(third.transformed[transforms[0]][1].cost, 1400 * M)
         self.assertEqual(third.ladders[transforms[1]][0], (1300, M))
 
+    def test_pair_counts_preserve_the_asymmetric_native_subtotal_doubling(self):
+        class Book:
+            validity, reason = "usable", None
+
+            def levels(self, side):
+                return {"bid": ((600, 3 * M),),
+                        "ask": ((700, M // 2), (750, 3 * M))}[side]
+
+        ask, bid = "kalshi_complement_ask", "kalshi_complement_bid"
+        # Native bid fills retain 4 pairs, ask fills 8 (taken + consumed).
+        # The first transform doubles BOTH subtotals. Ladders add 3/4/5/6.
+        for transforms, expected in (((), 15), ((ask,), 28), ((bid,), 25), ((ask, bid), 38)):
+            with self.subTest(transforms=transforms):
+                builder = ViewBuilder(BookRequirement(("ask", "bid"), (1, 3), transforms=transforms,
+                    ladders=("bid", "ask") + transforms), {"price_scale": "3", "quantity_scale": "6"})
+                view = builder.build(Book(), 12)
+                again = builder.build(Book(), 13, view, {"bid": 600})
+                self.assertEqual((view.levels, again.levels), (expected, expected))
+                self.assertIs(again.fills["ask"], view.fills["ask"])
+
 
 def rewrite(h, manifest, name, mutate):
     path = h.output / name
