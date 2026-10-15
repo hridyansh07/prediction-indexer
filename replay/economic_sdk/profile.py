@@ -199,12 +199,12 @@ class Collector:
         plan = self.plans[key]
         band_unit = int(self.policy["tick_atoms"][plan["venue"]])
         within = []
+        index, total = 0, 0
         for k in self.depth_ticks:
-            band, total = k * band_unit, 0
-            for price, quantity in levels:
-                if abs(price - best[0]) > band:
-                    break
-                total += quantity
+            band = k * band_unit
+            while index < len(levels) and abs(levels[index][0] - best[0]) <= band:
+                total += levels[index][1]
+                index += 1
             within.append(total)
         fills = None
         view = self.views(key) if self.views is not None else None
