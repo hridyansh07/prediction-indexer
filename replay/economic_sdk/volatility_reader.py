@@ -82,6 +82,9 @@ class _Reconstruction:
         self.offsets = [h * 1_000_000 for h in self.policy["horizons_ms"]]
         self.cost = accumulator_cost(self.policy)
         self.budget = bounds.StateBudget()
+        # The existing per-series reservation covers totals plus current
+        # scalar values and two reverse-index slots per pair. Samples and
+        # bucket occurrences retain their separate, unchanged charges.
         self.budget.charge(bounds.json_cost(self.pairs) + bounds.json_cost(self.unavailable)
                            + (len(self.books) + len(self.pairs)) * self.cost, "volatility reader state budget")
         self.totals = {(kind, index): self._blank() for kind, count in
@@ -115,7 +118,13 @@ class _Reconstruction:
         self.next_flush = self.end + self.offsets[-1]
         self.destinations = [self.start + h for h in self.offsets]
         self.state = {i: (False, None, None) for i in self.memberships[self.scope]}
-        self.scoped_pairs = [p for p in self.pairs if p["scope"] == self.scope]
+        self.values = {("book", i): None for i in self.state}
+        self.pairs_by_book = {}
+        for pair in self.pairs:
+            if pair["scope"] == self.scope:
+                self.values["gap", pair["pair"]] = None
+                for name in ("book_a", "book_b"):
+                    self.pairs_by_book.setdefault(pair[name], []).append(pair["pair"])
         self.history, self.expiries, self.history_values = {}, [], 0
 
     def _prices(self, row):
@@ -137,18 +146,15 @@ class _Reconstruction:
         usable, bid, ask = state
         return None if not usable or bid is None or ask is None else bid + ask
 
-    def _values(self):
-        values = {("book", i): self._mid(state) for i, state in self.state.items()}
-        for pair in self.scoped_pairs:
-            asks = []
-            for suffix in ("a", "b"):
-                index, side = pair["book_" + suffix], pair["side_" + suffix]
-                usable, bid, ask = self.state[index]
-                if side != self.books[index]["orientation"]:
-                    ask = None if bid is None else 10000 - bid
-                asks.append(ask if usable else None)
-            values["gap", pair["pair"]] = 2 * sum(asks) if all(a is not None for a in asks) else None
-        return values
+    def _gap(self, pair):
+        asks = []
+        for suffix in ("a", "b"):
+            index, side = pair["book_" + suffix], pair["side_" + suffix]
+            usable, bid, ask = self.state[index]
+            if side != self.books[index]["orientation"]:
+                ask = None if bid is None else 10000 - bid
+            asks.append(ask if usable else None)
+        return 2 * sum(asks) if all(a is not None for a in asks) else None
 
     def top(self, row):
         while self.scope < row["scope"]:
@@ -157,14 +163,16 @@ class _Reconstruction:
             self._enter()
         time, index = int(row["t_ns"]), row["book"]
         self.advance(time)
-        old_mid = self._mid(self.state[index])
+        old_mid = self.values["book", index]
         self.state[index] = self._prices(row)
+        new_mid = self.values["book", index] = self._mid(self.state[index])
         if row["cause"] != "open":
             bucket = self._bucket((time - self.start) // self.width, ("book", index))
             bucket["top_updates"] += 1
-            new_mid = self._mid(self.state[index])
             if old_mid is not None and new_mid is not None and old_mid != new_mid:
                 bucket["mid_changes"] += 1
+        for pair in self.pairs_by_book.get(index, ()):
+            self.values["gap", pair] = self._gap(self.pairs[pair])
 
     def _duration(self, end, values):
         while self.clock < end:
@@ -181,7 +189,7 @@ class _Reconstruction:
             self.clock = boundary
 
     def advance(self, until):
-        values = self._values()
+        values = self.values
         while True:
             time = min(self.grid, *self.destinations)
             if time >= until or time >= self.end:
