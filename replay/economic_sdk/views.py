@@ -105,8 +105,8 @@ class ViewBuilder:
         self.unit = 10 ** int(plan["price_scale"])
         self.ladders = requirement.ladders
         self.ages = ages
-        # A retained ladder depends on every level of its side, so that side is
-        # never reused merely because a touched price lies beyond consumed depth.
+        # Retained ladders depend on every level of their source side, even
+        # when a deep touch leaves all fixed-size fills unchanged.
         self.ladder_sides = frozenset(_LADDER_SIDES[source] for source in self.ladders)
         require(type(self.ladders) is tuple and len(set(self.ladders)) == len(self.ladders)
                 and all(source in _LADDER_SIDES for source in self.ladders)
@@ -125,13 +125,16 @@ class ViewBuilder:
         pair_counts = [0, 0]
         retained = {} if self.ladders else _NO_LADDERS
         for side in self.sides:
-            if reuse and (side not in sides or (side not in self.ladder_sides
-                                                and beyond(prior.fills[side], side, sides[side]))):
+            if reuse and (side not in sides or beyond(prior.fills[side], side, sides[side])):
                 fills[side] = prior.fills[side]
                 presence[side] = prior.present(side)
                 best[side] = prior.best_bid if side == "bid" else prior.best_ask
                 if side in self.ladder_sides:
-                    retained[side] = prior.ladders[side]
+                    old = prior.ladders[side]
+                    # Refresh full depth independently of the fixed fills.
+                    # Equal ladders keep their identity for epochs and retries.
+                    side_levels = book.levels(side) if side in sides else old
+                    retained[side] = old if old == side_levels else side_levels
                 pair_counts[side == "ask"] = prior.pair_counts[side == "ask"]
             else:
                 side_levels, side_fills = read_side(book, side, self.sizes_atoms)
