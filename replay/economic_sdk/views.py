@@ -23,17 +23,18 @@ class BookView:
 
     __slots__ = ("validity", "reason", "last_change", "bid_present", "ask_present",
                  "best_bid", "best_ask", "fills", "transformed", "levels", "crossed",
-                 "ladders", "best_changes")
+                 "ladders", "best_changes", "projection_unit")
 
     def __init__(self, validity, reason, last_change, bid_present, ask_present,
                  best_bid, best_ask, fills, transformed, levels, ladders=_NO_LADDERS,
-                 best_changes=_NO_AGES):
+                 best_changes=_NO_AGES, projection_unit=None):
         self.validity, self.reason, self.last_change = validity, reason, last_change
         self.bid_present, self.ask_present = bid_present, ask_present
         self.best_bid, self.best_ask = best_bid, best_ask
         self.fills, self.transformed, self.levels = fills, transformed, levels
         self.ladders = ladders
         self.best_changes = best_changes
+        self.projection_unit = projection_unit
         # The book's own best bid strictly above its best ask.
         self.crossed = (best_bid is not None and best_ask is not None
                         and best_bid[0] > best_ask[0])
@@ -148,31 +149,20 @@ class ViewBuilder:
             levels += sum(len(f.taken) + len(f.consumed) for f in fills[side].values())
         transformed = {}
         if "kalshi_complement_ask" in self.transforms:
-            previous = prior.transformed.get("kalshi_complement_ask") if prior is not None else None
-            if previous and prior.fills.get("bid") is not None and all(
-                    fills["bid"][size] is prior.fills["bid"][size] for size in self.sizes):
-                transformed["kalshi_complement_ask"] = previous
-            else:
-                unit = self.unit
-                transformed["kalshi_complement_ask"] = {
-                    size: complement_ask(fill, unit) for size, fill in fills["bid"].items()}
+            transformed["kalshi_complement_ask"] = self._project(
+                fills["bid"], prior, "bid", "kalshi_complement_ask")
             levels *= 2
         if "kalshi_complement_bid" in self.transforms:
-            previous = prior.transformed.get("kalshi_complement_bid") if prior is not None else None
-            if previous and prior.fills.get("ask") is not None and all(
-                    fills["ask"][size] is prior.fills["ask"][size] for size in self.sizes):
-                transformed["kalshi_complement_bid"] = previous
-            else:
-                unit = self.unit
-                transformed["kalshi_complement_bid"] = {
-                    size: complement_ask(fill, unit) for size, fill in fills["ask"].items()}
+            transformed["kalshi_complement_bid"] = self._project(
+                fills["ask"], prior, "ask", "kalshi_complement_bid")
             levels += sum(len(f.taken) + len(f.consumed) for f in fills["ask"].values())
         for transform, side in (("kalshi_complement_ask", "bid"), ("kalshi_complement_bid", "ask")):
             if transform in self.ladders:
                 # Reused while its source ladder is the identical object.
                 previous = prior.ladders.get(transform) if prior is not None else None
                 retained[transform] = (
-                    previous if previous is not None and prior.ladders[side] is retained[side]
+                    previous if previous is not None and prior.projection_unit == self.unit
+                    and prior.ladders[side] is retained[side]
                     else complement_ladder(retained[side], self.unit))
         for ladder in retained.values():
             levels += len(ladder)
@@ -184,7 +174,25 @@ class ViewBuilder:
         return BookView(book.validity, plain(book.reason), last_change,
                         presence.get("bid", False), presence.get("ask", False),
                         best.get("bid"), best.get("ask"), fills, transformed, levels, retained,
-                        best_changes)
+                        best_changes, self.unit)
+
+    def _project(self, fills, prior, side, transform):
+        previous = (prior.transformed.get(transform) if prior is not None
+                    and prior.projection_unit == self.unit else None)
+        native = prior.fills.get(side) if previous else None
+        if native and all(fill is native.get(size) for size, fill in fills.items()):
+            return previous
+        projected = {}
+        for size, fill in fills.items():
+            if native and fill is native.get(size):
+                old = previous[size]
+                # Reuse the projection, but preserve A1's fresh Fill identity
+                # on partial rebuilds: selection and ring charges depend on it.
+                projected[size] = Fill(old.filled_atoms, old.cost, old.depth_limited,
+                                       old.taken, old.consumed)
+            else:
+                projected[size] = complement_ask(fill, self.unit)
+        return projected
 
 
 def quote_ages(sources, views, time):

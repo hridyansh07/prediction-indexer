@@ -553,6 +553,41 @@ class FillConstructionTests(Base):
             with self.assertRaisesRegex(ProtocolError, "fill ladder not retained"):
                 FillHarness(root, policy())
 
+    def test_partial_projection_reuses_each_size_without_changing_fill_identities(self):
+        class Book:
+            validity, reason = "usable", None
+
+            def __init__(self, second_bid=550, second_ask=750):
+                self.sides = {"bid": ((600, M), (second_bid, 3 * M)),
+                              "ask": ((700, M), (second_ask, 3 * M))}
+
+            def levels(self, side):
+                return self.sides[side]
+
+        transforms = ("kalshi_complement_ask", "kalshi_complement_bid")
+        builder = ViewBuilder(BookRequirement(("bid", "ask"), (1, 3), transforms=transforms,
+                                              ladders=transforms),
+                              {"price_scale": "3", "quantity_scale": "6"}, ages=True)
+        first = builder.build(Book(), 12)
+        second = builder.build(Book(540, 760), 13, first, {"bid": 550, "ask": 750})
+        for transform, price, cost in ((transforms[0], 460, 1320 * M),
+                                        (transforms[1], 240, 780 * M)):
+            old, new = first.transformed[transform][1], second.transformed[transform][1]
+            self.assertEqual(old, new)
+            self.assertIsNot(old, new)  # A1's selection/ring reservation identity
+            self.assertIs(old.taken, new.taken)
+            self.assertIs(old.consumed, new.consumed)
+            self.assertEqual(second.transformed[transform][3].cost, cost)
+            self.assertEqual(second.ladders[transform][-1], (price, 3 * M))
+            self.assertEqual(second.best_changes[transform], 12)
+        self.assertEqual(second.last_change, 13)
+        self.assertEqual(second.levels, first.levels)
+        # Equal native fills do not license reuse at a different projection unit.
+        builder.unit = 2000
+        third = builder.build(Book(540, 760), 14, second, {"bid": 540, "ask": 760})
+        self.assertEqual(third.transformed[transforms[0]][1].cost, 1400 * M)
+        self.assertEqual(third.ladders[transforms[1]][0], (1300, M))
+
 
 def rewrite(h, manifest, name, mutate):
     path = h.output / name
