@@ -1163,3 +1163,71 @@ block exists, manifests require `game_state: {sha256, windows, mode}`, and episo
 Independent readers check those bindings and phase consistency. Without the
 block, persisted output remains unchanged, including the pinned complement and
 cross-venue goldens. Layout 1 retains its closed legacy schemas.
+
+## 15. Execution-delay probes
+
+The optional mechanism in
+[`EXECUTION_DELAY_V1.md`](specs/EXECUTION_DELAY_V1.md) extends fill checks with
+delayed decisions and per-leg arrivals. Strategy rollout and production settings
+remain outside this mechanism. The upstream
+[offline migration contract](specs/UNIVERSE_MIGRATIONS_V1.md) governs storage:
+execution terms start at Universe schema v8, with outcomes document version 2.
+Snapshot versions and outcomes-v1 compatibility are unchanged.
+
+`FillPolicy.probes` is absent by default. When present, its closed version-1
+policy names declared sizings, confirmation and arrival milliseconds, sequencing
+modes and an explicit unknown-delay default for every traded venue. Its product
+is at most 64. Millisecond policy values and the row fields `confirm_ms`,
+`arrival_ms`, `venue_delay_ms` are JSON integers, rejecting booleans and floats.
+The applied venue delay is never null. Quantities, prices, costs, signed values
+and nanosecond times use canonical decimal strings.
+
+The pure `Strategy.fill_delays(entity, time_ns)` default resolves the pinned
+market terms through scope membership, including Polymarket token IDs and
+Limitless subscription slugs. It returns per-leg nanoseconds or `None`, which
+selects the policy default. Delays are exact whole milliseconds. Strategies may
+override the hook with a pure implementation that the reader also calls.
+
+`probes.ndjson` contains exactly one row per configured scenario per fill episode,
+independently of episode closure. Confirmation zero uses the opening sizing's
+walk, including a recording sizing that was not tradeable; a zero-step recording
+sizing yields `empty` with no sent orders. Later confirmations require the fill
+to remain live and the selected sizing to be tradeable. A decision fixes each
+leg's quantity and worst accepted price. Arrivals take better prices, cancel
+unfilled remainders, and retain the best atoms for the matched quantity: lowest
+purchase prices or highest sale prices. Gross excess loss is purchase cost less
+exit sale proceeds for a bought leg, and exit repurchase cost less original sale
+proceeds for a sold leg. It is signed; unwind fees are excluded.
+
+The closed leg object adds `usable` evidence: true or false for an arrived leg,
+null for an unsent or censored leg. Unsent zero-quantity legs carry zero fill and
+unwind amounts with empty walks. `not_confirmed` has a null decision, no legs and
+null aggregate metrics. `decision_untradeable` carries the decision but no legs
+or aggregate metrics. A censored scenario keeps completed arrival walks, leaves
+unresolved walks and all unwind/aggregate metrics null, and makes no empty-fill
+claim. An arrival at or after the original decision scope's end is censored,
+including an internal scope boundary. Censoring precedes unusable/quantity
+statuses; a resolved unusable leg precedes the filled/partial/empty classification.
+
+Opening fills and probe decisions carry `ages` only with probes enabled. Each
+book records its last committed update and each declared retained ladder's last
+best price-or-quantity change, including exit ladders. Same-time updates commit
+only their final state. Bounds charge the book timestamp plus one timestamp per
+retained ladder, and the detached baseline needed for same-time comparison.
+
+Pending decisions and arrivals catch up before later books refresh and at
+terminal flush. They add no stream retention boundary or shift offset. A probe
+retains its entity and arrival exit evidence across episode closure; its state
+is reserved before insertion, with a 100,000-pending-scenario cap and the shared
+512 MiB state budget. Consuming more than `max_levels` fails rather than silently
+truncating a required walk. Output keeps the existing per-file, row and line caps.
+
+`probe_reader` independently validates coverage, closed rows, opening equality,
+walk limits/order/arithmetic, matched valuation, unwind losses, delay provenance,
+computed times, statuses and resolution order. Arrival ladders, confirmation
+ladders and quote ages remain writer-attested. Without probes there is no new
+file or fill field; existing semantic outputs and the complement V1 golden stay
+byte-identical. Synthetic full-cut and sparse-v3 tapes compare probe bytes;
+the current decoder continues to reject obsolete wire v2. Five-bundle corpus
+acceptance remains pending until the retained sample and independent screen are
+available.

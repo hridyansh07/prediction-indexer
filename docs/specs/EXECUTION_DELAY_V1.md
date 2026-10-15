@@ -194,7 +194,13 @@ Then:
   ladder at its own arrival time. The exit ladder is `bid` for a bought leg, or
   `kalshi_complement_bid` for a bought Kalshi complement; the reverse for a sold
   leg. The walk is best-first and records the proceeds.
-  - `leg_loss_gross` is excess cost minus exit proceeds, summed over legs.
+  - `leg_loss_gross` is summed over legs. For a bought leg it is the excess cost
+    minus the exit proceeds. For a sold leg it is the repurchase cost of the excess
+    minus the sale proceeds of that excess.
+  - Matched quantity always takes each leg's best atoms: the cheapest for a bought
+    leg, the highest-priced sales for a sold leg. The excess is therefore the worst
+    atoms.
+  - The value is signed, never clamped. A favourable move makes it negative.
   - Fees on the unwind are **not** modelled in V1. The field name says gross, and the
     loss is a lower bound.
   - The strategy's `BookRequirement.ladders` must retain every exit ladder its
@@ -204,8 +210,10 @@ Then:
   - `partial`: `matched_steps` is above 0 but below the decision steps;
   - `empty`: `matched_steps` is 0;
   - `unusable`: a leg's book was not usable at arrival;
-  - `censored`: an arrival is after the scope or run end. The probe is unresolved and
-    not counted as `empty`.
+  - `censored`: an arrival is at or after the end of the scope containing the
+    decision. Scopes are half-open `[start, end)`, so `a ≥ end` is censored, whether
+    `end` is a scope boundary inside the run or the run end. The probe is unresolved
+    and not counted as `empty`.
 
 ### 2.6 Timing
 
@@ -241,7 +249,11 @@ probe:
 
 - `delay_source` is `terms` or `default`.
 - `consumed` and `exit_consumed` are best-first and bounded by `max_levels`.
-- Integers are canonical decimal strings, as in fill objects.
+- Quantities, prices, costs, values and `*_ns` times are canonical decimal
+  strings, as in fill objects. `confirm_ms`, `arrival_ms` and `venue_delay_ms` are
+  JSON integers, never booleans or floats, within the policy's bounds.
+  `venue_delay_ms` is the applied delay after any default substitution, so it is
+  never null.
 - Rows are written in resolution order (§2.6). Every configured probe of every
   episode has exactly one row, so the row count per episode is the configured
   product.
@@ -273,7 +285,7 @@ decision time or an arrival time.
   `> x` refreshes the views, every pending evaluation with time ≤ `x` resolves
   against the current views.
 - The run's terminal flush resolves any remaining evaluations that fall inside the
-  run. Arrivals after the run end are `censored`.
+  run. Arrivals at or after the run end are `censored`.
 - This is exact, because an omitted cut changes no planned book: the views at `x`
   equal the views at the last published cut ≤ `x`.
 - Probe outputs carry the computed times (`time_ns`, `sent_ns`, `arrival_ns`), never
@@ -296,9 +308,14 @@ leg: `{"book_ns": ..., "best_ns": ...}`.
 - `best_ns` is the time since the best level (price or quantity) of the leg's walked
   ladder last changed.
 
-Both are nanoseconds before the instant priced. The SDK tracks per book the
-committed time of the last update and of the last best-level change, per retained
-ladder. Writer-attested, with bounds unchanged: two integers per book.
+Both are nanoseconds before the instant priced. The SDK tracks, per book, the
+committed time of the last update (one integer). It also tracks, per retained
+ladder of that book, the committed time of that ladder's last best-level change
+(one integer each). Ladders are `bid`, `ask`, `kalshi_complement_bid` and
+`kalshi_complement_ask`, as retained by `BookRequirement.ladders`. Exit ladders
+retained for probes count as well. `best_ns` reads the walked ladder's entry.
+Writer-attested. The bounds charge `1 + L` integers per book, where `L` is the
+number of ladders retained for that book (at most 4).
 
 ## 4. Tests
 
