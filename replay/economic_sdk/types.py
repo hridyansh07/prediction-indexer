@@ -106,6 +106,17 @@ class FillSizing:
 
 
 @dataclass(frozen=True, slots=True)
+class ProbePolicy:
+    """Bounded delayed-fill scenarios (execution delay spec §2)."""
+
+    sizings: tuple[str, ...]
+    confirm_ms: tuple[int, ...]
+    arrival_ms: tuple[int, ...]
+    sequencing: tuple[str, ...]
+    unknown_taker_delay_ms: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class FillPolicy:
     """Closed fill-check policy, parsed by ``economic_sdk.fills.fill_policy``.
 
@@ -117,6 +128,7 @@ class FillPolicy:
     step_contracts: str
     max_levels: int
     sizings: tuple[FillSizing, ...]
+    probes: ProbePolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
