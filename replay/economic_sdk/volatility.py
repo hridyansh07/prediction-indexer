@@ -49,6 +49,7 @@ class VolatilityRecorder(Stream):
                        (("book", len(self.table)), ("gap", len(self.pairs))) for i in range(count)}
         self.scope = -1
         self.rows, self.pending, self.tops, self.values = {}, [], {}, {}
+        self.pending_count = 0  # scalar occurrences, not physical clock batches
         self.flushed = -1
 
     def _new(self):
@@ -185,20 +186,24 @@ class VolatilityRecorder(Stream):
             self._integrate(due)
             # Resolve forward moves before admitting samples at the same clock instant.
             while self.pending and self.pending[0][0] == due:
-                _, key, bucket, horizon, previous = heapq.heappop(self.pending)
-                self.budget.release(PENDING_COST)
-                current = self.values[key]
-                if current is not None:
-                    delta = abs(current - previous)
-                    stats = self._row(bucket, key)["horizons"][horizon]
-                    stats[0] += 1
-                    stats[1] += delta
-                    stats[2] += delta * delta
-                    stats[3] = max(stats[3], delta)
-                    for j, threshold in enumerate(self.jump_thresholds):
-                        stats[4][j] += int(delta >= threshold)
+                _, bucket, horizon, samples = heapq.heappop(self.pending)
+                for key, previous in samples:
+                    self.pending_count -= 1
+                    self.budget.release(PENDING_COST)
+                    current = self.values[key]
+                    if current is not None:
+                        delta = abs(current - previous)
+                        stats = self._row(bucket, key)["horizons"][horizon]
+                        stats[0] += 1
+                        stats[1] += delta
+                        stats[2] += delta * delta
+                        stats[3] = max(stats[3], delta)
+                        for j, threshold in enumerate(self.jump_thresholds):
+                            stats[4][j] += int(delta >= threshold)
+                samples.clear()
             if due == self.next_sample:
                 bucket = (due - self.begin_ns) // self.width
+                batches = [None] * len(self.horizons)
                 for key, value in self.values.items():
                     if value is None:
                         continue
@@ -209,9 +214,16 @@ class VolatilityRecorder(Stream):
                         row["spread"] += 2 * (ask - bid)
                     for horizon, offset in enumerate(self.horizons):
                         if due + offset < self.end_ns:
-                            require(len(self.pending) < MAX_PENDING, "volatility pending sample budget")
+                            require(self.pending_count < MAX_PENDING, "volatility pending sample budget")
                             self.budget.charge(PENDING_COST, "volatility state budget")
-                            heapq.heappush(self.pending, (due + offset, key, bucket, horizon, value))
+                            self.pending_count += 1
+                            samples = batches[horizon]
+                            if samples is None:
+                                samples = batches[horizon] = []
+                                heapq.heappush(self.pending, (due + offset, bucket, horizon, samples))
+                            # One heap entry per origin clock/horizon, but every
+                            # scalar still checks and charges before retention.
+                            samples.append((key, value))
                 self.next_sample += self.sample
             self._flush_ready(due)
         self._integrate(until)
