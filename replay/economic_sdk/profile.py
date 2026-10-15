@@ -42,7 +42,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     profile_policy,
 )
 from replay.economic_sdk.levels import LevelRecorder
-from replay.economic_sdk.transitions import TransitionRecorder
+from replay.economic_sdk.transitions import CutScan, TransitionRecorder
 from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
@@ -261,8 +261,10 @@ class Collector:
         # Scopes opened by this advance write their rows from the state before this cut.
         self.sequence = cut.risk_sequence
         self._advance(time)
-        for stream in self.streams:
-            stream.cut(cut, raw, time, self.rows, self.scope)
+        if self.streams:
+            scan = CutScan(self.streams[0], self.transitions is not None)
+            for stream in self.streams:
+                stream.cut(cut, raw, time, self.rows, self.scope, scan)
         transitions = cut.body["book_transitions"]
         scope_books = self.rows
         if raw >= self.start and "activity" in self.groups:

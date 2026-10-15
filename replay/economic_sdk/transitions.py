@@ -113,6 +113,50 @@ def quote_text(quote):
     return None if quote is None else [str(quote[0]), str(quote[1])]
 
 
+class CutScan:
+    """Callback-local shared scan, evaluated at the recorders' original check points.
+
+    Nothing here survives the callback. In particular, events are not scanned
+    before opening rows, transition checks or a level-only mirror check can fail.
+    """
+
+    def __init__(self, stream, want_trades):
+        self.plans, self.written_of = stream.plans, stream.written_of
+        self.want_trades = want_trades
+        self.by_key = self.causes = self.clocks = self.trades = None
+
+    def touches(self, cut):
+        if self.by_key is None:
+            by_key, causes = {}, {}
+            for transition in cut.body["book_transitions"]:
+                key = (transition["key"]["instrument"], transition["key"]["orientation"])
+                require(key in self.plans, "unplanned transition")
+                require(key not in by_key, "duplicate book transition in one cut")
+                by_key[key] = transition
+                written = self.written_of.get(key)
+                kind = transition["decision"]["kind"]
+                if written is not None and RANK[kind] >= RANK.get(causes.get(written), -1):
+                    causes[written] = kind
+            self.by_key, self.causes = by_key, causes
+        return self.by_key, self.causes
+
+    def events(self, cut):
+        if self.clocks is None:
+            clocks, trades = {}, []
+            for observation in cut.body["market_events"]:
+                event = observation["event"]
+                if event["kind"] == "book":
+                    inner = event["value"]["value"]
+                    written = self.written_of.get((inner["instrument"], inner["orientation"]))
+                    clock = inner.get("venue_time")
+                    if written is not None and clock is not None:
+                        clocks.setdefault(written, []).append(clock)
+                elif self.want_trades and event["kind"] == "trade":
+                    trades.append(observation)
+            self.clocks, self.trades = clocks, trades
+        return self.clocks, self.trades
+
+
 class Stream:
     """One written stream: scope-entry rows, the cut scan and the committed frame."""
 
@@ -154,37 +198,6 @@ class Stream:
 
     def _opening(self, scope, key, at, sequence):
         raise NotImplementedError
-
-    # -- cut scan ------------------------------------------------------------------
-    def _touches(self, cut):
-        """Planned keys with a transition, and the strongest cause per written book."""
-        keys, causes, seen = [], {}, set()
-        for transition in cut.body["book_transitions"]:
-            key = (transition["key"]["instrument"], transition["key"]["orientation"])
-            require(key in self.plans, "unplanned transition")
-            require(key not in seen, "duplicate book transition in one cut")
-            seen.add(key)
-            keys.append(key)
-            written = self.written_of.get(key)
-            kind = transition["decision"]["kind"]
-            if written is not None and RANK[kind] >= RANK.get(causes.get(written), -1):
-                causes[written] = kind
-        return keys, causes
-
-    def _scan(self, cut, want_trades):
-        """Venue-time records of each written book's book events, and the trade observations."""
-        clocks, trades = {}, []
-        for observation in cut.body["market_events"]:
-            event = observation["event"]
-            if event["kind"] == "book":
-                inner = event["value"]["value"]
-                written = self.written_of.get((inner["instrument"], inner["orientation"]))
-                clock = inner.get("venue_time")
-                if written is not None and clock is not None:
-                    clocks.setdefault(written, []).append(clock)
-            elif want_trades and event["kind"] == "trade":
-                trades.append(observation)
-        return clocks, trades
 
     def _row(self, kind, scope, key, sequence, time, **fields):
         return {"type": kind, "scope": scope, "book": self.index[key], "cut": sequence,
@@ -264,17 +277,17 @@ class TransitionRecorder(Stream):
         if self.on_top is not None:
             self.on_top(row)
 
-    def cut(self, cut, raw, time, scoped, scope):
+    def cut(self, cut, raw, time, scoped, scope, scan):
         sequence = cut.risk_sequence
         gated = raw >= self.start
         if gated:
             self.flush(sequence)
-        keys, causes = self._touches(cut)
+        keys, causes = scan.touches(cut)
         for key in keys:
             self._remember(key, cut.books[key])
         if not gated:
             return
-        clocks, observed = self._scan(cut, True)
+        clocks, observed = scan.events(cut)
         trades = {}
         for observation in observed:
             value = observation["event"]["value"]

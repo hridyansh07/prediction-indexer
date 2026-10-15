@@ -174,13 +174,13 @@ class LevelRecorder(Stream):
                 for (side, price), delta in sorted(merged.items(), key=lambda e: (e[0][0] != "bid", e[0][1]))
                 if delta]
 
-    def cut(self, cut, raw, time, scoped, scope):
+    def cut(self, cut, raw, time, scoped, scope, scan):
         sequence = cut.risk_sequence
         gated = raw >= self.start
         if gated:
             self.flush(sequence)
-        keys, causes = self._touches(cut)
-        by_key = {(t["key"]["instrument"], t["key"]["orientation"]): t for t in cut.body["book_transitions"]}
+        by_key, causes = scan.touches(cut)
+        keys = by_key
         applied = {key: self._apply(key, by_key[key]) for key in sorted(keys)}
         for key in keys:
             book = cut.books[key]
@@ -189,7 +189,7 @@ class LevelRecorder(Stream):
             self._check(key, book)
         if not gated:
             return
-        clocks, _ = self._scan(cut, False)
+        clocks, _ = scan.events(cut)
         deltas = {key: detail for key, (kind, detail) in applied.items() if kind == "operations"}
         for key in sorted((k for k in causes if k in scoped), key=self.index.__getitem__):
             cause = causes[key]
