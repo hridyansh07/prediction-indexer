@@ -695,6 +695,21 @@ class BoundTests(unittest.TestCase):
                         deep_size(economics, seen)
                     self.assertGreaterEqual(bounds.ENTITY + bounds.json_cost(entity.descriptor),
                                             deep_size(entity, seen))
+                    # Selection scratch holds only extra containers/references
+                    # for an already-reserved memo, never another owned view.
+                    sample_views = h.strategy._views(entity, 10)
+                    fingerprint = h.strategy._input_fingerprint(entity.id, 10, sample_views)
+                    observation = Observation("UNUSABLE", context_free=True)
+                    memo = (fingerprint.copy(), observation, 0)
+                    selected = {entity.id: (sample_views, fingerprint)}
+                    seen = set()
+                    for economics in getattr(metadata, "economics", ()):
+                        deep_size(economics, seen)
+                    deep_size(tuple(h.strategy.views.values()), seen)
+                    reserved = (bounds.ENTITY + bounds.json_cost(entity.descriptor)
+                                + bounds.fingerprint_cost(fingerprint)
+                                + bounds.observation_cost(observation))
+                    self.assertGreaterEqual(reserved, deep_size((entity, memo, selected), seen))
                 h.finish()
 
     def fill(self, levels):
