@@ -10,7 +10,7 @@ from replay.economic_sdk import (BookRequirement, Requirements, Strategy, FillSp
 from replay.economic_sdk.fills import fill_policy
 from replay.economic_sdk.probes import MS
 from replay.economic_sdk.views import quote_ages
-from replay.preparation import encoded
+from replay.tests.test_streams import fields
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import M, ladder, operations
 from replay.tests.test_economic_sdk_fills import (KIND, LEG0, LEG1, ONE, FillHarness,
@@ -296,7 +296,7 @@ class ProbeTests(unittest.TestCase):
         row = self.row(h)
         self.assertEqual((row["status"], row["legs"][0]["arrival_ns"]), ("empty", str(17 * MS)))
 
-    def test_full_and_sparse_v3_tapes_have_identical_probe_bytes_without_new_boundaries(self):
+    def test_full_and_sparse_v4_tapes_have_identical_probe_bytes_without_new_boundaries(self):
         def run(full):
             h = self.harness(probes(confirm_ms=[0, 2], arrival_ms=[0, 1, 5]))
             self.open(h)
@@ -309,8 +309,8 @@ class ProbeTests(unittest.TestCase):
                     body = {**body, "risk_sequence": str(risk_sequence)}
                 elif kind == "terminal":
                     body = {**body, "risk_cuts": str(risk_sequence)}
-                cut = h.decoder.apply(encoded({
-                    "version": "3", "run_id": "coverage-test",
+                cut = h.decoder.apply(fields({
+                    "version": "4", "run_id": "coverage-test",
                     "attempt_id": h.context["attempt_id"], "sequence": str(h.seq),
                     "kind": kind, "body": body}))
                 h.seq += 1
