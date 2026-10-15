@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -87,3 +89,15 @@ class Ledger:
         with closing(self._connect()) as connection, connection:
             connection.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
                                "ON CONFLICT (key) DO UPDATE SET value = excluded.value", (key, value))
+
+    def record_source(self, corpus_key, source):
+        """Best-effort provenance only; never participates in committed result bytes."""
+        try:
+            key = "source:" + corpus_key
+            previous = self.get_meta(key)
+            if previous is not None and json.loads(previous)["commit"] != source["commit"]:
+                print(f"warning: source commit for corpus {corpus_key} differs from recorded source: "
+                      f"{json.loads(previous)['commit']} -> {source['commit']}", file=sys.stderr)
+            self.set_meta(key, json.dumps(source, sort_keys=True))
+        except Exception as error:
+            print(f"warning: could not record source for corpus {corpus_key}: {error}", file=sys.stderr)

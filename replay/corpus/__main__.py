@@ -9,29 +9,38 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import random
 import subprocess
 import sys
 from pathlib import Path
 
+from replay import semantics
 from replay.corpus import results, spec as specs
 from replay.corpus.ledger import Ledger
+from replay.strategies import canonical_reference
 
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def corpus_key(spec, *, source, materializer_describe, runner_config):
-    """Every input that changes results; a different key is a separate corpus run."""
-    fees = dict(spec["fees"])
-    fees["template_catalog"] = Path(spec["fees"]["template_catalog"]).name
-    fees["sources"] = sorted(_sha(p.read_bytes()) for p in Path(spec["fees"]["sources"]).iterdir() if p.is_file())
-    identity = {"corpus_key_version": 1, "groups": spec["groups"], "image_source": source,
-                "dockerfile": spec["image"]["dockerfile"], "materializer": _sha(materializer_describe),
-                "runner_config": _sha(runner_config), "fees": fees, "game_state": spec["game_state"],
-                "limits": spec["limits"]}
+def corpus_key(spec, *, materializer_describe):
+    """Declared output semantics; a different key is a separate corpus run."""
+    strategies = {}
+    for group in spec["groups"]:
+        original = group["factory"]
+        reference = canonical_reference(original)
+        module = importlib.import_module(reference.split(":", 1)[0])
+        version = getattr(module, "STRATEGY_VERSION", None)
+        if type(version) is not int:
+            raise ValueError(f"factory {original!r} (canonical {reference!r}) requires an integer STRATEGY_VERSION")
+        strategies[group["name"]] = [reference, version]
+    identity = {"corpus_key_version": 2, "strategies": strategies,
+                "replay_semantics": semantics.REPLAY_SEMANTICS_VERSION,
+                "materializer": _sha(materializer_describe), "groups": spec["groups"],
+                "game_state": spec["game_state"]}
     return _sha(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
 
 
@@ -44,9 +53,8 @@ def _context(spec, allow_dirty):
     raw = json.loads(Path(spec["runner_config"]).read_bytes())
     raw["universe_base_url"] = spec["universe_base_url"]
     runner_config = json.dumps(raw, sort_keys=True).encode()
-    key = corpus_key(spec, source={"commit": commit, "dirty": dirty}, materializer_describe=describe,
-                     runner_config=runner_config)
-    return key, runner_config
+    key = corpus_key(spec, materializer_describe=describe)
+    return key, runner_config, {"commit": commit, "dirty": dirty}
 
 
 def main(argv=None):
@@ -81,7 +89,7 @@ def _main(argv=None):
     if args.sample is not None and (args.sample < 1 or args.bundle):
         parser.error("--sample must be positive and cannot be combined with --bundle")
     spec = specs.load(args.spec, read_only=args.deep)
-    key, runner_config = _context(spec, args.allow_dirty)
+    key, runner_config, source = _context(spec, args.allow_dirty)
     if args.deep:
         return verify_deep(Path(spec["results_root"]) / key[:16], spec,
                            bundles=args.bundle, sample=args.sample, seed=args.seed)
@@ -102,6 +110,8 @@ def _main(argv=None):
         for name, error in bad:
             print("  ", name, error)
         return 1 if bad else 0
+
+    ledger.record_source(key, source)
 
     from archive.storage.factory import build_store
     from archive.storage.local import LocalObjectStore

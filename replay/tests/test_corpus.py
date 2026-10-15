@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -127,6 +128,27 @@ class LedgerTests(unittest.TestCase):
             self.assertIsNone(ledger.state("other", "b1"))
             ledger.set_meta("image_id:k", "sha256:1"); ledger.set_meta("image_id:k", "sha256:2")
             self.assertEqual(ledger.get_meta("image_id:k"), "sha256:2")
+
+    def test_source_is_provenance_only_warns_on_commit_change_and_is_best_effort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger(Path(tmp) / "l.sqlite3")
+            ledger.set_meta("image_id:k", "sha256:img")
+            first = {"commit": "abc", "dirty": False}
+            second = {"commit": "def", "dirty": True}
+            err = io.StringIO()
+            with patch("sys.stderr", err):
+                ledger.record_source("k", first)
+                ledger.record_source("k", first)
+                self.assertEqual(err.getvalue(), "")
+                self.assertEqual(json.loads(ledger.get_meta("source:k")), first)
+                ledger.record_source("k", second)
+            self.assertIn("abc -> def", err.getvalue())
+            self.assertEqual(json.loads(ledger.get_meta("source:k")), second)
+            self.assertEqual(ledger.get_meta("image_id:k"), "sha256:img")
+            self.assertEqual(ledger.summary("k"), {})
+            with patch.object(ledger, "set_meta", side_effect=OSError("disk full")), patch("sys.stderr", err):
+                ledger.record_source("k", second)  # diagnostics must not fail the run
+            self.assertIn("could not record source", err.getvalue())
 
 
 class ResultsTests(unittest.TestCase):
@@ -360,7 +382,7 @@ class ResultsTests(unittest.TestCase):
                 seen.append(directory.name)
                 return [{"group": "g", "status": "PASS"}]
 
-            with patch.object(entry, "_context", return_value=(key, b"{}")), \
+            with patch.object(entry, "_context", return_value=(key, b"{}", {"commit": "abc", "dirty": False})), \
                  patch("replay.corpus.deep.audit", side_effect=auditor), patch("sys.stdout", io.StringIO()):
                 self.assertEqual(entry.main(["verify", str(path), "--deep", "--bundle", "b", "--bundle", "c"]), 0)
                 self.assertEqual(seen, ["b", "c"])
@@ -392,20 +414,95 @@ class SpecTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown corpus token"):
                 specs.substitute({"a": "@corpus:nope"}, {})
 
-    def test_corpus_key_binds_groups_source_and_tools(self):
+    def test_corpus_key_binds_declared_versions_groups_game_and_materializer_only(self):
+        import importlib
+        from replay import semantics
+        from replay.tests.test_strategy_packages import CASES
+
+        spec = spec_document(Path("/not-read"))
+        spec["groups"] = [dict(spec["groups"][0], name=name, factory="replay.strategies." + name + ":build")
+                          for name, *_ in CASES]
+        original = deepcopy(spec)
+        args = {"materializer_describe": b"v6"}
+        base = corpus_key(spec, **args)
+        identity = {"corpus_key_version": 2, "strategies": {
+            g["name"]: [g["factory"], importlib.import_module(g["factory"].split(":")[0]).STRATEGY_VERSION]
+            for g in spec["groups"]}, "replay_semantics": semantics.REPLAY_SEMANTICS_VERSION,
+            "materializer": hashlib.sha256(b"v6").hexdigest(), "groups": spec["groups"],
+            "game_state": spec["game_state"]}
+        self.assertEqual(base, hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        for field, value in (("universe_base_url", "http://other"), ("limits", {"attempt_seconds": 1}),
+                             ("fees", {"template_catalog": "/absent/catalog", "sources": "/absent/sources"}),
+                             ("bundles", {"only": ["b"], "exclude": ["c"]}), ("work_root", "/other/work"),
+                             ("results_root", "/other/results"), ("runner_config", "/absent/runner"),
+                             ("image", {"build_context": "/other", "dockerfile": "other"}),
+                             ("redis", {"image": "other"}),
+                             ("derivative_cache", {"root": "/cache", "max_bytes": 100})):
+            with self.subTest(invariant=field):
+                self.assertEqual(base, corpus_key({**spec, field: value}, **args))
+        for group in spec["groups"]:
+            module = importlib.import_module(group["factory"].split(":")[0])
+            with self.subTest(version=group["name"]), patch.object(module, "STRATEGY_VERSION", module.STRATEGY_VERSION + 1):
+                self.assertNotEqual(base, corpus_key(spec, **args))
+        with patch.object(semantics, "REPLAY_SEMANTICS_VERSION", semantics.REPLAY_SEMANTICS_VERSION + 1):
+            self.assertNotEqual(base, corpus_key(spec, **args))
+        changed = deepcopy(spec)
+        changed["groups"][0]["config"]["policy"] = {}
+        self.assertNotEqual(base, corpus_key(changed, **args))
+        self.assertNotEqual(base, corpus_key(spec, materializer_describe=b"v7"))
+        self.assertNotEqual(base, corpus_key({**spec, "game_state": {"prepare": False}}, **args))
+        self.assertEqual(spec, original)
+
+    def test_corpus_key_resolves_historical_factory_and_names_both_references_on_missing_version(self):
+        from replay import semantics
+        from replay.strategies import same_venue_complement as package
+
+        spec = spec_document(Path("/not-read"))
+        spec["groups"][0]["factory"] = "replay.same_venue_complement:build"
+        identity = {"corpus_key_version": 2, "strategies": {"complement": [
+            "replay.strategies.same_venue_complement:build", package.STRATEGY_VERSION]},
+            "replay_semantics": semantics.REPLAY_SEMANTICS_VERSION,
+            "materializer": hashlib.sha256(b"v6").hexdigest(), "groups": spec["groups"],
+            "game_state": spec["game_state"]}
+        self.assertEqual(corpus_key(spec, materializer_describe=b"v6"), hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        with patch.object(package, "STRATEGY_VERSION", None):
+            with self.assertRaises(ValueError) as caught:
+                corpus_key(spec, materializer_describe=b"v6")
+        for text in ("STRATEGY_VERSION", "replay.same_venue_complement:build",
+                     "replay.strategies.same_venue_complement:build"):
+            self.assertIn(text, str(caught.exception))
+        spec["groups"][0]["factory"] = "replay.tests.test_corpus:spec_document"
+        with self.assertRaisesRegex(ValueError, "STRATEGY_VERSION"):
+            corpus_key(spec, materializer_describe=b"v6")
+
+    def test_context_source_url_runner_and_fee_bytes_are_not_key_material_and_dirty_gate_stays(self):
+        from replay.corpus.__main__ import _context
+
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); (root / "sources").mkdir(); (root / "sources/a.html").write_text("fee page")
+            root = Path(tmp)
+            runner = root / "runner.json"
+            runner.write_text('{"universe_base_url": "http://old"}')
+            sources = root / "sources"
+            sources.mkdir()
+            fee = sources / "fee.html"
+            fee.write_text("old fee")
             spec = spec_document(root)
-            args = dict(source={"commit": "abc", "dirty": False}, materializer_describe=b"v6", runner_config=b"{}")
-            base = corpus_key(spec, **args)
-            self.assertEqual(base, corpus_key(spec, **args))
-            changed = spec_document(root); changed["groups"][0]["config"]["policy"] = {}
-            self.assertNotEqual(base, corpus_key(changed, **args))
-            self.assertNotEqual(base, corpus_key(spec, **{**args, "materializer_describe": b"v7"}))
-            self.assertNotEqual(base, corpus_key(spec, **{**args, "source": {"commit": "abd", "dirty": False}}))
-            self.assertEqual(base, corpus_key(spec_document(root, work_root="/elsewhere"), **args))
-            self.assertEqual(base, corpus_key(spec_document(root, derivative_cache={"root": "/cache", "max_bytes": 100}),
-                                              **args))
+            with patch("replay.bench.docker.git_source", return_value=("abc", False)), \
+                 patch("replay.corpus.__main__.subprocess.run", return_value=SimpleNamespace(stdout=b"v6")):
+                base, _, source = _context(spec, False)
+            self.assertEqual(source, {"commit": "abc", "dirty": False})
+            spec["universe_base_url"] = "http://new"
+            runner.write_text('{"universe_base_url": "http://ignored", "timeout": 99}')
+            fee.write_text("new fee")
+            with patch("replay.bench.docker.git_source", return_value=("def", True)), \
+                 patch("replay.corpus.__main__.subprocess.run", return_value=SimpleNamespace(stdout=b"v6")):
+                with self.assertRaisesRegex(SystemExit, "image build context has uncommitted changes"):
+                    _context(spec, False)
+                key, raw, source = _context(spec, True)
+            self.assertEqual(key, base)
+            self.assertEqual(json.loads(raw), {"universe_base_url": "http://new", "timeout": 99})
+            self.assertEqual(source, {"commit": "def", "dirty": True})
 
     def test_derivative_cache_is_optional_closed_writable_and_disjoint(self):
         with tempfile.TemporaryDirectory() as tmp:
