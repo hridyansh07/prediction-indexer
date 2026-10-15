@@ -7,6 +7,272 @@ use replay_tape::{DerivativePin, SourceFaultReason};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+// Keys at this boundary are emitted in serde_json::Value's sorted order.
+// Only schema literals are written raw; all borrowed text uses serde's escaping.
+macro_rules! object {
+    ($out:ident, $($key:literal => $value:expr),* $(,)?) => {{
+        $out.raw("{");
+        let mut separator = "";
+        $(
+            $out.raw(separator);
+            $out.raw(concat!("\"", $key, "\":"));
+            $value;
+            separator = ",";
+        )*
+        let _ = separator;
+        $out.raw("}");
+    }};
+}
+
+/// One section buffer, borrowing Risk data for the duration of encoding only.
+/// No domain serialization, numeric conversion or section extraction builds a
+/// JSON tree. The existing entry/queue limits still charge the finished fields.
+#[derive(Default)]
+struct Section(Vec<u8>);
+
+impl Section {
+    fn raw(&mut self, value: &str) {
+        self.0.extend_from_slice(value.as_bytes());
+    }
+    fn value(&mut self, value: impl serde::Serialize) {
+        serde_json::to_writer(&mut self.0, &value).unwrap();
+    }
+    fn integer(&mut self, value: impl std::fmt::Display) {
+        use std::io::Write;
+        write!(&mut self.0, "\"{value}\"").unwrap();
+    }
+    fn array<T>(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+        mut emit: impl FnMut(&mut Self, T),
+    ) {
+        self.raw("[");
+        for (index, value) in values.into_iter().enumerate() {
+            if index != 0 {
+                self.raw(",");
+            }
+            emit(self, value);
+        }
+        self.raw("]");
+    }
+    fn optional<T>(&mut self, value: Option<T>, emit: impl FnOnce(&mut Self, T)) {
+        if let Some(value) = value {
+            emit(self, value);
+        } else {
+            self.raw("null");
+        }
+    }
+    fn finish(self) -> String {
+        String::from_utf8(self.0).unwrap()
+    }
+    fn pin(&mut self, p: &DerivativePin) {
+        object!(self,
+            "derivative_address" => self.value(&p.derivative_address),
+            "receipt_sha256" => self.value(p.receipt_sha256),
+        );
+    }
+    fn address(&mut self, a: &replay_domain::EventAddress) {
+        object!(self,
+            "canonical_seq" => self.integer(a.canonical_seq()),
+            "delivery_index" => self.integer(a.delivery_index()),
+            "event_index" => self.integer(a.event_index()),
+            "lane" => self.value(a.lane()),
+        );
+    }
+    fn reference(&mut self, r: &Reference) {
+        object!(self,
+            "address" => self.address(&r.address),
+            "order_ns" => self.integer(r.order_ns),
+            "pin" => self.pin(&r.pin),
+            "visible_ns" => self.integer(r.visible_ns),
+        );
+    }
+    fn origin(&mut self, origin: &CutOrigin) {
+        match origin {
+            CutOrigin::Window {
+                pin,
+                start_ns,
+                end_ns,
+            } => object!(self,
+                "end_ns" => self.integer(end_ns),
+                "kind" => self.value("window"),
+                "pin" => self.pin(pin),
+                "start_ns" => self.integer(start_ns),
+            ),
+            CutOrigin::Group {
+                pin,
+                first,
+                last,
+                visible_ns,
+            } => object!(self,
+                "first" => self.address(first),
+                "kind" => self.value("group"),
+                "last" => self.address(last),
+                "pin" => self.pin(pin),
+                "visible_ns" => self.integer(visible_ns),
+            ),
+        }
+    }
+    fn price(&mut self, p: replay_domain::ConditionalMarketPrice) {
+        object!(self,
+            "atoms" => self.integer(p.atoms()),
+            "scale" => self.integer(p.scale().exponent()),
+            "unit" => self.value(p.unit()),
+        );
+    }
+    fn quantity(&mut self, q: replay_domain::PositiveQty) {
+        object!(self,
+            "atoms" => self.integer(q.atoms()),
+            "scale" => self.integer(q.scale().exponent()),
+            "unit" => self.value(q.unit()),
+        );
+    }
+    fn level(&mut self, l: &replay_domain::Level) {
+        object!(self,
+            "price" => self.price(l.price()),
+            "quantity" => self.quantity(l.quantity()),
+        );
+    }
+    fn venue_time(&mut self, time: Option<replay_domain::VenueTime>) {
+        self.optional(time, |out, t| {
+            object!(out,
+                "event_kind" => out.value(t.event_kind()),
+                "event_ns" => out.optional(t.event_ns(), Self::integer),
+                "event_resolution" => out.value(t.event_resolution()),
+                "sent_ns" => out.optional(t.sent_ns(), Self::integer),
+            )
+        });
+    }
+    fn change(&mut self, c: replay_domain::LevelChange) {
+        use replay_domain::LevelChange;
+        let (kind, quantity) = match c {
+            LevelChange::Set(q) => ("set", Some(q)),
+            LevelChange::Delete => ("delete", None),
+            LevelChange::Increase(q) => ("increase", Some(q)),
+            LevelChange::Decrease(q) => ("decrease", Some(q)),
+        };
+        self.raw("{\"kind\":");
+        self.value(kind);
+        if let Some(quantity) = quantity {
+            self.raw(",\"value\":");
+            self.quantity(quantity);
+        }
+        self.raw("}");
+    }
+    fn delta(&mut self, d: &replay_domain::BookDelta, observation: bool) {
+        // Observations have venue_time; transition operations deliberately do not.
+        object!(self,
+            "book_hash" => self.value(d.book_hash()),
+            "change" => self.change(d.change()),
+            "instrument" => self.value(d.instrument()),
+            "orientation" => self.value(d.orientation()),
+            "price" => self.price(d.price()),
+            "side" => self.value(d.side()),
+        );
+        // Reopen the object only to append the optional observation field.
+        self.0.pop();
+        if observation {
+            self.raw(",\"venue_time\":");
+            self.venue_time(d.venue_time());
+        }
+        self.raw("}");
+    }
+    fn market(&mut self, event: &MarketEvent) {
+        use replay_domain::BookEvent;
+        match event {
+            MarketEvent::Book(book) => {
+                self.raw("{\"kind\":\"book\",\"value\":{\"kind\":");
+                self.value(match book {
+                    BookEvent::Full(_) => "full",
+                    BookEvent::Delta(_) => "delta",
+                });
+                self.raw(",\"value\":");
+                match book {
+                    BookEvent::Full(b) => object!(self,
+                        "asks" => self.array(b.asks(), Self::level),
+                        "bids" => self.array(b.bids(), Self::level),
+                        "instrument" => self.value(b.instrument()),
+                        "orientation" => self.value(b.orientation()),
+                        "snapshot_hash" => self.value(b.snapshot_hash()),
+                        "source_observed_ns" => self.optional(b.source_observed_ns(), Self::integer),
+                        "venue_time" => self.venue_time(b.venue_time()),
+                    ),
+                    BookEvent::Delta(d) => self.delta(d, true),
+                }
+                self.raw("}}");
+            }
+            MarketEvent::Trade(t) => {
+                self.raw("{\"kind\":\"trade\",\"value\":");
+                object!(self,
+                    "aggressor" => self.value(t.aggressor()),
+                    "instrument" => self.value(t.instrument()),
+                    "orientation" => self.value(t.orientation()),
+                    "price" => self.price(t.price()),
+                    "quantity" => self.quantity(t.quantity()),
+                    "venue_time" => self.venue_time(t.venue_time()),
+                );
+                self.raw("}");
+            }
+        }
+    }
+    fn reason(&mut self, r: &Reason) {
+        let kind = match r {
+            Reason::MissingInitialization => "missing_initialization",
+            Reason::EpochChanged => "epoch_changed",
+            Reason::ConnectionOpened => "connection_opened",
+            Reason::ConnectionClosed => "connection_closed",
+            Reason::ConnectionFailed => "connection_failed",
+            Reason::SubscriptionChanged => "subscription_changed",
+            Reason::UnsupportedState => "unsupported_state",
+            Reason::ScaleMismatch => "scale_mismatch",
+            Reason::QuantityUnderflow => "quantity_underflow",
+            Reason::QuantityOverflow => "quantity_overflow",
+            Reason::LaneNotExpected => "lane_not_expected",
+            Reason::Interval(SourceFaultReason::LaneMissing) => "lane_missing",
+            Reason::Continuity(v) => {
+                return object!(self,
+                    "kind" => self.value("continuity"),
+                    "verdict" => self.value(v),
+                );
+            }
+            Reason::Interval(SourceFaultReason::LaneInvalid { detail }) => {
+                return object!(self,
+                    "detail" => self.value(detail),
+                    "kind" => self.value("lane_invalid"),
+                );
+            }
+            Reason::Interval(SourceFaultReason::VisibleClockRegression {
+                previous_visible_ns,
+                observed_visible_ns,
+            }) => {
+                return object!(self,
+                    "kind" => self.value("visible_clock_regression"),
+                    "observed_visible_ns" => self.integer(observed_visible_ns),
+                    "previous_visible_ns" => self.integer(previous_visible_ns),
+                );
+            }
+        };
+        object!(self, "kind" => self.value(kind));
+    }
+    fn decision(&mut self, d: &Decision) {
+        match d {
+            Decision::Snapshot(l) => object!(self,
+                "asks" => self.array(l.asks(), |out, (p, q)| { out.raw("["); out.integer(p); out.raw(","); out.integer(q); out.raw("]"); }),
+                "bids" => self.array(l.bids(), |out, (p, q)| { out.raw("["); out.integer(p); out.raw(","); out.integer(q); out.raw("]"); }),
+                "kind" => self.value("snapshot"),
+            ),
+            Decision::Operations(ops) => object!(self,
+                "kind" => self.value("operations"),
+                "operations" => self.array(ops, |out, d| out.delta(d, false)),
+            ),
+            Decision::Invalidation(r) => object!(self,
+                "kind" => self.value("invalidation"),
+                "reason" => self.reason(r),
+            ),
+        }
+    }
+}
+
 /// One Redis entry. Limits count the sum of field values, not just `record`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fields {
@@ -16,8 +282,79 @@ pub struct Fields {
 }
 
 impl Fields {
-    /// Called only after retention. Keep the original cut encoder as the single
-    /// source of truth, then move observations/dependencies into their sections.
+    /// Direct borrowed encoding, called only after the retention decision.
+    pub fn cut(c: &RiskCut, run_id: &str, attempt_id: &str, sequence: u64) -> Self {
+        let mut record = Section::default();
+        object!(record,
+            "attempt_id" => record.value(attempt_id),
+            "body" => object!(record,
+                "book_transitions" => record.array(c.book_transitions(), |out, t| object!(out,
+                    "decision" => out.decision(&t.decision),
+                    "key" => object!(out,
+                        "instrument" => out.value(&t.key.instrument),
+                        "orientation" => out.value(t.key.orientation),
+                    ),
+                    "previous_revision" => out.integer(t.previous_revision),
+                    "revision" => out.integer(t.view.revision()),
+                )),
+                "origin" => record.origin(c.origin()),
+                "risk_sequence" => record.integer(c.sequence()),
+            ),
+            "kind" => record.value("cut"),
+            "run_id" => record.value(run_id),
+            "sequence" => record.integer(sequence),
+            "version" => record.value("4"),
+        );
+        let mut events = Section::default();
+        events.raw("{");
+        if !c.control_events().is_empty() {
+            events.raw("\"control_events\":");
+            events.array(c.control_events(), |out, r| {
+                object!(out,
+                    "event" => object!(out,
+                        "from" => out.value(&r.from),
+                        "kind" => out.value("metadata_changed"),
+                        "to" => out.value(&r.to),
+                    ),
+                    "reference" => out.reference(&r.reference),
+                )
+            });
+            events.raw(",");
+        }
+        events.raw("\"market_events\":");
+        events.array(c.market_events(), |out, r| {
+            object!(out,
+                "disposition" => out.value(match r.disposition {
+                    Disposition::Observed => "observed",
+                    Disposition::Applied => "applied",
+                    Disposition::Duplicate => "duplicate",
+                    Disposition::NotAuthority => "not_authority",
+                    Disposition::Invalidated => "invalidated",
+                }),
+                "event" => out.market(&r.event),
+                "reference" => out.reference(&r.reference),
+            )
+        });
+        events.raw("}");
+        let mut deps = Section::default();
+        deps.array(c.book_transitions(), |out, t| {
+            out.optional(t.view.dependency(), |out, d| {
+                object!(out,
+                    "anchor" => out.reference(&d.anchor),
+                    "epoch" => out.value(&d.epoch),
+                    "through" => out.reference(&d.through),
+                )
+            })
+        });
+        Self {
+            record: record.finish(),
+            events: Some(events.finish()),
+            deps: Some(deps.finish()),
+        }
+    }
+
+    /// Encode an already constructed envelope (also the reference path for cut
+    /// fixtures). Production cuts use the borrowed encoder above after retention.
     pub fn encode(mut envelope: Value) -> Self {
         let (events, deps) = if envelope["kind"] == "cut" {
             let body = envelope["body"].as_object_mut().unwrap();
