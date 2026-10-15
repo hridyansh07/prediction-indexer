@@ -1,0 +1,34 @@
+{
+  "replay.strategies.bundle_coverage": {
+    "digest": "72f9d56d06eea6f71b548cf912596f8fab75e538ca95214bc0eb0630b86bc3eb",
+    "version": 1
+  },
+  "replay.strategies.cross_venue_arbitrage": {
+    "digest": "d0edb47125f1cffbb07107b29640ed8fd64a03e1f47c2c8673e146fb65d24881",
+    "version": 1
+  },
+  "replay.strategies.cross_venue_implication_cover": {
+    "digest": "3a27e91483c7867fd8e1bd6d752ca8aafe48894b1cddd99ab6926f922979ba4b",
+    "version": 1
+  },
+  "replay.strategies.market_profile": {
+    "digest": "cb2ac84855a3abf1e14d870d86074d484cfb3d721f51ea17af951da0ec787443",
+    "version": 1
+  },
+  "replay.strategies.same_venue_complement": {
+    "digest": "1bcf6ac09cb3cbc9012505afd1020ce678ee55dc62a1c9b91d4b6806d34ce9cc",
+    "version": 1
+  },
+  "replay.strategies.same_venue_implication_cover": {
+    "digest": "ffa423773ab68f1aa882c8b93219fdbd56ca415f3b3019d34eece30c180a4bb2",
+    "version": 1
+  },
+  "replay.strategies.same_venue_multi_market": {
+    "digest": "dba4565e0a4cc13bc4d5c8be56d0372ad3b4dcf09424e3ed1cf01a06cf862d40",
+    "version": 1
+  },
+  "replay_semantics": {
+    "digest": "7fa6cf54e31180d6f34068ea41dc419a24b3009be0764011311a3c9f78b678d7",
+    "version": 1
+  }
+}
