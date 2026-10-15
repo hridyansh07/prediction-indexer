@@ -479,7 +479,17 @@ impl<S: StreamSink> Publisher<S> {
             let retained = self.retention.retain(&cut)?;
             if retained {
                 self.sequence = self.sequence.checked_add(1).ok_or(Error::Resource)?;
-                self.insert("cut", wire::cut(&cut))?;
+                self.buffer.insert(Entry {
+                    sequence: self.sequence,
+                    risk_sequence: Some(self.risk_sequence),
+                    fields: wire::Fields::cut(
+                        &cut,
+                        &self.config.run_id,
+                        &self.config.attempt_id,
+                        self.sequence,
+                    ),
+                    terminal: false,
+                })?;
             }
             self.buffer.flush_due()?;
             if !retained
