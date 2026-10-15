@@ -177,7 +177,7 @@ pub(crate) fn excluded_header(line: &[u8], scope: &ScopeFilter) -> Option<(u16, 
         if venue.is_empty() || native.is_empty() {
             return None;
         }
-        scope.instruments.iter().any(|entry| entry.as_str() == id)
+        scope.instruments.contains(id)
     } else {
         let control = body.strip_prefix(b"{\"kind\":\"control\",\"value\":{\"kind\":\"")?;
         let kind_end = control.iter().position(|&b| b == b'"')?;
@@ -193,7 +193,7 @@ pub(crate) fn excluded_header(line: &[u8], scope: &ScopeFilter) -> Option<(u16, 
             return None;
         }
         let lane_text = std::str::from_utf8(&line[lane.clone()]).ok()?;
-        scope.lanes.iter().any(|entry| entry.as_str() == lane_text)
+        scope.lanes.contains(lane_text)
     };
     if keep {
         return None; // Kept events retain the complete T4 typed-body path.
