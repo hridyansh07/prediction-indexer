@@ -154,12 +154,14 @@ def _quote(value, scale):
 
 def _ladder(value, scale, descending):
     require(type(value) is list, "ladder shape")
-    prices, result = [], {}
+    previous, ordered, result = None, True, {}
     for entry in value:
         price, quantity = _quote(entry, scale)
-        prices.append(price)
+        if previous is not None:
+            ordered &= price < previous if descending else price > previous
+        previous = price
         result[price] = quantity
-    require(prices == sorted(set(prices), reverse=descending), "ladder order")
+    require(ordered, "ladder order")
     return result
 
 
@@ -429,23 +431,36 @@ class _Levels:
             require(state is not None, "first level row is not an open ladder")
             changes = row["levels"]
             require(type(changes) is list and changes, "diff levels")
-            seen = []
+            previous, ordered = None, True
+            best, dirty = list(state.best), [False, False]
             out["before"] = state.top()
             for entry in changes:
                 require(type(entry) is list and len(entry) == 3 and entry[0] in ("bid", "ask"), "diff entry")
                 side = 0 if entry[0] == "bid" else 1
                 price, delta = _big(entry[1]), _signed(entry[2])
                 require(price <= 10 ** int(scale) and delta != 0, "diff entry range")
-                seen.append((side, price))
+                key = (side, price)
+                if previous is not None:
+                    ordered &= previous < key
+                previous = key
                 levels = state.sides[side]
                 new = levels.get(price, 0) + delta
                 require(new >= 0, "diff drives a level negative")
                 if new:
                     levels[price] = new
+                    if best[side] is None or (price > best[side] if side == 0 else price < best[side]):
+                        best[side] = price
                 else:
                     levels.pop(price, None)
-            require(seen == sorted(set(seen)), "diff order")
-            state.settle(0), state.settle(1)
+                    if price == best[side]:
+                        dirty[side] = True
+            # Order errors follow all entry/range/negative-quantity checks, as before.
+            require(ordered, "diff order")
+            for side in (0, 1):
+                if dirty[side]:
+                    state.settle(side)
+                else:
+                    state.best[side] = best[side]
         self.types[kind] = self.types.get(kind, 0) + 1
         out["after"] = state.top()
         out["opening"] = opening
