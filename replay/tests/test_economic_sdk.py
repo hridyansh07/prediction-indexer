@@ -53,11 +53,13 @@ def deep_size(value, seen=None):
         return 0
     seen.add(id(value))
     size = sys.getsizeof(value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
+        if type(value) is MappingProxyType:
+            size += sys.getsizeof(dict(value))  # the proxy's owned backing map
         size += sum(deep_size(k, seen) + deep_size(v, seen) for k, v in value.items())
     elif isinstance(value, (list, tuple, set, frozenset)):
         size += sum(deep_size(v, seen) for v in value)
-    elif dataclasses.is_dataclass(value) or hasattr(value, "__slots__"):
+    if dataclasses.is_dataclass(value) or hasattr(value, "__slots__"):
         for cls in type(value).__mro__:
             for name in getattr(cls, "__slots__", ()):
                 if hasattr(value, name):
@@ -603,6 +605,17 @@ class ComplementV2Tests(Base):
 
 
 class JsonCostTests(unittest.TestCase):
+    def test_owned_frozen_metadata_keeps_every_occurrence_charge(self):
+        source = {"legs": [{"instrument": "α", "quantity": 2**119}], "flag": True}
+        frozen = bounds.FrozenJSON(source)
+        expected = json_cost(source)
+        source["legs"][0]["quantity"] = 0
+        self.assertEqual(frozen["legs"][0]["quantity"], 2**119)
+        with self.assertRaises(TypeError):
+            frozen["legs"][0]["quantity"] = 3
+        self.assertEqual(bounds.json_cost(frozen), expected)
+        self.assertEqual(bounds.json_cost([frozen, frozen]), CONTAINER + 2 * (SLOT + expected))
+
     def test_generated_trees_match_the_old_cost_without_materializing_ids(self):
         class IntSubclass(int):
             pass
@@ -653,6 +666,36 @@ class JsonCostTests(unittest.TestCase):
 
 class BoundTests(unittest.TestCase):
     """Closed-form costs must not undercount a real recursive traversal."""
+
+    def test_entity_metadata_fits_the_unchanged_reservation(self):
+        from replay.strategies._shared.metadata import native_metadata, complement_metadata
+        from replay.tests.test_cross_venue_arbitrage import Harness as CrossHarness
+        from replay.tests.test_same_venue_multi_market import Harness as MultiHarness
+        from replay.tests.test_implication_cover import Harness as CoverHarness
+
+        controls = [{"kind": "cyclic_neighbor"}, {"kind": "time_shift", "shift_ns": ["5"]}]
+        cases = ((Harness, {"pairs": True, "known": True, "policy": v2_policy(controls=controls)}),
+                 (CrossHarness, {"policy": {"controls": controls[1:]}}),
+                 (MultiHarness, {}), (CoverHarness, {}), (CoverHarness, {"mode": "cross_venue"}))
+        for fixture, kwargs in cases:
+            with self.subTest(fixture=fixture.__module__, kwargs=kwargs), tempfile.TemporaryDirectory() as tmp:
+                h = fixture(Path(tmp), **kwargs)
+                for writer in h.strategy.writers.values():
+                    self.addCleanup(writer.stream.close)
+                h.window()
+                for entity in h.strategy.entities.values():
+                    if entity.admission is not None:
+                        continue
+                    metadata = (complement_metadata if fixture is Harness else native_metadata)(
+                        h.strategy.strategy, entity)
+                    # Economics/assets belong to the already reserved bridge;
+                    # count all owned maps, frozen backing maps and scalar slots.
+                    seen = set()
+                    for economics in getattr(metadata, "economics", ()):
+                        deep_size(economics, seen)
+                    self.assertGreaterEqual(bounds.ENTITY + bounds.json_cost(entity.descriptor),
+                                            deep_size(entity, seen))
+                h.finish()
 
     def fill(self, levels):
         consumed = tuple((10**6 + i, 10**12 + i) for i in range(levels))

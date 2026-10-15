@@ -3,9 +3,10 @@
 from dataclasses import replace
 
 from replay.strategies.cross_venue_arbitrage.strategy import CrossVenueArbitrage
-from replay.strategies.cross_venue_arbitrage.contract import UNIT, SETTLEMENT, sizes
+from replay.strategies.cross_venue_arbitrage.contract import SETTLEMENT, sizes
 from replay.strategies._shared.implication_cover.contract import Inputs, payoff
 from replay.strategies._shared.implication_cover.output import ImplicationReader, validate_content
+from replay.strategies._shared.metadata import native_metadata
 from replay.streams.protocol import require
 
 
@@ -33,14 +34,14 @@ class ImplicationCover(ImplicationReader, CrossVenueArbitrage):
         if observation.payload is None:
             return observation
         values = dict(observation.payload)
-        size, proof = int(entity.descriptor["size_contracts"]), entity.descriptor["implication"]
-        gross = payoff(proof, (size * UNIT, size * UNIT))
+        proof = entity.descriptor["implication"]
+        gross, middle, extra = native_metadata(self, entity).gross_payoffs
         net = (payoff(proof, tuple(int(leg["received_e36"]) for leg in values["native_legs"]))
                if values["fee_status"] == "KNOWN" else None)
-        values.update(payoffs_gross_e36=[str(v) for v in gross],
+        values.update(payoffs_gross_e36=list(gross),
                       payoffs_net_e36=None if net is None else [str(v) for v in net],
-                      payout_middle_gross_e36=str(max(gross)),
-                      payout_middle_extra_gross_e36=str(max(gross) - min(gross)),
+                      payout_middle_gross_e36=middle,
+                      payout_middle_extra_gross_e36=extra,
                       payout_middle_net_e36=None if net is None else str(max(net)),
                       payout_middle_extra_net_e36=None if net is None else str(max(net) - min(net)))
         return replace(observation, payload=values)

@@ -219,6 +219,12 @@ class ProbeTests(unittest.TestCase):
                          [(0, [1, 1], [str(14 * MS)] * 2),
                           (5, [3, 3], [str(21 * MS)] * 2)])
         self.assertTrue(all(leg["delay_source"] == "terms" for row in rows for leg in row["legs"]))
+        # Reuse the same resolved entity in non-monotone order. A cached
+        # time-selected term would incorrectly keep either 1 or 3 ms here.
+        entity = next(iter(h.strategy.entities.values()))
+        hook = h.strategy.strategy.fill_delays
+        for time, delay in ((16, 3 * MS), (15, MS), (10, None), (40, None), (12, MS)):
+            self.assertEqual(hook(entity, time * MS), (delay, delay))
 
     def test_c0_recording_sizing_prices_its_opening_walk_even_when_untradeable(self):
         record = {"name": "record", "role": "records", "target_contracts": "3"}
