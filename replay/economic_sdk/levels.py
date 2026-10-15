@@ -97,6 +97,7 @@ class LevelRecorder(Stream):
             return kind, None
         require(kind == "operations", "unknown decision")
         deltas = {}
+        unsettled = [False, False]
         for op in decision["operations"]:
             side = BID if op["side"] == "bid" else ASK
             price = int(op["price"]["atoms"])
@@ -118,16 +119,21 @@ class LevelRecorder(Stream):
                 if price not in levels:
                     self.budget.charge(LEVEL, "profile state budget")
                     top = mirror.best[side]
-                    if top is None or (price > top if side == BID else price < top):
+                    if not unsettled[side] and (top is None or (price > top if side == BID else price < top)):
                         mirror.best[side] = price
                 levels[price] = new
             elif price in levels:
                 del levels[price]
                 self.budget.release(LEVEL)
                 if price == mirror.best[side]:
-                    mirror.settle(side)
+                    unsettled[side] = True
             if new != old:
                 deltas[side, price] = deltas.get((side, price), 0) + new - old
+        # No operation reads the top; the decoder check needs only the final
+        # extrema. All per-operation checks and charges above remain ordered.
+        for side in (BID, ASK):
+            if unsettled[side]:
+                mirror.settle(side)
         return kind, deltas
 
     # -- rows ----------------------------------------------------------------------
