@@ -345,6 +345,38 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "no native risk plans"):
             Harness(other, all_uncaptured=True)
 
+    def test_s5_shared_keys_keep_membership_counts_row_order_and_first_provenance(self):
+        from replay.economic_sdk.availability import IntervalEngine
+
+        h = self.harness(scopes=True)
+        snapshot = copy.deepcopy(plain(h.snapshot))
+        first = snapshot["scopes"][0]["members"][0]
+        shared = {**copy.deepcopy(first), "market_id": "polymarket:shared", "books": first["books"][:1]}
+        snapshot["scopes"][0]["members"].insert(1, shared)
+        writer = type("Rows", (), {"append": lambda _, row: rows.append(row)})()
+        rows = []
+        engine = IntervalEngine(snapshot, writer)
+        from replay.streams.protocol import Cut
+        engine.initial(Cut(0, 0, "initial", {}, h.decoder.books))
+        engine.cut(h.window(), 0, 10)
+        # Reverse wire order must not reverse member/book visitation.
+        engine.cut(h.group(12, list(reversed(h.initial["plans"]))), 12, 12)
+        engine.cut(h.group(13, h.initial["plans"][:1]), 13, 13)  # status unchanged
+        engine.cut(h.group(17, h.initial["plans"][:1], {"kind": "connection_closed"}), 17, 17)
+        engine.cut(h.group(26, h.initial["plans"][:1]), 26, 26)  # quiet scope entry at 23
+        engine.terminal(40)
+        member = "member:" + first["market_id"]
+        shared_id = "member:polymarket:shared"
+        book = book_id(first["books"][0])
+        self.assertEqual([r["entity"] for r in rows if r["end_ns"] == "12"],
+                         [book_id(b) for b in first["books"]] + [member, shared_id, "bundle"])
+        self.assertEqual([(r["start_ns"], r["end_ns"], r["usable_books"], r["required_books"])
+                          for r in rows if r["entity"] == "bundle" and r["scope"] == 0],
+                         [("10", "12", 0, 3), ("12", "17", 3, 3), ("17", "23", 1, 3)])
+        self.assertEqual([(r["start_ns"], r["end_ns"], r["source"]["visible_ns"])
+                          for r in rows if r["entity"] == book and r["state"] == "usable"],
+                         [("12", "17", "12"), ("26", "40", "26")])
+
     def test_window_evidence_is_not_latched_reason_and_clip_preserves_origin(self):
         h = self.harness()
         h.window(0, 20, {"kind": "lane_missing"})
