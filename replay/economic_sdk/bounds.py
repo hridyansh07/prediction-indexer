@@ -8,9 +8,11 @@ maximal states. Exceeding a limit fails the attempt; nothing is truncated.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from replay.fees.lazy import LazyAssessmentIds
-from replay.streams.protocol import require
+from replay.streams.protocol import freeze, require
+from replay.strategy_sdk import plain
 
 MAX_ROWS = 2_000_000
 MAX_BYTES = 512 * 1024 * 1024
@@ -61,9 +63,37 @@ def json_cost(value):
         # materialize a handle just to account its retained state.
         return (512 + json_cost(value.request.retained_inputs)
                 + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
+    if type(value) is FrozenJSON:
+        return value.cost
     if isinstance(value, Mapping):
         return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
     return SMALL
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrozenJSON(Mapping):
+    """Owned immutable metadata with the original occurrence-based JSON cost.
+
+    This saves traversal, never reservation: every reference costs exactly as
+    the original tree. Entity metadata fits the existing descriptor reservation.
+    """
+
+    value: object
+    cost: int = field(init=False)
+
+    def __post_init__(self):
+        owned = freeze(plain(self.value))
+        object.__setattr__(self, "value", owned)
+        object.__setattr__(self, "cost", json_cost(owned))
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __iter__(self):
+        return iter(self.value)
+
+    def __len__(self):
+        return len(self.value)
 
 
 def fills_cost(sizes, levels):

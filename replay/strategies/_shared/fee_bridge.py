@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from replay.economic_fills import Fill
+from replay.economic_sdk.bounds import FrozenJSON
 from replay.fees import FeeEngine, Policy, Resolver
 from replay.fees.artifacts import load_catalog, parse_canonical
 from replay.fees.lazy import LazyAssessmentIds
@@ -317,6 +318,7 @@ class FeeBridge:
         expected_side = direction
         prepared = []
         reasons = []
+        captured_basket = basket if type(basket) is FrozenJSON else None
         for leg in legs:
             required = {"market_id", "key", "fill", "price_scale", "quantity_scale", "side"}
             if type(leg) is not dict or set(leg) != required or leg["side"] != expected_side:
@@ -340,8 +342,10 @@ class FeeBridge:
                 raise ValueError("unsupported leg venue") from error
             native_market = leg["market_id"].removeprefix(venue_name + ":")
             native_instrument = key[0].removeprefix(venue_name + ":")
+            if captured_basket is None:
+                captured_basket = freeze(plain(basket))
             request = _OrderInputs(
-                self._engine, self._resolver, experiment, scope, freeze(plain(basket)),
+                self._engine, self._resolver, experiment, scope, captured_basket,
                 direction, size, key, time, sequence,
                 self._context(venue, native_market, native_instrument, key[1], account),
                 economics, fill_value.taken)

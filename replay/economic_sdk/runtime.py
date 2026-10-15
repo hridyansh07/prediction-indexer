@@ -320,12 +320,18 @@ class Runtime:
             if self.profile is not None:
                 self.profile.cut(cut, raw, time, changed)
             skew_only = set()
+            # Only this cut's fully installed views. Nothing escapes to a
+            # subsequent cut (even at the same time), scope, release or timer.
+            # Only already-reserved memos enter this pointer-only scratch map;
+            # ENTITY/fingerprint container slack covers its temporary storage.
+            inputs = {}
             for key, sides in changed.items():
-                self._select(key, sides, time, affected, skew_only)
+                self._select(key, sides, time, affected, skew_only, inputs)
             # A changed time-shift book must reach its ring at this exact time,
             # even when no entity is staged now.
             if affected or self.staged_books or self.probes is not None:
-                self._stage(time, affected)
+                self._stage(time, affected, inputs)
+            inputs.clear()
             # Resolve every economic dependency first: another changed leg in
             # this cut may require evaluation rather than a skew-only refresh.
             for entity_id in sorted(skew_only - affected):
@@ -334,7 +340,7 @@ class Runtime:
             self.poisoned = True
             raise
 
-    def _select(self, key, sides, time, affected, skew_only):
+    def _select(self, key, sides, time, affected, skew_only, inputs):
         """Add the entities a change to ``key`` can change to ``affected``.
 
         An entity whose current observation is context-free and whose declared
@@ -361,9 +367,16 @@ class Runtime:
             elif sides is None or not read.isdisjoint(sides):
                 # A touched input: unchanged when every object it reads is identical.
                 memo = self.memo.get(entity_id)
-                if (self.legacy or memo is None or memo[1] is not value[0] or not _same(
-                        memo[0], self._input_fingerprint(entity_id, time))):
+                if self.legacy or memo is None or memo[1] is not value[0]:
                     affected.add(entity_id)
+                else:
+                    selected = inputs.get(entity_id)
+                    if selected is None:
+                        views = self._views(self.entities[entity_id], time)
+                        selected = (views, self._input_fingerprint(entity_id, time, views))
+                        inputs[entity_id] = selected
+                    if not _same(memo[0], selected[1]):
+                        affected.add(entity_id)
             elif self.legacy and value[0].status == EVALUATED:
                 entity = self.entities[entity_id]
                 if self._skew(entity, value[0].skew_legs)[1] != value[1]:
@@ -637,15 +650,17 @@ class Runtime:
             parts.append(self.game.view.revision)
         return parts
 
-    def _evaluate(self, entity_id):
+    def _evaluate(self, entity_id, inputs=None):
         entity = self.entities[entity_id]
         if entity.admission is not None:
             return (Observation(entity.admission, entity.admission_reasons,
                                 fields=self.experiment.unevaluated_fields), None)
-        views = self._views(entity, self.staged_time)
+        selected = inputs.get(entity_id) if inputs is not None else None
+        views = selected[0] if selected is not None else self._views(entity, self.staged_time)
         plan = self.plans_of.get(entity_id)
         if plan is not None:
-            fingerprint = self._input_fingerprint(entity_id, self.staged_time, views)
+            fingerprint = (selected[1] if selected is not None else
+                           self._input_fingerprint(entity_id, self.staged_time, views))
             memo = self.memo.get(entity_id)
             if memo is not None and _same(memo[0], fingerprint):
                 observation = memo[1]
@@ -730,10 +745,10 @@ class Runtime:
             cost = self._plain_costs[key] = bounds.observation_cost(observation)
         return cost
 
-    def _stage(self, time, entities):
+    def _stage(self, time, entities, inputs=None):
         self._begin_stage(time)
         for entity in sorted(entities):
-            self._retain_staged(entity, self._evaluate(entity))
+            self._retain_staged(entity, self._evaluate(entity, inputs))
 
     def _begin_stage(self, time):
         if self.staged_time is None:
