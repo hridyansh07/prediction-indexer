@@ -3,13 +3,15 @@
 Status: **implemented and offline validated; site UI explicitly deferred by the
 user; fresh retained-data strategy acceptance and the full corpus rerun pending.**
 
-This branch starts from `codex/research-outcomes-v2` at
-`998cfb71aa4232f7ca24562be0ed597730f2ed5e` (PR #77, targeting
-`feat/research-site`). It keeps the research package on its existing branch.
-Producer policies and runtime changes are delivered separately on
-`codex/strategy-execution-realism`, based on PR #78's
-`codex/execution-realism-fixes`. Neither PR imports the other package's whole
-branch. No UI source, chart, lens-layer behavior or dependency manifest changed.
+This branch is now rebased onto `feat/research-site` at
+`8d4cfc702cd35d35684a16cf7c26952237094ad0`, which contains merged PR #77.
+The already-merged compatibility fix is excluded from PR #80. Its original base
+was `codex/research-outcomes-v2` at
+`998cfb71aa4232f7ca24562be0ed597730f2ed5e`. The rebase leaves the code tree
+identical, and all 64 research tests pass again. Producer policies and runtime
+changes remain in PR #79 on `codex/strategy-execution-realism`, now based on
+`feat/corpus-runner` after #78 and the newer throughput changes merged. No UI
+source, chart, lens-layer behavior or dependency manifest changed.
 
 ## Implemented output contract
 
@@ -92,8 +94,9 @@ full corpus rerun remain pending complete pinned inputs and an authorized
 disposable runtime. No cloud access, service change, migration/deployment,
 target publication, live pilot or PR merge was performed.
 
-Merge #77 into `feat/research-site` first, then retarget this rollout there.
-Independently merge #78 into `feat/corpus-runner`, then retarget the producer
-rollout there. Review their shared output contract together. Integrate the
-updated corpus-runner lineage into `master` before research-site consumes the
-new outputs. Code merges do not authorize an operational rerun or live pilot.
+The prerequisites #77 and #78 are merged. PR #80 now targets `feat/research-site`
+and PR #79 targets `feat/corpus-runner` directly; each rollout can merge into its
+own feature branch. Review their common output contract together. Integrate the
+updated corpus-runner lineage into `master` before research-site consumes the new
+outputs, after the separately pending acceptance. Code merges do not authorize
+an operational rerun or live pilot.
