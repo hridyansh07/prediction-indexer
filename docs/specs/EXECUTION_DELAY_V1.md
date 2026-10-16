@@ -141,6 +141,17 @@ terms. `None` means unknown, and the SDK substitutes `unknown_taker_delay_ms`. T
 hook is pure: it depends only on its arguments and the pinned snapshot, because the
 reader calls it.
 
+`fill_loss(entity, native_losses, time_ns) -> int` values the gross unwind loss in
+the same monetary unit and scale as `fill_value`. `native_losses` is a tuple in
+leg order; each signed integer is still at that leg's native
+`price_scale + quantity_scale`. The SDK derives those native losses from the
+carried fill and exit walks, then the strategy converts their scales and quote
+assets using pinned inputs. The reader calls the same pure hook. Missing or
+unknown conversion fails the attempt; the SDK cannot infer a strategy's value
+unit and must not sum raw amounts from different native scales. The hook excludes
+unwind fees and accepts negative losses. Existing native leg `cost` and
+`exit_proceeds` fields retain their original units.
+
 ### 2.3 Decision
 
 For each opened fill episode (opening time `t0`) and each `c` in `confirm_ms`, the
@@ -194,7 +205,8 @@ Then:
   ladder at its own arrival time. The exit ladder is `bid` for a bought leg, or
   `kalshi_complement_bid` for a bought Kalshi complement; the reverse for a sold
   leg. The walk is best-first and records the proceeds.
-  - `leg_loss_gross` is summed over legs. For a bought leg it is the excess cost
+  - `leg_loss_gross` is valued by `fill_loss` after computing each leg's native
+    loss. For a bought leg it is the excess cost
     minus the exit proceeds. For a sold leg it is the repurchase cost of the excess
     minus the sale proceeds of that excess.
   - Matched quantity always takes each leg's best atoms: the cheapest for a bought
@@ -268,7 +280,8 @@ probe:
 - each leg's walk structurally: prices no worse than the limit, best-first,
   quantity, and cost = Σ p·q;
 - `matched_steps`, excess, and `value` through `fill_value` at `decision.time_ns`;
-- `leg_loss_gross` arithmetic;
+- per-leg native loss arithmetic and `leg_loss_gross` through `fill_loss`, in the
+  same monetary unit and scale as `value`;
 - arrival and send times from `fill_delays` plus the policy;
 - status from the leg results.
 

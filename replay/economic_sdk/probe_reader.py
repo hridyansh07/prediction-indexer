@@ -212,7 +212,7 @@ def _check(row, ep, scopes, policy, strategy, plans):
     require(row["status"] != "censored", "probe spurious censoring")
     matched = min(atoms // unit for (atoms, _, _), unit in zip(fills, spec.units))
     require(_natural(row["matched_steps"]) == matched, "probe matched steps")
-    matched_legs, loss = [], 0
+    matched_legs, native_losses = [], []
     for index, (leg, (atoms, cost, taken), unit) in enumerate(zip(row["legs"], fills, spec.units)):
         kept = _prefix(taken, matched * unit)
         kept_cost = sum(price * quantity for price, quantity in kept)
@@ -227,12 +227,14 @@ def _check(row, ep, scopes, policy, strategy, plans):
                 "probe exit proceeds")
         require(excess > 0 or (not exit_levels and proceeds == 0), "probe zero-excess unwind")
         excess_cost = cost - kept_cost
-        loss += (proceeds - excess_cost if spec.sources[index] in SELL_SOURCES
-                 else excess_cost - proceeds)
+        native_losses.append(proceeds - excess_cost if spec.sources[index] in SELL_SOURCES
+                             else excess_cost - proceeds)
     recorded = None if row["value"] is None else _signed(row["value"])
     value = 0 if matched == 0 else strategy.fill_value(entity, matched, tuple(matched_legs), when)
     require(value is None or type(value) is int, "probe value hook type")
     require(recorded == value, "probe matched value")
+    loss = strategy.fill_loss(entity, tuple(native_losses), when)
+    require(type(loss) is int, "probe loss value")
     require(_signed(row["leg_loss_gross"]) == loss, "probe gross loss")
     status = ("unusable" if any(leg["usable"] is False for leg in row["legs"])
               else "empty" if matched == 0 else "partial" if matched < steps else "filled")

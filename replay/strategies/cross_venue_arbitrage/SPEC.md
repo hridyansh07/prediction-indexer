@@ -130,6 +130,14 @@ supported with fill checks.
 
 Policy 2 remains readable and runnable for the fixed-size sweep.
 
+When probes are explicitly requested, `fill_loss` converts each signed native
+gross unwind loss to scale-36 research dollars under the same pinned
+`PARITY_SCENARIO` asset coverage as `fill_value`. Native per-leg costs and exit
+proceeds remain unchanged. The independent reader retains the prepared snapshot
+for the default execution-terms lookup and rejects an unvalued or raw-native
+aggregate loss. This mechanism does not enable a new strategy policy or probe
+configuration by default.
+
 **Retained fixture (2026-10-07).** Linux supervisor runs of the re-prepared
 Procyon context with current published fees and one governing `edge` sizing
 succeed in about 90 s (the eight-size sweep takes several minutes), and the

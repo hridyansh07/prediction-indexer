@@ -77,6 +77,12 @@ The strategy uses SDK fill checks only
 
 Controls are not supported with fill checks.
 
+With explicit probes, `fill_loss` converts every signed native gross unwind
+loss to scale 36 in the set's common quote asset, matching `fill_value` units.
+Unknown economics or different quote assets fail conversion. Native leg costs
+and exit proceeds remain unchanged. Reader-only instances retain the pinned
+snapshot for the default execution-terms lookup. Probes remain opt-in.
+
 ## 4. Configuration
 
 The closed run config is `{version: 1, snapshot_directory, snapshot_sha256,

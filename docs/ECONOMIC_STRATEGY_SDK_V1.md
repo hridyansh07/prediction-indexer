@@ -1199,6 +1199,19 @@ purchase prices or highest sale prices. Gross excess loss is purchase cost less
 exit sale proceeds for a bought leg, and exit repurchase cost less original sale
 proceeds for a sold leg. It is signed; unwind fees are excluded.
 
+The pure `Strategy.fill_loss(entity, native_losses, time_ns)` hook converts the
+signed per-leg native gross losses into the same monetary unit and scale as
+`fill_value`. Every tuple entry retains its leg's `price_scale + quantity_scale`
+until this conversion; per-leg output costs and exit proceeds stay native.
+There is no inferred default: a missing conversion hook, unavailable valuation,
+or non-integer result fails visibly. Runtime and independent reader both call
+the hook at decision time. Cross-venue and implication strategies apply their
+pinned parity valuation and convert each leg to scale-36 research dollars;
+same-venue multi-market converts the set's common quote asset to scale 36.
+This corrects the original raw-native sum, which could not be subtracted from
+the scale-36 matched value. Previously emitted incorrect sums fail the corrected
+reader's arithmetic check. Probe row shapes and output without probes are unchanged.
+
 The closed leg object adds `usable` evidence: true or false for an arrived leg,
 null for an unsent or censored leg. Unsent zero-quantity legs carry zero fill and
 unwind amounts with empty walks. `not_confirmed` has a null decision, no legs and
