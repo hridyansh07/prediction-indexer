@@ -105,24 +105,36 @@ those acceptance steps.
 No cloud/archive request, full live corpus run, Universe migration/deployment,
 service-state change, target publication, live pilot or PR merge was performed.
 
+## Rebase after prerequisite merges
+
+PR #78 merged into `feat/corpus-runner` at
+`36bfb95f50c2a3df0278edcd20ced68056b984d9`; that branch also contains the
+throughput and wire-V4 changes from #76. The producer rollout is now rebased onto
+that exact feature-branch tip, excluding its already-merged fixes. The two import
+conflicts preserve both the new execution-realism hooks and upstream cached
+valuation metadata. Its sparse/full parity fixture now uses the current V4
+section encoder; its timing, output-byte and Risk-sequence assertions are intact.
+
+The post-rebase focused gate passes **279 tests**, including the complete rollout,
+all four strategies, legacy output goldens, quote/probe readers, profile volatility,
+corpus/packaging, completed-reader paths and wire-V4 stream checks. The research
+branch is rebased onto `feat/research-site` at PR #77's merged commit
+`8d4cfc702cd35d35684a16cf7c26952237094ad0`; its code tree is unchanged by the
+rebase and all **64 research tests pass** again. Whitespace checks pass on both.
+No Rust or deployment files were changed by conflict resolution.
+
 ## Branch separation and merge order
 
-The producer branch `codex/strategy-execution-realism` starts from PR #78's
-`codex/execution-realism-fixes` at
-`902871166496aa130fc493685112ba947a08f5e1`. Its new implementation commit is
-`11f760a69669b82820cf9d14cc7ef06e704a1fc7`; the approved spec and reference corpus
-are a separate cohesive commit. It does not duplicate the dependency fixes.
+`codex/strategy-execution-realism` now targets `feat/corpus-runner` directly in
+PR #79. `codex/research-execution-realism` now targets `feat/research-site`
+directly in PR #80. The prerequisite fixes #78 and #77 are already merged and
+are excluded from both rollout diffs. The initial producer/research bases were
+`902871166496aa130fc493685112ba947a08f5e1` and
+`998cfb71aa4232f7ca24562be0ed597730f2ed5e`, respectively; the independent legacy
+baseline validation above remains pinned to its original source.
 
-The research branch `codex/research-execution-realism` starts from PR #77's
-`codex/research-outcomes-v2` at
-`998cfb71aa4232f7ca24562be0ed597730f2ed5e`. Research code stays on that branch;
-the producer branch does not import the research package.
-
-While #78 and #77 are open, each rollout PR is stacked on its corresponding
-fix branch. Merge #78 into `feat/corpus-runner`, then retarget the producer
-rollout there and review its focused diff. Independently merge #77 into
-`feat/research-site`, then retarget the research rollout there. Review the shared
-output contract across both PRs before integration. Integrate the updated
-corpus-runner lineage into `master` before the research-site lineage consumes
-the new outputs, resolving shared history normally. Nothing auto-merges, and
-merging code does not authorize operational acceptance or a live pilot.
+The rollout PRs can each merge into their own feature branch. Research code stays
+on its research lineage; the producer does not import that package. Integrate the
+updated corpus-runner lineage into `master` before research-site consumes the new
+outputs, after the separately pending acceptance. No PR is auto-merged, and code
+merges do not authorize operational acceptance or a live pilot.

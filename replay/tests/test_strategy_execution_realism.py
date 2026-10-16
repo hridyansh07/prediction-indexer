@@ -12,6 +12,7 @@ from replay.preparation import encoded
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_cross_venue_arbitrage import EDGE, fill_policy_v3
 from replay.tests.economic_scenarios import M, ladder, v2_policy
+from replay.tests.test_streams import fields
 
 MS = 1_000_000
 FLAGS = {"version": 1, "stale_ms": 5000, "settlement_allowlist": ["series_moneyline"]}
@@ -227,7 +228,7 @@ class IntegratedTests(unittest.TestCase):
                     body = {**body, "risk_sequence": str(risk)}
                 elif kind == "terminal":
                     body = {**body, "risk_cuts": str(risk)}
-                cut = h.decoder.apply(encoded({"version": "3", "run_id": "coverage-test",
+                cut = h.decoder.apply(fields({"version": "4", "run_id": "coverage-test",
                     "attempt_id": h.context["attempt_id"], "sequence": str(h.seq),
                     "kind": kind, "body": body}))
                 h.seq += 1

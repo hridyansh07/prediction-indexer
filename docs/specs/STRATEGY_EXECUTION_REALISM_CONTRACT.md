@@ -110,7 +110,9 @@ writer-attested, as in the SDK mechanism. No new manifest/file format number is
 needed: the closed strategy policy version selects these exact extensions.
 
 No new retained stream boundaries or offsets are declared. Probe decisions and
-arrivals retain the existing sparse-v3 catch-up rules and original Risk numbering.
+arrivals retain the sparse catch-up rules and original Risk numbering. The current
+transport is wire V4's declared sections; it supersedes the supplied spec's V3
+envelope while preserving those timing rules and all semantic output identities.
 Pending-state reservations include the extra decision walks/strings and fail
 before exceeding the existing shared budget or pending count. Reader opening
 walks are also charged to its state budget. Existing line and file limits remain.
