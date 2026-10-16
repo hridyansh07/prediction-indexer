@@ -18,7 +18,7 @@ def _closed(value, fields, label, optional=frozenset()):
     return value
 
 
-def load(path):
+def load(path, *, read_only=False):
     spec = _closed(json.loads(Path(path).read_bytes()), FIELDS, "corpus spec", {"derivative_cache"})
     if spec["version"] != 1:
         raise ValueError("corpus spec version")
@@ -57,12 +57,13 @@ def load(path):
             other = Path(spec[name]).resolve()
             if root.is_relative_to(other) or other.is_relative_to(root):
                 raise ValueError(f"derivative_cache.root must not overlap {name}")
-        try:
-            root.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryFile(dir=root):
-                pass
-        except OSError as error:
-            raise ValueError("derivative_cache.root must be a writable local directory") from error
+        if not read_only:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryFile(dir=root):
+                    pass
+            except OSError as error:
+                raise ValueError("derivative_cache.root must be a writable local directory") from error
         cache["root"] = str(root)
     return spec
 

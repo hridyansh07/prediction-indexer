@@ -1,9 +1,9 @@
 """Independent same-venue multi-market reader; never imports the runtime evaluator."""
 
-from fractions import Fraction
 from pathlib import Path
 
 from replay.strategies import canonical_reference
+from replay.strategies._shared.metadata import native_metadata
 
 from replay.strategies.same_venue_complement.output import _aggregate_rows
 from replay.strategies.cross_venue_arbitrage.contract import asset_row, asset_value, assess_net, economics_by_key, net_of
@@ -69,20 +69,16 @@ class MultiMarketReader(Strategy):
         Fees are the trigger's single-order assessment per leg, at the fill's
         open time. ``None`` when any fee or economics input is unknown.
         """
-        d = entity.descriptor
-        acquired = tuple((leg["instrument"], leg["orientation"]) for leg in d["legs"])
-        economics = tuple(self.bridge.economics(key) for key in acquired)
-        if any(e is None for e in economics) or len({e.quote for e in economics}) != 1:
+        metadata = native_metadata(self, entity)
+        if metadata.missing_economics or metadata.mixed_quotes:
             return None
-        fee_legs = tuple({"market_id": leg["market_id"], "key": key, "fill": fill,
-                          "price_scale": e.price_scale, "quantity_scale": e.quantity_scale, "side": "BUY"}
-                         for leg, key, fill, e in zip(d["legs"], acquired, legs, economics))
+        fee_legs = tuple(dict(leg._asdict(), fill=fill) for leg, fill in zip(metadata.fee_legs, legs))
         native, unknown, _, _ = assess_net(
-            self.bridge, experiment=self.experiment.experiment_sha256, scope=0, basket=d,
+            self.bridge, experiment=self.experiment.experiment_sha256, scope=0, basket=metadata.basket,
             size=steps, time=time, sequence=0, fee_legs=fee_legs, account=ACCOUNT)
         if unknown:
             return None
-        minimum = steps * Fraction(self.experiment.fills.step_contracts) * self.threshold * 10 ** 18
+        minimum = steps * metadata.minimum_step
         require(minimum.denominator == 1, "minimum net gap is not exact at the fill step")
         return net_of(native) - int(minimum)
 

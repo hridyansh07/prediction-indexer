@@ -20,6 +20,12 @@ macro_rules! text_id {
             }
         }
 
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                self.as_str()
+            }
+        }
+
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
@@ -52,6 +58,12 @@ impl InstrumentId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for InstrumentId {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 

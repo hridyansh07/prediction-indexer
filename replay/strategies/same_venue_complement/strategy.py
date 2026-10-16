@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .contract import SELF_CROSSED, Inputs, reason
 from .output import ComplementReader, validate_content
+from replay.strategies._shared.metadata import complement_metadata
 from replay.economic_sdk import (
     DEPTH_LIMITED, EVALUATED, ONE_SIDED, UNUSABLE, BookRequirement, Observation, Requirements,
     factory,
@@ -77,9 +78,8 @@ class SameVenueComplement(ComplementReader):
         return () if self.v2 else (str(min(f.filled_atoms for f in fills)),)
 
     def evaluate(self, entity, views, context):
-        desc = entity.descriptor
-        size = int(desc["size_contracts"])
-        venue, direction = desc["venue"], desc["direction"]
+        metadata = complement_metadata(self, entity)
+        size, venue, direction = metadata.size, metadata.venue, metadata.direction
         plain_fields = self.unevaluated
         if any(view.validity != "usable" for view in views):
             return Observation(UNUSABLE, self._unusable(views), fields=plain_fields, context_free=True)
@@ -110,9 +110,7 @@ class SameVenueComplement(ComplementReader):
         if any(fill.depth_limited for fill in fills):
             return Observation(DEPTH_LIMITED, self._limited(fills), fields=plain_fields,
                                context_free=True)
-        plan = self.plans[entity.legs[0]]
-        gross_scale = int(plan["price_scale"]) + int(plan["quantity_scale"])
-        unit = size * 10 ** gross_scale
+        gross_scale, unit = metadata.gross_scale, metadata.unit
         # Projected BUY costs are P-p, so U-cost is exactly bid_1+bid_2-U.
         gross = (unit - sum(f.cost for f in fills) if direction in ("long", "both_bids")
                  else sum(f.cost for f in fills) - unit)
@@ -120,13 +118,9 @@ class SameVenueComplement(ComplementReader):
             return Observation(EVALUATED, (), "GROSS_NONPOSITIVE",
                                () if self.v2 else ("SKIPPED", None), context_free=True)
         fee_direction = "SELL" if direction == "short" else "BUY"
-        legs = tuple({"market_id": leg["market_id"],
-                      "key": _opposite(leg) if projected else (leg["instrument"], leg["orientation"]),
-                      "fill": fill, "price_scale": int(self.plans[key]["price_scale"]),
-                      "quantity_scale": int(self.plans[key]["quantity_scale"]), "side": fee_direction}
-                     for leg, key, fill in zip(desc["legs"], entity.legs, fills))
+        legs = tuple(dict(leg._asdict(), fill=fill) for leg, fill in zip(metadata.fee_legs, fills))
         assessment = self.bridge.assess(experiment=self.experiment.experiment_sha256,
-                                        scope=context.scope, basket=desc, direction=fee_direction,
+                                        scope=context.scope, basket=metadata.basket, direction=fee_direction,
                                         size=size, time=context.time, sequence=context.sequence,
                                         legs=legs)
         net = assessment["gap_net"]
@@ -162,11 +156,6 @@ class SameVenueComplement(ComplementReader):
     def validate(self, directory, snapshot, manifest):
         require(self.bound, "missing initial")
         return validate_content(directory, snapshot, manifest)
-
-
-def _opposite(leg):
-    orientation = "complement" if leg["orientation"] == "outcome" else "outcome"
-    return (leg["instrument"], orientation)
 
 
 build = factory(SameVenueComplement)

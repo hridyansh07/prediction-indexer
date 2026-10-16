@@ -8,9 +8,11 @@ maximal states. Exceeding a limit fails the attempt; nothing is truncated.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from replay.fees.lazy import LazyAssessmentIds
-from replay.streams.protocol import require
+from replay.streams.protocol import freeze, require
+from replay.strategy_sdk import plain
 
 MAX_ROWS = 2_000_000
 MAX_BYTES = 512 * 1024 * 1024
@@ -44,22 +46,54 @@ FILL_STATE = 240    # one entity's open fill state: start, state and ladder epoc
 
 def json_cost(value):
     """Closed-form cost of a small JSON-shaped value (strings, ints, lists, dicts)."""
+    kind = type(value)
+    if kind is str:
+        return STR + 4 * len(value)
+    if kind is int:
+        return INT + value.bit_length() // 8
+    if kind is dict:
+        return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
+    if kind is list or kind is tuple:
+        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
+    if kind is bool or value is None:
+        return SMALL
     if isinstance(value, LazyAssessmentIds):
         # Captured immutable order inputs plus the worst-case eager debug IDs
         # and materialized IDs. Never traverse the shared engine/catalog or
         # materialize a handle just to account its retained state.
         return (512 + json_cost(value.request.retained_inputs)
                 + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
-    kind = type(value)
-    if kind is str:
-        return STR + 4 * len(value)
-    if kind is int:
-        return INT + value.bit_length() // 8
+    if type(value) is FrozenJSON:
+        return value.cost
     if isinstance(value, Mapping):
         return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
-    if kind in (list, tuple):
-        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
     return SMALL
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrozenJSON(Mapping):
+    """Owned immutable metadata with the original occurrence-based JSON cost.
+
+    This saves traversal, never reservation: every reference costs exactly as
+    the original tree. Entity metadata fits the existing descriptor reservation.
+    """
+
+    value: object
+    cost: int = field(init=False)
+
+    def __post_init__(self):
+        owned = freeze(plain(self.value))
+        object.__setattr__(self, "value", owned)
+        object.__setattr__(self, "cost", json_cost(owned))
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __iter__(self):
+        return iter(self.value)
+
+    def __len__(self):
+        return len(self.value)
 
 
 def fills_cost(sizes, levels):

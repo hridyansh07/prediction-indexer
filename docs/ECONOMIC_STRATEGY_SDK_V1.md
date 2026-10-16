@@ -374,6 +374,22 @@ following:
 
 The layout-1 reader (`reader`) keeps the V1 checks unchanged.
 
+**Post-SUCCESS reading (S6b).** The writer's full independent semantic validation
+still gates terminal ACK. Bench then calls
+`replay.economic_sdk.completed_reader.read_completed(run_directory, group,
+reader=configured_reader)`: for the seven shipped readers it verifies supervisor,
+snapshot, policy and receipt bindings, manifest/summary digests, and every file's
+SHA-256 and length from disk. Framed files bind their stored bytes without a new
+decode. Metadata must retain the writer's physical JSON encoding, and control
+summaries bind to the top-level summary. It returns the same
+`{receipt, manifest, summary}`; neither output bytes nor retained-state accounting
+changes. Unknown/custom readers retain their original call.
+
+Passing `deep=True` calls the configured reader unchanged, including its full
+semantic validation and original failures. Package readers themselves remain
+unchanged. Corpus deep audits reconstruct their original environment; see
+[`replay/corpus/README.md`](../replay/corpus/README.md).
+
 ## 6. Controls
 
 Controls are **opt-in**. The default policy has `controls: []`.

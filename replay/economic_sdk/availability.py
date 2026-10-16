@@ -55,6 +55,7 @@ class IntervalEngine:
         self.open = {}
         self.layouts = {}
         self.counts = []
+        self.usable = 0
         self.trades = {d: 0 for d in DISPOSITIONS}
         self.observed_trades = 0
 
@@ -125,9 +126,12 @@ class IntervalEngine:
         # Provenance denotes the FIRST observation establishing this status;
         # revision/tick churn is deliberately not an interval boundary.
         # Explicit interval faults are bounded by their own source window.
-        comparable = lambda x: {k: v for k, v in x.items() if k != "source"}
-        if prior is not None and comparable(prior[1]) == comparable(fields):
-            return
+        if prior is not None:
+            before = prior[1]
+            names = ("kind", "state", "evidence", "reason", "evidence_source") if fields["kind"] == "book" else (
+                "kind", "state", "usable_books", "required_books", "uncaptured_members")
+            if all(before[name] == fields[name] for name in names):
+                return
         if prior is not None:
             self._emit(entity, prior, t)
         self.open[entity] = (t, fields)
@@ -177,7 +181,16 @@ class IntervalEngine:
                     (b["instrument"], b["orientation"])
                     for b in scope["required_books"]
                 },
+                "by_key": {},
+                "total": 0,
+                "uncaptured": 0,
             }
+            for index, (_, books, outside) in enumerate(layout["members"]):
+                layout["total"] += len(books)
+                layout["uncaptured"] += outside
+                for key, entity in books:
+                    # Keep every membership occurrence, including shared keys.
+                    layout["by_key"].setdefault(key, (entity, []))[1].append(index)
             self.layouts[self.scope] = layout
         return layout
 
@@ -190,18 +203,31 @@ class IntervalEngine:
         """
         layout = self._layout()
         if changed is None:
-            self.counts = [None] * len(layout["members"])
-        touched = False
-        for index, (member_id, books, outside) in enumerate(layout["members"]):
-            if changed is not None and not any(k in changed for k, _ in books):
-                continue
-            touched = True
-            count = 0
+            self.counts = [0] * len(layout["members"])
+            self.usable = 0
+            indexes = range(len(self.counts))
+        else:
+            deltas = {}
+            for key in changed:
+                entry = layout["by_key"].get(key)
+                if entry is None:
+                    continue
+                entity, members = entry
+                delta = (int(self.books[key][0] == "usable")
+                         - int(self.open[entity][1]["state"] == "usable"))
+                for index in members:
+                    deltas[index] = deltas.get(index, 0) + delta
+            if not deltas:
+                return
+            indexes = sorted(deltas)
+        for index in indexes:
+            member_id, books, outside = layout["members"][index]
+            count = (sum(self.books[k][0] == "usable" for k, _ in books) if changed is None
+                     else self.counts[index] + deltas[index])
             for k, entity in books:
-                validity, why, source = self.books[k]
-                count += validity == "usable"
                 if changed is not None and k not in changed:
                     continue
+                validity, why, source = self.books[k]
                 evidence, evidence_source = self.evidence.get(k, ("unknown", None))
                 self._set(
                     entity,
@@ -216,7 +242,8 @@ class IntervalEngine:
                     },
                 )
             required = len(books)
-            self.counts[index] = (count, required, outside)
+            self.usable += count - self.counts[index]
+            self.counts[index] = count
             self._set(
                 member_id,
                 t,
@@ -228,13 +255,7 @@ class IntervalEngine:
                     "uncaptured_members": outside,
                 },
             )
-        if not touched:
-            return
-        total = usable = uncaptured = 0
-        for count, required, outside in self.counts:
-            total += required
-            usable += count
-            uncaptured += outside
+        total, usable, uncaptured = layout["total"], self.usable, layout["uncaptured"]
         self._set(
             "bundle",
             t,

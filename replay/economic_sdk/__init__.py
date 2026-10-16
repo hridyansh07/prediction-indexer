@@ -75,8 +75,10 @@ class Strategy:
         The default reads the pinned outcomes document. A strategy may override
         this hook; runtime and independent readers call the same pure contract.
         """
+        from replay.economic_sdk.entities import Entity
         from replay.economic_sdk.execution_terms import execution_delays
-        return execution_delays(self.snapshot, entity.legs, time_ns)
+        return execution_delays(self.snapshot, entity.legs, time_ns,
+                                entity=entity if isinstance(entity, Entity) else None)
 
     def manifest(self, files, instantaneous):
         raise NotImplementedError
@@ -123,5 +125,9 @@ def factory(strategy_class):
         game = strategy.requirements(strategy.snapshot, strategy.experiment.policy).game
         return configured(snapshot, config, timers=game.timers if game is not None else ())
 
+    def sections(config):
+        return frozenset(("record", "events")) if config.get("policy", {}).get("profile") is not None else frozenset(("record",))
+
+    build.sections = sections
     build.retention = retention
     return build

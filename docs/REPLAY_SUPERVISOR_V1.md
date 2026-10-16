@@ -75,6 +75,14 @@ learned from the stream. The terminal callback and `finish()` must both return
 successfully before its ACK. `finish()` must flush and close all strategy files.
 The adapter then validates its local terminal and writes `complete.json`.
 
+Wire V4 section declarations are resolved before launching participants and
+passed to the adapter, Consumer and Decoder. Economic SDK factories declare
+`record` (plus `events` for a non-null embedded profile); standalone profile and
+coverage declare `record + events`; other factories default to all sections.
+The adapter independently checks the declaration. These are SDK/runner
+capabilities, not strategy configuration or new semantic manifest fields; see
+the [V4 stream contract](REPLAY_STREAMS_V1.md#wire-version-4-declared-sections).
+
 Strategy owns episode schema, economics, filenames and any content verification.
 Write only provisional regular files/directories under the supplied output path.
 Do not spawn detached processes, close inherited lock descriptors, mutate the

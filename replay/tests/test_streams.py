@@ -1,3 +1,4 @@
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -9,7 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 from replay.streams import Consumer, Decoder, ProtocolError
-from replay.streams.protocol import books_sha256
+from replay.streams.protocol import SECTIONS, books_sha256
 from replay.streams.protocol import delta, event, venue_time
 
 FIXTURE = (
@@ -19,11 +20,24 @@ FIXTURE = (
 
 
 def records():
-    return [json.loads(line) for line in FIXTURE.read_bytes().splitlines()]
+    return [{**json.loads(line), "version": "4"} for line in FIXTURE.read_bytes().splitlines()]
 
 
 def encoded(value):
     return json.dumps(value, separators=(",", ":")).encode()
+
+
+def fields(value):
+    """Independent v4 projection of the frozen v3 fixture/test records."""
+    value = copy.deepcopy(value)
+    parts = {}
+    if value["kind"] == "cut":
+        body = value["body"]
+        events = {name: body.pop(name) for name in ("market_events", "control_events") if name in body}
+        if events:
+            parts[b"events"] = encoded(events)
+        parts[b"deps"] = encoded([t.pop("dependency") for t in body.get("book_transitions", [])])
+    return {b"record": encoded(value), **parts}
 
 
 def decoder(values):
@@ -106,13 +120,13 @@ def assert_contract(test, cuts):
 
 def apply_all(test, values):
     d = decoder(values)
-    cuts = [held(d.apply(encoded(r))) for r in values]
+    cuts = [held(d.apply(fields(r))) for r in values]
     d.finish()
     return d, cuts
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_v3_risk_sequence_and_terminal_bounds(self):
+    def test_v4_risk_sequence_and_terminal_bounds(self):
         values = records()
         for record in values:
             if record["kind"] == "cut":
@@ -122,25 +136,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(cuts[0].risk_sequence, 0)
         self.assertEqual(cuts[1].risk_sequence, 2)
         self.assertEqual(cuts[-1].risk_sequence, 101)
-        for version in ("1", "2"):
+        for version in ("1", "2", "3"):
             with self.subTest(version=version), self.assertRaisesRegex(ProtocolError, "version"):
-                decoder(values).apply(encoded({**values[0], "version": version}))
+                decoder(values).apply(fields({**values[0], "version": version}))
         for risk in ("0", "1", "2", "02", str(2**64), 4):
             d = decoder(values)
             for r in values[:2]:
-                d.apply(encoded(r))
+                d.apply(fields(r))
             bad = copy.deepcopy(values[2])
             bad["body"]["risk_sequence"] = risk
             with self.subTest(risk=risk), self.assertRaises(ProtocolError):
-                d.apply(encoded(bad))
+                d.apply(fields(bad))
         for field, value in (("cuts", "0"), ("risk_cuts", "0"), ("risk_cuts", "7")):
             d = decoder(values)
             for r in values[:-1]:
-                d.apply(encoded(r))
+                d.apply(fields(r))
             bad = copy.deepcopy(values[-1])
             bad["body"][field] = value
             with self.subTest(field=field, value=value), self.assertRaises(ProtocolError):
-                d.apply(encoded(bad))
+                d.apply(fields(bad))
 
     def test_retention_lists_are_closed_canonical_sorted_and_bounded(self):
         values = records()
@@ -317,7 +331,7 @@ class ProtocolTests(unittest.TestCase):
     def test_books_are_live_in_place_and_read_only_mappings(self):
         values = records()
         d = decoder(values)
-        cuts = [d.apply(encoded(r)) for r in values]
+        cuts = [d.apply(fields(r)) for r in values]
         d.finish()
         a = ("kalshi:A", "outcome")
         # Zero-copy contract: every cut exposes the SAME live books.
@@ -359,9 +373,9 @@ class ProtocolTests(unittest.TestCase):
             corrupt(bad)
             d = decoder(bad)
             for r in bad[:-1]:
-                d.apply(encoded(r))
+                d.apply(fields(r))
             with self.assertRaisesRegex(ProtocolError, "terminal book digest"):
-                d.apply(encoded(bad[-1]))
+                d.apply(fields(bad[-1]))
             self.assertTrue(d.poisoned)
             with self.assertRaisesRegex(ProtocolError, "missing terminal"):
                 d.finish()
@@ -370,9 +384,9 @@ class ProtocolTests(unittest.TestCase):
             bad[-1]["body"] = extra
             d = decoder(bad)
             for r in bad[:-1]:
-                d.apply(encoded(r))
+                d.apply(fields(r))
             with self.assertRaises(ProtocolError):
-                d.apply(encoded(bad[-1]))
+                d.apply(fields(bad[-1]))
 
     def test_rust_metadata_control_observation_and_canonical_omission(self):
         values = records()
@@ -401,15 +415,15 @@ class ProtocolTests(unittest.TestCase):
         values = records()
         d = decoder(values)
         for r in values[:3]:
-            d.apply(encoded(r))
+            d.apply(fields(r))
         bad = copy.deepcopy(values[3])
         bad["body"]["book_transitions"][1]["previous_revision"] = "4"
         with self.assertRaisesRegex(ProtocolError, "revision"):
-            d.apply(encoded(bad))
+            d.apply(fields(bad))
         # No atomic staging: the decoder (and attempt) is dead instead.
         self.assertTrue(d.poisoned)
         with self.assertRaisesRegex(ProtocolError, "closed decoder"):
-            d.apply(encoded(values[3]))
+            d.apply(fields(values[3]))
 
     def test_cheap_guards_reject_immediately(self):
         values = records()
@@ -461,19 +475,19 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 d = decoder(values)
                 for r in values[:3]:
-                    d.apply(encoded(r))
+                    d.apply(fields(r))
                 with self.assertRaises(ProtocolError):
-                    d.apply(encoded(bad))
+                    d.apply(fields(bad))
                 self.assertTrue(d.poisoned)
         d = decoder(values)
         for r in values[:-1]:
-            d.apply(encoded(r))
+            d.apply(fields(r))
         with self.assertRaisesRegex(ProtocolError, "missing terminal"):
             d.finish()
         terminal = copy.deepcopy(values[-1])
         terminal["body"]["cuts"] = "5"
         with self.assertRaisesRegex(ProtocolError, "terminal count"):
-            d.apply(encoded(terminal))
+            d.apply(fields(terminal))
         for raw in [b'{"version":"1","version":"1"}', b"[", b"NaN", b"Infinity", b"-Infinity", b"\xff"]:
             with self.assertRaises(ProtocolError):
                 decoder(values).apply(raw)
@@ -482,7 +496,7 @@ class ProtocolTests(unittest.TestCase):
         values = records()
         d = decoder(values)
         for r in values[:6]:
-            d.apply(encoded(r))
+            d.apply(fields(r))
         self.assertEqual(d.books[("kalshi:A", "outcome")].validity, "unusable")
         bad = copy.deepcopy(values[3])
         bad["sequence"] = "6"
@@ -490,7 +504,7 @@ class ProtocolTests(unittest.TestCase):
         bad["body"]["book_transitions"] = bad["body"]["book_transitions"][:1]
         bad["body"]["book_transitions"][0].update(previous_revision="3", revision="4")
         with self.assertRaisesRegex(ProtocolError, "unusable"):
-            d.apply(encoded(bad))
+            d.apply(fields(bad))
 
     def test_unread_fields_are_publisher_trusted(self):
         # Hot-path decoding no longer validates market/control observations or
@@ -531,7 +545,7 @@ class ProtocolTests(unittest.TestCase):
         values = records()
         d = decoder(values)
         for r in values[:3]:
-            d.apply(encoded(r))
+            d.apply(fields(r))
         change = copy.deepcopy(values[3])
         change["body"]["market_events"] = []
         change["body"]["book_transitions"] = change["body"]["book_transitions"][:1]
@@ -548,7 +562,7 @@ class ProtocolTests(unittest.TestCase):
                 change["body"]["risk_sequence"] = str(count + 2)
                 transition["previous_revision"] = str(count)
                 transition["revision"] = str(count + 1)
-                d.apply(encoded(change))
+                d.apply(fields(change))
                 if count in (100, 1200):
                     gc.collect()
                     retained.append(tracemalloc.get_traced_memory()[0])
@@ -561,6 +575,160 @@ class ProtocolTests(unittest.TestCase):
 
 
 PIN = {"derivative_address": "a" * 64, "receipt_sha256": "b" * 64}
+
+
+class SectionTests(unittest.TestCase):
+    def test_every_fixture_reassembles_and_all_declarations_preserve_books(self):
+        count = 0
+        for path in sorted(FIXTURE.parent.glob("*.ndjson")):
+            values = [json.loads(line) for line in path.read_bytes().splitlines()]
+            for sections in (SECTIONS, {"record"}, {"record", "events"}, {"record", "deps"}):
+                d = Decoder(values[0]["run_id"], values[0]["attempt_id"], values[0]["body"],
+                            int(values[0]["body"]["max_entry_bytes"]), sections=sections)
+                for old in values:
+                    cut = d.apply(fields({**old, "version": "4"}))
+                    with self.subTest(fixture=path.name, sequence=cut.sequence, sections=sections):
+                        if sections == SECTIONS or cut.kind != "cut":
+                            self.assertEqual(thaw(cut.body), old["body"])
+                        if cut.kind == "cut":
+                            if "events" not in sections:
+                                self.assertIsInstance(cut.body, dict)
+                                for name in ("market_events", "control_events"):
+                                    with self.assertRaisesRegex(ProtocolError, "undeclared section"):
+                                        cut.body[name]
+                                    with self.assertRaisesRegex(ProtocolError, "undeclared section"):
+                                        cut.body.get(name, [])
+                                self.assertEqual(cut.body.get("absent", 42), 42)
+                                with self.assertRaises(KeyError):
+                                    cut.body["absent"]
+                            for original, t in zip(old["body"]["book_transitions"], cut.body["book_transitions"]):
+                                self.assertIs(type(t), dict)
+                                book = cut.books[(t["key"]["instrument"], t["key"]["orientation"])]
+                                if "deps" in sections:
+                                    self.assertEqual(book.dependency, original["dependency"])
+                                else:
+                                    with self.assertRaises(KeyError):
+                                        t["dependency"]
+                                    with self.assertRaisesRegex(ProtocolError, "undeclared section"):
+                                        getattr(book, "dependency", None)
+                d.finish()  # Includes the unmodified Rust terminal books digest.
+            count += len(values)
+        self.assertEqual(count, 79)
+
+    def test_only_protocol_reassembly_reads_transition_dependencies(self):
+        def reads(tree):
+            found = []
+            for node in ast.walk(tree):
+                key = None
+                if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                    key = node.slice
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and node.func.attr in {"get", "pop", "setdefault", "__getitem__"} and node.args):
+                    key = node.args[0]
+                if isinstance(key, ast.Constant) and key.value == "dependency":
+                    found.append(node.lineno)
+            return found
+
+        # Ensure the scanner rejects both direct and default-returning reads,
+        # but not the assignment used to reassemble declared dependencies.
+        self.assertEqual(reads(ast.parse("t['dependency']\nt.get('dependency', None)\nt['dependency'] = None")), [1, 2])
+        root = Path(__file__).resolve().parents[1]
+        violations = []
+        for path in sorted(root.rglob("*.py")):
+            if "tests" in path.relative_to(root).parts:
+                continue
+            tree = ast.parse(path.read_text(), filename=str(path))
+            allowed = set()
+            if path == root / "streams/protocol.py":
+                decoder = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Decoder")
+                allowed = {node.lineno for method in decoder.body
+                           if isinstance(method, ast.FunctionDef) and method.name in {"_sections", "_cut"}
+                           for node in ast.walk(method) if hasattr(node, "lineno")}
+            violations.extend(f"{path.relative_to(root)}:{line}" for line in reads(tree) if line not in allowed)
+        self.assertEqual(violations, [], "transition dependency reads require a deps declaration")
+
+    def test_skipped_malformed_sections_are_not_parsed_but_declared_ones_fail(self):
+        values = records()
+        for name in (b"events", b"deps"):
+            for invalid in (b"[", b'"\xff"', b"NaN"):
+                for declared in (False, True):
+                    sections = {"record", name.decode()} if declared else {"record"}
+                    d = Decoder("contract", "golden", values[0]["body"], 65536, sections=sections)
+                    d.apply(fields(values[0]))
+                    entry = {**fields(values[1]), name: invalid}
+                    with self.subTest(section=name, invalid=invalid, declared=declared):
+                        if declared:
+                            with self.assertRaisesRegex(ProtocolError, "malformed JSON"):
+                                d.apply(entry)
+                            self.assertTrue(d.poisoned)
+                        else:
+                            d.apply(entry)
+
+    def test_aggregate_entry_limit_includes_unparsed_sections_at_exact_boundary(self):
+        values = records()
+        for extra in (0, 1):
+            d = Decoder("contract", "golden", values[0]["body"], 65536, sections={"record"})
+            d.apply(fields(values[0]))
+            entry = fields(values[1])
+            entry[b"events"] = b"[" * (65536 - len(entry[b"record"]) - len(entry[b"deps"]) + extra)
+            self.assertLess(max(map(len, entry.values())), 65536)
+            if extra:
+                with self.assertRaisesRegex(ProtocolError, "entry limit"):
+                    d.apply(entry)
+                self.assertTrue(d.poisoned)
+            else:
+                self.assertEqual(d.apply(entry).sequence, 1)
+
+    def test_section_shapes_and_dependency_alignment_fail_closed(self):
+        values = records()
+        for changes in ({b"extra": b"{}"}, {b"deps": b"[null]"},
+                        {b"events": b'{"unknown":[]}'}, {b"deps": b"{}"},
+                        {b"events": None}, {b"deps": "[]"}, {b"record": bytearray(b"{}")}):
+            d = decoder(values)
+            d.apply(fields(values[0]))
+            entry = {**fields(values[1]), **changes}
+            with self.subTest(changes=changes), self.assertRaises(ProtocolError):
+                d.apply(entry)
+            self.assertTrue(d.poisoned)
+        for sections in ({"events"}, {"record", "unknown"}, set()):
+            with self.assertRaisesRegex(ProtocolError, "section declaration"):
+                Decoder("contract", "golden", values[0]["body"], 65536, sections=sections)
+
+    def test_runner_declarations_match_the_sdk_and_factory_defaults(self):
+        from replay.strategy_sdk import stream_sections
+        economics = ("same_venue_complement", "cross_venue_arbitrage", "same_venue_multi_market",
+                     "same_venue_implication_cover", "cross_venue_implication_cover")
+        for name in economics:
+            for profile in (None, {}):
+                spec = {"factory": f"replay.strategies.{name}:build", "config": {"policy": {"profile": profile}}}
+                self.assertEqual(stream_sections(spec), {"record"} if profile is None else {"record", "events"})
+        for name in ("market_profile", "bundle_coverage"):
+            for reference in (f"replay.strategies.{name}:build", f"replay.{name}:build",
+                              f"replay.strategies.{name}.strategy:build"):
+                self.assertEqual(stream_sections({"factory": reference, "config": {}}), {"record", "events"})
+        self.assertEqual(stream_sections({"factory": "replay.tests.test_supervisor:strategy", "config": {}}), SECTIONS)
+
+    def test_consumer_checks_summed_batch_before_hooks_and_passes_sections(self):
+        values = records()
+        entries = [(f"{i + 1}-0".encode(), fields(r)) for i, r in enumerate(values)]
+        total = sum(len(v) for _, f in entries for v in f.values())
+        for limit in (total - 1, total):
+            with patch("redis.Redis.from_url") as connect, patch.object(Consumer, "_eval"):
+                c = Consumer("redis://localhost", scope="test", run_id="contract", attempt_id="golden",
+                             group="fast", initial=values[0]["body"], sections={"record"})
+                connect.return_value.xreadgroup.return_value = [(c._keys[0].encode(), entries)]
+                c._batch_bytes = limit
+                cuts = []
+                if limit < total:
+                    with self.assertRaisesRegex(ProtocolError, "batch limit"):
+                        c.poll(cuts.append)
+                    self.assertEqual(cuts, [])
+                else:
+                    self.assertEqual(c.poll(cuts.append), len(values))
+                    self.assertTrue(c.terminal)
+                    with self.assertRaisesRegex(ProtocolError, "undeclared section"):
+                        cuts[2].body.get("market_events", [])
+                c.close()
 
 
 class InPlaceBook:
@@ -599,9 +767,9 @@ class InPlaceBook:
         if kind == "cut":
             body = {**body, "risk_sequence": str(self.decoder.sequence + 1)}
         return self.decoder.apply(
-            encoded(
+            fields(
                 {
-                    "version": "3",
+                    "version": "4",
                     "run_id": "r",
                     "attempt_id": "a",
                     "sequence": str(self.decoder.sequence + 1),

@@ -32,6 +32,34 @@ config, fees and limits, so results from different inputs never mix. A dirty
 checkout changes the key and is refused unless you pass `--allow-dirty`. Commit
 before a real run.
 
+## Verification and deep audits
+
+Plain `python -m replay.corpus verify SPEC` remains the rehash-only reader of
+`corpus_receipt.json`. For full semantic validation, use
+`python -m replay.corpus verify SPEC --deep --bundle ID --bundle OTHER_ID`, or
+`--deep --sample N --seed S`. Sampling uses sorted committed results and a local
+random generator; the seed defaults to **0**. The two subset selectors cannot
+be combined. Without either selector, deep verification selects all committed
+results under this spec's corpus key.
+
+Every selected bundle is first rehashed, then audited in its recorded bench
+image (`image.id`, or `result.json.image.id` for reused images). The original
+configured package readers run unchanged, each group is reported, and one
+bundle/group failure does not stop the rest. The committed run and context,
+matching spec fee catalog, committed game state when present, and cached
+derivatives by address mount read-only at their original `/bench` paths. The
+audit has no network, pulls no image, and never rebuilds, fetches, rematerializes,
+updates cache bookkeeping or writes a ledger/result.
+
+Resolve prerequisites before launching: an absent image, evicted/corrupt
+derivative or fee catalog identity mismatch reports
+`<bundle> deep: missing prerequisite <kind> <id>` and skips that bundle; this
+does not invalidate its result. Context/game-state prerequisites are also
+checked. Exit status is **0** for a complete passing audit, **1** for any result
+failure, or **2** when only missing prerequisites prevent completion. The spec
+and source/tool inputs still identify the corpus key; use the original inputs
+to select an older corpus.
+
 ## Optional persistent derivative cache
 
 Add this field to the corpus spec (version 1); omitting it preserves the

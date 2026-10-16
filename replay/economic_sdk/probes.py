@@ -97,19 +97,20 @@ class Manager:
         self.policy = runtime.fill.probes
         self.heap, self.episodes = [], {}
         self.pending = 0
+        # References to immutable policy sizings, covered by its JSON reservation.
+        self.sizings = tuple((i, sizing) for i, sizing in enumerate(runtime.fill.sizings)
+                            if sizing.name in self.policy.sizings)
 
     def add(self, identity, entity, spec, maxima, start, limit, priced, ages):
         episode = _Episode(identity, entity, spec, maxima, start, limit)
         rows = {row["name"]: row for row in priced.json["results"]}
-        selected = set(self.policy.sizings)
-        for sizing_index, sizing in enumerate(self.runtime.fill.sizings):
-            if sizing.name not in selected:
-                continue
+        # Compute once, but reserve every scenario occurrence at the same point.
+        cost = bounds.probe_cost(entity, len(spec.units), self.runtime.fill.max_levels)
+        for sizing_index, sizing in self.sizings:
             for confirm in self.policy.confirm_ms:
                 for latency in self.policy.arrival_ms:
                     for mode_index, mode in enumerate(self.policy.sequencing):
                         require(self.pending < bounds.MAX_PENDING_PROBES, "pending probe bound")
-                        cost = bounds.probe_cost(entity, len(spec.units), self.runtime.fill.max_levels)
                         self.runtime.budget.charge(cost, "pending probe state budget")
                         probe = _Probe(episode, sizing,
                                        (start, sizing_index, confirm, latency, mode_index, entity.id),

@@ -42,7 +42,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     profile_policy,
 )
 from replay.economic_sdk.levels import LevelRecorder
-from replay.economic_sdk.transitions import TransitionRecorder
+from replay.economic_sdk.transitions import CutScan, TransitionRecorder
 from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
@@ -70,6 +70,10 @@ class _State:
 
     def __init__(self, kind, bid=None, ask=None, depth=None, fills=None):
         self.kind, self.bid, self.ask, self.depth, self.fills = kind, bid, ask, depth, fills
+
+    def same(self, other):
+        return (self.kind == other.kind and self.bid == other.bid and self.ask == other.ask
+                and self.depth == other.depth and self.fills == other.fills)
 
     def quotes(self):
         return {"bid": None if self.bid is None else [str(self.bid[0]), str(self.bid[1])],
@@ -164,19 +168,25 @@ class Collector:
 
     # -- inputs ------------------------------------------------------------------
     def _read(self, key, book, sides):
-        """Refresh the live book's validity and only the ``sides`` it touched."""
+        """Refresh touched facts; report whether a derived state could differ."""
         reason = None if book.reason is None else book.reason.get("kind")
-        self.validity[key] = (book.validity, reason)
+        validity = (book.validity, reason)
+        changed = self.validity.get(key) != validity
+        self.validity[key] = validity
         if book.validity != "usable":
             self.side_facts[key] = {"bid": None, "ask": None}
-            return
+            return changed
         facts = self.side_facts.setdefault(key, {"bid": None, "ask": None})
         for side in sides or ("bid", "ask"):
             current = facts[side]
             if sides and current is not None and current[3] is not None and (
                     sides[side] > current[3] if side == "ask" else sides[side] < current[3]):
                 continue  # strictly beyond every band and walked level: unchanged
-            facts[side] = self._side(key, book, side)
+            new = self._side(key, book, side)
+            if new != current:
+                facts[side] = new
+                changed = True
+        return changed
 
     def _side(self, key, book, side):
         if "depth" not in self.groups:
@@ -189,12 +199,12 @@ class Collector:
         plan = self.plans[key]
         band_unit = int(self.policy["tick_atoms"][plan["venue"]])
         within = []
+        index, total = 0, 0
         for k in self.depth_ticks:
-            band, total = k * band_unit, 0
-            for price, quantity in levels:
-                if abs(price - best[0]) > band:
-                    break
-                total += quantity
+            band = k * band_unit
+            while index < len(levels) and abs(levels[index][0] - best[0]) <= band:
+                total += levels[index][1]
+                index += 1
             within.append(total)
         fills = None
         view = self.views(key) if self.views is not None else None
@@ -261,8 +271,10 @@ class Collector:
         # Scopes opened by this advance write their rows from the state before this cut.
         self.sequence = cut.risk_sequence
         self._advance(time)
-        for stream in self.streams:
-            stream.cut(cut, raw, time, self.rows, self.scope)
+        if self.streams:
+            scan = CutScan(self.streams[0], self.transitions is not None)
+            for stream in self.streams:
+                stream.cut(cut, raw, time, self.rows, self.scope, scan)
         transitions = cut.body["book_transitions"]
         scope_books = self.rows
         if raw >= self.start and "activity" in self.groups:
@@ -300,18 +312,28 @@ class Collector:
                 self._trade(key, row, value)
         if changed is None:
             changed = touched_sides(cut)
-        derive = set()
+        affected, derive = set(), set()
         for key, sides in changed.items():
             if key not in self.plans:
                 continue
-            self._read(key, cut.books[key], sides)
-            derive.add(key)
+            refreshed = self._read(key, cut.books[key], sides)
+            affected.add(key)
+            if refreshed:
+                derive.add(key)
             if key in self.counterpart:
-                derive.add(self.counterpart[key])
-        if derive:
-            self.staged = time
-            for key in derive:
-                self.pending[key] = self._derive(key)
+                other = self.counterpart[key]
+                affected.add(other)
+                if refreshed:
+                    derive.add(other)
+        for key in affected:
+            new = self._derive(key) if key in derive else self.pending.get(key, self.state[key])
+            if new.same(self.state[key]) and not self._needs_accrual_charge(key, time):
+                # This also removes B after same-time A -> B -> A. Trades above
+                # have already read the intermediate pending state.
+                self.pending.pop(key, None)
+            else:
+                self.pending[key] = new
+        self.staged = time if self.pending else None
 
     def terminal(self, end, sequence=None):
         if self.staged is not None:
@@ -344,6 +366,20 @@ class Collector:
             row.trades_unpriced += 1
 
     # -- time --------------------------------------------------------------------
+    def _needs_accrual_charge(self, key, time):
+        """An equal-state commit must still make its first allocation on time."""
+        row = self.rows.get(key)
+        if row is None or time <= self.since[key]:
+            return False
+        state = self.state[key]
+        if state.kind == "not_initialized":
+            return False
+        if state.kind != "usable":
+            return state.kind.split(":", 1)[1] not in row.unusable
+        return (state.bid is not None and state.ask is not None
+                and ("top_of_book" in self.groups or "self_crossing" in self.groups)
+                and state.ask[0] - state.bid[0] not in row.spread_hist)
+
     def _commit(self):
         time = self.staged
         keys = sorted(self.pending)

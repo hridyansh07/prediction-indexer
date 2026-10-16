@@ -322,7 +322,7 @@ def validate(config):
     Decoder(t["run_id"], "validation", expected, t["max_entry_bytes"]).apply(
         json.dumps(
             {
-                "version": "3",
+                "version": "4",
                 "run_id": t["run_id"],
                 "attempt_id": "validation",
                 "sequence": "0",
@@ -633,6 +633,9 @@ def attempt(root, config, state, redis, lock_fd, url):
             del publisher_stderr[:-MAX_PUBLISHER_STDERR_BYTES]
 
     try:
+        from replay.strategy_sdk import stream_sections
+        sections = {group: sorted(stream_sections(spec))
+                    for group, spec in config["strategies"].items()}
         launch(
             "publisher",
             [
@@ -667,6 +670,7 @@ def attempt(root, config, state, redis, lock_fd, url):
                             str(root),
                             a["id"],
                             group,
+                            json.dumps(sections[group]),
                         ],
                     )
                 joined = True

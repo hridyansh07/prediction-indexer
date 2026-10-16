@@ -367,6 +367,30 @@ class ScopeTests(Case):
 
 
 class LevelTests(Case):
+    def test_s5_batch_extrema_after_repeated_deletes_reinsertions_and_empty_sides(self):
+        h = self.harness()
+        ladder(h, 12, PM[0], bids=((400, 5 * M), (390, 3 * M), (380, M)),
+               asks=((450, 2 * M), (460, 4 * M), (470, M)))
+        send(h, 13, (PM, operations(
+            op(PM, "bid", 400, "delete"), op(PM, "ask", 450, "delete"),
+            op(PM, "bid", 390, "delete"), op(PM, "ask", 460, "delete"),
+            op(PM, "bid", 400, "set", 2 * M), op(PM, "ask", 440, "set", 3 * M),
+            op(PM, "bid", 400, "delete"), op(PM, "ask", 440, "delete"),
+            op(PM, "bid", 385, "increase", M), op(PM, "ask", 465, "set", 2 * M))))
+        send(h, 14, (PM, operations(
+            op(PM, "ask", 465, "delete"), op(PM, "bid", 385, "delete"),
+            op(PM, "ask", 470, "decrease", M), op(PM, "bid", 380, "delete"))))
+        result = h.finish()
+        top = tops(self, h, PM, result)
+        self.assertEqual([(r["bid"], r["ask"]) for r in top[-2:]],
+                         [(quote(385, M), quote(465, 2 * M)), (None, None)])
+        diffs = self.rows(h, PM, "levels", result, "diff")
+        self.assertEqual(diffs[0]["levels"], [["bid", "385", str(M)], ["bid", "390", str(-3 * M)],
+                                             ["bid", "400", str(-5 * M)], ["ask", "450", str(-2 * M)],
+                                             ["ask", "460", str(-4 * M)], ["ask", "465", str(2 * M)]])
+        self.assertEqual(diffs[1]["levels"], [["bid", "380", str(-M)], ["bid", "385", str(-M)],
+                                             ["ask", "465", str(-2 * M)], ["ask", "470", str(-M)]])
+
     def test_polymarket_set_up_down_delete_and_net_zero(self):
         h = self.harness(LEVELS)
         ladder(h, 12, PM[0], bids=((400, 5 * M), (390, 3 * M)), asks=((450, 2 * M), (460, 4 * M)))
