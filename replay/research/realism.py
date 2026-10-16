@@ -246,6 +246,9 @@ def volatility_document(output, bundle_id, event_id, game, books):
     manifest, summary = read_json(output / "manifest.json"), read_json(output / "summary.json")
     entry = manifest.get("files", {}).get("volatility.ndjson.zst")
     if entry is None:
+        policy = manifest.get("policy") or {}
+        require("volatility" not in policy.get("groups", []) and "volatility" not in policy,
+                "profile declares volatility without volatility.ndjson.zst identity")
         require(not (output / "volatility.ndjson.zst").exists(), "undeclared volatility evidence")
         return {"state": "unavailable", "reason": "legacy input: volatility not recorded", "pairs": [], "rows": []}
     require(type(summary.get("volatility")) is dict, "volatility file without summary")

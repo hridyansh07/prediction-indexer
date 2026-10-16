@@ -264,6 +264,16 @@ class ExecutionBuildTest(unittest.TestCase):
         self.assertEqual(items[0]["detail"]["probes"]["state"], "unavailable")
         self.assertEqual(items[0]["detail"]["flags_state"], "unavailable")
 
+    def test_declared_missing_volatility_is_invalid_not_legacy(self):
+        output = self.root / "declared"
+        output.mkdir()
+        write_json(output / "summary.json", {})
+        for policy in ({"version": 2, "groups": ["transitions", "volatility"]},
+                       {"version": 2, "groups": ["transitions"], "volatility": {}}):
+            write_json(output / "manifest.json", {"policy": policy, "files": {}})
+            with self.subTest(policy=policy), self.assertRaisesRegex(ResearchError, "declares volatility"):
+                realism.volatility_document(output, BUNDLE, None, "lol", BOOKS)
+
     def test_volatility_identity_and_resource_limit(self):
         output = self.result / "run" / ATTEMPT / "profile" / "output"
         with mock.patch.object(realism, "MAX_VOLATILITY_SERIES", 1):
