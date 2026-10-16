@@ -10,6 +10,8 @@ from fractions import Fraction
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from replay.research import realism
+
 DURATION_EDGES_MS = [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 60_000,
                      300_000, 3_600_000]
 NET_EDGES = [0, 0.01, 0.1, 1, 5, 10, 25, 50, 100, 250, 1_000]
@@ -88,6 +90,13 @@ def episode_rows(bundle_id, lens, items, *, books, capture_end_ns, game):
                 "net": None if net is None else float(Fraction(net["value"])),
                 "net_exact": None if net is None else net["value"], "net_unit": None if net is None else net["unit"],
                 "quantity": None if quantity is None else float(Fraction(quantity["value"])),
+                "quantity_exact": None if quantity is None else quantity["value"],
+                "pairing_class": item["detail"].get("flags", {}).get("pairing_class"),
+                "settlement_review": item["detail"].get("flags", {}).get("settlement_review"),
+                "stale_legs": item["detail"].get("flags", {}).get("stale_legs"),
+                "flags_state": item["detail"].get("flags_state", "unavailable"),
+                "edge_per_set": item["detail"].get("edge_per_set"),
+                "t10_value": item["detail"].get("t10_value"),
                 "seconds_to_capture_end": (capture_end_ns - start) / 1e9,
                 "route_id": item["detail"].get("route_id"), "shares_leg_with": share, "dedup_group": group,
                 "game": game, "market_types": types})
@@ -100,8 +109,39 @@ EPISODE_SCHEMA = pa.schema([
     ("books", pa.list_(pa.int32())), ("markets", pa.list_(pa.string())), ("venues", pa.list_(pa.string())),
     ("venue_pair", pa.string()), ("censored", pa.bool_()), ("end_reason", pa.string()),
     ("net", pa.float64()), ("net_exact", pa.string()), ("net_unit", pa.string()), ("quantity", pa.float64()),
+    ("quantity_exact", pa.string()), ("pairing_class", pa.string()), ("settlement_review", pa.bool_()),
+    ("stale_legs", pa.list_(pa.int32())), ("flags_state", pa.string()),
+    ("edge_per_set", pa.string()), ("t10_value", pa.string()),
     ("seconds_to_capture_end", pa.float64()), ("route_id", pa.string()), ("shares_leg_with", pa.int32()),
     ("dedup_group", pa.int32()), ("game", pa.string()), ("market_types", pa.list_(pa.string())),
+])
+
+_PAIRS = pa.list_(pa.list_(pa.string()))
+_WALK = pa.struct([("atoms", pa.string()), ("cost", pa.string()), ("taken", _PAIRS), ("consumed", _PAIRS)])
+_AGE = pa.struct([("book_ns", pa.string()), ("best_ns", pa.string())])
+_DECISION = pa.struct([("time_ns", pa.string()), ("steps", pa.string()), ("limits", pa.list_(pa.string())),
+                       ("ages", pa.list_(_AGE)), ("value", pa.string()), ("legs", pa.list_(_WALK))])
+_ARRIVAL = pa.struct([("sent_ns", pa.string()), ("arrival_ns", pa.string()), ("venue_delay_ms", pa.int64()),
+                     ("delay_source", pa.string()), ("usable", pa.bool_()), ("filled_atoms", pa.string()),
+                     ("cost", pa.string()), ("consumed", _PAIRS), ("excess_atoms", pa.string()),
+                     ("exit_consumed", _PAIRS), ("exit_proceeds", pa.string())])
+PROBE_SCHEMA = pa.schema([
+    ("bundle_id", pa.string()), ("event_id", pa.string()), ("lens", pa.string()), ("episode_id", pa.string()),
+    ("game", pa.string()), ("scope", pa.int32()), ("markets", pa.list_(pa.string())),
+    ("market_types", pa.list_(pa.string())), ("pairing_class", pa.string()), ("settlement_review", pa.bool_()),
+    ("stale_legs", pa.list_(pa.int32())), ("gap_pair", pa.int32()), ("gap_pair_state", pa.string()),
+    ("sizing", pa.string()), ("confirm_ms", pa.int64()), ("arrival_ms", pa.int64()),
+    ("sequencing", pa.string()), ("status", pa.string()), ("decision", _DECISION), ("legs", pa.list_(_ARRIVAL)),
+    ("matched_steps", pa.string()), ("value", pa.string()), ("leg_loss_gross", pa.string()),
+    ("matched_sets", pa.string()), ("decision_sets", pa.string()), ("value_exact", pa.string()),
+    ("value_unit", pa.string()), ("leg_loss_gross_exact", pa.string()),
+    ("decision_edge_per_set", pa.string()), ("decision_edge_state", pa.string()),
+])
+VOLATILITY_SCHEMA = pa.schema([
+    ("bundle_id", pa.string()), ("event_id", pa.string()), ("game", pa.string()), ("type", pa.string()),
+    ("book", pa.int32()), ("pair", pa.int32()), ("market_types", pa.list_(pa.string())),
+    ("horizon_ms", pa.int64()), ("samples", pa.int64()), ("n", pa.int64()), ("state", pa.string()),
+    ("sum_sq4", pa.string()), ("rms", pa.float64()), ("jumps_json", pa.string()),
 ])
 
 
@@ -165,7 +205,7 @@ def _stats(per_event, dedup_per_event, durations, nets, quantities):
     }
 
 
-def summarize(config, event_rows, episodes):
+def summarize(config, event_rows, episodes, *, probes=(), volatility=(), evidence=()):
     """``summary.json``: per lens, headline-kind statistics with and without the 100 ms filter."""
     lenses = {}
     by_lens_event = defaultdict(list)
@@ -194,7 +234,10 @@ def summarize(config, event_rows, episodes):
         lenses[name] = entry
     return {"summary_version": 1, "min_duration_ms": MIN_DURATION_MS,
             "events": {state: sum(1 for e in event_rows if e["state"] == state) for state in EVENT_STATES},
-            "packs": sum(1 for e in event_rows if e["pack"] == "ok"), "lenses": lenses}
+            "packs": sum(1 for e in event_rows if e["pack"] == "ok"), "lenses": lenses,
+            "execution_realism": {"version": 1, "evidence": list(evidence),
+                "delayed_fills": realism.delayed_summaries(probes), "volatility": list(volatility),
+                "pair_loss_comparisons": realism.pair_loss_comparisons(probes, volatility)}}
 
 
 def _fmt(value, digits=2):
@@ -243,7 +286,8 @@ def viability(config, version, inputs, superseded, event_rows, episodes, summary
               "overlaps B and B overlaps C they are one group even when A and C never overlap, so dedup "
               "is a conservative lower bound, not a count of distinct opportunities. Net is modeled "
               "apparent edge at episode open, not a return. Nothing is filtered except where a column says "
-              "≥100 ms.", ""]
+              "≥100 ms. Duration views are non-causal research context: eventual survival is known only "
+              "after the fact. Delayed-fill confirmation uses decision time instead.", ""]
     for name, entry in summary["lenses"].items():
         lines += [f"### {entry['label']} (`{name}`)", "",
                   "Lens states: " + ", ".join(f"{k} {v}" for k, v in entry["states"].items()) + ".", ""]
@@ -269,8 +313,17 @@ def viability(config, version, inputs, superseded, event_rows, episodes, summary
                   f"| Share of events with at least one | {_fmt(a['share_with_one'])} | {_fmt(b['share_with_one'])} |",
                   f"| Net total | {_fmt(a['net_total'])} | {_fmt(b['net_total'])} |",
                   f"| Largest net | {_fmt(a['net_max'])} | {_fmt(b['net_max'])} |", ""]
+        eligible = [r for r in episodes if r["lens"] == name and r["kind"] == entry["headline_kind"]]
+        lines += ["Opening edge per set (exact decision-at-open arithmetic; no duration selection):", "",
+                  "| Threshold | Episodes | Events | Modeled net total |", "|---|---:|---:|---:|"]
+        for cents in (1, 2, 3):
+            selected = [r for r in eligible if realism.at_threshold(r.get("edge_per_set"), cents)]
+            total = sum((Fraction(r["net_exact"]) for r in selected if r["net_exact"] is not None), Fraction())
+            lines.append(f"| ≥{cents}¢ | {len(selected)} | {len({r['bundle_id'] for r in selected})} | "
+                         f"{realism.exact_ratio(total)} |")
+        lines += ["", f"Opening edge per set unavailable: {sum(r.get('edge_per_set') is None for r in eligible)}.", ""]
         hist = a["histograms"]["duration_ms"]
-        lines += ["Duration distribution (ms, all episodes):", "",
+        lines += ["Duration distribution (ms, all episodes; **non-causal research context**):", "",
                   "| From | To | Episodes |", "|---:|---:|---:|"]
         edges = hist["edges"]
         for index, count in enumerate(hist["counts"]):
@@ -284,4 +337,60 @@ def viability(config, version, inputs, superseded, event_rows, episodes, summary
                            ("market type", lambda r: "+".join(r["market_types"])),
                            ("venue pair", lambda r: r["venue_pair"])):
             lines += [f"By {title}:", ""] + _breakdown(rows, ok_events, key) + [""]
+    lines += realism_report(summary["execution_realism"])
     return ("\n".join(lines).rstrip() + "\n").encode()
+
+
+def realism_report(document):
+    lines = ["## Delayed fills", "",
+             "Thresholds use each sizing's own decision-time value / (decision steps × step_contracts), "
+             "with exact rational comparisons. Arrival value and eventual episode duration never select a row. "
+             "Money uses the declared common lens unit at scale 36; native leg costs are never summed. "
+             "t10 is listed first. Unknown decisions are excluded only from thresholded tables. "
+             "Unresolved probes remain in status counts; their ratios and money are unavailable. "
+             "Positive-event share uses events with resolved net evidence in the selected group; "
+             "the resolved denominator is shown. Gross unwind loss excludes unwind fees.", ""]
+    for row in document["evidence"]:
+        if row["state"] != "ok":
+            lines.append(f"- `{row['bundle_id']}` {row['lens']} {row['kind']}: **unavailable** — {row['reason']}.")
+    lines += ["", "| Lens | Sizing | Sequencing | c ms | L ms | Threshold | Group | Status counts | Mean fill ratio | "
+              "Median matched sets | Σ value | Σ gross loss | Σ net after loss | Positive event share | Resolved events | Decision edge unavailable | Unit |",
+              "|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for r in document["delayed_fills"]:
+        threshold = "all" if r["threshold_cents"] == 0 else f"≥{r['threshold_cents']}¢"
+        group = "all" if r["group_by"] == "all" else f"{r['group_by']}={r['group']}"
+        values = [r[k] if r[k] is not None else "unavailable" for k in (
+            "mean_fill_ratio", "median_matched_sets", "value_sum", "leg_loss_gross_sum", "net_after_loss_sum", "positive_event_share")]
+        statuses = ", ".join(f"{k}:{r['status_counts'].get(k, 0)}" for k in realism.PROBE_STATUSES)
+        lines.append(f"| {r['lens']} | {r['sizing']} | {r['sequencing']} | {r['confirm_ms']} | {r['arrival_ms']} | "
+                     f"{threshold} | {group} | {statuses} | " + " | ".join(map(str, values)) +
+                     f" | {r['events_with_resolved_probes']} | {r['decision_edge_unavailable']} | {r['value_unit']} |")
+    if not document["delayed_fills"]:
+        lines += ["", "Delayed-fill evidence unavailable: no recorded probes."]
+    lines += ["", "## Volatility", "",
+              "Book mid and native-side gap moves at 1 s and 3 s. RMS is a derived square root in quote "
+              "currency per contract; exact n and sum_sq4 remain in the table. Jump rates use each "
+              "profile threshold in scale-4 price atoms. No evidence is rendered as zero.", "",
+              "| Bundle | Game | Market types | Type | Book / pair | Horizon ms | n | RMS | Jump rates |",
+              "|---|---|---|---|---|---:|---:|---:|---|"]
+    for r in document["volatility"]:
+        jumps = ", ".join(f"{j}:{s['rate'] if s['rate'] is not None else 'unavailable'}" for j, s in r["jumps"].items())
+        lines.append(f"| {r['bundle_id']} | {r['game']} | {'+'.join(r['market_types'])} | {r['type']} | "
+                     f"{r['book'] if r['type'] == 'book' else r['pair']} | {r['horizon_ms']} | {r['n']} | "
+                     f"{r['rms'] if r['rms'] is not None else 'unavailable'} | {jumps} |")
+    if not document["volatility"]:
+        lines += ["", "Volatility evidence unavailable: no recorded volatility rows."]
+    lines += ["", "### Gap volatility beside delayed-fill leg loss", "",
+              "Joins require the same bundle, scope and both native (book, orientation) sides. Lens and "
+              "probe settings remain separate. Multi-leg baskets and pairs without mask evidence remain "
+              "unavailable; no event-wide loss is assigned to unrelated pairs.", "",
+              "| Bundle | Lens | Pair | Sizing | Sequencing | c ms | L ms | Σ gross loss | Unit | Gap RMS 1 s | Gap RMS 3 s |",
+              "|---|---|---:|---|---|---:|---:|---:|---|---:|---:|"]
+    for r in document["pair_loss_comparisons"]:
+        lines.append(f"| {r['bundle_id']} | {r['lens']} | {r['pair']} | {r['sizing']} | {r['sequencing']} | "
+                     f"{r['confirm_ms']} | {r['arrival_ms']} | {r['leg_loss_gross_sum']} | {r['value_unit']} | "
+                     f"{r['gap_rms_1s'] if r['gap_rms_1s'] is not None else 'unavailable'} | "
+                     f"{r['gap_rms_3s'] if r['gap_rms_3s'] is not None else 'unavailable'} |")
+    if not document["pair_loss_comparisons"]:
+        lines += ["", "Pair/lens loss comparison unavailable: no matching native-side pair evidence."]
+    return lines
