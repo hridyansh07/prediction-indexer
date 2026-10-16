@@ -32,6 +32,11 @@ Results committed without `context/` (before the corpus runner kept it) still ge
 packs, marked `context: missing`: the title is the bundle id, books are labelled by
 instrument, and no cross-venue twins are known.
 
+Contexts may pin outcomes document version 1 or version 2. The strict preparation
+reader validates version-2 execution terms, including their change-point order,
+when research loads committed game state or a local game-state archive. Reading
+either version preserves the committed context bytes and identities.
+
 Modules: `inputs` (discovery, attempts, lens states, context binding), `series`
 (overview and tiles from `transitions.ndjson.zst`), `overlays` (the SDK episode
 adapter), `game` (windowed game facts), `metadata` (titles, books, twins),
