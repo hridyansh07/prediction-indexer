@@ -58,6 +58,13 @@ New policies retain native `ask` and exit `bid`, or both projected
 reused. Native costs/proceeds keep their native scales. Aggregate value and gross
 loss share scale-36 research-dollar/common quote units. No unwind fee is added.
 
+Kalshi basket inputs declare `("crossed", None)` as well as the projected
+acquisition ask and native bid. The evaluator's self-cross exclusion reads the
+source book's native bid and ask, including the ask retained for probe exits.
+An ask-only uncross therefore invalidates that exclusion even when the native
+bid and projected acquisition fill are identical. This applies to operation
+cuts and same-bid snapshots; the self-cross exclusion itself remains enforced.
+
 ## Episode and probe output contract
 
 Only fill episodes of the new policies add the top-level closed object:

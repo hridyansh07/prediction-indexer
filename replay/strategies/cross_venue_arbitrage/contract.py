@@ -234,7 +234,8 @@ def baskets(snapshot, policy, scope_index):
                           "admission": admission, "direction": "buy", "size_contracts": size,
                           "settlement_model": SETTLEMENT,
                           "outcomes_provider": snapshot.get("outcomes", {}).get("provider")}
-            inputs = None if admission is not None else tuple((("kalshi_complement_ask", int(size)), ("bid", int(size)))
+            inputs = None if admission is not None else tuple(
+                           (("kalshi_complement_ask", int(size)), ("bid", int(size)), ("crossed", None))
                            if key[0].startswith("kalshi:") else
                            (("ask", int(size)), ("crossed", None)) for key in acquired)
             result.append(Basket(descriptor, sources, (venues, route, "buy", 0 if size is None else int(size)),

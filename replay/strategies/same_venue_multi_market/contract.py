@@ -129,7 +129,7 @@ def baskets(snapshot, policy, scope_index):
             "settlement_model": SETTLEMENT, "outcomes_provider": provider,
         }
         inputs = None if admission is not None else tuple(
-            (("kalshi_complement_ask", 1), ("bid", 1)) if k[0].startswith("kalshi:")
+            (("kalshi_complement_ask", 1), ("bid", 1), ("crossed", None)) if k[0].startswith("kalshi:")
             else (("ask", 1), ("crossed", None)) for k in acquired)
         result.append(Basket(descriptor, sources, (venue, set_id, "buy", 0 if admission else 1),
                              admission, tuple(reason(r) for r in why), None, (venue,), set_id, inputs))

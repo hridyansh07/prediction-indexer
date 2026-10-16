@@ -216,6 +216,75 @@ class IntegratedTests(unittest.TestCase):
         self.assertTrue(all(r["status"] == "decision_untradeable" for r in rows
                             if r["sizing"] == "t10" and r["confirm_ms"] > 0))
 
+    def assert_kalshi_ask_only_recovery(self, kind, update):
+        h = self.harness(kind)
+        entity = next(e for e in h.strategy.entities.values()
+                      if e.admission is None and len(e.legs) == 2
+                      and any(k[0] == "kalshi:series" for k in e.legs))
+        key = next(k for k in entity.legs if k[0] == "kalshi:series")
+        # The final state at 16s is crossed before this route can open a fill.
+        # Its unchanged native bid still projects to a 0.40 acquisition ask.
+        ladder(h, 16 * 10**9, *key, bids=((60, 20),), asks=((50, 20),))
+        h.group(17 * 10**9)
+        self.assertEqual(h.strategy.current[entity.id][0].status, "SELF_CROSSED_LEG")
+        prior = h.strategy.views[key]
+        self.assertEqual(prior.validity, "usable")
+        self.assertTrue(prior.crossed)
+        if update == "snapshot":
+            ladder(h, 18 * 10**9, *key, bids=((60, 20),), asks=((70, 20),))
+        else:
+            plan = h.initial["plans"][h.plan_index(*key)]
+            transition = h.transition(plan, 18 * 10**9)
+            transition["decision"] = {"kind": "operations", "operations": [
+                {"instrument": key[0], "orientation": key[1], "side": "ask",
+                 "price": {"atoms": str(price), "scale": plan["price_scale"],
+                           "unit": "quote_per_contract"},
+                 "change": ({"kind": "delete"} if price == 50 else
+                            {"kind": "set", "value": {"atoms": "20",
+                             "scale": plan["quantity_scale"], "unit": "contracts"}}),
+                 "book_hash": None} for price in (50, 70)]}
+            ref = h.ref(18 * 10**9)
+            h.send("cut", {"origin": {"kind": "group", "pin": h.pin,
+                "first": ref["address"], "last": ref["address"], "visible_ns": str(18 * 10**9)},
+                "market_events": [], "book_transitions": [transition]})
+        h.group(19 * 10**9)
+        current = h.strategy.views[key]
+        self.assertFalse(current.crossed)
+        self.assertIs(current.fills["bid"][1], prior.fills["bid"][1])
+        self.assertIs(current.transformed["kalshi_complement_ask"][1],
+                      prior.transformed["kalshi_complement_ask"][1])
+        # Verify the market is economically positive independently of memo reuse.
+        from replay.economic_sdk.types import Context
+        fresh = h.strategy.strategy.evaluate(entity, tuple(h.strategy.views[k] for k in entity.legs),
+            Context(19 * 10**9, h.seq, 0, h.strategy.experiment.experiment_sha256))
+        self.assertIn("net", fresh.predicates)
+        self.assertEqual(int(fresh.payload["gap_gross"]), 2 * 10**35)
+        # finish() runs the real writer and independent semantic reader before
+        # checking that persisted exclusion time ends at the ask-only recovery.
+        h.finish()
+        index = h.strategy.index[entity.id]
+        denominator = next(r for r in h.records("denominators.ndjson")
+                           if r["scope"] == 0 and r["entity"] == index)
+        self.assertEqual(denominator["status_ns"]["SELF_CROSSED_LEG"], str(2 * 10**9))
+        self.assertEqual(denominator["status_ns"]["DEPTH_SUFFICIENT"], str(22 * 10**9))
+        episodes = [r for r in h.records("episodes.ndjson")
+                    if r["scope"] == 0 and r["entity"] == index and r["kind"] == "net"]
+        self.assertEqual([(r["start_ns"], r["end_ns"]) for r in episodes],
+                         [(str(18 * 10**9), str(40 * 10**9))])
+        probes = [r for r in h.records("probes.ndjson") if r["episode_id"] == episodes[0]["episode_id"]]
+        self.assertEqual(len(probes), 60)
+        self.assertTrue(all(r["status"] == "filled" for r in probes))
+
+    def test_kalshi_ask_only_operations_uncross_recovers_all_four_policies(self):
+        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+            with self.subTest(kind=kind):
+                self.assert_kalshi_ask_only_recovery(kind, "operations")
+
+    def test_kalshi_same_bid_snapshot_uncross_recovers_all_four_policies(self):
+        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+            with self.subTest(kind=kind):
+                self.assert_kalshi_ask_only_recovery(kind, "snapshot")
+
     def test_new_policy_sparse_and_full_cuts_preserve_probe_bytes_and_risk_numbering(self):
         outputs = []
         for full in (False, True):

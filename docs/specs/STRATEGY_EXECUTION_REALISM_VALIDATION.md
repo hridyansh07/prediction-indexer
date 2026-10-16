@@ -138,3 +138,35 @@ on its research lineage; the producer does not import that package. Integrate th
 updated corpus-runner lineage into `master` before research-site consumes the new
 outputs, after the separately pending acceptance. No PR is auto-merged, and code
 merges do not authorize operational acceptance or a live pilot.
+
+## R10: Kalshi ask-only uncross recovery (17 October 2026)
+
+The reported cache/dependency mismatch is **confirmed by a runtime regression**,
+starting from producer revision `bb3e401a72a869cfed7537a6e92e2cb07d858662`.
+Before production code changed, two new tests failed in all eight subcases:
+cross-venue arbitrage policy 4, same-venue multi-market policy 2 and both
+implication-cover policy-4 factories, each with either ask-only operations or a
+same-bid snapshot. Every case uses distinct committed times, usable books,
+known synthetic fees and unchanged bid/projected-acquisition fill objects.
+
+At 16s the Kalshi source has bid 60/ask 50. At 18s only its ask recovers to 70;
+the projected acquisition ask and the other leg remain 0.40. A fresh production
+evaluation has positive gross value of 0.20 per set, but the persisted exclusion
+remained until 40s: **24 seconds instead of 2**. The semantic reader accepted
+that internally consistent output, demonstrating why this requires a runtime
+regression rather than only a rehashed-output check.
+
+The three owning basket constructors now declare the evaluator's `crossed`
+input for Kalshi legs. This makes ask-side selection and fingerprint invalidation
+observe the transition without changing the SDK or disabling the exclusion.
+After the fix, all eight subcases preserve the initial exclusion, record exactly
+2s of it, open the expected 18s–40s net episode and write all 60 filled probe
+scenarios. The real writer and independent semantic reader complete in each case.
+
+The expanded focused gate passes **295 tests**, including these regressions,
+all four strategy packages, SDK cache/port/outcome/metadata checks, quote/probe
+readers, wire-V4 streams, corpus validation and the existing all-file legacy
+hash goldens. Whitespace checks pass. Full root/replay suites and Rust, UI,
+Compose and live acceptance were not rerun for this three-declaration Python
+correction; their earlier outcomes above remain historical. Existing recorded
+inputs/results are unchanged.
