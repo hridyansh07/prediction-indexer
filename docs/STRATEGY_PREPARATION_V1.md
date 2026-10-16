@@ -188,6 +188,12 @@ book mappings. It returns deeply immutable mappings/tuples. For an externally
 pinned identity,
 pass `expected_sha256`; a colocated receipt alone is not an authenticity signature.
 
+The pinned outcomes document may itself be version 1 or 2. Version 2 requires
+every market's closed `execution_terms` object (`status`, `changes`), with strictly
+increasing UTC change points and nonnegative integer or null taker delays.
+Version-1 documents retain their original shape and bytes; the reader does not
+add execution terms to them.
+
 The same directory/config loads without source calls. Changed config fails; a
 context without receipt is uncommitted and requires a new directory. A local flock
 prevents concurrent preparation. Files are immutable by ownership contract, as
