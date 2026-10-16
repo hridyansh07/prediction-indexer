@@ -1,0 +1,24 @@
+{
+  "research_version": 1,
+  "lenses": {
+    "profile": {"group": "profile", "adapter": "profile", "label": "Market profile"},
+    "complement": {"group": "complement", "adapter": "sdk_episodes", "label": "Same-venue complement",
+                   "headline_kind": "net", "value_scale": 36, "value_unit": "USD"},
+    "cross": {"group": "cross", "adapter": "sdk_episodes", "label": "Cross-venue complete set",
+              "headline_kind": "net", "value_scale": 36, "value_unit": "USD"},
+    "multi": {"group": "multi", "adapter": "sdk_episodes", "label": "Same-venue multi-market",
+              "headline_kind": "net", "value_scale": 36, "value_unit": "USD"},
+    "cover_same": {"group": "cover_same", "adapter": "sdk_episodes", "label": "Same-venue implication cover",
+                   "headline_kind": "net", "value_scale": 36, "value_unit": "USD"},
+    "cover_cross": {"group": "cover_cross", "adapter": "sdk_episodes", "label": "Cross-venue implication cover",
+                    "headline_kind": "net", "value_scale": 36, "value_unit": "USD"}
+  },
+  "game_time_windows": {
+    "kalshi_market_close": {"before_ms": 2000, "after_ms": 5000},
+    "close_minus_duration": {"before_ms": 2000, "after_ms": 65000},
+    "kalshi_milestone_end": {"before_ms": 2000, "after_ms": 5000}
+  },
+  "game_time_windows_status": "provisional",
+  "overview_max_buckets": 2048,
+  "tile_minutes": 10
+}

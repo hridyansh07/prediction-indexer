@@ -1,0 +1,545 @@
+/* Research site: corpus view and event terminal. Uses the app's dark tokens. */
+.research-page {
+  min-width: 0;
+}
+.research-page .small {
+  font-size: 12px;
+}
+.research-page .mono {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+}
+.research-crumbs {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.research-crumbs a {
+  color: var(--periwinkle);
+}
+.research-heading .notice,
+.research-page .notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #5a4a2a;
+  border-radius: 8px;
+  background: #241f15;
+  color: var(--apricot);
+  font-size: 13px;
+}
+.research-toolbar,
+.research-filters,
+.research-playback {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 18px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.research-toolbar select,
+.research-filters select,
+.research-filters input,
+.research-playback select {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 8px;
+  background: var(--surface);
+  color: inherit;
+  max-width: 420px;
+}
+.research-filters input {
+  width: 96px;
+}
+.research-toolbar button,
+.research-playback button,
+.legend-actions button {
+  font-size: 13px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 12px;
+  background: var(--surface-raised);
+  cursor: pointer;
+}
+.research-toolbar .check,
+.research-playback .check {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.research-toolbar .tier {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+.research-plot {
+  position: relative;
+  padding: 8px 0 4px;
+  border-top: 1px solid var(--line);
+}
+.research-chart {
+  width: 100%;
+  min-width: 0;
+}
+.research-chart .u-select {
+  background: rgba(169, 167, 223, 0.15);
+}
+.research-tracks {
+  position: relative;
+}
+.research-tracks .track {
+  position: relative;
+  border-top: 1px dashed var(--line);
+}
+.research-tracks .track svg {
+  display: block;
+  overflow: visible;
+}
+.track-label {
+  position: absolute;
+  top: 3px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 11px;
+}
+.track-state {
+  fill: var(--apricot);
+  font-size: 11px;
+}
+/* Lens marks take their layer colour from the fill attribute; only selection overrides it. */
+.episode-mark {
+  cursor: pointer;
+}
+.episode-mark.selected {
+  fill: #e7e7ee;
+}
+.density {
+  cursor: zoom-in;
+}
+.research-layers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.layers-title {
+  color: var(--muted);
+  font-size: 12px;
+  margin-right: 4px;
+}
+.lens-chip-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+.lens-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.lens-chip.on {
+  border-color: var(--lens);
+  background: color-mix(in srgb, var(--lens) 18%, transparent);
+  color: inherit;
+}
+.lens-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.lens-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--lens);
+  flex: none;
+}
+.lens-chip.on .lens-dot {
+  background: var(--lens);
+}
+.lens-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lens-why {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.lens-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.lens-tag::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--lens);
+}
+.episode-list {
+  list-style: none;
+  margin: 8px 0 12px;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.episode-list button {
+  display: grid;
+  grid-template-columns: 58px 104px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.episode-list li:last-child button {
+  border-bottom: 0;
+}
+.episode-list button:hover {
+  background: var(--surface-raised);
+}
+.episode-list button[aria-current='true'] {
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 0 #e7e7ee;
+}
+.episode-kind {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.episode-net {
+  text-align: right;
+}
+.market-status {
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 10px;
+}
+.axis-caption {
+  padding-top: 6px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+.research-playback input[type='range'] {
+  flex: 1 1 240px;
+  min-width: 160px;
+}
+.research-legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+  gap: 6px 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.legend-group.twins {
+  grid-column: span 1;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.legend-claim {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.legend-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.legend-entry > span {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.legend-label {
+  overflow-wrap: anywhere;
+}
+.legend-venue {
+  color: var(--muted);
+  font-size: 11px;
+}
+.legend-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.swatch {
+  flex: none;
+}
+.state-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.state-ok {
+  color: var(--sage);
+}
+.state-failed,
+.state-build_failed,
+.state-receipt_invalid,
+.state-context_invalid,
+.state-invalid {
+  color: #e66767;
+  border-color: #5a2b2b;
+}
+.state-excluded,
+.state-missing,
+.state-incomplete,
+.state-no_usable_time {
+  color: var(--apricot);
+  border-color: #5a4a2a;
+}
+.research-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  gap: 24px;
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+.research-details h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.readout {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.readout th,
+.readout td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+.readout td:nth-child(n + 3) {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  text-align: right;
+}
+.readout tr.highlight td {
+  background: var(--surface-raised);
+}
+dl.episode,
+dl.lens-states {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  font-size: 13px;
+}
+dl.episode > div,
+dl.lens-states > div {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 8px;
+}
+dl.lens-states {
+  margin-top: 16px;
+}
+dl dt {
+  color: var(--muted);
+}
+dl dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.reason {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  padding: 12px 0;
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.stat-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.stat strong {
+  font-size: 24px;
+  font-weight: 650;
+}
+.histograms {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  padding: 12px 0 20px;
+}
+.histogram {
+  margin: 0;
+}
+.histogram figcaption {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.histogram svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.histogram .bar {
+  fill: #3987e5;
+}
+.histogram .marker {
+  stroke: var(--apricot);
+  stroke-dasharray: 3 3;
+}
+.histogram .baseline {
+  stroke: var(--line);
+}
+.histogram .axis {
+  fill: var(--muted);
+  font-size: 10px;
+}
+.research-table {
+  display: grid;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.research-table .row {
+  display: grid;
+  grid-template-columns:
+    minmax(160px, 2fr) 110px 120px 110px 130px
+    repeat(5, minmax(70px, 1fr));
+  gap: 10px;
+  align-items: center;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+  min-width: 1060px;
+}
+.research-table .row.head {
+  color: var(--muted);
+  font-size: 11px;
+}
+.research-table .row.link {
+  cursor: pointer;
+}
+.research-table .row.link:hover {
+  background: var(--surface);
+}
+.research-table a {
+  color: inherit;
+}
+.research-table button.sort {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.research-filters input.wide {
+  width: 220px;
+}
+.research-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.corpus-meta code {
+  font-size: 11px;
+}
+.episode-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.episode-nav button {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 10px;
+  background: var(--surface-raised);
+  cursor: pointer;
+  font-size: 12px;
+}
+.episode-nav button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* Long instrument and bundle ids (78-digit Polymarket tokens) wrap instead of
+   widening the page. */
+.research-heading h1,
+.research-crumbs {
+  overflow-wrap: anywhere;
+}
+.readout {
+  table-layout: fixed;
+}
+.readout th:first-child,
+.readout td:first-child {
+  width: 46%;
+  overflow-wrap: anywhere;
+}
+.readout td {
+  overflow-wrap: anywhere;
+}
+.research-heading h1.untitled {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: clamp(20px, 3vw, 28px);
+  letter-spacing: 0;
+}

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import {
@@ -18,11 +18,32 @@ import {
   ReplayJobsPage,
   ReplayOutputPage,
 } from './replay';
+import { resolveCorpusBase } from './research/research-model';
 import { UniverseAuthProvider } from './universe-auth';
 import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
 const queryClient = createUniverseQueryClient();
+// The research routes always exist (a direct visit explains what is missing), but
+// the nav links to them only in builds that configure a research base.
+const RESEARCH_CONFIGURED =
+  resolveCorpusBase(
+    import.meta.env.VITE_CORPUS_BASE_URL as string | undefined,
+    import.meta.env.DEV,
+  ) !== '';
+const ResearchCorpusPage = lazy(() =>
+  import('./research/research-corpus').then((m) => ({
+    default: m.ResearchCorpusPage,
+  })),
+);
+const ResearchEventPage = lazy(() =>
+  import('./research/research-event').then((m) => ({
+    default: m.ResearchEventPage,
+  })),
+);
+const researchFallback = (
+  <div className="empty-state">Loading the research site…</div>
+);
 
 function App() {
   return (
@@ -45,6 +66,7 @@ function App() {
           <NavLink to="/history">History</NavLink>
           <NavLink to="/decisions">Decisions</NavLink>
           <NavLink to="/replay">Replay</NavLink>
+          {RESEARCH_CONFIGURED && <NavLink to="/research">Research</NavLink>}
         </nav>
         <AccountMenu />
       </header>
@@ -54,6 +76,22 @@ function App() {
           <Route path="/targets" element={<Navigate to="/" replace />} />
           <Route path="/history" element={<EventUniversePage />} />
           <Route path="/decisions" element={<DecisionsPage />} />
+          <Route
+            path="/research"
+            element={
+              <Suspense fallback={researchFallback}>
+                <ResearchCorpusPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/research/events/:bundleId"
+            element={
+              <Suspense fallback={researchFallback}>
+                <ResearchEventPage />
+              </Suspense>
+            }
+          />
           <Route path="/replay" element={<ReplayJobsPage />} />
           <Route path="/replay/new" element={<NewReplayPage />} />
           <Route path="/replay/admin" element={<ReplayAdminPage />} />

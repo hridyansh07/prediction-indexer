@@ -12,8 +12,8 @@ from replay.streams.protocol import require
 from replay.supervisor import write_json_durable, fsync_directory
 
 
-def prepare_game_state(context_directory, output_directory, *, store):
-    context = load_snapshot(context_directory)
+def game_state_document(context, *, store):
+    """The validated prepared document for a loaded context, built in memory; nothing is written."""
     header, participants = context_header(context)
     document = {"version": 1, **header, "state": "unavailable", "reason": "no_source", "source": None,
                 "competitors": align({"home": None, "away": None}, participants),
@@ -34,6 +34,12 @@ def prepare_game_state(context_directory, output_directory, *, store):
             else:
                 document["reason"] = "incomplete"
     validate(document, context)
+    return document
+
+
+def prepare_game_state(context_directory, output_directory, *, store):
+    context = load_snapshot(context_directory)
+    document = game_state_document(context, store=store)
     root = Path(output_directory)
     require(not root.exists() and not root.is_symlink(), "game state output already exists")
     root.parent.mkdir(parents=True, exist_ok=True)
