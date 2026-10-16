@@ -261,15 +261,15 @@ class Manager:
         episode = probe.episode
         steps = min(fill.filled_atoms // unit for fill, unit in zip(probe.fills, episode.spec.units))
         matched = tuple(_part(fill, steps * unit) for fill, unit in zip(probe.fills, episode.spec.units))
-        loss = 0
+        native_losses = []
         for leg, (fill, part, source) in enumerate(zip(probe.fills, matched, episode.spec.sources)):
             excess = fill.filled_atoms - part.filled_atoms
             exit_fill = _walk(probe.exits[leg], excess, self.runtime.fill.max_levels)
             excess_cost = fill.cost - part.cost
             # A sold leg repurchases its worst (lowest-priced) excess sales;
             # best-first matched sales have already been retained by _part.
-            loss += (exit_fill.cost - excess_cost if source in SELL_SOURCES
-                     else excess_cost - exit_fill.cost)
+            native_losses.append(exit_fill.cost - excess_cost if source in SELL_SOURCES
+                                 else excess_cost - exit_fill.cost)
             probe.legs[leg].update(excess_atoms=_number(excess), exit_consumed=_pairs(exit_fill.taken),
                                    exit_proceeds=_number(exit_fill.cost))
         if any(row["usable"] is False for row in probe.legs):
@@ -286,6 +286,9 @@ class Manager:
         value = self.runtime.strategy.fill_value(episode.entity, steps, matched,
                                                  int(probe.decision["time_ns"])) if steps else 0
         require(value is None or type(value) is int, "probe value")
+        loss = self.runtime.strategy.fill_loss(episode.entity, tuple(native_losses),
+                                               int(probe.decision["time_ns"]))
+        require(type(loss) is int, "probe loss value")
         self._emit(probe, status, steps, value, loss)
 
     def _emit(self, probe, status, steps=None, value=None, loss=None):

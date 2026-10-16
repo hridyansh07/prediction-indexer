@@ -6,7 +6,7 @@ from pathlib import Path
 from replay.strategies import canonical_reference
 
 from replay.strategies.same_venue_complement.output import _aggregate_rows
-from replay.strategies.cross_venue_arbitrage.contract import asset_row, asset_value, assess_net, economics_by_key, net_of
+from replay.strategies.cross_venue_arbitrage.contract import asset_row, asset_value, assess_net, economics_by_key, native_amount, net_of
 from replay.economic_sdk import FillSpec, Strategy, aggregate_reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.fills import step_atoms
@@ -28,6 +28,7 @@ class MultiMarketReader(Strategy):
     native_scales = True
 
     def __init__(self, policy, identity, fees, snapshot, bridge=None):
+        self.snapshot = snapshot
         self.policy = policy_config(policy)
         self.experiment = experiment(self.policy, identity)
         # Fill values price fees through the bridge in the runtime and the reader alike.
@@ -85,6 +86,15 @@ class MultiMarketReader(Strategy):
         minimum = steps * Fraction(self.experiment.fills.step_contracts) * self.threshold * 10 ** 18
         require(minimum.denominator == 1, "minimum net gap is not exact at the fill step")
         return net_of(native) - int(minimum)
+
+    def fill_loss(self, entity, native_losses, time_ns):
+        """Gross unwind loss at scale 36, in the set's single quote asset."""
+        economics = tuple(self.bridge.economics((leg["instrument"], leg["orientation"]))
+                          for leg in entity.descriptor["legs"])
+        require(all(e is not None for e in economics) and
+                len({e.quote for e in economics}) == 1, "probe loss valuation unavailable")
+        return sum(native_amount(loss, e.price_scale + e.quantity_scale)
+                   for loss, e in zip(native_losses, economics))
 
     # -- episode payloads ----------------------------------------------------------
     def open_facts(self, value, entity, kind):

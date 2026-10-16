@@ -26,6 +26,9 @@ AGES = [{"book_ns": "10", "best_ns": "5"}, {"book_ns": "10", "best_ns": "5"}]
 
 
 class Value:
+    def fill_loss(self, entity, native_losses, time):
+        return sum(native_losses)
+
     def fill_spec(self, entity):
         return FillSpec(("ask", "ask"), (5, 5))
 

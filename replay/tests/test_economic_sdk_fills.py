@@ -144,6 +144,10 @@ class PairFills(Strategy):
             return sum(leg.cost for leg in legs) - steps * self.units[0] * (P + fee)
         return steps * self.units[0] * (P - fee) - sum(leg.cost for leg in legs)
 
+    def fill_loss(self, entity, native_losses, time):
+        # This synthetic strategy's values use the shared native scale 9.
+        return sum(native_losses)
+
     # -- completion and reader hooks --------------------------------------------
     def manifest(self, files, instantaneous):
         return {"version": 1, "strategy": self.name, "snapshot_sha256": self.snapshot_sha256,

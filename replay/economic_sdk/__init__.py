@@ -78,6 +78,18 @@ class Strategy:
         from replay.economic_sdk.execution_terms import execution_delays
         return execution_delays(self.snapshot, entity.legs, time_ns)
 
+    def fill_loss(self, entity, native_losses, time_ns):
+        """Value signed per-leg gross unwind losses in ``fill_value`` units.
+
+        ``native_losses`` is a tuple in leg order, each at that leg's native
+        price-times-quantity scale. The strategy supplies exact scale/asset
+        conversion using only these arguments and pinned inputs. No unwind
+        fees enter this hook. Unknown conversion fails instead of adding
+        unlike units or assuming the strategy's value scale.
+        """
+        from replay.streams.protocol import require
+        require(False, "probe loss valuation hook required")
+
     def manifest(self, files, instantaneous):
         raise NotImplementedError
 
