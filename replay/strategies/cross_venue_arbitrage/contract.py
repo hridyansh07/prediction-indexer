@@ -56,10 +56,10 @@ def valuation_config(value):
 
 
 def _sweep(policy):
-    """Policy 3 as the SDK policy 2 it measures with: one trigger size, no controls."""
-    if policy.get("version") != 3:
+    """Fill policies use the SDK policy-2 trigger machinery without controls."""
+    if policy.get("version") not in (3, 4):
         return policy
-    sweep = {k: v for k, v in policy.items() if k != "fills"}
+    sweep = {k: v for k, v in policy.items() if k not in ("fills", "flags")}
     sweep.update(version=2, sizes_contracts=[TRIGGER_SIZE], headline_size_contracts=TRIGGER_SIZE,
                  controls=[], controls_episodes=False, controls_slices=False,
                  time_shift_ring_entries="0")
@@ -67,12 +67,16 @@ def _sweep(policy):
 
 
 def policy_config(value):
-    """Policy 2 (the fixed-size sweep) or policy 3 (fill checks at a 1-contract trigger)."""
+    """Closed sweep (2), fill checks (3), or execution-realism fill checks (4)."""
     value = plain(value)
-    if type(value) is dict and value.get("version") == 3:
-        obj(value, _V3_FIELDS + (" game" if "game" in value else ""))
+    if type(value) is dict and value.get("version") in (3, 4):
+        require(type(value["version"]) is int, "policy version")
+        obj(value, _V3_FIELDS + (" flags" if value["version"] == 4 else "") + (" game" if "game" in value else ""))
         sdk_policy(_sweep(value))
-        fill_policy(value["fills"], FILL_KIND)
+        fill = fill_policy(value["fills"], FILL_KIND)
+        if value["version"] == 4:
+            from replay.strategies._shared.execution_realism import rollout_policy
+            rollout_policy(value, fill)
         return value
     policy = sdk_policy(value)
     require(policy["version"] == 2, "cross-venue requires SDK policy 2 or 3")
@@ -93,7 +97,7 @@ def experiment_identity(snapshot_sha, policy, fees, valuation):
 
 
 def experiment(policy, identity):
-    fills = fill_policy(policy["fills"], FILL_KIND) if policy["version"] == 3 else None
+    fills = fill_policy(policy["fills"], FILL_KIND) if policy["version"] in (3, 4) else None
     return replace(sdk_experiment(_sweep(policy), identity), strategy=STRATEGY, policy=policy,
                    policy_sha256=digest(policy), diagnostic_statuses=DIAGNOSTICS, fills=fills)
 

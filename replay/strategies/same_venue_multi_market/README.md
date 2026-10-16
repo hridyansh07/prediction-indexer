@@ -15,3 +15,10 @@ Completed bench reader: `replay.strategies.same_venue_multi_market:read_complete
 Configuration: [config.example.json](config.example.json). Full contract: [SPEC.md](SPEC.md).
 Tests remain under `replay/tests/`; shared SDK and bench instructions are
 linked from the [strategy index](../README.md).
+
+Execution-realism policy **2** adds recording t10, delayed-fill probes and
+reader-checked episode flags. The example uses the reference 60-probe policy;
+legacy policy 1 retains its output bytes. The shared
+[producer contract](../../../docs/specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md)
+defines decision values/native walks, flags, pinned market delays and units.
+Retained-data acceptance and the full corpus rerun remain pending.

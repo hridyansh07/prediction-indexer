@@ -31,6 +31,7 @@ class Strategy:
     # Explicit opt-in for strategies that price every leg in its native scales.
     native_scales = False
     experiment = None
+    probe_decision_evidence = False
     snapshot = None
 
     # -- runtime ---------------------------------------------------------------
@@ -91,6 +92,13 @@ class Strategy:
         """
         from replay.streams.protocol import require
         require(False, "probe loss valuation hook required")
+
+    def fill_flags(self, entity, ages):
+        """Optional closed flags for a fill episode; absent for legacy policies."""
+        return None
+
+    def check_fill_flags(self, value, entity, ages):
+        raise NotImplementedError
 
     def manifest(self, files, instantaneous):
         raise NotImplementedError

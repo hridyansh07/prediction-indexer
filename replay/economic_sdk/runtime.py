@@ -1106,6 +1106,8 @@ class Runtime:
                 episode.fill.json["end_books"] = end_books(
                     self.fill_specs[episode.entity][0].sources, self._views(entity, end))
                 row["fill"] = episode.fill.json
+                if self.strategy.probe_decision_evidence:
+                    row["flags"] = self.strategy.fill_flags(entity, episode.fill.json["ages"])
             if self.game is not None:
                 row["open"]["game"] = episode.open_game
                 row["at_max"]["game"] = episode.max_game

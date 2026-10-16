@@ -40,13 +40,16 @@ def _numbers(value, cap, positive):
 
 
 def policy_config(value):
-    """Closed policy version 1; fill checks are the only mode."""
+    """Closed fill policy 1 or execution-realism policy 2."""
     value = plain(value)
-    value = obj(value, _FIELDS + (" game" if type(value) is dict and "game" in value else ""))
+    value = obj(value, _FIELDS + (" flags" if type(value) is dict and value.get("version") == 2 else "") + (" game" if type(value) is dict and "game" in value else ""))
     if "game" in value:
         game_policy(value["game"])
-    require(type(value["version"]) is int and value["version"] == 1, "policy version")
-    fill_policy(value["fills"], FILL_KIND)
+    require(type(value["version"]) is int and value["version"] in (1, 2), "policy version")
+    fill = fill_policy(value["fills"], FILL_KIND)
+    if value["version"] == 2:
+        from replay.strategies._shared.execution_realism import rollout_policy
+        rollout_policy(value, fill)
     require(type(value["max_legs"]) is int and 2 <= value["max_legs"] <= MAX_LEGS, "max_legs")
     _numbers(value["latency_tiers_ns"], 8, True)
     require(value["headline_latency_ns"] in value["latency_tiers_ns"], "headline membership")

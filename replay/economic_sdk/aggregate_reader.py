@@ -465,7 +465,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         _closed(row, ("scope", "entity", "episode_id", "kind", "start_ns", "end_ns", "end_reason",
                       "censored", "opening_slice_survival_ns", "viable_tiers", "qualified_ns",
                       "qualified_by_skew_ns", "class_ns", "qualifying_class_ns", "open", "maxima",
-                      "at_max") + (("fill",) if is_fill else ()))
+                      "at_max") + (("fill",) if is_fill else ())
+                + (("flags",) if is_fill and strategy.probe_decision_evidence else ()))
         scope, index, kind = row["scope"], row["entity"], row["kind"]
         require(type(scope) is int and 0 <= scope < len(entities) and type(index) is int
                 and 0 <= index < len(entities[scope]), "episode entity")
@@ -488,6 +489,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         if is_fill:
             _check_fill(row["fill"], entity, row["end_reason"], fill, strategy,
                         [10 ** int(plans[key]["price_scale"]) for key in entity.legs], start)
+            if strategy.probe_decision_evidence:
+                strategy.check_fill_flags(row["flags"], entity, row["fill"]["ages"])
             fill_lifetime[scope, index] = fill_lifetime.get((scope, index), 0) + end - start
         order = (end, scope) + entity.order + (kind, start)
         require(last is None or last <= order, "episode close order")
@@ -549,12 +552,14 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
                     "q": [uint(qualified[t]) for t in tiers], "seen_q": [0] * len(tiers), "reached": 0,
                     "last": start, "slices": [], "open": opening, "fill": is_fill})
         if is_fill and fill.probes is not None:
-            # The probe reader needs only opening quantities and limits, not a
-            # second retained copy of every opening walk.
+            # Legacy probes retain only quantities and limits. New strategy
+            # policies also bind their carried decision walks to this opening.
+            evidence = strategy.probe_decision_evidence
             probe_opening = {result["name"]: {
                 "steps": result["steps"], "tradeable": result["tradeable"],
                 "limits": [leg["taken"][-1][0] if leg["taken"] else None
-                           for leg in result["legs"]], "ages": row["fill"]["ages"]}
+                           for leg in result["legs"]], "ages": row["fill"]["ages"],
+                **({"value": result["value"], "legs": result["legs"]} if evidence else {})}
                 for result in row["fill"]["results"]}
             budget.reserve(bounds.json_cost(probe_opening), "reader state budget (probe openings)")
             eps[-1]["probe_opening"] = probe_opening

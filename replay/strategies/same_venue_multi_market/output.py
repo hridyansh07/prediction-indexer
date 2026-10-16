@@ -1,5 +1,6 @@
 """Independent same-venue multi-market reader; never imports the runtime evaluator."""
 
+from replay.strategies._shared.execution_realism import ExecutionRealism
 from pathlib import Path
 
 from replay.strategies import canonical_reference
@@ -24,7 +25,7 @@ PAYLOAD = ("gap_gross gap_net gross_scale net_scale payout_floor_gross_e36 payou
            "native_legs quote_asset fee_status assumptions evidence settlement_model outcomes_provider")
 
 
-class MultiMarketReader(Strategy):
+class MultiMarketReader(ExecutionRealism, Strategy):
     native_scales = True
 
     def __init__(self, policy, identity, fees, snapshot, bridge=None):
