@@ -20,7 +20,7 @@ T10 = {"name": "t10", "role": "records", "target_contracts": "10"}
 PROBES = {"version": 1, "sizings": ["edge", "t10"], "confirm_ms": [0, 500, 1000],
           "arrival_ms": [100, 250, 500, 1000, 2000],
           "sequencing": ["simultaneous", "slow_first"],
-          "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 3000}}
+          "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 1000}}
 
 
 def policy(base, version=4, **changes):
@@ -113,7 +113,7 @@ class IntegratedTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.counter = 0
 
-    def harness(self, kind, *, terms=False, step="1", quantity=20, populate=True, **kwargs):
+    def harness(self, kind, *, terms=False, step="1", quantity=20, populate=True, max_levels=64, **kwargs):
         import replay.tests.test_cross_venue_arbitrage as cross
         import replay.tests.test_same_venue_multi_market as multi
         import replay.tests.test_implication_cover as imp
@@ -121,13 +121,17 @@ class IntegratedTests(unittest.TestCase):
         root = Path(self.tmp.name) / str(self.counter)
         root.mkdir()
         if kind == "multi":
+            value = policy(multi.policy(step=step), 2)
+            value["fills"]["max_levels"] = max_levels
             with patch.object(multi, "config", seconds(multi.config)):
-                h = multi.Harness(root, value=policy(multi.policy(step=step), 2),
+                h = multi.Harness(root, value=value,
                                   doc=observed(multi.sibling_document()) if terms else multi.sibling_document())
         else:
             old = cross.fill_policy_v3
             def new_policy(*args, **kwargs):
-                return policy(old(*args, **kwargs))
+                value = policy(old(*args, **kwargs))
+                value["fills"]["max_levels"] = max_levels
+                return value
             doc = (imp.implication_document() if kind != "cross" else cross.document())
             if terms:
                 doc = observed(doc, zero=terms == "zero")
@@ -159,8 +163,8 @@ class IntegratedTests(unittest.TestCase):
         return h
 
     def exit_case(self, kind="cross", orientation="outcome", *, step="1", exit_bids=((30, 10),),
-                  unusable=False, terms=False):
-        h = self.harness(kind, step=step, populate=False, terms=terms)
+                  unusable=False, terms=False, max_levels=64):
+        h = self.harness(kind, step=step, populate=False, terms=terms, max_levels=max_levels)
         h.window(end=40 * 10**9)
         acquired = ("kalshi:series", orientation)
         other = {"cross": ("polymarket:987" if orientation == "outcome" else "polymarket:123", "outcome"),
@@ -233,6 +237,14 @@ class IntegratedTests(unittest.TestCase):
                 rows, _ = self.exit_rows(h, entity)
                 self.assertTrue(any(leg["exit_consumed"] for row in rows for leg in row["legs"]))
 
+    def test_bids_only_kalshi_thin_exit_stops_at_cap_without_failing_attempt(self):
+        h, entity = self.exit_case(exit_bids=((30, 1), (20, 1), (10, 10)), max_levels=2)
+        _, row = self.exit_rows(h, entity)
+        self.assertEqual((row["status"], row["matched_steps"]), ("partial", "6"))
+        self.assertEqual((row["legs"][0]["excess_atoms"], row["legs"][0]["exit_consumed"],
+                          row["legs"][0]["exit_proceeds"], row["leg_loss_gross"]),
+                         ("4", [["30", "1"], ["20", "1"]], "50", str(11 * 10**35)))
+
     def test_bids_only_exit_uses_final_same_time_arrival_not_decision_or_later_view(self):
         h, entity = self.exit_case(exit_bids=((20, 10),))
         kalshi_books(h, 16_100 * MS, yes=((31, 10),), no=((60, 10),))
@@ -261,7 +273,7 @@ class IntegratedTests(unittest.TestCase):
                 elif failure == "builder":
                     del h.strategy.builders[key]
                 elif failure == "ladder":
-                    h.strategy.builders[key].ladders = ("kalshi_complement_ask", "kalshi_complement_bid")
+                    h.strategy.builders[key].ladders = ("kalshi_complement_ask",)
                 else:
                     original = strategy.fill_spec
                     strategy.fill_spec = lambda e: FillSpec(("bid", "ask"), original(e).units)
@@ -373,7 +385,20 @@ class IntegratedTests(unittest.TestCase):
                             if r["sizing"] == "t10" and r["confirm_ms"] > 0))
 
     def assert_kalshi_ask_only_recovery(self, kind, update):
-        h = self.harness(kind)
+        from dataclasses import replace
+        from replay.strategies.cross_venue_arbitrage.strategy import CrossVenueArbitrage
+        from replay.strategies.same_venue_multi_market.strategy import SameVenueMultiMarket
+        owner = SameVenueMultiMarket if kind == "multi" else CrossVenueArbitrage
+        original = owner.requirements
+        def synthetic_asks(strategy, snapshot, policy):
+            result = original(strategy, snapshot, policy)
+            return replace(result, books={key: replace(req, sides=("bid", "ask"))
+                           if key[0].startswith("kalshi:") else req for key, req in result.books.items()})
+        # R10 remains a defensive declared-input test, not a normalizer shape.
+        # R12 production requirements never read Kalshi asks. Explicitly opt
+        # into them only for this pre-existing synthetic crossed fixture.
+        with patch.object(owner, "requirements", synthetic_asks):
+            h = self.harness(kind)
         entity = next(e for e in h.strategy.entities.values()
                       if e.admission is None and len(e.legs) == 2
                       and any(k[0] == "kalshi:series" for k in e.legs))
