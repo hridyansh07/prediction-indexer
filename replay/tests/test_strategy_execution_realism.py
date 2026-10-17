@@ -11,7 +11,7 @@ from unittest.mock import patch
 from replay.preparation import encoded
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_cross_venue_arbitrage import EDGE, fill_policy_v3
-from replay.tests.economic_scenarios import M, ladder, v2_policy
+from replay.tests.economic_scenarios import M, kalshi_books, ladder, v2_policy
 from replay.tests.test_streams import fields
 
 MS = 1_000_000
@@ -92,7 +92,7 @@ def seconds(original):
     return config
 
 
-def observed(doc):
+def observed(doc, *, zero=False):
     doc = copy.deepcopy(doc)
     doc["version"] = 2
     for market in doc["markets"]:
@@ -101,6 +101,9 @@ def observed(doc):
             market["execution_terms"] = {"status": "observed", "changes": [
                 {"from": "1970-01-01T00:00:15Z", "taker_delay_ms": 1000},
                 {"from": "1970-01-01T00:00:16.5Z", "taker_delay_ms": 2000}]}
+            if zero:
+                market["execution_terms"]["changes"] = [
+                    {"from": "1970-01-01T00:00:15Z", "taker_delay_ms": 0}]
     return doc
 
 
@@ -110,7 +113,7 @@ class IntegratedTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.counter = 0
 
-    def harness(self, kind, *, terms=False, step="1", quantity=20):
+    def harness(self, kind, *, terms=False, step="1", quantity=20, populate=True, **kwargs):
         import replay.tests.test_cross_venue_arbitrage as cross
         import replay.tests.test_same_venue_multi_market as multi
         import replay.tests.test_implication_cover as imp
@@ -127,14 +130,16 @@ class IntegratedTests(unittest.TestCase):
                 return policy(old(*args, **kwargs))
             doc = (imp.implication_document() if kind != "cross" else cross.document())
             if terms:
-                doc = observed(doc)
+                doc = observed(doc, zero=terms == "zero")
             fixture = cross.Harness if kind == "cross" else imp.Harness
             with patch.object(cross, "config", seconds(cross.config)), \
                  patch.object(cross, "fill_policy_v3", new_policy):
                 h = fixture(root, fills=(EDGE,), step=step, doc=doc,
                             **({"mode": kind} if kind != "cross" else {}),
-                            **({"scales": {"kalshi": ("2", "2")}} if step == "0.01" else {}))
+                            **({"scales": {"kalshi": ("2", "2")}} if step == "0.01" else {}), **kwargs)
         self.addCleanup(h.close)
+        if not populate:
+            return h
         h.window(end=40 * 10**9)
         # Quiet books are six seconds old when the second leg appears. Both
         # modes buy all legs; keep native bid below ask to avoid self-crossing.
@@ -152,6 +157,157 @@ class IntegratedTests(unittest.TestCase):
                 ladder(h, 16 * 10**9, p["instrument"], p["orientation"],
                        bids=((100, quantity * M),), asks=((400, quantity * M),))
         return h
+
+    def exit_case(self, kind="cross", orientation="outcome", *, step="1", exit_bids=((30, 10),),
+                  unusable=False, terms=False):
+        h = self.harness(kind, step=step, populate=False, terms=terms)
+        h.window(end=40 * 10**9)
+        acquired = ("kalshi:series", orientation)
+        other = {"cross": ("polymarket:987" if orientation == "outcome" else "polymarket:123", "outcome"),
+                 "multi": ("kalshi:beta", "outcome"),
+                 "same_venue": ("kalshi:sweep", "complement"),
+                 "cross_venue": ("polymarket:654", "outcome")}[kind]
+        unit = 100 if step == "0.01" else 1
+        own = tuple((p, q * unit) for p, q in exit_bids)
+        source = ((60, 10 * unit),)
+        def pair(at, own_bids=own, invalid=None):
+            kalshi_books(h, at, yes=own_bids if orientation == "outcome" else source,
+                         no=source if orientation == "outcome" else own_bids, unusable=invalid)
+        pair(16_000 * MS)
+        if other[0].startswith("kalshi:"):
+            kalshi_books(h, 16_000 * MS, other[0],
+                         yes=((60 if other[1] == "complement" else 30, 10),),
+                         no=((60 if other[1] == "outcome" else 30, 10),))
+            kalshi_books(h, 16_050 * MS, other[0],
+                         yes=((60, 6),) if other[1] == "complement" else ((30, 10),),
+                         no=((60, 6),) if other[1] == "outcome" else ((30, 10),))
+        else:
+            ladder(h, 16_000 * MS, *other, bids=((100, 10 * M),), asks=((400, 10 * M),))
+            ladder(h, 16_050 * MS, *other, bids=((100, 10 * M),), asks=((400, 6 * M),))
+        if unusable:
+            pair(16_075 * MS, invalid=orientation)
+        entity = next(e for e in h.strategy.entities.values() if e.admission is None
+                      and tuple((d["instrument"], d["orientation"]) for d in e.descriptor["legs"])
+                      == tuple(sorted((acquired, other))))
+        return h, entity
+
+    def exit_rows(self, h, entity):
+        h.finish()  # Real writer and the strategy's independent semantic reader.
+        episode = next(r for r in h.records("episodes.ndjson") if r["kind"] == "net"
+                       and r["entity"] == h.strategy.index[entity.id] and r["start_ns"] == str(16_000 * MS))
+        rows = [r for r in h.records("probes.ndjson") if r["episode_id"] == episode["episode_id"]]
+        self.assertEqual(len(rows), 60)
+        row = next(r for r in rows if r["sizing"] == "t10" and r["confirm_ms"] == 0
+                   and r["arrival_ms"] == 100 and r["sequencing"] == "simultaneous")
+        return rows, row
+
+    def test_bids_only_kalshi_yes_and_no_excess_use_acquired_native_bids(self):
+        for orientation in ("outcome", "complement"):
+            for step, unit in (("1", 1), ("0.01", 100)):
+                with self.subTest(orientation=orientation, step=step):
+                    h, entity = self.exit_case(orientation=orientation, step=step)
+                    _, row = self.exit_rows(h, entity)
+                    leg = row["legs"][0]
+                    self.assertEqual((row["status"], row["matched_steps"]),
+                                     ("partial", "6" if step == "1" else "600"))
+                    self.assertEqual(leg["excess_atoms"], str(4 * unit))
+                    actual = (leg["exit_consumed"], leg["exit_proceeds"], row["leg_loss_gross"])
+                    self.assertEqual(actual, ([["30", str(4 * unit)]], str(120 * unit), str(4 * 10**35)))
+
+    def test_bids_only_kalshi_insufficient_empty_and_unusable_exit_depth(self):
+        for bids, unusable, walk, proceeds, loss in (
+                (((30, 1), (20, 1)), False, [["30", "1"], ["20", "1"]], "50", 11 * 10**35),
+                ((), False, [], "0", 16 * 10**35),
+                (((30, 10),), True, [], "0", 16 * 10**35)):
+            with self.subTest(bids=bids, unusable=unusable):
+                h, entity = self.exit_case(exit_bids=bids, unusable=unusable)
+                _, row = self.exit_rows(h, entity)
+                self.assertEqual(row["legs"][0]["excess_atoms"], "4")
+                self.assertEqual((row["legs"][0]["exit_consumed"], row["legs"][0]["exit_proceeds"],
+                                  row["leg_loss_gross"]), (walk, proceeds, str(loss)))
+
+    def test_bids_only_kalshi_all_four_factories_read_all_60_scenarios(self):
+        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+            with self.subTest(kind=kind):
+                h, entity = self.exit_case(kind)
+                rows, _ = self.exit_rows(h, entity)
+                self.assertTrue(any(leg["exit_consumed"] for row in rows for leg in row["legs"]))
+
+    def test_bids_only_exit_uses_final_same_time_arrival_not_decision_or_later_view(self):
+        h, entity = self.exit_case(exit_bids=((20, 10),))
+        kalshi_books(h, 16_100 * MS, yes=((31, 10),), no=((60, 10),))
+        kalshi_books(h, 16_100 * MS, yes=((30, 10),), no=((60, 10),))
+        kalshi_books(h, 16_200 * MS, yes=((10, 10),), no=((60, 10),))
+        _, row = self.exit_rows(h, entity)
+        self.assertEqual(row["legs"][0]["arrival_ns"], str(16_100 * MS))
+        self.assertEqual(row["legs"][0]["exit_consumed"], [["30", "4"]])
+
+    def test_probe_exit_bind_failures_are_exact(self):
+        from replay.economic_sdk import FillSpec
+        for failure, message in (("plan", "probe exit book not planned"),
+                                 ("builder", "probe exit book not planned"),
+                                 ("ladder", "probe exit ladder not retained"),
+                                 ("sold", "probe exit unsupported for Kalshi sold leg")):
+            with self.subTest(failure=failure):
+                h = self.harness("cross", populate=False, defer_initial=True)
+                strategy = h.strategy.strategy
+                pair = (("kalshi:series", "outcome"), ("polymarket:987", "outcome"))
+                basket = next(b for b in strategy.baskets(strategy.snapshot, strategy.policy, 0)
+                              if b.admission is None and
+                              tuple((d["instrument"], d["orientation"]) for d in b.descriptor["legs"]) == pair)
+                key = pair[0]
+                if failure == "plan":
+                    del h.strategy.plans[key]
+                elif failure == "builder":
+                    del h.strategy.builders[key]
+                elif failure == "ladder":
+                    h.strategy.builders[key].ladders = ("kalshi_complement_ask", "kalshi_complement_bid")
+                else:
+                    original = strategy.fill_spec
+                    strategy.fill_spec = lambda e: FillSpec(("bid", "ask"), original(e).units)
+                    h.strategy.builders[basket.legs[0]].ladders += ("bid",)
+                with patch.object(strategy, "baskets", return_value=(basket,)):
+                    with self.assertRaises(ProtocolError) as error:
+                        h.send("initial", h.initial)
+                self.assertEqual(str(error.exception), message)
+
+    def test_pm_unknown_default_is_1000ms_but_observed_zero_wins(self):
+        for observed_zero in (False, True):
+            with self.subTest(observed_zero=observed_zero):
+                h, entity = self.exit_case(terms="zero" if observed_zero else False)
+                _, row = self.exit_rows(h, entity)
+                self.assertEqual((row["legs"][1]["venue_delay_ms"], row["legs"][1]["delay_source"]),
+                                 (0, "terms") if observed_zero else (1000, "default"))
+
+    def non_kalshi_case(self):
+        # Hold the configured delay fixed across R12, independently of its new
+        # reference default. Kalshi plans exist, but cannot open an episode.
+        fixed = {**PROBES, "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 3000}}
+        with patch(__name__ + ".PROBES", fixed):
+            h = self.harness("cross", populate=False, limitless=True)
+        h.window(end=40 * 10**9)
+        kalshi_books(h, 16_000 * MS)
+        ladder(h, 16_000 * MS, "limitless:slug", bids=((250, 10 * M),), asks=((400, 10 * M),))
+        ladder(h, 16_000 * MS, "polymarket:987", bids=((100, 10 * M),), asks=((400, 10 * M),))
+        ladder(h, 16_050 * MS, "polymarket:987", bids=((100, 10 * M),), asks=((400, 6 * M),))
+        h.finish()
+        return h
+
+    def test_non_kalshi_realism_probes_match_base_bytes(self):
+        h = self.non_kalshi_case()
+        self.assertEqual(hashlib.sha256((h.output / "probes.ndjson").read_bytes()).hexdigest(),
+                         "89f36166ac2f8b3df7a4e05e461d79d555179976cc9d2add79d7933e754036d0")
+
+    def test_all_realism_requirements_read_only_kalshi_bids(self):
+        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+            with self.subTest(kind=kind):
+                h = self.harness(kind, populate=False)
+                requirements = h.strategy.strategy.requirements(h.strategy.snapshot, h.strategy.experiment.policy)
+                for key, requirement in requirements.books.items():
+                    if key[0].startswith("kalshi:"):
+                        self.assertEqual(requirement.sides, ("bid",))
+                        self.assertEqual(requirement.transforms, ("kalshi_complement_ask",))
+                        self.assertEqual(set(requirement.ladders), {"bid", "kalshi_complement_ask"})
 
     def rehash(self, h, manifest, name, rows):
         raw = b"".join(encoded(row) + b"\n" for row in rows)
@@ -395,6 +551,20 @@ class DecisionEvidenceTests(unittest.TestCase):
 
 
 class LegacyBytesTests(unittest.TestCase):
+    def test_a1_native_probe_matches_base_bytes(self):
+        from replay.tests.test_execution_delay_probes import ProbeTests, probes
+        from replay.tests.test_economic_sdk_fills import LEG1
+        case = ProbeTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        two = {"name": "two", "role": "governs", "target_contracts": "2"}
+        h = case.harness(probes(sizings=["two"]), two)
+        case.open(h)
+        case.book(h, 15, LEG1, (500, M))
+        h.finish()
+        self.assertEqual(hashlib.sha256((h.output / "probes.ndjson").read_bytes()).hexdigest(),
+                         "f26f5060f2ad6bc37cf2df4aab40fe2816519baeb4c403c40d7b1eaf739a6900")
+
     def test_every_old_policy_output_matches_the_dependency_base_bytes(self):
         # Recorded independently from 902871166496aa130fc493685112ba947a08f5e1,
         # before production changes. Hash every output, including receipts and
