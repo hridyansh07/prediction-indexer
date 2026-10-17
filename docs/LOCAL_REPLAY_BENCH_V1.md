@@ -90,6 +90,10 @@ Exit codes are the same for every command:
 6. **Cleanup.**
    - Containers and networks the bench created are removed in a `finally`
      path, on every exit, including failures and interrupts.
+   - After cleanup and evidence (`result.json`, `orchestration.json`) are written,
+     `run_bench` re-raises a `KeyboardInterrupt` that occurred anywhere, including
+     during a cleanup step, so a calling orchestrator stops instead of reading an
+     ordinary exit 3. The bench CLI catches it and still exits 3.
    - An image the bench built is removed after the run unless `--keep-image`
      is given.
    - Ownership labels are verified before collecting logs or removing a resource;
@@ -192,7 +196,12 @@ Supply that selected directory as `fee_catalog_directory`, not `OUT_DIR`.
 4. Start the runner container on that network:
    - every mount from `mounts` is read-only, plus a single writable mount for
      `OUT_DIR`;
-   - the entrypoint is `python -m replay.bench.inside /bench/spec.resolved.json`.
+   - the entrypoint is `python -m replay.bench.inside /bench/spec.resolved.json`;
+   - the one environment variable is the literal `REPLAY_PARTICIPANT_DIAGNOSTICS=1`,
+     so a failed strategy participant writes
+     `OUT_DIR/run/<attempt>/<group>/failure.json` (exit code, cause chain, and
+     traceback, capped at 16 KiB). Container logs don't show participant output,
+     because the supervisor discards child stderr.
 5. Inside the container, `inside` does the following:
    1. Build the supervisor config from `base_run_config`. Set `strategies` to
       the declared groups and `transport.groups` to their names in order. Set a
@@ -200,10 +209,14 @@ Supply that selected directory as `fee_catalog_directory`, not `OUT_DIR`.
       `limits.attempts = 1` (an override cannot enable retries).
    2. Write `OUT_DIR/input.json`.
    3. Call `replay.supervisor.run(config, OUT_DIR/run, redis_url)`.
-   4. For each group, call its `reader(OUT_DIR/run, name)`, which must require
-      supervisor SUCCESS (every existing `read_completed` does). Write the
-      returned receipt, and the summary when present, to
-      `OUT_DIR/groups/<name>/`.
+   4. For each group, call the SDK completed-reader dispatcher with its configured
+      reader. For shipped readers, the writer has already run full independent
+      semantic validation before terminal ACK; this post-SUCCESS read binds the
+      supervisor, receipt, configuration, manifest/summary digests and all stored
+      file hashes/lengths without repeating semantics. Custom readers retain
+      their original call. Write the returned receipt, and the summary when
+      present, to `OUT_DIR/groups/<name>/`. Explicit `deep=True` audits call the
+      configured reader unchanged (Economic SDK S6b).
    5. For each group, run its `checks` (§6), writing
       `OUT_DIR/groups/<name>/checks/<check>.json`.
    6. Write `OUT_DIR/result.json` (§7).
@@ -397,7 +410,8 @@ economic figures of its own.
 - Docker orchestration, with the Docker client injected as a fake:
   - unique names;
   - read-only mounts;
-  - cleanup on success, on failure and on `KeyboardInterrupt`;
+  - cleanup on success, on failure and on `KeyboardInterrupt` (which is re-raised
+    after cleanup; the CLI returns 3);
   - removal limited to bench-created objects;
   - image kept with `--keep-image`;
   - cache pruned only with the flag.

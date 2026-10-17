@@ -8,7 +8,7 @@ slices, controls, bounded output and the independent reader.
 from replay.economic_sdk.types import (
     ADMISSIONS, CONTROL, DEPTH_LIMITED, EVALUATED, ONE_SIDED, REAL, SDK_STATUSES, UNUSABLE,
     Basket, BookRequirement, Context, Control, Experiment, FillPolicy, FillSizing, FillSpec,
-    GameRequirement, Observation, Requirements,
+    GameRequirement, Observation, ProbePolicy, Requirements,
 )
 from replay.economic_sdk.views import BookView
 
@@ -16,7 +16,7 @@ __all__ = [
     "ADMISSIONS", "CONTROL", "DEPTH_LIMITED", "EVALUATED", "ONE_SIDED", "REAL",
     "SDK_STATUSES", "UNUSABLE", "Basket", "BookRequirement", "BookView", "Context",
     "Control", "Experiment", "FillPolicy", "FillSizing", "FillSpec", "Observation",
-    "GameRequirement", "Requirements", "Strategy", "factory",
+    "GameRequirement", "ProbePolicy", "Requirements", "Strategy", "factory",
 ]
 
 
@@ -31,6 +31,7 @@ class Strategy:
     # Explicit opt-in for strategies that price every leg in its native scales.
     native_scales = False
     experiment = None
+    probe_decision_evidence = False
     snapshot = None
 
     # -- runtime ---------------------------------------------------------------
@@ -67,6 +68,36 @@ class Strategy:
         sequence, scope or other context): the reader recomputes it from the
         fill the episode carries and its start time.
         """
+        raise NotImplementedError
+
+    def fill_delays(self, entity, time_ns):
+        """Pure per-leg taker delays in ns, or ``None`` when unknown.
+
+        The default reads the pinned outcomes document. A strategy may override
+        this hook; runtime and independent readers call the same pure contract.
+        """
+        from replay.economic_sdk.entities import Entity
+        from replay.economic_sdk.execution_terms import execution_delays
+        return execution_delays(self.snapshot, entity.legs, time_ns,
+                                entity=entity if isinstance(entity, Entity) else None)
+
+    def fill_loss(self, entity, native_losses, time_ns):
+        """Value signed per-leg gross unwind losses in ``fill_value`` units.
+
+        ``native_losses`` is a tuple in leg order, each at that leg's native
+        price-times-quantity scale. The strategy supplies exact scale/asset
+        conversion using only these arguments and pinned inputs. No unwind
+        fees enter this hook. Unknown conversion fails instead of adding
+        unlike units or assuming the strategy's value scale.
+        """
+        from replay.streams.protocol import require
+        require(False, "probe loss valuation hook required")
+
+    def fill_flags(self, entity, ages):
+        """Optional closed flags for a fill episode; absent for legacy policies."""
+        return None
+
+    def check_fill_flags(self, value, entity, ages):
         raise NotImplementedError
 
     def manifest(self, files, instantaneous):
@@ -108,4 +139,15 @@ def factory(strategy_class):
     def build(context):
         return Runtime(strategy_class(context["config"]), context)
 
+    def retention(config, snapshot):
+        from replay.economic_sdk.retention import configured
+        strategy = strategy_class(config)
+        game = strategy.requirements(strategy.snapshot, strategy.experiment.policy).game
+        return configured(snapshot, config, timers=game.timers if game is not None else ())
+
+    def sections(config):
+        return frozenset(("record", "events")) if config.get("policy", {}).get("profile") is not None else frozenset(("record",))
+
+    build.sections = sections
+    build.retention = retention
     return build

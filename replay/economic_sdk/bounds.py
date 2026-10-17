@@ -7,7 +7,12 @@ against a real recursive ``sys.getsizeof`` traversal of representative
 maximal states. Exceeding a limit fails the attempt; nothing is truncated.
 """
 
-from replay.streams.protocol import require
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from replay.fees.lazy import LazyAssessmentIds
+from replay.streams.protocol import freeze, require
+from replay.strategy_sdk import plain
 
 MAX_ROWS = 2_000_000
 MAX_BYTES = 512 * 1024 * 1024
@@ -19,6 +24,7 @@ MAX_ENTITY_TABLE = 64 * 1024 * 1024
 MAX_STATE = 512 * 1024 * 1024
 MAX_CONSUMED_LEVELS = 1024
 MAX_SKEW_POINTS = 100_000
+MAX_PENDING_PROBES = 100_000
 
 # Per-object upper bounds (64-bit CPython 3.11+), with allocator slack.
 INT = 48            # an int below 2**120
@@ -47,9 +53,47 @@ def json_cost(value):
         return INT + value.bit_length() // 8
     if kind is dict:
         return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
-    if kind in (list, tuple):
+    if kind is list or kind is tuple:
         return CONTAINER + sum(SLOT + json_cost(v) for v in value)
+    if kind is bool or value is None:
+        return SMALL
+    if isinstance(value, LazyAssessmentIds):
+        # Captured immutable order inputs plus the worst-case eager debug IDs
+        # and materialized IDs. Never traverse the shared engine/catalog or
+        # materialize a handle just to account its retained state.
+        return (512 + json_cost(value.request.retained_inputs)
+                + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
+    if type(value) is FrozenJSON:
+        return value.cost
+    if isinstance(value, Mapping):
+        return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
     return SMALL
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrozenJSON(Mapping):
+    """Owned immutable metadata with the original occurrence-based JSON cost.
+
+    This saves traversal, never reservation: every reference costs exactly as
+    the original tree. Entity metadata fits the existing descriptor reservation.
+    """
+
+    value: object
+    cost: int = field(init=False)
+
+    def __post_init__(self):
+        owned = freeze(plain(self.value))
+        object.__setattr__(self, "value", owned)
+        object.__setattr__(self, "cost", json_cost(owned))
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __iter__(self):
+        return iter(self.value)
+
+    def __len__(self):
+        return len(self.value)
 
 
 def fills_cost(sizes, levels):
@@ -78,7 +122,29 @@ def view_cost(view, sizes):
     sides = len(view.fills) + len(view.transformed)
     return (VIEW + sides * CONTAINER + fills_cost(sides * sizes, view.levels)
             + (json_cost(view.reason) if view.reason is not None else 0) + 2 * PAIR
-            + len(view.ladders) * (CONTAINER + SLOT))
+            + len(view.ladders) * (CONTAINER + SLOT)
+            + (age_timestamps_cost(len(view.best_changes)) if view.best_changes else 0))
+
+
+def age_timestamps_cost(ladders):
+    """One last book update and one best-change integer per declared ladder.
+
+    Exit ladders count. Map containers/keys are charged separately from the
+    exact ``1 + L`` timestamp reservation; L is at most four.
+    """
+    return ((1 + ladders) * INT + CONTAINER
+            + ladders * (SLOT + STR + 4 * len("kalshi_complement_ask")))
+
+
+def age_commit_cost(ladders):
+    """Same-time comparison baseline, including replacement allocation overlap.
+
+    The baseline owns only each declared ladder's best pair and timestamp,
+    never its full depth. Reserve the previous and replacement baseline while
+    a stage is committing so temporary dictionary copies remain bounded too.
+    """
+    return 2 * (CONTAINER + 2 * SLOT + 2 * CONTAINER + ladders * (
+        2 * SLOT + 2 * (STR + 4 * len("kalshi_complement_ask")) + PAIR + INT))
 
 
 def live_fill_cost(priced):
@@ -89,6 +155,16 @@ def live_fill_cost(priced):
 
 def fill_state_cost(legs):
     return FILL_STATE + CONTAINER + legs * (SLOT + INT)
+
+
+def probe_cost(entity, legs, levels):
+    """One pending scenario, including copied decision, fills and arrival exit depth.
+
+    Reserve both object state and canonical row strings before adding a probe;
+    arithmetic is bounded separately to 80 decimal digits per output scalar.
+    """
+    return (4096 + json_cost(entity.descriptor) + json_cost(entity.legs)
+            + legs * (4096 + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80))))
 
 
 def quotes_cost(quotes):

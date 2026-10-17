@@ -10,6 +10,24 @@ from replay.streams.protocol import obj, require
 from replay.supervisor import fsync_directory
 
 
+def stream_sections(spec):
+    """Resolve delivery capabilities before participant launch, never in strategies."""
+    from replay.strategies import canonical_reference, load_entrypoint
+    from replay.streams.protocol import SECTIONS, declared_sections
+
+    reference = canonical_reference(spec["factory"])
+    if reference in {
+        "replay.strategies.bundle_coverage:build",
+        "replay.strategies.bundle_coverage.strategy:build",
+        "replay.strategies.market_profile:build",
+        "replay.strategies.market_profile.strategy:build",
+    }:
+        return frozenset(("record", "events"))
+    factory = load_entrypoint(reference)
+    declaration = getattr(factory, "sections", None)
+    return declared_sections(declaration(spec["config"]) if declaration else SECTIONS)
+
+
 def plain(value):
     """Copy immutable SDK metadata into JSON containers, without copying books."""
     if isinstance(value, Mapping):

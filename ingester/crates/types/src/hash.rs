@@ -13,6 +13,21 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 
 pub type Digest32 = [u8; 32];
 
+const HEX_NIBBLES: [u8; 256] = {
+    let mut table = [255; 256];
+    let mut i = 0;
+    while i < 10 {
+        table[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    i = 0;
+    while i < 6 {
+        table[b'a' as usize + i] = (10 + i) as u8;
+        i += 1;
+    }
+    table
+};
+
 /// One finalized SHA-256 value. The raw bytes are authoritative; lowercase hex
 /// is only its canonical wire representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,17 +56,14 @@ impl Sha256 {
         if hex.len() != 64 {
             return Err(Sha256Error::InvalidHexLength(hex.len()));
         }
-        if !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(Sha256Error::NonCanonicalHex);
-        }
         let mut bytes = [0_u8; 32];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let offset = index * 2;
-            *byte = u8::from_str_radix(&hex[offset..offset + 2], 16)
-                .expect("canonical lowercase hexadecimal was checked above");
+        for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            let high = HEX_NIBBLES[pair[0] as usize];
+            let low = HEX_NIBBLES[pair[1] as usize];
+            if high == 255 || low == 255 {
+                return Err(Sha256Error::NonCanonicalHex);
+            }
+            *byte = (high << 4) | low;
         }
         Ok(Self(bytes))
     }
@@ -234,6 +246,10 @@ mod tests {
         for (raw, expected_hex) in [
             ([0_u8; 32], "0".repeat(64)),
             ([0xff_u8; 32], "f".repeat(64)),
+            (
+                core::array::from_fn(|i| i as u8),
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
+            ),
         ] {
             let digest = Sha256::from(raw);
             let hex = digest.as_hex();
@@ -273,6 +289,30 @@ mod tests {
         );
         assert!(serde_json::from_str::<Sha256>(&format!("\"{}\"", "A".repeat(64))).is_err());
         assert!(serde_json::from_str::<Sha256>("[]").is_err());
+        for byte in 0u8..=127 {
+            for offset in [0, 1, 62, 63] {
+                let mut hex = vec![b'0'; 64];
+                hex[offset] = byte;
+                let text = std::str::from_utf8(&hex).unwrap();
+                let expected = if byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) {
+                    let mut raw = [0; 32];
+                    raw[offset / 2] =
+                        u8::from_str_radix(&text[offset / 2 * 2..offset / 2 * 2 + 2], 16).unwrap();
+                    Ok(Sha256::from_bytes(raw))
+                } else {
+                    Err(Sha256Error::NonCanonicalHex)
+                };
+                assert_eq!(
+                    Sha256::from_hex(text),
+                    expected,
+                    "byte={byte}, offset={offset}"
+                );
+            }
+        }
+        assert_eq!(
+            Sha256::from_hex(&"é".repeat(32)),
+            Err(Sha256Error::NonCanonicalHex)
+        );
     }
 
     #[test]

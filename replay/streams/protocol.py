@@ -1,4 +1,4 @@
-"""Replay wire V1. All wire integers are canonical unsigned strings.
+"""Replay wire V4. All wire integers are canonical unsigned strings.
 
 The strict helpers below (closed objects, canonical integers, duplicate-key
 rejection) remain the reusable validators for configuration and output files.
@@ -10,6 +10,10 @@ import heapq
 import json
 import re
 from types import MappingProxyType
+
+
+# Load the optional replay dependency once, only when a stream decoder is built.
+_orjson = None
 
 
 class ProtocolError(Exception):
@@ -51,6 +55,13 @@ def choice(value, choices):
 def array(value):
     require(type(value) is list)
     return value
+
+
+def retention_list(value, cap):
+    numbers = [uint(v) for v in array(value)]
+    require(len(numbers) <= cap, "retention list limit")
+    require(all(a < b for a, b in zip(numbers, numbers[1:])), "retention list order")
+    return numbers
 
 
 def key(value):
@@ -237,7 +248,7 @@ def pairs(values):
 
 def decode(data, limit):
     """Strict JSON for configuration/output readers: duplicate keys and NaN or
-    Infinity constants are rejected. The stream Decoder uses plain json.loads."""
+    Infinity constants are rejected. The stream Decoder uses orjson.loads."""
     require(type(data) is bytes and len(data) <= limit, "entry limit")
     try:
         return json.loads(
@@ -248,9 +259,35 @@ def decode(data, limit):
 
 
 INITIAL_FIELDS = (
-    "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes"
+    "pins start_ns end_ns lower_bound plans groups retain_boundaries_ns retain_shift_offsets_ns max_entry_bytes max_queue_bytes"
 )
 ENVELOPE_FIELDS = "version run_id attempt_id sequence kind body"
+SECTIONS = frozenset(("record", "events", "deps"))
+_UNDECLARED = object()
+
+
+def declared_sections(sections):
+    sections = frozenset(sections)
+    require("record" in sections and sections <= SECTIONS, "section declaration")
+    return sections
+
+
+class _SectionBody(dict):
+    """Guard only omitted events; present-key indexing uses dict's C path."""
+
+    __slots__ = ()
+
+    def __missing__(self, key):
+        if key in ("market_events", "control_events"):
+            raise ProtocolError("undeclared section: " + key)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if key in ("market_events", "control_events"):
+            raise ProtocolError("undeclared section: " + key)
+        return dict.get(self, key, default)
+
+
 SIDES = {"bid": 0, "ask": 1}
 # Dense price arrays cost 16 * (10**scale + 1) bytes per initialized book
 # (Kalshi/Polymarket scale 4: ~160 KiB; Limitless scale 3: ~16 KiB). Larger
@@ -285,7 +322,7 @@ class Book:
     __slots__ = (
         "revision",
         "validity",
-        "dependency",
+        "_dependency",
         "as_of",
         "reason",
         "_limit",
@@ -295,15 +332,21 @@ class Book:
         "_best",
     )
 
-    def __init__(self, price_scale):
+    def __init__(self, price_scale, *, deps=True):
         self.revision = 0
         self.validity = "not_initialized"
-        self.dependency = self.as_of = self.reason = None
+        self._dependency = None if deps else _UNDECLARED
+        self.as_of = self.reason = None
         self._limit = 10**price_scale
         self._dense = price_scale <= DENSE_MAX_PRICE_SCALE
         self._quantities = None  # allocated by the first snapshot
         self._occupied = (set(), set())
         self._best = [None, None]
+
+    @property
+    def dependency(self):
+        require(self._dependency is not _UNDECLARED, "undeclared section: deps")
+        return self._dependency
 
     def __repr__(self):
         return (
@@ -465,10 +508,11 @@ class Cut:
     read-only mapping. Neither may be retained past the hook that received it.
     """
 
-    __slots__ = ("sequence", "kind", "body", "books")
+    __slots__ = ("sequence", "risk_sequence", "kind", "body", "books")
 
-    def __init__(self, sequence, kind, body, books):
+    def __init__(self, sequence, risk_sequence, kind, body, books):
         self.sequence, self.kind, self.body, self.books = sequence, kind, body, books
+        self.risk_sequence = risk_sequence
 
     def __repr__(self):
         return f"Cut(sequence={self.sequence}, kind={self.kind!r})"
@@ -486,8 +530,13 @@ class Decoder:
     publisher ships in the same image and is trusted for everything else.
     """
 
-    def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes):
+    def __init__(self, run_id, attempt_id, expected_initial, max_entry_bytes, *, sections=SECTIONS):
+        global _orjson
+        if _orjson is None:
+            import orjson as _orjson
+
         self.run_id, self.attempt_id = run_id, attempt_id
+        self.sections = declared_sections(sections)
         self._expected = decode(json.dumps(expected_initial).encode(), max_entry_bytes)
         self.limit = max_entry_bytes
         self._books = {}
@@ -495,6 +544,7 @@ class Decoder:
         self._plans = {}
         self._pins = set()
         self.sequence = -1
+        self.risk_sequence = 0
         self.terminal = False
         self.poisoned = False
 
@@ -517,14 +567,20 @@ class Decoder:
             raise
 
     def _apply(self, data):
-        require(type(data) is bytes and len(data) <= self.limit, "entry limit")
+        # Raw record bytes remain convenient for initial/terminal offline callers.
+        fields = {b"record": data} if type(data) is bytes else data
+        require(type(fields) is dict and b"record" in fields
+                and len(fields) == 1 + (b"events" in fields) + (b"deps" in fields), "entry fields")
+        record, events, deps = fields[b"record"], fields.get(b"events", b""), fields.get(b"deps", b"")
+        require(type(record) is bytes and type(events) is bytes and type(deps) is bytes
+                and len(record) + len(events) + len(deps) <= self.limit, "entry limit")
         try:
-            r = json.loads(data)
+            r = _orjson.loads(record)
         except (ValueError, UnicodeError, RecursionError) as e:
             raise ProtocolError("malformed JSON") from e
         obj(r, ENVELOPE_FIELDS)
         require(
-            r["version"] == "2"
+            r["version"] == "4"
             and r["run_id"] == self.run_id
             and r["attempt_id"] == self.attempt_id,
             "identity/version",
@@ -532,12 +588,18 @@ class Decoder:
         seq = self.sequence + 1
         require(r["sequence"] == str(seq), "stream sequence gap or duplicate")
         kind, b = r["kind"], r["body"]
+        if kind != "cut":
+            require(len(fields) == 1, "entry fields")
         if seq == 0:
             self._initial(kind, b)
+            risk_sequence = 0
             b = freeze(b)
         elif kind == "terminal":
-            obj(b, "cuts books_sha256")
-            require(uint(b["cuts"]) == seq - 1, "terminal count")
+            obj(b, "cuts risk_cuts books_sha256")
+            cuts, risk_cuts = uint(b["cuts"]), uint(b["risk_cuts"])
+            require(cuts == seq - 1, "terminal count")
+            require(risk_cuts >= cuts and risk_cuts >= self.risk_sequence, "terminal risk count")
+            risk_sequence = risk_cuts + 1
             require(
                 b["books_sha256"] == books_sha256(self._books), "terminal book digest"
             )
@@ -545,14 +607,45 @@ class Decoder:
             b = freeze(b)
         else:
             require(kind == "cut", "record kind")
+            risk_sequence = uint(b["risk_sequence"])
+            require(risk_sequence > self.risk_sequence and risk_sequence >= seq, "risk sequence")
+            b = self._sections(b, fields)
             self._cut(b)
         self.sequence = seq
-        return Cut(seq, kind, b, self._view)
+        self.risk_sequence = risk_sequence
+        return Cut(seq, risk_sequence, kind, b, self._view)
+
+    def _sections(self, body, fields):
+        require("market_events" not in body and "control_events" not in body, "events in record")
+        transitions = body["book_transitions"]
+        if "events" in self.sections:
+            if b"events" in fields:
+                try:
+                    events = _orjson.loads(fields[b"events"])
+                except (ValueError, UnicodeError, RecursionError) as e:
+                    raise ProtocolError("malformed JSON") from e
+                require(type(events) is dict and bool(events)
+                        and set(events) <= {"market_events", "control_events"}, "events fields")
+                body.update(events)
+        else:
+            body = _SectionBody(body)
+        require(b"deps" in fields, "missing deps")
+        if "deps" in self.sections:
+            try:
+                deps = _orjson.loads(fields[b"deps"])
+            except (ValueError, UnicodeError, RecursionError) as e:
+                raise ProtocolError("malformed JSON") from e
+            require(type(deps) is list and len(deps) == len(transitions), "deps alignment")
+            for transition, dependency in zip(transitions, deps):
+                transition["dependency"] = dependency
+        return body
 
     def _initial(self, kind, b):
         """Sequence 0 only: complete closed validation of the pinned plan."""
         require(kind == "initial" and b == self._expected, "initial binding")
         obj(b, INITIAL_FIELDS)
+        retention_list(b["retain_boundaries_ns"], 100_000)
+        retention_list(b["retain_shift_offsets_ns"], 128)
         require(uint(b["start_ns"]) < uint(b["end_ns"]))
         choice(b["lower_bound"], "clip expand_to_window_start require_window_boundary")
         require(uint(b["max_entry_bytes"]) == self.limit)
@@ -572,7 +665,7 @@ class Decoder:
                 uint(p["price_scale"], 18),
                 uint(p["quantity_scale"], 18),
             )
-            books[k] = Book(self._plans[k][0])
+            books[k] = Book(self._plans[k][0], deps="deps" in self.sections)
         require(books)
         self._books.update(books)
 
@@ -597,17 +690,20 @@ class Decoder:
             if kind == "operations":
                 require(book.validity == "usable", "operations on unusable book")
                 book._operations(d["operations"])
-                book.dependency = t["dependency"]
+                if "deps" in self.sections:
+                    book._dependency = t["dependency"]
             elif kind == "snapshot":
                 book._snapshot(d["bids"], d["asks"])
                 book.validity = "usable"
-                book.dependency = t["dependency"]
+                if "deps" in self.sections:
+                    book._dependency = t["dependency"]
                 book.reason = None
             else:
                 require(kind == "invalidation", "unknown decision")
                 book._clear()
                 book.validity = "unusable"
-                book.dependency = None
+                if "deps" in self.sections:
+                    book._dependency = None
                 book.reason = d["reason"]
             book.revision = revision
             book.as_of = origin

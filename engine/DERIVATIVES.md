@@ -14,6 +14,8 @@ pub fn inspect_pinned(input: &PinnedDerivative, limits: &ReadLimits)
     -> Result<DerivativeMetadata, String>;
 pub fn open_pinned(input: &PinnedDerivative, limits: &ReadLimits)
     -> Result<VerifiedWindowReader, String>;
+pub fn open_pinned_scoped(input: &PinnedDerivative, limits: &ReadLimits,
+                          scope: ScopeFilter) -> Result<VerifiedWindowReader, String>;
 impl VerifiedWindowReader {
     pub fn next_delivery(&mut self) -> Result<Option<SourceDelivery>, String>;
     pub fn finish(self) -> Result<FinishedWindow, String>;
@@ -38,11 +40,22 @@ Open:
 
 Traversal decodes each snapshot file once with the codec's structural decoder
 (one checksummed dictionary-free frame, no truncation/trailing/concatenated
-bytes, output bound, final LF, recorded stored length, decoded length and LF
-count) and parses each line once into its final typed record
-(`SegmentRecord::from_json` and the closed reject and source types). One parsed
-record feeds every semantic check: closed schemas and versions, child order, exact
-reject provenance, one-to-one fault/reject pairing, one disposition per source,
+bytes, output bound, final LF, stored SHA-256/length, decoded length and LF
+count). Unscoped reads parse each line into its final typed record
+(`SegmentRecord::from_json` and the closed reject and source types). Scoped reads
+validate schema version, the complete header/address and provenance/continuity,
+event kind (including book/control subkind), and instrument or fault impact/lane.
+Canonical excluded book/trade/anchor/control events use an allocation-free header
+scanner and exact selection prefixes; their bodies are not lexed. Text views point
+into the reader's unchanged current-line buffer until evidence checks finish.
+Profile-2 deliveries retain the already decoded source header, without allocating
+event `record_id` or lane strings for excluded children. Both provenance hashes
+are still decoded: source and child equality require them. Selected bodies,
+normalization faults, escaped strings and any prefix/terminator/layout mismatch
+use T4's serde header/`RawValue`/projection path. Rejects and source evidence
+still decode fully, and fault/reject pairing checks the header, reject ID and
+impact even for excluded faults. One parsed header feeds every evidence check:
+child order, exact reject provenance, one-to-one fault/reject pairing, one disposition per source,
 delivery/tie/lane/group limits, and coverage agreement. Per-line checks run as a
 line is read, per-delivery checks before the delivery is returned, whole-window
 checks (frame identity, EOF, counts, final tie run, coverage) at window EOF.
@@ -50,28 +63,53 @@ Records may therefore be exposed before their window is fully verified; any late
 violation poisons the attempt and only clean EOF can finish. Source replacement or
 deletion after snapshotting cannot change yielded records; a concurrent rewrite
 that changes a file length fails open, while a length-preserving one is caught
-only by the frame and semantic checks.
+by the stored digest, frame and semantic checks during traversal.
 
 ### Read-time integrity
 
-Exact bytes are bound to the pin by SHA-256 at install, not re-proved per read.
+Exact bytes are bound to the pin by SHA-256 at install. Reads verify the stored
+frame digest without repeating the decoded-side digest.
 
 - **Install**: Replay installs a derivative only after the materializer built it
   or the strict `--inspect-pin` audit verified a download. A local copy is bound
   to its pin by `replay/jobs/bundle.py::_check_pinned_files` (receipt hash equals
   the pin; every other file matches the receipt's stored SHA-256 and length);
   a mismatch is `integrity_failure`.
-- **Read** (`open_pinned`, hence walker and risk engine): re-hashes only the
-  receipt (against the pin) and manifest (against the receipt); performs no
-  SHA-256 over stored or decoded data and no decode/re-encode canonical
-  comparison. Same-length damage to a hash-bound file is caught by the frame
-  checksum or a semantic check during traversal.
+- **Read** (`open_pinned` / `open_pinned_scoped`, hence walker and risk engine):
+  re-hashes the receipt (against the pin), manifest (against the receipt), and
+  every stored frame. It performs no decoded-side SHA-256 or decode/re-encode
+  canonical comparison. Every byte, including excluded event bodies, contributes
+  to the unchanged decoder's stored digest, logical length and LF count.
 - **Audit** (`verify_derivative`, `materialize_range --inspect-pin`, the
   existing-address no-op check): the same single pass plus both SHA-256 identities
-  of every output and canonical equality of every line. A digest-only disagreement
-  over unchanged valid bytes is an install/audit finding, not a read failure.
+  of every output and canonical equality of every line. A decoded-digest-only
+  disagreement over unchanged valid bytes is an audit finding; a stored-digest
+  disagreement also fails a pinned read.
   Verification proves the committed interpretation, not that a normalizer was
   correct; a wrong derivative needs a corrected normalizer and a new pin.
+
+Excluded body syntax and schema checks may be skipped only because the derivative's complete
+typed bodies were validated when built (or independently audited on download),
+and the receipt-pinned stored SHA-256 binds those exact bytes. T4b deliberately
+replaces T4's hot-read malformed-excluded-JSON rejection: a byte change fails the
+stored-frame digest (also in clipped tails); Audit and `--inspect-pin` still reject
+malformed JSON anywhere. A freshly forged pin is not an audited installation.
+Headers, kinds and selection evidence still validate, with serde fallback when
+the canonical scanner cannot recognize them. Scoped reading is not an independent
+body audit of newly supplied bytes. Risk's
+continuity and duplicate decisions use the source header's verdict and connection
+epoch, not excluded book hashes or venue sequences. Scope changes no materializer
+output bytes or persisted schema.
+
+For excluded events, ordering/grouping/coverage consume canonical sequence, child
+index, lane, delivery index, visible time and tie tag; retained references also
+carry order time. Source/child equality additionally compares record ID and all
+provenance fields (source digest, source line, content hash, continuity). Counts and
+budgets use every line/child, not just kept bodies. Epochs come from the source
+sidecar. Fault reject IDs and impacts retain T4's exact reject pairing. Neither
+Risk nor evidence needs excluded book/trade/anchor payloads beyond instrument
+selection. The diagnostic `DerivativeWalker::open_without_input_fastpath` retains
+T4 projection parsing; `open_without_input_filter` retains full typed parsing.
 
 ### Limits (`ReadLimits::default()`)
 
@@ -162,9 +200,13 @@ cannot be forged.
 **Scope.** `ScopeFilter { instruments, lanes }` is explicit caller input; the
 walker infers nothing from lane names and performs no resolver lookup or `1 - p`
 projection. Instrument selection includes every orientation. Selected venues are
-the prefix before `:` of requested instrument IDs. Filtering happens after group
-completion and preserves original child indexes and source spans (never
-renumbered):
+the prefix before `:` of requested instrument IDs. The walker passes this same
+scope to its event reader to avoid constructing excluded bodies; group completion
+and exposure preserve original child indexes and unfiltered source spans (never
+renumbered). `SourceDelivery::event_count()` and `last_event_address()` include
+excluded children, so counts, budgets and group ends do not shrink. The diagnostic
+`DerivativeWalker::open_without_input_filter` uses the full-body reference path
+with identical downstream filtering for equivalence tests:
 
 - instrument-addressed book/trade/`AuditAnchor` events are kept for requested
   instruments (anchors are inert evidence);

@@ -19,7 +19,7 @@ from replay.stream import ByteStreamer, read_object
 
 #: Bumped when a projection's field set changes, so rows minted under the old
 #: set are distinguishable rather than silently comparable.
-PROJECTION_VERSION = 1
+PROJECTION_VERSION = 2
 
 #: How a target record came to exist. `captured` was written by the run that
 #: fetched it and is proof of what the targeter used. `asserted` was fetched
@@ -54,6 +54,7 @@ TARGET_RECORD_PROJECTIONS: dict[str, tuple[str, ...]] = {
         "feesEnabled",
         "orderMinSize",
         "outcomes",
+        "secondsDelay",
     ),
     "limitless": (
         "collateralToken.decimals",
@@ -82,7 +83,9 @@ def projection_id(venue: str) -> str | None:
     """The identity of `venue`'s projection, or `None` if none is declared."""
     if venue not in TARGET_RECORD_PROJECTIONS:
         return None
-    return f"{venue}.v{PROJECTION_VERSION}"
+    # The execution-delay revision consumes one new Polymarket field. The
+    # Limitless field contract did not change, so its identity remains v1.
+    return f"{venue}.v{PROJECTION_VERSION if venue == 'polymarket' else 1}"
 
 
 def project_record(venue: str, record: Any) -> dict[str, Any] | None:

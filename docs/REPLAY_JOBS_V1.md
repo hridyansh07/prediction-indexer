@@ -409,7 +409,7 @@ with `interval_out_of_range`. Occurrences are clipped to the job interval.
     }
   },
   "limits": {"small": {"max_entry_bytes": 1048576, "max_queue_bytes": 67108864,
-    "command_timeout_ms": 5000, "publish_batch_entries": 100,
+    "command_timeout_ms": 5000, "publish_batch_entries": 1024,
     "attempts": 3, "no_progress": 2, "progress_margin": 100,
     "stall_seconds": 30, "attempt_seconds": 300, "run_seconds": 900,
     "poll_seconds": 0.1, "stop_seconds": 2}},
