@@ -155,3 +155,76 @@ Per AGENTS.md, write the regressions first and show them failing on
 - The validation document (`STRATEGY_EXECUTION_REALISM_VALIDATION.md`) gains an
   R12 section: before/after failure evidence and the test list.
 - No corpus, bench, service or production-data run is part of this change.
+
+## 8. Addendum: bounded exit walks and uncovered sold excess
+
+From the execution-realism verification of 40c2804 (findings F2 and F1).
+
+### 8.1 An exit walk never fails the attempt (F2)
+
+Today the exit ladder is sliced to `max_levels + 1`, and `_walk` raises
+`"probe consumed level bound"` when the excess needs more than `max_levels`
+levels (`probes.py:46,250,275`). Exit walks have no price limit. Once §2 makes
+Kalshi exits read real bids, a large excess against a thin, many-level ladder
+would fail the whole bundle attempt over a diagnostic field.
+
+The rule:
+
+- An exit walk takes at most `max_levels` levels, best-first, and stops. It
+  never raises the level-bound error. The excess it cannot reach within
+  `max_levels` levels is an **exit shortfall**, treated exactly like excess
+  beyond the ladder's displayed depth.
+- Save only `max_levels` exit levels at arrival (not `max_levels + 1`). The
+  extra level existed only to detect the failure.
+- **The arrival (entry) walk is unchanged.** It still fails the attempt
+  when it needs more than `max_levels` levels within its frozen limit, as
+  `an_arrival_that_needs_more_than_max_levels_fails_without_truncation` pins.
+  Truncating an entry walk would understate matched quantity, which is the
+  probe's primary result. Do not change that test.
+- **Row schema is unchanged.** The shortfall is already visible as
+  `excess_atoms` minus the exit quantity in `exit_consumed`. The reader accepts
+  `exit_consumed` with at most `max_levels` levels and an exit quantity of at
+  most `excess_atoms`. It rejects more levels than that.
+
+### 8.2 Uncovered sold excess is a loss, never a gain (F1)
+
+Today, for a sold leg, `native_loss = exit_cost − excess_proceeds`. Excess the
+repurchase ladder cannot cover is never charged, so an empty repurchase ladder
+turns the full excess sale proceeds into a negative loss, a gain
+(`probes.py:275-280`, `probe_reader.py:261`). Bought legs are already
+conservative: unexited excess keeps its full cost.
+
+The rule mirrors that conservatism:
+
+- For a sold leg, each uncovered excess atom is charged as a repurchase at
+  the book's maximum price, the unit payout `10**price_scale` (the same
+  `maxima` the runtime already carries).
+- `native_loss = exit_cost + uncovered_atoms × max_price − excess_proceeds`.
+  It stays signed.
+- `exit_proceeds` and `exit_consumed` still record only what the ladder
+  actually covered. The charge for uncovered atoms appears only in
+  `leg_loss_gross`.
+- The writer and `probe_reader` both apply the same rule, independently.
+- No current rollout strategy sells, so no corpus byte changes. This closes the
+  latent defect for future sold-leg strategies.
+
+### 8.3 Tests (falsifying first)
+
+1. **Thin exit ladder.** A bought Kalshi excess whose acquired-side bids
+   are spread over more than `max_levels` levels. The attempt completes, the
+   exit walks exactly `max_levels` levels, and the remainder keeps its full
+   cost in the loss. This fails today with `"probe consumed level bound"`.
+2. **Non-Kalshi thin exit.** The same case on a Polymarket bought leg.
+3. **Entry bound is unchanged.** The existing arrival max_levels failure
+   test still passes, unmodified.
+4. **Sold leg, empty repurchase ladder.** Adapt
+   `test_sold_excess_unwind_is_signed_and_matched_keeps_highest_sales`: today
+   it yields a negative `leg_loss_gross` equal to the full proceeds, which the
+   reader accepts. After the fix, the loss equals
+   `uncovered × max_price − proceeds`, which is positive.
+5. **Sold leg, partial repurchase.** Covered atoms come from the ladder, and
+   uncovered atoms are charged at the maximum price.
+6. **Reader rejections.** A row with `max_levels + 1` exit levels is rejected.
+   So is a rehashed sold-leg row whose loss omits the uncovered charge.
+7. **Byte identity.** Every bought-leg row that needs at most `max_levels`
+   exit levels is byte-identical to its §2-only output.
