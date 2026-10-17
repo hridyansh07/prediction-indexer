@@ -73,11 +73,14 @@ class StrategyPackageTests(unittest.TestCase):
                         from replay.tests.test_market_volatility import policy
                         kwargs["policy"] = policy()
                         kwargs["policy"]["groups"] = sorted(kwargs["policy"]["groups"] + ["levels", "availability"])
+                        kwargs["storage"] = {"version": 1, "profile": "zstd"}
                     h = harness_class(root, **kwargs)
                     subject = h.profile if name == "market_profile" else h.strategy
                     config = getattr(h, config_attribute) if config_attribute else h.cfg
                     if name == "market_profile":
                         config = {**h.cfg, "policy": h.profile.policy}
+                        if h.profile.storage is not None:
+                            config["storage"] = h.profile.storage
                     factory = ("replay." if historical else "replay.strategies.") + name + ":build"
                     reader = (old_reader if historical else "replay.strategies." + name) + ":read_completed"
                     spec = run_spec(root, root / "context")
@@ -192,6 +195,26 @@ class StrategyPackageTests(unittest.TestCase):
                                         path.write_bytes(raw)
                             if name == "market_profile" and not historical:
                                 from replay.strategies.market_profile.strategy import profile_identity
+                                # The physical frame is verified by the generic byte-tamper loop above.
+                                self.assertIn("profile.ndjson.zst", original_result["manifest"]["files"])
+                                mismatch = deepcopy(expected)
+                                mismatch["strategies"]["coverage"]["config"].pop("storage")
+                                new_identity = supervisor.identity(mismatch)
+                                bindings = [run / "SUCCESS.json", run / ("a" * 32) / "result.json",
+                                            output.parent / "complete.json", output / "content_receipt.json"]
+                                originals = {p: p.read_bytes() for p in [run / "run.json", *bindings]}
+                                supervisor.write_json_durable(run / "run.json", mismatch)
+                                for path in bindings:
+                                    supervisor.write_json_durable(path, {**supervisor.read(path), "identity": new_identity})
+                                try:
+                                    # Every supervisor and content binding is valid; only storage intent differs.
+                                    with self.assertRaisesRegex(ProtocolError, "configured storage"):
+                                        package_reader(run, "coverage")
+                                    with self.assertRaisesRegex(ProtocolError, "configured storage"):
+                                        read_completed(run, "coverage", reader=package_reader)
+                                finally:
+                                    for path, raw in originals.items():
+                                        path.write_bytes(raw)
                                 path = output / "content_receipt.json"
                                 supervisor.write_json_durable(path, {**original_result["receipt"],
                                     "terminal": float(original_result["receipt"]["terminal"])})

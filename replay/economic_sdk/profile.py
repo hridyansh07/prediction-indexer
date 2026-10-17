@@ -32,6 +32,8 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     GROUPS,
     LEVELS_FILE,
     MAX_PROFILE_ROWS,
+    PROFILE_FILE,
+    PROFILE_PLAIN,
     STRATEGY,
     TRANSITIONS_FILE,
     V2_GROUPS,
@@ -40,9 +42,10 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     profile_files,
     profile_identity,
     profile_policy,
+    profile_storage,
 )
 from replay.economic_sdk.levels import LevelRecorder
-from replay.economic_sdk.transitions import CutScan, TransitionRecorder
+from replay.economic_sdk.transitions import CutScan, TransitionRecorder, finish_frame
 from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
@@ -92,8 +95,10 @@ class Collector:
     """Per-book profile over one stream; scope-, bucket- and staging-aware."""
 
     def __init__(self, policy, snapshot, snapshot_sha256, root, experiment_sha256, budget=None,
-                 views=None, standalone=False):
+                 views=None, standalone=False, storage=None):
         self.policy = profile_policy(policy, standalone=standalone)
+        self.storage = (profile_storage(storage, self.policy, standalone=standalone)
+                        if storage is not None else None)
         # Embedded in an SDK strategy, ``views(key)`` returns that group's
         # detached view, whose walked fills are reused when they cover our sizes.
         self.views = views
@@ -710,7 +715,12 @@ class Collector:
         self.writers["profile.ndjson"].append(out)
 
     def finish_files(self):
-        files = {name: writer.finish() for name, writer in self.writers.items()}
+        files = {}
+        for name, writer in self.writers.items():
+            if name == PROFILE_PLAIN and self.storage is not None:
+                files[PROFILE_FILE] = finish_frame(writer, writer.path.with_name(PROFILE_FILE))
+            else:
+                files[name] = writer.finish()
         if self.transitions is not None:
             files[TRANSITIONS_FILE] = self.transitions.finish()
         if self.levels is not None:

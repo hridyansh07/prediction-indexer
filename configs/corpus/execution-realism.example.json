@@ -503,6 +503,10 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {
+          "version": 1,
+          "profile": "zstd"
+        },
         "policy": {
           "version": 2,
           "bucket_ns": "60000000000",

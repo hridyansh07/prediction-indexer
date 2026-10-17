@@ -425,7 +425,16 @@ Isolation rules:
 
 `replay.strategies.market_profile:build` runs beside any strategy and needs no fee
 configuration. Its closed configuration is
-`{version, snapshot_directory, snapshot_sha256, policy}`. It can instead run inside
+`{version, snapshot_directory, snapshot_sha256, policy}` with optional standalone
+`storage: {version: 1, profile: "zstd"}` for policy 2 only. Omission keeps the old
+bytes and manifests 1/2; opt-in selects closed manifest/layout 3 and replaces only
+`profile.ndjson` with exact NDJSON in one checksummed, dictionary-free level-3
+Zstandard frame. It retains profile's 2,000,000-row, 512 MiB logical and 64 KiB
+line bounds. Storage is outside policy and experiment identity, but changes the
+whole-manifest digest and receipt `semantic_sha256`. Strict and post-SUCCESS readers
+bind the selected representation to configured intent. See
+[the storage contract](specs/MARKET_PROFILE_V2.md#11-standalone-profile-storage-v1-implemented-extension).
+It can instead run inside
 an SDK strategy through `Requirements.profile`; complement policy 2 exposes this as
 `"profile": null | <profile policy>`. It records no economic judgement.
 

@@ -13,6 +13,16 @@ standalone profile keeps its existing groups, including `transitions` and
 `levels`, and adds the reference volatility settings. Coverage and the
 same-venue complement are unchanged.
 
+Future runs using this template opt into lossless profile compression at the
+`profile` group's **`config.storage: {"version": 1, "profile": "zstd"}`**, beside
+`config.policy`. Only `profile.ndjson` becomes `profile.ndjson.zst`; no group or
+limit changes, and no old result or operator-owned run spec is migrated. This
+selects profile manifest/layout 3, not a new economic policy. Omitting `storage`
+retains legacy plaintext. Experiment identity and recomputed summary stay equal;
+the manifest and receipt semantic digests change, and corpus keys still bind the
+source commit and full group configuration. See the
+[storage contract](../../docs/specs/MARKET_PROFILE_V2.md#11-standalone-profile-storage-v1-implemented-extension).
+
 The source-owned configuration found during implementation was
 `.bench/corpus/corpus-spec.json` in the primary checkout. It is outside version
 control and has been preserved. This template retains its group names, comparison
@@ -26,9 +36,10 @@ To migrate an operator-owned configuration:
    reviewed endpoint, canonical store, runner, materializer, image context, fees,
    work/output paths, and bundle selection. Use a fresh ledger/output namespace
    when comparing runs. Never use retained inputs as scratch space.
-2. Copy the four fill policies and the profile policy from this template. Keep
-   `@corpus:fees`, `@corpus:valuation`, `{context}`, and `{snapshot_sha256}` as
-   literal tokens; the runner supplies their pinned per-bundle values.
+2. Copy the four fill policies and the profile policy and `config.storage` from
+   this template. Keep `@corpus:fees`, `@corpus:valuation`, `{context}`, and
+   `{snapshot_sha256}` as literal tokens; the runner supplies their pinned
+   per-bundle values.
 3. Keep complement and coverage unchanged. Review profile ticks against the
    prepared plan scales. Verify the fee source bytes and catalog identity through
    the existing fee workflow; this template does not make new fee claims.

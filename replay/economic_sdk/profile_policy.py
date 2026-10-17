@@ -20,6 +20,8 @@ STRATEGY = "market_profile_v1"
 GROUPS = ("activity", "depth", "pair_consistency", "quote_stability", "self_crossing", "top_of_book")
 V2_GROUPS = ("availability", "levels", "transitions", "volatility")
 FILES = ("incidents.ndjson", "pair_profile.ndjson", "profile.ndjson")
+PROFILE_PLAIN = "profile.ndjson"
+PROFILE_FILE = "profile.ndjson.zst"
 AVAILABILITY_FILE = "availability.ndjson"
 TRANSITIONS_FILE = "transitions.ndjson.zst"
 TRANSITIONS_PLAIN = "transitions.ndjson"  # provisional; deleted once the frame is committed
@@ -93,10 +95,20 @@ def profile_identity(snapshot_sha256, policy):
     return digest({"strategy": STRATEGY, "policy": policy, "snapshot_sha256": snapshot_sha256})
 
 
-def profile_files(policy):
-    """The exact file set a policy produces; manifests and readers use this."""
+def profile_storage(value, policy, *, standalone=False):
+    """Explicit storage V1 opt-in, outside the observational policy and identity."""
+    value = obj(plain(value), "version profile")
+    require(type(value["version"]) is int and value["version"] == 1, "profile storage version")
+    require(value["profile"] == "zstd", "profile storage representation")
+    require(standalone and policy["version"] == 2, "profile storage requires standalone policy 2")
+    return value
+
+
+def profile_files(policy, storage=None):
+    """The exact file set for a validated policy/storage selection."""
     groups = set(policy["groups"])
-    return (FILES + ((AVAILABILITY_FILE,) if "availability" in groups else ())
+    base = tuple(PROFILE_FILE if n == PROFILE_PLAIN and storage is not None else n for n in FILES)
+    return (base + ((AVAILABILITY_FILE,) if "availability" in groups else ())
             + ((TRANSITIONS_FILE,) if "transitions" in groups else ())
             + ((LEVELS_FILE,) if "levels" in groups else ())
             + ((VOLATILITY_FILE,) if "volatility" in groups else ()))

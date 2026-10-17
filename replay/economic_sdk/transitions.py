@@ -113,6 +113,30 @@ def quote_text(quote):
     return None if quote is None else [str(quote[0]), str(quote[1])]
 
 
+def finish_frame(writer, stored):
+    """Commit one frame, then remove only this writer's newly produced plain spool.
+
+    Callers own these exclusive writers in a fresh empty output directory.
+    The manifest/receipt is published only after this function succeeds.
+    """
+    logical = writer.finish()
+    plain = writer.path
+    temporary = stored.with_name(stored.name + ".open")
+    require(not stored.exists(), "existing output")
+    with plain.open("rb") as source, temporary.open("xb") as sink:
+        result = encode_stream(source, sink)
+        sink.flush()
+        os.fsync(sink.fileno())
+    require({"sha256": result.logical.sha256, "byte_length": result.logical.byte_length,
+             "records": result.logical.line_count} == logical, stored.name + " logical identity")
+    temporary.rename(stored)
+    fsync_directory(stored.parent)
+    plain.unlink()
+    fsync_directory(stored.parent)
+    return {"logical": logical,
+            "stored": {"sha256": result.stored.sha256, "byte_length": result.stored.byte_length}}
+
+
 class CutScan:
     """Callback-local shared scan, evaluated at the recorders' original check points.
 
@@ -206,24 +230,7 @@ class Stream:
     # -- commit --------------------------------------------------------------------
     def finish(self):
         """Seal the rows, store them as one Zstandard frame, then drop the plain file."""
-        root = self.root
-        logical = self.writer.finish()
-        plain = root / self.plain
-        stored = root / self.final
-        temporary = stored.with_name(stored.name + ".open")
-        require(not stored.exists(), "existing output")
-        with plain.open("rb") as source, temporary.open("xb") as sink:
-            result = encode_stream(source, sink)
-            sink.flush()
-            os.fsync(sink.fileno())
-        require({"sha256": result.logical.sha256, "byte_length": result.logical.byte_length,
-                 "records": result.logical.line_count} == logical, self.final + " logical identity")
-        temporary.rename(stored)
-        fsync_directory(root)
-        plain.unlink()
-        fsync_directory(root)
-        return {"logical": logical,
-                "stored": {"sha256": result.stored.sha256, "byte_length": result.stored.byte_length}}
+        return finish_frame(self.writer, self.root / self.final)
 
 
 class TransitionRecorder(Stream):

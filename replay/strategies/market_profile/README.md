@@ -24,9 +24,26 @@ Specification: [MARKET_PROFILE_V2](../../../docs/specs/MARKET_PROFILE_V2.md).
 The file set follows the policy: `incidents.ndjson`, `pair_profile.ndjson` and
 `profile.ndjson`, plus `availability.ndjson`, `transitions.ndjson.zst` and
 `levels.ndjson.zst` when those groups are on, and `volatility.ndjson.zst` when
-volatility is on. The manifest `version` is 2 for a
+volatility is on. Without a storage opt-in, the manifest `version` is 2 for a
 version-2 policy; each `.ndjson.zst` entry is `{logical: {sha256, byte_length,
 records}, stored: {sha256, byte_length}}` and the other entries are unchanged.
+
+For new standalone policy-2 outputs, add **`"storage": {"version": 1, "profile": "zstd"}`**
+beside `policy` in the strategy config. This selects closed manifest/layout 3,
+compressing only `profile.ndjson` to `profile.ndjson.zst` through the shared
+streaming level-3 encoder (one checksummed dictionary-free frame). Exact decoded
+bytes, logical SHA/length/LF count, row ordering, experiment identity and the
+independently recomputed summary stay the same. The manifest and receipt semantic
+digests change with the physical layout. Profile bounds remain 2,000,000 rows,
+512 MiB logical and 64 KiB per line; there is no plaintext duplicate or staging
+file on success. Readers require the manifest-selected representation and bind
+storage to the configured intent after SUCCESS as well.
+
+Omit `storage` to preserve legacy output; V1 and embedded profiles do not accept
+the opt-in. Old plaintext manifests 1/2 remain readable. No existing results are
+migrated. The future-corpus opt-in is the `profile` group's `config.storage` in
+[`configs/corpus/execution-realism.example.json`](../../../configs/corpus/execution-realism.example.json).
+Full [storage contract](../../../docs/specs/MARKET_PROFILE_V2.md#11-standalone-profile-storage-v1-implemented-extension).
 
 - **`availability`** runs the interval engine of
   [`replay/economic_sdk/availability.py`](../../economic_sdk/availability.py),

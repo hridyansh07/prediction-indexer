@@ -33,12 +33,14 @@ class _Tee:
 class Harness(CoverageHarness):
     """Coverage's hand-authored tape, with the profile (and optionally coverage) as groups."""
 
-    def __init__(self, root, *, policy=None, with_coverage=False, **kwargs):
+    def __init__(self, root, *, policy=None, storage=None, with_coverage=False, **kwargs):
         self.profile_output = root / "profile"
         self.profile_output.mkdir()
 
         def factory(context):
             config = {**context["config"], "policy": policy or PROFILE_POLICY}
+            if storage is not None:
+                config["storage"] = storage
             self.profile = MarketProfile(freeze({**context, "config": config,
                                                  "output_directory": str(self.profile_output)}))
             if not with_coverage:

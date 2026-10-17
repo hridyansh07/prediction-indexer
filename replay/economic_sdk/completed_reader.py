@@ -78,6 +78,8 @@ def read_completed(run_directory, group, *, reader, deep=False):
     if package in ("market_profile", "bundle_coverage"):
         module = importlib.import_module(f"replay.strategies.{package}." +
                                         ("strategy" if package == "market_profile" else "output"))
+        if package == "market_profile":
+            cfg = module.profile_config(cfg)
         prepared = PreparedInput({k: cfg[k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
         policy = module.profile_policy(cfg["policy"], standalone=True) if package == "market_profile" else None
         inputs = None
@@ -114,6 +116,9 @@ def read_completed(run_directory, group, *, reader, deep=False):
     require(manifest["summary_sha256"] == digest(summary), "summary identity/schema")
     if policy is not None:
         require(manifest["policy"] == policy, "configured policy")
+    if package == "market_profile":
+        require(manifest.get("storage") == cfg.get("storage"), "configured storage")
+        module.check_output_files(output, manifest["files"])
     if inputs is not None:
         expected = inputs.experiment_sha256 if package == "same_venue_complement" else inputs.identity
         require(manifest["experiment_sha256"] == expected

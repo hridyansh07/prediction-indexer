@@ -9,6 +9,7 @@ from pathlib import Path
 from replay.corpus.__main__ import corpus_key
 from replay.corpus.spec import load
 from replay.economic_sdk.profile_policy import profile_policy
+from replay.strategies.market_profile.strategy import profile_config
 
 
 REFERENCE = Path(__file__).resolve().parents[2] / "configs/corpus/execution-realism.example.json"
@@ -64,6 +65,8 @@ class ReferenceCorpusTests(unittest.TestCase):
         self.assertEqual(complement["sizes_contracts"], ["1", "10", "100"])
         self.assertNotIn("fills", complement)
         profile = groups["profile"]["config"]["policy"]
+        self.assertEqual(groups["profile"]["config"]["storage"], {"version": 1, "profile": "zstd"})
+        self.assertEqual(profile_config(groups["profile"]["config"]), groups["profile"]["config"])
         self.assertTrue({"volatility", "transitions", "levels"} <= set(profile["groups"]))
         self.assertEqual(profile_policy(profile, standalone=True), profile)
         self.assertEqual(profile["volatility"], {
@@ -97,6 +100,9 @@ class ReferenceCorpusTests(unittest.TestCase):
                         self.assertNotEqual(corpus_key(changed, **args), base)
             changed = copy.deepcopy(spec)
             changed["groups"][-1]["config"]["policy"]["volatility"]["sample_ms"] = 500
+            self.assertNotEqual(corpus_key(changed, **args), base)
+            changed = copy.deepcopy(spec)
+            changed["groups"][-1]["config"].pop("storage")
             self.assertNotEqual(corpus_key(changed, **args), base)
             changed = copy.deepcopy(spec)
             changed["work_root"] = str(root / "other-scratch")
