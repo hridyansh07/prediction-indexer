@@ -45,7 +45,7 @@ def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_ex
         raise FileExistsError(f"corpus result already exists: {destination}")
     directories = set()
     if durable:
-        from archive.common.durable import fsync_directory
+        from replay.supervisor import fsync_directory
         # Include the existing ancestor that will gain the first new entry.
         parent = destination
         while not parent.exists():
