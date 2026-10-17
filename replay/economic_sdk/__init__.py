@@ -59,6 +59,16 @@ class Strategy:
         """Static ``FillSpec`` of an admitted entity: per-leg ladder source and units."""
         raise NotImplementedError
 
+    def fill_exits(self, entity):
+        """Static per-leg ``(book_key, ladder)`` for excess unwind.
+
+        The default preserves the reverse ladder on the entry source book.
+        Strategies whose acquired book differs override this hook.
+        """
+        from replay.economic_sdk.probes import EXIT_SOURCE
+        return tuple((key, EXIT_SOURCE[source])
+                     for key, source in zip(entity.legs, self.fill_spec(entity).sources))
+
     def fill_value(self, entity, steps, legs, time):
         """Pure value of ``steps`` basket steps on per-leg ``Fill`` objects, or ``None``.
 

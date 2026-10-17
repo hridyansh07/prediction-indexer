@@ -1188,6 +1188,17 @@ Limitless subscription slugs. It returns per-leg nanoseconds or `None`, which
 selects the policy default. Delays are exact whole milliseconds. Strategies may
 override the hook with a pure implementation that the reader also calls.
 
+The pure `Strategy.fill_exits(entity)` hook returns one `(book_key, ladder)`
+per leg. The default reverses each entry source on `entity.legs[i]`, preserving
+existing probe users. The four execution-realism strategies override it through
+their shared policy helper: BUY excess exits into the acquired descriptor
+book's native `bid`, not Kalshi's opposite-orientation entry source. Non-Kalshi
+SELL exits keep the same-book reverse mapping; Kalshi SELL with probes fails
+with `"probe exit unsupported for Kalshi sold leg"`. Bind requires each exit
+plan and builder (`"probe exit book not planned"`) and retained ladder
+(`"probe exit ladder not retained"`). The exit uses that book's committed usable
+view at arrival. The independent reader checks exit prices against its scale.
+
 `probes.ndjson` contains exactly one row per configured scenario per fill episode,
 independently of episode closure. Confirmation zero uses the opening sizing's
 walk, including a recording sizing that was not tradeable; a zero-step recording
@@ -1196,8 +1207,14 @@ to remain live and the selected sizing to be tradeable. A decision fixes each
 leg's quantity and worst accepted price. Arrivals take better prices, cancel
 unfilled remainders, and retain the best atoms for the matched quantity: lowest
 purchase prices or highest sale prices. Gross excess loss is purchase cost less
-exit sale proceeds for a bought leg, and exit repurchase cost less original sale
-proceeds for a sold leg. It is signed; unwind fees are excluded.
+exit sale proceeds for a bought leg, including full cost for unexited atoms.
+For a sold leg it is actual exit repurchase cost plus uncovered atoms charged
+at unit payout (`10**price_scale`), less original excess sale proceeds. It is
+signed; unwind fees are excluded. Exit walks retain and take at most
+`max_levels` levels, treating any further quantity as a shortfall without
+failing the attempt. Entry walks still fail if their frozen limit requires
+more than `max_levels` levels. Actual exits alone enter `exit_consumed` and
+`exit_proceeds`; no row schema changes.
 
 The pure `Strategy.fill_loss(entity, native_losses, time_ns)` hook converts the
 signed per-leg native gross losses into the same monetary unit and scale as

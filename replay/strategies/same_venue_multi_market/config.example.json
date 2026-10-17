@@ -55,7 +55,7 @@
         "unknown_taker_delay_ms": {
           "kalshi": 0,
           "limitless": 0,
-          "polymarket": 3000
+          "polymarket": 1000
         }
       }
     },

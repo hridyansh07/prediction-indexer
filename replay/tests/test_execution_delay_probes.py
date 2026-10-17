@@ -180,6 +180,19 @@ class ProbeTests(unittest.TestCase):
                          (str(M), [["300", str(M)]]))
         self.assertEqual(row["leg_loss_gross"], str(100 * M))
 
+    def test_polymarket_thin_exit_stops_at_cap_and_preserves_unexited_cost(self):
+        two = {"name": "two", "role": "governs", "target_contracts": "2"}
+        h = self.harness(probes(sizings=["two"]), two, fill_overrides={"max_levels": 2})
+        self.book(h, 12, LEG0, (400, 2 * M), bids=((300, M // 4), (200, M // 4), (100, M)))
+        self.book(h, 12, LEG1, (500, 2 * M))
+        self.book(h, 15, LEG1, (500, M))
+        row = self.row(h)  # Includes independent aggregate-reader validation.
+        self.assertEqual((row["status"], row["matched_steps"]), ("partial", "1"))
+        self.assertEqual((row["legs"][0]["excess_atoms"], row["legs"][0]["exit_consumed"],
+                          row["legs"][0]["exit_proceeds"], row["leg_loss_gross"]),
+                         (str(M), [["300", str(M // 4)], ["200", str(M // 4)]],
+                          str(125 * M), str(275 * M)))
+
     def test_prices_beyond_limit_are_empty_and_better_prices_are_taken(self):
         for price, status, matched in ((410, "empty", "0"), (390, "filled", "1")):
             with self.subTest(price=price):
@@ -472,10 +485,12 @@ class ProbeTests(unittest.TestCase):
 
     def test_sold_excess_unwind_is_signed_and_matched_keeps_highest_sales(self):
         two = {"name": "two", "role": "governs", "target_contracts": "2"}
-        for repurchase, expected in ((750, 100 * M), (600, -50 * M)):
+        for repurchase, quantity, expected in ((750, M, 100 * M), (600, M, -50 * M),
+                                                (None, 0, 350 * M), (750, M // 4, 575 * M // 2)):
             with self.subTest(repurchase=repurchase):
                 h = self.harness(probes(sizings=["two"]), two, side="sell")
-                self.book(h, 12, LEG0, (repurchase, 2 * M), bids=((700, M), (650, M)))
+                asks = () if repurchase is None else ((repurchase, quantity),)
+                self.book(h, 12, LEG0, *asks, bids=((700, M), (650, M)))
                 self.book(h, 12, LEG1, (800, 2 * M), bids=((550, 2 * M),))
                 self.book(h, 15, LEG1, (800, 2 * M), bids=((550, M),))
                 row = self.row(h)
@@ -483,7 +498,10 @@ class ProbeTests(unittest.TestCase):
                 # The matched sale is 700, so the excess sale is 650.
                 self.assertEqual(row["value"], str((700 + 550 - 1010) * M))
                 self.assertEqual(row["legs"][0]["excess_atoms"], str(M))
-                self.assertEqual(row["legs"][0]["exit_consumed"], [[str(repurchase), str(M)]])
+                self.assertEqual(row["legs"][0]["exit_consumed"],
+                                 [] if repurchase is None else [[str(repurchase), str(quantity)]])
+                self.assertEqual(row["legs"][0]["exit_proceeds"],
+                                 "0" if repurchase is None else str(repurchase * quantity))
                 self.assertEqual(row["leg_loss_gross"], str(expected))
 
     def test_all_four_retained_ladders_keep_committed_best_change_timestamps(self):

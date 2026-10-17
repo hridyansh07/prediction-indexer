@@ -14,7 +14,7 @@ from replay.economic_sdk.fills import fill_policy
 from replay.economic_sdk.probe_reader import validate
 from replay.economic_sdk.reader import Budget
 from replay.economic_sdk.types import FillSpec
-from replay.economic_sdk import BookRequirement, Requirements, aggregate_reader, factory
+from replay.economic_sdk import BookRequirement, Requirements, Strategy, aggregate_reader, factory
 from replay.preparation import digest, encoded, load_snapshot
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_economic_sdk_fills import (FillHarness, LEG0, LEG1, ONE, PairFills,
@@ -25,7 +25,7 @@ MS = 1_000_000
 AGES = [{"book_ns": "10", "best_ns": "5"}, {"book_ns": "10", "best_ns": "5"}]
 
 
-class Value:
+class Value(Strategy):
     def fill_loss(self, entity, native_losses, time):
         return sum(native_losses)
 
@@ -126,6 +126,8 @@ class ProbeReaderTests(unittest.TestCase):
                     "probe walk level bound")
         self.reject(lambda row: row["legs"][0].update(filled_atoms="11"), "probe filled quantity")
         self.reject(lambda row: row["legs"][0].update(exit_consumed=[["390", "6"]]), "probe exit quantity")
+        self.reject(lambda row: row["legs"][0].update(
+            exit_consumed=[[str(p), "1"] for p in range(390, 386, -1)]), "probe walk level bound")
 
     def test_policy_grid_has_exact_rows_and_no_orphans(self):
         for rows, episodes, message in (([], None, "probe coverage"),
@@ -282,6 +284,22 @@ class ProbeReaderTests(unittest.TestCase):
                 self.read()
                 self.reject(lambda row: row.update(leg_loss_gross=str(-loss)), "probe gross loss")
                 self.reject(lambda row: row.update(value="350"), "probe matched value")
+
+    def test_sold_uncovered_excess_is_charged_at_maximum_price_independently(self):
+        self.strategy = SoldValue()
+        self.ep["probe_opening"]["two"]["limits"] = ["550", "500"]
+        self.row["decision"]["limits"] = ["550", "500"]
+        self.row["legs"][0].update(consumed=[["600", "5"], ["550", "5"]], cost="5750")
+        self.row["value"] = "600"
+        for walk, proceeds, loss, old_loss in (([], 0, 2250, -2750),
+                                               ([["560", "2"]], 1120, 1370, -1630)):
+            with self.subTest(walk=walk):
+                self.row["legs"][0].update(exit_consumed=walk, exit_proceeds=str(proceeds))
+                # 5 excess sold at 550; uncovered atoms repurchase at 1000.
+                self.row["leg_loss_gross"] = str(loss)
+                self.read()
+                # read() rehashes this counterfeit row before checking it.
+                self.reject(lambda row: row.update(leg_loss_gross=str(old_loss)), "probe gross loss")
 
     def test_millisecond_fields_reject_noninteger_and_out_of_bound_values(self):
         for field in ("confirm_ms", "arrival_ms", "venue_delay_ms"):
