@@ -173,7 +173,8 @@ def context_document(bundle_id):
 
 def corpus_result(key_dir, bundle_id, *, corpus_key=None, status="SUCCESS", groups=("profile", "cross", "coverage"),
                   excluded=(), failed_group=None, context=True, success_marker=True, attempts=(ATTEMPT,),
-                  checks=None, rows=None, episodes=None, commit=True, tamper_context=False, game_state=None):
+                  checks=None, rows=None, episodes=None, commit=True, tamper_context=False, game_state=None,
+                  before_commit=None):
     """Write a bench output into a staging directory and commit it as the corpus runner does."""
     key_dir = Path(key_dir)
     corpus_key = corpus_key or (key_dir.name + "0" * (64 - len(key_dir.name)))
@@ -228,6 +229,8 @@ def corpus_result(key_dir, bundle_id, *, corpus_key=None, status="SUCCESS", grou
         "error": None if status != "FAILED" else {"type": "SupervisorError", "message": "group failed",
                                                   "trace_tail": ""}})
     destination = key_dir / bundle_id
+    if before_commit is not None:
+        before_commit(staging)
     if commit:
         corpus_results.commit(staging, destination, corpus_key=corpus_key, bundle_id=bundle_id, status=status,
                               bench_exit=0 if status == "SUCCESS" else 3, game_state=None,

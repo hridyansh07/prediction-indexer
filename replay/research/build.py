@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from replay.economic_sdk.availability_reader import book_id
-from replay.research import game, metadata, overlays, series, tables
+from replay.research import game, metadata, overlays, realism, series, tables
 from replay.research.inputs import discover
 from replay.research.jsonio import (ResearchError, dumps, file_identity, fsync_directory, identity, read_json,
                                     require, write_bytes)
@@ -76,7 +76,11 @@ def build_pack(event, root, config, game_state_root):
     game_json = game.game_json(document, how, config["game_time_windows"], config["game_time_windows_status"])
     pack.put("game.json", game_json)
 
-    lenses, rows = {}, []
+    volatility = realism.volatility_document(profile, event.bundle_id, header["event_id"], header["game"], books)
+    pack.put("volatility.json", volatility)
+    lenses, rows, probes, evidence = {}, [], [], []
+    evidence.append({"bundle_id": event.bundle_id, "lens": "profile", "kind": "volatility",
+                     "state": volatility["state"], "reason": volatility["reason"]})
     for name, lens in config["lenses"].items():
         state = {k: v for k, v in event.lenses[name].items() if k != "output"}
         if state["state"] == "ok" and lens["adapter"] == "sdk_episodes":
@@ -86,6 +90,10 @@ def build_pack(event, root, config, game_state_root):
             state["episodes"] = len(overlay["items"])
             rows += tables.episode_rows(event.bundle_id, name, overlay["items"], books=books,
                                         capture_end_ns=capture_end, game=header["game"])
+            probes += realism.probe_rows(event.bundle_id, header["event_id"], name, overlay["items"], books,
+                                         header["game"], volatility["pairs"])
+            evidence.append({"bundle_id": event.bundle_id, "lens": name, "kind": "probes",
+                             **overlay["probes"]})
         lenses[name] = state
 
     manifest = {
@@ -100,6 +108,7 @@ def build_pack(event, root, config, game_state_root):
                        "source_dirty": event.result["image"].get("source_dirty"),
                        "bench_status": event.result["status"]},
         "overview": {"bucket_ns": overview["bucket_ns"], "buckets": overview["buckets"]},
+        "execution_realism": {"volatility": volatility["state"]},
         "tiles": tiles, "files": dict(sorted(pack.files.items())),
     }
     data = dumps(manifest)
@@ -107,7 +116,7 @@ def build_pack(event, root, config, game_state_root):
     facts = {"capture_start_ns": capture_start, "duration_s": (capture_end - capture_start) / 1e9,
              "venues": sorted({b["venue"] for b in books}), "book_count": len(books),
              "scope_count": len(scopes), "game_state": game_json["state"], **header}
-    return data, rows, facts
+    return data, rows, facts, probes, volatility["rows"], evidence
 
 
 def event_row(event, config, pack_state, pack_error, facts, rows):
@@ -142,7 +151,8 @@ def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=prin
     events, superseded, inputs = discover(key_dirs, config)
     staging = Path(tempfile.mkdtemp(prefix=".build-", dir=out))
     try:
-        packs, event_rows, episodes, failures = {}, [], [], []
+        packs, event_rows, episodes, failures, probes, volatility, evidence = {}, [], [], [], [], [], []
+        probe_budget = realism.ProbeBudget()
         for event in events:
             pack_state, pack_error, facts, rows = None, None, None, []
             if event.state == "ok":
@@ -150,11 +160,15 @@ def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=prin
                     pack_state = "no_profile"
                 else:
                     try:
-                        data, rows, facts = build_pack(event, staging / "events" / event.bundle_id, config,
-                                                       game_state_root)
+                        data, rows, facts, event_probes, event_volatility, event_evidence = build_pack(
+                            event, staging / "events" / event.bundle_id, config, game_state_root)
+                        probe_budget.reserve(event_probes)
                         packs[event.bundle_id] = {"pack": f"events/{event.bundle_id}/manifest.json",
                                                   **identity(data)}
                         pack_state = "ok"
+                        probes += event_probes
+                        volatility += event_volatility
+                        evidence += event_evidence
                     except Exception as error:   # recorded per event and reported; never silent
                         shutil.rmtree(staging / "events" / event.bundle_id, ignore_errors=True)
                         pack_state, pack_error, rows = "build_failed", f"{type(error).__name__}: {error}", []
@@ -168,10 +182,13 @@ def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=prin
         tables_out = {
             "events.parquet": tables.parquet_bytes(event_rows, tables.event_schema(list(config["lenses"]))),
             "episodes.parquet": tables.parquet_bytes(episodes, tables.EPISODE_SCHEMA),
+            "probes.parquet": tables.parquet_bytes(probes, tables.PROBE_SCHEMA),
+            "volatility.parquet": tables.parquet_bytes(
+                [{**r, "jumps_json": dumps(r["jumps"]).decode().strip()} for r in volatility], tables.VOLATILITY_SCHEMA),
             "verify.json": dumps({"verify_version": 1, "checks": checks}),
             "events.json": dumps(tables.events_index(config, event_rows)),
         }
-        summary = tables.summarize(config, event_rows, episodes)
+        summary = tables.summarize(config, event_rows, episodes, probes=probes, volatility=volatility, evidence=evidence)
         tables_out["summary.json"] = dumps(summary)
         for name, data in tables_out.items():
             files[name] = write_bytes(staging / name, data)

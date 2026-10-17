@@ -12,6 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from replay.research.jsonio import ResearchError, read_json, require
+from replay.research import realism
 
 OVERLAY_VERSION = 1
 
@@ -72,8 +73,9 @@ def episode_intervals(output, lens_name, lens, books):
             except (IndexError, TypeError) as error:
                 raise ResearchError(f"{lens_name}: episode {row.get('episode_id')} has no entity") from error
             items.append(_interval(row, entity["descriptor"], lens, step, mapped))
+    probe_evidence = realism.attach_probes(output, items, step, lens["value_scale"], lens["value_unit"])
     return {"overlay_version": OVERLAY_VERSION, "lens": lens_name, "kind": "intervals", "label": lens["label"],
-            "semantic_sha256": receipt.get("semantic_sha256"), "items": items}
+            "semantic_sha256": receipt.get("semantic_sha256"), "probes": probe_evidence, "items": items}
 
 
 def _interval(row, descriptor, lens, step, mapped):
@@ -89,11 +91,22 @@ def _interval(row, descriptor, lens, step, mapped):
     metrics = [{"name": "duration", "value": exact_decimal(Fraction(end - start, 1_000_000)), "unit": "ms"}]
     detail = {"kind": row["kind"], "route_id": descriptor.get("route_id"),
               "basket_kind": descriptor.get("basket_kind"), "legs": legs,
-              "viable_tiers": row.get("viable_tiers")}
+              "viable_tiers": row.get("viable_tiers"), "scope": row["scope"],
+              "flags_state": "ok" if "flags" in row else "unavailable"}
+    if "flags" in row:
+        flags = row["flags"]
+        require(type(flags) is dict and set(flags) == {"pairing_class", "settlement_review", "stale_legs"},
+                "invalid episode flags")
+        require(type(flags["pairing_class"]) is str and type(flags["settlement_review"]) is bool and
+                type(flags["stale_legs"]) is list and all(type(i) is int and 0 <= i < len(legs)
+                for i in flags["stale_legs"]) and flags["stale_legs"] == sorted(set(flags["stale_legs"])),
+                "invalid episode flag types")
+        detail["flags"] = flags
     if unmapped:
         detail["unmapped_legs"] = unmapped
     fill = row.get("fill")
     if fill is not None:
+        detail["has_fill"] = True
         governing = next((r for r in fill["results"] if r["role"] == "governs"), None)
         require(governing is not None, f"episode {row['episode_id']} fill has no governing result")
         require(step is not None, "fill episode without a fill policy in the manifest")
@@ -102,6 +115,14 @@ def _interval(row, descriptor, lens, step, mapped):
                             "value": exact_decimal(Fraction(int(governing["value"]), 10 ** lens["value_scale"]))})
         metrics.append({"name": "quantity", "unit": "contracts",
                         "value": exact_decimal(int(governing["steps"]) * step)})
+        contracts = int(governing["steps"]) * step
+        edge = (None if not contracts or governing["value"] is None else
+                Fraction(int(governing["value"]), 10 ** lens["value_scale"]) / contracts)
+        recording = next((r for r in fill["results"] if r["name"] == "t10"), None)
+        detail.update(step_contracts=exact_decimal(step),
+                      edge_per_set=None if edge is None else realism.exact_ratio(edge),
+                      t10_value=None if recording is None or recording["value"] is None else
+                      exact_decimal(Fraction(int(recording["value"]), 10 ** lens["value_scale"])))
         detail.update(stop=governing["stop"], sizing=governing["name"], kill_prices=fill["kill_prices"],
                       end_books=fill["end_books"])
     label = row["kind"] if not descriptor.get("basket_kind") else f"{row['kind']} · {descriptor['basket_kind']}"
