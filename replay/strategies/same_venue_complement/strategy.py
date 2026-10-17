@@ -16,6 +16,7 @@ from replay.economic_sdk import (
     factory,
 )
 from replay.preparation import encoded
+from replay.economic_sdk.storage import stored_manifest
 from replay.streams.protocol import require
 
 _GROSS, _GROSS_NET = frozenset({"gross"}), frozenset({"gross", "net"})
@@ -144,14 +145,14 @@ class SameVenueComplement(ComplementReader):
 
     # -- completion --------------------------------------------------------------
     def manifest(self, files, instantaneous):
-        return {"version": self.policy["version"], "strategy": self.experiment.strategy,
+        return stored_manifest({"version": self.policy["version"], "strategy": self.experiment.strategy,
                 "snapshot_sha256": self.inputs.prepared.sha256, "policy": self.policy,
                 "policy_sha256": self.inputs.policy_sha256,
                 "experiment_sha256": self.experiment.experiment_sha256,
                 "fee_config": self.bridge.semantic_config,
                 "fee_engine_identity": self.bridge.engine_identity, "files": files,
                 "instantaneous_positive": instantaneous,
-                "payout_assumption": "unit_complement_assumption_not_resolution_proof"}
+                "payout_assumption": "unit_complement_assumption_not_resolution_proof"}, self.inputs.storage, 3)
 
     def validate(self, directory, snapshot, manifest):
         require(self.bound, "missing initial")

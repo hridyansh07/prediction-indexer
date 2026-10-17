@@ -342,6 +342,50 @@ share the row/chunk encoder and resolve one scope at a time, without a new globa
 descriptor cache. The final writer also verifies preflight length before rename.
 Layout 1 has no entity table and preserves the frozen complement V1 behavior.
 
+**Economic storage V1 (opt-in).** A layout-2 strategy may add the closed
+`storage: {"version": 1, "economic": "zstd"}` object beside `policy` in its run
+configuration. Omission preserves the legacy manifest version and every default
+physical/logical byte. Explicit null, unknown fields/values, and layout-1 opt-in
+are rejected. Storage never enters economic policy or experiment identity.
+
+With this selection, every economic evidence filename above (including
+`probes.ndjson` when configured, controls, and audits) gains `.zst`.
+`summary.json`, control summaries, `manifest.json`, and `content_receipt.json`
+remain plain JSON; embedded market-profile files are unchanged. The logical
+layout is still 2. Each owning strategy allocates a new closed stored-manifest
+version: complement 3, cross-venue arbitrage 3, multi-market 2, and both
+implication covers 2. It requires the same `storage` object and maps **physical**
+filenames to `{logical: {sha256, byte_length, records}, stored: {sha256,
+byte_length}}`; embedded profile entries keep their legacy identities. Old
+manifest schemas stay closed and readable.
+
+The shared `encoder` writes one dictionary-free, checksummed level-3 frame per
+file. Bounded streaming preserves exact canonical JSON bytes, ordering and LF,
+including empty streams. The writer seals/fsyncs its newly owned plaintext spool,
+streams and fsyncs `<logical>.zst.open`, checks logical identity, renames the
+frame, fsyncs its directory, then removes **only its own spool** and fsyncs again.
+Only after all frames and independent semantic validation succeed are summaries,
+manifest and receipt published. A failed frame never authorizes removal of a
+pre-existing artifact. Success leaves exactly one representation and no staging.
+
+Readers select from the validated manifest and bind storage intent to the run
+configuration in both strict completed and post-SUCCESS byte readers. They reject
+duplicates, missing files, staging leftovers, unknown paths and symlinks; verify
+stored and logical hashes/lengths/counts; and reject corrupt, truncated,
+concatenated or trailing frames/bytes without decoded temporary files. Ordinary
+streams keep 2,000,000 records, 512 MiB logical bytes, and 64 KiB including LF per
+line. Entity tables keep their separate one-record 64 MiB document path and exact
+early preflight; reasons keep the one-record 8 MiB path. Transition/levels bounds
+do not apply. Summaries are independently recomputed with the same semantics.
+
+Physical manifests and `content_receipt.semantic_sha256` (the whole manifest
+digest) intentionally differ by storage. Corpus physical receipts keep schema 1;
+corpus keys still bind source commit and complete group configuration. No old
+output is migrated. Future runs using
+`configs/corpus/execution-realism.example.json` select this opt-in on `complement`,
+`cross`, `multi`, `cover_same`, and `cover_cross`; its standalone `profile` group
+keeps its independent profile storage block.
+
 A strategy may represent a statically rejected, size-independent basket with a
 null size in its own descriptor and a deterministic numeric ordering sentinel.
 Admission bypasses evaluation and declared input compilation; it still receives
@@ -425,7 +469,16 @@ Isolation rules:
 
 `replay.strategies.market_profile:build` runs beside any strategy and needs no fee
 configuration. Its closed configuration is
-`{version, snapshot_directory, snapshot_sha256, policy}`. It can instead run inside
+`{version, snapshot_directory, snapshot_sha256, policy}` with optional standalone
+`storage: {version: 1, profile: "zstd"}` for policy 2 only. Omission keeps the old
+bytes and manifests 1/2; opt-in selects closed manifest/layout 3 and replaces only
+`profile.ndjson` with exact NDJSON in one checksummed, dictionary-free level-3
+Zstandard frame. It retains profile's 2,000,000-row, 512 MiB logical and 64 KiB
+line bounds. Storage is outside policy and experiment identity, but changes the
+whole-manifest digest and receipt `semantic_sha256`. Strict and post-SUCCESS readers
+bind the selected representation to configured intent. See
+[the storage contract](specs/MARKET_PROFILE_V2.md#11-standalone-profile-storage-v1-implemented-extension).
+It can instead run inside
 an SDK strategy through `Requirements.profile`; complement policy 2 exposes this as
 `"profile": null | <profile policy>`. It records no economic judgement.
 

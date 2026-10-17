@@ -71,11 +71,13 @@ def strategy_config(base, root, known=False):
 
 
 class Harness(CoverageHarness):
-    def __init__(self, root, *, known=False, pairs=False, policy=None, **kwargs):
+    def __init__(self, root, *, known=False, pairs=False, policy=None, storage=None, **kwargs):
         def factory(context):
             self.complement_config = strategy_config(dict(context["config"]), root, known)
             if policy:
                 self.complement_config["policy"] = {**self.complement_config["policy"], **policy}
+            if storage is not None:
+                self.complement_config["storage"] = storage
             return build({**context, "config": self.complement_config})
         detail_factory = paired_detail if pairs else preparation_detail
         if pairs:

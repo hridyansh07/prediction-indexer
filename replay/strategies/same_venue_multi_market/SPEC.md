@@ -117,6 +117,14 @@ floors, one native leg per book (outcome asset, cost, quote delta, received,
 charges, assessment identities), `quote_asset`, fee status and labels,
 `settlement_model: "normal_resolution_only"` and the outcomes provider.
 
+The closed configuration optionally accepts `storage: {"version": 1,
+"economic": "zstd"}` beside `policy` (SDK §5). This selects stored manifest
+version **2**, requiring the storage block and nested logical/stored identities
+for `.zst` economic evidence, including probes/audits. Summary format 1 and
+embedded profiles remain unchanged. Omission preserves manifest 1 and exact
+legacy bytes. Policy/experiment identity stays equal; physical manifest and
+receipt digests differ. Explicit null and unknown storage combinations fail.
+
 The independent reader (`replay.strategies.same_venue_multi_market.output`) reconstructs
 entities, re-walks consumed quotes, checks fee, cashflow and payout arithmetic,
 recomputes episodes, slices, denominators and Q(L), and re-prices every fill

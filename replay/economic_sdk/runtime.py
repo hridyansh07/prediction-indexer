@@ -35,10 +35,12 @@ from replay.economic_intervals import CutClock, EpisodeMath
 from replay.economic_sdk import bounds
 from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.entity_tables import preflight, table_chunks, write_table
+from replay.economic_sdk.framing import commit_frame
 from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, check_spec,
                                        END_BOOK_LINE, end_books,
                                        crossed, price)
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
+from replay.economic_sdk.storage import configured_storage
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, GameRequirement, Observation
 from replay.economic_sdk.game import ANCHORS, Timeline, binding as game_binding, episode_game, game_policy
 from replay.economic_sdk.views import ViewBuilder, quote_ages, touched_sides, unavailable_view
@@ -124,6 +126,7 @@ class Runtime:
         experiment = self.experiment = strategy.experiment
         self.legacy = experiment.layout == 1
         check_experiment(experiment)
+        self.storage = configured_storage(context["config"], experiment.layout)
         # Fill mode (spec §13): the trigger kind's episodes are priced fills.
         self.fill = experiment.fills
         self.snapshot = strategy.snapshot
@@ -1237,6 +1240,9 @@ class Runtime:
             files = {name: writer.finish() for name, writer in self.writers.items()}
             if not self.legacy:
                 files |= self._tables()
+                if self.storage is not None:
+                    files = {name + ".zst": commit_frame(self.root / name, logical)
+                             for name, logical in files.items()}
             if self.profile is not None:
                 files |= self.profile.finish_files()
             manifest = self.strategy.manifest(files, self.instantaneous)

@@ -5,6 +5,7 @@ from .contract import (Inputs, SCALE, UNIT, SETTLEMENT, assess_net, native_amoun
 from .output import CrossVenueReader, validate_content
 from replay.strategies._shared.metadata import native_metadata
 from replay.strategies.same_venue_complement.contract import reason
+from replay.economic_sdk.storage import stored_manifest
 from replay.economic_sdk import (BookRequirement, Requirements, Observation, factory,
                                  EVALUATED, UNUSABLE, ONE_SIDED, DEPTH_LIMITED)
 
@@ -108,7 +109,7 @@ class CrossVenueArbitrage(CrossVenueReader):
                            payload=payload, quotes=quotes)
 
     def manifest(self, files, instantaneous):
-        return {"version": 2, "strategy": self.experiment.strategy,
+        return stored_manifest({"version": 2, "strategy": self.experiment.strategy,
                 "snapshot_sha256": self.inputs.prepared.sha256, "policy": self.policy,
                 "policy_sha256": self.experiment.policy_sha256,
                 "experiment_sha256": self.experiment.experiment_sha256,
@@ -116,7 +117,7 @@ class CrossVenueArbitrage(CrossVenueReader):
                 "files": files, "instantaneous_positive": instantaneous,
                 "settlement_model": SETTLEMENT,
                 "outcomes_provider": self.snapshot.get("outcomes", {}).get("provider"),
-                "valuation": self.valuation}
+                "valuation": self.valuation}, self.inputs.storage, 3)
 
     def validate(self, directory, snapshot, manifest):
         from replay.streams.protocol import require

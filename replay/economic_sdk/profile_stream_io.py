@@ -1,4 +1,4 @@
-"""Streaming reads of the market profile's Zstandard row files.
+"""Streaming reads of the SDK's profile and economic Zstandard evidence.
 
 ``stream_lines`` decodes one committed frame through the shared codec in two
 passes and never writes a decoded byte to disk: pass one verifies both

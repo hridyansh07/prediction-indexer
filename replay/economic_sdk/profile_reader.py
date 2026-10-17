@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from replay.economic_sdk import bounds
 from replay.economic_sdk.availability_reader import book_id, duration_rows, validate_intervals
 from replay.economic_sdk.profile_policy import (
     AVAILABILITY_FILE,
@@ -19,17 +20,21 @@ from replay.economic_sdk.profile_policy import (
     GROUPS,
     LEVELS_FILE,
     LEVELS_PLAIN,
+    PROFILE_FILE,
+    PROFILE_PLAIN,
     TRANSITIONS_FILE,
     TRANSITIONS_PLAIN,
     VOLATILITY_FILE,
     VOLATILITY_PLAIN,
     pairs_of,
     profile_policy,
+    profile_storage,
 )
-from replay.economic_sdk.reader import lines, signed
-from replay.economic_sdk.transitions_reader import validate_streams
+from replay.economic_sdk.profile_stream_io import stream_lines
+from replay.economic_sdk.reader import file_identity, lines, signed
+from replay.economic_sdk.transitions_reader import identity_record, validate_streams
 from replay.economic_sdk.volatility_reader import validate_volatility
-from replay.streams.protocol import obj, require, uint  # noqa: F401
+from replay.streams.protocol import decode, obj, require, uint  # noqa: F401
 
 _STATE = ("usable_ns", "not_initialized_ns", "unusable_ns", "bid_empty_ns", "ask_empty_ns",
           "both_empty_ns", "two_sided_ns")
@@ -72,9 +77,29 @@ def _bucketed(start, end, width, scope_start, scope_end):
     require(end == scope_end or end % width == 0, "row end alignment")
 
 
+def _profile_rows(root, files, storage):
+    name = PROFILE_PLAIN if storage is None else PROFILE_FILE
+    for other in (PROFILE_PLAIN, PROFILE_FILE):
+        path = root / other
+        require(other == name or not (path.exists() or path.is_symlink()), "profile representation")
+        stage = root / (other + ".open")
+        require(not (stage.exists() or stage.is_symlink()), "unexpected provisional profile file")
+    if storage is None:
+        yield from lines(root, name, files[name])
+    else:
+        path = root / name
+        require(path.is_file() and not path.is_symlink(), "regular output required")
+        logical, stored = identity_record(files[name])
+        file_identity(logical)  # Profile caps, not the larger transitions/levels caps.
+        for payload in stream_lines(path, logical, stored, bounds.MAX_LINE, "profile"):
+            yield decode(payload, bounds.MAX_LINE)
+
+
 def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_sha256, *,
-                     standalone=False):
+                     standalone=False, storage=None):
     policy = profile_policy(policy, standalone=standalone)
+    if storage is not None:
+        storage = profile_storage(storage, policy, standalone=standalone)
     root = Path(root)
     groups = set(policy["groups"])
     width = int(policy["bucket_ns"])
@@ -112,7 +137,7 @@ def validate_profile(root, snapshot, files, policy, experiment_sha256, snapshot_
     require(not (root / (VOLATILITY_FILE + ".open")).exists(), "unexpected provisional volatility frame")
     facts = {"state": {}, "open": {}, "buckets": {}} if groups & {"transitions", "levels"} else None
     last, cursor, totals = None, {}, {}
-    for row in lines(root, "profile.ndjson", files["profile.ndjson"]):
+    for row in _profile_rows(root, files, storage):
         obj(row, fields)
         scope = row["scope"]
         identity(row, scope)

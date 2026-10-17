@@ -110,6 +110,15 @@ checks fees/native cashflow arithmetic, and verifies every state's payout,
 its minimum and its middle/extra payout. Completed readers additionally require
 supervisor SUCCESS and exact factory/configuration/content-receipt bindings.
 
+Both wrappers optionally accept the closed `storage: {"version": 1,
+"economic": "zstd"}` block beside `policy` (SDK §5). It selects stored manifest
+version **2**, with the required storage block and nested logical/stored
+identities for every `.zst` economic evidence file, including requested controls,
+audits and probes. Summary version 1 and embedded profiles stay unchanged.
+Omission retains manifest 1 and exact legacy bytes; explicit null and unknown
+combinations fail. Storage is outside policy/experiment identity, while physical
+manifest and receipt digests intentionally change.
+
 The existing local bench needs no infrastructure change. Add either or both
 factory/reader rows from the table above to a reviewed `groups` list under
 [LOCAL_REPLAY_BENCH_V1.md](../../../../docs/LOCAL_REPLAY_BENCH_V1.md), with the pinned existing

@@ -15,6 +15,7 @@ Policy 2 fields beyond policy 1: ``controls`` (list, default empty),
 """
 
 from replay.economic_sdk.bounds import MAX_METADATA
+from replay.economic_sdk.storage import closed_config, configured_storage
 from replay.economic_sdk.types import Basket, Control, Experiment
 from replay.economic_sdk.game import game_policy, experiment_policy
 from replay.preparation import digest, encoded
@@ -133,12 +134,13 @@ class Inputs:
         from replay.strategies._shared.fee_bridge import FeeBridge
         from replay.strategy_sdk import PreparedInput
 
-        config = obj(plain(config), "version snapshot_directory snapshot_sha256 fees policy")
+        config = closed_config(config, "version snapshot_directory snapshot_sha256 fees policy")
         require(len(encoded(config)) <= MAX_METADATA, "configuration budget")
         self.config = config
         self.prepared = PreparedInput({k: config[k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
         self.snapshot = plain(self.prepared.snapshot)
         self.policy = policy_config(config["policy"])
+        self.storage = configured_storage(config, 1 if self.policy["version"] == 1 else 2)
         self.bridge = FeeBridge(config["fees"], self.snapshot["plans"])
         self.policy_sha256 = digest(self.policy)
         self.experiment_sha256 = experiment_identity(self.prepared.sha256, self.policy, self.bridge.semantic_config)

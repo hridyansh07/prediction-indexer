@@ -9,6 +9,7 @@ from pathlib import Path
 from replay.corpus.__main__ import corpus_key
 from replay.corpus.spec import load
 from replay.economic_sdk.profile_policy import profile_policy
+from replay.strategies.market_profile.strategy import profile_config
 
 
 REFERENCE = Path(__file__).resolve().parents[2] / "configs/corpus/execution-realism.example.json"
@@ -37,6 +38,9 @@ class ReferenceCorpusTests(unittest.TestCase):
     def test_reference_has_exact_policies_and_sixty_probe_scenarios(self):
         groups = {g["name"]: g for g in self.reference()["groups"]}
         self.assertEqual(set(groups), {"coverage", "complement", "profile", *VERSIONS})
+        for name in ("complement", *VERSIONS):
+            self.assertEqual(groups[name]["config"]["storage"], {"version": 1, "economic": "zstd"})
+        self.assertNotIn("storage", groups["coverage"]["config"])
         for name, version in VERSIONS.items():
             with self.subTest(group=name):
                 policy = groups[name]["config"]["policy"]
@@ -64,6 +68,8 @@ class ReferenceCorpusTests(unittest.TestCase):
         self.assertEqual(complement["sizes_contracts"], ["1", "10", "100"])
         self.assertNotIn("fills", complement)
         profile = groups["profile"]["config"]["policy"]
+        self.assertEqual(groups["profile"]["config"]["storage"], {"version": 1, "profile": "zstd"})
+        self.assertEqual(profile_config(groups["profile"]["config"]), groups["profile"]["config"])
         self.assertTrue({"volatility", "transitions", "levels"} <= set(profile["groups"]))
         self.assertEqual(profile_policy(profile, standalone=True), profile)
         self.assertEqual(profile["volatility"], {
@@ -81,6 +87,11 @@ class ReferenceCorpusTests(unittest.TestCase):
                         materializer_describe=b"offline producer", runner_config=b"{}")
             base = corpus_key(spec, **args)
             for group in spec["groups"]:
+                if "storage" in group["config"]:
+                    changed = copy.deepcopy(spec)
+                    changed["groups"][spec["groups"].index(group)]["config"].pop("storage")
+                    with self.subTest(group=group["name"], field="storage"):
+                        self.assertNotEqual(corpus_key(changed, **args), base)
                 if group["name"] not in VERSIONS:
                     continue
                 index = spec["groups"].index(group)
@@ -99,12 +110,31 @@ class ReferenceCorpusTests(unittest.TestCase):
             changed["groups"][-1]["config"]["policy"]["volatility"]["sample_ms"] = 500
             self.assertNotEqual(corpus_key(changed, **args), base)
             changed = copy.deepcopy(spec)
+            changed["groups"][-1]["config"].pop("storage")
+            self.assertNotEqual(corpus_key(changed, **args), base)
+            changed = copy.deepcopy(spec)
             changed["work_root"] = str(root / "other-scratch")
             self.assertEqual(corpus_key(changed, **args), base)
             spec["unknown"] = True
             path.write_text(json.dumps(spec))
             with self.assertRaisesRegex(ValueError, "corpus spec"):
                 load(path)
+
+    def test_economic_storage_is_closed_explicit_and_layout_two_only(self):
+        from replay.economic_sdk.storage import closed_config, configured_storage
+        from replay.streams.protocol import ProtocolError
+        self.assertIsNone(configured_storage({}, 1))
+        self.assertIsNone(configured_storage({}, 2))
+        value = {"version": 1, "economic": "zstd"}
+        self.assertEqual(configured_storage({"storage": value}, 2), value)
+        for invalid in (None, {}, {**value, "profile": "zstd"}, {**value, "version": True},
+                        {**value, "version": 2}, {**value, "economic": "plain"}):
+            with self.subTest(storage=invalid), self.assertRaises(ProtocolError):
+                configured_storage({"storage": invalid}, 2)
+        with self.assertRaisesRegex(ProtocolError, "requires layout 2"):
+            configured_storage({"storage": value}, 1)
+        with self.assertRaises(ProtocolError):
+            closed_config({"version": 1, "storage": value, "unknown": True}, "version")
 
 
 if __name__ == "__main__":

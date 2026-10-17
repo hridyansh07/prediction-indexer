@@ -17,6 +17,7 @@ from .contract import (
 from replay.economic_sdk import Strategy, aggregate_reader, reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.output import Layout
+from replay.economic_sdk.storage import logical_files, manifest_storage
 from replay.economic_sdk.game import manifest_fields
 from replay.economic_sdk.reader import quantiles as _quantiles  # noqa: F401  (stable test surface)
 from replay.economic_sdk.reader import read_json as _json
@@ -38,9 +39,10 @@ def check_manifest(value, complete=True):
               "fee_engine_identity files instantaneous_positive payout_assumption")
     if complete:
         fields += " summary_sha256"
-    obj(value, fields + manifest_fields(value))
+    obj(value, fields + (" storage" if value.get("version") == 3 else "") + manifest_fields(value))
     policy_config(value["policy"])
-    require(type(value["version"]) is int and value["version"] == value["policy"]["version"])
+    layout = 1 if value["policy"]["version"] == 1 else 2
+    manifest_storage(value, value["policy"]["version"], 3, layout)
     require(value["strategy"] == STRATEGY and value["payout_assumption"] == PAYOUT)
     for field in ("snapshot_sha256", "policy_sha256", "experiment_sha256", "fee_engine_identity"):
         sha(value[field])
@@ -58,6 +60,8 @@ def check_manifest(value, complete=True):
     for key, count in value["instantaneous_positive"].items():
         sha(key)
         require(type(count) is int and 0 <= count <= 2**64 - 1)
+    if layout == 2:
+        logical_files(value, experiment(value["policy"], value["experiment_sha256"]))
 
 
 class ComplementReader(Strategy):
@@ -413,6 +417,7 @@ def read_completed(run_directory, group):
     require(result["manifest"]["experiment_sha256"] == inputs.experiment_sha256
             and result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity,
             "configured identity")
+    require(result["manifest"].get("storage") == inputs.storage, "configured storage")
     receipt = result["receipt"]
     require({k: receipt[k] for k in ("identity", "attempt_id", "group", "run_id", "terminal")}
             == {"identity": success["identity"], "attempt_id": success["attempt"], "group": group,

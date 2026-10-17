@@ -53,6 +53,14 @@ summaries now use **format version 2**; the experiment identity pins
 format-1 outputs require their original frozen reader or a fresh replay; this
 reader rejects them rather than reinterpreting their denominator table.
 
+The closed configuration optionally accepts `storage: {"version": 1,
+"economic": "zstd"}` beside `policy` (SDK §5). This selects stored manifest
+version **3**, requiring the storage block and nested logical/stored identities
+for every `.zst` economic evidence file, including requested probes, controls
+and audits. Summary format 2 and embedded profiles are unchanged. Omission keeps
+manifest 2 and its exact legacy bytes. Storage does not enter policy/experiment
+identity, but physical manifest and receipt digests intentionally change.
+
 Statically rejected pairs and uncaptured members use `size_contracts: null` and
 are emitted once per scope, with the full scope duration. Admitted pairs retain
 one entity per requested size and their original descriptors/identities. A null

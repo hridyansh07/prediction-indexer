@@ -48,7 +48,7 @@ class ImplicationCover(ImplicationReader, CrossVenueArbitrage):
 
     def manifest(self, files, instantaneous):
         result = CrossVenueArbitrage.manifest(self, files, instantaneous)
-        result.update(version=1, venue_mode=self.mode)
+        result.update(version=1 if self.inputs.storage is None else 2, venue_mode=self.mode)
         return result
 
     def validate(self, directory, snapshot, manifest):

@@ -50,6 +50,62 @@ Read first:
   The other files keep `{sha256, byte_length, records}`.
 - `replay/strategies/market_profile/config.v2.example.json` has every group on.
 
+### 1.1 Standalone profile storage V1 (implemented extension)
+
+The standalone configuration has one optional field outside `policy`:
+
+```json
+"storage": {"version": 1, "profile": "zstd"}
+```
+
+This closed object accepts only those two fields and values (integer version,
+not boolean). It is allowed only with standalone **policy version 2**. Omission
+retains the exact old layout and bytes: manifest versions 1/2 still have their
+original closed schemas and plaintext `profile.ndjson`. Explicit null, a policy
+storage field, or embedded storage is invalid. No economic policy version,
+group, bucket, measurement, limit or experiment identity changes.
+
+Opt-in selects **manifest/output layout version 3**, whose closed schema is
+`{version, strategy, snapshot_sha256, policy, experiment_sha256, storage, files,
+summary_sha256}`. `storage` is required and equals the configuration object above.
+The provisional manifest omits only `summary_sha256`, as before. Layout 3 replaces
+only the `profile.ndjson` entry with `profile.ndjson.zst`, using
+`{logical: {sha256, byte_length, records}, stored: {sha256, byte_length}}`.
+Other file selections, schemas and bytes are unchanged, including `levels`.
+
+The frame is exact original NDJSON, including row order, serialized JSON bytes
+and final LFs: shared `encoder.encode_stream`, Zstandard level 3, checksum on,
+dictionary-free, exactly one frame. The writer uses the unchanged bounded
+`LineWriter` to spool only its own newly generated profile in a fresh empty output
+directory. Following the levels writer, it seals/fsyncs the spool, streams it
+into an exclusive `.zst.open`, fsyncs the frame, verifies logical identity,
+renames it and fsyncs the directory, then removes only that spool and fsyncs the
+directory again. Independent content validation precedes durable summary,
+manifest and content receipt publication. A failure publishes no commit marker;
+readers reject staging leftovers, both representations, or neither. There is no
+migration, recompression or removal of pre-existing or committed output.
+
+Profile bounds remain **2,000,000 rows, 512 MiB logical bytes, 64 KiB per line**,
+including LF; the transitions/levels limits never apply to this file. Readers
+select from the validated manifest, not filename discovery, require regular
+non-symlink files, and verify both identities with the shared strict two-pass
+streaming decoder without a decoded disk copy. They reject corruption,
+truncation, extra/concatenated frames, trailing bytes and wrong hashes, lengths
+or LF counts. The independent row validation and recomputed summary are identical
+across layouts. Both the strict completed reader and the post-SUCCESS stored-byte
+dispatcher additionally bind manifest storage (including omission) to configured
+storage intent; post-SUCCESS mode hashes the receipted physical frame as usual.
+
+`experiment_sha256` is unchanged because storage is outside policy. The manifest
+digest and receipt's `semantic_sha256` **do change**: the latter continues to hash
+the entire manifest. Bench comparison retains that distinction. The generic
+corpus receipt remains version 1 and binds physical files without a schema change;
+corpus keys continue to include source commit and full group configuration.
+
+Future corpus runs using the tracked template opt in at
+`configs/corpus/execution-realism.example.json`, group `name: "profile"`,
+`config.storage`. No retained run specification or external worker is changed.
+
 ## 2. Availability (the bundle_coverage fold)
 
 Implemented; unchanged by this revision.

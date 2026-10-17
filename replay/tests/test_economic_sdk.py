@@ -789,22 +789,27 @@ class ProfilingHarnessTests(unittest.TestCase):
 class TableSizeTests(unittest.TestCase):
     """Entity/reason tables are one record; real bundles exceed the 64 KiB line cap."""
 
-    def _roundtrip(self, value):
+    def _roundtrip(self, value, compressed=False):
         from types import SimpleNamespace
         from replay.economic_sdk.aggregate_reader import _table
+        from replay.economic_sdk.framing import commit_frame
         from replay.economic_sdk.runtime import Runtime
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             identity = Runtime._write_table(SimpleNamespace(root=root), "entities.json", value)
+            if compressed:
+                identity = commit_frame(root / "entities.json", identity)
             return identity, _table(root, "entities.json", {"entities.json": identity})
 
     def test_table_larger_than_line_cap_round_trips(self):
         # 1,500 entities with ~600-byte descriptors: about 0.9 MB, as on the bench bundle.
         scopes = [[{"hash": f"{i:064x}", "descriptor": {"legs": ["x" * 600], "index": i}}
                    for i in range(1500)]]
-        identity, table = self._roundtrip({"scopes": scopes})
-        self.assertGreater(identity["byte_length"], bounds.MAX_LINE)
-        self.assertEqual(table, {"scopes": scopes})
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                identity, table = self._roundtrip({"scopes": scopes}, compressed)
+                self.assertGreater((identity["logical"] if compressed else identity)["byte_length"], bounds.MAX_LINE)
+                self.assertEqual(table, {"scopes": scopes})
 
     def test_table_identity_and_bound_still_fail_closed(self):
         from types import SimpleNamespace
@@ -820,6 +825,85 @@ class TableSizeTests(unittest.TestCase):
                 _table(root, "big.json", {"big.json": {"sha256": "0" * 64,
                                                        "byte_length": bounds.MAX_METADATA + 3,
                                                        "records": 1}})
+
+    def test_compressed_rows_empty_frames_line_limits_and_exact_identities(self):
+        import hashlib
+        from encoder import CodecError
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import document, lines
+        for label, payload, valid in (("empty", b"", True), ("lf", b"{}\n", True),
+                ("boundary", b'"' + b"a" * (bounds.MAX_LINE - 3) + b'"\n', True),
+                ("over", b'"' + b"a" * (bounds.MAX_LINE - 2) + b'"\n', False),
+                ("unterminated", b"{}", False)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "episodes.ndjson"
+                path.write_bytes(payload)
+                logical = {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
+                           "records": payload.count(b"\n")}
+                if payload and not payload.endswith(b"\n"):
+                    with self.assertRaises(CodecError):
+                        commit_frame(path, logical)
+                    self.assertEqual(path.read_bytes(), payload)
+                    continue
+                identity = commit_frame(path, logical)
+                if not valid:
+                    with self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, identity))
+                    continue
+                self.assertEqual(list(lines(root, path.name, identity)),
+                                 [json.loads(row) for row in payload.splitlines()])
+                for side, field in (("logical", "sha256"), ("logical", "byte_length"),
+                                    ("logical", "records"), ("stored", "sha256"), ("stored", "byte_length")):
+                    changed = {k: dict(v) for k, v in identity.items()}
+                    changed[side][field] = "0" * 64 if field == "sha256" else changed[side][field] + 1
+                    with self.subTest(side=side, field=field), self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, changed))
+                for field, limit in (("records", bounds.MAX_ROWS), ("byte_length", bounds.MAX_BYTES)):
+                    changed = {**identity, "logical": {**logical, field: limit + 1}}
+                    with self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, changed))
+                for name, limit in (("entities.json", bounds.MAX_ENTITY_TABLE), ("reasons.json", bounds.MAX_METADATA)):
+                    changed = {**identity, "logical": {**logical, "records": 1, "byte_length": limit + 1}}
+                    with self.assertRaises(ProtocolError):
+                        document(root, name, changed, limit)
+
+    def test_compressed_reader_rejects_rehashed_corruption_truncation_and_trailing_frames(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import lines
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "episodes.ndjson"
+            payload = b'{"x":1}\n'
+            path.write_bytes(payload)
+            logical = {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload), "records": 1}
+            identity = commit_frame(path, logical)
+            frame = path.with_name(path.name + ".zst")
+            raw = frame.read_bytes()
+            for mutation in (raw[:-1], raw + b"x", raw + raw, raw[:-1] + bytes([raw[-1] ^ 1])):
+                frame.write_bytes(mutation)
+                rehashed = {**identity, "stored": {"sha256": hashlib.sha256(mutation).hexdigest(),
+                                                  "byte_length": len(mutation)}}
+                with self.assertRaises(ProtocolError):
+                    list(lines(root, path.name, rehashed))
+
+    def test_frame_failures_preserve_owned_spool_until_durable_frame_commit(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        for boundary in ("encode_stream", "os.fsync", "fsync_directory"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "episodes.ndjson"
+                raw = b"{}\n"
+                path.write_bytes(raw)
+                logical = {"sha256": hashlib.sha256(raw).hexdigest(), "byte_length": len(raw), "records": 1}
+                with patch("replay.economic_sdk.framing." + boundary, side_effect=OSError("synthetic failure")):
+                    with self.assertRaisesRegex(OSError, "synthetic failure"):
+                        commit_frame(path, logical)
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual((root / "episodes.ndjson.zst").exists(), boundary == "fsync_directory")
+                self.assertFalse((root / "content_receipt.json").exists())
 
 
 if __name__ == "__main__":

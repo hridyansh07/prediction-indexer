@@ -108,6 +108,28 @@ class ProbeReaderTests(unittest.TestCase):
     def test_partial_better_prices_default_delay_and_gross_unwind_read(self):
         self.read()
 
+    def test_compressed_probe_reader_checks_semantics_after_valid_frame_identities(self):
+        from replay.economic_sdk.framing import commit_frame
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                root = Path(tmp)
+                row = copy.deepcopy(self.row)
+                if not valid:
+                    row["legs"][0]["cost"] = "4001"
+                payload = encoded(row) + b"\n"
+                path = root / "probes.ndjson"
+                path.write_bytes(payload)
+                identity = commit_frame(path, {"sha256": hashlib.sha256(payload).hexdigest(),
+                    "byte_length": len(payload), "records": 1})
+                def read():
+                    return validate(root, identity, [self.ep], self.scopes, self.policy,
+                                    self.strategy, self.plans, Budget())
+                if valid:
+                    read()
+                else:
+                    with self.assertRaisesRegex(ProtocolError, "probe fill cost"):
+                        read()
+
     def test_cost_value_excess_and_unwind_are_independently_recomputed(self):
         for field, amount, message in (("cost", "4001", "probe fill cost"),
                                        ("excess_atoms", "4", "probe excess atoms"),

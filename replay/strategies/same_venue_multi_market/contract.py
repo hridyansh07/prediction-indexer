@@ -10,6 +10,7 @@ from replay.strategies.same_venue_complement.contract import (EPISODE_CLASSES, R
                                         reason)
 from replay.strategies.cross_venue_arbitrage.contract import SCALE, UNIT, source_key  # noqa: F401  (shared helpers)
 from replay.economic_sdk.fills import fill_policy
+from replay.economic_sdk.storage import closed_config, configured_storage
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.economic_sdk.types import Basket, Experiment
 from replay.economic_sdk.game import game_policy, experiment_policy
@@ -83,12 +84,13 @@ def experiment(policy, identity):
 class Inputs:
     def __init__(self, config):
         from replay.strategies._shared.fee_bridge import FeeBridge
-        config = obj(plain(config), "version snapshot_directory snapshot_sha256 fees policy")
+        config = closed_config(config, "version snapshot_directory snapshot_sha256 fees policy")
         require(type(config["version"]) is int and config["version"] == 1, "config version")
         require(len(encoded(config)) <= 8 * 1024 * 1024, "configuration budget")
         self.prepared = PreparedInput({k: config[k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
         self.snapshot = plain(self.prepared.snapshot)
         self.policy = policy_config(config["policy"])
+        self.storage = configured_storage(config, 2)
         self.bridge = FeeBridge(config["fees"], self.snapshot["plans"])
         self.identity = experiment_identity(self.prepared.sha256, self.policy, self.bridge.semantic_config)
 

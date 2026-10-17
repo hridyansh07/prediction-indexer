@@ -63,6 +63,11 @@ def check_files(files, names):
 
 
 def lines(root, name, identity):
+    if "logical" in identity:
+        from replay.economic_sdk.storage import stored_lines
+        for payload in stored_lines(root, name, identity, bounds.MAX_LINE):
+            yield decode(payload, bounds.MAX_LINE)
+        return
     path = root / name
     require(path.is_file() and not path.is_symlink(), "regular output required")
     checksum = hashlib.sha256()
@@ -86,10 +91,15 @@ def document(root, name, identity, limit=bounds.MAX_METADATA):
     for entities, MAX_METADATA otherwise), which real bundles exceed the per-row
     MAX_LINE with; the file identity still binds it.
     """
-    path = root / name
-    require(path.is_file() and not path.is_symlink(), "regular output required")
-    with path.open("rb") as stream:
-        payload = stream.read(limit + 1)
+    if "logical" in identity:
+        from replay.economic_sdk.storage import stored_lines
+        payload = b"".join(stored_lines(root, name, identity, limit))
+        identity = identity["logical"]
+    else:
+        path = root / name
+        require(path.is_file() and not path.is_symlink(), "regular output required")
+        with path.open("rb") as stream:
+            payload = stream.read(limit + 1)
     require(len(payload) <= limit, "table/size")
     require(payload.endswith(b"\n") and payload.count(b"\n") == 1, "table is one record")
     require({"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
