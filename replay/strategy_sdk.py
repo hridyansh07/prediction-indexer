@@ -83,12 +83,14 @@ class LineWriter:
 
     def append(self, value):
         payload = encoded(value) + b"\n"
-        require(len(payload) <= self.max_line_bytes, "output line budget")
-        require(
-            self.size + len(payload) <= self.max_bytes
-            and self.count < self.max_records,
-            "output budget",
-        )
+        if len(payload) > self.max_line_bytes:
+            require(False, f"output line budget: {self.path}; "
+                    f"line_bytes={len(payload)} max_line_bytes={self.max_line_bytes}")
+        if self.size + len(payload) > self.max_bytes or self.count >= self.max_records:
+            require(False, f"output budget: {self.path}; "
+                    f"logical_bytes={self.size + len(payload)} max_bytes={self.max_bytes} "
+                    f"records={self.count + 1} max_records={self.max_records} "
+                    f"next_line_bytes={len(payload)}")
         self.stream.write(payload)
         self.hash.update(payload)
         self.size += len(payload)

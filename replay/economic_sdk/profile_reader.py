@@ -90,7 +90,7 @@ def _profile_rows(root, files, storage):
         path = root / name
         require(path.is_file() and not path.is_symlink(), "regular output required")
         logical, stored = identity_record(files[name])
-        file_identity(logical)  # Profile caps, not the larger transitions/levels caps.
+        file_identity(logical, name)  # Profile caps, not the larger transitions/levels caps.
         for payload in stream_lines(path, logical, stored, bounds.MAX_LINE, "profile"):
             yield decode(payload, bounds.MAX_LINE)
 

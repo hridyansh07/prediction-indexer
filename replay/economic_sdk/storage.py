@@ -49,7 +49,7 @@ def evidence_identity(name, value, compressed):
         logical, stored = value["logical"], obj(value["stored"], "sha256 byte_length")
         sha(stored["sha256"])
         require(type(stored["byte_length"]) is int and stored["byte_length"] >= 0, "stored byte length")
-    file_identity(logical)
+    file_identity(logical, name)
     if name.endswith("entities.json") or name == "reasons.json":
         limit = bounds.MAX_ENTITY_TABLE if name.endswith("entities.json") else bounds.MAX_METADATA
         require(logical["records"] == 1 and logical["byte_length"] <= limit, "table/size")
@@ -74,7 +74,7 @@ def logical_files(manifest, experiment):
         evidence_identity(name, entry, compressed)
         result[name] = entry
     for name in extras:
-        file_identity(files[name])
+        file_identity(files[name], name)
         result[name] = files[name]
     return result
 

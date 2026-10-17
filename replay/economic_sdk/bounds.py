@@ -195,7 +195,10 @@ class StateBudget:
         self.used = 0
 
     def replace(self, old, new, message="detached state budget"):
-        require(self.used - old + new <= self.limit, message)
+        if self.used - old + new > self.limit:
+            require(False, f"{message}: retained_bytes={self.used - old + new} "
+                    f"max_state_bytes={self.limit} used_bytes={self.used} "
+                    f"replaced_bytes={old} requested_bytes={new}")
         self.used += new - old
 
     def charge(self, amount, message="detached state budget"):
