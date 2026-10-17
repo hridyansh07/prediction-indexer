@@ -32,15 +32,26 @@ def _copy(source, destination):
 
 
 def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_exit, game_state,
-           excluded_groups=(), inputs=()):
+           excluded_groups=(), inputs=(), durable=False):
     """Copy every regular file of a finished bench output, hash it, then write the receipt last.
 
     `inputs` are (relative path, source) pairs kept beside the outputs: the prepared
     context and game state, which the bench only mounts under in/.
+    `durable` also syncs directory entries before and after receipt publication;
+    callers discarding their only private inputs must require this gate.
     """
     bench_output, destination = Path(bench_output), Path(destination)
     if destination.exists():
         raise FileExistsError(f"corpus result already exists: {destination}")
+    directories = set()
+    if durable:
+        from archive.common.durable import fsync_directory
+        # Include the existing ancestor that will gain the first new entry.
+        parent = destination
+        while not parent.exists():
+            directories.add(parent)
+            parent = parent.parent
+        directories.add(parent)
     sources = {}
     for path in sorted(p for p in bench_output.rglob("*") if p.is_file() and not p.is_symlink()):
         relative = path.relative_to(bench_output).as_posix()
@@ -55,6 +66,17 @@ def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_ex
         _copy(path, destination / relative)
         sha, length = _hash(destination / relative)
         files.append({"path": relative, "byte_length": length, "sha256": sha})
+        if durable:
+            parent = (destination / relative).parent
+            while parent != destination:
+                directories.add(parent)
+                parent = parent.parent
+    if durable:
+        destination.mkdir(parents=True, exist_ok=True)
+        # Files were individually fsynced above. Persist their names and every
+        # newly created ancestor before publishing the commit marker.
+        for directory in sorted(directories, key=lambda p: (-len(p.parts), str(p))):
+            fsync_directory(directory)
     receipt = {"corpus_receipt_version": VERSION, "corpus_key": corpus_key, "bundle_id": bundle_id,
                "status": status, "bench_exit": bench_exit, "game_state": game_state,
                "excluded_groups": list(excluded_groups), "files": files}
@@ -63,6 +85,8 @@ def commit(bench_output, destination, *, corpus_key, bundle_id, status, bench_ex
         writer.write(raw)
         writer.flush()
         os.fsync(writer.fileno())
+    if durable:
+        fsync_directory(destination)
     return hashlib.sha256(raw).hexdigest()
 
 

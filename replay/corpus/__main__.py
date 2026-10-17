@@ -73,14 +73,25 @@ def _main(argv=None):
     parser.add_argument("--seed", type=int, default=0, help="deterministic deep-audit sample seed (default: 0)")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--discard-materialized-inputs", action="store_true", help=(
+        "run only, default off: bypass the shared derivative cache (including its writable probe) and "
+        "discard only this attempt's fresh private work after bench SUCCESS/exit 0 and durable result commit. "
+        "Never removes canonical/raw evidence, committed results or the pre-existing shared cache. "
+        "Receipt verification remains possible; future deep audits can be INCOMPLETE until exact matching "
+        "derivatives are available/restored (deep audit does not rebuild them). Canonical evidence plus the "
+        "exact producer may permit reconstruction, not immediate audit readiness. May increase "
+        "rematerialization CPU/I/O and transient space. Failed/interrupted attempts remain for separate "
+        "review; not a general cleanup tool. Use a dedicated, disjoint, non-symlink work_root."))
     parser.add_argument("--refresh-bundles", action="store_true",
                         help="re-list retired bundles from Universe instead of the cached list")
     args = parser.parse_args(argv)
+    if args.discard_materialized_inputs and args.command != "run":
+        parser.error("--discard-materialized-inputs requires run")
     if args.deep and args.command != "verify" or args.sample is not None and not args.deep:
         parser.error("--deep and --sample require verify --deep")
     if args.sample is not None and (args.sample < 1 or args.bundle):
         parser.error("--sample must be positive and cannot be combined with --bundle")
-    spec = specs.load(args.spec, read_only=args.deep)
+    spec = specs.load(args.spec, read_only=args.deep, discard_materialized_inputs=args.discard_materialized_inputs)
     key, runner_config = _context(spec, args.allow_dirty)
     if args.deep:
         return verify_deep(Path(spec["results_root"]) / key[:16], spec,
@@ -103,6 +114,14 @@ def _main(argv=None):
             print("  ", name, error)
         return 1 if bad else 0
 
+    if args.discard_materialized_inputs:
+        print("discard-materialized-inputs: shared derivative cache bypassed; only fresh private attempts "
+              "are discarded after SUCCESS/exit 0 and durable commit. Canonical/raw evidence, committed "
+              "results and pre-existing shared cache are never removed. Receipt verification remains "
+              "possible; deep audit may be INCOMPLETE without exact matching derivatives and does not "
+              "rebuild them. Reconstruction needs canonical evidence and the exact producer. "
+              "Rematerialization may increase CPU/I/O and transient space; failed/interrupted attempts "
+              "remain for separate review, not automatic cleanup.", flush=True)
     from archive.storage.factory import build_store
     from archive.storage.local import LocalObjectStore
     from replay.bench.docker import run_bench
@@ -139,7 +158,8 @@ def _main(argv=None):
                         history=HistoryClient(spec["universe_base_url"], timeout=120), game_store=game_store,
                         image_id=ledger.get_meta("image_id:" + key), ensure_bundle=ensure_bundle,
                         prepare_stage=prepare_stage, supervisor_config=supervisor_config,
-                        prepare_game_state=prepare_game_state, run_bench=run_bench)
+                        prepare_game_state=prepare_game_state, run_bench=run_bench,
+                        discard_materialized_inputs=args.discard_materialized_inputs)
     print(f"{len(bundles)} bundles selected")
     processed, skipped = run_corpus(pipeline, ledger, bundles, retry_failed=args.retry_failed,
                                     log=lambda m: print(m, flush=True))

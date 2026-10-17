@@ -7,6 +7,7 @@ import importlib
 import inspect
 import json
 import shutil
+import sys
 import time
 import traceback
 from contextlib import ExitStack
@@ -18,6 +19,7 @@ from urllib.request import ProxyHandler, build_opener
 from replay.corpus import results
 from replay.corpus.fees import fee_inputs
 from replay.corpus.overlay import OverlayStore, VerifyingSink
+from replay.corpus.private import PrivateAttempt, validate_roots
 from replay.corpus.spec import substitute
 
 PUBLISHER, PYTHON = Path("/usr/local/bin/replay-publish"), Path("/usr/local/bin/python3.13")
@@ -94,30 +96,52 @@ class Pipeline:
     """Dependencies are injected so tests run without Universe, GCS, Rust or Docker."""
 
     def __init__(self, spec, *, corpus_key, config, canonical, history, game_store, image_id,
-                 ensure_bundle, prepare_stage, supervisor_config, prepare_game_state, run_bench, sleep=time.sleep):
+                 ensure_bundle, prepare_stage, supervisor_config, prepare_game_state, run_bench, sleep=time.sleep,
+                 discard_materialized_inputs=False):
         self.spec, self.corpus_key, self.config = spec, corpus_key, config
         self.canonical, self.history, self.game_store = canonical, history, game_store
         self.image_id = image_id
         self.ensure_bundle, self.prepare_stage = ensure_bundle, prepare_stage
         self.supervisor_config, self.prepare_game_state, self.run_bench = supervisor_config, prepare_game_state, run_bench
         self.sleep = sleep
+        self.discard_materialized_inputs = discard_materialized_inputs
+        self.materialized_inputs_diagnostics = None
         self.derivative_cache, self.cache_diagnostics = None, None
-        if "derivative_cache" in spec:
+        if "derivative_cache" in spec and not discard_materialized_inputs:
             from replay.jobs.derivative_cache import DerivativeCache
             self.derivative_cache = DerivativeCache(**spec["derivative_cache"])
 
     def results_dir(self, bundle_id):
+        from replay.jobs.contracts import bundle_receipt_key
+        bundle_receipt_key(bundle_id)   # also protects the legacy retry deletion path
+        if self.discard_materialized_inputs:
+            validate_roots(self.spec)
         return Path(self.spec["results_root"]) / self.corpus_key[:16] / bundle_id
 
     def run(self, bundle_id):
         """Return (state, bench_exit, receipt_sha256, excluded_groups); raise StageError on a failed stage."""
-        from replay.jobs.contracts import parse_request
-        work = Path(self.spec["work_root"]) / bundle_id
-        shutil.rmtree(work, ignore_errors=True)   # a crashed earlier attempt
-        work.mkdir(parents=True)
+        from replay.jobs.contracts import bundle_receipt_key, parse_request
+        self.materialized_inputs_diagnostics = None
+        _stage("request", bundle_receipt_key, bundle_id)   # before any work deletion
+        attempt, discard_ready = None, False
+        if self.discard_materialized_inputs:
+            attempt = _stage("work", PrivateAttempt, self.spec)
+            work = attempt.path
+            self.materialized_inputs_diagnostics = {
+                "mode": "discard_materialized_inputs", "attempt_path": str(work), "cleanup": "retained"}
+        else:
+            work = Path(self.spec["work_root"]) / bundle_id
+            shutil.rmtree(work, ignore_errors=True)   # a crashed earlier legacy attempt
+            work.mkdir(parents=True)
         leases = ExitStack()
         self.cache_diagnostics = None
         try:
+            if attempt is not None:
+                # Fail closed before consumers if the path cannot be logged;
+                # the finally below still closes both owned descriptors.
+                _stage("work_log", print,
+                       f"{bundle_id} materialized_inputs: {json.dumps(self.materialized_inputs_diagnostics)}",
+                       file=sys.stderr, flush=True)
             job_id = _job_id(bundle_id)
             request = _stage("request", parse_request, json.dumps({
                 "replay_request_version": 1, "bundle_id": bundle_id, "probe_markets": None, "interval": None,
@@ -187,6 +211,8 @@ class Pipeline:
             if self.image_id is None and (work / "bench" / "image.id").exists():
                 self.image_id = (work / "bench" / "image.id").read_text().strip()
             status = json.loads((work / "bench" / "result.json").read_bytes())["status"]
+            if attempt is not None:
+                self.materialized_inputs_diagnostics.update(bench_exit=exit_code, bench_status=status)
             kept = [("context/context.json", context / "context.json"),
                     ("context/receipt.json", context / "receipt.json")]
             if game_path is not None:
@@ -194,14 +220,48 @@ class Pipeline:
             receipt_sha = _stage("commit", results.commit, work / "bench", self.results_dir(bundle_id),
                                  corpus_key=self.corpus_key, bundle_id=bundle_id, status=status,
                                  bench_exit=exit_code, game_state=game_state, excluded_groups=excluded,
-                                 inputs=kept)
+                                 inputs=kept, **({"durable": True} if attempt is not None else {}))
+            if attempt is not None:
+                self.materialized_inputs_diagnostics["durable_commit"] = True
+            discard_ready = exit_code == 0 and status == "SUCCESS"
             state = {"SUCCESS": "done", "GAME_STATE_UNAVAILABLE": "game_state_unavailable"}.get(status, "failed")
+            if attempt is not None and status == "SUCCESS" and exit_code != 0:
+                # The bench may have succeeded before its Docker cleanup failed (exit 3).
+                state = "failed"
             return state, exit_code, receipt_sha, excluded
         finally:
             try:
                 leases.close()
             finally:
-                shutil.rmtree(work, ignore_errors=True)
+                if attempt is None:
+                    shutil.rmtree(work, ignore_errors=True)
+                else:
+                    self._finish_private_attempt(bundle_id, attempt, discard_ready and sys.exc_info()[0] is None)
+
+    def _finish_private_attempt(self, bundle_id, attempt, discard_ready):
+        diagnostic = self.materialized_inputs_diagnostics
+        try:
+            if discard_ready:
+                try:
+                    attempt.discard()
+                    diagnostic["cleanup"] = "discarded"
+                except (Exception, KeyboardInterrupt) as error:
+                    diagnostic.update(cleanup="cleanup_failed", error=f"{type(error).__name__}: {error}",
+                                      note="retained path may be partially removed; review separately")
+                    if isinstance(error, KeyboardInterrupt):
+                        raise
+        finally:
+            try:
+                attempt.close()
+            except OSError as error:
+                diagnostic["close_error"] = str(error)
+            # Operational evidence lives in logs/ledger, never in a published result.
+            # A broken log must not mask a stage error/interrupt or invalidate a
+            # durable success. The caller can still persist this in the ledger.
+            try:
+                print(f"{bundle_id} materialized_inputs: {json.dumps(diagnostic)}", file=sys.stderr, flush=True)
+            except (Exception, KeyboardInterrupt) as error:
+                diagnostic["log_error"] = f"{type(error).__name__}: {error}"
 
     def _prepare(self, work, request, resolved, ready):
         """Prepare the context; outcomes must come from Universe.
@@ -275,6 +335,8 @@ def run_corpus(pipeline, ledger, bundles, *, retry_failed=False, log=print):
             detail = {"excluded_groups": excluded} if excluded else {}
             if pipeline.cache_diagnostics is not None:
                 detail["derivative_cache"] = pipeline.cache_diagnostics
+            if pipeline.materialized_inputs_diagnostics is not None:
+                detail["materialized_inputs"] = pipeline.materialized_inputs_diagnostics
             ledger.finish(pipeline.corpus_key, bundle_id, state, seconds=time.monotonic() - started,
                           bench_exit=exit_code, receipt_sha256=receipt,
                           detail=json.dumps(detail) if detail else None)
@@ -282,8 +344,13 @@ def run_corpus(pipeline, ledger, bundles, *, retry_failed=False, log=print):
             log(f"[{index}/{len(bundles)}] {bundle_id} {state} exit={exit_code} {time.monotonic() - started:.0f}s{note}")
         except StageError as error:
             detail = "".join(traceback.format_exception(error.error))[-4000:]
-            if pipeline.cache_diagnostics is not None:
-                detail = json.dumps({"error": detail, "derivative_cache": pipeline.cache_diagnostics})
+            if pipeline.cache_diagnostics is not None or pipeline.materialized_inputs_diagnostics is not None:
+                diagnostics = {"error": detail}
+                if pipeline.cache_diagnostics is not None:
+                    diagnostics["derivative_cache"] = pipeline.cache_diagnostics
+                if pipeline.materialized_inputs_diagnostics is not None:
+                    diagnostics["materialized_inputs"] = pipeline.materialized_inputs_diagnostics
+                detail = json.dumps(diagnostics)
             ledger.finish(pipeline.corpus_key, bundle_id, "failed", seconds=time.monotonic() - started,
                           stage=error.stage, detail=detail)
             log(f"[{index}/{len(bundles)}] {bundle_id} FAILED at {error.stage}: {error}")
