@@ -61,6 +61,7 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {"version": 1, "economic": "zstd"},
         "fees": "@corpus:fees",
         "policy": {
           "version": 2,
@@ -115,6 +116,7 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {"version": 1, "economic": "zstd"},
         "fees": "@corpus:fees",
         "policy": {
           "version": 4,
@@ -213,6 +215,7 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {"version": 1, "economic": "zstd"},
         "fees": "@corpus:fees",
         "policy": {
           "version": 2,
@@ -307,6 +310,7 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {"version": 1, "economic": "zstd"},
         "fees": "@corpus:fees",
         "policy": {
           "version": 4,
@@ -405,6 +409,7 @@
         "version": 1,
         "snapshot_directory": "{context}",
         "snapshot_sha256": "{snapshot_sha256}",
+        "storage": {"version": 1, "economic": "zstd"},
         "fees": "@corpus:fees",
         "policy": {
           "version": 4,

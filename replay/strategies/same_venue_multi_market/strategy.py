@@ -101,14 +101,15 @@ class SameVenueMultiMarket(MultiMarketReader):
                            payload=payload, quotes=quotes)
 
     def manifest(self, files, instantaneous):
-        return {"version": 1, "strategy": self.experiment.strategy,
+        from replay.economic_sdk.storage import stored_manifest
+        return stored_manifest({"version": 1, "strategy": self.experiment.strategy,
                 "snapshot_sha256": self.inputs.prepared.sha256, "policy": self.policy,
                 "policy_sha256": self.experiment.policy_sha256,
                 "experiment_sha256": self.experiment.experiment_sha256,
                 "fee_config": self.bridge.semantic_config, "fee_engine_identity": self.bridge.engine_identity,
                 "files": files, "instantaneous_positive": instantaneous,
                 "settlement_model": SETTLEMENT,
-                "outcomes_provider": self.snapshot.get("outcomes", {}).get("provider")}
+                "outcomes_provider": self.snapshot.get("outcomes", {}).get("provider")}, self.inputs.storage, 2)
 
     def validate(self, directory, snapshot, manifest):
         from replay.streams.protocol import require

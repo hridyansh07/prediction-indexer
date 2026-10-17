@@ -182,11 +182,13 @@ def economics_by_key(fee_config):
 class Inputs:
     def __init__(self, config):
         from replay.strategies._shared.fee_bridge import FeeBridge
-        config = obj(plain(config), "version snapshot_directory snapshot_sha256 fees policy valuation")
+        from replay.economic_sdk.storage import closed_config, configured_storage
+        config = closed_config(config, "version snapshot_directory snapshot_sha256 fees policy valuation")
         require(len(encoded(config)) <= 8 * 1024 * 1024, "configuration budget")
         self.prepared = PreparedInput({k: config[k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
         self.snapshot = plain(self.prepared.snapshot)
         self.policy = policy_config(config["policy"])
+        self.storage = configured_storage(config, 2)
         self.valuation = valuation_config(config["valuation"])
         self.bridge = FeeBridge(config["fees"], self.snapshot["plans"])
         self.identity = experiment_identity(self.prepared.sha256, self.policy,

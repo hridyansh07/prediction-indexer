@@ -12,6 +12,7 @@ from replay.economic_sdk import FillSpec, Strategy, aggregate_reader
 from replay.economic_sdk.bounds import MAX_METADATA, MAX_STATE
 from replay.economic_sdk.fills import step_atoms
 from replay.economic_sdk.reader import read_json, signed
+from replay.economic_sdk.storage import logical_files, manifest_storage
 from replay.fees import Policy
 from replay.fees.domain import AccountClass, Component, Evidence, Venue
 from replay.preparation import digest, encoded, load_snapshot, sha
@@ -226,8 +227,10 @@ def check_manifest(value, snapshot, complete):
     fields = ("version strategy snapshot_sha256 policy policy_sha256 experiment_sha256 fee_config "
               "fee_engine_identity files instantaneous_positive settlement_model outcomes_provider")
     from replay.economic_sdk.game import manifest_fields
-    obj(value, fields + (" summary_sha256" if complete else "") + manifest_fields(value))
-    require(type(value["version"]) is int and value["version"] == 1 and value["strategy"] == STRATEGY,
+    obj(value, fields + (" storage" if value.get("version") == 2 else "")
+        + (" summary_sha256" if complete else "") + manifest_fields(value))
+    manifest_storage(value, 1, 2)
+    require(value["strategy"] == STRATEGY,
             "manifest version/strategy")
     policy_config(value["policy"])
     require(value["settlement_model"] == SETTLEMENT
@@ -246,6 +249,7 @@ def check_manifest(value, snapshot, complete):
     for key, amount in value["instantaneous_positive"].items():
         sha(key)
         require(type(amount) is int and 0 <= amount <= 2 ** 64 - 1, "instantaneous positive count")
+    logical_files(value, experiment(value["policy"], value["experiment_sha256"]))
 
 
 def validate_content(directory, snapshot, manifest, bridge):
@@ -299,6 +303,7 @@ def read_completed(run_directory, group):
                               expected_sha256=spec["config"]["snapshot_sha256"], bridge=inputs.bridge)
     require(result["manifest"]["experiment_sha256"] == inputs.identity
             and result["manifest"]["fee_engine_identity"] == inputs.bridge.engine_identity, "configured identity")
+    require(result["manifest"].get("storage") == inputs.storage, "configured storage")
     require({k: result["receipt"][k] for k in ("identity", "attempt_id", "group", "run_id", "terminal")} ==
             {"identity": success["identity"], "attempt_id": success["attempt"], "group": group,
              "run_id": config["transport"]["run_id"], "terminal": success["terminal"]},

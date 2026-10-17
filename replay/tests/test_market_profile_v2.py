@@ -485,7 +485,7 @@ class ProfileStorageTests(Case):
             exercise(h)
             h.terminal()
             h.decoder.finish()
-            with patch("replay.economic_sdk.transitions." + boundary, side_effect=OSError("synthetic failure")):
+            with patch("replay.economic_sdk.framing." + boundary, side_effect=OSError("synthetic failure")):
                 with self.subTest(boundary=boundary), self.assertRaisesRegex(OSError, "synthetic failure"):
                     h.strategy.finish()
             self.assertTrue((h.profile_output / "profile.ndjson").is_file())

@@ -38,8 +38,9 @@ from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.fills import (FILL_LIVE, FILL_STATES, KILL_PRICE, MAX_END_REASON,
                                        check_experiment)
 from replay.economic_sdk.entity_tables import entity_rows
-from replay.economic_sdk.output import aggregate_files, file_list, group_of
-from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
+from replay.economic_sdk.output import aggregate_files, group_of
+from replay.economic_sdk.reader import Budget, document, lines, quantiles, signed
+from replay.economic_sdk.storage import check_inventory, logical_files
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES, SELL_SOURCES
 from replay.economic_sdk.game import check_binding, check_episode_game
 from replay.economic_sdk.probe_reader import check_ages, validate as validate_probes
@@ -331,8 +332,8 @@ def validate(directory, snapshot, manifest, strategy):
     check_experiment(experiment)
     snapshot = plain(snapshot)
     root = Path(directory)
-    files = manifest["files"]
-    check_files(files, file_list(experiment) + strategy.extra_files())
+    files = logical_files(manifest, experiment)
+    check_inventory(root, manifest["files"])
     plans = {(p["instrument"], p["orientation"]): p for p in snapshot["plans"]}
     scopes = snapshot["scopes"]
     run_end = int(scopes[-1]["end_ns"])

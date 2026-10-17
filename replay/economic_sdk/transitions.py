@@ -9,16 +9,16 @@ only as the ``outcome`` (Yes) book, whose ask is projected from the
 book showed, never why (``docs/specs/MARKET_PROFILE_V2.md`` section 4).
 
 This module also holds the machinery both streams share: the written-book table,
-flat venue-time keys, scope-entry rows and the commit of one Zstandard frame.
+flat venue-time keys and scope-entry rows. Durable Zstandard frame publication
+is shared with economic evidence in ``framing.py``.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from encoder import encode_stream
 from replay.economic_sdk import bounds
+from replay.economic_sdk.framing import finish_frame
 from replay.economic_sdk.profile_policy import (
     TRANSITIONS_FILE,
     TRANSITIONS_MAX_BYTES,
@@ -27,7 +27,6 @@ from replay.economic_sdk.profile_policy import (
 )
 from replay.strategy_sdk import LineWriter
 from replay.streams.protocol import require
-from replay.supervisor import fsync_directory
 
 BID, ASK = 0, 1
 # A touching transition's strength: the strongest one of a cut names a row's cause.
@@ -111,30 +110,6 @@ def validity_text(book):
 
 def quote_text(quote):
     return None if quote is None else [str(quote[0]), str(quote[1])]
-
-
-def finish_frame(writer, stored):
-    """Commit one frame, then remove only this writer's newly produced plain spool.
-
-    Callers own these exclusive writers in a fresh empty output directory.
-    The manifest/receipt is published only after this function succeeds.
-    """
-    logical = writer.finish()
-    plain = writer.path
-    temporary = stored.with_name(stored.name + ".open")
-    require(not stored.exists(), "existing output")
-    with plain.open("rb") as source, temporary.open("xb") as sink:
-        result = encode_stream(source, sink)
-        sink.flush()
-        os.fsync(sink.fileno())
-    require({"sha256": result.logical.sha256, "byte_length": result.logical.byte_length,
-             "records": result.logical.line_count} == logical, stored.name + " logical identity")
-    temporary.rename(stored)
-    fsync_directory(stored.parent)
-    plain.unlink()
-    fsync_directory(stored.parent)
-    return {"logical": logical,
-            "stored": {"sha256": result.stored.sha256, "byte_length": result.stored.byte_length}}
 
 
 class CutScan:
@@ -230,7 +205,7 @@ class Stream:
     # -- commit --------------------------------------------------------------------
     def finish(self):
         """Seal the rows, store them as one Zstandard frame, then drop the plain file."""
-        return finish_frame(self.writer, self.root / self.final)
+        return finish_frame(self.writer)
 
 
 class TransitionRecorder(Stream):

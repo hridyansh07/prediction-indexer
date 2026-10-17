@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from replay.economic_fills import walk
 from replay.economic_sdk import bounds
+from replay.economic_sdk.framing import finish_frame
 from replay.economic_sdk.availability import IntervalEngine
 from replay.economic_sdk.availability_reader import MAX_BYTES as AVAILABILITY_BYTES
 from replay.economic_sdk.availability_reader import MAX_LINE as AVAILABILITY_LINE
@@ -45,7 +46,7 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     profile_storage,
 )
 from replay.economic_sdk.levels import LevelRecorder
-from replay.economic_sdk.transitions import CutScan, TransitionRecorder, finish_frame
+from replay.economic_sdk.transitions import CutScan, TransitionRecorder
 from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
@@ -718,7 +719,7 @@ class Collector:
         files = {}
         for name, writer in self.writers.items():
             if name == PROFILE_PLAIN and self.storage is not None:
-                files[PROFILE_FILE] = finish_frame(writer, writer.path.with_name(PROFILE_FILE))
+                files[PROFILE_FILE] = finish_frame(writer)
             else:
                 files[name] = writer.finish()
         if self.transitions is not None:

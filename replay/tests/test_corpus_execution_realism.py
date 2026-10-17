@@ -38,6 +38,9 @@ class ReferenceCorpusTests(unittest.TestCase):
     def test_reference_has_exact_policies_and_sixty_probe_scenarios(self):
         groups = {g["name"]: g for g in self.reference()["groups"]}
         self.assertEqual(set(groups), {"coverage", "complement", "profile", *VERSIONS})
+        for name in ("complement", *VERSIONS):
+            self.assertEqual(groups[name]["config"]["storage"], {"version": 1, "economic": "zstd"})
+        self.assertNotIn("storage", groups["coverage"]["config"])
         for name, version in VERSIONS.items():
             with self.subTest(group=name):
                 policy = groups[name]["config"]["policy"]
@@ -84,6 +87,11 @@ class ReferenceCorpusTests(unittest.TestCase):
                         materializer_describe=b"offline producer", runner_config=b"{}")
             base = corpus_key(spec, **args)
             for group in spec["groups"]:
+                if "storage" in group["config"]:
+                    changed = copy.deepcopy(spec)
+                    changed["groups"][spec["groups"].index(group)]["config"].pop("storage")
+                    with self.subTest(group=group["name"], field="storage"):
+                        self.assertNotEqual(corpus_key(changed, **args), base)
                 if group["name"] not in VERSIONS:
                     continue
                 index = spec["groups"].index(group)
@@ -111,6 +119,22 @@ class ReferenceCorpusTests(unittest.TestCase):
             path.write_text(json.dumps(spec))
             with self.assertRaisesRegex(ValueError, "corpus spec"):
                 load(path)
+
+    def test_economic_storage_is_closed_explicit_and_layout_two_only(self):
+        from replay.economic_sdk.storage import closed_config, configured_storage
+        from replay.streams.protocol import ProtocolError
+        self.assertIsNone(configured_storage({}, 1))
+        self.assertIsNone(configured_storage({}, 2))
+        value = {"version": 1, "economic": "zstd"}
+        self.assertEqual(configured_storage({"storage": value}, 2), value)
+        for invalid in (None, {}, {**value, "profile": "zstd"}, {**value, "version": True},
+                        {**value, "version": 2}, {**value, "economic": "plain"}):
+            with self.subTest(storage=invalid), self.assertRaises(ProtocolError):
+                configured_storage({"storage": invalid}, 2)
+        with self.assertRaisesRegex(ProtocolError, "requires layout 2"):
+            configured_storage({"storage": value}, 1)
+        with self.assertRaises(ProtocolError):
+            closed_config({"version": 1, "storage": value, "unknown": True}, "version")
 
 
 if __name__ == "__main__":
