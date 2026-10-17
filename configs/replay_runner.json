@@ -23,7 +23,7 @@
       "max_entry_bytes": 1048576,
       "max_queue_bytes": 67108864,
       "command_timeout_ms": 5000,
-      "publish_batch_entries": 100,
+      "publish_batch_entries": 1024,
       "attempts": 3,
       "no_progress": 2,
       "progress_margin": 100,

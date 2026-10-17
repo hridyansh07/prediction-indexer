@@ -1,13 +1,14 @@
 """Independent cross-venue result reader; never imports the runtime evaluator."""
 
-from fractions import Fraction
+from replay.strategies._shared.execution_realism import ExecutionRealism
 from pathlib import Path
 
 from replay.strategies import canonical_reference
+from replay.strategies._shared.metadata import native_metadata
 
 from .contract import (
     STRATEGY, SETTLEMENT, SCALE, UNIT, Inputs, asset_row, asset_value, assess_net, baskets,
-    economics_by_key, experiment, experiment_identity, net_of, policy_config, valuation_config,
+    economics_by_key, experiment, experiment_identity, native_amount, net_of, policy_config, valuation_config,
 )
 from replay.strategies.same_venue_complement.contract import control_descriptor, control_label
 from replay.strategies.same_venue_complement.output import _aggregate_rows
@@ -21,10 +22,11 @@ from replay.preparation import digest, encoded, load_snapshot, sha
 from replay.streams.protocol import freeze, obj, require, uint
 
 
-class CrossVenueReader(Strategy):
+class CrossVenueReader(ExecutionRealism, Strategy):
     native_scales = True
 
     def __init__(self, policy, identity, valuation, fees, snapshot, bridge=None):
+        self.snapshot = snapshot
         self.policy = policy_config(policy)
         self.valuation = valuation_config(valuation)
         self.experiment = experiment(self.policy, identity)
@@ -71,23 +73,29 @@ class CrossVenueReader(Strategy):
         the fill's open time. ``None`` when any fee, economics or valuation input
         is unknown.
         """
-        d = entity.descriptor
-        acquired = tuple((leg["instrument"], leg["orientation"]) for leg in d["legs"])
-        economics = tuple(self.bridge.economics(key) for key in acquired)
-        if any(e is None for e in economics) or any(
-                asset_row(e.quote) not in self.valuation["assets"] for e in economics):
+        metadata = native_metadata(self, entity)
+        if metadata.missing_economics or any(
+                quote not in self.valuation["assets"] for quote in metadata.quote_assets):
             return None
-        fee_legs = tuple({"market_id": leg["market_id"], "key": key, "fill": fill,
-                          "price_scale": e.price_scale, "quantity_scale": e.quantity_scale, "side": "BUY"}
-                         for leg, key, fill, e in zip(d["legs"], acquired, legs, economics))
+        fee_legs = tuple(dict(leg._asdict(), fill=fill) for leg, fill in zip(metadata.fee_legs, legs))
         native, unknown, _, _ = assess_net(
-            self.bridge, experiment=self.experiment.experiment_sha256, scope=0, basket=d,
+            self.bridge, experiment=self.experiment.experiment_sha256, scope=0, basket=metadata.basket,
             size=steps, time=time, sequence=0, fee_legs=fee_legs)
         if unknown:
             return None
-        minimum = steps * Fraction(self.experiment.fills.step_contracts) * self.threshold * 10 ** 18
+        minimum = steps * metadata.minimum_step
         require(minimum.denominator == 1, "minimum net gap is not exact at the fill step")
         return net_of(native) - int(minimum)
+
+    def fill_loss(self, entity, native_losses, time_ns):
+        """Gross unwind loss in scale-36 research dollars under pinned parity."""
+        economics = tuple(self.bridge.economics((leg["instrument"], leg["orientation"]))
+                          for leg in entity.descriptor["legs"])
+        require(self.valuation is not None and all(e is not None and
+                asset_row(e.quote) in self.valuation["assets"] for e in economics),
+                "probe loss valuation unavailable")
+        return sum(native_amount(loss, e.price_scale + e.quantity_scale)
+                   for loss, e in zip(native_losses, economics))
 
     def control_descriptor(self, basket, control, replacement, admission):
         return control_descriptor(self.policy, basket, control, replacement, admission)

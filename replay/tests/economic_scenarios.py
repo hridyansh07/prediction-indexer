@@ -45,6 +45,18 @@ def ladder(h, time, instrument, orientation="outcome", *, bids=(), asks=(), why=
                           "market_events": [], "book_transitions": [transition]})
 
 
+def kalshi_books(h, time, instrument="kalshi:series", *, yes=(), no=(), unusable=None):
+    """Normalizer-shaped pair: native YES/NO bids, never native asks.
+
+    Like kalshi/event.rs, one snapshot updates both orientations. ``unusable``
+    optionally invalidates one orientation after the paired snapshot.
+    """
+    for orientation, bids in (("outcome", yes), ("complement", no)):
+        ladder(h, time, instrument, orientation, bids=bids)
+    if unusable is not None:
+        ladder(h, time, instrument, unusable, why={"kind": "connection_closed"})
+
+
 M = 1_000_000  # one contract at quantity scale 6
 
 

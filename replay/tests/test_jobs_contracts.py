@@ -753,7 +753,7 @@ class RunnerConfigTest(unittest.TestCase):
         self.assertEqual(set(config.authorities), {"kalshi", "limitless", "polymarket"})
         self.assertEqual(config.orchestration, c.Orchestration(20, 86400, 60))
         self.assertIn("small", config.limits)
-        self.assertEqual(config.limits["small"]["publish_batch_entries"], 100)
+        self.assertEqual(config.limits["small"]["publish_batch_entries"], 1024)
         self.assertEqual(
             config.strategies["bundle_coverage"],
             c.StrategyEntry(

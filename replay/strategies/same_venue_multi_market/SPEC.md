@@ -77,6 +77,12 @@ The strategy uses SDK fill checks only
 
 Controls are not supported with fill checks.
 
+With explicit probes, `fill_loss` converts every signed native gross unwind
+loss to scale 36 in the set's common quote asset, matching `fill_value` units.
+Unknown economics or different quote assets fail conversion. Native leg costs
+and exit proceeds remain unchanged. Reader-only instances retain the pinned
+snapshot for the default execution-terms lookup. Probes remain opt-in.
+
 ## 4. Configuration
 
 The closed run config is `{version: 1, snapshot_directory, snapshot_sha256,
@@ -147,3 +153,13 @@ completed reader re-priced every fill, and bench cleanup reported no errors.
 - **Independent check** against the published fee formulas, not the fee SDK:
   all 29 opening payloads (1-set gross and net), all 3 fill values, all 6 kill
   prices, and all 3 edge stops' next steps (from `beyond`) agree.
+
+## Execution-realism policy 2
+
+The newer closed policy and upgraded example implement the authorized
+[strategy-realism specification](../../../docs/specs/STRATEGY_EXECUTION_REALISM_V1.md).
+Its [producer contract](../../../docs/specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md)
+owns required t10/probes/flags, independent reader checks and exact monetary/native
+units. Earlier policies above retain their schemas and bytes. The reference is
+60 probes per fill; no flag filters an episode. Retained-data acceptance remains
+pending.

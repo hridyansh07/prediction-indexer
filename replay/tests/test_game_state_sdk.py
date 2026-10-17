@@ -498,7 +498,14 @@ class GameInputTests(unittest.TestCase):
         with patch.object(SameVenueComplement, "baskets", baskets), \
              patch.object(SameVenueComplement, "requirements", requirements), \
              patch.object(SameVenueComplement, "evaluate", evaluate):
-            h = self.harness(); h.window(); seen.clear(); h.group(19)
+            h = self.harness()
+            from replay.economic_sdk.retention import for_groups
+            self.assertEqual(for_groups(h.snapshot, [{
+                "factory": "replay.strategies.same_venue_complement:build",
+                "config": h.complement_config,
+            }]), {"retain_boundaries_ns": ["10", "12", "17", "20", "22", "32", "40"],
+                 "retain_shift_offsets_ns": []})
+            h.window(); seen.clear(); h.group(19)
             self.assertEqual({(d, t) for d, t, _, _ in seen}, {("long", 12), ("long", 17)})
             h.group(20)
             self.assertIn(("long", 20, "between_segments", 3), seen)

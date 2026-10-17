@@ -20,6 +20,12 @@ over every market instead produces relations the report legitimately does not
 contain -- and asserts equivalences over markets the targeter had already judged
 untrustworthy.
 
+A market whose parameter the projection corrected (see
+`docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md`) is the one exception to checking
+against the report: the report derived its relations from the uncorrected
+value, so relations naming such a market are checked against the relationships
+the targeter code derives from the corrected rebuilt bundle.
+
 Recomputation is the risk: a bundle rebuilt here must compile the same masks the
 targeter compiled at report time. `verify_claims` is the standing check, and it
 is deliberately asymmetric. A relation the claims *invent* is a guessed
@@ -48,7 +54,7 @@ from targeter.v2.models import (
     EventBundle,
     parse_timestamp,
 )
-from targeter.v2.relationships import derive_bundle_claims
+from targeter.v2.relationships import derive_bundle_claims, derive_bundle_relationships
 from universe.derive.market_projection import MarketProjectionError
 
 
@@ -86,7 +92,13 @@ def project_claims(
 
     Raises ``MarketProjectionError`` when the recomputed claims assert a
     cross-venue relation the report did not record.
+
+    Offline migration may supply ``relations=None`` when v6 did not retain
+    the candidate's report context. Derive its market claims, but neither
+    verify nor emit relations without that evidence. Ingestion's closed
+    projection validator requires a list, so it never takes this path.
     """
+    verification_available = projection["relations"] is not None
     # One raw projection event is one candidate bundle, which is the unit the
     # targeter derives relationships over. `event_id_for_bundle` maps that
     # bundle onto the umbrella event the resolved projection assigned it, so a
@@ -102,6 +114,16 @@ def project_claims(
     venue_markets: dict[str, list[Mapping[str, Any]]] = {}
     for row in projection["venue_markets"]:
         venue_markets.setdefault(row["event_id"], []).append(row)
+
+    corrected = {
+        (row["venue"], row["venue_market_id"])
+        for row in projection.get("corrections", ())
+    }
+    # Markets whose recorded relations are stale because the report derived
+    # them from a parameter this projection corrected, and the relations the
+    # targeter code derives for them from the corrected bundle instead.
+    rederived: list[dict[str, Any]] = []
+    rederived_markets: set[tuple[str, str]] = set()
 
     unreconstructed = 0
     claims: dict[str, dict[str, Any]] = {}
@@ -127,6 +149,31 @@ def project_claims(
         groups = derive_bundle_claims(
             bundle, excluded_market_ids=exclusions.get(event_id, frozenset())
         )
+        touched = {
+            (row["venue"], row["venue_market_id"])
+            for row in venue_markets.get(event_id, ())
+        } & corrected
+        if touched and verification_available:
+            analysis = derive_bundle_relationships(
+                bundle, excluded_market_ids=exclusions.get(event_id, frozenset())
+            )
+            rederived_markets |= touched
+            for relation in analysis.relationships:
+                members = [
+                    {
+                        "venue": venue,
+                        "venue_market_id": native,
+                        "claim_key": claim_key,
+                    }
+                    for venue, native, claim_key in (
+                        _split(relation.left),
+                        _split(relation.right),
+                    )
+                ]
+                if any((m["venue"], m["venue_market_id"]) in touched for m in members):
+                    rederived.append(
+                        {"relation_type": relation.relationship, "members": members}
+                    )
         implied |= implied_market_relations(groups)
         for group in groups:
             for claim in group.claims:
@@ -170,10 +217,18 @@ def project_claims(
                     },
                 )
 
-    shortfall = verify_claims(implied, projection["relations"])
+    recorded = [
+        row
+        for row in projection["relations"] or ()
+        if not any(
+            (member["venue"], member["venue_market_id"]) in rederived_markets
+            for member in row["members"]
+        )
+    ] + rederived
+    shortfall = verify_claims(implied, recorded) if verification_available else 0
     return {
         "claims": [claims[key] for key in sorted(claims)],
-        "claim_relations": [relations[key] for key in sorted(relations)],
+        "claim_relations": [relations[key] for key in sorted(relations)] if verification_available else [],
         "market_claims": [market_claims[key] for key in sorted(market_claims)],
         "relation_shortfall": shortfall,
         "unreconstructed_bundles": unreconstructed,

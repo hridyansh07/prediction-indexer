@@ -15,7 +15,7 @@ from replay.supervisor import fsync_directory
 MAX_BYTES = 16 * 1024 * 1024
 NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}')
 IMPORT = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*')
-RESERVED = {'.', '..', 'publisher', 'ready', 'publisher.json', 'result.json', 'interrupted.json'}
+RESERVED = {'.', '..', 'publisher', 'ready', 'publisher.json', 'publisher.stderr.txt', 'result.json', 'interrupted.json'}
 
 
 def read_json(path):

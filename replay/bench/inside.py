@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import time
 
+from replay.economic_sdk.completed_reader import read_completed
 from replay.preparation import load_snapshot
 from replay.fees.artifacts import load_catalog
 from replay.strategies import load_entrypoint
@@ -126,7 +127,7 @@ def execute(spec, output=Path('/bench'), *, redis_url, supervisor_run=supervisor
             if 'unavailable' in entry:
                 continue
             directory = root / 'groups' / group['name']
-            returned = plain(readers[group['name']](root / 'run', group['name']))
+            returned = plain(read_completed(root / 'run', group['name'], reader=readers[group['name']]))
             require(type(returned) is dict and type(returned.get('receipt')) is dict, 'reader must return a receipt')
             entry['receipt'] = returned['receipt']
             write_json(directory / 'receipt.json', returned['receipt'])

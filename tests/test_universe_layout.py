@@ -17,6 +17,7 @@ ALLOWED = {
     "jobs": {"config"},
     "api": {"store", "claims", "derive", "jobs", "config"},
     "config": set(),
+    "tools": set(),  # standalone read-only diagnostics
 }
 
 

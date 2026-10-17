@@ -165,3 +165,13 @@ updated master `83c9968`, with the primary project's virtual environment:
   example policy/valuation schema validation passed.
 - Rust and Compose gates were not run: neither implementation changed.
   Redis/Risk execution and retained-fixture performance remain unverified.
+
+## Execution-realism policy 4
+
+Both variants additionally accept closed policy 4 with recording t10, the
+reference 60-probe grid, pinned market-specific delays, exit ladders and recorded
+pairing/review/stale flags. Independent readers reprice the carried decision
+walks and recompute every flag. See the
+[producer contract](../../../../docs/specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md)
+for schemas, exact units and validation. Policies 2 and 3 keep their output
+bytes. No retained-data acceptance, full corpus rerun or live execution is claimed.

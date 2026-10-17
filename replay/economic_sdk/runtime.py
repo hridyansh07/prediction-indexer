@@ -41,7 +41,8 @@ from replay.economic_sdk.fills import (FILL_LIVE, KILL_PRICE, check_experiment, 
 from replay.economic_sdk.output import Layout, aggregate_files, group_of, row_common
 from replay.economic_sdk.types import CONTROL, EVALUATED, REAL, BookRequirement, Context, GameRequirement, Observation
 from replay.economic_sdk.game import ANCHORS, Timeline, binding as game_binding, episode_game, game_policy
-from replay.economic_sdk.views import ViewBuilder, touched_sides, unavailable_view
+from replay.economic_sdk.views import ViewBuilder, quote_ages, touched_sides, unavailable_view
+from replay.fees.lazy import assessment_json
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
@@ -154,6 +155,9 @@ class Runtime:
             for anchor, offset in timers:
                 require(anchor in ANCHORS and type(offset) is int and 0 <= offset <= 2**64 - 1,
                         "game timer anchor/offset")
+        from replay.economic_sdk.retention import required
+        self.retention = required(self.snapshot, experiment.policy, timeline=self.game,
+                                  timers=self.game_requirement.timers if self.game_requirement else ())
         if self.legacy:
             self.layout_files = Layout(experiment)
             names = self.layout_files.files
@@ -180,7 +184,8 @@ class Runtime:
         self.builders = {}
         for key, requirement in sorted(requirements.books.items()):
             require(key in self.plans and type(requirement) is BookRequirement, "book requirement")
-            self.builders[key] = ViewBuilder(requirement, self.plans[key])
+            self.builders[key] = ViewBuilder(requirement, self.plans[key],
+                                             ages=self.fill is not None and self.fill.probes is not None)
         self.profile = None
         if requirements.profile is not None:
             from replay.economic_sdk.profile import Collector
@@ -211,6 +216,7 @@ class Runtime:
 
         self.scope = 0
         self.sequence = -1
+        self.risk_sequence = 0
         self.views = {}
         self.view_costs = {}
         self.entities = {}
@@ -238,6 +244,12 @@ class Runtime:
         self.fill_state = {}
         self.fill_ns = {}
         self.epochs = {}
+        self.probes = None
+        self.age_commits = {}
+        self.age_staged_books = set()
+        if self.fill is not None and self.fill.probes is not None:
+            from replay.economic_sdk.probes import Manager
+            self.probes = Manager(self)
         self.terminal = self.finished = self.poisoned = False
 
     @property
@@ -254,8 +266,11 @@ class Runtime:
             require(not self.poisoned and not self.terminal, "closed economic strategy")
             require(cut.sequence == self.sequence + 1, "economic sequence")
             self.sequence = cut.sequence
+            self.risk_sequence = cut.risk_sequence
             if cut.kind == "initial":
                 require(cut.sequence == 0)
+                from replay.economic_sdk.retention import check
+                check(cut.body, self.retention)
                 self.strategy.bind(cut.body)
                 start = self.clock.start
                 for key, builder in self.builders.items():
@@ -277,8 +292,10 @@ class Runtime:
                 self._flush_stage()
                 self._advance(end)
                 self._close_scope(end, "RUN_END", True)
+                if self.probes is not None:
+                    self.probes.terminal(end)
                 if self.profile is not None:
-                    self.profile.terminal(end)
+                    self.profile.terminal(end, cut.risk_sequence)
                 self.terminal = True
                 return
             require(cut.kind == "cut")
@@ -303,12 +320,18 @@ class Runtime:
             if self.profile is not None:
                 self.profile.cut(cut, raw, time, changed)
             skew_only = set()
+            # Only this cut's fully installed views. Nothing escapes to a
+            # subsequent cut (even at the same time), scope, release or timer.
+            # Only already-reserved memos enter this pointer-only scratch map;
+            # ENTITY/fingerprint container slack covers its temporary storage.
+            inputs = {}
             for key, sides in changed.items():
-                self._select(key, sides, time, affected, skew_only)
+                self._select(key, sides, time, affected, skew_only, inputs)
             # A changed time-shift book must reach its ring at this exact time,
             # even when no entity is staged now.
-            if affected or self.staged_books:
-                self._stage(time, affected)
+            if affected or self.staged_books or self.probes is not None:
+                self._stage(time, affected, inputs)
+            inputs.clear()
             # Resolve every economic dependency first: another changed leg in
             # this cut may require evaluation rather than a skew-only refresh.
             for entity_id in sorted(skew_only - affected):
@@ -317,7 +340,7 @@ class Runtime:
             self.poisoned = True
             raise
 
-    def _select(self, key, sides, time, affected, skew_only):
+    def _select(self, key, sides, time, affected, skew_only, inputs):
         """Add the entities a change to ``key`` can change to ``affected``.
 
         An entity whose current observation is context-free and whose declared
@@ -344,9 +367,16 @@ class Runtime:
             elif sides is None or not read.isdisjoint(sides):
                 # A touched input: unchanged when every object it reads is identical.
                 memo = self.memo.get(entity_id)
-                if (self.legacy or memo is None or memo[1] is not value[0] or not _same(
-                        memo[0], self._input_fingerprint(entity_id, time))):
+                if self.legacy or memo is None or memo[1] is not value[0]:
                     affected.add(entity_id)
+                else:
+                    selected = inputs.get(entity_id)
+                    if selected is None:
+                        views = self._views(self.entities[entity_id], time)
+                        selected = (views, self._input_fingerprint(entity_id, time, views))
+                        inputs[entity_id] = selected
+                    if not _same(memo[0], selected[1]):
+                        affected.add(entity_id)
             elif self.legacy and value[0].status == EVALUATED:
                 entity = self.entities[entity_id]
                 if self._skew(entity, value[0].skew_legs)[1] != value[1]:
@@ -381,6 +411,22 @@ class Runtime:
 
     # -- views and history ---------------------------------------------------
     def _set_view(self, key, view):
+        if self.probes is not None:
+            # Every same-time intermediate compares with the last *committed*
+            # best quote, so a changed-then-restored best has no apparent age reset.
+            previous = self.age_commits.get(key)
+            sources = self.builders[key].ladders
+            if previous is not None:
+                old_best, old_changes = previous
+                view.best_changes = {
+                    source: (old_changes[source] if old_best[source] == (
+                        view.ladders[source][0] if view.ladders[source] else None)
+                        else view.last_change) for source in sources}
+            else:
+                self.budget.charge(bounds.SLOT + bounds.age_commit_cost(len(sources)))
+                self.age_commits[key] = ({source: view.ladders[source][0] if view.ladders[source] else None
+                                          for source in sources}, dict(view.best_changes))
+            self.age_staged_books.add(key)
         if self.fill is not None and view.ladders:
             prior = self.views.get(key)
             if prior is None or any(ladder is not prior.ladders.get(source)
@@ -509,6 +555,16 @@ class Runtime:
                 check_spec(spec, entity)
                 for key, source in zip(entity.legs, spec.sources):
                     require(source in self.builders[key].ladders, "fill ladder not retained")
+                    if self.probes is not None:
+                        venue = self.plans[key]["venue"]
+                        require(venue in self.fill.probes.unknown_taker_delay_ms,
+                                "probe unknown taker delay missing venue")
+                if self.probes is not None:
+                    exits = self.strategy.fill_exits(entity)
+                    require(type(exits) is tuple and len(exits) == len(entity.legs), "fill exits arity")
+                    for key, ladder in exits:
+                        require(key in self.plans and key in self.builders, "probe exit book not planned")
+                        require(ladder in self.builders[key].ladders, "probe exit ladder not retained")
                 maxima = tuple(10 ** int(self.plans[key]["price_scale"]) for key in entity.legs)
                 specs[entity.id] = (spec, maxima)
                 cost += bounds.SLOT + bounds.json_cost([list(spec.sources), list(spec.units),
@@ -544,9 +600,16 @@ class Runtime:
             if boundary is None and due is None and release is None and game_due is None:
                 break
             at = min(x for x in (boundary, release, game_due, due) if x is not None)
+            if self.probes is not None:
+                self.probes.before(at)
             affected = set()
             if boundary == at:
                 self._close_scope(at, "SCOPE_END", False)
+                if self.probes is not None:
+                    # Every pending old-scope event at its upper bound is a
+                    # censor or an unconfirmed decision, independent of books.
+                    # Release it before the next scope can consume its capacity.
+                    self.probes.committed(at)
                 for _ in self.clock.advance(at):
                     pass
                 self.scope = self.clock.scope
@@ -572,9 +635,13 @@ class Runtime:
                 # A quiet interval starts with the last observed prices, before
                 # the already-decoded future cut refreshes projections.
                 self._flush_stage()
+                if self.probes is not None:
+                    self.probes.committed(at)
                 entered = set()
             else:
                 entered = affected
+        if self.probes is not None:
+            self.probes.before(time)
         self.clock.time = time
         return entered
 
@@ -586,15 +653,17 @@ class Runtime:
             parts.append(self.game.view.revision)
         return parts
 
-    def _evaluate(self, entity_id):
+    def _evaluate(self, entity_id, inputs=None):
         entity = self.entities[entity_id]
         if entity.admission is not None:
             return (Observation(entity.admission, entity.admission_reasons,
                                 fields=self.experiment.unevaluated_fields), None)
-        views = self._views(entity, self.staged_time)
+        selected = inputs.get(entity_id) if inputs is not None else None
+        views = selected[0] if selected is not None else self._views(entity, self.staged_time)
         plan = self.plans_of.get(entity_id)
         if plan is not None:
-            fingerprint = self._input_fingerprint(entity_id, self.staged_time, views)
+            fingerprint = (selected[1] if selected is not None else
+                           self._input_fingerprint(entity_id, self.staged_time, views))
             memo = self.memo.get(entity_id)
             if memo is not None and _same(memo[0], fingerprint):
                 observation = memo[1]
@@ -650,7 +719,7 @@ class Runtime:
         return spread, index
 
     def _fresh(self, entity, views):
-        context = Context(self.staged_time, self.sequence, self.scope,
+        context = Context(self.staged_time, self.risk_sequence, self.scope,
                           self.experiment.experiment_sha256, self.game.view if self.game is not None else None)
         observation = self.strategy.evaluate(entity, views, context)
         require(type(observation) is Observation and observation.status in self.statuses,
@@ -679,10 +748,10 @@ class Runtime:
             cost = self._plain_costs[key] = bounds.observation_cost(observation)
         return cost
 
-    def _stage(self, time, entities):
+    def _stage(self, time, entities, inputs=None):
         self._begin_stage(time)
         for entity in sorted(entities):
-            self._retain_staged(entity, self._evaluate(entity))
+            self._retain_staged(entity, self._evaluate(entity, inputs))
 
     def _begin_stage(self, time):
         if self.staged_time is None:
@@ -715,6 +784,13 @@ class Runtime:
             self._ring_append(key, time, self.views[key])
         self.staged_books.clear()
         self.staged_time = None
+        if self.probes is not None:
+            for key in self.age_staged_books:
+                view = self.views[key]
+                self.age_commits[key] = ({source: view.ladders[source][0] if view.ladders[source] else None
+                                          for source in self.builders[key].ladders}, dict(view.best_changes))
+            self.age_staged_books.clear()
+            self.probes.committed(time)
 
     # -- intervals, episodes and slices ---------------------------------------
     def _commit(self, entity, time, value):
@@ -784,6 +860,8 @@ class Runtime:
                        tuple(view.ladders[source] for view, source in zip(views, spec.sources)),
                        maxima, lambda steps, legs: strategy.fill_value(entity, steps, legs, time))
         if priced.state == FILL_LIVE:
+            if self.probes is not None:
+                priced.json["ages"] = quote_ages(spec.sources, views, time)
             self._open_episode(key, time, observation, skew, priced)
         self._fill_state(entity.id, time, priced.state, epochs)
 
@@ -829,7 +907,8 @@ class Runtime:
 
     def _check_retained_slice(self, quotes, payload):
         # Checked for the initial and every replacement slice, before retention.
-        require(len(encoded({"consumed": quotes_json(quotes), "open_values": payload}))
+        require(len(encoded({"consumed": quotes_json(quotes),
+                             "open_values": assessment_json(payload, placeholders=True)}))
                 + 1024 <= bounds.MAX_LINE, "slice retained line budget")
 
     def _open_episode(self, key, time, observation, skew, priced=None):
@@ -869,6 +948,11 @@ class Runtime:
                 "open episode bound")
         self.budget.charge(episode.cost)
         self.episodes[key] = episode
+        if priced is not None and self.probes is not None:
+            spec, maxima = self.fill_specs[key[0]]
+            self.probes.add(episode_id(self.scope, key[0], key[1], time), self.entities[key[0]],
+                            spec, maxima, time, int(self.clock.scopes[self.scope]["end_ns"]),
+                            priced, priced.json["ages"])
 
     def _update_episode(self, episode, time, observation, skew):
         payload = observation.payload
@@ -918,7 +1002,7 @@ class Runtime:
                 "episode_id": identity, "kind": episode.kind, "end_reason": reason,
                 "censored": censored, "consumed": quotes_json(episode.quotes),
                 "survival_ns": str(survival), "viable_tiers": viable,
-                "open_values": episode.slice_values, "opening_skew_bucket": episode.slice_skew,
+                "open_values": assessment_json(episode.slice_values), "opening_skew_bucket": episode.slice_skew,
             }
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
             self.writers[self.layout_files.name("slices", entity.cls)].append(row)
@@ -932,7 +1016,7 @@ class Runtime:
         if group + "slices.ndjson" in self.writers:
             self.writers[group + "slices.ndjson"].append(row)
         if entity.cls == REAL and self.experiment.audit_intervals:
-            row = row | {"quotes": quotes_json(episode.quotes), "values": episode.slice_values}
+            row = row | {"quotes": quotes_json(episode.quotes), "values": assessment_json(episode.slice_values)}
             require(len(encoded(row)) + 1 <= bounds.MAX_LINE, "slice retained line budget")
             self.writers["audit/slices.ndjson"].append(row)
 
@@ -977,6 +1061,8 @@ class Runtime:
             entities[item[0][0]].order, item[0][1], self.episodes[item[0]].start))
         for key, end, reason, censored in closures:
             episode = self.episodes.pop(key)
+            if episode.fill is not None and self.probes is not None:
+                self.probes.close(episode_id(self.scope, episode.entity, episode.kind, episode.start), end)
             self.budget.release(episode.cost + (len(episode.skew_points) - 1) * (bounds.PAIR + bounds.SLOT)
                                 if not self.legacy else episode.cost)
             self._emit_slice(episode, end, reason, censored)
@@ -993,7 +1079,7 @@ class Runtime:
                     "opening_slice_survival_ns": str(episode.opening_survival or 0),
                     "viable_tiers": [t for t in self.tiers if t in episode.viable],
                     "qualified_ns": {t: str(v) for t, v in episode.qualified.items()},
-                    "open_values": episode.open_values,
+                    "open_values": assessment_json(episode.open_values),
                     "opening_skew_bucket": episode.opening_skew,
                 } | {"max_" + name: value for name, value in episode.maxima.items()}
                 self.writers[self.layout_files.name("episodes", entity.cls)].append(row)
@@ -1015,14 +1101,16 @@ class Runtime:
                 "open": {"value_class": episode.open_class,
                          "reasons": [self._reason(r) for r in episode.open_reasons],
                          "leg_skew_ns": str(skew_ns), "skew_bucket": skew_bucket,
-                         "values": episode.open_values, "quotes": quotes_json(episode.open_quotes)},
+                         "values": assessment_json(episode.open_values), "quotes": quotes_json(episode.open_quotes)},
                 "maxima": episode.maxima,
-                "at_max": {"values": episode.at_max[0], "quotes": quotes_json(episode.at_max[1])},
+                "at_max": {"values": assessment_json(episode.at_max[0]), "quotes": quotes_json(episode.at_max[1])},
             }
             if episode.fill is not None:
                 episode.fill.json["end_books"] = end_books(
                     self.fill_specs[episode.entity][0].sources, self._views(entity, end))
                 row["fill"] = episode.fill.json
+                if self.strategy.probe_decision_evidence:
+                    row["flags"] = self.strategy.fill_flags(entity, episode.fill.json["ages"])
             if self.game is not None:
                 row["open"]["game"] = episode.open_game
                 row["at_max"]["game"] = episode.max_game
@@ -1160,6 +1248,7 @@ class Runtime:
             self.open_measurements.clear(); self.episodes.clear(); self.reverse.clear()
             self.memo.clear(); self.reasons.clear()
             self.game = None; self.game_timers.clear(); self.game_entities.clear()
+            self.probes = None; self.age_commits.clear(); self.age_staged_books.clear()
             self.budget = None
             summary = strategy.validate(self.root, snapshot, manifest)
             require(len(encoded(summary)) <= bounds.MAX_METADATA, "summary budget")

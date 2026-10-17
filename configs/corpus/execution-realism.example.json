@@ -1,0 +1,571 @@
+{
+  "version": 1,
+  "universe_base_url": "<UNIVERSE_BASE_URL>",
+  "runner_config": "<RUNNER_CONFIG>",
+  "canonical_store": "<CANONICAL_STORE>",
+  "work_root": "<WORK_ROOT>",
+  "results_root": "<RESULTS_ROOT>",
+  "ledger": "<LEDGER>",
+  "materializer": "<MATERIALIZER>",
+  "image": {
+    "build_context": "<REPOSITORY_ROOT>",
+    "dockerfile": "docker/replay-runner.Dockerfile"
+  },
+  "redis": {
+    "image": "redis:8.2-alpine",
+    "maxmemory": "256mb"
+  },
+  "limits": {
+    "attempt_seconds": 10800,
+    "run_seconds": 10900,
+    "stall_seconds": 900
+  },
+  "fees": {
+    "template_catalog": "<REVIEWED_FEE_CATALOG_DIRECTORY>",
+    "sources": "<REVIEWED_FEE_SOURCE_DIRECTORY>",
+    "kalshi_member_class": "DIRECT",
+    "limitless_buy_bps": 300,
+    "limitless_sell_bps": 150
+  },
+  "game_state": {
+    "prepare": false
+  },
+  "bundles": {
+    "only": null,
+    "exclude": null
+  },
+  "groups": [
+    {
+      "name": "coverage",
+      "factory": "replay.strategies.bundle_coverage:build",
+      "reader": "replay.strategies.bundle_coverage:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}"
+      },
+      "checks": [],
+      "compare": {
+        "rows": "durations",
+        "key": [
+          "scope",
+          "entity"
+        ]
+      }
+    },
+    {
+      "name": "complement",
+      "factory": "replay.strategies.same_venue_complement:build",
+      "reader": "replay.strategies.same_venue_complement:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": "@corpus:fees",
+        "policy": {
+          "version": 2,
+          "sizes_contracts": [
+            "1",
+            "10",
+            "100"
+          ],
+          "headline_size_contracts": "10",
+          "latency_tiers_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "headline_latency_ns": "1000000000",
+          "minimum_net_gap_per_contract_e18": "0",
+          "leg_skew_buckets_ns": [
+            "100000000",
+            "1000000000",
+            "5000000000",
+            "15000000000",
+            "60000000000"
+          ],
+          "verdict": {
+            "maximum_positive_time_fraction_ppm": "0",
+            "minimum_evaluated_ns": "3600000000000"
+          },
+          "controls": [],
+          "controls_episodes": false,
+          "controls_slices": false,
+          "audit_intervals": false,
+          "time_shift_ring_entries": "0",
+          "profile": null
+        }
+      },
+      "checks": [],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "venue",
+          "basket_kind",
+          "direction",
+          "size_contracts"
+        ]
+      }
+    },
+    {
+      "name": "cross",
+      "factory": "replay.strategies.cross_venue_arbitrage:build",
+      "reader": "replay.strategies.cross_venue_arbitrage:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": "@corpus:fees",
+        "policy": {
+          "version": 4,
+          "fills": {
+            "version": 1,
+            "step_contracts": "0.01",
+            "max_levels": 64,
+            "sizings": [
+              {
+                "name": "edge",
+                "role": "governs",
+                "edge": true
+              },
+              {
+                "name": "t10",
+                "role": "records",
+                "target_contracts": "10"
+              }
+            ],
+            "probes": {
+              "version": 1,
+              "sizings": [
+                "edge",
+                "t10"
+              ],
+              "confirm_ms": [
+                0,
+                500,
+                1000
+              ],
+              "arrival_ms": [
+                100,
+                250,
+                500,
+                1000,
+                2000
+              ],
+              "sequencing": [
+                "simultaneous",
+                "slow_first"
+              ],
+              "unknown_taker_delay_ms": {
+                "kalshi": 0,
+                "limitless": 0,
+                "polymarket": 1000
+              }
+            }
+          },
+          "latency_tiers_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "headline_latency_ns": "1000000000",
+          "minimum_net_gap_per_contract_e18": "0",
+          "leg_skew_buckets_ns": [
+            "100000000",
+            "1000000000",
+            "5000000000",
+            "15000000000",
+            "60000000000"
+          ],
+          "verdict": {
+            "maximum_positive_time_fraction_ppm": "0",
+            "minimum_evaluated_ns": "3600000000000"
+          },
+          "audit_intervals": false,
+          "profile": null,
+          "flags": {
+            "version": 1,
+            "stale_ms": 5000,
+            "settlement_allowlist": [
+              "series_moneyline"
+            ]
+          }
+        },
+        "valuation": "@corpus:valuation"
+      },
+      "checks": [],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "venue",
+          "basket_kind",
+          "direction",
+          "route_id",
+          "size_contracts"
+        ]
+      }
+    },
+    {
+      "name": "multi",
+      "factory": "replay.strategies.same_venue_multi_market:build",
+      "reader": "replay.strategies.same_venue_multi_market:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": "@corpus:fees",
+        "policy": {
+          "version": 2,
+          "fills": {
+            "version": 1,
+            "step_contracts": "0.01",
+            "max_levels": 64,
+            "sizings": [
+              {
+                "name": "edge",
+                "role": "governs",
+                "edge": true
+              },
+              {
+                "name": "t10",
+                "role": "records",
+                "target_contracts": "10"
+              }
+            ],
+            "probes": {
+              "version": 1,
+              "sizings": [
+                "edge",
+                "t10"
+              ],
+              "confirm_ms": [
+                0,
+                500,
+                1000
+              ],
+              "arrival_ms": [
+                100,
+                250,
+                500,
+                1000,
+                2000
+              ],
+              "sequencing": [
+                "simultaneous",
+                "slow_first"
+              ],
+              "unknown_taker_delay_ms": {
+                "kalshi": 0,
+                "limitless": 0,
+                "polymarket": 1000
+              }
+            }
+          },
+          "max_legs": 4,
+          "latency_tiers_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "headline_latency_ns": "1000000000",
+          "minimum_net_gap_per_contract_e18": "0",
+          "leg_skew_buckets_ns": [
+            "100000000",
+            "1000000000",
+            "5000000000",
+            "15000000000",
+            "60000000000"
+          ],
+          "audit_intervals": false,
+          "profile": null,
+          "flags": {
+            "version": 1,
+            "stale_ms": 5000,
+            "settlement_allowlist": [
+              "series_moneyline"
+            ]
+          }
+        }
+      },
+      "checks": [],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "venue",
+          "basket_kind",
+          "direction",
+          "set_id",
+          "size_contracts"
+        ]
+      }
+    },
+    {
+      "name": "cover_same",
+      "factory": "replay.strategies.same_venue_implication_cover:build",
+      "reader": "replay.strategies.same_venue_implication_cover:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": "@corpus:fees",
+        "policy": {
+          "version": 4,
+          "fills": {
+            "version": 1,
+            "step_contracts": "0.01",
+            "max_levels": 64,
+            "sizings": [
+              {
+                "name": "edge",
+                "role": "governs",
+                "edge": true
+              },
+              {
+                "name": "t10",
+                "role": "records",
+                "target_contracts": "10"
+              }
+            ],
+            "probes": {
+              "version": 1,
+              "sizings": [
+                "edge",
+                "t10"
+              ],
+              "confirm_ms": [
+                0,
+                500,
+                1000
+              ],
+              "arrival_ms": [
+                100,
+                250,
+                500,
+                1000,
+                2000
+              ],
+              "sequencing": [
+                "simultaneous",
+                "slow_first"
+              ],
+              "unknown_taker_delay_ms": {
+                "kalshi": 0,
+                "limitless": 0,
+                "polymarket": 1000
+              }
+            }
+          },
+          "latency_tiers_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "headline_latency_ns": "1000000000",
+          "minimum_net_gap_per_contract_e18": "0",
+          "leg_skew_buckets_ns": [
+            "100000000",
+            "1000000000",
+            "5000000000",
+            "15000000000",
+            "60000000000"
+          ],
+          "verdict": {
+            "maximum_positive_time_fraction_ppm": "0",
+            "minimum_evaluated_ns": "3600000000000"
+          },
+          "audit_intervals": false,
+          "profile": null,
+          "flags": {
+            "version": 1,
+            "stale_ms": 5000,
+            "settlement_allowlist": [
+              "series_moneyline"
+            ]
+          }
+        },
+        "valuation": "@corpus:valuation"
+      },
+      "checks": [],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "venue",
+          "basket_kind",
+          "direction",
+          "route_id",
+          "size_contracts"
+        ]
+      }
+    },
+    {
+      "name": "cover_cross",
+      "factory": "replay.strategies.cross_venue_implication_cover:build",
+      "reader": "replay.strategies.cross_venue_implication_cover:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "fees": "@corpus:fees",
+        "policy": {
+          "version": 4,
+          "fills": {
+            "version": 1,
+            "step_contracts": "0.01",
+            "max_levels": 64,
+            "sizings": [
+              {
+                "name": "edge",
+                "role": "governs",
+                "edge": true
+              },
+              {
+                "name": "t10",
+                "role": "records",
+                "target_contracts": "10"
+              }
+            ],
+            "probes": {
+              "version": 1,
+              "sizings": [
+                "edge",
+                "t10"
+              ],
+              "confirm_ms": [
+                0,
+                500,
+                1000
+              ],
+              "arrival_ms": [
+                100,
+                250,
+                500,
+                1000,
+                2000
+              ],
+              "sequencing": [
+                "simultaneous",
+                "slow_first"
+              ],
+              "unknown_taker_delay_ms": {
+                "kalshi": 0,
+                "limitless": 0,
+                "polymarket": 1000
+              }
+            }
+          },
+          "latency_tiers_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "headline_latency_ns": "1000000000",
+          "minimum_net_gap_per_contract_e18": "0",
+          "leg_skew_buckets_ns": [
+            "100000000",
+            "1000000000",
+            "5000000000",
+            "15000000000",
+            "60000000000"
+          ],
+          "verdict": {
+            "maximum_positive_time_fraction_ppm": "0",
+            "minimum_evaluated_ns": "3600000000000"
+          },
+          "audit_intervals": false,
+          "profile": null,
+          "flags": {
+            "version": 1,
+            "stale_ms": 5000,
+            "settlement_allowlist": [
+              "series_moneyline"
+            ]
+          }
+        },
+        "valuation": "@corpus:valuation"
+      },
+      "checks": [],
+      "compare": {
+        "rows": "rows",
+        "key": [
+          "venue",
+          "basket_kind",
+          "direction",
+          "route_id",
+          "size_contracts"
+        ]
+      }
+    },
+    {
+      "name": "profile",
+      "factory": "replay.strategies.market_profile:build",
+      "reader": "replay.strategies.market_profile:read_completed",
+      "config": {
+        "version": 1,
+        "snapshot_directory": "{context}",
+        "snapshot_sha256": "{snapshot_sha256}",
+        "policy": {
+          "version": 2,
+          "bucket_ns": "60000000000",
+          "groups": [
+            "activity",
+            "availability",
+            "depth",
+            "levels",
+            "pair_consistency",
+            "quote_stability",
+            "self_crossing",
+            "top_of_book",
+            "transitions",
+            "volatility"
+          ],
+          "sizes_contracts": [
+            "1",
+            "100"
+          ],
+          "tick_atoms": {
+            "kalshi": "100",
+            "polymarket": "10",
+            "limitless": "1"
+          },
+          "depth_ticks": [
+            "1",
+            "5",
+            "10"
+          ],
+          "survival_edges_ns": [
+            "250000000",
+            "1000000000",
+            "5000000000"
+          ],
+          "volatility": {
+            "version": 1,
+            "sample_ms": 250,
+            "horizons_ms": [
+              250,
+              500,
+              1000,
+              3000,
+              10000
+            ],
+            "bucket_ms": 60000,
+            "jump_atoms": [
+              100,
+              200,
+              500
+            ],
+            "gap_pairs": "outcome_complements"
+          }
+        }
+      },
+      "checks": [],
+      "compare": {
+        "rows": "books",
+        "key": [
+          "scope",
+          "instrument",
+          "orientation"
+        ]
+      }
+    }
+  ]
+}

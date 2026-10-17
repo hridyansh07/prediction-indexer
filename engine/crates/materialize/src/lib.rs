@@ -6,9 +6,11 @@
 
 mod candidate;
 mod evidence;
+mod input;
 mod profile1;
 mod reader;
 mod schema;
+mod scope;
 mod verify;
 
 #[cfg(test)]
@@ -38,13 +40,15 @@ use sha2::{Digest, Sha256 as Sha256Hasher};
 pub use evidence::{CoverageEvidence, LaneCoverage, LaneState, SourceFault, SourceFaultReason};
 pub use reader::{
     DerivativeMetadata, FinishedWindow, PinnedDerivative, ReadLimits, SourceDelivery,
-    VerifiedWindowReader, inspect_pinned, open_pinned,
+    VerifiedWindowReader, inspect_pinned, open_pinned, open_pinned_scoped,
+    open_pinned_scoped_without_fastpath,
 };
 pub use schema::{
     CompressedOutput, CompressionContract, DerivativeCounts, DerivativeManifest, DerivativeReceipt,
     DerivativeSpec, LogicalIdentity, NormalizationPolicy, PlainOutput, RejectDisposition,
     RejectRecord, SourceReceipt, StoredIdentity,
 };
+pub use scope::ScopeFilter;
 pub use verify::{DerivativePin, VerifiedDerivative, verify_derivative};
 
 const ADDRESS_DOMAIN: &[u8] = b"prediction-indexer/replay-normalized-derivative/v1";

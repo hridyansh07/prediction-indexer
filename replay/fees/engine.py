@@ -504,12 +504,13 @@ class FeeEngine(Closed):
                 fill.order_key,
                 fill.counterfactual_revision,
             )
-            if fill.event_time < last_time or fill.identity in seen:
+            fill_identity = fill.identity
+            if fill.event_time < last_time or fill_identity in seen:
                 raise ValueError("duplicate or out-of-order fills")
             if fill.new_order and key in states:
                 raise ValueError("duplicate new-order declaration")
             last_time = fill.event_time
-            seen.add(fill.identity)
+            seen.add(fill_identity)
             result, state = self.assess(
                 fill,
                 resolver.resolve(fill.context, fill.event_time, knowledge_cutoff)
