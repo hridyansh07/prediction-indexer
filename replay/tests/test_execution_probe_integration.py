@@ -1,14 +1,13 @@
 """Probe money units and pinned terms through production strategy readers.
 
-The strategy rollout is separate: tests opt into probes and retain exits locally,
-while using the production evaluators, FeeBridge, default delays and readers.
+Legacy policies explicitly opt into probes, using production requirements,
+evaluators, FeeBridge, default delays and readers without retention overrides.
 """
 
 import copy
 import hashlib
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,21 +35,6 @@ def milliseconds(original):
     return config
 
 
-def retain_exits(original):
-    def requirements(self, snapshot, policy):
-        result = original(self, snapshot, policy)
-        books = {}
-        for key, requirement in result.books.items():
-            if self.plans[key]["venue"] == "kalshi":
-                sources = ("kalshi_complement_ask", "kalshi_complement_bid")
-                books[key] = replace(requirement, sides=("bid", "ask"),
-                                     transforms=sources, ladders=sources)
-            else:
-                books[key] = replace(requirement, ladders=("ask", "bid"))
-        return replace(result, books=books)
-    return requirements
-
-
 class ProbeIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -59,7 +43,6 @@ class ProbeIntegrationTests(unittest.TestCase):
 
     def cross(self, *, observed=False):
         import replay.tests.test_cross_venue_arbitrage as fixtures
-        from replay.strategies.cross_venue_arbitrage.strategy import CrossVenueArbitrage
         original = fixtures.fill_policy_v3
 
         def policy(*args, **kwargs):
@@ -77,9 +60,7 @@ class ProbeIntegrationTests(unittest.TestCase):
                     market["execution_terms"] = {"status": "observed", "changes": [
                         {"from": "1970-01-01T00:00:00.011Z", "taker_delay_ms": 1}]}
         with patch.object(fixtures, "config", milliseconds(fixtures.config)), \
-             patch.object(fixtures, "fill_policy_v3", policy), \
-             patch.object(CrossVenueArbitrage, "requirements",
-                          retain_exits(CrossVenueArbitrage.requirements)):
+             patch.object(fixtures, "fill_policy_v3", policy):
             h = fixtures.Harness(self.root, fills=(TWO,), doc=document)
         self.addCleanup(h.close)
         h.window(end=40 * MS)
@@ -131,13 +112,10 @@ class ProbeIntegrationTests(unittest.TestCase):
 
     def test_multi_market_probe_reader_keeps_snapshot_and_values_native_loss(self):
         import replay.tests.test_same_venue_multi_market as fixtures
-        from replay.strategies.same_venue_multi_market.strategy import SameVenueMultiMarket
         policy = fixtures.policy(TWO)
         policy["fills"]["probes"] = probes(sizings=["two"],
             unknown_taker_delay_ms={"kalshi": 0, "polymarket": 0})
-        with patch.object(fixtures, "config", milliseconds(fixtures.config)), \
-             patch.object(SameVenueMultiMarket, "requirements",
-                          retain_exits(SameVenueMultiMarket.requirements)):
+        with patch.object(fixtures, "config", milliseconds(fixtures.config)):
             h = fixtures.Harness(self.root, value=policy)
         self.addCleanup(h.close)
         h.window(end=40 * MS)

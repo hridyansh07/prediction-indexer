@@ -23,9 +23,11 @@ PROBES = {"version": 1, "sizings": ["edge", "t10"], "confirm_ms": [0, 500, 1000]
           "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 1000}}
 
 
-def policy(base, version=4, **changes):
+def policy(base, version=4, *, legacy=False, **changes):
     value = copy.deepcopy(base)
-    value.update(version=version, flags=copy.deepcopy(FLAGS))
+    value.update(version=version)
+    if not legacy:
+        value["flags"] = copy.deepcopy(FLAGS)
     value["fills"]["sizings"] = [EDGE, T10]
     value["fills"]["probes"] = copy.deepcopy(PROBES)
     value.update(changes)
@@ -113,7 +115,8 @@ class IntegratedTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.counter = 0
 
-    def harness(self, kind, *, terms=False, step="1", quantity=20, populate=True, max_levels=64, **kwargs):
+    def harness(self, kind, *, terms=False, step="1", quantity=20, populate=True, max_levels=64,
+                legacy=False, **kwargs):
         import replay.tests.test_cross_venue_arbitrage as cross
         import replay.tests.test_same_venue_multi_market as multi
         import replay.tests.test_implication_cover as imp
@@ -121,15 +124,16 @@ class IntegratedTests(unittest.TestCase):
         root = Path(self.tmp.name) / str(self.counter)
         root.mkdir()
         if kind == "multi":
-            value = policy(multi.policy(step=step), 2)
+            value = policy(multi.policy(step=step), 1 if legacy else 2, legacy=legacy)
             value["fills"]["max_levels"] = max_levels
             with patch.object(multi, "config", seconds(multi.config)):
                 h = multi.Harness(root, value=value,
-                                  doc=observed(multi.sibling_document()) if terms else multi.sibling_document())
+                                  doc=observed(multi.sibling_document()) if terms else multi.sibling_document(),
+                                  **kwargs)
         else:
             old = cross.fill_policy_v3
             def new_policy(*args, **kwargs):
-                value = policy(old(*args, **kwargs))
+                value = policy(old(*args, **kwargs), 3 if legacy else 4, legacy=legacy)
                 value["fills"]["max_levels"] = max_levels
                 return value
             doc = (imp.implication_document() if kind != "cross" else cross.document())
@@ -163,8 +167,9 @@ class IntegratedTests(unittest.TestCase):
         return h
 
     def exit_case(self, kind="cross", orientation="outcome", *, step="1", exit_bids=((30, 10),),
-                  unusable=False, terms=False, max_levels=64):
-        h = self.harness(kind, step=step, populate=False, terms=terms, max_levels=max_levels)
+                  unusable=False, terms=False, max_levels=64, legacy=False, **kwargs):
+        h = self.harness(kind, step=step, populate=False, terms=terms, max_levels=max_levels,
+                         legacy=legacy, **kwargs)
         h.window(end=40 * 10**9)
         acquired = ("kalshi:series", orientation)
         other = {"cross": ("polymarket:987" if orientation == "outcome" else "polymarket:123", "outcome"),
@@ -196,14 +201,42 @@ class IntegratedTests(unittest.TestCase):
         return h, entity
 
     def exit_rows(self, h, entity):
-        h.finish()  # Real writer and the strategy's independent semantic reader.
-        episode = next(r for r in h.records("episodes.ndjson") if r["kind"] == "net"
+        from replay.economic_sdk.reader import lines
+        result = h.finish()  # Real writer and the strategy's independent semantic reader.
+        files = result["manifest"]["files"]
+        def records(name):
+            return lines(h.output, name, files.get(name, files.get(name + ".zst")))
+        episode = next(r for r in records("episodes.ndjson") if r["kind"] == "net"
                        and r["entity"] == h.strategy.index[entity.id] and r["start_ns"] == str(16_000 * MS))
-        rows = [r for r in h.records("probes.ndjson") if r["episode_id"] == episode["episode_id"]]
+        rows = [r for r in records("probes.ndjson") if r["episode_id"] == episode["episode_id"]]
         self.assertEqual(len(rows), 60)
         row = next(r for r in rows if r["sizing"] == "t10" and r["confirm_ms"] == 0
                    and r["arrival_ms"] == 100 and r["sequencing"] == "simultaneous")
         return rows, row
+
+    def test_legacy_opt_in_probes_bind_all_factories_without_upgrading_kalshi_exits(self):
+        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+            for orientation in (("outcome", "complement") if kind == "cross" else ("outcome",)):
+                outputs = []
+                for compressed in (False, True):
+                    with self.subTest(kind=kind, orientation=orientation, compressed=compressed):
+                        h, entity = self.exit_case(kind, orientation, legacy=True,
+                            **({"storage": {"version": 1, "economic": "zstd"}} if compressed else {}))
+                        rows, row = self.exit_rows(h, entity)
+                        self.assertEqual((row["status"], row["matched_steps"]), ("partial", "6"))
+                        index = next(i for i, d in enumerate(entity.descriptor["legs"])
+                                     if d["instrument"] == "kalshi:series")
+                        leg = row["legs"][index]
+                        # The legacy reverse-source exit projects nonexistent native asks,
+                        # despite the acquired book having bids. Do not upgrade it to R12.
+                        self.assertEqual((leg["excess_atoms"], leg["exit_consumed"],
+                                          leg["exit_proceeds"], row["leg_loss_gross"]),
+                                         ("4", [], "0", str(16 * 10**35)))
+                        self.assertNotIn("value", row["decision"])
+                        self.assertNotIn("legs", row["decision"])
+                        outputs.append(rows)
+                if len(outputs) == 2:
+                    self.assertEqual(outputs[0], outputs[1])
 
     def test_bids_only_kalshi_yes_and_no_excess_use_acquired_native_bids(self):
         for orientation in ("outcome", "complement"):
