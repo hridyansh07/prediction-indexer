@@ -3,6 +3,9 @@
 import hashlib
 import io
 import json
+import os
+import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -463,7 +466,8 @@ class PipelineTests(unittest.TestCase):
         retention.start()
         self.addCleanup(retention.stop)
 
-    def harness(self, tmp, *, bench_status="SUCCESS", fail_stage=None, outcomes=None, cache=None):
+    def harness(self, tmp, *, bench_status="SUCCESS", bench_exit=None, fail_stage=None, outcomes=None, cache=None,
+                discard_materialized_inputs=False):
         root = Path(tmp)
         spec = spec_document(root)
         if cache is not None:
@@ -491,7 +495,7 @@ class PipelineTests(unittest.TestCase):
             out.mkdir(); (out / "game_state.json").write_text('{"state":"unavailable","reason":"no_fetch"}')
 
         def supervisor(job_id, request, config, receipt, pins, snapshot, context, **kw):
-            host = Path(spec["work_root"]) / "b1" / "derivatives" / "addr"
+            host = context.parent.parent / "derivatives" / "addr"
             return {"transport": {"inputs": [{"directory": str(host)}]}, "publisher": "x", "python": "y"}
 
         def bench(spec_path, out, *, keep_image, label):
@@ -499,15 +503,235 @@ class PipelineTests(unittest.TestCase):
             calls["run_config"] = json.loads(Path(calls["bench_spec"]["base_run_config"]).read_bytes())
             out.mkdir(); (out / "image.id").write_text("sha256:img\n")
             (out / "result.json").write_text(json.dumps({"status": bench_status}))
-            return 0 if bench_status == "SUCCESS" else 2
+            return bench_exit if bench_exit is not None else 0 if bench_status == "SUCCESS" else 2
 
         history = SimpleNamespace(resolve=lambda job_id, request, config: SimpleNamespace(window_interval=(0, 1800)))
         config = SimpleNamespace(canonical_window_seconds=1800)
         pipeline = Pipeline(spec, corpus_key="f" * 64, config=config, canonical=LocalObjectStore(root / "canonical"),
                             history=history, game_store="gcs", image_id=None, ensure_bundle=ensure,
                             prepare_stage=prepare, supervisor_config=supervisor, prepare_game_state=game,
-                            run_bench=bench, sleep=lambda seconds: calls.setdefault("slept", []).append(seconds))
+                            run_bench=bench, sleep=lambda seconds: calls.setdefault("slept", []).append(seconds),
+                            discard_materialized_inputs=discard_materialized_inputs)
         return pipeline, calls, root
+
+    def test_discard_mode_bypasses_shared_cache_and_deletes_only_after_durable_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = {"root": str(root / "cache"), "max_bytes": 1}
+            Path(cache["root"]).mkdir()
+            (Path(cache["root"]) / "existing-input").write_bytes(b"shared input")
+            (root / "work/b1").mkdir(parents=True)
+            (root / "work/b1/old-input").write_bytes(b"legacy attempt")
+            with patch("replay.jobs.derivative_cache.DerivativeCache", side_effect=AssertionError("shared cache access")):
+                pipeline, calls, _ = self.harness(tmp, cache=cache, discard_materialized_inputs=True)
+                ledger = Ledger(root / "ledger.sqlite3")
+                fsync, rmtree = os.fsync, shutil.rmtree
+                synced = []
+
+                def sync(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        synced.append((os.fstat(fd).st_ino, (pipeline.results_dir("b1") / results.RECEIPT).exists()))
+                    fsync(fd)
+
+                def remove(path, *args, **kwargs):
+                    diagnostic = pipeline.materialized_inputs_diagnostics
+                    if diagnostic and kwargs.get("dir_fd") is not None:
+                        dest = pipeline.results_dir("b1")
+                        self.assertEqual(results.verify(dest)["status"], "SUCCESS")
+                        self.assertIn((dest.stat().st_ino, True), synced)
+                    return rmtree(path, *args, **kwargs)
+
+                with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                     patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                     patch("os.fsync", side_effect=sync), patch("shutil.rmtree", side_effect=remove), \
+                     patch("sys.stderr", io.StringIO()) as err:
+                    self.assertEqual(run_corpus(pipeline, ledger, ["b1"]), (1, 0))
+            detail = json.loads(ledger.state(pipeline.corpus_key, "b1")["detail"])["materialized_inputs"]
+            self.assertEqual((detail["cleanup"], detail["durable_commit"]), ("discarded", True))
+            self.assertFalse(Path(detail["attempt_path"]).exists())
+            self.assertNotIn("derivative_cache", json.loads(ledger.state(pipeline.corpus_key, "b1")["detail"]))
+            self.assertIn("discarded", err.getvalue())
+            self.assertEqual((Path(cache["root"]) / "existing-input").read_bytes(), b"shared input")
+            self.assertEqual(sorted(p.name for p in Path(cache["root"]).iterdir()), ["existing-input"])
+            self.assertEqual((root / "work/b1/old-input").read_bytes(), b"legacy attempt")
+            self.assertEqual(calls["bench_spec"]["mounts"], [
+                {"host": str(Path(detail["attempt_path"]) / "derivatives"), "container": "/bench/in/derivatives"}])
+
+    def test_discard_mode_keeps_failed_checks_nonzero_exits_and_uncertain_consumers(self):
+        for status, code in (("CHECKS_FAILED", 2), ("FAILED", 3), ("SUCCESS", 3),
+                             ("GAME_STATE_UNAVAILABLE", 2), ("CHECKS_FAILED", 0)):
+            with self.subTest(status=status, code=code), tempfile.TemporaryDirectory() as tmp:
+                pipeline, _, root = self.harness(tmp, bench_status=status, bench_exit=code,
+                                                 discard_materialized_inputs=True)
+                with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                     patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                     patch("sys.stderr", io.StringIO()) as err:
+                    state, returned, _, _ = pipeline.run("b1")
+                diagnostic = pipeline.materialized_inputs_diagnostics
+                work = Path(diagnostic["attempt_path"])
+                self.assertTrue((work / "derivatives/addr").is_dir())
+                self.assertEqual((diagnostic["cleanup"], diagnostic["bench_exit"], returned), ("retained", code, code))
+                self.assertIn(str(work), err.getvalue())
+                self.assertEqual(state, "game_state_unavailable" if status == "GAME_STATE_UNAVAILABLE" else "failed")
+                self.assertEqual(results.verify(pipeline.results_dir("b1"))["bench_exit"], code)
+
+    def test_discard_mode_keeps_stage_interrupt_commit_and_fsync_failures(self):
+        for failure in ("materialize", "interrupt", "commit", "file_fsync", "directory_fsync", "receipt_fsync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                pipeline, _, root = self.harness(tmp, fail_stage="materialize" if failure == "materialize" else None,
+                                                 discard_materialized_inputs=True)
+                if failure == "interrupt":
+                    pipeline.run_bench = lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt())
+                fsync, commit = os.fsync, results.commit
+
+                def sync(fd):
+                    directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+                    receipt_exists = (pipeline.results_dir("b1") / results.RECEIPT).exists()
+                    if (failure == "file_fsync" and not directory or
+                            failure == "directory_fsync" and directory and not receipt_exists or
+                            failure == "receipt_fsync" and directory and receipt_exists):
+                        raise OSError("injected fsync failure")
+                    fsync(fd)
+
+                def publish(*args, **kwargs):
+                    if failure == "commit":
+                        raise OSError("injected copy failure")
+                    return commit(*args, **kwargs)
+
+                with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                     patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                     patch("os.fsync", side_effect=sync), patch.object(results, "commit", side_effect=publish), \
+                     patch("sys.stderr", io.StringIO()) as err:
+                    with self.assertRaises(KeyboardInterrupt if failure == "interrupt" else StageError):
+                        pipeline.run("b1")
+                diagnostic = pipeline.materialized_inputs_diagnostics
+                self.assertEqual(diagnostic["cleanup"], "retained")
+                self.assertTrue(Path(diagnostic["attempt_path"]).is_dir())
+                self.assertIn(diagnostic["attempt_path"], err.getvalue())
+                self.assertNotIn("durable_commit", diagnostic)
+
+    def test_cleanup_failure_keeps_committed_result_valid_and_reports_without_changing_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, root = self.harness(tmp, discard_materialized_inputs=True)
+            ledger = Ledger(root / "ledger.sqlite3")
+            rmtree = shutil.rmtree
+
+            def remove(path, *args, **kwargs):
+                if kwargs.get("dir_fd") is not None:
+                    raise OSError("injected private cleanup failure")
+                return rmtree(path, *args, **kwargs)
+
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                 patch("sys.stderr", io.StringIO()) as err, patch("shutil.rmtree", side_effect=remove):
+                run_corpus(pipeline, ledger, ["b1"])
+            row = ledger.state(pipeline.corpus_key, "b1")
+            self.assertEqual((row["state"], row["bench_exit"]), ("done", 0))
+            self.assertEqual(results.verify(pipeline.results_dir("b1"))["status"], "SUCCESS")
+            self.assertIn("cleanup_failed", err.getvalue())
+            diagnostic = json.loads(row["detail"])["materialized_inputs"]
+            self.assertIn("injected private cleanup failure", diagnostic["error"])
+            self.assertTrue(Path(diagnostic["attempt_path"]).is_dir())
+
+    def test_initial_log_failure_retains_work_before_consumers_and_closes_descriptors(self):
+        class BrokenLog(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("initial log unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, root = self.harness(tmp, discard_materialized_inputs=True)
+            ledger = Ledger(root / "ledger.sqlite3")
+            before = len(os.listdir("/proc/self/fd"))   # only this synthetic process's descriptors
+            with patch("sys.stderr", BrokenLog()):
+                run_corpus(pipeline, ledger, ["b1"], log=lambda _: None)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+            row = ledger.state(pipeline.corpus_key, "b1")
+            self.assertEqual((row["state"], row["stage"]), ("failed", "work_log"))
+            diagnostic = json.loads(row["detail"])["materialized_inputs"]
+            self.assertEqual(diagnostic["cleanup"], "retained")
+            self.assertIn("BrokenPipeError", diagnostic["log_error"])
+            self.assertEqual(list(Path(diagnostic["attempt_path"]).iterdir()), [])
+            self.assertFalse(pipeline.results_dir("b1").exists())
+
+    def test_final_log_failure_preserves_success_stage_error_and_interrupt_without_fd_leaks(self):
+        class BrokenFinalLog(io.StringIO):
+            messages = 0
+
+            def write(self, text):
+                if "materialized_inputs:" in text:
+                    self.messages += 1
+                    if self.messages > 1:
+                        raise BrokenPipeError("final log unavailable")
+                return super().write(text)
+
+        for outcome in ("success", "stage_error", "interrupt"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                pipeline, _, root = self.harness(tmp, discard_materialized_inputs=True,
+                                                 fail_stage="materialize" if outcome == "stage_error" else None)
+                interrupt = KeyboardInterrupt("original interruption")
+                if outcome == "interrupt":
+                    pipeline.run_bench = lambda *a, **kw: (_ for _ in ()).throw(interrupt)
+                ledger = Ledger(root / "ledger.sqlite3")
+                with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                     patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                     patch("sys.stderr", BrokenFinalLog()):
+                    before = len(os.listdir("/proc/self/fd"))
+                    if outcome == "interrupt":
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            run_corpus(pipeline, ledger, ["b1"], log=lambda _: None)
+                        self.assertIs(caught.exception, interrupt)
+                    else:
+                        run_corpus(pipeline, ledger, ["b1"], log=lambda _: None)
+                    self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+                diagnostic = pipeline.materialized_inputs_diagnostics
+                self.assertIn("BrokenPipeError", diagnostic["log_error"])
+                row = ledger.state(pipeline.corpus_key, "b1")
+                if outcome == "success":
+                    self.assertEqual((row["state"], row["bench_exit"]), ("done", 0))
+                    self.assertEqual(results.verify(pipeline.results_dir("b1"))["status"], "SUCCESS")
+                    self.assertIn("BrokenPipeError", json.loads(row["detail"])["materialized_inputs"]["log_error"])
+                elif outcome == "stage_error":
+                    self.assertEqual((row["state"], row["stage"]), ("failed", "materialize"))
+                    self.assertIn("materializer crashed", json.loads(row["detail"])["error"])
+                else:
+                    self.assertEqual(row["state"], "running")
+                self.assertEqual(Path(diagnostic["attempt_path"]).exists(), outcome != "success")
+
+    def test_discard_retry_and_second_worker_never_reuse_or_remove_older_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, root = self.harness(tmp, fail_stage="materialize", discard_materialized_inputs=True)
+            ledger = Ledger(root / "ledger.sqlite3")
+            with patch("replay.jobs.contracts.parse_request", return_value="request"), \
+                 patch("replay.corpus.pipeline.fee_inputs", return_value=(root / "cat", {}, {})), \
+                 patch("sys.stderr", io.StringIO()):
+                run_corpus(pipeline, ledger, ["b1"])
+                old = Path(pipeline.materialized_inputs_diagnostics["attempt_path"])
+                (old / "orphan-input").write_bytes(b"old consumer")
+                first, _, _ = self.harness(tmp, discard_materialized_inputs=True)
+                second, _, _ = self.harness(tmp, discard_materialized_inputs=True)
+                bench = first.run_bench
+
+                def interleaved(*args, **kwargs):
+                    active = Path(first.materialized_inputs_diagnostics["attempt_path"])
+                    second.run("b2")
+                    self.assertTrue((active / "derivatives/addr").is_dir())
+                    self.assertEqual((old / "orphan-input").read_bytes(), b"old consumer")
+                    return bench(*args, **kwargs)
+
+                first.run_bench = interleaved
+                self.assertEqual(run_corpus(first, ledger, ["b1"], retry_failed=True), (1, 0))
+            paths = [old, Path(first.materialized_inputs_diagnostics["attempt_path"]),
+                     Path(second.materialized_inputs_diagnostics["attempt_path"])]
+            self.assertEqual(len(set(paths)), 3)
+            self.assertEqual((old / "orphan-input").read_bytes(), b"old consumer")
+            self.assertFalse(paths[1].exists())
+            self.assertFalse(paths[2].exists())
+            self.assertEqual(ledger.state(first.corpus_key, "b1")["attempts"], 2)
+            # The reserved parent cannot be mistaken for legacy bundle work.
+            legacy, _, _ = self.harness(tmp)
+            with self.assertRaises(StageError):
+                legacy.run(old.parent.name)
+            self.assertEqual((old / "orphan-input").read_bytes(), b"old consumer")
 
     def test_bundle_runs_end_to_end_with_pinned_inputs_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:

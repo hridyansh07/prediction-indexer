@@ -21,7 +21,8 @@ bundle under `results_root/<corpus key[:16]>/<bundle>/`, and writes
 7. Commit the results: the bench output (without its mounted `in/` inputs), plus
    the prepared `context/context.json` and `context/receipt.json` and, when game
    state is prepared, `game_state/game_state.json`. These label the event and its
-   books downstream, and the work directory holding them is deleted.
+   books downstream. By default the work directory is deleted unconditionally;
+   the opt-in private-attempt mode below retains unsuccessful work instead.
 
 A SQLite ledger (`ledger`) makes the run resumable. A failed stage is recorded
 for that bundle and never stops the corpus. `--retry-failed` reruns failures.
@@ -120,6 +121,82 @@ the corpus semantic key. Cached/uncached bundle receipts, pins and derivative
 bytes remain identical. The disposable verifying sink need not re-stream
 already hash-verified derivatives; durable object stores still receive them.
 
+## Discard new private materialized inputs after success (default off)
+
+```bash
+python -m replay.corpus run SPEC --discard-materialized-inputs
+```
+
+This **run-only operational option** bypasses the shared derivative cache, even
+when `derivative_cache` is configured. There is no cache construction, lease,
+lookup, admission, eviction or writable-cache probe. Configuration/path safety
+validation still applies. The configured cache location remains available for
+later audit lookup; the option does not change the corpus-spec schema, semantic
+key, economic policy, input bytes, declared pins or result receipt format.
+Without the flag the existing cache and work-cleanup behavior is unchanged.
+
+**This does not reclaim any pre-existing shared cache.** It never removes
+canonical/raw evidence or committed results, and introduces no shared-cache
+reaper. Production jobs' never-delete-derivatives rule remains unchanged.
+`--retry-failed` retains its existing result-replacement semantics; it does not
+authorize cleanup of an older private attempt.
+
+Each attempt exclusively creates a fresh mode-0700 directory at
+`work_root/.corpus-private-attempts:/attempt-<random>/`. The reserved namespace
+cannot be a valid bundle ID, and bundle IDs are validated before legacy work or
+retry deletion. The runner never adopts, reuses, lists or sweeps earlier
+attempts. Use a dedicated absolute work root, disjoint from canonical/raw data,
+results, the shared cache and configured input/config files. Symlinked root
+components, overlapping roots (including existing bind aliases), and nesting
+inside an older private namespace are refused. Before removal, the runner
+revalidates the roots and checks the namespace and attempt inode identities.
+Content removal is anchored to the attempt descriptor held since exclusive
+creation, not a later pathname lookup. Replacing the attempt name after its
+identity check cannot redirect recursive deletion to the replacement. The root
+name is rechecked and removed only with nonrecursive `rmdir`; this last check
+is not atomic, but a nonempty replacement cannot lose contents. Linux filesystem
+support for fd-relative, symlink-resistant operations and directory fsync is
+required.
+
+Private work is eligible for deletion only after **all** of:
+
+1. The bench returns **exit 0** with **`SUCCESS`**, after its consumer cleanup.
+   A `SUCCESS` artifact with exit 3 (for example, Docker cleanup failure) is not
+   eligible and is recorded as failed in this mode.
+2. Result publication copies and fsyncs every output and kept context/game file.
+3. Directory entries for the complete output tree and every newly created
+   ancestor are fsynced **before** writing the unchanged receipt bytes; the
+   receipt file and then its containing directory are fsynced before commit
+   returns. A visible receipt alone is not this durability gate.
+
+A stage failure, nonzero/checks-failed result, interrupt, copy/commit/fsync
+failure or uncertain consumer shutdown retains the attempt. SIGKILL cannot
+report a final status, so the path is printed and flushed before consumers
+start. Retries and other workers always use new directories. Retained attempts
+need separate operator review, including consumer shutdown; **this flag is not
+a general cleanup tool**. A private cleanup error is visible but does not
+invalidate an already durable committed result or replace an earlier failure.
+A cleanup error/interrupt mid-removal can leave a partially removed directory;
+its path and diagnostic remain visible. No result evidence is edited afterward.
+
+Logs report the operational mode and attempt path at creation and the final
+`retained`, `discarded` or `cleanup_failed` outcome. Completed/failed ledger
+rows also retain `detail.materialized_inputs`, including bench status/exit,
+the durable-commit gate when passed, and any cleanup error. If the initial path
+log cannot be written/flushed, stage `work_log` fails before consumers start,
+retaining work and closing its descriptors. Final logging is best-effort:
+`log_error` remains in diagnostics/ledger without replacing the original failure
+or invalidating a committed success. Interrupted rows keep the existing
+`running` semantics; consult the initial flushed log for their path.
+
+Ordinary receipt verification remains possible. **Future deep audits may be
+INCOMPLETE** until exact matching derivative inputs are available elsewhere or
+restored to the configured lookup location. Deep audit currently does **not**
+rebuild derivatives. Canonical evidence plus the exact producer may allow
+reconstruction; that is not immediate audit readiness. Bypassing the cache can
+increase rematerialization CPU/I/O and transient space before successful work
+is discarded. Results and canonical/raw evidence continue to occupy space.
+
 ## Running everything in Docker
 
 `compose.corpus.yaml` runs the orchestrator in a container
@@ -160,8 +237,10 @@ The compose file sets `init: true` (tini forwards the signal to the orchestrator
 bench removes its containers, network and image, and writes `result.json` and
 `orchestration.json`. The corpus then stops with exit 130. That bundle's ledger
 row stays `running` and no result or receipt is committed for it, so the next run
-redoes it (`attempts` is incremented). The bundle's scratch work directory is
-deleted, including the interrupted bench output; the redo recreates it from nothing.
+redoes it (`attempts` is incremented). By default the bundle's scratch work
+directory is deleted, including the interrupted bench output; the redo recreates
+it from nothing. With `--discard-materialized-inputs`, interrupted private work
+is retained and the redo creates a separate fresh attempt instead.
 A SIGKILL (grace period exceeded) skips cleanup: remove leftover `bench-corpus-*`
 containers and networks by hand, then rerun.
 
