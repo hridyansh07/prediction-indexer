@@ -165,6 +165,7 @@ class Manager:
             # sizing with unknown/nonpositive value or short depth.
             tradeable = True
             ages = probe.ages
+            decision_value, decision_legs = row["value"], row["legs"]
         else:
             usable = all(view.validity == "usable" for view in views)
             ladders = tuple(view.ladders[source] if usable else ()
@@ -177,7 +178,13 @@ class Manager:
             limits = [_number(leg.taken[-1][0]) if leg.taken else None for leg in result.legs]
             tradeable = usable and reason is None
             ages = quote_ages(episode.spec.sources, views, d)
+            decision_value = None if result.value is None else _number(result.value)
+            decision_legs = [{"atoms": _number(leg.filled_atoms), "cost": _number(leg.cost),
+                              "taken": _pairs(leg.taken), "consumed": _pairs(leg.consumed)}
+                             for leg in result.legs]
         probe.decision = {"time_ns": str(d), "steps": _number(steps), "limits": limits, "ages": ages}
+        if self.runtime.strategy.probe_decision_evidence:
+            probe.decision.update(value=decision_value, legs=decision_legs)
         probe.opening, probe.ages = None, None
         if not tradeable:
             self._emit(probe, "decision_untradeable")

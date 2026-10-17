@@ -867,8 +867,8 @@ records that as FEE_UNKNOWN without rounding.
 
 ## 13. Fill checks
 
-Status: **implemented in the SDK; no production strategy uses it yet.** The
-cross-venue strategy is not ported (that is a later step). The SDK is proven
+Status: **implemented in the SDK and the four structural fill strategies.**
+Their individual specifications own the strategy policy versions. The SDK is proven
 offline by a synthetic two-leg strategy in
 `replay/tests/test_economic_sdk_fills.py`. Fill mode is an explicit opt-in;
 without it every existing output, including complement policies 1 and 2 and
@@ -1244,3 +1244,16 @@ byte-identical. Synthetic full-cut and sparse-v3 tapes compare probe bytes;
 the current decoder continues to reject obsolete wire v2. Five-bundle corpus
 acceptance remains pending until the retained sample and independent screen are
 available.
+
+## 16. Strategy execution-realism rollout
+
+The four opted-in policy versions (cross-venue arbitrage 4, same-venue
+multi-market 2 and both implication covers 4) require recording t10 alongside
+governing edge, delayed-fill probes and the closed flags policy. Fill episodes
+add pairing/review/stale flags; non-null probe decisions additionally carry their
+own value and native `{atoms,cost,taken,consumed}` walks. This enables exact causal
+edge-per-set thresholds at later confirmations. The independent reader reprices
+those decisions and recomputes flags; the new policy version selects the closed
+schema. Earlier policies, including explicit old-policy probes, retain their
+bytes. Details and bounds are in the
+[producer contract](specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md).

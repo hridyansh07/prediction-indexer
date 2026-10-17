@@ -26,3 +26,8 @@ examples. Changes to common proof or payout arithmetic belong here.
 
 Generic reconstruction, time, book views, depth walking, episodes and fee models
 remain in `replay`, `replay.economic_sdk` and `replay.fees`.
+
+[execution_realism.py](execution_realism.py) validates the four strategies' new
+closed policy fields and supplies pure descriptor-market delay and flag evidence.
+Flag verification independently derives the pairing/review/staleness from the
+pinned outcomes and opening ages; old policies opt out of the new output fields.

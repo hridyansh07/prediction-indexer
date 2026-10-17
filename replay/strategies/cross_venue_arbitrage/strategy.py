@@ -31,11 +31,14 @@ class CrossVenueArbitrage(CrossVenueReader):
     def requirements(self, snapshot, policy):
         # Fill checks walk each leg's full ask ladder (Kalshi: the projected bids).
         fills = self.experiment.fills is not None
+        probes = self.probe_decision_evidence
         return Requirements({key: (
-            BookRequirement(("bid",), self.sizes, True, ("kalshi_complement_ask",),
+            BookRequirement(("bid", "ask") if probes else ("bid",), self.sizes, True,
+                            ("kalshi_complement_ask", "kalshi_complement_bid") if probes else ("kalshi_complement_ask",),
+                            ("kalshi_complement_ask", "kalshi_complement_bid") if probes else
                             ("kalshi_complement_ask",) if fills else ())
             if plan["venue"] == "kalshi" else
-            BookRequirement(("bid", "ask"), self.sizes, ladders=("ask",) if fills else ()))
+            BookRequirement(("bid", "ask"), self.sizes, ladders=("ask", "bid") if probes else ("ask",) if fills else ()))
             for key, plan in self.plans.items()}, self.experiment.profile)
 
     def evaluate(self, entity, views, context):

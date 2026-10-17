@@ -1,5 +1,6 @@
 """Independent cross-venue result reader; never imports the runtime evaluator."""
 
+from replay.strategies._shared.execution_realism import ExecutionRealism
 from pathlib import Path
 
 from replay.strategies import canonical_reference
@@ -21,7 +22,7 @@ from replay.preparation import digest, encoded, load_snapshot, sha
 from replay.streams.protocol import freeze, obj, require, uint
 
 
-class CrossVenueReader(Strategy):
+class CrossVenueReader(ExecutionRealism, Strategy):
     native_scales = True
 
     def __init__(self, policy, identity, valuation, fees, snapshot, bridge=None):

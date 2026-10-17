@@ -164,7 +164,7 @@ def probe_cost(entity, legs, levels):
     arithmetic is bounded separately to 80 decimal digits per output scalar.
     """
     return (4096 + json_cost(entity.descriptor) + json_cost(entity.legs)
-            + legs * (4096 + levels * (4 * (PAIR + SLOT) + 4 * (STR + 4 * 80))))
+            + legs * (4096 + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80))))
 
 
 def quotes_cost(quotes):

@@ -1,0 +1,53 @@
+{
+  "cross": {
+    "content_receipt.json": "b5516e30a3f864b9ae96908d6be7035c52c25afdcbca037246c54a84b0923c58",
+    "denominators.ndjson": "3fe4d2580c4d38d0bfca58ad2208eb423b43eccd67a2dc5986015c63c1887c08",
+    "entities.json": "1ec9bb2f56be74e725d3b8c40e3dbab6de53ae17fb9a309bf96b6c5fec9f2d9b",
+    "episodes.ndjson": "c4a90a5f2e5dd40a1e0c52c0e835bc5e300161a375736f2354e290108d168545",
+    "manifest.json": "694ea78abd19fa2ea2c4d78b6cfce63b7930cc06d5ad0ee291c6df59b76498ef",
+    "reasons.json": "1655b885039a38fbc06f11c92964689253d0442a498cebc230507ab5166d541a",
+    "slices.ndjson": "109d9dac6dd1dbb21a97c0ce409452e131549bfb26b508c78ef3dee682ded14d",
+    "summary.json": "ea4a606156e72e40e6e045aca3a598945734ae795dd3bfb628a72ef93774cf3e"
+  },
+  "cross_venue": {
+    "content_receipt.json": "6fbf34744b733a492147360491bd05acb53399a2d9f8d1608d43d8cf9decd2aa",
+    "denominators.ndjson": "6835f8a1c77585c0df51c7da917167a91179e209aa3f410d9342af7308474c81",
+    "entities.json": "e789674227a00ad61eb08d3460136e3b86482cdb089d5db8ee0fb4657312d2fa",
+    "episodes.ndjson": "7e2eb53c2f6e44a76727882185c1027e745a6d15db65edbcc4262441d174d4d8",
+    "manifest.json": "4bbbc68420181ab4b1d6216ff8db42f047c1b027d439c3c19a9a6bec0d18240a",
+    "reasons.json": "2b48b5f020c1077039c08a03bdb9382837a07ad3a47e68908fb8ff6e9f5e236d",
+    "slices.ndjson": "13443fabb0b6d86a78687bedea01802050e67d69ac6af9b24b4787d0ee4c56b9",
+    "summary.json": "b056a756d09437facd2cd22e625c60ec78a4ac4234ba1b8bbdffa0919283bb02"
+  },
+  "multi": {
+    "content_receipt.json": "02cc56d3c9d236ee369c83fffec15351c680a3db80b7559cce1b1ad1e0c6ead7",
+    "denominators.ndjson": "d7828eb35c50de72a768fa1b9a649167af609bdd57778680da00684c48cc4dd2",
+    "entities.json": "fcbbdc0519858b60fb802a6fb15f5a52dad954e46a377ea45e6786224d8ad719",
+    "episodes.ndjson": "3b4c8ccd763b76a567394d561402e4cad6aab73c2892bf6f25d3c57ee24cc457",
+    "manifest.json": "5e2fbe612c0368baadc0a01f7c9a20e107b1aa3cee62a85f61cd631f395f72c5",
+    "reasons.json": "561566b60424845abf0f4dbe3fae3172149f1c46c882bfee5a261f05be5d9dec",
+    "slices.ndjson": "bd52b623d2016667b2aaf4d25e72e17e902797c82444d9e3df12bd37c4acd75a",
+    "summary.json": "d7d3967857dd73d86806a6351d1e9b80bd0072122adf6fefaf5b71c4a44e7a7c"
+  },
+  "old_probes": {
+    "content_receipt.json": "06ac551ba4fc3d10ab1992a1a1947e9478d6687915254cadee1c50f3c14a7c9c",
+    "denominators.ndjson": "53be9e878adab52294b0a97c435ae6e21f0b11baa7012f512e4f48b71a79975a",
+    "entities.json": "1ec9bb2f56be74e725d3b8c40e3dbab6de53ae17fb9a309bf96b6c5fec9f2d9b",
+    "episodes.ndjson": "175a6e790cfd57f8a5bb44c7380d5fcb53406a134edfc023cbad6ccf59a5008f",
+    "manifest.json": "a8245bf6d0f87d19dd9a1dfc53b32d2b9bae51bfbc48cabcb7242537a81ddffe",
+    "probes.ndjson": "0f261baa8d785cad6ac67ead801d61341e7c352aadb4bbcb3466403c876bed9f",
+    "reasons.json": "1655b885039a38fbc06f11c92964689253d0442a498cebc230507ab5166d541a",
+    "slices.ndjson": "bc0f768a1dfda5a84fa26fa209b3a1a23a7d6506431bdbfd1ce298ab7dcd909f",
+    "summary.json": "68b892267eb3d00430febc0bdb40a67879e16bbae25504219d3b713f4023d33c"
+  },
+  "same_venue": {
+    "content_receipt.json": "0841cf2f9d525bb44bad16d1ddf8247f3732fe63c0e0e607edb8e428548c4b79",
+    "denominators.ndjson": "2ff018f4c04868bdd7479aefbeba33131cdd413de0eaaf69584ab16cf4ac0a44",
+    "entities.json": "9732c331763e7e2e34ef1447ec580ee2bba512b045f79d5aaf793d65cbe391f6",
+    "episodes.ndjson": "59668c387ee095b008e0820d4a43add1d48832e4009cebf232cf7c022162d5fd",
+    "manifest.json": "e68ec66ceda38e35be7b2fff89c2e3a9ac5cb8bff8fe8b3e388e897804fdbc64",
+    "reasons.json": "8426b953de8c34480dc249ca6c022a42958bc9e41591072404d2f6e7c335c855",
+    "slices.ndjson": "f8c4876648209bf5a2a4b885f105e527d5de6a59da9ca33973f57c341d786884",
+    "summary.json": "5dc5f2a53768e7b1b925c207aa864be5e0b004aa74987c1c1aa46d55168c2f28"
+  }
+}

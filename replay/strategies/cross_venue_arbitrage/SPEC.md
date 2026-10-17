@@ -550,3 +550,13 @@ The refreshed source manifest additionally covers
 20 source/config/document files. This validation supersedes the earlier
 unstaged-only instruction: the user requested committing and pushing the branch
 to GitHub. The main checkout, retained evidence and research memo remain preserved.
+
+## Execution-realism policy 4
+
+The newer closed policy and upgraded example implement the authorized
+[strategy-realism specification](../../../docs/specs/STRATEGY_EXECUTION_REALISM_V1.md).
+Its [producer contract](../../../docs/specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md)
+owns required t10/probes/flags, independent reader checks and exact monetary/native
+units. Earlier policies above retain their schemas and bytes. The reference is
+60 probes per fill; no flag filters an episode. Retained-data acceptance remains
+pending.

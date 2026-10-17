@@ -71,7 +71,7 @@ def _prefix(levels, quantity):
     return tuple(taken)
 
 
-def _decision(row, ep, policy, count, maxima):
+def _decision(row, ep, policy, count, maxima, strategy, spec):
     confirm = row["confirm_ms"]
     when = ep["start"] + confirm * NS_PER_MS
     require(when <= 2**64 - 1, "probe decision time overflow")
@@ -80,7 +80,8 @@ def _decision(row, ep, policy, count, maxima):
                 "probe not_confirmed")
         return when, None, None
     require(confirm == 0 or when < ep["end"], "probe decision outside live fill")
-    decision = obj(row["decision"], "time_ns steps limits ages")
+    evidence = getattr(strategy, "probe_decision_evidence", False)
+    decision = obj(row["decision"], "time_ns steps limits ages" + (" value legs" if evidence else ""))
     require(uint(decision["time_ns"]) == when, "probe decision time")
     steps = _natural(decision["steps"])
     require(type(decision["limits"]) is list and len(decision["limits"]) == count,
@@ -101,6 +102,36 @@ def _decision(row, ep, policy, count, maxima):
     elif row["status"] != "decision_untradeable":
         require(steps > 0 and (sizing.mode != "target" or steps == sizing.target_steps),
                 "probe tradeable decision steps")
+    if evidence:
+        require(type(decision["legs"]) is list and len(decision["legs"]) == count,
+                "probe decision leg count")
+        fills = []
+        for index, leg in enumerate(decision["legs"]):
+            leg = obj(leg, "atoms cost taken consumed")
+            atoms, cost = _natural(leg["atoms"]), _natural(leg["cost"])
+            taken = _walk(leg["taken"], maxima[index], policy.max_levels,
+                          spec.sources[index] in SELL_SOURCES)
+            consumed = _walk(leg["consumed"], maxima[index], policy.max_levels,
+                             spec.sources[index] in SELL_SOURCES)
+            require(len(taken) == len(consumed), "probe decision levels")
+            require(all(p == cp and q <= cq and (q == cq or i == len(taken) - 1)
+                        for i, ((p, q), (cp, cq)) in enumerate(zip(taken, consumed))),
+                    "probe decision taken/consumed")
+            require(atoms == steps * spec.units[index] == sum(q for _, q in taken),
+                    "probe decision atoms")
+            require(cost == sum(p * q for p, q in taken), "probe decision cost")
+            require(decision["limits"][index] == (str(taken[-1][0]) if taken else None),
+                    "probe decision worst limit")
+            fills.append(Fill(atoms, cost, False, taken, consumed))
+        recorded = None if decision["value"] is None else _signed(decision["value"])
+        computed = strategy.fill_value(ep["entity"], steps, tuple(fills), when) if steps else None
+        require(computed is None or type(computed) is int, "probe decision value hook type")
+        require(recorded == computed, "probe decision value")
+        if confirm == 0:
+            require(decision["value"] == opening["value"] and decision["legs"] == opening["legs"],
+                    "probe opening decision evidence")
+        elif row["status"] != "decision_untradeable":
+            require(recorded is not None and recorded > 0, "probe tradeable decision value")
     return when, steps, limits
 
 
@@ -155,7 +186,7 @@ def _check(row, ep, scopes, policy, strategy, plans):
     check_spec(spec, entity)
     require(count > 0, "probe fill spec")
     maxima = tuple(10 ** int(plans[key]["price_scale"]) for key in entity.legs)
-    when, steps, limits = _decision(row, ep, policy, count, maxima)
+    when, steps, limits = _decision(row, ep, policy, count, maxima, strategy, spec)
     end = int(scopes[ep["scope"]]["end_ns"])
     if row["status"] in ("not_confirmed", "decision_untradeable"):
         require(row["legs"] == [] and all(row[name] is None for name in _METRICS),
