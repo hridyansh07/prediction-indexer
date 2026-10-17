@@ -31,9 +31,9 @@ class SameVenueMultiMarket(MultiMarketReader):
         # The trigger reads one contract; fill checks walk each leg's full ask ladder.
         size = (int(TRIGGER_SIZE),)
         probes = self.probe_decision_evidence
-        transforms = ("kalshi_complement_ask", "kalshi_complement_bid") if probes else ("kalshi_complement_ask",)
+        transforms = ("kalshi_complement_ask",)
         return Requirements({key: (
-            BookRequirement(("bid", "ask") if probes else ("bid",), size, True, transforms, transforms)
+            BookRequirement(("bid",), size, True, transforms, transforms + ("bid",) if probes else transforms)
             if plan["venue"] == "kalshi" else BookRequirement(("bid", "ask"), size, ladders=("ask", "bid") if probes else ("ask",)))
             for key, plan in self.plans.items()}, self.experiment.profile)
 

@@ -35,11 +35,17 @@ flags, retain their original closed output schemas and remain runnable/readable.
 The four `config.example.json` files carry the exact reference policy: governing
 edge plus recording t10; confirmations 0/500/1,000 ms; arrivals
 100/250/500/1,000/2,000 ms; simultaneous and slow-first; defaults of 0 ms for
-Kalshi/Limitless and 3,000 ms for Polymarket. This is exactly 60 probes per fill
+Kalshi/Limitless and 1,000 ms for Polymarket. This is exactly 60 probes per fill
 episode. The flags reference is 5,000 ms and `["series_moneyline"]`. Other finite
 SDK probe grids and explicitly configured allowlists/staleness remain valid
 experiments; all configuration values enter policy and experiment identities.
 All three venue defaults must be present in a new policy.
+
+The 1 s unknown-Polymarket default is the owner's 17 October 2026 decision,
+based on the Universe v8 audit: all 232,495 Polymarket execution-term rows carry
+1000 ms, and every market in all 1,212 retired bundles has observed terms. The
+old 3 s maximum rationale was unsupported. Known observations, including zero,
+override the default; `delay_source` remains `terms` or `default`.
 
 ## Pinned decisions and exits
 
@@ -52,18 +58,37 @@ return unknown; only the SDK applies the configured default. The lookup is pure,
 and the independent reader performs it at decision time too, including when
 slow-first sends other legs later.
 
-New policies retain native `ask` and exit `bid`, or both projected
-`kalshi_complement_ask` and exit `kalshi_complement_bid`. Existing FeeBridge,
+The [R12 amendment](PROBE_EXIT_SOURCE_V1.md) makes `fill_exits` resolve BUY exits
+to native `bid` on the acquired descriptor book. Kalshi entry books are the
+opposite orientation; acquired YES exits into YES bids, acquired NO into NO bids.
+New policies retain Kalshi native `bid` and `kalshi_complement_ask`, reading no
+native asks and retaining no `kalshi_complement_bid`. Polymarket/Limitless keep
+native `ask`/`bid`. Missing exit plans/builders fail with `probe exit book not
+planned`; missing retention fails with `probe exit ladder not retained`. A
+Kalshi sold leg fails with `probe exit unsupported for Kalshi sold leg`.
+Non-Kalshi sold legs keep their same-book reverse mapping. The SDK default
+preserves the legacy entry-source reverse mapping for other probe users.
+
+Exit ladders use the exit book's committed usable view at arrival, never a
+later book or a borrowed source ladder. Empty/unusable exits yield no proceeds.
+Walks stay best-first and unpriced, retaining and walking at most `max_levels`
+exit levels. Excess beyond that cap is a shortfall, never an attempt failure;
+entry walks still fail if they need more than `max_levels` levels within their
+frozen limit. Unexited BUY excess keeps its acquisition cost. Uncovered sold
+excess is charged at unit payout (`10**price_scale`) per atom in both writer
+and independent reader, without changing actual `exit_consumed`/`exit_proceeds`.
+No cut/retention boundary or row field changes. The reader checks exit prices
+against the exit book's price scale.
+Existing FeeBridge,
 `assess_net` memoization and the scale-36 `fill_loss` conversions from PR #78 are
 reused. Native costs/proceeds keep their native scales. Aggregate value and gross
 loss share scale-36 research-dollar/common quote units. No unwind fee is added.
 
 Kalshi basket inputs declare `("crossed", None)` as well as the projected
-acquisition ask and native bid. The evaluator's self-cross exclusion reads the
-source book's native bid and ask, including the ask retained for probe exits.
-An ask-only uncross therefore invalidates that exclusion even when the native
-bid and projected acquisition fill are identical. This applies to operation
-cuts and same-bid snapshots; the self-cross exclusion itself remains enforced.
+acquisition ask and native bid. R10's declaration stays defensively, but with no
+native asks read the Kalshi crossed flag cannot fire on normalizer-shaped
+books. The old ask-only recovery fixtures remain explicitly synthetic and opt
+into ask reads only in those tests. Non-Kalshi self-cross exclusion is unchanged.
 
 ## Episode and probe output contract
 

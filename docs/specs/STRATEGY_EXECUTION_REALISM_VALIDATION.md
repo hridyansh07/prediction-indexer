@@ -3,9 +3,13 @@
 Status: **producer and offline research implementation delivered; site UI deferred
 by the user; fresh retained-data acceptance and the full corpus rerun pending.**
 
-The approved [supplied specification](STRATEGY_EXECUTION_REALISM_V1.md) is saved
-byte for byte, including its original `proposed` label. Its SHA-256 is
+The approved [supplied specification](STRATEGY_EXECUTION_REALISM_V1.md) was
+originally saved byte for byte, including its `proposed` label, with SHA-256
 `6ae97739d47dd71414e575a895fc3f9159c3166cd0b0ebf4faeadf36789a1ff6`.
+That is the historical supplied-text hash, not the current file's hash: the
+approved [R12 amendment](PROBE_EXIT_SOURCE_V1.md) now updates §2's exits and
+Polymarket default. The R12 specification and its §8 addendum are each recorded
+verbatim in separate commits.
 The user explicitly authorized this implementation. The
 [producer contract](STRATEGY_EXECUTION_REALISM_CONTRACT.md) records implemented
 schemas, units and limits. Current `EXECUTION_DELAY_V1.md` and the volatility
@@ -170,3 +174,81 @@ hash goldens. Whitespace checks pass. Full root/replay suites and Rust, UI,
 Compose and live acceptance were not rerun for this three-declaration Python
 correction; their earlier outcomes above remain historical. Existing recorded
 inputs/results are unchanged.
+
+## R12: acquired-book probe exits, bounded walks and sold shortfalls (17 October 2026)
+
+Work started in a new `fix/probe-exit-source` worktree, verified against exactly
+`origin/feat/corpus-runner` at `40c280416b402999fb0ce260008d09d64da03c49`
+before editing. The first commit records the approved R12 spec verbatim.
+The owner's §8 addendum is a separate verbatim spec commit. Regressions for
+both stages were written and run before their corresponding production fixes.
+
+### Before/after observations through real writers and semantic readers
+
+All new R12 Kalshi fixtures carry both orientations with native bids only,
+never injected native asks. They exercise prepared snapshots, the decoder,
+the real strategy factories and the SDK writer, then independent aggregate and
+strategy readers. They do not exercise a live venue, retained data or corpus.
+
+| Case | Before | After |
+|---|---|---|
+| R12, BUY 10 at 0.40, other leg fills 6, acquired bid 0.30 | On unchanged base production code, `exit_consumed: []`, proceeds 0, full excess-cost loss 1.60 | Acquired YES/NO bids cover 4; proceeds 1.20; loss 0.40 (scale-36 `400000000000000000000000000000000000`) |
+| R12, acquired bids cover only 2 of 4 at 0.30/0.20 | Empty exit; loss 1.60 | Two real exit levels, proceeds 0.50; uncovered 2 keep full cost; loss 1.10 |
+| R12, acquired book empty or unusable | Empty exit, full-cost loss | Unchanged conservative result: no borrowed ladder, proceeds 0, loss 1.60 |
+| F2, Kalshi excess 4, bids 30×1/20×1/10×10, cap 2 | With §2 implemented but before §8, attempt raises `probe consumed level bound` | All 60 scenarios read; selected row exits exactly first 2 levels, proceeds 50 native, loss 1.10 at scale 36 |
+| F2, Polymarket excess 1,000,000 atoms, 300×250,000/200×250,000/100×1,000,000, cap 2 | Same level-bound attempt failure | Two-level exit, proceeds 125,000,000; loss 275,000,000 (native scale 9); remainder keeps its cost |
+| F1, sold excess 1,000,000 atoms at 650, empty repurchase book, max price 1000 | Writer reports −650,000,000 loss; reader accepts it | Writer and reader charge uncovered atoms: +350,000,000 loss; actual exit remains empty with proceeds 0 |
+| F1, same sold excess, only 250,000 repurchased at 750 | Writer reports −462,500,000 loss; reader accepts it | Actual repurchase cost 187,500,000 plus 750,000×1000 uncovered charge minus 650,000,000 sales = +287,500,000 loss |
+
+The base R12 run executes six methods with 15 failing subcases, including
+acquired YES/NO and 0.01-contract steps. The §8 before run has two failing
+sold-loss subcases and four errors (two thin-exit failures and two independent
+reader arithmetic cases). Its unchanged entry-bound and reader level-cap
+controls pass. After the fixes, the same cases pass. Fully covered favourable
+sold exits remain negative losses; there is no clamping.
+
+Additional regressions pin the final same-time arrival view rather than a
+decision/intermediate/later book; every factory's 60 scenarios; exact missing
+plan/builder, missing ladder and unsupported Kalshi SELL messages; Kalshi bid-only
+requirements; and the 1000 ms default with observed zero taking precedence.
+The reader rejects rehashed rows with `max_levels + 1` exit levels or sold loss
+that omits the uncovered charge. The original entry-bound failure test is
+unmodified. Probe row schemas and retained cut/shift boundaries are unchanged.
+
+### Compatibility and final offline gates
+
+- Every old-policy output hash, the complement V1 goldens and A1's non-Kalshi
+  probe bytes pass unchanged. A1's probe SHA-256 remains
+  `f26f5060f2ad6bc37cf2df4aab40fe2816519baeb4c403c40d7b1eaf739a6900`.
+- The PM/Limitless-only realism fixture holds its configured delay fixed;
+  its probe SHA-256 remains
+  `89f36166ac2f8b3df7a4e05e461d79d555179976cc9d2add79d7933e754036d0`.
+- Nine whole probe files from §2-only and §8 output compare byte-identically
+  for bought exits within the cap: all four factories, fractional NO,
+  insufficient/empty/unusable exits, and PM/Limitless. Four factory hashes are
+  pinned in the integrated regression.
+- Focused §7 modules plus `test_corpus_execution_realism`: **158 tests pass**.
+  Modules: `test_strategy_execution_realism`, `test_execution_probe_integration`,
+  `test_execution_delay_probes`, `test_execution_probe_reader`,
+  `test_cross_venue_arbitrage`, `test_same_venue_multi_market`,
+  `test_implication_cover`, `test_strategy_packages`, `test_economic_sdk_port`,
+  `test_streams`, and the reference-corpus module.
+- Full Python gates: `.venv/bin/python -m unittest discover -s tests`:
+  **1,002 tests pass**; `.venv/bin/python -m unittest discover -s replay/tests`:
+  **758 tests, OK with 62 skips**. Optional integration coverage requiring
+  prebuilt Rust binaries or explicitly disposable Redis remains unverified.
+  Whitespace checks pass. No Rust/UI/deployment files changed.
+
+The initial focused run exposed a synthetic reader double that did not inherit
+the SDK `Strategy` default; it now inherits that interface. The first full
+replay run also found the reference-corpus test's old 3000 ms expectation;
+it now pins the approved 1000 ms default. Neither required production fallback
+behavior. R10's old synthetic ask-only tests explicitly opt into ask reads;
+production Kalshi requirements do not.
+
+Local evidence is under `.amp/in/artifacts/`: `r12-base-regressions.log`,
+`r12-addendum-before.log`, `r12-after-evidence.json`,
+`r12-section2-hashes.json`, and the focused/full gate logs. No corpus, bench,
+Docker, live service, production data, object store or database operation was
+performed, and `data/` and credentials were untouched. Offline unittest-owned
+temporary fixtures are the only integration runtime used.

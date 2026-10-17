@@ -43,7 +43,7 @@ Each strategy enables `probes` with the reference settings:
   "confirm_ms": [0, 500, 1000],
   "arrival_ms": [100, 250, 500, 1000, 2000],
   "sequencing": ["simultaneous", "slow_first"],
-  "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 3000}
+  "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 1000}
 }
 ```
 
@@ -51,15 +51,19 @@ Each strategy enables `probes` with the reference settings:
   `execution_terms` from the pinned outcomes document at the decision time. The
   mapping is the entity descriptor's `legs[].market_id`, which matches the outcomes
   document's `markets[].market_id`.
-- **The defaults:** 0 for Kalshi and Limitless, which document no taker delay. 3 s for
-  a Polymarket market whose terms are unavailable: the largest value observed on
-  esports markets, chosen conservatively. `delay_source` in each probe row says which
-  applied.
-- **Exit ladders:** each strategy's `BookRequirement.ladders` gains the exit ladders
-  the probes need. That's `bid` for every bought native leg and
-  `kalshi_complement_bid` for every bought Kalshi complement leg, plus the reverse
-  for sold legs. Some are retained already: the implication covers keep `bid`
-  ladders (`_shared/implication_cover/contract.py`).
+- **The defaults:** 0 for Kalshi and Limitless, which document no taker delay. 1 s for
+  a Polymarket market whose terms are unavailable (owner decision, 17 Oct 2026):
+  the Universe v8 audit found 1000 ms on all 232,495 Polymarket execution-term
+  rows, with observed terms for every market in all 1,212 retired bundles. The
+  earlier 3 s maximum was unsupported. A numeric observation, including 0,
+  always wins. `delay_source` semantics are unchanged.
+- **Exit ladders:** BUY excess sells into the acquired descriptor book's native
+  `bid` at arrival, including Kalshi YES and NO. Kalshi entry sources remain
+  the opposite orientation's projected bids; they are not the exit books.
+  Retain native `bid` and `kalshi_complement_ask`, without reading native asks
+  or retaining `kalshi_complement_bid`. Non-Kalshi SELL legs keep the reverse
+  mapping; Kalshi sold legs fail closed with probes. The approved
+  [R12 amendment](PROBE_EXIT_SOURCE_V1.md) owns binding, timing and compatibility.
 
 ## 3. Eligibility flags (recorded, never filtered)
 

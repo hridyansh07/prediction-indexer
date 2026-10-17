@@ -186,6 +186,7 @@ def _check(row, ep, scopes, policy, strategy, plans):
     check_spec(spec, entity)
     require(count > 0, "probe fill spec")
     maxima = tuple(10 ** int(plans[key]["price_scale"]) for key in entity.legs)
+    exit_maxima = tuple(10 ** int(plans[key]["price_scale"]) for key, _ in strategy.fill_exits(entity))
     when, steps, limits = _decision(row, ep, policy, count, maxima, strategy, spec)
     end = int(scopes[ep["scope"]]["end_ns"])
     if row["status"] in ("not_confirmed", "decision_untradeable"):
@@ -250,15 +251,17 @@ def _check(row, ep, scopes, policy, strategy, plans):
         matched_legs.append(Fill(matched * unit, kept_cost, False, kept, kept))
         excess = atoms - matched * unit
         require(_natural(leg["excess_atoms"]) == excess, "probe excess atoms")
-        exit_levels = _walk(leg["exit_consumed"], maxima[index], policy.max_levels,
+        exit_levels = _walk(leg["exit_consumed"], exit_maxima[index], policy.max_levels,
                             spec.sources[index] not in SELL_SOURCES)
-        require(sum(quantity for _, quantity in exit_levels) <= excess, "probe exit quantity")
+        covered = sum(quantity for _, quantity in exit_levels)
+        require(covered <= excess, "probe exit quantity")
         proceeds = _natural(leg["exit_proceeds"])
         require(proceeds == sum(price * quantity for price, quantity in exit_levels),
                 "probe exit proceeds")
         require(excess > 0 or (not exit_levels and proceeds == 0), "probe zero-excess unwind")
         excess_cost = cost - kept_cost
-        native_losses.append(proceeds - excess_cost if spec.sources[index] in SELL_SOURCES
+        native_losses.append(proceeds + (excess - covered) * maxima[index] - excess_cost
+                             if spec.sources[index] in SELL_SOURCES
                              else excess_cost - proceeds)
     recorded = None if row["value"] is None else _signed(row["value"])
     value = 0 if matched == 0 else strategy.fill_value(entity, matched, tuple(matched_legs), when)

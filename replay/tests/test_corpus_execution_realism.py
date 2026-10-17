@@ -50,7 +50,7 @@ class ReferenceCorpusTests(unittest.TestCase):
                     "version": 1, "sizings": ["edge", "t10"], "confirm_ms": [0, 500, 1000],
                     "arrival_ms": [100, 250, 500, 1000, 2000],
                     "sequencing": ["simultaneous", "slow_first"],
-                    "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 3000}})
+                    "unknown_taker_delay_ms": {"kalshi": 0, "limitless": 0, "polymarket": 1000}})
                 probes = policy["fills"]["probes"]
                 self.assertEqual(len(probes["sizings"]) * len(probes["confirm_ms"]) *
                                  len(probes["arrival_ms"]) * len(probes["sequencing"]), 60)

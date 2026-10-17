@@ -556,12 +556,15 @@ class Runtime:
                 for key, source in zip(entity.legs, spec.sources):
                     require(source in self.builders[key].ladders, "fill ladder not retained")
                     if self.probes is not None:
-                        from replay.economic_sdk.probes import EXIT_SOURCE
-                        require(EXIT_SOURCE[source] in self.builders[key].ladders,
-                                "probe exit ladder not retained")
                         venue = self.plans[key]["venue"]
                         require(venue in self.fill.probes.unknown_taker_delay_ms,
                                 "probe unknown taker delay missing venue")
+                if self.probes is not None:
+                    exits = self.strategy.fill_exits(entity)
+                    require(type(exits) is tuple and len(exits) == len(entity.legs), "fill exits arity")
+                    for key, ladder in exits:
+                        require(key in self.plans and key in self.builders, "probe exit book not planned")
+                        require(ladder in self.builders[key].ladders, "probe exit ladder not retained")
                 maxima = tuple(10 ** int(self.plans[key]["price_scale"]) for key in entity.legs)
                 specs[entity.id] = (spec, maxima)
                 cost += bounds.SLOT + bounds.json_cost([list(spec.sources), list(spec.units),

@@ -201,14 +201,27 @@ Then:
   own fee-inclusive value of the matched quantity, at decision time `d`.
   `matched_legs` takes each leg's cheapest `matched_steps × units` atoms of what it
   filled. `null` when unknown; 0 when `matched_steps` is 0.
-- **Excess unwind:** each excess quantity is sold immediately into that leg's exit
-  ladder at its own arrival time. The exit ladder is `bid` for a bought leg, or
-  `kalshi_complement_bid` for a bought Kalshi complement; the reverse for a sold
-  leg. The walk is best-first and records the proceeds.
+- **Excess unwind:** `Strategy.fill_exits(entity)` returns one `(book_key, ladder)`
+  per leg, read from that book's committed usable view at the leg's own arrival.
+  The SDK default reverses the entry source on the same book. Under the
+  [R12 amendment](PROBE_EXIT_SOURCE_V1.md), the four execution-realism strategies
+  sell BUY excess into the acquired descriptor book's native `bid`, including
+  both Kalshi orientations. Non-Kalshi sold legs repurchase on the same book's
+  `ask`; Kalshi sold legs with probes fail closed at bind.
+  - Save and walk at most `max_levels` exit levels, best-first, with no price
+    limit. An exit walk never fails the attempt at the level bound: any excess
+    beyond the cap or displayed depth is an exit shortfall. Empty or unusable
+    exit books cover nothing. The entry walk is unchanged and still fails with
+    `"probe consumed level bound"` if it needs more than `max_levels` levels
+    within its frozen price limit.
   - `leg_loss_gross` is valued by `fill_loss` after computing each leg's native
-    loss. For a bought leg it is the excess cost
-    minus the exit proceeds. For a sold leg it is the repurchase cost of the excess
-    minus the sale proceeds of that excess.
+    loss. For a bought leg it is excess cost minus exit proceeds; unexited atoms
+    retain their full acquisition cost. For a sold leg it is
+    `exit_cost + uncovered_atoms * 10**price_scale - excess_sale_proceeds`:
+    uncovered atoms are charged as repurchases at the maximum price (unit payout).
+    The writer and independent reader both apply this rule. `exit_consumed` and
+    `exit_proceeds` record only actual ladder coverage; the uncovered charge
+    appears only in `leg_loss_gross`. No row field changes.
   - Matched quantity always takes each leg's best atoms: the cheapest for a bought
     leg, the highest-priced sales for a sold leg. The excess is therefore the worst
     atoms.

@@ -33,9 +33,8 @@ class CrossVenueArbitrage(CrossVenueReader):
         fills = self.experiment.fills is not None
         probes = self.probe_decision_evidence
         return Requirements({key: (
-            BookRequirement(("bid", "ask") if probes else ("bid",), self.sizes, True,
-                            ("kalshi_complement_ask", "kalshi_complement_bid") if probes else ("kalshi_complement_ask",),
-                            ("kalshi_complement_ask", "kalshi_complement_bid") if probes else
+            BookRequirement(("bid",), self.sizes, True, ("kalshi_complement_ask",),
+                            ("kalshi_complement_ask", "bid") if probes else
                             ("kalshi_complement_ask",) if fills else ())
             if plan["venue"] == "kalshi" else
             BookRequirement(("bid", "ask"), self.sizes, ladders=("ask", "bid") if probes else ("ask",) if fills else ()))

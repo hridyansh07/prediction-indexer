@@ -245,9 +245,13 @@ class Manager:
         row.update(filled_atoms=_number(fill.filled_atoms), cost=_number(fill.cost),
                    consumed=_pairs(fill.taken))
         probe.fills[leg] = fill
-        # Only max_levels + 1 exit levels can matter: a required extra level
-        # fails the attempt at unwind, while less depth remains visible.
-        probe.exits[leg] = view.ladders[EXIT_SOURCE[source]][:self.runtime.fill.max_levels + 1]
+        key, ladder = self.runtime.strategy.fill_exits(episode.entity)[leg]
+        # Like the entry view, live views are committed at the greatest time
+        # <= at: the manager drains before any later cut refreshes them.
+        exit_view = self.runtime.views[key]
+        # Exit depth beyond this cap is a shortfall, never an attempt failure.
+        probe.exits[leg] = (exit_view.ladders[ladder][:self.runtime.fill.max_levels]
+                            if exit_view.validity == "usable" else ())
         if probe.mode == "slow_first" and leg == probe.first:
             if not fill.filled_atoms:
                 for other in range(len(probe.legs)):
@@ -276,7 +280,9 @@ class Manager:
             excess_cost = fill.cost - part.cost
             # A sold leg repurchases its worst (lowest-priced) excess sales;
             # best-first matched sales have already been retained by _part.
-            native_losses.append(exit_fill.cost - excess_cost if source in SELL_SOURCES
+            uncovered = excess - exit_fill.filled_atoms
+            native_losses.append(exit_fill.cost + uncovered * episode.maxima[leg] - excess_cost
+                                 if source in SELL_SOURCES
                                  else excess_cost - exit_fill.cost)
             probe.legs[leg].update(excess_atoms=_number(excess), exit_consumed=_pairs(exit_fill.taken),
                                    exit_proceeds=_number(exit_fill.cost))

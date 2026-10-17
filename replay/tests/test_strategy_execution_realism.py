@@ -231,11 +231,24 @@ class IntegratedTests(unittest.TestCase):
                                   row["leg_loss_gross"]), (walk, proceeds, str(loss)))
 
     def test_bids_only_kalshi_all_four_factories_read_all_60_scenarios(self):
-        for kind in ("cross", "multi", "same_venue", "cross_venue"):
+        # Whole-file hashes recorded after §2 but before §8: bounded exits
+        # must not change any bought-leg row that fits within the cap.
+        expected = {
+            "cross": "60b498b7356d5985490bb08a4411c4c942877db0d677aa45dea55a75822a4a16",
+            "multi": "947762d0a94cf9719634bed0a6d35ec728eb2c162173430f6fabd88e0bfc36c9",
+            "same_venue": "120dd68a7363fd071292b6e346bbfe49d3d88ca4e23e5b0d9bd29603792f7570",
+            "cross_venue": "ecdc18b2c0d8f49e43342406293007ba43f9d69aea264f4a5f9fe86155d6d61d"}
+        for kind, sha in expected.items():
             with self.subTest(kind=kind):
                 h, entity = self.exit_case(kind)
-                rows, _ = self.exit_rows(h, entity)
-                self.assertTrue(any(leg["exit_consumed"] for row in rows for leg in row["legs"]))
+                _, row = self.exit_rows(h, entity)
+                index = next(i for i, d in enumerate(entity.descriptor["legs"])
+                             if d["instrument"] == "kalshi:series")
+                leg = row["legs"][index]
+                self.assertEqual((leg["excess_atoms"], leg["exit_consumed"], leg["exit_proceeds"],
+                                  row["leg_loss_gross"]),
+                                 ("4", [["30", "4"]], "120", str(4 * 10**35)))
+                self.assertEqual(hashlib.sha256((h.output / "probes.ndjson").read_bytes()).hexdigest(), sha)
 
     def test_bids_only_kalshi_thin_exit_stops_at_cap_without_failing_attempt(self):
         h, entity = self.exit_case(exit_bids=((30, 1), (20, 1), (10, 10)), max_levels=2)

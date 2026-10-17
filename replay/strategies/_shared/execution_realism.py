@@ -54,6 +54,21 @@ def market_delays(snapshot, entity, time_ns):
     return tuple(result)
 
 
+def acquired_exits(entity, spec):
+    """BUY excess sells native bids on the acquired descriptor book, not its source."""
+    from replay.economic_sdk.probes import EXIT_SOURCE
+    from replay.economic_sdk.types import SELL_SOURCES
+    exits = []
+    for key, leg, source in zip(entity.legs, entity.descriptor["legs"], spec.sources):
+        acquired = (leg["instrument"], leg["orientation"])
+        if source in SELL_SOURCES:
+            require(not acquired[0].startswith("kalshi:"), "probe exit unsupported for Kalshi sold leg")
+            exits.append((key, EXIT_SOURCE[source]))
+        else:
+            exits.append((acquired, "bid"))
+    return tuple(exits)
+
+
 def record_flags(snapshot, entity, policy, ages):
     markets = {m["market_id"]: m for m in snapshot.get("outcomes", {}).get("document", {}).get("markets", [])}
     types = [markets.get(leg["market_id"], {}).get("market_type") for leg in entity.descriptor["legs"]]
@@ -98,6 +113,11 @@ class ExecutionRealism:
         if self.probe_decision_evidence:
             return market_delays(self.snapshot, entity, time_ns)
         return super().fill_delays(entity, time_ns)
+
+    def fill_exits(self, entity):
+        if self.probe_decision_evidence:
+            return acquired_exits(entity, self.fill_spec(entity))
+        return super().fill_exits(entity)
 
     def fill_flags(self, entity, ages):
         if self.probe_decision_evidence:
