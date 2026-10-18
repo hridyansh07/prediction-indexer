@@ -157,14 +157,16 @@ def fill_state_cost(legs):
     return FILL_STATE + CONTAINER + legs * (SLOT + INT)
 
 
-def probe_cost(entity, legs, levels):
-    """One pending scenario, including copied decision, fills and arrival exit depth.
+def probe_cost(legs, levels=0):
+    """Scenario header plus actually retained entry/exit level occurrences.
 
-    Reserve both object state and canonical row strings before adding a probe;
-    arithmetic is bounded separately to 80 decimal digits per output scalar.
+    Episode metadata and shared decisions have separate owners. Each retained
+    level reserves native pairs, matching/unwind scratch and canonical strings
+    (80 decimal digits per scalar), even though arrival strings are emitted
+    only on resolution. Never infer future arrival depth from opening depth.
     """
-    return (4096 + json_cost(entity.descriptor) + json_cost(entity.legs)
-            + legs * (4096 + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80))))
+    return (4096 + legs * 4096
+            + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80)))
 
 
 def quotes_cost(quotes):

@@ -1302,8 +1302,18 @@ Pending decisions and arrivals catch up before later books refresh and at
 terminal flush. They add no stream retention boundary or shift offset. A probe
 retains its entity and arrival exit evidence across episode closure; its state
 is reserved before insertion, with a 100,000-pending-scenario cap and the shared
-512 MiB state budget. Consuming more than `max_levels` fails rather than silently
-truncating a required walk. Output keeps the existing per-file, row and line caps.
+512 MiB state budget. Episode metadata and each `(episode, sizing, confirmation)`
+decision have shared owners. Scenario headers are charged on admission; actual
+decision and arrival evidence growth is charged before retention, rather than
+reserving every scenario's maximum configured depth upfront. Opening depth does
+not bound future arrivals. Arrival walks stay native until row emission; saved
+exit prefixes need cover at most that leg's actual fill, still within
+`max_levels`. Scenario payloads release on resolution, shared evidence after its
+last sibling; stale censor-event shells remain charged until their final pop.
+See [the retention contract §6](specs/LEGACY_PROBE_RETENTION_V1.md#6-phase-aware-probe-retention-owner-authorized-follow-up).
+Consuming more than `max_levels` fails for required entry walks, while exit
+shortfalls keep their existing conservative valuation. Output keeps the existing
+per-file, row and line caps, schemas and bytes.
 
 `probe_reader` independently validates coverage, closed rows, opening equality,
 walk limits/order/arithmetic, matched valuation, unwind losses, delay provenance,

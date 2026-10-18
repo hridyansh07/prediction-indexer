@@ -380,3 +380,81 @@ included: later decision/arrival books may deepen beyond opening depth. No
 corpus/bench workload, Docker, service, network, retained data, secrets, `data/`
 or `~/pi-data` access occurred. The owner's actual memory exception and the
 separate operational acceptance remain unverified here.
+
+## Follow-up: phase-aware probe memory (18 October 2026)
+
+Starting from local `d014343`, the owner authorized implementation of
+[the retention contract §6](LEGACY_PROBE_RETENTION_V1.md#6-phase-aware-probe-retention-owner-authorized-follow-up).
+The configured grid, economics, successful output bytes and every existing
+limit remain unchanged. No late-release bug was found: the old manager already
+released each scenario's reservation immediately after writing its row. The
+demonstrated capacity problem was reserving every scenario's full configured
+depth upfront, whether that depth was ever retained or not.
+
+Two regressions were run before production edits. A shallow 60-scenario fixture
+with `max_levels=64` and 2 MiB additional state capacity failed after admitting
+three scenarios (`pending probe state budget`, 638,144 bytes requested for the
+fourth). An arrival with one contract filled saved 64 exit levels although the
+best level alone covered every possible excess. Both regressions pass after
+the change; the full grid reports the independently expected one/two-contract
+quantities and values, and completes through its semantic reader.
+
+The manager now shares episode metadata and each sizing/confirmation decision;
+later confirmations do not retain opening walks/ages. Separate scenario
+headers retain independent timings, arrivals and native fills. Decision and
+actual arrival evidence growth are charged before retention. Exit snapshots
+save only the capped prefix needed to cover the actual arrival fill; arrival
+walk strings are formatted at emission. Identical native walk tuples share
+storage. Payloads release per resolved scenario, decisions at their last
+sibling and metadata at the last scenario. Finished censor events clear their
+payloads but keep a charged header until the final heap pop.
+
+Additional checks cover a later arrival using three levels after opening on
+one, rejected arrival growth leaving budget and fill/exit state unchanged,
+rejected confirmation evidence leaving its group unchanged, and releases while
+the runtime fill episode remains open. Aggregate owned reservations cover the
+deduplicated retained heap/episode graph, rather than incorrectly requiring
+each exclusive scenario reservation to cover all shared owners again.
+
+A disposable offline comparison loaded the unchanged `d014343` probe manager
+and reservation function directly from Git, without changing a checkout. It
+compared before/after writers and independent semantic readers for **40 paired
+cases / 80 fixture runs**: four factories, Kalshi YES/NO where supported by the
+fixture, legacy/new policies, plain/zstd, and deep/capped thin exits. Every
+selected episode retained all 60 scenarios. All **360 complete output-file
+comparisons** matched byte-for-byte, including manifests and receipts. Existing
+sold-shortfall, missing/zero delay, empty/unusable, sparse/same-time and censor
+tests and legacy/complement/A1 goldens pass unchanged in their observable output.
+
+Representative cross-venue new-policy YES, 60 scenarios, 30-level exit book:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Probe reservations immediately after admission | 38,884,320 B | 803,943 B |
+| Maximum sampled probe reservations | 38,884,320 B | 862,495 B |
+| Maximum sampled reachable heap/episode graph | 181,375 B | 116,817 B |
+
+These are synthetic retained-state reservations and recursive object-graph
+samples, **not process RSS, a production peak or a throughput estimate**. The
+new reservation still exceeded the measured retained graph at every checked
+decision/arrival phase with pending probes. The first row is about 48 times
+smaller; native graph reduction is much smaller and must not be described as a
+48-times RSS saving.
+
+Under `nice -n 19`, focused verification passed **180 tests**; root discovery
+passed **1002 tests**; replay discovery completed **782 tests, 62 skipped**
+(optional Rust/disposable-Redis cases). The strengthened confirmation-growth
+test was also rerun individually after the broad gate. `git diff --check`
+passed. A separate charge/release ledger over the probe and realism modules
+passed 56 tests: all 88 completed writer runtimes returned their probe-owned
+budget delta to exactly zero, including censor and episode-closure cases.
+Existing fixture ResourceWarnings remain visible; no Rust/UI/deployment gate,
+service, retained-data or operator-config corpus acceptance was run.
+
+Evidence: `.amp/in/artifacts/probe-memory-comparison.json`,
+`probe-memory-comparison.log`, `probe-memory-root.log` and
+`probe-memory-replay.log`. No corpus/bench workload, network, object store,
+secrets, `data/` or `~/pi-data` access occurred. This local change does not
+authorize a rollout or certify all 1,212 bundles. Integration into the launch
+revision and a retry of the previously failing operator sample remain separate;
+output-byte/row caps are not fixed by lowering retained-state reservations.

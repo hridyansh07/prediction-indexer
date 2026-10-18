@@ -151,3 +151,69 @@ graphs on successful budget checks; failure counting uses bounded existing
 episode tables and constant extra workspace. No reservation/retention
 optimization, limit, scenario, economics or output-schema change is part of
 this diagnostic amendment.
+
+## 6. Phase-aware probe retention (owner-authorized follow-up)
+
+This section supersedes §5's instruction to keep the old reservations. Preserve
+the configured grid (including all 60 reference scenarios), the 64-scenario
+policy bound, the 100,000 pending-scenario cap and the shared 512 MiB retained
+state limit. Do not change fees, fills, timing, status/ordering, evidence fields,
+exit mappings, shortfall arithmetic, or writer/reader output limits.
+
+### Ownership and admission
+
+- Reserve entity/spec/episode metadata once per probe episode, not per scenario.
+- Reserve opening evidence once per `(episode, sizing, confirmation)` group.
+  Only confirmation zero needs an opening walk/ages reference. Later decisions
+  must price the committed decision-time book, never reuse opening depth.
+- Latency and sequencing siblings share the same decision evidence, priced once
+  through the pure hooks. They still have separate send times, arrivals, fills,
+  exit snapshots and output rows. Decision evidence is not mutated after pricing.
+- Each scenario starts with a fixed header reservation: `4096 + 4096 * legs`.
+  An admission that introduces an episode or decision group charges all new
+  owners atomically before queuing the scenario. Failed admission changes neither
+  charged bytes nor retained owners.
+- Before retaining a decision, replace its group's reservation with `4096` plus
+  `bounds.json_cost(decision)`. Before retaining an arrival, charge the actual
+  count of entry and saved exit levels. Each level keeps the existing conservative
+  allowance `8 * (PAIR + SLOT) + 8 * (STR + 4 * 80)` for native pairs, matching and
+  unwind workspace, and canonical strings. Opening depth is not a future cap:
+  better prices may require more levels at arrival. Growth can fail visibly at
+  decision or arrival with `pending probe state budget`, before retention.
+
+### Evidence retained while waiting
+
+Keep entry fills as native immutable `Fill` objects. Their identical `taken` and
+`consumed` tuples share storage. Format the arrival `consumed` strings only when
+writing the resolved row; preserve null unresolved walks, empty unsent walks and
+all existing reader semantics. The level reservation still covers those strings.
+
+At each leg's arrival, save the shortest best-first exit prefix whose cumulative
+quantity covers that leg's actual filled quantity, stopping at `max_levels` or
+the end of the usable exit ladder. Save nothing for zero fills/unusable exits.
+This is lossless: excess is never greater than that leg's actual fill. Keep the
+full displayed quantity at the final saved level; do not invent depth or change
+the later partial-level unwind. Entry walks still fail if they need more than
+`max_levels`; capped exit walks still preserve unexited cost.
+
+### Release and verification
+
+Release each scenario's payload immediately after its row is successfully
+written, not when its runtime episode closes. Release a shared decision after
+its last sibling and episode metadata after its last scenario. Censored
+scenarios can leave same-boundary heap events: clear their payload references
+immediately, retain the small header reservation until their final stale event
+is popped, then release it. Shared owners must not be freed while a sibling
+still references them. Failure-only diagnostics from §5 remain unchanged.
+
+Verify aggregate **owned** reservations against the deduplicated heap/episode
+object graph, including decisions, native arrival fills and saved exits. Do not
+compare a scenario's exclusive reservation against a traversal that counts all
+shared owners again. Keep recursive graph sizing out of production paths.
+Verify a shallow 60-scenario episode within a small fixed budget; later deeper
+decision/arrival growth and rejection before retention; releases while runtime
+episodes remain open; and empty, sold, thin, unusable, same-time and censored
+outcomes. Compare complete output bytes against the unchanged implementation
+and run independent readers, including bids-only Kalshi YES/NO, all four
+factories, legacy/new policies and plain/zstd. Synthetic reservation/graph
+measurements are not process RSS or full-corpus capacity acceptance.

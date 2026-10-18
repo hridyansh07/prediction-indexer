@@ -49,7 +49,8 @@ def _walk(ladder, quantity, levels, limit=None, sell=False):
             taken.append((price, amount))
             filled += amount
             cost += price * amount
-    return Fill(filled, cost, filled < quantity, tuple(taken), tuple(taken))
+    taken = tuple(taken)
+    return Fill(filled, cost, filled < quantity, taken, taken)
 
 
 def _part(fill, quantity):
@@ -64,7 +65,20 @@ class _Episode:
     maxima: tuple
     start: int
     limit: int
+    cost: int
     end: int | None = None
+    count: int = 0
+
+
+@dataclass(slots=True)
+class _Decision:
+    # One owner per (episode, sizing, confirmation). Its evidence is immutable
+    # after pricing; latency and sequencing cannot change the decision book.
+    cost: int
+    opening: dict | None
+    ages: list | None
+    json: dict | None = None
+    tradeable: bool = False
     count: int = 0
 
 
@@ -77,8 +91,7 @@ class _Probe:
     latency: int
     mode: str
     cost: int
-    opening: dict
-    ages: list
+    group: _Decision
     decision: dict | None = None
     legs: list = field(default_factory=list)
     fills: list = field(default_factory=list)
@@ -87,6 +100,7 @@ class _Probe:
     delays: tuple = ()
     first: int | None = None
     finished: bool = False
+    events: int = 0
 
 
 class Manager:
@@ -116,25 +130,37 @@ class Manager:
                 f"heap_events={len(self.heap)}")
 
     def add(self, identity, entity, spec, maxima, start, limit, priced, ages):
-        episode = _Episode(identity, entity, spec, maxima, start, limit)
+        episode_cost = (4096 + bounds.json_cost(identity) + bounds.json_cost(entity.descriptor)
+                        + bounds.json_cost(entity.legs) + bounds.json_cost(entity.metadata)
+                        + bounds.json_cost(spec.sources) + bounds.json_cost(spec.units)
+                        + bounds.json_cost(maxima))
+        episode = _Episode(identity, entity, spec, maxima, start, limit, episode_cost)
         rows = {row["name"]: row for row in priced.json["results"]}
-        # Compute once, but reserve every scenario occurrence at the same point.
-        cost = bounds.probe_cost(entity, len(spec.units), self.runtime.fill.max_levels)
+        cost = bounds.probe_cost(len(spec.units))
         for sizing_index, sizing in self.sizings:
             for confirm in self.policy.confirm_ms:
+                opening, opening_ages = (rows[sizing.name], ages) if confirm == 0 else (None, None)
+                group = _Decision(4096 + bounds.json_cost(opening) + bounds.json_cost(opening_ages),
+                                  opening, opening_ages)
                 for latency in self.policy.arrival_ms:
                     for mode_index, mode in enumerate(self.policy.sequencing):
+                        # Admit all new owners atomically; a rejected first
+                        # scenario must not leave a charged, unreferenced group.
+                        requested = cost + (group.cost if not group.count else 0)
+                        if not episode.count:
+                            requested += episode.cost
                         if self.pending >= bounds.MAX_PENDING_PROBES:
                             budget = self.runtime.budget
-                            require(False, f"pending probe bound: retained_bytes={budget.used + cost} "
+                            require(False, f"pending probe bound: retained_bytes={budget.used + requested} "
                                     f"max_state_bytes={budget.limit} used_bytes={budget.used} "
-                                    f"replaced_bytes=0 requested_bytes={cost}; {self._diagnostics()}")
-                        self.runtime.budget.charge(cost, "pending probe state budget")
+                                    f"replaced_bytes=0 requested_bytes={requested}; {self._diagnostics()}")
+                        self.runtime.budget.charge(requested, "pending probe state budget")
                         probe = _Probe(episode, sizing,
                                        (start, sizing_index, confirm, latency, mode_index, entity.id),
-                                       confirm, latency, mode, cost, rows[sizing.name], ages)
+                                       confirm, latency, mode, cost, group)
                         self.pending += 1
                         episode.count += 1
+                        group.count += 1
                         self._push(probe, _time(start + confirm * MS), -1)
         self.episodes[identity] = episode
 
@@ -147,6 +173,7 @@ class Manager:
         # A beyond-scope decision is not_confirmed; beyond-scope arrival is
         # censored. Both resolve at the scope limit without waiting for a cut.
         heapq.heappush(self.heap, (min(at, probe.episode.limit), probe.order, leg, probe))
+        probe.events += 1
 
     def before(self, time):
         self._drain(time, inclusive=False)
@@ -161,7 +188,11 @@ class Manager:
     def _drain(self, time, inclusive):
         while self.heap and (self.heap[0][0] < time or inclusive and self.heap[0][0] == time):
             at, _, leg, probe = heapq.heappop(self.heap)
+            probe.events -= 1
             if probe.finished:
+                if not probe.events:
+                    self.runtime.budget.release(probe.cost)
+                    probe.cost = 0
                 continue
             if leg == -1:
                 self._decide(probe)
@@ -174,39 +205,14 @@ class Manager:
         if probe.confirm and ((episode.end is not None and episode.end <= d) or d >= episode.limit):
             self._emit(probe, "not_confirmed")
             return
-        views = self.runtime._views(episode.entity, d)
-        if probe.confirm == 0:
-            row = probe.opening
-            steps = int(row["steps"])
-            limits = [leg["taken"][-1][0] if leg["taken"] else None for leg in row["legs"]]
-            # At c=0 the opening walk is the decision even for a recording
-            # sizing with unknown/nonpositive value or short depth.
-            tradeable = True
-            ages = probe.ages
-            decision_value, decision_legs = row["value"], row["legs"]
-        else:
-            usable = all(view.validity == "usable" for view in views)
-            ladders = tuple(view.ladders[source] if usable else ()
-                            for source, view in zip(episode.spec.sources, views))
-            value = lambda steps, legs: self.runtime.strategy.fill_value(episode.entity, steps, legs, d)
-            result = walk_sizing(probe.sizing, ladders, episode.spec.units, value,
-                                 self.runtime.fill.max_levels)
-            _, reason = assess(probe.sizing, result, value, episode.maxima, sells(episode.spec.sources))
-            steps = result.steps
-            limits = [_number(leg.taken[-1][0]) if leg.taken else None for leg in result.legs]
-            tradeable = usable and reason is None
-            ages = quote_ages(episode.spec.sources, views, d)
-            decision_value = None if result.value is None else _number(result.value)
-            decision_legs = [{"atoms": _number(leg.filled_atoms), "cost": _number(leg.cost),
-                              "taken": _pairs(leg.taken), "consumed": _pairs(leg.consumed)}
-                             for leg in result.legs]
-        probe.decision = {"time_ns": str(d), "steps": _number(steps), "limits": limits, "ages": ages}
-        if self.runtime.strategy.probe_decision_evidence:
-            probe.decision.update(value=decision_value, legs=decision_legs)
-        probe.opening, probe.ages = None, None
-        if not tradeable:
+        group = probe.group
+        if group.json is None:
+            self._price_decision(probe, d)
+        probe.decision = group.json
+        if not group.tradeable:
             self._emit(probe, "decision_untradeable")
             return
+        steps = int(probe.decision["steps"])
         hook = self.runtime.strategy.fill_delays(episode.entity, d)
         require(type(hook) is tuple and len(hook) == len(episode.spec.units), "fill delays arity")
         delays, sources = [], []
@@ -242,6 +248,42 @@ class Manager:
             probe.first = max(range(len(delays)), key=lambda leg: (delays[leg], -leg))
             self._send(probe, probe.first, d)
 
+    def _price_decision(self, probe, d):
+        episode, group = probe.episode, probe.group
+        views = self.runtime._views(episode.entity, d)
+        if probe.confirm == 0:
+            row = group.opening
+            steps = int(row["steps"])
+            limits = [leg["taken"][-1][0] if leg["taken"] else None for leg in row["legs"]]
+            # At c=0 the opening walk is the decision even for a recording
+            # sizing with unknown/nonpositive value or short depth.
+            tradeable = True
+            ages = group.ages
+            decision_value, decision_legs = row["value"], row["legs"]
+        else:
+            usable = all(view.validity == "usable" for view in views)
+            ladders = tuple(view.ladders[source] if usable else ()
+                            for source, view in zip(episode.spec.sources, views))
+            value = lambda steps, legs: self.runtime.strategy.fill_value(episode.entity, steps, legs, d)
+            result = walk_sizing(probe.sizing, ladders, episode.spec.units, value,
+                                 self.runtime.fill.max_levels)
+            _, reason = assess(probe.sizing, result, value, episode.maxima, sells(episode.spec.sources))
+            steps = result.steps
+            limits = [_number(leg.taken[-1][0]) if leg.taken else None for leg in result.legs]
+            tradeable = usable and reason is None
+            ages = quote_ages(episode.spec.sources, views, d)
+            decision_value = None if result.value is None else _number(result.value)
+            decision_legs = [{"atoms": _number(leg.filled_atoms), "cost": _number(leg.cost),
+                              "taken": _pairs(leg.taken), "consumed": _pairs(leg.consumed)}
+                             for leg in result.legs]
+        decision = {"time_ns": str(d), "steps": _number(steps), "limits": limits, "ages": ages}
+        if self.runtime.strategy.probe_decision_evidence:
+            decision.update(value=decision_value, legs=decision_legs)
+        cost = 4096 + bounds.json_cost(decision)
+        self.runtime.budget.replace(group.cost, cost, "pending probe state budget")
+        group.cost, group.json, group.tradeable = cost, decision, tradeable
+        group.opening, group.ages = None, None
+
     def _send(self, probe, leg, time):
         arrival = _time(time + probe.delays[leg])
         probe.legs[leg]["sent_ns"], probe.legs[leg]["arrival_ns"] = str(time), str(arrival)
@@ -255,21 +297,33 @@ class Manager:
             self._emit(probe, "censored")
             return
         view = self.runtime._views(episode.entity, at)[leg]
-        row["usable"] = view.validity == "usable"
+        usable = view.validity == "usable"
         source = episode.spec.sources[leg]
         fill = (_walk(view.ladders[source], probe.targets[leg], self.runtime.fill.max_levels,
                       int(probe.decision["limits"][leg]), source in SELL_SOURCES)
-                if row["usable"] else Fill(0, 0, True, (), ()))
-        row.update(filled_atoms=_number(fill.filled_atoms), cost=_number(fill.cost),
-                   consumed=_pairs(fill.taken))
-        probe.fills[leg] = fill
+                if usable else Fill(0, 0, True, (), ()))
+        filled_atoms, cost = _number(fill.filled_atoms), _number(fill.cost)
+        for price, quantity in fill.taken:
+            _number(price), _number(quantity)
         key, ladder = self.runtime.strategy.fill_exits(episode.entity)[leg]
         # Like the entry view, live views are committed at the greatest time
         # <= at: the manager drains before any later cut refreshes them.
         exit_view = self.runtime.views[key]
-        # Exit depth beyond this cap is a shortfall, never an attempt failure.
-        probe.exits[leg] = (exit_view.ladders[ladder][:self.runtime.fill.max_levels]
-                            if exit_view.validity == "usable" else ())
+        # Excess cannot exceed this leg's actual fill. Retain the shortest
+        # best-first prefix that could cover it, still respecting the exit cap.
+        count, quantity = 0, 0
+        if exit_view.validity == "usable" and fill.filled_atoms:
+            for _, displayed in exit_view.ladders[ladder]:
+                if quantity >= fill.filled_atoms or count == self.runtime.fill.max_levels:
+                    break
+                count += 1
+                quantity += displayed
+        exit_levels = exit_view.ladders[ladder][:count]
+        growth = bounds.probe_cost(0, len(fill.taken) + count) - bounds.probe_cost(0)
+        self.runtime.budget.charge(growth, "pending probe state budget")
+        probe.cost += growth
+        row.update(usable=usable, filled_atoms=filled_atoms, cost=cost)
+        probe.fills[leg], probe.exits[leg] = fill, exit_levels
         if probe.mode == "slow_first" and leg == probe.first:
             if not fill.filled_atoms:
                 for other in range(len(probe.legs)):
@@ -324,16 +378,31 @@ class Manager:
         self._emit(probe, status, steps, value, loss)
 
     def _emit(self, probe, status, steps=None, value=None, loss=None):
+        # Arrival walks stay native while pending. Formatting them only here
+        # avoids retaining the same quantities as both integers and strings.
+        legs = [dict(row, consumed=_pairs(fill.taken)) if fill is not None else row
+                for row, fill in zip(probe.legs, probe.fills)]
         row = {"episode_id": probe.episode.id, "sizing": probe.sizing.name,
                "confirm_ms": probe.confirm, "arrival_ms": probe.latency,
                "sequencing": probe.mode, "status": status, "decision": probe.decision,
-               "legs": probe.legs, "matched_steps": None if steps is None else _number(steps),
+               "legs": legs, "matched_steps": None if steps is None else _number(steps),
                "value": None if value is None else _number(value),
                "leg_loss_gross": None if loss is None else _number(loss)}
         self.runtime.writers["probes.ndjson"].append(row)
         probe.finished = True
-        self.runtime.budget.release(probe.cost)
+        # A censor may leave other same-boundary events queued. Clear their
+        # payload immediately, but charge the small shell until the last pop.
+        remaining = bounds.probe_cost(len(probe.episode.spec.units)) if probe.events else 0
+        self.runtime.budget.release(probe.cost - remaining)
+        probe.cost = remaining
         self.pending -= 1
+        probe.group.count -= 1
+        if not probe.group.count:
+            self.runtime.budget.release(probe.group.cost)
         probe.episode.count -= 1
         if not probe.episode.count:
+            self.runtime.budget.release(probe.episode.cost)
             self.episodes.pop(probe.episode.id, None)
+        probe.episode, probe.group, probe.decision = None, None, None
+        probe.legs, probe.fills, probe.exits, probe.targets = [], [], [], []
+        probe.delays = ()

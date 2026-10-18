@@ -558,8 +558,11 @@ class IntegratedTests(unittest.TestCase):
         pending = {id(entry[-1]): entry[-1] for entry in manager.heap if not entry[-1].finished}
         self.assertTrue(pending)
         self.assertTrue(any(probe.decision is not None and "legs" in probe.decision for probe in pending.values()))
-        for probe in pending.values():
-            self.assertGreaterEqual(probe.cost, deep_size(probe))
+        groups = {id(probe.group): probe.group for probe in pending.values()}
+        owners = (sum(probe.cost for probe in pending.values())
+                  + sum(group.cost for group in groups.values())
+                  + sum(episode.cost for episode in manager.episodes.values()))
+        self.assertGreaterEqual(owners, deep_size((manager.heap, manager.episodes)))
         h.finish()
         self.assertEqual(manager.pending, 0)
         h = self.harness("cross")
@@ -570,6 +573,22 @@ class IntegratedTests(unittest.TestCase):
                       "runtime_open_fill_episodes=1 probe_episode_groups=1 "
                       "admitting_probe_scenarios=59 heap_events=59", str(error.exception))
         self.assertEqual(h.strategy.probes.pending, 59)
+
+        h = self.harness("cross")
+        manager, budget = h.strategy.probes, h.strategy.budget
+        price = manager._price_decision
+        before = []
+        def bounded(probe, time):
+            if probe.confirm:
+                budget.limit = budget.used
+                before.append((probe.group, probe.group.cost, budget.used))
+            return price(probe, time)
+        with patch.object(manager, "_price_decision", side_effect=bounded):
+            with self.assertRaisesRegex(ProtocolError, "^pending probe state budget"):
+                h.finish()
+        group, cost, used = before[0]
+        self.assertEqual((group.cost, budget.used), (cost, used))
+        self.assertIsNone(group.json)
 
     def test_rehashed_flags_and_decision_economics_are_reader_checked(self):
         from replay.strategies.cross_venue_arbitrage.output import validate_content
