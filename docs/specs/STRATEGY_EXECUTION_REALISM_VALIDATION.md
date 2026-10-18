@@ -252,3 +252,209 @@ Local evidence is under `.amp/in/artifacts/`: `r12-base-regressions.log`,
 Docker, live service, production data, object store or database operation was
 performed, and `data/` and credentials were untouched. Offline unittest-owned
 temporary fixtures are the only integration runtime used.
+
+## Follow-up: legacy opt-in retention and separate capacity blocker (17 October 2026)
+
+Local remediation starts from integration
+`e3f933004dae0ed1131f844523b47a214001be96` (#82), in the new
+`fix/legacy-probe-retention` worktree. The first commit records
+[the support and capacity specification](LEGACY_PROBE_RETENTION_V1.md).
+The audit checkout and published history are unchanged; this follow-up has not
+been pushed. Production code was verified at local revision
+`66a4d54f746b60f6a4686809bdcf1ba2416779a3` before this documentation-only commit.
+
+The unchanged five-layout package method fails on the base's multi-market
+policy 1 with explicit probes, before its first frame and before compression:
+`probe exit ladder not retained`. The mismatch originates in #75 (`f4cfa5c`):
+the SDK added optional probes and mandatory exit-retention binding while the
+strategies retained only entry ladders. #78 (`36bfb95`) documented opt-in legacy
+probes but tested them with a retention override. #79 (`40c2804`) added retention
+gated on new-policy flags. #82 first exercises the documented legacy opt-in
+without that override. This is neither a new R12 exit-mapping defect nor a codec
+failure or invalid policy fixture.
+
+Requirements now follow actual `fills.probes`; policy still selects exit
+mapping. Legacy probes retain the entry-source reverse transform, including
+its native-ask input, while new policies retain acquired-book native bids.
+The change neither fabricates Kalshi asks nor upgrades legacy economics.
+Implication covers inherit the owning cross-venue requirements. Bind checks,
+their exact errors, row schemas and R12/§8 algorithms remain unchanged.
+
+### Falsification and compatibility evidence
+
+| Check | Before production fix | After |
+|---|---|---|
+| Unchanged five-layout package method | One multi-market bind error on plain output | Passes all five layouts and both storage representations, including exact decoded bytes, identities and recomputed summaries |
+| Legacy probe regressions and unpatched existing integration tests | Seven methods produce 13 bind errors: ten new bids-only subcases and three existing cases | Same seven methods plus the package method: eight pass |
+| Budget diagnostics | Three methods produce ten failing subcases against unchanged budget code | Same diagnostics pass; 43-test SDK/profile focused selection passes |
+
+The committed legacy regression uses all four factories, Kalshi YES and NO in
+cross-venue, plain and economic-zstd, with 60 scenarios per selected episode.
+It uses production requirements without a retention override and adds no native
+Kalshi asks. An additional 20-run fixture comparison covers both policy families
+and both storage representations: 1,200 selected-episode rows pass real writers
+and independent semantic readers; logical probe identities and experiment
+identities match across storage. For BUY 10 at 0.40 with peer fill 6 and acquired
+bid 0.30, legacy intentionally records empty exits and full-cost loss 1.60;
+realism still exits 4 for 1.20 and loses 0.40 at scale 36. Existing explicit-probe,
+no-probe and complement byte goldens pass unchanged.
+
+All verification uses offline disposable fixtures under `nice -n 19`:
+
+- Expanded focused selection, including R12 §7 modules, profile/codec controls
+  and economic SDK bounds: **324 tests pass**.
+- `.venv/bin/python -m unittest discover -s tests -q`: **1,002 tests pass**.
+- `.venv/bin/python -m unittest discover -s replay/tests -q`: **777 tests, OK
+  with 62 skips**. Skipped optional integrations remain unverified; no Redis
+  service, full Rust gate, UI or deployment gate was run.
+- `git diff --check` passes. Existing fixture-constructor resource warnings are
+  visible, not suppressed. The original package test is unmodified.
+
+Evidence is under this worktree's `.amp/in/artifacts/`:
+`base-package-gate.log`, `base-legacy-regressions.log`,
+`fixed-legacy-and-package.log`, `base-budget-diagnostics-corrected.log`,
+`fixed-budget-focused.log`, `legacy-realism-evidence.json`, and
+`final-focused.log`, `final-root.log`, `final-replay.log`.
+
+### The reported 512 MiB failure is not yet classified or resolved
+
+Writer and ordinary plain/zstd reader diagnostics now identify the stream and
+logical bytes, rows or line bytes with the applicable cap. Detached-state
+diagnostics separately identify retained-byte usage and cap, before growth.
+No numeric limit changed: ordinary files remain 512 MiB/2,000,000 rows,
+ordinary lines 64 KiB, retained state independently 512 MiB; availability and
+16 GiB/50-million-row transitions/levels/volatility limits stay unchanged.
+Compression follows bounded plaintext writing and cannot bypass those caps.
+
+The owner's reported ten-bundle failure lacks an exception and failing-stream
+metadata, so it cannot yet justify an output-cap increase or a memory change.
+The remaining owner input is non-secret exception/traceback, revision and
+configuration identity, participant/stream, attempted bytes/rows/line size or
+state usage/request/cap, and expected complete counts if available. A measured
+stream-specific byte ceiling and adjacent row ceiling remain an explicit
+decision after that evidence, with consistent writer/plain/zstd-reader changes.
+There is no truncation, sampling, scenario reduction or episode splitting.
+
+No retained/corpus/bench workload, Docker, external service, production data,
+object store, secrets, `data/` or `~/pi-data` was accessed for this remediation.
+The actual operator-configuration/Universe-v8 five-bundle acceptance remains a
+separate operational gate; a smaller run cannot cure an oversized single bundle.
+
+## Follow-up: failure-only probe census (18 October 2026)
+
+Starting from local `0772c1f`, the diagnostic amendment in
+[the retention specification §5](LEGACY_PROBE_RETENTION_V1.md#5-failure-only-probe-and-shared-writer-memory-diagnostics)
+adds pending scenarios/cap, all runtime open episodes, the priced-fill subset,
+probe groups (including a partially admitted grid), admitting scenarios and raw
+heap events. The same lazy context covers shared writer retained-state failures
+outside probe admission, including view and episode growth. Existing prefixes,
+used/replaced/requested/attempted bytes and caps remain intact. Counts run only
+on failure, use existing episode tables and constant extra workspace, and do
+not traverse heap objects. Rejection still precedes charge/retention.
+
+Before production changes, four regression methods fail in five subcases on
+missing counts. Afterward, all four pass. The partial-grid case reports **59
+pending scenarios, two runtime episodes, one fill episode, one probe group and
+59 heap events**, even though the group is not yet registered. Shared view
+growth tests cover one pending scenario/two arrival events with either one
+open fill episode or none after closure; failed growth leaves budget usage and
+the retained view unchanged.
+
+Under `nice -n 19`, the expanded focused selection passes **201 tests**:
+execution delay/probe integration/probe reader, strategy execution realism,
+economic SDK/fills/port, strategy packaging and market profile V2. Existing
+goldens, all-four-factory 60-scenario controls and semantic readers pass.
+A separate real R12 fixture writes all 60 selected rows and passes its reader
+with loss 0.40; its diagnostic callback runs once for an induced writer-state
+failure and zero times during subsequent successful completion. Independent
+reader-state and output-budget controls retain distinct prefixes and contain
+no writer probe counts. Whitespace checks pass; existing fixture resource
+warnings remain visible. Full root/replay gates were not repeated for this
+failure-only amendment; their previous results above remain historical.
+
+Logs: `.amp/in/artifacts/probe-counts-before-corrected.log`,
+`probe-counts-after.log`, `probe-counts-focused.log` and
+`probe-counts-controls.log`. No limits, scenarios, reservations, release timing,
+retention, economics or output schemas changed. No reservation optimization is
+included: later decision/arrival books may deepen beyond opening depth. No
+corpus/bench workload, Docker, service, network, retained data, secrets, `data/`
+or `~/pi-data` access occurred. The owner's actual memory exception and the
+separate operational acceptance remain unverified here.
+
+## Follow-up: phase-aware probe memory (18 October 2026)
+
+Starting from local `d014343`, the owner authorized implementation of
+[the retention contract §6](LEGACY_PROBE_RETENTION_V1.md#6-phase-aware-probe-retention-owner-authorized-follow-up).
+The configured grid, economics, successful output bytes and every existing
+limit remain unchanged. No late-release bug was found: the old manager already
+released each scenario's reservation immediately after writing its row. The
+demonstrated capacity problem was reserving every scenario's full configured
+depth upfront, whether that depth was ever retained or not.
+
+Two regressions were run before production edits. A shallow 60-scenario fixture
+with `max_levels=64` and 2 MiB additional state capacity failed after admitting
+three scenarios (`pending probe state budget`, 638,144 bytes requested for the
+fourth). An arrival with one contract filled saved 64 exit levels although the
+best level alone covered every possible excess. Both regressions pass after
+the change; the full grid reports the independently expected one/two-contract
+quantities and values, and completes through its semantic reader.
+
+The manager now shares episode metadata and each sizing/confirmation decision;
+later confirmations do not retain opening walks/ages. Separate scenario
+headers retain independent timings, arrivals and native fills. Decision and
+actual arrival evidence growth are charged before retention. Exit snapshots
+save only the capped prefix needed to cover the actual arrival fill; arrival
+walk strings are formatted at emission. Identical native walk tuples share
+storage. Payloads release per resolved scenario, decisions at their last
+sibling and metadata at the last scenario. Finished censor events clear their
+payloads but keep a charged header until the final heap pop.
+
+Additional checks cover a later arrival using three levels after opening on
+one, rejected arrival growth leaving budget and fill/exit state unchanged,
+rejected confirmation evidence leaving its group unchanged, and releases while
+the runtime fill episode remains open. Aggregate owned reservations cover the
+deduplicated retained heap/episode graph, rather than incorrectly requiring
+each exclusive scenario reservation to cover all shared owners again.
+
+A disposable offline comparison loaded the unchanged `d014343` probe manager
+and reservation function directly from Git, without changing a checkout. It
+compared before/after writers and independent semantic readers for **40 paired
+cases / 80 fixture runs**: four factories, Kalshi YES/NO where supported by the
+fixture, legacy/new policies, plain/zstd, and deep/capped thin exits. Every
+selected episode retained all 60 scenarios. All **360 complete output-file
+comparisons** matched byte-for-byte, including manifests and receipts. Existing
+sold-shortfall, missing/zero delay, empty/unusable, sparse/same-time and censor
+tests and legacy/complement/A1 goldens pass unchanged in their observable output.
+
+Representative cross-venue new-policy YES, 60 scenarios, 30-level exit book:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Probe reservations immediately after admission | 38,884,320 B | 803,943 B |
+| Maximum sampled probe reservations | 38,884,320 B | 862,495 B |
+| Maximum sampled reachable heap/episode graph | 181,375 B | 116,817 B |
+
+These are synthetic retained-state reservations and recursive object-graph
+samples, **not process RSS, a production peak or a throughput estimate**. The
+new reservation still exceeded the measured retained graph at every checked
+decision/arrival phase with pending probes. The first row is about 48 times
+smaller; native graph reduction is much smaller and must not be described as a
+48-times RSS saving.
+
+Under `nice -n 19`, focused verification passed **180 tests**; root discovery
+passed **1002 tests**; replay discovery completed **782 tests, 62 skipped**
+(optional Rust/disposable-Redis cases). The strengthened confirmation-growth
+test was also rerun individually after the broad gate. `git diff --check`
+passed. A separate charge/release ledger over the probe and realism modules
+passed 56 tests: all 88 completed writer runtimes returned their probe-owned
+budget delta to exactly zero, including censor and episode-closure cases.
+Existing fixture ResourceWarnings remain visible; no Rust/UI/deployment gate,
+service, retained-data or operator-config corpus acceptance was run.
+
+Evidence: `.amp/in/artifacts/probe-memory-comparison.json`,
+`probe-memory-comparison.log`, `probe-memory-root.log` and
+`probe-memory-replay.log`. No corpus/bench workload, network, object store,
+secrets, `data/` or `~/pi-data` access occurred. This local change does not
+authorize a rollout or certify all 1,212 bundles. Integration into the launch
+revision and a retry of the previously failing operator sample remain separate;
+output-byte/row caps are not fixed by lowering retained-state reservations.

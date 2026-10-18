@@ -767,9 +767,18 @@ class BoundTests(unittest.TestCase):
     def test_state_budget_fails_before_retention(self):
         budget = bounds.StateBudget(limit=100)
         budget.charge(60)
-        with self.assertRaisesRegex(ProtocolError, "detached state budget"):
+        with self.assertRaisesRegex(ProtocolError,
+                "detached state budget: retained_bytes=101 max_state_bytes=100 used_bytes=60"):
             budget.charge(41)
         self.assertEqual(budget.used, 60)
+        from replay.economic_sdk.reader import Budget
+        with patch.object(bounds, "MAX_STATE", 100):
+            reader = Budget()
+            reader.reserve(60)
+            with self.assertRaisesRegex(ProtocolError,
+                    "reader state budget: retained_bytes=101 max_state_bytes=100 used_bytes=60"):
+                reader.reserve(41)
+            self.assertEqual(reader.used, 60)
 
 
 class ProfilingHarnessTests(unittest.TestCase):
@@ -788,6 +797,52 @@ class ProfilingHarnessTests(unittest.TestCase):
 
 class TableSizeTests(unittest.TestCase):
     """Entity/reason tables are one record; real bundles exceed the 64 KiB line cap."""
+
+    def test_writer_budget_errors_identify_stream_dimension_attempt_and_cap(self):
+        from replay.strategy_sdk import LineWriter
+        for dimension, limits, expected in (
+                ("bytes", (5, 3, 3), "logical_bytes=6 max_bytes=5 records=2 max_records=3"),
+                ("rows", (9, 1, 3), "logical_bytes=6 max_bytes=9 records=2 max_records=1"),
+                ("line", (9, 3, 2), "line_bytes=3 max_line_bytes=2")):
+            with self.subTest(dimension=dimension), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "probes.ndjson"
+                writer = LineWriter(path, max_bytes=limits[0], max_records=limits[1], max_line_bytes=limits[2])
+                self.addCleanup(writer.stream.close)
+                if dimension != "line":
+                    writer.append({})
+                with self.assertRaises(ProtocolError) as error:
+                    writer.append({})
+                self.assertIn(str(path), str(error.exception))
+                self.assertIn(expected, str(error.exception))
+                identity = writer.finish()
+                expected_payload = b"" if dimension == "line" else b"{}\n"
+                self.assertEqual(path.read_bytes(), expected_payload)
+                self.assertEqual((identity["byte_length"], identity["records"]),
+                                 (len(expected_payload), expected_payload.count(b"\n")))
+
+    def test_plain_and_zstd_reader_budget_errors_report_logical_stream_usage(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import lines
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "probes.ndjson"
+                path.write_bytes(b"{}\n")
+                identity = {"sha256": hashlib.sha256(b"{}\n").hexdigest(), "byte_length": 3, "records": 1}
+                if compressed:
+                    identity = commit_frame(path, identity)
+                with patch.multiple(bounds, MAX_BYTES=3, MAX_ROWS=1, MAX_LINE=3):
+                    self.assertEqual(list(lines(root, path.name, identity)), [{}])
+                for field, limit, expected in (
+                        ("MAX_BYTES", 2, "logical_bytes=3 max_bytes=2"),
+                        ("MAX_ROWS", 0, "records=1 max_records=0"),
+                        ("MAX_LINE", 2, "line_bytes=3 max_line_bytes=2")):
+                    with self.subTest(field=field), patch.object(bounds, field, limit):
+                        with self.assertRaises(ProtocolError) as error:
+                            list(lines(root, path.name, identity))
+                        self.assertIn(path.name, str(error.exception))
+                        self.assertIn(expected, str(error.exception))
 
     def _roundtrip(self, value, compressed=False):
         from types import SimpleNamespace

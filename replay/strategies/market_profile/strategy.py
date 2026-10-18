@@ -142,7 +142,7 @@ def _manifest(value, complete):
         if name in files:
             logical, _ = identity_record(files[name])
             if name == PROFILE_FILE:
-                file_identity(logical)
+                file_identity(logical, name)
     if complete:
         sha(value["summary_sha256"])
 

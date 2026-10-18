@@ -30,10 +30,13 @@ class SameVenueMultiMarket(MultiMarketReader):
     def requirements(self, snapshot, policy):
         # The trigger reads one contract; fill checks walk each leg's full ask ladder.
         size = (int(TRIGGER_SIZE),)
-        probes = self.probe_decision_evidence
-        transforms = ("kalshi_complement_ask",)
+        probes = self.experiment.fills.probes is not None
+        # Legacy probes reverse the entry source; realism probes exit acquired bids.
+        legacy_exits = probes and not self.probe_decision_evidence
+        transforms = ("kalshi_complement_ask",) + (("kalshi_complement_bid",) if legacy_exits else ())
         return Requirements({key: (
-            BookRequirement(("bid",), size, True, transforms, transforms + ("bid",) if probes else transforms)
+            BookRequirement(("bid", "ask") if legacy_exits else ("bid",), size, True, transforms,
+                            transforms + (("bid",) if probes and not legacy_exits else ()))
             if plan["venue"] == "kalshi" else BookRequirement(("bid", "ask"), size, ladders=("ask", "bid") if probes else ("ask",)))
             for key, plan in self.plans.items()}, self.experiment.profile)
 

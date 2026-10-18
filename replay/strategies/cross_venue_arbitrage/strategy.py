@@ -32,9 +32,13 @@ class CrossVenueArbitrage(CrossVenueReader):
     def requirements(self, snapshot, policy):
         # Fill checks walk each leg's full ask ladder (Kalshi: the projected bids).
         fills = self.experiment.fills is not None
-        probes = self.probe_decision_evidence
+        probes = fills and self.experiment.fills.probes is not None
+        # Legacy probes reverse the entry source; realism probes exit acquired bids.
+        legacy_exits = probes and not self.probe_decision_evidence
+        transforms = ("kalshi_complement_ask",) + (("kalshi_complement_bid",) if legacy_exits else ())
         return Requirements({key: (
-            BookRequirement(("bid",), self.sizes, True, ("kalshi_complement_ask",),
+            BookRequirement(("bid", "ask") if legacy_exits else ("bid",), self.sizes, True, transforms,
+                            transforms if legacy_exits else
                             ("kalshi_complement_ask", "bid") if probes else
                             ("kalshi_complement_ask",) if fills else ())
             if plan["venue"] == "kalshi" else

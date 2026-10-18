@@ -252,8 +252,11 @@ Probes are causal and resolve in stream order:
   evaluated at `a`.
 - Probes with equal times resolve in the order: episode start, sizing, `c`, `L`,
   sequencing, leg.
-- Pending probes are charged by `bounds` like open fill state. A run that would
-  exceed its bound fails at the attempt that adds the probe, as for fills.
+- Pending probes are charged by `bounds` like open fill state. Under the
+  [phase-aware retention amendment](LEGACY_PROBE_RETENTION_V1.md#6-phase-aware-probe-retention-owner-authorized-follow-up),
+  episode/decision owners are shared, and arrival depth is charged as it is
+  retained. A run that would exceed its bound fails before retaining the new
+  scenario or decision/arrival growth. Opening depth never caps future depth.
 
 ### 2.7 Output
 

@@ -157,14 +157,16 @@ def fill_state_cost(legs):
     return FILL_STATE + CONTAINER + legs * (SLOT + INT)
 
 
-def probe_cost(entity, legs, levels):
-    """One pending scenario, including copied decision, fills and arrival exit depth.
+def probe_cost(legs, levels=0):
+    """Scenario header plus actually retained entry/exit level occurrences.
 
-    Reserve both object state and canonical row strings before adding a probe;
-    arithmetic is bounded separately to 80 decimal digits per output scalar.
+    Episode metadata and shared decisions have separate owners. Each retained
+    level reserves native pairs, matching/unwind scratch and canonical strings
+    (80 decimal digits per scalar), even though arrival strings are emitted
+    only on resolution. Never infer future arrival depth from opening depth.
     """
-    return (4096 + json_cost(entity.descriptor) + json_cost(entity.legs)
-            + legs * (4096 + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80))))
+    return (4096 + legs * 4096
+            + levels * (8 * (PAIR + SLOT) + 8 * (STR + 4 * 80)))
 
 
 def quotes_cost(quotes):
@@ -193,9 +195,14 @@ class StateBudget:
     def __init__(self, limit=MAX_STATE):
         self.limit = limit
         self.used = 0
+        self.failure_context = None  # Optional lazy writer diagnostics; never used on success.
 
     def replace(self, old, new, message="detached state budget"):
-        require(self.used - old + new <= self.limit, message)
+        if self.used - old + new > self.limit:
+            context = f"; {self.failure_context()}" if self.failure_context is not None else ""
+            require(False, f"{message}: retained_bytes={self.used - old + new} "
+                    f"max_state_bytes={self.limit} used_bytes={self.used} "
+                    f"replaced_bytes={old} requested_bytes={new}{context}")
         self.used += new - old
 
     def charge(self, amount, message="detached state budget"):

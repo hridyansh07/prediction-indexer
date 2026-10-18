@@ -139,7 +139,7 @@ def read_completed(run_directory, group, *, reader, deep=False):
             _, stored = identity_record(identity)
             _hash_file(output, name, stored)
         else:
-            _hash_file(output, name, file_identity(identity))
+            _hash_file(output, name, file_identity(identity, name))
     metadata = {"manifest.json": manifest, "summary.json": summary, "content_receipt.json": receipt}
     # Control summaries are emitted after semantic validation and are not listed
     # in manifest.files. They are bound by the receipted top-level summary.

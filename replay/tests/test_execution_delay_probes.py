@@ -383,8 +383,17 @@ class ProbeTests(unittest.TestCase):
         h = self.harness(probes(arrival_ms=[0, 1]))
         self.open(h)
         with patch.object(bounds, "MAX_PENDING_PROBES", 1):
-            with self.assertRaisesRegex(ProtocolError, "pending probe bound"):
+            with self.assertRaisesRegex(ProtocolError, "^pending probe bound") as error:
                 self.book(h, 13, LEG0, (400, 2 * M))
+        message = str(error.exception)
+        self.assertIn("pending_scenarios=1 max_pending_probes=1 runtime_open_episodes=1 "
+                      "runtime_open_fill_episodes=1 probe_episode_groups=1 "
+                      "admitting_probe_scenarios=1 heap_events=1", message)
+        budget, manager = h.strategy.budget, h.strategy.probes
+        cost = manager.heap[0][-1].cost
+        self.assertIn(f"retained_bytes={budget.used + cost} max_state_bytes={budget.limit} "
+                      f"used_bytes={budget.used} replaced_bytes=0 requested_bytes={cost}", message)
+        self.assertEqual((manager.pending, len(manager.heap), len(manager.episodes)), (1, 1, 0))
 
     def test_probe_state_is_conservatively_reserved_and_survives_episode_close(self):
         sizing = {"name": "large", "role": "governs", "target_contracts": "64"}
@@ -398,12 +407,87 @@ class ProbeTests(unittest.TestCase):
         self.book(h, 18, LEG0, *asks0, bids=exit_ladder)  # Leg 0 arrived at 17.
         manager = h.strategy.probes
         retained = next(entry[-1] for entry in manager.heap if not entry[-1].finished)
-        self.assertGreaterEqual(retained.cost, deep_size(retained))
+        self.assertGreaterEqual(retained.cost + retained.group.cost + retained.episode.cost,
+                                deep_size(retained))
         ladder(h, 20 * MS, LEG1, why={"kind": "connection_closed"})
         self.book(h, 21, LEG0, *asks0, bids=exit_ladder)
         self.assertFalse(h.strategy.episodes)
         self.assertEqual(manager.pending, 1)
-        self.assertGreaterEqual(retained.cost, deep_size(retained))
+        self.assertGreaterEqual(retained.cost + retained.group.cost + retained.episode.cost,
+                                deep_size(retained))
+        h.finish()
+
+    def test_full_sixty_scenario_grid_completes_with_two_mib_of_probe_capacity(self):
+        two = {"name": "two", "role": "records", "target_contracts": "2"}
+        grid = probes(sizings=["one", "two"], confirm_ms=[0, 1, 2],
+                      arrival_ms=[5, 6, 7, 8, 9], sequencing=["simultaneous", "slow_first"])
+        h = self.harness(grid, ONE, two, fill_overrides={"max_levels": 64})
+        manager = h.strategy.probes
+        h.strategy.budget.limit = h.strategy.budget.used + 2 * 1024 * 1024
+        self.open(h)
+        h.finish()
+        rows = h.rows("probes.ndjson")
+        self.assertEqual(len(rows), 60)
+        self.assertEqual({row["status"] for row in rows}, {"filled"})
+        self.assertEqual({(row["sizing"], row["matched_steps"], row["value"]) for row in rows},
+                         {("one", "1", str(90 * M)), ("two", "2", str(180 * M))})
+        self.assertEqual((manager.pending, manager.heap, manager.episodes), (0, [], {}))
+
+    def test_exit_snapshot_drops_depth_unreachable_by_any_excess(self):
+        h = self.harness(delays=(0, 20 * MS), fill_overrides={"max_levels": 64})
+        deep_bids = tuple((300 - index, 2 * M) for index in range(64))
+        self.book(h, 12, LEG0, (400, 2 * M), bids=deep_bids)
+        self.book(h, 12, LEG1, (500, 2 * M))
+        self.book(h, 18, LEG1, (500, 2 * M))
+        probe = h.strategy.probes.heap[0][-1]
+        self.assertEqual(probe.exits[0], ((300, 2 * M),))
+        row = self.row(h)
+        self.assertEqual((row["status"], row["value"], row["leg_loss_gross"]),
+                         ("filled", str(90 * M), "0"))
+
+    def test_later_deeper_arrival_is_reserved_before_retention(self):
+        two = {"name": "two", "role": "governs", "target_contracts": "2"}
+        for reject in (False, True):
+            with self.subTest(reject=reject):
+                h = self.harness(probes(sizings=["two"]), two)
+                self.open(h)
+                self.book(h, 15, LEG0, (380, M // 2), (390, M // 2), (400, M))
+                manager, budget = h.strategy.probes, h.strategy.budget
+                arrive = manager._arrive
+                before = []
+                def bounded(probe, leg):
+                    if reject:
+                        budget.limit = budget.used
+                        before.append((probe, probe.cost, budget.used))
+                    return arrive(probe, leg)
+                with patch.object(manager, "_arrive", side_effect=bounded):
+                    if reject:
+                        with self.assertRaisesRegex(ProtocolError, "^pending probe state budget"):
+                            h.finish()
+                        probe, cost, used = before[0]
+                        self.assertEqual((probe.cost, budget.used), (cost, used))
+                        self.assertEqual(probe.fills, [None, None])
+                        self.assertEqual(probe.exits, [None, None])
+                    else:
+                        h.finish()
+                        row = h.rows("probes.ndjson")[0]
+                        self.assertEqual(row["legs"][0]["consumed"],
+                                         [["380", str(M // 2)], ["390", str(M // 2)], ["400", str(M)]])
+                        self.assertEqual(row["value"], str(195 * M))
+
+    def test_probe_reservations_release_while_the_fill_episode_remains_open(self):
+        h = self.harness(probes(arrival_ms=[1, 5], sequencing=["simultaneous", "slow_first"]))
+        self.open(h)
+        self.book(h, 13, LEG0, (400, 2 * M))
+        manager, budget = h.strategy.probes, h.strategy.budget
+        initial = budget.used
+        self.assertEqual(manager.pending, 4)
+        self.book(h, 15, LEG0, (400, 2 * M))
+        self.assertEqual(manager.pending, 2)
+        self.assertLess(budget.used, initial)
+        self.book(h, 24, LEG0, (400, 2 * M))
+        self.assertEqual((manager.pending, manager.heap, manager.episodes), (0, [], {}))
+        self.assertTrue(h.strategy.episodes)
         h.finish()
 
     def test_probe_state_budget_fails_before_a_new_probe_is_retained(self):
@@ -416,11 +500,47 @@ class ProbeTests(unittest.TestCase):
         spec, maxima = h.strategy.fill_specs[episode.entity]
         h.strategy.budget.limit = h.strategy.budget.used
         previous = manager.pending
-        with self.assertRaisesRegex(ProtocolError, "pending probe state budget"):
+        used = h.strategy.budget.used
+        with self.assertRaisesRegex(ProtocolError, "^pending probe state budget") as error:
             manager.add("new", entity, spec, maxima, episode.start, 40 * MS,
                         episode.fill, episode.fill.json["ages"])
+        message = str(error.exception)
+        self.assertRegex(message, f"retained_bytes=[1-9][0-9]* max_state_bytes={used} used_bytes={used} "
+                         r"replaced_bytes=0 requested_bytes=[1-9][0-9]*")
+        self.assertIn("pending_scenarios=1 max_pending_probes=100000 runtime_open_episodes=1 "
+                      "runtime_open_fill_episodes=1 probe_episode_groups=1 "
+                      "admitting_probe_scenarios=0 heap_events=2", message)
+        self.assertEqual(h.strategy.budget.used, used)
         self.assertEqual(manager.pending, previous)
         self.assertNotIn("new", manager.episodes)
+
+    def test_shared_view_growth_failure_reports_pending_probes_after_episode_close_too(self):
+        for close in (False, True):
+            with self.subTest(closed=close):
+                h = self.harness(probes(arrival_ms=[20]))
+                self.open(h)
+                price = 600 if close else 400
+                self.book(h, 13, LEG0, (price, 2 * M))
+                time = 14 if close else 13
+                if close:
+                    self.book(h, time, LEG0, (price, 2 * M))
+                runtime, manager = h.strategy, h.strategy.probes
+                used = runtime.budget.used
+                runtime.budget.limit = used
+                key = (LEG0, "outcome")
+                prior = runtime.views[key]
+                with self.assertRaisesRegex(ProtocolError, "^detached state budget") as error:
+                    self.book(h, time, LEG0, (price, 2 * M), (price + 10, M))
+                message = str(error.exception)
+                self.assertIn(f"max_state_bytes={used} used_bytes={used}", message)
+                self.assertRegex(message, r"replaced_bytes=[1-9][0-9]* requested_bytes=[1-9][0-9]*")
+                opened = 0 if close else 1
+                self.assertIn(f"pending_scenarios=1 max_pending_probes=100000 runtime_open_episodes={opened} "
+                              f"runtime_open_fill_episodes={opened} probe_episode_groups=1 "
+                              "admitting_probe_scenarios=0 heap_events=2", message)
+                self.assertEqual(runtime.budget.used, used)
+                self.assertIs(runtime.views[key], prior)
+                self.assertEqual((manager.pending, len(manager.heap), len(manager.episodes)), (1, 2, 1))
 
     def test_an_arrival_that_needs_more_than_max_levels_fails_without_truncation(self):
         h = self.harness(fill_overrides={"max_levels": 1})
