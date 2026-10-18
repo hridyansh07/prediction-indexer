@@ -564,8 +564,11 @@ class IntegratedTests(unittest.TestCase):
         self.assertEqual(manager.pending, 0)
         h = self.harness("cross")
         with patch.object(bounds, "MAX_PENDING_PROBES", 59):
-            with self.assertRaisesRegex(ProtocolError, "pending probe bound"):
+            with self.assertRaisesRegex(ProtocolError, "^pending probe bound") as error:
                 h.finish()
+        self.assertIn("pending_scenarios=59 max_pending_probes=59 runtime_open_episodes=2 "
+                      "runtime_open_fill_episodes=1 probe_episode_groups=1 "
+                      "admitting_probe_scenarios=59 heap_events=59", str(error.exception))
         self.assertEqual(h.strategy.probes.pending, 59)
 
     def test_rehashed_flags_and_decision_economics_are_reader_checked(self):

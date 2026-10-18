@@ -193,12 +193,14 @@ class StateBudget:
     def __init__(self, limit=MAX_STATE):
         self.limit = limit
         self.used = 0
+        self.failure_context = None  # Optional lazy writer diagnostics; never used on success.
 
     def replace(self, old, new, message="detached state budget"):
         if self.used - old + new > self.limit:
+            context = f"; {self.failure_context()}" if self.failure_context is not None else ""
             require(False, f"{message}: retained_bytes={self.used - old + new} "
                     f"max_state_bytes={self.limit} used_bytes={self.used} "
-                    f"replaced_bytes={old} requested_bytes={new}")
+                    f"replaced_bytes={old} requested_bytes={new}{context}")
         self.used += new - old
 
     def charge(self, amount, message="detached state budget"):

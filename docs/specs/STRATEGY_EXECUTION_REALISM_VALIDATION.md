@@ -339,3 +339,44 @@ No retained/corpus/bench workload, Docker, external service, production data,
 object store, secrets, `data/` or `~/pi-data` was accessed for this remediation.
 The actual operator-configuration/Universe-v8 five-bundle acceptance remains a
 separate operational gate; a smaller run cannot cure an oversized single bundle.
+
+## Follow-up: failure-only probe census (18 October 2026)
+
+Starting from local `0772c1f`, the diagnostic amendment in
+[the retention specification §5](LEGACY_PROBE_RETENTION_V1.md#5-failure-only-probe-and-shared-writer-memory-diagnostics)
+adds pending scenarios/cap, all runtime open episodes, the priced-fill subset,
+probe groups (including a partially admitted grid), admitting scenarios and raw
+heap events. The same lazy context covers shared writer retained-state failures
+outside probe admission, including view and episode growth. Existing prefixes,
+used/replaced/requested/attempted bytes and caps remain intact. Counts run only
+on failure, use existing episode tables and constant extra workspace, and do
+not traverse heap objects. Rejection still precedes charge/retention.
+
+Before production changes, four regression methods fail in five subcases on
+missing counts. Afterward, all four pass. The partial-grid case reports **59
+pending scenarios, two runtime episodes, one fill episode, one probe group and
+59 heap events**, even though the group is not yet registered. Shared view
+growth tests cover one pending scenario/two arrival events with either one
+open fill episode or none after closure; failed growth leaves budget usage and
+the retained view unchanged.
+
+Under `nice -n 19`, the expanded focused selection passes **201 tests**:
+execution delay/probe integration/probe reader, strategy execution realism,
+economic SDK/fills/port, strategy packaging and market profile V2. Existing
+goldens, all-four-factory 60-scenario controls and semantic readers pass.
+A separate real R12 fixture writes all 60 selected rows and passes its reader
+with loss 0.40; its diagnostic callback runs once for an induced writer-state
+failure and zero times during subsequent successful completion. Independent
+reader-state and output-budget controls retain distinct prefixes and contain
+no writer probe counts. Whitespace checks pass; existing fixture resource
+warnings remain visible. Full root/replay gates were not repeated for this
+failure-only amendment; their previous results above remain historical.
+
+Logs: `.amp/in/artifacts/probe-counts-before-corrected.log`,
+`probe-counts-after.log`, `probe-counts-focused.log` and
+`probe-counts-controls.log`. No limits, scenarios, reservations, release timing,
+retention, economics or output schemas changed. No reservation optimization is
+included: later decision/arrival books may deepen beyond opening depth. No
+corpus/bench workload, Docker, service, network, retained data, secrets, `data/`
+or `~/pi-data` access occurred. The owner's actual memory exception and the
+separate operational acceptance remain unverified here.

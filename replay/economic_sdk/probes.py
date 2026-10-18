@@ -100,6 +100,20 @@ class Manager:
         # References to immutable policy sizings, covered by its JSON reservation.
         self.sizings = tuple((i, sizing) for i, sizing in enumerate(runtime.fill.sizings)
                             if sizing.name in self.policy.sizings)
+        # Pending reservations share this writer budget with views and episodes.
+        runtime.budget.failure_context = self._diagnostics
+
+    def _diagnostics(self):
+        # add registers a group only after queuing its whole grid. At failure,
+        # at most one admitting group can have queued but unregistered scenarios.
+        admitting = self.pending - sum(episode.count for episode in self.episodes.values())
+        groups = len(self.episodes) + bool(admitting)
+        opened = self.runtime.episodes
+        return (f"pending_scenarios={self.pending} max_pending_probes={bounds.MAX_PENDING_PROBES} "
+                f"runtime_open_episodes={len(opened)} "
+                f"runtime_open_fill_episodes={sum(episode.fill is not None for episode in opened.values())} "
+                f"probe_episode_groups={groups} admitting_probe_scenarios={admitting} "
+                f"heap_events={len(self.heap)}")
 
     def add(self, identity, entity, spec, maxima, start, limit, priced, ages):
         episode = _Episode(identity, entity, spec, maxima, start, limit)
@@ -110,7 +124,11 @@ class Manager:
             for confirm in self.policy.confirm_ms:
                 for latency in self.policy.arrival_ms:
                     for mode_index, mode in enumerate(self.policy.sequencing):
-                        require(self.pending < bounds.MAX_PENDING_PROBES, "pending probe bound")
+                        if self.pending >= bounds.MAX_PENDING_PROBES:
+                            budget = self.runtime.budget
+                            require(False, f"pending probe bound: retained_bytes={budget.used + cost} "
+                                    f"max_state_bytes={budget.limit} used_bytes={budget.used} "
+                                    f"replaced_bytes=0 requested_bytes={cost}; {self._diagnostics()}")
                         self.runtime.budget.charge(cost, "pending probe state budget")
                         probe = _Probe(episode, sizing,
                                        (start, sizing_index, confirm, latency, mode_index, entity.id),

@@ -118,3 +118,36 @@ it consistently to writers and all plain/zstd readers, and prove exact-bound
 success/one-over rejection without increasing retained state. A fresh actual
 operator-config/Universe-v8 five-bundle acceptance remains a separate gate and
 cannot certify this unmeasured oversized bundle.
+
+## 5. Failure-only probe and shared-writer memory diagnostics
+
+Keep the complete probe grid and existing reservations. When probes are enabled,
+pending-scenario admission failures and every shared writer retained-state
+failure include these counts, calculated only on failure:
+
+- `pending_scenarios` and `max_pending_probes`;
+- `runtime_open_episodes`, counting all kinds, and
+  `runtime_open_fill_episodes`, counting only episodes with a priced `fill`
+  (not the trigger-positive/no-fill denominator state);
+- `probe_episode_groups`, including a partially admitted grid, and
+  `admitting_probe_scenarios`, its already queued but unregistered scenarios;
+- `heap_events`, the actual queue length, including any stale finished events.
+
+Counts describe retained state before the rejected operation, not the proposed
+new scenario/episode. Probe groups may outlive runtime episodes. A grid is
+registered only after all its scenarios have been queued; do not mistake zero
+registered groups during partial admission for zero probe groups. Calculate
+that one in-progress group's count from pending minus registered scenario
+counts, without changing registration order or retaining extra probe objects.
+
+Keep `pending probe bound`, `pending probe state budget` and shared-writer
+`detached state budget` prefixes. Include the existing attempted retained bytes,
+used/replaced/requested bytes and state cap even on pending-count exhaustion.
+Do not charge or retain the rejected growth. Shared view/episode growth can fail
+while probes consume the same budget, so its diagnostics use the same lazy
+writer context. Reader and output failures remain distinct and do not acquire
+these writer counts. Do not count, format, traverse the heap or size object
+graphs on successful budget checks; failure counting uses bounded existing
+episode tables and constant extra workspace. No reservation/retention
+optimization, limit, scenario, economics or output-schema change is part of
+this diagnostic amendment.

@@ -383,8 +383,17 @@ class ProbeTests(unittest.TestCase):
         h = self.harness(probes(arrival_ms=[0, 1]))
         self.open(h)
         with patch.object(bounds, "MAX_PENDING_PROBES", 1):
-            with self.assertRaisesRegex(ProtocolError, "pending probe bound"):
+            with self.assertRaisesRegex(ProtocolError, "^pending probe bound") as error:
                 self.book(h, 13, LEG0, (400, 2 * M))
+        message = str(error.exception)
+        self.assertIn("pending_scenarios=1 max_pending_probes=1 runtime_open_episodes=1 "
+                      "runtime_open_fill_episodes=1 probe_episode_groups=1 "
+                      "admitting_probe_scenarios=1 heap_events=1", message)
+        budget, manager = h.strategy.budget, h.strategy.probes
+        cost = manager.heap[0][-1].cost
+        self.assertIn(f"retained_bytes={budget.used + cost} max_state_bytes={budget.limit} "
+                      f"used_bytes={budget.used} replaced_bytes=0 requested_bytes={cost}", message)
+        self.assertEqual((manager.pending, len(manager.heap), len(manager.episodes)), (1, 1, 0))
 
     def test_probe_state_is_conservatively_reserved_and_survives_episode_close(self):
         sizing = {"name": "large", "role": "governs", "target_contracts": "64"}
@@ -416,11 +425,48 @@ class ProbeTests(unittest.TestCase):
         spec, maxima = h.strategy.fill_specs[episode.entity]
         h.strategy.budget.limit = h.strategy.budget.used
         previous = manager.pending
-        with self.assertRaisesRegex(ProtocolError, "pending probe state budget"):
+        used = h.strategy.budget.used
+        cost = manager.heap[0][-1].cost
+        with self.assertRaisesRegex(ProtocolError, "^pending probe state budget") as error:
             manager.add("new", entity, spec, maxima, episode.start, 40 * MS,
                         episode.fill, episode.fill.json["ages"])
+        message = str(error.exception)
+        self.assertIn(f"retained_bytes={used + cost} max_state_bytes={used} used_bytes={used} "
+                      f"replaced_bytes=0 requested_bytes={cost}", message)
+        self.assertIn("pending_scenarios=1 max_pending_probes=100000 runtime_open_episodes=1 "
+                      "runtime_open_fill_episodes=1 probe_episode_groups=1 "
+                      "admitting_probe_scenarios=0 heap_events=2", message)
+        self.assertEqual(h.strategy.budget.used, used)
         self.assertEqual(manager.pending, previous)
         self.assertNotIn("new", manager.episodes)
+
+    def test_shared_view_growth_failure_reports_pending_probes_after_episode_close_too(self):
+        for close in (False, True):
+            with self.subTest(closed=close):
+                h = self.harness(probes(arrival_ms=[20]))
+                self.open(h)
+                price = 600 if close else 400
+                self.book(h, 13, LEG0, (price, 2 * M))
+                time = 14 if close else 13
+                if close:
+                    self.book(h, time, LEG0, (price, 2 * M))
+                runtime, manager = h.strategy, h.strategy.probes
+                used = runtime.budget.used
+                runtime.budget.limit = used
+                key = (LEG0, "outcome")
+                prior = runtime.views[key]
+                with self.assertRaisesRegex(ProtocolError, "^detached state budget") as error:
+                    self.book(h, time, LEG0, (price, 2 * M), (price + 10, M))
+                message = str(error.exception)
+                self.assertIn(f"max_state_bytes={used} used_bytes={used}", message)
+                self.assertRegex(message, r"replaced_bytes=[1-9][0-9]* requested_bytes=[1-9][0-9]*")
+                opened = 0 if close else 1
+                self.assertIn(f"pending_scenarios=1 max_pending_probes=100000 runtime_open_episodes={opened} "
+                              f"runtime_open_fill_episodes={opened} probe_episode_groups=1 "
+                              "admitting_probe_scenarios=0 heap_events=2", message)
+                self.assertEqual(runtime.budget.used, used)
+                self.assertIs(runtime.views[key], prior)
+                self.assertEqual((manager.pending, len(manager.heap), len(manager.episodes)), (1, 2, 1))
 
     def test_an_arrival_that_needs_more_than_max_levels_fails_without_truncation(self):
         h = self.harness(fill_overrides={"max_levels": 1})
