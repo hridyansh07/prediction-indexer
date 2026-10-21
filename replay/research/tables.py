@@ -147,6 +147,7 @@ VOLATILITY_SCHEMA = pa.schema([
 
 def event_schema(lenses):
     fields = [("bundle_id", pa.string()), ("event_id", pa.string()), ("corpus_key", pa.string()),
+              ("key_prefix", pa.string()),
               ("state", pa.string()), ("message", pa.string()), ("pack", pa.string()), ("pack_error", pa.string()),
               ("context", pa.string()), ("game", pa.string()), ("title", pa.string()),
               ("capture_start_ns", pa.int64()), ("duration_s", pa.float64()), ("venues", pa.list_(pa.string())),
@@ -268,8 +269,9 @@ def viability(config, version, inputs, superseded, event_rows, episodes, summary
              "Inputs: " + ", ".join(f"`{i['corpus_key'] or i['key_prefix']}` ({i['bundles']} results)"
                                     for i in inputs) + ".", ""]
     if superseded:
-        lines.append(f"Superseded results (a later key directory won): {len(superseded)} — "
-                     + ", ".join(f"`{s['bundle_id']}` from `{s['key_prefix']}`" for s in superseded) + ".")
+        lines.append(f"Superseded results (verified commit selection): {len(superseded)} — "
+                     + ", ".join(f"`{s['bundle_id']}` from `{s['key_prefix']}` "
+                                 f"({s.get('state', 'superseded')})" for s in superseded) + ".")
         lines.append("")
     lines += ["## Events", "", "| State | Events |", "|---|---:|"]
     lines += [f"| {state} | {count} |" for state, count in summary["events"].items()]

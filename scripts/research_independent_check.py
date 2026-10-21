@@ -1,7 +1,8 @@
 """Independent acceptance check for a research build (RESEARCH_SITE_V1 §6, items 2 and 3).
 
-It deliberately imports nothing from ``replay.research``. Zstandard goes through
-the shared ``encoder`` package. For every pack in the current version it:
+It shares only the manifest-selected evidence reader, never the build's tables
+or aggregation logic. Zstandard goes through the shared ``encoder`` package.
+For every pack in the current version it:
 
 1. recomputes the overview's bid and ask ``last`` per bucket and book from the
    profile's ``transitions.ndjson.zst`` with its own algorithm (closed state
@@ -25,37 +26,12 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
-from encoder import LogicalIdentity, StoredIdentity, decode_stream
-
-
-class Lines:
-    """A decode sink that hands complete lines to a callback without keeping them."""
-
-    def __init__(self, on_line):
-        self.on_line, self.partial = on_line, b""
-
-    def write(self, data):
-        size = len(data)
-        *lines, self.partial = (self.partial + bytes(data)).split(b"\n")
-        for line in lines:
-            self.on_line(line)
-        return size
-
-    def flush(self):
-        pass
+from replay.economic_sdk import bounds
+from replay.research.files import Files
 
 
 def rows(output):
-    manifest = json.loads((output / "manifest.json").read_bytes())
-    entry = manifest["files"]["transitions.ndjson.zst"]
-    logical, stored = entry["logical"], entry["stored"]
-    collected = []
-    with (output / "transitions.ndjson.zst").open("rb") as source:
-        decode_stream(source, Lines(lambda line: collected.append(json.loads(line))),
-                      expected_logical=LogicalIdentity(logical["sha256"], logical["byte_length"], logical["records"]),
-                      expected_stored=StoredIdentity(stored["sha256"], stored["byte_length"]),
-                      max_decoded_bytes=logical["byte_length"])
-    return collected
+    return Files(output).lines("transitions.ndjson")
 
 
 def intervals(transitions, scopes):
@@ -99,7 +75,7 @@ def expected_last(per_book, books, start, end, bucket):
 
 def check_overview(pack_dir, profile_output):
     overview = json.loads((pack_dir / "overview.json").read_bytes())
-    summary = json.loads((profile_output / "summary.json").read_bytes())
+    summary = Files(profile_output).document("summary.json", bounds.MAX_METADATA)
     scopes = summary["transition_scopes"]
     start, end, bucket = int(overview["start_ns"]), int(overview["end_ns"]), int(overview["bucket_ns"])
     per_book = intervals(rows(profile_output), scopes)
@@ -124,7 +100,8 @@ def decimal(value):
 
 def check_overlay(pack_dir, lens, lens_config, group_output):
     overlay = json.loads((pack_dir / "overlays" / f"{lens}.json").read_bytes())
-    episodes = [json.loads(line) for line in (group_output / "episodes.ndjson").open("rb")]
+    files = Files(group_output)
+    episodes = list(files.lines("episodes.ndjson"))
     by_id = {row["episode_id"]: row for row in episodes}
     bad = 0
     for item in overlay["items"]:
@@ -132,7 +109,7 @@ def check_overlay(pack_dir, lens, lens_config, group_output):
         if row is None or (item["start_ns"], item["end_ns"], item["end_reason"], item["censored"]) != (
                 str(row["start_ns"]), str(row["end_ns"]), row["end_reason"], row["censored"]):
             bad += 1
-    step = Fraction(json.loads((group_output / "manifest.json").read_bytes())["policy"]["fills"]["step_contracts"]) \
+    step = Fraction(files.manifest["policy"]["fills"]["step_contracts"]) \
         if any("fill" in row for row in episodes) else None
     fills = []
     for row in episodes:
@@ -164,7 +141,7 @@ def main(argv=None):
     manifest_bytes = (args.out / pointer["manifest_key"]).read_bytes()
     assert hashlib.sha256(manifest_bytes).hexdigest() == pointer["manifest_sha256"], "corpus manifest identity"
     manifest = json.loads(manifest_bytes)
-    keys = {k.name: k for k in args.key_dirs}
+    keys = {k.resolve().name: k.resolve() for k in args.key_dirs}
     failures = 0
     for bundle, entry in sorted(manifest["events"].items()):
         pack_dir = args.out / pointer["version"] / "events" / bundle

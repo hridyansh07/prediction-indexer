@@ -7,15 +7,14 @@ decimal exists. Thresholds never use binary floating point or arrival values.
 
 from __future__ import annotations
 
-import json
 import math
 import statistics
 from collections import Counter, defaultdict
 from fractions import Fraction
-from pathlib import Path
 
-from replay.economic_sdk.profile_stream_io import stream_lines
-from replay.research.jsonio import dumps, file_identity, read_json, require
+from replay.economic_sdk import bounds
+from replay.research.files import Files
+from replay.research.jsonio import dumps, require
 
 MAX_PROBE_ROWS = 1_000_000
 MAX_PROBE_BYTES = 128 * 1024 * 1024
@@ -117,13 +116,13 @@ def probe_detail(row, step, scale, unit):
 
 def attach_probes(output, items, step, scale, unit):
     """Bounded, identity-checked sidecar join; rows never silently lose their episode."""
-    output = Path(output)
-    manifest = read_json(output / "manifest.json")
+    files = Files(output)
+    manifest = files.manifest
     policy = (manifest.get("policy") or {}).get("fills") or {}
-    entry = manifest.get("files", {}).get("probes.ndjson")
+    entry = files.entry("probes.ndjson")
     enabled = policy.get("probes") is not None
     if not enabled:
-        require(entry is None and not (output / "probes.ndjson").exists(), "undeclared probe evidence")
+        require(entry is None, "undeclared probe evidence")
     by_id = {item["id"]: item for item in items}
     require(len(by_id) == len(items), "duplicate overlay episode id")
     for item in items:
@@ -138,26 +137,17 @@ def attach_probes(output, items, step, scale, unit):
             "research probe policy product bound")
     require(entry is not None, "probe policy has no probes.ndjson identity")
     require(step is not None, "probes without fill step_contracts")
-    path = output / "probes.ndjson"
-    require(path.is_file(), "probe policy has no probes.ndjson file")
-    actual = file_identity(path)
-    require(all(actual[k] == entry[k] for k in actual), "probes.ndjson identity mismatch")
-    require(actual["byte_length"] <= MAX_PROBE_BYTES, "research probes exceed byte budget")
     count, seen, budget = 0, set(), ProbeBudget()
-    with path.open("rb") as handle:
-        while line := handle.readline(MAX_LINE + 1):
-            require(len(line) <= MAX_LINE and line.endswith(b"\n"), "research probe line bound")
-            count += 1
-            require(count <= MAX_PROBE_ROWS, "research probes exceed row budget")
-            row = json.loads(line)
-            require(row["episode_id"] in by_id, "probe has no episode")
-            key = tuple(row[k] for k in ("episode_id", "sizing", "confirm_ms", "arrival_ms", "sequencing"))
-            require(key not in seen, "duplicate research probe")
-            seen.add(key)
-            derived = probe_detail(row, step, scale, unit)
-            budget.reserve((derived,))
-            by_id[row["episode_id"]]["detail"]["probes"]["items"].append(derived)
-    require(count == entry.get("records"), "probes.ndjson record count mismatch")
+    for row in files.lines("probes.ndjson", max_line=MAX_LINE, max_bytes=MAX_PROBE_BYTES):
+        count += 1
+        require(count <= MAX_PROBE_ROWS, "research probes exceed row budget")
+        require(row["episode_id"] in by_id, "probe has no episode")
+        key = tuple(row[k] for k in ("episode_id", "sizing", "confirm_ms", "arrival_ms", "sequencing"))
+        require(key not in seen, "duplicate research probe")
+        seen.add(key)
+        derived = probe_detail(row, step, scale, unit)
+        budget.reserve((derived,))
+        by_id[row["episode_id"]]["detail"]["probes"]["items"].append(derived)
     expected = {(s, c, a, mode) for s in probe_policy["sizings"] for c in probe_policy["confirm_ms"]
                 for a in probe_policy["arrival_ms"] for mode in probe_policy["sequencing"]}
     for item in items:
@@ -242,22 +232,19 @@ def delayed_summaries(rows):
 
 def volatility_document(output, bundle_id, event_id, game, books):
     """Aggregate verified bucket evidence; retain exact totals behind RMS and rates."""
-    output = Path(output)
-    manifest, summary = read_json(output / "manifest.json"), read_json(output / "summary.json")
-    entry = manifest.get("files", {}).get("volatility.ndjson.zst")
+    files = Files(output)
+    manifest, summary = files.manifest, files.document("summary.json", bounds.MAX_METADATA)
+    entry = files.entry("volatility.ndjson")
     if entry is None:
         policy = manifest.get("policy") or {}
         require("volatility" not in policy.get("groups", []) and "volatility" not in policy,
                 "profile declares volatility without volatility.ndjson.zst identity")
-        require(not (output / "volatility.ndjson.zst").exists(), "undeclared volatility evidence")
         return {"state": "unavailable", "reason": "legacy input: volatility not recorded", "pairs": [], "rows": []}
     require(type(summary.get("volatility")) is dict, "volatility file without summary")
     pairs = summary["volatility"]["gap_pairs"]
     require(len(pairs) <= 4096 and len(books) <= MAX_VOLATILITY_SERIES, "research volatility series bound")
     totals = {}
-    for line in stream_lines(output / "volatility.ndjson.zst", entry["logical"], entry["stored"],
-                             MAX_LINE, "volatility"):
-        row = json.loads(line)
+    for row in files.lines("volatility.ndjson", max_line=MAX_LINE):
         require(row["type"] in ("book", "gap"), "unknown volatility row type")
         fields = {"type", "scope", "bucket", "start_ns", "end_ns", "samples", "horizons"}
         fields |= ({"book", "two_sided_ns", "mid_changes", "top_updates", "spread_sum2"} if row["type"] == "book"

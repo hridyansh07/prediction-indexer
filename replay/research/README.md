@@ -11,9 +11,21 @@ strategy runtime: it reads the outputs the corpus runner committed. Specificatio
     [--config configs/research.json] [--game-state <local game-state archive root>]
 ```
 
-- Pass key directories (`results_root/<corpus key[:16]>`). When a bundle appears
-  in several, the **last** one on the command line wins; the others are listed as
-  superseded in the corpus manifest and the viability report.
+- Pass key directories (`results_root/<corpus key[:16]>`). A bundle's single
+  verified committed result wins regardless of input order. Multiple commits
+  fail unless `--prefer-later` is supplied (on either `verify` or `build`), in
+  which case the last **committed** input wins. Incomplete or invalid attempts
+  never displace a commit; they remain `superseded_uncommitted` in the manifest
+  and viability report with their key prefix. No commit anywhere remains an
+  explicit uncommitted or receipt-invalid event.
+- The CLI resolves key-directory arguments once with `Path.resolve()`. This
+  canonicalizes symlinked results roots (including macOS `/var` → `/private/var`)
+  before the strict reader checks for symlinked parents. Symlinks inside the
+  resolved evidence tree still fail loudly with `regular output required`.
+- Put `--out` on a POSIX filesystem supporting atomic rename and directory
+  fsync, preferably the spare machine's WSL ext4, not an NTFS/shared mount.
+  AppleDouble `._*` and `.DS_Store` files are ignored during discovery and
+  identical-version comparison; other unexpected output files still fail.
 - Inputs are read in place and never written. Output goes only to `--out`.
 - `build` writes one content-addressed version, `OUT/<version>/`, and then replaces
   `OUT/current.json`. An identical rebuild reuses the version; a differing one
@@ -28,6 +40,18 @@ event whose `profile` lens is `ok` gets a pack under `events/<bundle_id>/`:
 The corpus level holds `manifest.json`, `events.parquet`, `episodes.parquet`,
 `probes.parquet`, `volatility.parquet`, `summary.json`, `viability.md` and
 `verify.json`.
+
+Group evidence is selected from its manifest by `replay.research.files.Files`.
+It reads declared plain or `.zst` files, verifies logical identities and stored
+frame identities through the shared encoder, and rejects missing, ambiguous or
+undeclared evidence. Entity documents are bounded at 256 MiB; reasons and
+summaries at 8 MiB. Streams are bounded per line without a decoded disk copy.
+Summary and publication metadata keep their existing SDK layout outside the
+file inventory; summaries bind through `summary_sha256`. The independent checker
+shares this byte reader but recomputes chart buckets and overlays independently.
+Events carry both `corpus_key` and `key_prefix`; an incomplete event inherits a
+full key only when another verified receipt in its directory establishes it,
+otherwise `corpus_key` stays null rather than inventing an identity.
 
 Execution-realism evidence extends the offline tables and report. UI work is
 deferred; the existing lens layers and charts are unchanged. Every episode has

@@ -1,19 +1,19 @@
 """Approved corpus-input regressions, using offline runtime output and receipts."""
 
-import copy
 import hashlib
 import io
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
 from encoder import encode_stream
-from replay.research import build as builder, series
+from replay.research import build as builder
 from replay.research.inputs import discover
-from replay.research.jsonio import ResearchError, dumps, read_json
+from replay.research.jsonio import ResearchError, read_json
 from replay.tests.research_fixtures import ATTEMPT, corpus_result, write_json
 from replay.tests.test_research_build import CONFIG, CONFIG_PATH, OK
 from replay.tests import test_strategy_execution_realism as execution
@@ -48,7 +48,7 @@ class CorpusInputsTest(unittest.TestCase):
         output = self.build()
         rows = pq.read_table(output / "events.parquet").to_pylist()
         self.assertEqual(rows[0]["key_prefix"], "a" * 16)
-        self.assertEqual(rows[0]["corpus_key"], "a" * 16 + "0" * 48)
+        self.assertIsNone(rows[0]["corpus_key"])  # No verified full key exists in this directory.
         output = self.build(self.keys, out="chosen")
         self.assertIn("superseded_uncommitted", (output / "viability.md").read_text())
 
@@ -105,6 +105,10 @@ class CorpusInputsTest(unittest.TestCase):
             results.append((pq.read_table(output / "episodes.parquet").to_pylist(),
                             pq.read_table(output / "probes.parquet").to_pylist(),
                             read_json(output / "events" / OK / "overlays" / "cross.json")))
+            from scripts.research_independent_check import main as independent_check
+            with redirect_stdout(io.StringIO()) as report:
+                self.assertEqual(independent_check([str(output.parent), str(key)]), 0)
+            self.assertIn("ALL CHECKS PASSED", report.getvalue())
         self.assertTrue(results[0][0])
         self.assertTrue(results[0][1])
         # Storage changes the semantic manifest digest, not economic rows.
@@ -138,6 +142,34 @@ class CorpusInputsTest(unittest.TestCase):
         self.assertTrue(pack["tiles"]["raw"])
         self.assertEqual(pack["execution_realism"]["volatility"], "ok")
 
+    def test_compressed_availability_matches_plain_and_cli_resolves_root(self):
+        corpus_result(self.keys[0], OK)
+        plain = self.build()
+
+        def compress_availability(staging):
+            output = staging / "run" / ATTEMPT / "profile" / "output"
+            source = output / "availability.ndjson"
+            with source.open("rb") as handle, (output / "availability.ndjson.zst").open("wb") as sink:
+                result = encode_stream(handle, sink)
+            manifest = read_json(output / "manifest.json")
+            logical = manifest["files"].pop("availability.ndjson")
+            manifest["files"]["availability.ndjson.zst"] = {"logical": logical, "stored": {
+                "sha256": result.stored.sha256, "byte_length": result.stored.byte_length}}
+            source.unlink()
+            write_json(output / "manifest.json", manifest)
+
+        corpus_result(self.keys[1], OK, before_commit=compress_availability)
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        from replay.research.__main__ import main
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["verify", str(alias / self.keys[1].name)]), 0)
+            self.assertEqual(main(["build", str(alias / self.keys[1].name), "--out", str(self.root / "cli")]), 0)
+        pointer = read_json(self.root / "cli" / "current.json")
+        compressed = self.root / "cli" / pointer["version"]
+        self.assertEqual(read_json(plain / "events" / OK / "availability.json"),
+                         read_json(compressed / "events" / OK / "availability.json"))
+
 
 class DeclaredFilesTest(unittest.TestCase):
     def setUp(self):
@@ -156,7 +188,7 @@ class DeclaredFilesTest(unittest.TestCase):
 
     def test_corruption_and_inventory_errors(self):
         from replay.research.files import Files
-        for case, message in (("stored", "stored.*sha256"), ("logical", "logical.*sha256"),
+        for case, message in (("stored", "stored.*sha256"), ("logical", "decoded.*sha256"),
                               ("truncated", "truncat"), ("trailing", "trailing"),
                               ("concatenated", "trailing|concatenat"), ("checksum", "checksum"),
                               ("both", "both forms declared"), ("undeclared", "undeclared evidence"),
@@ -209,6 +241,28 @@ class DeclaredFilesTest(unittest.TestCase):
         entry["records"] = 1
         with self.assertRaisesRegex(ValueError, "line bound"):
             list(Files(self.root, manifest).lines("episodes.ndjson", max_line=3))
+
+    def test_symlinked_evidence_parent_is_rejected(self):
+        from replay.research.files import Files
+        manifest = self.stored()
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "regular output required"):
+            Files(alias, manifest).document("entities.json", 1024)
+
+    def test_reasons_metadata_limit_and_summary_binding(self):
+        from replay.economic_sdk.bounds import MAX_METADATA
+        from replay.research.files import Files
+        manifest = self.stored(b'{"reasons":[]}\n', name="reasons.json")
+        self.assertEqual(Files(self.root, manifest).document("reasons.json", MAX_METADATA), {"reasons": []})
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            Files(self.root, manifest).document("reasons.json", 1)
+        write_json(self.root / "summary.json", {"x": 1})
+        manifest["summary_sha256"] = hashlib.sha256(b'{"x":1}').hexdigest()
+        self.assertEqual(Files(self.root, manifest).document("summary.json", MAX_METADATA), {"x": 1})
+        write_json(self.root / "summary.json", {"x": 2})
+        with self.assertRaisesRegex(ValueError, "summary.json: logical sha256 mismatch"):
+            Files(self.root, manifest).document("summary.json", MAX_METADATA)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,11 @@ Every episode becomes one interval, in file order. Nothing is filtered.
 
 from __future__ import annotations
 
-import json
 from fractions import Fraction
-from pathlib import Path
 
-from replay.research.jsonio import ResearchError, read_json, require
+from replay.economic_sdk import bounds
+from replay.research.files import Files
+from replay.research.jsonio import ResearchError, require
 from replay.research import realism
 
 OVERLAY_VERSION = 1
@@ -57,22 +57,20 @@ def _legs(descriptor):
 
 def episode_intervals(output, lens_name, lens, books):
     """Return the overlay document for one ``sdk_episodes`` lens output directory."""
-    output = Path(output)
-    manifest = read_json(output / "manifest.json")
-    receipt = read_json(output / "content_receipt.json")
-    scopes = read_json(output / "entities.json")["scopes"]
+    files = Files(output)
+    manifest = files.manifest
+    receipt = files.document("content_receipt.json", bounds.MAX_METADATA)
+    scopes = files.document("entities.json", bounds.MAX_ENTITY_TABLE)["scopes"]
     fills = (manifest.get("policy") or {}).get("fills")
     step = Fraction(fills["step_contracts"]) if fills else None
     mapped = book_mapper(books)
     items = []
-    with (output / "episodes.ndjson").open("rb") as handle:
-        for line in handle:
-            row = json.loads(line)
-            try:
-                entity = scopes[row["scope"]][row["entity"]]
-            except (IndexError, TypeError) as error:
-                raise ResearchError(f"{lens_name}: episode {row.get('episode_id')} has no entity") from error
-            items.append(_interval(row, entity["descriptor"], lens, step, mapped))
+    for row in files.lines("episodes.ndjson"):
+        try:
+            entity = scopes[row["scope"]][row["entity"]]
+        except (IndexError, TypeError) as error:
+            raise ResearchError(f"{lens_name}: episode {row.get('episode_id')} has no entity") from error
+        items.append(_interval(row, entity["descriptor"], lens, step, mapped))
     probe_evidence = realism.attach_probes(output, items, step, lens["value_scale"], lens["value_unit"])
     return {"overlay_version": OVERLAY_VERSION, "lens": lens_name, "kind": "intervals", "label": lens["label"],
             "semantic_sha256": receipt.get("semantic_sha256"), "probes": probe_evidence, "items": items}

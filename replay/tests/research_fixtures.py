@@ -96,6 +96,11 @@ def profile_output(directory, rows=None, *, books=BOOKS, scopes=SCOPES, availabi
              "state": "PARTIAL"},
         ]
     ndjson(directory / "availability.ndjson", availability)
+    manifest = json.loads((directory / "manifest.json").read_bytes())
+    data = (directory / "availability.ndjson").read_bytes()
+    manifest["files"]["availability.ndjson"] = {
+        "sha256": hashlib.sha256(data).hexdigest(), "byte_length": len(data), "records": data.count(b"\n")}
+    write_json(directory / "manifest.json", manifest)
     write_json(directory / "content_receipt.json", {"semantic_sha256": "1" * 64})
 
 
@@ -141,7 +146,13 @@ def cross_output(directory, episodes=None):
     ]]
     write_json(directory / "entities.json", {"scopes": entities})
     ndjson(directory / "episodes.ndjson", default_episodes() if episodes is None else episodes)
-    write_json(directory / "manifest.json", {"version": 2, "policy": {"fills": {"step_contracts": "0.01"}}})
+    files = {}
+    for name in ("entities.json", "episodes.ndjson"):
+        data = (directory / name).read_bytes()
+        files[name] = {"sha256": hashlib.sha256(data).hexdigest(), "byte_length": len(data),
+                       "records": data.count(b"\n")}
+    write_json(directory / "manifest.json", {"version": 2, "policy": {"fills": {"step_contracts": "0.01"}},
+                                              "files": files})
     write_json(directory / "content_receipt.json", {"semantic_sha256": "2" * 64})
 
 

@@ -55,13 +55,13 @@ def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def discover(key_dirs, config):
+def discover(key_dirs, config, *, prefer_later=False):
     """Return (events sorted by bundle id, superseded, inputs).
 
-    The key directory given last wins for a bundle found in several; the others
-    are reported as superseded, never dropped silently.
+    Verified commits win over incomplete attempts. Ambiguous commits require
+    explicit preference; every losing directory remains visible.
     """
-    chosen, superseded, inputs = {}, [], []
+    candidates, chosen, superseded, inputs = {}, {}, [], []
     for key_dir in key_dirs:
         key_dir = Path(key_dir)
         if not key_dir.is_dir():
@@ -72,17 +72,34 @@ def discover(key_dirs, config):
             event = classify(root, key_dir.name, config)
             if event.corpus_key is not None:
                 corpus_keys.add(event.corpus_key)
-            previous = chosen.get(event.bundle_id)
-            if previous is not None:
-                superseded.append({"bundle_id": event.bundle_id, "key_prefix": previous.key_prefix,
-                                   "corpus_key": previous.corpus_key, "by": key_dir.name})
-            chosen[event.bundle_id] = event
+            candidates.setdefault(event.bundle_id, []).append(event)
         if len(corpus_keys) > 1:
             raise ResearchError(f"{key_dir} holds results of several corpus keys: {sorted(corpus_keys)}")
         key = next(iter(corpus_keys), None)
         if key is not None and not key.startswith(key_dir.name):
             raise ResearchError(f"{key_dir} name does not prefix its corpus key {key}")
+        # Incomplete attempts inherit only the key verified elsewhere in this
+        # directory, never a fabricated 64-character identity from its prefix.
+        for root in bundles:
+            event = candidates[root.name][-1]
+            if event.corpus_key is None:
+                event.corpus_key = key
         inputs.append({"key_prefix": key_dir.name, "corpus_key": key, "bundles": len(bundles)})
+    for bundle, events in candidates.items():
+        committed = [e for e in events if e.receipt_sha256 is not None and e.state != "receipt_invalid"]
+        if len(committed) > 1 and not prefer_later:
+            raise ResearchError(f"{bundle}: multiple committed results; use --prefer-later: "
+                                + ", ".join(e.key_prefix for e in committed))
+        winner = (committed or events)[-1]
+        chosen[bundle] = winner
+        for event in events:
+            if event is winner:
+                continue
+            row = {"bundle_id": bundle, "key_prefix": event.key_prefix,
+                   "corpus_key": event.corpus_key, "by": winner.key_prefix}
+            if event not in committed:
+                row["state"] = "superseded_uncommitted"
+            superseded.append(row)
     superseded.sort(key=lambda row: (row["bundle_id"], row["key_prefix"]))
     return [chosen[b] for b in sorted(chosen)], superseded, inputs
 

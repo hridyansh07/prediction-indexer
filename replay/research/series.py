@@ -8,12 +8,9 @@ and written, as soon as the stream passes its end.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from replay.economic_sdk import bounds
-from replay.economic_sdk.profile_stream_io import stream_lines
-from replay.research.jsonio import ResearchError, read_json, require, safe_int
+from replay.research.files import Files
+from replay.research.jsonio import ResearchError, require, safe_int
 
 SECOND = 1_000_000_000
 QUOTE_SIDES = ("bid", "ask")
@@ -88,7 +85,7 @@ def _price(quote):
 
 def profile_tables(output):
     """The profile summary's written books and scopes, validated for this use."""
-    summary = read_json(Path(output) / "summary.json")
+    summary = Files(output).document("summary.json", bounds.MAX_METADATA)
     books = summary.get("transition_books")
     scopes = summary.get("transition_scopes")
     require(type(books) is list and books, "profile summary has no transition_books (transitions group off?)")
@@ -98,12 +95,7 @@ def profile_tables(output):
 
 def transitions_rows(output):
     """Decoded rows of the profile's ``transitions.ndjson.zst``, identities verified first."""
-    path = Path(output) / "transitions.ndjson.zst"
-    manifest = read_json(Path(output) / "manifest.json")
-    entry = manifest["files"].get(path.name)
-    require(entry is not None, "profile manifest lists no transitions.ndjson.zst")
-    for line in stream_lines(path, entry["logical"], entry["stored"], bounds.MAX_LINE, "transitions"):
-        yield json.loads(line)
+    yield from Files(output).lines("transitions.ndjson")
 
 
 def build_series(rows, *, books, scopes, max_buckets, tile_minutes, write_tile):

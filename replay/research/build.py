@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import tempfile
@@ -12,6 +11,7 @@ from pathlib import Path
 from replay.economic_sdk.availability_reader import book_id
 from replay.research import game, metadata, overlays, realism, series, tables
 from replay.research.inputs import discover
+from replay.research.files import Files
 from replay.research.jsonio import (ResearchError, dumps, file_identity, fsync_directory, identity, read_json,
                                     require, write_bytes)
 
@@ -32,21 +32,19 @@ class Pack:
 
 
 def availability_document(output, books):
-    path = Path(output) / "availability.ndjson"
-    if not path.is_file():
+    files = Files(output)
+    if files.entry("availability.ndjson") is None:
         return {"availability_version": 1, "state": "missing", "books": []}
     index = {book_id({"instrument": b["instrument"], "orientation": b["orientation"]}): b["book"] for b in books}
     intervals = {b["book"]: [] for b in books}
-    with path.open("rb") as handle:
-        for line in handle:
-            row = json.loads(line)
-            book = index.get(row["entity"])
-            if book is None:
-                continue
-            reason = row.get("reason")
-            intervals[book].append({"start_ns": row["start_ns"], "end_ns": row["end_ns"], "scope": row["scope"],
-                                    "state": row["state"],
-                                    "reason": reason.get("kind") if type(reason) is dict else reason})
+    for row in files.lines("availability.ndjson"):
+        book = index.get(row["entity"])
+        if book is None:
+            continue
+        reason = row.get("reason")
+        intervals[book].append({"start_ns": row["start_ns"], "end_ns": row["end_ns"], "scope": row["scope"],
+                                "state": row["state"],
+                                "reason": reason.get("kind") if type(reason) is dict else reason})
     return {"availability_version": 1, "state": "ok",
             "books": [{"book": book, "intervals": intervals[book]} for book in sorted(intervals)]}
 
@@ -122,6 +120,7 @@ def build_pack(event, root, config, game_state_root):
 def event_row(event, config, pack_state, pack_error, facts, rows):
     header = facts or metadata.event_header(event.bundle_id, event.context)
     row = {"bundle_id": event.bundle_id, "event_id": header.get("event_id"), "corpus_key": event.corpus_key,
+           "key_prefix": event.key_prefix,
            "state": event.state, "message": event.message, "pack": pack_state, "pack_error": pack_error,
            "context": event.context_state, "game": header.get("game"), "title": header.get("title"),
            "capture_start_ns": None if facts is None else facts["capture_start_ns"],
@@ -144,11 +143,11 @@ def event_row(event, config, pack_state, pack_error, facts, rows):
     return row
 
 
-def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=print):
+def build(key_dirs, out, config, *, config_bytes, game_state_root=None, log=print, prefer_later=False):
     """Build into ``out``; return ``(version, failures)``. ``current.json`` is replaced last."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    events, superseded, inputs = discover(key_dirs, config)
+    events, superseded, inputs = discover(key_dirs, config, prefer_later=prefer_later)
     staging = Path(tempfile.mkdtemp(prefix=".build-", dir=out))
     try:
         packs, event_rows, episodes, failures, probes, volatility, evidence = {}, [], [], [], [], [], []
@@ -231,16 +230,18 @@ def _sync_tree(root):
 
 def _verify_existing(target, staging):
     """An existing version is reused only when it holds exactly the same bytes."""
-    mine = {p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file()}
-    theirs = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()}
+    mine = {p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file()
+            and not any(part.startswith("._") or part == ".DS_Store" for part in p.relative_to(staging).parts)}
+    theirs = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()
+              and not any(part.startswith("._") or part == ".DS_Store" for part in p.relative_to(target).parts)}
     require(mine == theirs, f"existing version {target.name} differs in its file set; refusing to rewrite")
     for relative in sorted(mine):
         if file_identity(staging / relative) != file_identity(target / relative):
             raise ResearchError(f"existing version {target.name} differs at {relative}; refusing to rewrite")
 
 
-def verify_only(key_dirs, config):
-    events, superseded, inputs = discover(key_dirs, config)
+def verify_only(key_dirs, config, *, prefer_later=False):
+    events, superseded, inputs = discover(key_dirs, config, prefer_later=prefer_later)
     return {"verify_version": 1, "inputs": inputs, "superseded": superseded,
             "checks": [check for event in events for check in event.checks]}
 

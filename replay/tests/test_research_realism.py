@@ -147,7 +147,8 @@ def add_execution_evidence(staging):
     manifest = read_json(output / "manifest.json")
     manifest["policy"]["fills"]["probes"] = {"sizings": ["edge", "t10"], "confirm_ms": [0, 500, 1000],
         "arrival_ms": [100, 250, 500, 1000, 2000], "sequencing": ["simultaneous", "slow_first"]}
-    manifest["files"] = {"probes.ndjson": {**file_identity(output / "probes.ndjson"), "records": len(rows)}}
+    manifest["files"]["episodes.ndjson"] = {**file_identity(output / "episodes.ndjson"), "records": len(episodes)}
+    manifest["files"]["probes.ndjson"] = {**file_identity(output / "probes.ndjson"), "records": len(rows)}
     write_json(output / "manifest.json", manifest)
     profile = staging / "run" / ATTEMPT / "profile" / "output"
     pairs = [{"scope": 0, "pair": 7, "book_a": 0, "side_a": "complement", "book_b": 1,

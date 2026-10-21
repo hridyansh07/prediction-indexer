@@ -88,7 +88,7 @@ class InputsTest(unittest.TestCase):
         corpus_result(self.key, B1, status="FAILED")
         corpus_result(self.key, B3)
         corpus_result(later, B1)
-        events, superseded, inputs = self.one([self.key, later])
+        events, superseded, inputs = discover([self.key, later], CONFIG, prefer_later=True)
         self.assertEqual([(e.bundle_id, e.key_prefix) for e in events],
                          [(B1, "bbbbbbbbbbbbbbbb"), (B3, "aaaaaaaaaaaaaaaa")])
         self.assertEqual(superseded, [{"bundle_id": B1, "key_prefix": "aaaaaaaaaaaaaaaa",
