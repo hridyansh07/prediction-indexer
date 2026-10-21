@@ -19,6 +19,7 @@ def main(argv=None):
     prepare = commands.add_parser('prepare')
     prepare.add_argument('config', type=Path); prepare.add_argument('out_dir', type=Path)
     prepare.add_argument('--warm-timeout-s', type=float, default=120)
+    prepare.add_argument('--universe-timeout-s', type=float, default=60)
     prepare.add_argument('--allow-outcomes-unavailable', action='store_true')
     game_state = commands.add_parser('prepare-game-state')
     game_state.add_argument('context_dir', type=Path); game_state.add_argument('out_dir', type=Path)
@@ -46,6 +47,7 @@ def main(argv=None):
             report, code = {'game_state_sha256': pin}, 0
         elif args.command == 'prepare':
             code, report = prepare_context(args.config, args.out_dir, warm_timeout_s=args.warm_timeout_s,
+                                           universe_timeout_s=args.universe_timeout_s,
                                            allow_outcomes_unavailable=args.allow_outcomes_unavailable)
         elif args.command == 'fees':
             report, code = build_fees(args.spec, args.out_dir), 0

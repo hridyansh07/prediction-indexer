@@ -10,6 +10,19 @@ from replay.tests.test_preparation_outcomes import document
 
 
 class PrepareEndpointTests(unittest.TestCase):
+    def test_factory_default_timeout_remains_ten_seconds(self):
+        source = universe_from_environment(env_file=None, environ={"UNIVERSE_BASE_URL": "https://universe.example"})
+        self.assertEqual(source.timeout, 10)
+
+    def test_factory_timeout_override_and_validation(self):
+        settings = {"env_file": None, "environ": {"UNIVERSE_BASE_URL": "https://universe.example"}}
+        for timeout in (0.05, 60):
+            with self.subTest(timeout=timeout):
+                self.assertEqual(universe_from_environment(**settings, timeout=timeout).timeout, timeout)
+        for timeout in (0, -1, 60.01, True, "60", None, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                universe_from_environment(**settings, timeout=timeout)
+
     def test_literal_dotenv_and_environment_precedence(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/"synthetic.env"

@@ -105,7 +105,7 @@ Exit codes are the same for every command:
 
 ## 4. Commands
 
-### 4.1 `prepare CONFIG OUT_DIR [--warm-timeout-s 120] [--allow-outcomes-unavailable]`
+### 4.1 `prepare CONFIG OUT_DIR [--warm-timeout-s 120] [--universe-timeout-s 60] [--allow-outcomes-unavailable]`
 
 1. Validate `CONFIG` with the existing closed preparation configuration
    ([STRATEGY_PREPARATION_V1.md](STRATEGY_PREPARATION_V1.md)).
@@ -117,7 +117,11 @@ Exit codes are the same for every command:
 
    A cold Universe cache has made the preparation client's short timeout
    produce `outcomes.unavailable` for every book.
-4. Run the existing `prepare(config, OUT_DIR, universe=source)`.
+4. Run the existing `prepare(config, OUT_DIR, universe=source)`. The bench's
+   selection and outcomes client uses `--universe-timeout-s` (default 60 seconds,
+   positive and at most 60, validated by `UniverseHTTP`). This is separate from
+   the outcomes warm-up timeout: warming outcomes does not warm selection reads.
+   Direct `universe_from_environment()` callers retain the 10-second default.
 5. After preparation, check that `outcomes.provider` is non-null. If outcomes
    are unavailable:
    - exit 3, naming the reason;

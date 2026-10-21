@@ -14,7 +14,7 @@ _SETTING = re.compile(r"^\s*(?:export\s+)?UNIVERSE_BASE_URL\s*=\s*(.*)$")
 _VALUE = re.compile(r"^(?:\"([^\"]*)\"|'([^']*)'|([^\s]+?))(?:\s+#.*)?\s*$")
 
 
-def universe_from_environment(*, env_file=Path(".env"), environ=None):
+def universe_from_environment(*, env_file=Path(".env"), environ=None, timeout=10):
     """Exported setting wins; otherwise parse only this dotenv key, without execution.
 
     No expansion, credential loading, environment mutation or URL logging occurs.
@@ -45,7 +45,7 @@ def universe_from_environment(*, env_file=Path(".env"), environ=None):
         parts = urlsplit(url)
         if not parts.hostname or parts.port == 0:
             raise ValueError()
-        source = UniverseHTTP(url, timeout=10)
+        source = UniverseHTTP(url, timeout=timeout)
     except (ValueError, TypeError, ProtocolError) as error:
         raise ValueError("UNIVERSE_BASE_URL must be an HTTP(S) URL without credentials, query or fragment") from error
     return source

@@ -57,7 +57,7 @@ def warm_outcomes(source, bundle_id, *, client, timeout, clock=time.monotonic):
     return attempts
 
 
-def prepare_context(config_path, output, *, warm_timeout_s=120, allow_outcomes_unavailable=False,
+def prepare_context(config_path, output, *, warm_timeout_s=120, universe_timeout_s=60, allow_outcomes_unavailable=False,
                     warm_client=None, environ=None, prepare_fn=prepare, source_factory=universe_from_environment):
     config = read_json(config_path)
     validate_config(config)
@@ -65,7 +65,7 @@ def prepare_context(config_path, output, *, warm_timeout_s=120, allow_outcomes_u
     if warm_timeout_s > 600:
         raise ValueError('warm timeout exceeds 600 seconds')
     # No dotenv path reaches the existing CLI helper.
-    source = source_factory(env_file=None, environ=environ)
+    source = source_factory(env_file=None, environ=environ, timeout=universe_timeout_s)
     root = create_output(output)
     report = {'version': 1, 'config_sha256': digest(config), 'snapshot_sha256': None,
               'universe_base_url_set': True, 'warm_up': [], 'outcomes': None,

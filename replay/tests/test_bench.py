@@ -19,7 +19,7 @@ from replay.bench.inside import execute, initial_result, validate_result
 from replay.bench.prepare import PreparationEnvironmentError, prepare_context
 from replay.bench.specs import resolve_spec, supervisor_config, validate_run_spec
 from replay.fees.domain import tree
-from replay.preparation import prepare, load_snapshot
+from replay.preparation import prepare, load_snapshot, encoded
 from replay.streams.protocol import ProtocolError
 from replay.tests.test_preparation import config, detail
 from replay.tests.test_preparation_outcomes import document
@@ -356,6 +356,62 @@ class BenchTests(unittest.TestCase):
             prepare_context(cfg, output, environ={'UNIVERSE_BASE_URL': 'https://synthetic.invalid'})
         self.assertEqual(marker.read_text(), 'unchanged')
 
+    def test_prepare_cold_selection_timeout_and_committed_context(self):
+        cfg = self.root / 'prepare.json'; write_json(cfg, config())
+        warm = Mock(get=Mock(return_value=200))
+        # Deterministic short-scale transport: 11 seconds of selection latency
+        # elapse on a virtual clock, with no sleep, socket, or Universe service.
+        now = [0.0]
+        def request(url, *, timeout):
+            selection = '/selections/' in url
+            latency = 11 if selection else 0
+            now[0] += min(latency, timeout)
+            if latency > timeout:
+                raise TimeoutError('synthetic cold selection')
+            response = io.BytesIO(encoded(detail() if selection else document()))
+            response.status = 200
+            return contextlib.closing(response)
+
+        errors = []
+        def observed_prepare(*args, **kwargs):
+            try:
+                return prepare(*args, **kwargs)
+            except ProtocolError as error:
+                errors.append(str(error))
+                raise
+
+        with patch('replay.preparation.build_opener', return_value=Mock(open=request)), \
+             patch('replay.preparation.time.monotonic', side_effect=lambda: now[0]):
+            snapshots = []
+            for name, options in (('default', {}), ('explicit', {'universe_timeout_s': 20})):
+                output = self.root / ('cold-' + name)
+                try:
+                    code, report = prepare_context(
+                        cfg, output, environ={'UNIVERSE_BASE_URL': 'https://synthetic.invalid'},
+                        warm_client=warm, prepare_fn=observed_prepare, **options)
+                except PreparationEnvironmentError:
+                    self.fail('cold selection preparation failed: ' + '; '.join(errors))
+                self.assertEqual(code, 0)
+                snapshot = load_snapshot(output, expected_sha256=report['snapshot_sha256'])
+                self.assertEqual(snapshot['evidence'][0]['provider'], 'universe')
+                self.assertEqual(snapshot['outcomes']['provider'], 'universe')
+                snapshots.append((output / 'context.json').read_bytes())
+            self.assertEqual(snapshots[0], snapshots[1])
+            output = self.root / 'cold-short'
+            with self.assertRaises(PreparationEnvironmentError):
+                prepare_context(cfg, output, universe_timeout_s=10,
+                                environ={'UNIVERSE_BASE_URL': 'https://synthetic.invalid'},
+                                warm_client=warm, prepare_fn=observed_prepare)
+            self.assertEqual(errors, ['pinned occurrence unavailable'])
+            self.assertFalse((output / 'receipt.json').exists())
+
+    def test_prepare_cli_universe_timeout(self):
+        for args, expected in (([], 60), (['--universe-timeout-s', '23.5'], 23.5)):
+            with patch('replay.bench.__main__.prepare_context', return_value=(0, {})) as prepare_mock, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bench_main(['prepare', 'config.json', 'output', *args]), 0)
+            self.assertEqual(prepare_mock.call_args.kwargs['universe_timeout_s'], expected)
+
     def test_prepare_environment_only_warm_retries_and_outcome_policy(self):
         cfg = self.root / 'prepare.json'; write_json(cfg, config())
         warm = Mock(); warm.get.side_effect = [TimeoutError('https://private.invalid'), 200]
@@ -366,7 +422,7 @@ class BenchTests(unittest.TestCase):
             with self.assertRaises(ValueError): prepare_context(cfg, self.root / 'missing', warm_client=warm)
         code, report = prepare_context(cfg, self.root / 'prepared', environ={'UNIVERSE_BASE_URL': 'https://exported.invalid'},
                                        source_factory=factory, warm_client=warm)
-        factory.assert_called_once_with(env_file=None, environ={'UNIVERSE_BASE_URL': 'https://exported.invalid'})
+        factory.assert_called_once_with(env_file=None, environ={'UNIVERSE_BASE_URL': 'https://exported.invalid'}, timeout=60)
         self.assertEqual(code, 0); self.assertEqual(len(report['warm_up']), 2)
         self.assertNotIn('https://', (self.root / 'prepared/bench_prepare.json').read_text())
         source.outcomes.return_value = None
@@ -393,7 +449,7 @@ class BenchTests(unittest.TestCase):
         source = Mock(); source.base_url = 'https://correct.invalid'; source.side_effect = lambda *_: detail(); source.outcomes.return_value = document()
         with patch.object(Path, 'open', guarded), patch('replay.prepare_context.UniverseHTTP', return_value=source) as construct:
             prepare_context(cfg, self.root / 'env-only', environ={'UNIVERSE_BASE_URL': source.base_url}, warm_client=Mock(get=Mock(return_value=200)))
-        construct.assert_called_once_with('https://correct.invalid', timeout=10)
+        construct.assert_called_once_with('https://correct.invalid', timeout=60)
 
     def test_context_comparison_pinned_equal_outcomes_and_evidence(self):
         other = context(self.root, 'second')
