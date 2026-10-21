@@ -20,7 +20,7 @@
   },
   "limits": {
     "small": {
-      "max_entry_bytes": 1048576,
+      "max_entry_bytes": 8388608,
       "max_queue_bytes": 67108864,
       "command_timeout_ms": 5000,
       "publish_batch_entries": 1024,
