@@ -200,6 +200,8 @@ run directly looks up the markets it holds:
 | Polymarket | `GET /markets/<id>` per market | `acceptingOrders == false` (`active` is ignored; it stays true after close) |
 | Limitless | `GET /markets/<slug>` per market | `expired == true` or `status == RESOLVED` (`tradeType` stays `clob` and is ignored) |
 
+Venues probe concurrently using their own sessions; lookups within each venue
+remain sequential and use the same durable request slots as discovery.
 Open requires an affirmative open shape. A failed, malformed, 404 or ambiguous
 lookup is `unknown`, which retains exactly like `open`; eviction on a failed
 read would drop live capture on an API blip. Probe results are ephemeral and

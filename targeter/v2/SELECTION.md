@@ -82,9 +82,15 @@ keeps non-Latin letters and combining marks so unrelated names cannot collapse.
 ## Venue adapters
 
 `adapters/` is the only place vendor fields are read. Downstream modules see
-canonical records only. All three adapters take a shared durable JSON client
-(`adapters/clients.py`); malformed response shapes and repeated pagination
-cursors are fatal for that venue.
+canonical records only. All three adapters use the durable JSON client in
+`adapters/clients.py`. Each venue has its own persistent HTTP session, with
+gzip/deflate response decoding; independent venues discover concurrently.
+Pagination within a venue remains sequential, and the shared filesystem
+request slots retain the cross-process per-host minimum interval. Catalogue
+results and failures are collected in adapter order regardless of completion
+order. Malformed response shapes and repeated pagination cursors are fatal for
+that venue. Injecting a client into `run_shadow` retains serial discovery for
+offline/debug callers.
 
 **Kalshi.** Reads the Sports series catalogue, classifies series through the
 registry, then pages open events once with nested markets (`status=open`,
