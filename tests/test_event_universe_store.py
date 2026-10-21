@@ -911,6 +911,30 @@ class EventUniverseTests(unittest.TestCase):
         self.assertEqual([row["processed"] for row in resumed], [1, 1])
         self.assertEqual(self.database.status()["counts"]["targeter_runs"], 3)
 
+    def test_backfill_resume_skips_indexed_v4_after_manifest_head_only(self) -> None:
+        source = _publish_run(self.objects, _selection_report(R1, G1))
+        bounds = {
+            "generated_start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "generated_end": datetime(2026, 1, 2, tzinfo=timezone.utc),
+        }
+        # The run commits before the batch cursor: a crash in between must
+        # resume by discovering the existing run, not fetching its artifacts.
+        with mock.patch.object(self.database, "set_checkpoint", side_effect=RuntimeError("lost batch checkpoint")):
+            with self.assertRaisesRegex(RuntimeError, "lost batch checkpoint"):
+                backfill_targeter_history(objects=self.objects, database=self.database, **bounds)
+        with sqlite3.connect(self.database.path) as connection:
+            self.assertEqual(connection.execute("SELECT projection_version FROM universe_run_projections").fetchall(), [(4,)])
+        with mock.patch.object(self.objects, "head", wraps=self.objects.head) as heads, \
+                mock.patch.object(self.objects, "open", side_effect=AssertionError("unexpected object body read")), \
+                mock.patch.object(self.objects, "open_verified", side_effect=AssertionError("unexpected verified object read")), \
+                mock.patch.object(self.objects, "verify_metadata", side_effect=AssertionError("unexpected artifact metadata verification")), \
+                mock.patch.object(self.objects, "verify", side_effect=AssertionError("unexpected artifact verification")):
+            result = backfill_targeter_history(objects=self.objects, database=self.database, **bounds)
+        self.assertEqual(result.failures, [], result.as_record())
+        self.assertEqual((result.ingested, result.skipped, result.pending_failures), (0, 1, 0))
+        self.assertTrue(result.completed)
+        self.assertEqual(heads.call_args_list, [mock.call(source["manifest_key"])])
+
     def test_canonical_backfill_logs_invalid_manifest_and_continues(self) -> None:
         invalid = _selection_report(R1, G1)
         invalid["report_version"] = 2
@@ -1722,9 +1746,9 @@ class EventUniverseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     application.get(path)
 
-    def test_fresh_database_uses_canonical_schema_v6(self) -> None:
+    def test_fresh_database_uses_canonical_schema_v8(self) -> None:
         with sqlite3.connect(self.database.path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
             tables = {
                 row[0]
                 for row in connection.execute(

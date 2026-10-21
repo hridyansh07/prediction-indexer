@@ -38,10 +38,10 @@ The transport's optional `publish_batch_entries` (an integer 1–1024; absent me
 the publisher default of 100) sizes the publisher's buffer only. It is not in the
 expected initial record, but like every transport field it is part of the run
 identity when present. A `run.json` written before the field existed still
-validates. Replay jobs pass their limits preset's value; the narrow bundle entry
+validates. Replay jobs pass their limits preset's value (`small` uses 1024); the narrow bundle entry
 point below does not set it and so uses 100.
 Groups must match strategy keys exactly; `.`, `..`, `publisher`, `ready`,
-`publisher.json`, `result.json`, and `interrupted.json` are reserved.
+`publisher.json`, `publisher.stderr.txt`, `result.json`, and `interrupted.json` are reserved.
 The config is limited to 1 MiB, validated before launching, copied durably as
 `run.json`, and SHA-256 bound to every checkpoint and completion marker.
 Validation independently recomputes the typed composite normalizer descriptor,
@@ -64,7 +64,9 @@ Each importable factory receives deeply immutable context with `run_id`,
 `attempt_id`, `group`, `identity`, strategy `config`, and `output_directory`.
 It returns an object implementing `__call__(cut)` and `finish()`.
 The adapter delivers initial, cut, and terminal records from `replay.streams`,
-reading whole-entry batches (default 128 MiB budget) and ACKing each batch once
+reading up to 1024 whole entries per poll with a byte budget of
+`max(128 MiB, 1024 × max_entry_bytes)` (1 GiB at a 1 MiB entry cap),
+and ACKing each batch once
 after every callback in it returned. Books and cut bodies are live, in-place views
 valid only during that callback; a strategy must copy anything it keeps (see the
 zero-copy hook contract in [REPLAY_STREAMS_V1.md](REPLAY_STREAMS_V1.md)).
@@ -72,6 +74,14 @@ The expected initial is built independently from the pinned run config, never
 learned from the stream. The terminal callback and `finish()` must both return
 successfully before its ACK. `finish()` must flush and close all strategy files.
 The adapter then validates its local terminal and writes `complete.json`.
+
+Wire V4 section declarations are resolved before launching participants and
+passed to the adapter, Consumer and Decoder. Economic SDK factories declare
+`record` (plus `events` for a non-null embedded profile); standalone profile and
+coverage declare `record + events`; other factories default to all sections.
+The adapter independently checks the declaration. These are SDK/runner
+capabilities, not strategy configuration or new semantic manifest fields; see
+the [V4 stream contract](REPLAY_STREAMS_V1.md#wire-version-4-declared-sections).
 
 Strategy owns episode schema, economics, filenames and any content verification.
 Write only provisional regular files/directories under the supplied output path.
@@ -97,8 +107,12 @@ run start time, and active attempt ID/progress. It contains no books or resume
 cursor. Start count and random attempt namespace are durable **before launch**.
 Every retry uses the original pins, empty books, sequence zero, fresh stream/state
 keys and fresh output directory. Failed outputs and small `result.json` diagnostics
-are retained. Child stdout/stderr are discarded rather than growing unbounded or
-being parsed as retry evidence. When `REPLAY_PARTICIPANT_DIAGNOSTICS=1` is set
+are retained. Child stdout and strategy stderr are discarded. Publisher stderr
+is drained with bounded memory and its last 16 KiB is durably written as
+`<attempt-id>/publisher.stderr.txt` after child teardown, on success or failure.
+This raw-byte diagnostic is never parsed as retry evidence and changes no
+identity, receipt or semantic hash. A supervisor crash before teardown may leave
+no stderr file. When `REPLAY_PARTICIPANT_DIAGNOSTICS=1` is set
 (the local bench sets it; production doesn't), a failed strategy participant
 also writes a bounded `failure.json` in its participant directory, with the exit
 code, cause chain and traceback tail. It's for people only: the supervisor never
@@ -248,3 +262,47 @@ and independently reads the success marker. Run via:
 cargo test --manifest-path engine/Cargo.toml -p replay-transport \
   --test contract -- --ignored --test-threads=1 --nocapture
 ```
+
+## Wire version 3 retention and liveness amendment
+
+Transport and initial schemas now require `retain_boundaries_ns` and
+`retain_shift_offsets_ns`; their validation and R1–R4 retention rules are defined
+in the [stream v3 amendment](REPLAY_STREAMS_V1.md#wire-version-3). Jobs and corpus
+builders use the SDK retention helper to union the actual groups' scope ends,
+game releases/timer declarations and time-shift offsets. The narrow bundle helper
+uses its strategy's prepared snapshot when supplied; without a snapshot it has
+only the requested start, not any implicit strategy-specific time authority.
+Economic/profile consumers independently reject insufficient retention coverage.
+These lists are initial-bound and hashed into the supervisor run identity.
+
+The publisher's named `LIVENESS_MS = 1000` flushes an aged buffer through the
+existing non-blocking drain. An empty-buffer publisher scanning omitted cuts may
+issue `liveness <risk_sequence>` at most once per interval. This strictly
+increasing canonical-u64 op updates only the state hash's `risk_progress`; it
+rejects poisoned/terminal attempts. Appends also set that field to their last
+accepted cut's Risk sequence. There are no heartbeat stream records.
+
+The supervisor reads `risk_progress` with its existing fixed-field HMGET. The
+stall clock resets on minimum consumer ACK advancement, or on Risk progress
+advancement **only while min(done) == published**. A publisher behind unACKed
+entries cannot use scan progress to mask a stuck consumer. Initial/terminal
+publication, `done:<group>`, result progress and all completion receipts remain
+wire/Redis-entry counts, exactly as before.
+
+Checkpoint `state.json` is now closed version 2: active attempt fields are
+`{id, progress, retry_progress}`. `progress` remains the minimum ACK count;
+`retry_progress` is the caught-up Risk high-water, initially -1. It is persisted
+with each advance, including before an interruption. Retry stagnation compares
+the larger of this Risk high-water and the existing ACK-based fallback against
+the historical best plus `progress_margin`. Keeping the fallback prevents a
+stale initial Risk value from erasing genuine ACK progress after backlog. The
+numeric margin is unchanged, now in Risk-cut units whenever Risk progress is
+available. `no_progress`, attempts and other budgets are unchanged. Old
+checkpoints/configurations are not resumed as v3 attempts.
+
+Disposable-server tests cover an empty scan lasting three seconds with a
+two-second stall limit, a full queue with a stuck consumer that still times out,
+canonical/monotonic/poisoned/terminal liveness rejection, and unchanged completion
+counts. Rust checks lone-cut age flushing and that a buffered/backlogged publisher
+cannot issue heartbeats. These are synthetic correctness tests, not replay/corpus
+benchmarks.

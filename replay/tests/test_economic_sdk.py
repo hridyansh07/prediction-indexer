@@ -2,22 +2,48 @@
 
 import dataclasses
 import json
+import random
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 from replay.strategies.same_venue_complement.output import _skew_artifact, validate_content
 from replay.economic_fills import Fill, walk
 from replay.economic_intervals import CutClock
 from replay.economic_sdk import EVALUATED, Observation, bounds
+from replay.economic_sdk.bounds import CONTAINER, INT, SLOT, SMALL, STR
 from replay.economic_sdk.views import BookView, unavailable_view
+from replay.fees.lazy import LazyAssessmentIds, assessment_json
 from replay.preparation import load_snapshot
 from replay.strategies.same_venue_complement.strategy import SameVenueComplement, build
 from replay.streams.protocol import ProtocolError
 from replay.tests.economic_scenarios import M, ladder, operations, v2_policy
 from replay.tests.test_same_venue_complement import Harness
+
+
+# Verbatim b970e70 implementation; recursive calls stay on this reference.
+def json_cost(value):
+    """Closed-form cost of a small JSON-shaped value (strings, ints, lists, dicts)."""
+    if isinstance(value, LazyAssessmentIds):
+        # Captured immutable order inputs plus the worst-case eager debug IDs
+        # and materialized IDs. Never traverse the shared engine/catalog or
+        # materialize a handle just to account its retained state.
+        return (512 + json_cost(value.request.retained_inputs)
+                + 2 * (CONTAINER + len(value) * (SLOT + STR + 4 * 64)))
+    kind = type(value)
+    if kind is str:
+        return STR + 4 * len(value)
+    if kind is int:
+        return INT + value.bit_length() // 8
+    if isinstance(value, Mapping):
+        return CONTAINER + sum(SLOT + json_cost(k) + json_cost(v) for k, v in value.items())
+    if kind in (list, tuple):
+        return CONTAINER + sum(SLOT + json_cost(v) for v in value)
+    return SMALL
 
 
 def deep_size(value, seen=None):
@@ -27,11 +53,13 @@ def deep_size(value, seen=None):
         return 0
     seen.add(id(value))
     size = sys.getsizeof(value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
+        if type(value) is MappingProxyType:
+            size += sys.getsizeof(dict(value))  # the proxy's owned backing map
         size += sum(deep_size(k, seen) + deep_size(v, seen) for k, v in value.items())
     elif isinstance(value, (list, tuple, set, frozenset)):
         size += sum(deep_size(v, seen) for v in value)
-    elif dataclasses.is_dataclass(value) or hasattr(value, "__slots__"):
+    if dataclasses.is_dataclass(value) or hasattr(value, "__slots__"):
         for cls in type(value).__mro__:
             for name in getattr(cls, "__slots__", ()):
                 if hasattr(value, name):
@@ -115,6 +143,38 @@ class SharedViewTests(Base):
             operations(h, 15, "polymarket:123", "outcome", "bid", 401, M)
             self.assertGreater(evaluate.call_count, 0)
         h.finish()
+
+    def test_same_time_restaging_can_mutate_nested_payload_handles(self):
+        # S1c's no-mutation precondition does not hold for all accepted payloads:
+        # observation equality compares lazy IDs with eager IDs and materializes
+        # the new handle after evaluate returns, before the stage is flushed.
+        with patch.dict("os.environ", REPLAY_FEE_CROSSCHECK="0"):
+            h = self.harness(known=True, policy=v2_policy())
+        original = h.strategy.strategy.evaluate
+        eager = True
+        captured = []
+
+        def evaluate(entity, views, context):
+            observation = original(entity, views, context)
+            if observation.payload is not None:
+                if eager:
+                    return dataclasses.replace(observation, payload=assessment_json(observation.payload))
+                handles = observation.payload["assessments"]
+                self.assertTrue(all(isinstance(ids, LazyAssessmentIds) and ids._ids is None
+                                    for ids in handles))
+                captured.append(observation)
+            return observation
+
+        with patch.object(h.strategy.strategy, "evaluate", side_effect=evaluate):
+            h.window(); h.quote(12, 0); h.quote(12, 1)
+            eager = False
+            # Same gross value, different consumed quantity and order identity.
+            h.quote(12, 0, quantity=6 * M)
+            self.assertEqual(h.strategy.staged_time, 12)
+            self.assertTrue(captured)
+            self.assertTrue(any(ids._ids is not None for observation in captured
+                                for ids in observation.payload["assessments"]))
+        h.finish()  # the mixed representation remains valid for the strict reader
 
     def test_cached_positive_updates_skew_without_evaluation_or_slice_changes(self):
         # A pure gross-only evaluator: no fee assessment or context-dependent identity.
@@ -544,8 +604,113 @@ class ComplementV2Tests(Base):
         self.assertFalse(_skew_artifact({"2": 0}, policy))
 
 
+class JsonCostTests(unittest.TestCase):
+    def test_owned_frozen_metadata_keeps_every_occurrence_charge(self):
+        source = {"legs": [{"instrument": "α", "quantity": 2**119}], "flag": True}
+        frozen = bounds.FrozenJSON(source)
+        expected = json_cost(source)
+        source["legs"][0]["quantity"] = 0
+        self.assertEqual(frozen["legs"][0]["quantity"], 2**119)
+        with self.assertRaises(TypeError):
+            frozen["legs"][0]["quantity"] = 3
+        self.assertEqual(bounds.json_cost(frozen), expected)
+        self.assertEqual(bounds.json_cost([frozen, frozen]), CONTAINER + 2 * (SLOT + expected))
+
+    def test_generated_trees_match_the_old_cost_without_materializing_ids(self):
+        class IntSubclass(int):
+            pass
+
+        class StrSubclass(str):
+            pass
+
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class TupleSubclass(tuple):
+            pass
+
+        def forbidden_assessments():
+            raise AssertionError("accounting must not materialize lazy IDs")
+
+        handles = [LazyAssessmentIds(SimpleNamespace(
+            retained_inputs={"order": "α" * 64, "levels": ((19, 29),)},
+            levels=tuple(range(size)), assessments=forbidden_assessments))
+            for size in (0, 1, 7)]
+        leaves = [None, False, True, 0, -1, 2**119, -(2**2048), "", "α🧮" * 19,
+                  IntSubclass(2**200), StrSubclass("αβ"), ListSubclass([2**140]),
+                  TupleSubclass(("nested", False)), *handles]
+        rng = random.Random(19)
+
+        def tree(depth):
+            if not depth or rng.randrange(3) == 0:
+                return rng.choice(leaves)
+            kind = rng.choice((list, tuple, dict, DictSubclass, MappingProxyType))
+            children = [tree(depth - 1) for _ in range(rng.randrange(5))]
+            if kind in (list, tuple):
+                return kind(children)
+            keys = ("α", "🧮", -2, 2**140, (1, False))
+            return kind({keys[i]: child for i, child in enumerate(children)})
+
+        shared = {"repeated": ["α", True, handles[-1]]}
+        values = leaves + [[], (), {}, DictSubclass(shared), MappingProxyType(shared),
+                           (False, 2**140), [shared, shared]]
+        values.extend(tree(4) for _ in range(2000))
+        for index, value in enumerate(values):
+            with self.subTest(tree=index, kind=type(value).__name__):
+                self.assertEqual(bounds.json_cost(value), json_cost(value))
+        self.assertTrue(all(ids._ids is None for ids in handles))
+
+
 class BoundTests(unittest.TestCase):
     """Closed-form costs must not undercount a real recursive traversal."""
+
+    def test_entity_metadata_fits_the_unchanged_reservation(self):
+        from replay.strategies._shared.metadata import native_metadata, complement_metadata
+        from replay.tests.test_cross_venue_arbitrage import Harness as CrossHarness
+        from replay.tests.test_same_venue_multi_market import Harness as MultiHarness
+        from replay.tests.test_implication_cover import Harness as CoverHarness
+
+        controls = [{"kind": "cyclic_neighbor"}, {"kind": "time_shift", "shift_ns": ["5"]}]
+        cases = ((Harness, {"pairs": True, "known": True, "policy": v2_policy(controls=controls)}),
+                 (CrossHarness, {"policy": {"controls": controls[1:]}}),
+                 (MultiHarness, {}), (CoverHarness, {}), (CoverHarness, {"mode": "cross_venue"}))
+        for fixture, kwargs in cases:
+            with self.subTest(fixture=fixture.__module__, kwargs=kwargs), tempfile.TemporaryDirectory() as tmp:
+                h = fixture(Path(tmp), **kwargs)
+                for writer in h.strategy.writers.values():
+                    self.addCleanup(writer.stream.close)
+                h.window()
+                for entity in h.strategy.entities.values():
+                    if entity.admission is not None:
+                        continue
+                    metadata = (complement_metadata if fixture is Harness else native_metadata)(
+                        h.strategy.strategy, entity)
+                    # Economics/assets belong to the already reserved bridge;
+                    # count all owned maps, frozen backing maps and scalar slots.
+                    seen = set()
+                    for economics in getattr(metadata, "economics", ()):
+                        deep_size(economics, seen)
+                    self.assertGreaterEqual(bounds.ENTITY + bounds.json_cost(entity.descriptor),
+                                            deep_size(entity, seen))
+                    # Selection scratch holds only extra containers/references
+                    # for an already-reserved memo, never another owned view.
+                    sample_views = h.strategy._views(entity, 10)
+                    fingerprint = h.strategy._input_fingerprint(entity.id, 10, sample_views)
+                    observation = Observation("UNUSABLE", context_free=True)
+                    memo = (fingerprint.copy(), observation, 0)
+                    selected = {entity.id: (sample_views, fingerprint)}
+                    seen = set()
+                    for economics in getattr(metadata, "economics", ()):
+                        deep_size(economics, seen)
+                    deep_size(tuple(h.strategy.views.values()), seen)
+                    reserved = (bounds.ENTITY + bounds.json_cost(entity.descriptor)
+                                + bounds.fingerprint_cost(fingerprint)
+                                + bounds.observation_cost(observation))
+                    self.assertGreaterEqual(reserved, deep_size((entity, memo, selected), seen))
+                h.finish()
 
     def fill(self, levels):
         consumed = tuple((10**6 + i, 10**12 + i) for i in range(levels))
@@ -563,6 +728,20 @@ class BoundTests(unittest.TestCase):
                         (10**6, 10**12), (10**6, 10**12), fills, transformed, levels)
         self.assertGreaterEqual(bounds.view_cost(view, sizes), deep_size(view))
         self.assertGreaterEqual(bounds.view_cost(unavailable_view(0), 1), deep_size(unavailable_view(0)))
+        # Minimal views have less allocator slack than large ladders. Include
+        # the new projection-unit/pair-count fields and A1's four age ladders.
+        from replay.economic_sdk import BookRequirement
+        from replay.economic_sdk.views import ViewBuilder
+        transforms = ("kalshi_complement_ask", "kalshi_complement_bid")
+        for sides, extra in ((("bid",), ()), (("ask", "bid"), transforms)):
+            for depth in (0, 1, 7):
+                with self.subTest(sides=sides, depth=depth):
+                    book = SimpleNamespace(validity="usable", reason=None,
+                        levels=lambda side: tuple((300 + i, 10**6) for i in range(depth)))
+                    builder = ViewBuilder(BookRequirement(sides, (1,), transforms=extra,
+                        ladders=sides + extra), {"price_scale": "3", "quantity_scale": "6"}, ages=True)
+                    actual = builder.build(book, 10**18)
+                    self.assertGreaterEqual(bounds.view_cost(actual, 1), deep_size(actual))
 
     def test_observation_episode_and_fingerprint_costs_are_conservative(self):
         payload = {"gap_gross": "9" * 40, "gap_net": "-" + "9" * 40, "gross_scale": 9, "net_scale": 18,
@@ -588,9 +767,18 @@ class BoundTests(unittest.TestCase):
     def test_state_budget_fails_before_retention(self):
         budget = bounds.StateBudget(limit=100)
         budget.charge(60)
-        with self.assertRaisesRegex(ProtocolError, "detached state budget"):
+        with self.assertRaisesRegex(ProtocolError,
+                "detached state budget: retained_bytes=101 max_state_bytes=100 used_bytes=60"):
             budget.charge(41)
         self.assertEqual(budget.used, 60)
+        from replay.economic_sdk.reader import Budget
+        with patch.object(bounds, "MAX_STATE", 100):
+            reader = Budget()
+            reader.reserve(60)
+            with self.assertRaisesRegex(ProtocolError,
+                    "reader state budget: retained_bytes=101 max_state_bytes=100 used_bytes=60"):
+                reader.reserve(41)
+            self.assertEqual(reader.used, 60)
 
 
 class ProfilingHarnessTests(unittest.TestCase):
@@ -610,22 +798,73 @@ class ProfilingHarnessTests(unittest.TestCase):
 class TableSizeTests(unittest.TestCase):
     """Entity/reason tables are one record; real bundles exceed the 64 KiB line cap."""
 
-    def _roundtrip(self, value):
+    def test_writer_budget_errors_identify_stream_dimension_attempt_and_cap(self):
+        from replay.strategy_sdk import LineWriter
+        for dimension, limits, expected in (
+                ("bytes", (5, 3, 3), "logical_bytes=6 max_bytes=5 records=2 max_records=3"),
+                ("rows", (9, 1, 3), "logical_bytes=6 max_bytes=9 records=2 max_records=1"),
+                ("line", (9, 3, 2), "line_bytes=3 max_line_bytes=2")):
+            with self.subTest(dimension=dimension), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "probes.ndjson"
+                writer = LineWriter(path, max_bytes=limits[0], max_records=limits[1], max_line_bytes=limits[2])
+                self.addCleanup(writer.stream.close)
+                if dimension != "line":
+                    writer.append({})
+                with self.assertRaises(ProtocolError) as error:
+                    writer.append({})
+                self.assertIn(str(path), str(error.exception))
+                self.assertIn(expected, str(error.exception))
+                identity = writer.finish()
+                expected_payload = b"" if dimension == "line" else b"{}\n"
+                self.assertEqual(path.read_bytes(), expected_payload)
+                self.assertEqual((identity["byte_length"], identity["records"]),
+                                 (len(expected_payload), expected_payload.count(b"\n")))
+
+    def test_plain_and_zstd_reader_budget_errors_report_logical_stream_usage(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import lines
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "probes.ndjson"
+                path.write_bytes(b"{}\n")
+                identity = {"sha256": hashlib.sha256(b"{}\n").hexdigest(), "byte_length": 3, "records": 1}
+                if compressed:
+                    identity = commit_frame(path, identity)
+                with patch.multiple(bounds, MAX_BYTES=3, MAX_ROWS=1, MAX_LINE=3):
+                    self.assertEqual(list(lines(root, path.name, identity)), [{}])
+                for field, limit, expected in (
+                        ("MAX_BYTES", 2, "logical_bytes=3 max_bytes=2"),
+                        ("MAX_ROWS", 0, "records=1 max_records=0"),
+                        ("MAX_LINE", 2, "line_bytes=3 max_line_bytes=2")):
+                    with self.subTest(field=field), patch.object(bounds, field, limit):
+                        with self.assertRaises(ProtocolError) as error:
+                            list(lines(root, path.name, identity))
+                        self.assertIn(path.name, str(error.exception))
+                        self.assertIn(expected, str(error.exception))
+
+    def _roundtrip(self, value, compressed=False):
         from types import SimpleNamespace
         from replay.economic_sdk.aggregate_reader import _table
+        from replay.economic_sdk.framing import commit_frame
         from replay.economic_sdk.runtime import Runtime
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             identity = Runtime._write_table(SimpleNamespace(root=root), "entities.json", value)
+            if compressed:
+                identity = commit_frame(root / "entities.json", identity)
             return identity, _table(root, "entities.json", {"entities.json": identity})
 
     def test_table_larger_than_line_cap_round_trips(self):
         # 1,500 entities with ~600-byte descriptors: about 0.9 MB, as on the bench bundle.
         scopes = [[{"hash": f"{i:064x}", "descriptor": {"legs": ["x" * 600], "index": i}}
                    for i in range(1500)]]
-        identity, table = self._roundtrip({"scopes": scopes})
-        self.assertGreater(identity["byte_length"], bounds.MAX_LINE)
-        self.assertEqual(table, {"scopes": scopes})
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                identity, table = self._roundtrip({"scopes": scopes}, compressed)
+                self.assertGreater((identity["logical"] if compressed else identity)["byte_length"], bounds.MAX_LINE)
+                self.assertEqual(table, {"scopes": scopes})
 
     def test_table_identity_and_bound_still_fail_closed(self):
         from types import SimpleNamespace
@@ -641,6 +880,85 @@ class TableSizeTests(unittest.TestCase):
                 _table(root, "big.json", {"big.json": {"sha256": "0" * 64,
                                                        "byte_length": bounds.MAX_METADATA + 3,
                                                        "records": 1}})
+
+    def test_compressed_rows_empty_frames_line_limits_and_exact_identities(self):
+        import hashlib
+        from encoder import CodecError
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import document, lines
+        for label, payload, valid in (("empty", b"", True), ("lf", b"{}\n", True),
+                ("boundary", b'"' + b"a" * (bounds.MAX_LINE - 3) + b'"\n', True),
+                ("over", b'"' + b"a" * (bounds.MAX_LINE - 2) + b'"\n', False),
+                ("unterminated", b"{}", False)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "episodes.ndjson"
+                path.write_bytes(payload)
+                logical = {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
+                           "records": payload.count(b"\n")}
+                if payload and not payload.endswith(b"\n"):
+                    with self.assertRaises(CodecError):
+                        commit_frame(path, logical)
+                    self.assertEqual(path.read_bytes(), payload)
+                    continue
+                identity = commit_frame(path, logical)
+                if not valid:
+                    with self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, identity))
+                    continue
+                self.assertEqual(list(lines(root, path.name, identity)),
+                                 [json.loads(row) for row in payload.splitlines()])
+                for side, field in (("logical", "sha256"), ("logical", "byte_length"),
+                                    ("logical", "records"), ("stored", "sha256"), ("stored", "byte_length")):
+                    changed = {k: dict(v) for k, v in identity.items()}
+                    changed[side][field] = "0" * 64 if field == "sha256" else changed[side][field] + 1
+                    with self.subTest(side=side, field=field), self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, changed))
+                for field, limit in (("records", bounds.MAX_ROWS), ("byte_length", bounds.MAX_BYTES)):
+                    changed = {**identity, "logical": {**logical, field: limit + 1}}
+                    with self.assertRaises(ProtocolError):
+                        list(lines(root, path.name, changed))
+                for name, limit in (("entities.json", bounds.MAX_ENTITY_TABLE), ("reasons.json", bounds.MAX_METADATA)):
+                    changed = {**identity, "logical": {**logical, "records": 1, "byte_length": limit + 1}}
+                    with self.assertRaises(ProtocolError):
+                        document(root, name, changed, limit)
+
+    def test_compressed_reader_rejects_rehashed_corruption_truncation_and_trailing_frames(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        from replay.economic_sdk.reader import lines
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "episodes.ndjson"
+            payload = b'{"x":1}\n'
+            path.write_bytes(payload)
+            logical = {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload), "records": 1}
+            identity = commit_frame(path, logical)
+            frame = path.with_name(path.name + ".zst")
+            raw = frame.read_bytes()
+            for mutation in (raw[:-1], raw + b"x", raw + raw, raw[:-1] + bytes([raw[-1] ^ 1])):
+                frame.write_bytes(mutation)
+                rehashed = {**identity, "stored": {"sha256": hashlib.sha256(mutation).hexdigest(),
+                                                  "byte_length": len(mutation)}}
+                with self.assertRaises(ProtocolError):
+                    list(lines(root, path.name, rehashed))
+
+    def test_frame_failures_preserve_owned_spool_until_durable_frame_commit(self):
+        import hashlib
+        from replay.economic_sdk.framing import commit_frame
+        for boundary in ("encode_stream", "os.fsync", "fsync_directory"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "episodes.ndjson"
+                raw = b"{}\n"
+                path.write_bytes(raw)
+                logical = {"sha256": hashlib.sha256(raw).hexdigest(), "byte_length": len(raw), "records": 1}
+                with patch("replay.economic_sdk.framing." + boundary, side_effect=OSError("synthetic failure")):
+                    with self.assertRaisesRegex(OSError, "synthetic failure"):
+                        commit_frame(path, logical)
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual((root / "episodes.ndjson.zst").exists(), boundary == "fsync_directory")
+                self.assertFalse((root / "content_receipt.json").exists())
 
 
 if __name__ == "__main__":

@@ -427,6 +427,7 @@ def _market_projection(
         "decisions",
         "selected_markets",
         "relations",
+        "corrections",
     }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise EvidenceConflict("market projection fields are invalid")
@@ -461,6 +462,7 @@ def _market_projection_identity(value: Mapping[str, Any]) -> tuple[str, int]:
             "decisions",
             "selected_markets",
             "relations",
+            "corrections",
         )
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), rows

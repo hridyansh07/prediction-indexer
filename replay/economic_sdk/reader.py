@@ -48,31 +48,45 @@ def signed(value):
     return int(value)
 
 
-def file_identity(value):
+def file_identity(value, name="output"):
     value = obj(value, "sha256 byte_length records")
     sha(value["sha256"])
-    require(type(value["byte_length"]) is int and 0 <= value["byte_length"] <= bounds.MAX_BYTES)
-    require(type(value["records"]) is int and 0 <= value["records"] <= bounds.MAX_ROWS)
+    require(type(value["byte_length"]) is int and value["byte_length"] >= 0)
+    if value["byte_length"] > bounds.MAX_BYTES:
+        require(False, f"output budget: {name}; logical_bytes={value['byte_length']} max_bytes={bounds.MAX_BYTES}")
+    require(type(value["records"]) is int and value["records"] >= 0)
+    if value["records"] > bounds.MAX_ROWS:
+        require(False, f"output budget: {name}; records={value['records']} max_records={bounds.MAX_ROWS}")
     return value
 
 
 def check_files(files, names):
     require(type(files) is dict and set(files) == set(names), "output file set")
-    for identity in files.values():
-        file_identity(identity)
+    for name, identity in files.items():
+        file_identity(identity, name)
 
 
 def lines(root, name, identity):
+    if "logical" in identity:
+        from replay.economic_sdk.storage import stored_lines
+        for payload in stored_lines(root, name, identity, bounds.MAX_LINE):
+            yield decode(payload, bounds.MAX_LINE)
+        return
     path = root / name
     require(path.is_file() and not path.is_symlink(), "regular output required")
     checksum = hashlib.sha256()
     size = count = 0
     with path.open("rb") as stream:
         while payload := stream.readline(bounds.MAX_LINE + 1):
-            require(len(payload) <= bounds.MAX_LINE and payload.endswith(b"\n"), "line/truncation")
+            if len(payload) > bounds.MAX_LINE:
+                require(False, f"line/truncation: {name}; line_bytes={len(payload)} max_line_bytes={bounds.MAX_LINE}")
+            if not payload.endswith(b"\n"):
+                require(False, f"line/truncation: {name}; unterminated line")
             size += len(payload)
             count += 1
-            require(size <= bounds.MAX_BYTES and count <= bounds.MAX_ROWS, "output budget")
+            if size > bounds.MAX_BYTES or count > bounds.MAX_ROWS:
+                require(False, f"output budget: {name}; logical_bytes={size} max_bytes={bounds.MAX_BYTES} "
+                        f"records={count} max_records={bounds.MAX_ROWS}")
             checksum.update(payload)
             yield decode(payload, bounds.MAX_LINE)
     require({"sha256": checksum.hexdigest(), "byte_length": size, "records": count} == identity,
@@ -86,10 +100,15 @@ def document(root, name, identity, limit=bounds.MAX_METADATA):
     for entities, MAX_METADATA otherwise), which real bundles exceed the per-row
     MAX_LINE with; the file identity still binds it.
     """
-    path = root / name
-    require(path.is_file() and not path.is_symlink(), "regular output required")
-    with path.open("rb") as stream:
-        payload = stream.read(limit + 1)
+    if "logical" in identity:
+        from replay.economic_sdk.storage import stored_lines
+        payload = b"".join(stored_lines(root, name, identity, limit))
+        identity = identity["logical"]
+    else:
+        path = root / name
+        require(path.is_file() and not path.is_symlink(), "regular output required")
+        with path.open("rb") as stream:
+            payload = stream.read(limit + 1)
     require(len(payload) <= limit, "table/size")
     require(payload.endswith(b"\n") and payload.count(b"\n") == 1, "table is one record")
     require({"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
@@ -109,10 +128,13 @@ class Budget:
 
     def __init__(self, *roots):
         self.used = sum(bounds.json_cost(root) for root in roots)
-        require(self.used <= bounds.MAX_STATE, "reader state budget")
+        if self.used > bounds.MAX_STATE:
+            require(False, f"reader state budget: retained_bytes={self.used} max_state_bytes={bounds.MAX_STATE}")
 
     def reserve(self, growth, message="reader state budget"):
-        require(self.used + growth <= bounds.MAX_STATE, message)
+        if self.used + growth > bounds.MAX_STATE:
+            require(False, f"{message}: retained_bytes={self.used + growth} "
+                    f"max_state_bytes={bounds.MAX_STATE} used_bytes={self.used} requested_bytes={growth}")
         self.used += growth
 
     def release(self, size):
@@ -130,7 +152,9 @@ def quantiles(values, budget=None):
     if budget is not None:
         budget.reserve(working, "reader state budget (quantile working copy)")
     else:
-        require(working <= bounds.MAX_STATE, "reader state budget (quantile working copy)")
+        if working > bounds.MAX_STATE:
+            require(False, f"reader state budget (quantile working copy): "
+                    f"retained_bytes={working} max_state_bytes={bounds.MAX_STATE}")
     work = array("Q", values)
 
     def select(k):

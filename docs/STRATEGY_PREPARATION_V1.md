@@ -188,11 +188,13 @@ book mappings. It returns deeply immutable mappings/tuples. For an externally
 pinned identity,
 pass `expected_sha256`; a colocated receipt alone is not an authenticity signature.
 
-The pinned outcomes document may itself be version 1 or 2. Version 2 requires
-every market's closed `execution_terms` object (`status`, `changes`), with strictly
-increasing UTC change points and nonnegative integer or null taker delays.
-Version-1 documents retain their original shape and bytes; the reader does not
-add execution terms to them.
+Outcomes documents may be version 1 or version 2. Version 2 requires the closed
+`execution_terms` object on every market, with `observed` or `unavailable`
+status, strictly ordered UTC change points and nullable nonnegative integer
+`taker_delay_ms`. Consecutive equal values are rejected. Version 1 is preserved
+verbatim and supplies unavailable execution terms. The snapshot and receipt
+versions remain unchanged; see
+[`EXECUTION_DELAY_V1.md`](specs/EXECUTION_DELAY_V1.md).
 
 The same directory/config loads without source calls. Changed config fails; a
 context without receipt is uncommitted and requires a new directory. A local flock

@@ -298,6 +298,14 @@ def _supervisor_config(request, normalizer, pins):
         },
         "limits": runtime["limits"],
     }
+    from replay.economic_sdk.retention import for_groups
+    from replay.preparation import load_snapshot
+    strategy_config = strategy["config"]
+    snapshot = (load_snapshot(strategy_config["snapshot_directory"],
+                              expected_sha256=strategy_config["snapshot_sha256"])
+                if "snapshot_directory" in strategy_config else
+                {"config": request["interval"], "scopes": []})
+    config["transport"].update(for_groups(snapshot, config["strategies"].values()))
     return supervisor.validate(config)
 
 

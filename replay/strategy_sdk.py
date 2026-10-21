@@ -10,6 +10,24 @@ from replay.streams.protocol import obj, require
 from replay.supervisor import fsync_directory
 
 
+def stream_sections(spec):
+    """Resolve delivery capabilities before participant launch, never in strategies."""
+    from replay.strategies import canonical_reference, load_entrypoint
+    from replay.streams.protocol import SECTIONS, declared_sections
+
+    reference = canonical_reference(spec["factory"])
+    if reference in {
+        "replay.strategies.bundle_coverage:build",
+        "replay.strategies.bundle_coverage.strategy:build",
+        "replay.strategies.market_profile:build",
+        "replay.strategies.market_profile.strategy:build",
+    }:
+        return frozenset(("record", "events"))
+    factory = load_entrypoint(reference)
+    declaration = getattr(factory, "sections", None)
+    return declared_sections(declaration(spec["config"]) if declaration else SECTIONS)
+
+
 def plain(value):
     """Copy immutable SDK metadata into JSON containers, without copying books."""
     if isinstance(value, Mapping):
@@ -65,12 +83,14 @@ class LineWriter:
 
     def append(self, value):
         payload = encoded(value) + b"\n"
-        require(len(payload) <= self.max_line_bytes, "output line budget")
-        require(
-            self.size + len(payload) <= self.max_bytes
-            and self.count < self.max_records,
-            "output budget",
-        )
+        if len(payload) > self.max_line_bytes:
+            require(False, f"output line budget: {self.path}; "
+                    f"line_bytes={len(payload)} max_line_bytes={self.max_line_bytes}")
+        if self.size + len(payload) > self.max_bytes or self.count >= self.max_records:
+            require(False, f"output budget: {self.path}; "
+                    f"logical_bytes={self.size + len(payload)} max_bytes={self.max_bytes} "
+                    f"records={self.count + 1} max_records={self.max_records} "
+                    f"next_line_bytes={len(payload)}")
         self.stream.write(payload)
         self.hash.update(payload)
         self.size += len(payload)

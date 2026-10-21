@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -49,18 +50,41 @@ def _context(spec, allow_dirty):
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except KeyboardInterrupt as interrupt:
+        # Ctrl-C or `docker kill --signal=INT`: the bench has already cleaned up. The bundle's
+        # ledger row stays `running` and nothing was committed, so the next run redoes it.
+        bundle = getattr(interrupt, "bundle_id", None)
+        print("interrupted" + (f" while running bundle {bundle}; it is left 'running' and will be redone"
+                               " on the next run" if bundle else "; no bundle was running"),
+              file=sys.stderr, flush=True)
+        return 130
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("run", "status", "verify"))
     parser.add_argument("spec", type=Path)
     parser.add_argument("--limit", type=int, help="process at most N pending bundles")
     parser.add_argument("--bundle", action="append", default=[], help="only these bundle ids (repeatable)")
+    parser.add_argument("--deep", action="store_true", help="verify with the original readers in the recorded image")
+    parser.add_argument("--sample", type=int, help="deep-audit N randomly selected committed results")
+    parser.add_argument("--seed", type=int, default=0, help="deterministic deep-audit sample seed (default: 0)")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--refresh-bundles", action="store_true",
                         help="re-list retired bundles from Universe instead of the cached list")
     args = parser.parse_args(argv)
-    spec = specs.load(args.spec)
+    if args.deep and args.command != "verify" or args.sample is not None and not args.deep:
+        parser.error("--deep and --sample require verify --deep")
+    if args.sample is not None and (args.sample < 1 or args.bundle):
+        parser.error("--sample must be positive and cannot be combined with --bundle")
+    spec = specs.load(args.spec, read_only=args.deep)
     key, runner_config = _context(spec, args.allow_dirty)
+    if args.deep:
+        return verify_deep(Path(spec["results_root"]) / key[:16], spec,
+                           bundles=args.bundle, sample=args.sample, seed=args.seed)
     ledger = Ledger(spec["ledger"])
     print("corpus key", key)
     if args.command == "status":
@@ -122,6 +146,40 @@ def main(argv=None):
     print(f"processed {processed}, skipped {skipped}")
     print(json.dumps(ledger.summary(key), indent=1))
     return 0
+
+
+def verify_deep(root, spec, *, bundles=(), sample=None, seed=0, auditor=None):
+    """Rehash first; isolate and report every selected bundle, including missing inputs."""
+    from replay.corpus.deep import MissingPrerequisite, audit
+    auditor = auditor or audit
+    committed = {p.name: p for p in sorted(root.iterdir())
+                 if p.is_dir() and (p / results.RECEIPT).is_file()} if root.exists() else {}
+    selected = sorted(set(bundles)) if bundles else sorted(committed)
+    if sample is not None:
+        selected = sorted(random.Random(seed).sample(selected, min(sample, len(selected))))
+    good = bad = missing = 0
+    for name in selected:
+        try:
+            directory = committed.get(name)
+            if directory is None:
+                raise FileNotFoundError("committed result not found")
+            results.verify(directory)
+            reports = auditor(directory, spec)
+            for report in reports:
+                print(name, "deep:", report["group"], report["status"], report.get("error", ""))
+            if any(r["status"] == "FAIL" for r in reports):
+                bad += 1
+            else:
+                good += 1
+        except MissingPrerequisite as error:
+            missing += 1
+            print(name, error)
+        except Exception as error:
+            bad += 1
+            print(name, "deep: FAIL", type(error).__name__, str(error))
+    print(f"deep verified {good}, failed {bad}, missing prerequisites {missing}")
+    # Missing inputs mean an incomplete audit, not a failure of the result.
+    return 1 if bad else 2 if missing else 0
 
 
 if __name__ == "__main__":

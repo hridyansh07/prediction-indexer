@@ -4,7 +4,7 @@ from hashlib import sha1
 from importlib.resources import files
 from urllib.parse import urlsplit
 
-from .protocol import Decoder, ProtocolError, TransportError, array, obj, require, uint
+from .protocol import SECTIONS, Decoder, ProtocolError, TransportError, array, obj, require, uint
 
 SCRIPT = files(__package__).joinpath("attempt.lua").read_text()
 SCRIPT_SHA = sha1(SCRIPT.encode()).hexdigest()
@@ -26,6 +26,7 @@ class Consumer:
         timeout=5.0,
         batch_entries=None,
         batch_bytes=DEFAULT_BATCH_BYTES,
+        sections=SECTIONS,
     ):
         """`batch_entries=None` reads as many whole entries as `batch_bytes`
         admits at the attempt's entry cap, at most 1024."""
@@ -38,7 +39,7 @@ class Consumer:
         require(0 < timeout <= 60)
         obj(
             initial,
-            "pins start_ns end_ns lower_bound plans groups max_entry_bytes max_queue_bytes",
+            "pins start_ns end_ns lower_bound plans groups retain_boundaries_ns retain_shift_offsets_ns max_entry_bytes max_queue_bytes",
         )
         entry = uint(initial["max_entry_bytes"])
         if batch_entries is None:
@@ -60,7 +61,7 @@ class Consumer:
             for suffix in ("stream", "state")
         ]
         self._group = group
-        self._decoder = Decoder(run_id, attempt_id, initial, entry)
+        self._decoder = Decoder(run_id, attempt_id, initial, entry, sections=sections)
         self._batch_entries, self._batch_bytes = batch_entries, batch_bytes
         self._timeout = timeout
         self._completed = -1
@@ -138,12 +139,11 @@ class Consumer:
             )
             ids = []
             for entry_id, fields in entries:
-                require(len(fields) == 1 and b"record" in fields, "entry fields")
                 require(
                     entry_id == f"{self._decoder.sequence + 2}-0".encode(),
                     "entry sequence",
                 )
-                hook(self._decoder.apply(fields[b"record"]))
+                hook(self._decoder.apply(fields))
                 ids.append(entry_id)
             if ids:
                 last = self._decoder.sequence + 1

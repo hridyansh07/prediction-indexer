@@ -144,6 +144,10 @@ class PairFills(Strategy):
             return sum(leg.cost for leg in legs) - steps * self.units[0] * (P + fee)
         return steps * self.units[0] * (P - fee) - sum(leg.cost for leg in legs)
 
+    def fill_loss(self, entity, native_losses, time):
+        # This synthetic strategy's values use the shared native scale 9.
+        return sum(native_losses)
+
     # -- completion and reader hooks --------------------------------------------
     def manifest(self, files, instantaneous):
         return {"version": 1, "strategy": self.name, "snapshot_sha256": self.snapshot_sha256,
@@ -552,6 +556,61 @@ class FillConstructionTests(Base):
                 {key: BookRequirement(("ask",), (1,)) for key in self.plans})):
             with self.assertRaisesRegex(ProtocolError, "fill ladder not retained"):
                 FillHarness(root, policy())
+
+    def test_partial_projection_reuses_each_size_without_changing_fill_identities(self):
+        class Book:
+            validity, reason = "usable", None
+
+            def __init__(self, second_bid=550, second_ask=750):
+                self.sides = {"bid": ((600, M), (second_bid, 3 * M)),
+                              "ask": ((700, M), (second_ask, 3 * M))}
+
+            def levels(self, side):
+                return self.sides[side]
+
+        transforms = ("kalshi_complement_ask", "kalshi_complement_bid")
+        builder = ViewBuilder(BookRequirement(("bid", "ask"), (1, 3), transforms=transforms,
+                                              ladders=transforms),
+                              {"price_scale": "3", "quantity_scale": "6"}, ages=True)
+        first = builder.build(Book(), 12)
+        second = builder.build(Book(540, 760), 13, first, {"bid": 550, "ask": 750})
+        for transform, price, cost in ((transforms[0], 460, 1320 * M),
+                                        (transforms[1], 240, 780 * M)):
+            old, new = first.transformed[transform][1], second.transformed[transform][1]
+            self.assertEqual(old, new)
+            self.assertIsNot(old, new)  # A1's selection/ring reservation identity
+            self.assertIs(old.taken, new.taken)
+            self.assertIs(old.consumed, new.consumed)
+            self.assertEqual(second.transformed[transform][3].cost, cost)
+            self.assertEqual(second.ladders[transform][-1], (price, 3 * M))
+            self.assertEqual(second.best_changes[transform], 12)
+        self.assertEqual(second.last_change, 13)
+        self.assertEqual(second.levels, first.levels)
+        # Equal native fills do not license reuse at a different projection unit.
+        builder.unit = 2000
+        third = builder.build(Book(540, 760), 14, second, {"bid": 540, "ask": 760})
+        self.assertEqual(third.transformed[transforms[0]][1].cost, 1400 * M)
+        self.assertEqual(third.ladders[transforms[1]][0], (1300, M))
+
+    def test_pair_counts_preserve_the_asymmetric_native_subtotal_doubling(self):
+        class Book:
+            validity, reason = "usable", None
+
+            def levels(self, side):
+                return {"bid": ((600, 3 * M),),
+                        "ask": ((700, M // 2), (750, 3 * M))}[side]
+
+        ask, bid = "kalshi_complement_ask", "kalshi_complement_bid"
+        # Native bid fills retain 4 pairs, ask fills 8 (taken + consumed).
+        # The first transform doubles BOTH subtotals. Ladders add 3/4/5/6.
+        for transforms, expected in (((), 15), ((ask,), 28), ((bid,), 25), ((ask, bid), 38)):
+            with self.subTest(transforms=transforms):
+                builder = ViewBuilder(BookRequirement(("ask", "bid"), (1, 3), transforms=transforms,
+                    ladders=("bid", "ask") + transforms), {"price_scale": "3", "quantity_scale": "6"})
+                view = builder.build(Book(), 12)
+                again = builder.build(Book(), 13, view, {"bid": 600})
+                self.assertEqual((view.levels, again.levels), (expected, expected))
+                self.assertIs(again.fills["ask"], view.fills["ask"])
 
 
 def rewrite(h, manifest, name, mutate):

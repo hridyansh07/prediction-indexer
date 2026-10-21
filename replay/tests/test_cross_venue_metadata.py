@@ -60,7 +60,7 @@ def wide_fixture(scope_count=14):
 
 
 class WideHarness(Harness):
-    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False):
+    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False, storage=None):
         self.root=root
         d, doc, c=wide_fixture(scope_count)
         if pin:
@@ -92,6 +92,8 @@ class WideHarness(Harness):
                                      controls_episodes=True,controls_slices=True)
             cfg["valuation"]={"version":1,"kind":"PARITY_SCENARIO","unit":"research_dollar",
                               "assets":sorted(cfg["fees"]["assets"].values(),key=encoded)}
+            if storage is not None:
+                cfg["storage"] = storage
             self.cross_config=cfg
             return build({**context,"config":cfg})
         with patch("replay.tests.test_bundle_coverage.detail",side_effect=lambda:copy.deepcopy(d)), \
@@ -147,6 +149,15 @@ class MetadataRegressionTests(unittest.TestCase):
                  self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
                 WideHarness(root,scope_count=70)
             self.assertEqual(list((root/"output").iterdir()),[])
+
+    def test_compressed_storage_preserves_early_entity_preflight_before_any_spool(self):
+        from replay.streams.protocol import ProtocolError
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("replay.economic_sdk.bounds.MAX_ENTITY_TABLE", 1), \
+                 self.assertRaisesRegex(ProtocolError, "entity metadata preflight.*entities.json"):
+                WideHarness(root, scope_count=1, storage={"version": 1, "economic": "zstd"})
+            self.assertEqual(list((root / "output").iterdir()), [])
 
     def test_eight_and_four_sizes_have_identical_shared_route_time_and_episodes(self):
         summaries=[]

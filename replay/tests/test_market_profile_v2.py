@@ -2,15 +2,20 @@
 
 import copy
 import hashlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from encoder import encode_stream
+from replay.economic_sdk import bounds
 from replay.economic_sdk.profile import Collector, profile_files, profile_policy
+from replay.economic_sdk.profile_stream_io import stream_lines
 from replay.preparation import load_snapshot
-from replay.streams.protocol import ProtocolError
-from replay.strategies.market_profile.strategy import validate_content
+from replay.streams.protocol import Decoder, ProtocolError
+from replay.strategies.market_profile.strategy import profile_config, read_provisional, validate_content
 from replay.tests.economic_scenarios import M, PROFILE_POLICY, ladder, v2_policy
 from replay.tests.test_same_venue_complement import Harness as ComplementHarness
 from replay.tests.test_market_profile import Harness
@@ -58,6 +63,70 @@ class Case(unittest.TestCase):
 
 
 class AvailabilityParityTests(Case):
+    def test_declared_sections_preserve_every_group_output_byte(self):
+        from replay.streams.protocol import SECTIONS
+        from replay.tests.test_bundle_coverage import Harness as CoverageHarness
+
+        tape = [json.loads(line) for line in
+                (Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures/strategy-sparse.ndjson").read_bytes().splitlines()]
+        for name, factory, kwargs, output_attr, declared in (
+                ("economic", ComplementHarness, {"known": True, "policy": v2_policy()}, "output", {"record"}),
+                ("embedded", ComplementHarness, {"known": True, "policy": v2_policy(profile=PROFILE_POLICY)}, "output", {"record", "events"}),
+                ("profile", Harness, {"policy": v2("availability", "levels", "transitions")}, "profile_output", {"record", "events"}),
+                ("coverage", CoverageHarness, {}, "output", {"record", "events"})):
+            outputs = []
+            for index, sections in enumerate((SECTIONS, declared)):
+                h = factory(self.sub(f"{name}-sections-{index}"), scopes=True, lower_bound="expand_to_window_start",
+                            pin=tape[0]["body"]["pins"][0], wire_records=tape, sections=sections, **kwargs)
+                root = getattr(h, output_attr)
+                outputs.append({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            with self.subTest(group=name):
+                self.assertEqual(outputs[0], outputs[1])  # Includes receipts and stored compressed bytes.
+
+    def test_real_rust_full_and_sparse_wire_have_byte_identical_semantic_outputs(self):
+        fixtures = Path(__file__).resolve().parents[2] / "engine/crates/transport/tests/fixtures"
+        tapes = [[json.loads(line) for line in (fixtures / name).read_bytes().splitlines()]
+                 for name in ("strategy-full.ndjson", "strategy-sparse.ndjson")]
+        full, sparse = tapes
+        total, retained = int(full[-1]["body"]["cuts"]), int(sparse[-1]["body"]["cuts"])
+        self.assertLess(retained, total)
+        print(f"v3 fixture retained/total cuts: {retained}/{total} ({retained / total:.1%})")
+        profile = v2("availability", "levels", "transitions")
+        policy = v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}],
+                           controls_episodes=True, controls_slices=True, audit_intervals=True,
+                           profile=PROFILE_POLICY)
+        for name, factory, kwargs, output_attr in (
+                ("economic", ComplementHarness, {"known": True, "policy": policy}, "output"),
+                ("profile", Harness, {"policy": profile}, "profile_output")):
+            outputs = []
+            receipts = []
+            for index, tape in enumerate(tapes):
+                h = factory(self.sub(f"{name}-{index}"), scopes=True, lower_bound="expand_to_window_start",
+                            pin=tape[0]["body"]["pins"][0], wire_records=tape, **kwargs)
+                root = getattr(h, output_attr)
+                outputs.append({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*")
+                                if p.is_file() and p.name != "content_receipt.json"})
+                receipts.append(json.loads((root / "content_receipt.json").read_bytes()))
+                self.assertTrue(json.loads((root / "manifest.json").read_bytes())["files"])
+            with self.subTest(strategy=name):
+                self.assertEqual(outputs[0], outputs[1])
+                self.assertEqual(receipts[0]["semantic_sha256"], receipts[1]["semantic_sha256"])
+                self.assertNotEqual(receipts[0]["terminal"], receipts[1]["terminal"])
+
+    def test_initial_fails_fast_for_missing_scope_or_shift_coverage(self):
+        for index, (factory, field, missing, kwargs) in enumerate((
+                (Harness, "retain_boundaries_ns", "23", {}),
+                (ComplementHarness, "retain_shift_offsets_ns", "5",
+                 {"policy": v2_policy(controls=[{"kind": "time_shift", "shift_ns": ["5"]}])}))):
+            h = factory(self.sub(f"missing-{index}"), scopes=True, defer_initial=True, **kwargs)
+            writers = h.profile.collector.writers if factory is Harness else h.strategy.writers
+            for writer in writers.values():
+                self.addCleanup(writer.stream.close)
+            h.initial[field].remove(missing)
+            h.decoder = Decoder("coverage-test", h.context["attempt_id"], h.initial, 65536)
+            with self.subTest(field=field), self.assertRaisesRegex(ProtocolError, "v3 retention does not cover"):
+                h.send("initial", h.initial)
+
     def test_availability_rows_and_durations_equal_bundle_coverage(self):
         for index, kwargs in enumerate((
                 {}, {"mixed": True}, {"mixed": True, "scopes": True},
@@ -228,6 +297,217 @@ class VersionOneByteIdentityTests(Case):
         digests.update({"coverage/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                         for p in sorted(h.output.iterdir())})
         self.assertEqual(digests, V1_DIGESTS)
+
+
+STORAGE = {"version": 1, "profile": "zstd"}
+PROFILE_ZSTD = "profile.ndjson.zst"
+
+
+class ProfileStorageTests(Case):
+    def produced(self, name, **kwargs):
+        h = Harness(self.sub(name), policy=v2(), storage=STORAGE, mixed=True, scopes=True, **kwargs)
+        exercise(h)
+        return h, h.finish()
+
+    def validate(self, h, manifest):
+        return validate_content(h.profile_output, load_snapshot(h.root / "context", expected_sha256=h.sha), manifest)
+
+    def decoded(self, h, manifest):
+        entry = manifest["files"][PROFILE_ZSTD]
+        return b"".join(stream_lines(h.profile_output / PROFILE_ZSTD, entry["logical"], entry["stored"],
+                                    bounds.MAX_LINE, "profile"))
+
+    def test_storage_preserves_exact_logical_bytes_summary_identity_and_all_other_files(self):
+        from replay.tests.test_market_volatility import policy
+        profile = policy()
+        profile["groups"] = sorted(profile["groups"] + ["availability", "levels"])
+        outputs = []
+        for name, storage in (("plain", None), ("zstd", STORAGE)):
+            h = Harness(self.sub(name), policy=profile, storage=storage, mixed=True, scopes=True)
+            exercise(h)
+            outputs.append((h, h.finish()))
+        (a, plain), (b, framed) = outputs
+        payload = (a.profile_output / "profile.ndjson").read_bytes()
+        self.assertTrue(payload.endswith(b"\n"))
+        self.assertEqual(self.decoded(b, framed["manifest"]), payload)
+        self.assertEqual(framed["manifest"]["files"][PROFILE_ZSTD]["logical"],
+                         {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload),
+                          "records": payload.count(b"\n")})
+        self.assertEqual(framed["manifest"]["files"][PROFILE_ZSTD]["logical"],
+                         plain["manifest"]["files"]["profile.ndjson"])
+        self.assertEqual(framed["manifest"]["experiment_sha256"], plain["manifest"]["experiment_sha256"])
+        self.assertEqual(framed["summary"], plain["summary"])
+        self.assertEqual(self.validate(b, framed["manifest"]), plain["summary"])
+        self.assertNotEqual(framed["receipt"]["semantic_sha256"], plain["receipt"]["semantic_sha256"])
+        self.assertEqual((plain["manifest"]["version"], framed["manifest"]["version"]), (2, 3))
+        self.assertEqual(framed["manifest"]["storage"], STORAGE)
+        for name in set(plain["manifest"]["files"]) - {"profile.ndjson"}:
+            self.assertEqual((a.profile_output / name).read_bytes(), (b.profile_output / name).read_bytes(), name)
+        self.assertEqual({p.name for p in b.profile_output.iterdir()},
+                         set(framed["manifest"]["files"]) | {"manifest.json", "summary.json", "content_receipt.json"})
+
+    def test_storage_is_closed_v2_standalone_only_and_never_an_economic_policy_field(self):
+        config = {"version": 1, "snapshot_directory": "/unused", "snapshot_sha256": "0" * 64,
+                  "policy": v2(), "storage": STORAGE}
+        self.assertEqual(profile_config(config), config)
+        for storage in (None, {}, {**STORAGE, "version": True}, {**STORAGE, "version": 2},
+                        {**STORAGE, "profile": "plain"}, {**STORAGE, "level": 3}):
+            with self.subTest(storage=storage), self.assertRaises(ProtocolError):
+                profile_config({**config, "storage": storage})
+        with self.assertRaisesRegex(ProtocolError, "standalone policy 2"):
+            profile_config({**config, "policy": PROFILE_POLICY})
+        with self.assertRaises(ProtocolError):
+            profile_policy({**v2(), "storage": STORAGE}, standalone=True)
+        with self.assertRaisesRegex(ProtocolError, "standalone policy 2"):
+            Collector(v2(), {}, "0" * 64, self.root, "1" * 64, storage=STORAGE)
+
+    def test_strict_read_rejects_extra_missing_and_provisional_representations(self):
+        h, result = self.produced("files")
+        for name in ("profile.ndjson", "profile.ndjson.open", PROFILE_ZSTD + ".open", "levels.ndjson.zst.open"):
+            path = h.profile_output / name
+            path.write_bytes(b"")
+            try:
+                with self.subTest(name=name), self.assertRaisesRegex(ProtocolError, "output file set"):
+                    read_provisional(h.profile_output, h.root / "context", expected_sha256=h.sha)
+            finally:
+                path.unlink()
+        path = h.profile_output / PROFILE_ZSTD
+        saved = h.root / "saved-frame"
+        path.rename(saved)
+        try:
+            with self.assertRaisesRegex(ProtocolError, "output file set"):
+                self.validate(h, result["manifest"])
+            path.symlink_to(saved)
+            try:
+                with self.assertRaisesRegex(ProtocolError, "regular output"):
+                    self.validate(h, result["manifest"])
+            finally:
+                path.unlink()
+            # A plaintext file does not substitute for the manifest-selected frame.
+            (h.profile_output / "profile.ndjson").write_bytes(b"")
+            with self.assertRaisesRegex(ProtocolError, "output file set"):
+                self.validate(h, result["manifest"])
+            (h.profile_output / "profile.ndjson").unlink()
+        finally:
+            saved.rename(path)
+        for version in (1, 2):
+            broken = copy.deepcopy(result["manifest"])
+            broken["version"] = version
+            with self.subTest(version=version), self.assertRaises(ProtocolError):
+                self.validate(h, broken)
+        for mutation in ("missing-storage", "plaintext-identity", "both", "neither"):
+            broken = copy.deepcopy(result["manifest"])
+            if mutation == "missing-storage":
+                broken.pop("storage")
+            elif mutation == "plaintext-identity":
+                broken["files"][PROFILE_ZSTD] = broken["files"][PROFILE_ZSTD]["logical"]
+            elif mutation == "both":
+                broken["files"]["profile.ndjson"] = broken["files"][PROFILE_ZSTD]["logical"]
+            else:
+                broken["files"].pop(PROFILE_ZSTD)
+            with self.subTest(mutation=mutation), self.assertRaises(ProtocolError):
+                self.validate(h, broken)
+
+    def test_strict_read_rejects_bad_frames_even_with_rehashed_stored_identity(self):
+        h, result = self.produced("frames")
+        path = h.profile_output / PROFILE_ZSTD
+        frame = path.read_bytes()
+        mutations = (frame[:-1], frame + b"trailing", frame + frame,
+                     frame[:-1] + bytes([frame[-1] ^ 1]))
+        for index, damaged in enumerate(mutations):
+            broken = copy.deepcopy(result["manifest"])
+            broken["files"][PROFILE_ZSTD]["stored"] = {
+                "sha256": hashlib.sha256(damaged).hexdigest(), "byte_length": len(damaged)}
+            path.write_bytes(damaged)
+            try:
+                with self.subTest(mutation=index), self.assertRaisesRegex(ProtocolError, "profile codec"):
+                    self.validate(h, broken)
+            finally:
+                path.write_bytes(frame)
+        for side, field, value in (("logical", "sha256", "0" * 64), ("stored", "sha256", "0" * 64),
+                                   ("logical", "records", 1), ("logical", "byte_length", 1),
+                                   ("stored", "byte_length", 1)):
+            broken = copy.deepcopy(result["manifest"])
+            broken["files"][PROFILE_ZSTD][side][field] = value
+            with self.subTest(side=side, field=field), self.assertRaisesRegex(ProtocolError, "profile codec"):
+                self.validate(h, broken)
+
+    def test_rehashed_rows_still_require_independent_semantic_validation(self):
+        h, result = self.produced("rows")
+        payload = self.decoded(h, result["manifest"])
+        rows = payload.splitlines(keepends=True)
+        rows.pop(1)
+        path = h.profile_output / PROFILE_ZSTD
+        with path.open("wb") as sink:
+            encoded = encode_stream(io.BytesIO(b"".join(rows)), sink)
+        broken = copy.deepcopy(result["manifest"])
+        broken["files"][PROFILE_ZSTD] = {
+            "logical": {"sha256": encoded.logical.sha256, "byte_length": encoded.logical.byte_length,
+                        "records": encoded.logical.line_count},
+            "stored": {"sha256": encoded.stored.sha256, "byte_length": encoded.stored.byte_length}}
+        with self.assertRaisesRegex(ProtocolError, "partition|incomplete"):
+            self.validate(h, broken)
+
+    def test_profile_caps_do_not_inherit_the_larger_stream_caps(self):
+        h, result = self.produced("caps")
+        for field, over in (("records", 2_000_001), ("byte_length", 512 * 1024**2 + 1)):
+            broken = copy.deepcopy(result["manifest"])
+            broken["files"][PROFILE_ZSTD]["logical"][field] = over
+            with self.subTest(field=field), self.assertRaises(ProtocolError):
+                self.validate(h, broken)
+        path = h.profile_output / PROFILE_ZSTD
+        for length in (64 * 1024, 64 * 1024 + 1):
+            # Both are far below the levels 1 MiB bound; only the latter exceeds the profile bound.
+            payload = b" " * (length - 3) + b"{}\n"
+            with path.open("wb") as sink:
+                encoded = encode_stream(io.BytesIO(payload), sink)
+            broken = copy.deepcopy(result["manifest"])
+            broken["files"][PROFILE_ZSTD] = {
+                "logical": {"sha256": encoded.logical.sha256, "byte_length": length, "records": 1},
+                "stored": {"sha256": encoded.stored.sha256, "byte_length": encoded.stored.byte_length}}
+            with self.subTest(length=length), self.assertRaises(ProtocolError) as error:
+                self.validate(h, broken)
+            self.assertEqual("line/truncation" in str(error.exception), length > 64 * 1024)
+        with patch("replay.economic_sdk.profile.MAX_PROFILE_ROWS", 1):
+            limited = Harness(self.sub("limited"), policy=v2(), storage=STORAGE)
+        limited.window()
+        try:
+            with self.assertRaisesRegex(ProtocolError, "output budget"):
+                limited.terminal()
+        finally:
+            for writer in limited.profile.collector.writers.values():
+                writer.stream.close()
+        self.assertFalse((limited.profile_output / "manifest.json").exists())
+
+    def test_failed_codec_or_frame_directory_sync_never_commits_or_removes_its_spool(self):
+        for boundary in ("encode_stream", "fsync_directory"):
+            h = Harness(self.sub(boundary), policy=v2(), storage=STORAGE)
+            exercise(h)
+            h.terminal()
+            h.decoder.finish()
+            with patch("replay.economic_sdk.framing." + boundary, side_effect=OSError("synthetic failure")):
+                with self.subTest(boundary=boundary), self.assertRaisesRegex(OSError, "synthetic failure"):
+                    h.strategy.finish()
+            self.assertTrue((h.profile_output / "profile.ndjson").is_file())
+            self.assertEqual((h.profile_output / PROFILE_ZSTD).exists(), boundary == "fsync_directory")
+            self.assertFalse((h.profile_output / "manifest.json").exists())
+            self.assertFalse((h.profile_output / "content_receipt.json").exists())
+
+    def test_generic_corpus_commit_and_verify_bind_the_compressed_physical_file(self):
+        from replay.corpus import results
+        h, result = self.produced("corpus")
+        destination = self.root / "committed"
+        results.commit(h.profile_output, destination, corpus_key="offline", bundle_id="synthetic",
+                       status="SUCCESS", bench_exit=0, game_state=None)
+        receipt = results.verify(destination)
+        self.assertEqual(receipt["corpus_receipt_version"], 1)
+        stored = next(row for row in receipt["files"] if row["path"] == PROFILE_ZSTD)
+        self.assertEqual({k: stored[k] for k in ("sha256", "byte_length")},
+                         result["manifest"]["files"][PROFILE_ZSTD]["stored"])
+        frame = destination / PROFILE_ZSTD
+        frame.write_bytes(frame.read_bytes()[:-1])
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            results.verify(destination)
 
 
 if __name__ == "__main__":

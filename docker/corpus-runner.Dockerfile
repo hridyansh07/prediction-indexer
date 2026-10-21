@@ -9,12 +9,18 @@
 
 FROM rust:1.90-bookworm AS rust-builder
 
+# Release Rust builds target x86-64-v3 on amd64 and stay portable on other
+# architectures (e.g. arm64). Pass --build-arg RUSTFLAGS=... to override.
+ARG TARGETARCH
+ARG RUSTFLAGS=""
+
 WORKDIR /build
 COPY encoder/rust/ encoder/rust/
 COPY ingester/ ingester/
 COPY engine/ engine/
 COPY replay/streams/attempt.lua replay/streams/attempt.lua
-RUN cargo build --locked --release --manifest-path engine/Cargo.toml \
+RUN flags="${RUSTFLAGS:-$([ "$TARGETARCH" = amd64 ] && echo "-C target-cpu=x86-64-v3")}" \
+    && RUSTFLAGS="$flags" cargo build --locked --release --manifest-path engine/Cargo.toml \
       -p replay-normalizers --example materialize_range
 
 FROM python:3.13-slim-bookworm

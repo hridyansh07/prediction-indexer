@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from replay.economic_fills import walk
 from replay.economic_sdk import bounds
+from replay.economic_sdk.framing import finish_frame
 from replay.economic_sdk.availability import IntervalEngine
 from replay.economic_sdk.availability_reader import MAX_BYTES as AVAILABILITY_BYTES
 from replay.economic_sdk.availability_reader import MAX_LINE as AVAILABILITY_LINE
@@ -32,16 +33,21 @@ from replay.economic_sdk.profile_policy import (  # noqa: F401  (re-exported)
     GROUPS,
     LEVELS_FILE,
     MAX_PROFILE_ROWS,
+    PROFILE_FILE,
+    PROFILE_PLAIN,
     STRATEGY,
     TRANSITIONS_FILE,
     V2_GROUPS,
+    VOLATILITY_FILE,
     pairs_of,
     profile_files,
     profile_identity,
     profile_policy,
+    profile_storage,
 )
 from replay.economic_sdk.levels import LevelRecorder
-from replay.economic_sdk.transitions import TransitionRecorder
+from replay.economic_sdk.transitions import CutScan, TransitionRecorder
+from replay.economic_sdk.volatility import VolatilityRecorder
 from replay.economic_sdk.views import touched_sides
 from replay.strategy_sdk import LineWriter, plain
 from replay.streams.protocol import require
@@ -69,6 +75,10 @@ class _State:
     def __init__(self, kind, bid=None, ask=None, depth=None, fills=None):
         self.kind, self.bid, self.ask, self.depth, self.fills = kind, bid, ask, depth, fills
 
+    def same(self, other):
+        return (self.kind == other.kind and self.bid == other.bid and self.ask == other.ask
+                and self.depth == other.depth and self.fills == other.fills)
+
     def quotes(self):
         return {"bid": None if self.bid is None else [str(self.bid[0]), str(self.bid[1])],
                 "ask": None if self.ask is None else [str(self.ask[0]), str(self.ask[1])]}
@@ -86,8 +96,10 @@ class Collector:
     """Per-book profile over one stream; scope-, bucket- and staging-aware."""
 
     def __init__(self, policy, snapshot, snapshot_sha256, root, experiment_sha256, budget=None,
-                 views=None, standalone=False):
+                 views=None, standalone=False, storage=None):
         self.policy = profile_policy(policy, standalone=standalone)
+        self.storage = (profile_storage(storage, self.policy, standalone=standalone)
+                        if storage is not None else None)
         # Embedded in an SDK strategy, ``views(key)`` returns that group's
         # detached view, whose walked fills are reused when they cover our sizes.
         self.views = views
@@ -152,24 +164,35 @@ class Collector:
             self.levels = LevelRecorder(snapshot, self.plans, self.policy, self.counterpart,
                                         root, self.budget)
         self.streams = tuple(s for s in (self.transitions, self.levels) if s is not None)
+        self.volatility = None
+        if "volatility" in self.groups:
+            self.volatility = VolatilityRecorder(snapshot, self.plans, self.policy, self.counterpart,
+                                                 root, self.budget)
+            self.transitions.on_top = self.volatility.top
         if self.availability is not None:
             self.budget.charge(len(entities(snapshot)) * 2048, "profile state budget")
 
     # -- inputs ------------------------------------------------------------------
     def _read(self, key, book, sides):
-        """Refresh the live book's validity and only the ``sides`` it touched."""
+        """Refresh touched facts; report whether a derived state could differ."""
         reason = None if book.reason is None else book.reason.get("kind")
-        self.validity[key] = (book.validity, reason)
+        validity = (book.validity, reason)
+        changed = self.validity.get(key) != validity
+        self.validity[key] = validity
         if book.validity != "usable":
             self.side_facts[key] = {"bid": None, "ask": None}
-            return
+            return changed
         facts = self.side_facts.setdefault(key, {"bid": None, "ask": None})
         for side in sides or ("bid", "ask"):
             current = facts[side]
             if sides and current is not None and current[3] is not None and (
                     sides[side] > current[3] if side == "ask" else sides[side] < current[3]):
                 continue  # strictly beyond every band and walked level: unchanged
-            facts[side] = self._side(key, book, side)
+            new = self._side(key, book, side)
+            if new != current:
+                facts[side] = new
+                changed = True
+        return changed
 
     def _side(self, key, book, side):
         if "depth" not in self.groups:
@@ -182,12 +205,12 @@ class Collector:
         plan = self.plans[key]
         band_unit = int(self.policy["tick_atoms"][plan["venue"]])
         within = []
+        index, total = 0, 0
         for k in self.depth_ticks:
-            band, total = k * band_unit, 0
-            for price, quantity in levels:
-                if abs(price - best[0]) > band:
-                    break
-                total += quantity
+            band = k * band_unit
+            while index < len(levels) and abs(levels[index][0] - best[0]) <= band:
+                total += levels[index][1]
+                index += 1
             within.append(total)
         fills = None
         view = self.views(key) if self.views is not None else None
@@ -252,10 +275,12 @@ class Collector:
         if self.staged is not None and time > self.staged:
             self._commit()
         # Scopes opened by this advance write their rows from the state before this cut.
-        self.sequence = cut.sequence
+        self.sequence = cut.risk_sequence
         self._advance(time)
-        for stream in self.streams:
-            stream.cut(cut, raw, time, self.rows, self.scope)
+        if self.streams:
+            scan = CutScan(self.streams[0], self.transitions is not None)
+            for stream in self.streams:
+                stream.cut(cut, raw, time, self.rows, self.scope, scan)
         transitions = cut.body["book_transitions"]
         scope_books = self.rows
         if raw >= self.start and "activity" in self.groups:
@@ -293,18 +318,28 @@ class Collector:
                 self._trade(key, row, value)
         if changed is None:
             changed = touched_sides(cut)
-        derive = set()
+        affected, derive = set(), set()
         for key, sides in changed.items():
             if key not in self.plans:
                 continue
-            self._read(key, cut.books[key], sides)
-            derive.add(key)
+            refreshed = self._read(key, cut.books[key], sides)
+            affected.add(key)
+            if refreshed:
+                derive.add(key)
             if key in self.counterpart:
-                derive.add(self.counterpart[key])
-        if derive:
-            self.staged = time
-            for key in derive:
-                self.pending[key] = self._derive(key)
+                other = self.counterpart[key]
+                affected.add(other)
+                if refreshed:
+                    derive.add(other)
+        for key in affected:
+            new = self._derive(key) if key in derive else self.pending.get(key, self.state[key])
+            if new.same(self.state[key]) and not self._needs_accrual_charge(key, time):
+                # This also removes B after same-time A -> B -> A. Trades above
+                # have already read the intermediate pending state.
+                self.pending.pop(key, None)
+            else:
+                self.pending[key] = new
+        self.staged = time if self.pending else None
 
     def terminal(self, end, sequence=None):
         if self.staged is not None:
@@ -313,6 +348,8 @@ class Collector:
         self._advance(end)
         for stream in self.streams:
             stream.flush(self.sequence)
+        if self.volatility is not None:
+            self.volatility.terminal()
         self._close_scope(end, "RUN_END")
         if self.availability is not None:
             self.availability.terminal(end)
@@ -335,6 +372,20 @@ class Collector:
             row.trades_unpriced += 1
 
     # -- time --------------------------------------------------------------------
+    def _needs_accrual_charge(self, key, time):
+        """An equal-state commit must still make its first allocation on time."""
+        row = self.rows.get(key)
+        if row is None or time <= self.since[key]:
+            return False
+        state = self.state[key]
+        if state.kind == "not_initialized":
+            return False
+        if state.kind != "usable":
+            return state.kind.split(":", 1)[1] not in row.unusable
+        return (state.bid is not None and state.ask is not None
+                and ("top_of_book" in self.groups or "self_crossing" in self.groups)
+                and state.ask[0] - state.bid[0] not in row.spread_hist)
+
     def _commit(self):
         time = self.staged
         keys = sorted(self.pending)
@@ -665,9 +716,16 @@ class Collector:
         self.writers["profile.ndjson"].append(out)
 
     def finish_files(self):
-        files = {name: writer.finish() for name, writer in self.writers.items()}
+        files = {}
+        for name, writer in self.writers.items():
+            if name == PROFILE_PLAIN and self.storage is not None:
+                files[PROFILE_FILE] = finish_frame(writer)
+            else:
+                files[name] = writer.finish()
         if self.transitions is not None:
             files[TRANSITIONS_FILE] = self.transitions.finish()
         if self.levels is not None:
             files[LEVELS_FILE] = self.levels.finish()
+        if self.volatility is not None:
+            files[VOLATILITY_FILE] = self.volatility.finish()
         return files

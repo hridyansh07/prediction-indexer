@@ -342,6 +342,50 @@ share the row/chunk encoder and resolve one scope at a time, without a new globa
 descriptor cache. The final writer also verifies preflight length before rename.
 Layout 1 has no entity table and preserves the frozen complement V1 behavior.
 
+**Economic storage V1 (opt-in).** A layout-2 strategy may add the closed
+`storage: {"version": 1, "economic": "zstd"}` object beside `policy` in its run
+configuration. Omission preserves the legacy manifest version and every default
+physical/logical byte. Explicit null, unknown fields/values, and layout-1 opt-in
+are rejected. Storage never enters economic policy or experiment identity.
+
+With this selection, every economic evidence filename above (including
+`probes.ndjson` when configured, controls, and audits) gains `.zst`.
+`summary.json`, control summaries, `manifest.json`, and `content_receipt.json`
+remain plain JSON; embedded market-profile files are unchanged. The logical
+layout is still 2. Each owning strategy allocates a new closed stored-manifest
+version: complement 3, cross-venue arbitrage 3, multi-market 2, and both
+implication covers 2. It requires the same `storage` object and maps **physical**
+filenames to `{logical: {sha256, byte_length, records}, stored: {sha256,
+byte_length}}`; embedded profile entries keep their legacy identities. Old
+manifest schemas stay closed and readable.
+
+The shared `encoder` writes one dictionary-free, checksummed level-3 frame per
+file. Bounded streaming preserves exact canonical JSON bytes, ordering and LF,
+including empty streams. The writer seals/fsyncs its newly owned plaintext spool,
+streams and fsyncs `<logical>.zst.open`, checks logical identity, renames the
+frame, fsyncs its directory, then removes **only its own spool** and fsyncs again.
+Only after all frames and independent semantic validation succeed are summaries,
+manifest and receipt published. A failed frame never authorizes removal of a
+pre-existing artifact. Success leaves exactly one representation and no staging.
+
+Readers select from the validated manifest and bind storage intent to the run
+configuration in both strict completed and post-SUCCESS byte readers. They reject
+duplicates, missing files, staging leftovers, unknown paths and symlinks; verify
+stored and logical hashes/lengths/counts; and reject corrupt, truncated,
+concatenated or trailing frames/bytes without decoded temporary files. Ordinary
+streams keep 2,000,000 records, 512 MiB logical bytes, and 64 KiB including LF per
+line. Entity tables keep their separate one-record 64 MiB document path and exact
+early preflight; reasons keep the one-record 8 MiB path. Transition/levels bounds
+do not apply. Summaries are independently recomputed with the same semantics.
+
+Physical manifests and `content_receipt.semantic_sha256` (the whole manifest
+digest) intentionally differ by storage. Corpus physical receipts keep schema 1;
+corpus keys still bind source commit and complete group configuration. No old
+output is migrated. Future runs using
+`configs/corpus/execution-realism.example.json` select this opt-in on `complement`,
+`cross`, `multi`, `cover_same`, and `cover_cross`; its standalone `profile` group
+keeps its independent profile storage block.
+
 A strategy may represent a statically rejected, size-independent basket with a
 null size in its own descriptor and a deterministic numeric ordering sentinel.
 Admission bypasses evaluation and declared input compilation; it still receives
@@ -373,6 +417,22 @@ following:
 - The summary and verdicts are recomputed from denominators and episodes.
 
 The layout-1 reader (`reader`) keeps the V1 checks unchanged.
+
+**Post-SUCCESS reading (S6b).** The writer's full independent semantic validation
+still gates terminal ACK. Bench then calls
+`replay.economic_sdk.completed_reader.read_completed(run_directory, group,
+reader=configured_reader)`: for the seven shipped readers it verifies supervisor,
+snapshot, policy and receipt bindings, manifest/summary digests, and every file's
+SHA-256 and length from disk. Framed files bind their stored bytes without a new
+decode. Metadata must retain the writer's physical JSON encoding, and control
+summaries bind to the top-level summary. It returns the same
+`{receipt, manifest, summary}`; neither output bytes nor retained-state accounting
+changes. Unknown/custom readers retain their original call.
+
+Passing `deep=True` calls the configured reader unchanged, including its full
+semantic validation and original failures. Package readers themselves remain
+unchanged. Corpus deep audits reconstruct their original environment; see
+[`replay/corpus/README.md`](../replay/corpus/README.md).
 
 ## 6. Controls
 
@@ -409,7 +469,16 @@ Isolation rules:
 
 `replay.strategies.market_profile:build` runs beside any strategy and needs no fee
 configuration. Its closed configuration is
-`{version, snapshot_directory, snapshot_sha256, policy}`. It can instead run inside
+`{version, snapshot_directory, snapshot_sha256, policy}` with optional standalone
+`storage: {version: 1, profile: "zstd"}` for policy 2 only. Omission keeps the old
+bytes and manifests 1/2; opt-in selects closed manifest/layout 3 and replaces only
+`profile.ndjson` with exact NDJSON in one checksummed, dictionary-free level-3
+Zstandard frame. It retains profile's 2,000,000-row, 512 MiB logical and 64 KiB
+line bounds. Storage is outside policy and experiment identity, but changes the
+whole-manifest digest and receipt `semantic_sha256`. Strict and post-SUCCESS readers
+bind the selected representation to configured intent. See
+[the storage contract](specs/MARKET_PROFILE_V2.md#11-standalone-profile-storage-v1-implemented-extension).
+It can instead run inside
 an SDK strategy through `Requirements.profile`; complement policy 2 exposes this as
 `"profile": null | <profile policy>`. It records no economic judgement.
 
@@ -522,6 +591,16 @@ for row in iter_transitions(out / "transitions.ndjson.zst"):
 for row, (bids, asks) in iter_levels(out / "levels.ndjson.zst"):
     depth = sum(q for _, q in bids[:3])
 ```
+
+The standalone profile additionally supports `volatility`, requiring `transitions`
+and its own closed policy block. It samples on a scope-relative clock and records
+exact scale-4 doubled-mid and complete-set gap move statistics without new wire
+retention boundaries. Its reader independently rebuilds every row and mask pair
+from verified transitions and the prepared snapshot. Unknown masks remain visible;
+prices needing rounding fail. See the [supplied volatility specification](specs/MARKET_VOLATILITY_V1.md)
+and [implementation contract](specs/MARKET_VOLATILITY_V1_CONTRACT.md) for row shapes,
+units and bounded state. Without the group, policy identities and output bytes
+are unchanged. Retained five-bundle acceptance remains pending.
 
 ## 8. Retained-state bounds
 
@@ -841,8 +920,8 @@ records that as FEE_UNKNOWN without rounding.
 
 ## 13. Fill checks
 
-Status: **implemented in the SDK; no production strategy uses it yet.** The
-cross-venue strategy is not ported (that is a later step). The SDK is proven
+Status: **implemented in the SDK and the four structural fill strategies.**
+Their individual specifications own the strategy policy versions. The SDK is proven
 offline by a synthetic two-leg strategy in
 `replay/tests/test_economic_sdk_fills.py`. Fill mode is an explicit opt-in;
 without it every existing output, including complement policies 1 and 2 and
@@ -1137,3 +1216,124 @@ block exists, manifests require `game_state: {sha256, windows, mode}`, and episo
 Independent readers check those bindings and phase consistency. Without the
 block, persisted output remains unchanged, including the pinned complement and
 cross-venue goldens. Layout 1 retains its closed legacy schemas.
+
+## 15. Execution-delay probes
+
+The optional mechanism in
+[`EXECUTION_DELAY_V1.md`](specs/EXECUTION_DELAY_V1.md) extends fill checks with
+delayed decisions and per-leg arrivals. Strategy rollout and production settings
+remain outside this mechanism. The upstream
+[offline migration contract](specs/UNIVERSE_MIGRATIONS_V1.md) governs storage:
+execution terms start at Universe schema v8, with outcomes document version 2.
+Snapshot versions and outcomes-v1 compatibility are unchanged.
+
+`FillPolicy.probes` is absent by default. When present, its closed version-1
+policy names declared sizings, confirmation and arrival milliseconds, sequencing
+modes and an explicit unknown-delay default for every traded venue. Its product
+is at most 64. Millisecond policy values and the row fields `confirm_ms`,
+`arrival_ms`, `venue_delay_ms` are JSON integers, rejecting booleans and floats.
+The applied venue delay is never null. Quantities, prices, costs, signed values
+and nanosecond times use canonical decimal strings.
+
+The pure `Strategy.fill_delays(entity, time_ns)` default resolves the pinned
+market terms through scope membership, including Polymarket token IDs and
+Limitless subscription slugs. It returns per-leg nanoseconds or `None`, which
+selects the policy default. Delays are exact whole milliseconds. Strategies may
+override the hook with a pure implementation that the reader also calls.
+
+The pure `Strategy.fill_exits(entity)` hook returns one `(book_key, ladder)`
+per leg. The default reverses each entry source on `entity.legs[i]`, preserving
+existing probe users. The four execution-realism strategies override it through
+their shared policy helper: BUY excess exits into the acquired descriptor
+book's native `bid`, not Kalshi's opposite-orientation entry source. Non-Kalshi
+SELL exits keep the same-book reverse mapping; Kalshi SELL with probes fails
+with `"probe exit unsupported for Kalshi sold leg"`. Bind requires each exit
+plan and builder (`"probe exit book not planned"`) and retained ladder
+(`"probe exit ladder not retained"`). The exit uses that book's committed usable
+view at arrival. The independent reader checks exit prices against its scale.
+
+`probes.ndjson` contains exactly one row per configured scenario per fill episode,
+independently of episode closure. Confirmation zero uses the opening sizing's
+walk, including a recording sizing that was not tradeable; a zero-step recording
+sizing yields `empty` with no sent orders. Later confirmations require the fill
+to remain live and the selected sizing to be tradeable. A decision fixes each
+leg's quantity and worst accepted price. Arrivals take better prices, cancel
+unfilled remainders, and retain the best atoms for the matched quantity: lowest
+purchase prices or highest sale prices. Gross excess loss is purchase cost less
+exit sale proceeds for a bought leg, including full cost for unexited atoms.
+For a sold leg it is actual exit repurchase cost plus uncovered atoms charged
+at unit payout (`10**price_scale`), less original excess sale proceeds. It is
+signed; unwind fees are excluded. Exit walks retain and take at most
+`max_levels` levels, treating any further quantity as a shortfall without
+failing the attempt. Entry walks still fail if their frozen limit requires
+more than `max_levels` levels. Actual exits alone enter `exit_consumed` and
+`exit_proceeds`; no row schema changes.
+
+The pure `Strategy.fill_loss(entity, native_losses, time_ns)` hook converts the
+signed per-leg native gross losses into the same monetary unit and scale as
+`fill_value`. Every tuple entry retains its leg's `price_scale + quantity_scale`
+until this conversion; per-leg output costs and exit proceeds stay native.
+There is no inferred default: a missing conversion hook, unavailable valuation,
+or non-integer result fails visibly. Runtime and independent reader both call
+the hook at decision time. Cross-venue and implication strategies apply their
+pinned parity valuation and convert each leg to scale-36 research dollars;
+same-venue multi-market converts the set's common quote asset to scale 36.
+This corrects the original raw-native sum, which could not be subtracted from
+the scale-36 matched value. Previously emitted incorrect sums fail the corrected
+reader's arithmetic check. Probe row shapes and output without probes are unchanged.
+
+The closed leg object adds `usable` evidence: true or false for an arrived leg,
+null for an unsent or censored leg. Unsent zero-quantity legs carry zero fill and
+unwind amounts with empty walks. `not_confirmed` has a null decision, no legs and
+null aggregate metrics. `decision_untradeable` carries the decision but no legs
+or aggregate metrics. A censored scenario keeps completed arrival walks, leaves
+unresolved walks and all unwind/aggregate metrics null, and makes no empty-fill
+claim. An arrival at or after the original decision scope's end is censored,
+including an internal scope boundary. Censoring precedes unusable/quantity
+statuses; a resolved unusable leg precedes the filled/partial/empty classification.
+
+Opening fills and probe decisions carry `ages` only with probes enabled. Each
+book records its last committed update and each declared retained ladder's last
+best price-or-quantity change, including exit ladders. Same-time updates commit
+only their final state. Bounds charge the book timestamp plus one timestamp per
+retained ladder, and the detached baseline needed for same-time comparison.
+
+Pending decisions and arrivals catch up before later books refresh and at
+terminal flush. They add no stream retention boundary or shift offset. A probe
+retains its entity and arrival exit evidence across episode closure; its state
+is reserved before insertion, with a 100,000-pending-scenario cap and the shared
+512 MiB state budget. Episode metadata and each `(episode, sizing, confirmation)`
+decision have shared owners. Scenario headers are charged on admission; actual
+decision and arrival evidence growth is charged before retention, rather than
+reserving every scenario's maximum configured depth upfront. Opening depth does
+not bound future arrivals. Arrival walks stay native until row emission; saved
+exit prefixes need cover at most that leg's actual fill, still within
+`max_levels`. Scenario payloads release on resolution, shared evidence after its
+last sibling; stale censor-event shells remain charged until their final pop.
+See [the retention contract §6](specs/LEGACY_PROBE_RETENTION_V1.md#6-phase-aware-probe-retention-owner-authorized-follow-up).
+Consuming more than `max_levels` fails for required entry walks, while exit
+shortfalls keep their existing conservative valuation. Output keeps the existing
+per-file, row and line caps, schemas and bytes.
+
+`probe_reader` independently validates coverage, closed rows, opening equality,
+walk limits/order/arithmetic, matched valuation, unwind losses, delay provenance,
+computed times, statuses and resolution order. Arrival ladders, confirmation
+ladders and quote ages remain writer-attested. Without probes there is no new
+file or fill field; existing semantic outputs and the complement V1 golden stay
+byte-identical. Synthetic full-cut and sparse-v3 tapes compare probe bytes;
+the current decoder continues to reject obsolete wire v2. Five-bundle corpus
+acceptance remains pending until the retained sample and independent screen are
+available.
+
+## 16. Strategy execution-realism rollout
+
+The four opted-in policy versions (cross-venue arbitrage 4, same-venue
+multi-market 2 and both implication covers 4) require recording t10 alongside
+governing edge, delayed-fill probes and the closed flags policy. Fill episodes
+add pairing/review/stale flags; non-null probe decisions additionally carry their
+own value and native `{atoms,cost,taken,consumed}` walks. This enables exact causal
+edge-per-set thresholds at later confirmations. The independent reader reprices
+those decisions and recomputes flags; the new policy version selects the closed
+schema. Earlier policies, including explicit old-policy probes, retain their
+bytes. Details and bounds are in the
+[producer contract](specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md).

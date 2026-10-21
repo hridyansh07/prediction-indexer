@@ -614,6 +614,14 @@ coverage.
 - compact slices;
 - opt-in controls and audit.
 
+Policy 2 optionally accepts the closed `storage: {"version": 1, "economic":
+"zstd"}` configuration beside `policy`, as defined in SDK §5. It selects stored
+manifest version **3**, with that required storage block and nested
+logical/stored identities for `.zst` economic evidence. Summary versions and
+embedded profile bytes do not change. Omission retains manifests 1/2 and exact
+legacy bytes; policy 1 rejects storage opt-in. Storage is outside policy and
+experiment identity; receipt/manifest digests change with physical layout.
+
 Policy 2 also differs in these ways:
 
 - its reasons are structured (SDK spec §11);

@@ -9,16 +9,16 @@ only as the ``outcome`` (Yes) book, whose ask is projected from the
 book showed, never why (``docs/specs/MARKET_PROFILE_V2.md`` section 4).
 
 This module also holds the machinery both streams share: the written-book table,
-flat venue-time keys, scope-entry rows and the commit of one Zstandard frame.
+flat venue-time keys and scope-entry rows. Durable Zstandard frame publication
+is shared with economic evidence in ``framing.py``.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from encoder import encode_stream
 from replay.economic_sdk import bounds
+from replay.economic_sdk.framing import finish_frame
 from replay.economic_sdk.profile_policy import (
     TRANSITIONS_FILE,
     TRANSITIONS_MAX_BYTES,
@@ -27,7 +27,6 @@ from replay.economic_sdk.profile_policy import (
 )
 from replay.strategy_sdk import LineWriter
 from replay.streams.protocol import require
-from replay.supervisor import fsync_directory
 
 BID, ASK = 0, 1
 # A touching transition's strength: the strongest one of a cut names a row's cause.
@@ -113,6 +112,50 @@ def quote_text(quote):
     return None if quote is None else [str(quote[0]), str(quote[1])]
 
 
+class CutScan:
+    """Callback-local shared scan, evaluated at the recorders' original check points.
+
+    Nothing here survives the callback. In particular, events are not scanned
+    before opening rows, transition checks or a level-only mirror check can fail.
+    """
+
+    def __init__(self, stream, want_trades):
+        self.plans, self.written_of = stream.plans, stream.written_of
+        self.want_trades = want_trades
+        self.by_key = self.causes = self.clocks = self.trades = None
+
+    def touches(self, cut):
+        if self.by_key is None:
+            by_key, causes = {}, {}
+            for transition in cut.body["book_transitions"]:
+                key = (transition["key"]["instrument"], transition["key"]["orientation"])
+                require(key in self.plans, "unplanned transition")
+                require(key not in by_key, "duplicate book transition in one cut")
+                by_key[key] = transition
+                written = self.written_of.get(key)
+                kind = transition["decision"]["kind"]
+                if written is not None and RANK[kind] >= RANK.get(causes.get(written), -1):
+                    causes[written] = kind
+            self.by_key, self.causes = by_key, causes
+        return self.by_key, self.causes
+
+    def events(self, cut):
+        if self.clocks is None:
+            clocks, trades = {}, []
+            for observation in cut.body["market_events"]:
+                event = observation["event"]
+                if event["kind"] == "book":
+                    inner = event["value"]["value"]
+                    written = self.written_of.get((inner["instrument"], inner["orientation"]))
+                    clock = inner.get("venue_time")
+                    if written is not None and clock is not None:
+                        clocks.setdefault(written, []).append(clock)
+                elif self.want_trades and event["kind"] == "trade":
+                    trades.append(observation)
+            self.clocks, self.trades = clocks, trades
+        return self.clocks, self.trades
+
+
 class Stream:
     """One written stream: scope-entry rows, the cut scan and the committed frame."""
 
@@ -155,37 +198,6 @@ class Stream:
     def _opening(self, scope, key, at, sequence):
         raise NotImplementedError
 
-    # -- cut scan ------------------------------------------------------------------
-    def _touches(self, cut):
-        """Planned keys with a transition, and the strongest cause per written book."""
-        keys, causes, seen = [], {}, set()
-        for transition in cut.body["book_transitions"]:
-            key = (transition["key"]["instrument"], transition["key"]["orientation"])
-            require(key in self.plans, "unplanned transition")
-            require(key not in seen, "duplicate book transition in one cut")
-            seen.add(key)
-            keys.append(key)
-            written = self.written_of.get(key)
-            kind = transition["decision"]["kind"]
-            if written is not None and RANK[kind] >= RANK.get(causes.get(written), -1):
-                causes[written] = kind
-        return keys, causes
-
-    def _scan(self, cut, want_trades):
-        """Venue-time records of each written book's book events, and the trade observations."""
-        clocks, trades = {}, []
-        for observation in cut.body["market_events"]:
-            event = observation["event"]
-            if event["kind"] == "book":
-                inner = event["value"]["value"]
-                written = self.written_of.get((inner["instrument"], inner["orientation"]))
-                clock = inner.get("venue_time")
-                if written is not None and clock is not None:
-                    clocks.setdefault(written, []).append(clock)
-            elif want_trades and event["kind"] == "trade":
-                trades.append(observation)
-        return clocks, trades
-
     def _row(self, kind, scope, key, sequence, time, **fields):
         return {"type": kind, "scope": scope, "book": self.index[key], "cut": sequence,
                 "t_ns": str(time), **fields}
@@ -193,24 +205,7 @@ class Stream:
     # -- commit --------------------------------------------------------------------
     def finish(self):
         """Seal the rows, store them as one Zstandard frame, then drop the plain file."""
-        root = self.root
-        logical = self.writer.finish()
-        plain = root / self.plain
-        stored = root / self.final
-        temporary = stored.with_name(stored.name + ".open")
-        require(not stored.exists(), "existing output")
-        with plain.open("rb") as source, temporary.open("xb") as sink:
-            result = encode_stream(source, sink)
-            sink.flush()
-            os.fsync(sink.fileno())
-        require({"sha256": result.logical.sha256, "byte_length": result.logical.byte_length,
-                 "records": result.logical.line_count} == logical, self.final + " logical identity")
-        temporary.rename(stored)
-        fsync_directory(root)
-        plain.unlink()
-        fsync_directory(root)
-        return {"logical": logical,
-                "stored": {"sha256": result.stored.sha256, "byte_length": result.stored.byte_length}}
+        return finish_frame(self.writer)
 
 
 class TransitionRecorder(Stream):
@@ -220,6 +215,7 @@ class TransitionRecorder(Stream):
                          max_bytes=TRANSITIONS_MAX_BYTES, max_line=bounds.MAX_LINE)
         self.state = {}   # planned key -> (validity, best bid, best ask), as of the last cut
         self.last = {}    # written key -> (validity, bid, ask) of the previous row in the open scope
+        self.on_top = None  # optional same-pass observer; never retains the row
 
     # -- state ---------------------------------------------------------------------
     def initial(self, cut, scoped):
@@ -256,19 +252,24 @@ class TransitionRecorder(Stream):
 
     def _opening(self, scope, key, at, sequence):
         top = self.last[key] = self._top(key)
-        self.writer.append(self._top_row(scope, key, sequence, at, "open", top, {}))
+        self._write_top(self._top_row(scope, key, sequence, at, "open", top, {}))
 
-    def cut(self, cut, raw, time, scoped, scope):
-        sequence = cut.sequence
+    def _write_top(self, row):
+        self.writer.append(row)
+        if self.on_top is not None:
+            self.on_top(row)
+
+    def cut(self, cut, raw, time, scoped, scope, scan):
+        sequence = cut.risk_sequence
         gated = raw >= self.start
         if gated:
             self.flush(sequence)
-        keys, causes = self._touches(cut)
+        keys, causes = scan.touches(cut)
         for key in keys:
             self._remember(key, cut.books[key])
         if not gated:
             return
-        clocks, observed = self._scan(cut, True)
+        clocks, observed = scan.events(cut)
         trades = {}
         for observation in observed:
             value = observation["event"]["value"]
@@ -284,8 +285,8 @@ class TransitionRecorder(Stream):
                 top = self._top(key)
                 if top != self.last[key] or cause != "operations":
                     self.last[key] = top
-                    self.writer.append(self._top_row(scope, key, sequence, time, cause, top,
-                                                     venue_keys(clocks.get(key, ()))))
+                    self._write_top(self._top_row(scope, key, sequence, time, cause, top,
+                                                 venue_keys(clocks.get(key, ()))))
             for observation in trades.get(key, ()):
                 value = observation["event"]["value"]
                 clock = value.get("venue_time")

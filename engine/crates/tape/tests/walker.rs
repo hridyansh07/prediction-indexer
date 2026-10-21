@@ -13,8 +13,9 @@ use indexer_finalize::{
 use indexer_types::{ContentHash, Sha256};
 use prediction_encoder::{encode_stream, encoder_version};
 use replay_domain::{
-    BookEvent, ContractOrientation, ControlEvent, FaultImpact, FullBook, InstrumentId, LaneId,
-    SEGMENT_SCHEMA_VERSION, SegmentEvent,
+    AuditAnchor, BookDelta, BookEvent, BookStateHash, ConditionalMarketPrice, ContractOrientation,
+    ControlEvent, DecimalScale, FaultImpact, FullBook, InstrumentId, LaneId, Level, LevelChange,
+    PositiveQty, SEGMENT_SCHEMA_VERSION, SegmentEvent, Sha1, Side, TradeEvent,
 };
 use replay_materialize::{DerivativeSpec, NormalizationPolicy, build_window, open_pinned};
 use replay_tape::*;
@@ -190,6 +191,16 @@ impl Normalize for Fake {
                 instrument_hint: None,
                 impact: FaultImpact::RequestedVenueBooks(lane.clone()),
             }),
+            "instrument_reject" | "audit_reject" => Normalization::Reject(ParseReject {
+                parser_version: 1,
+                error_code: "unsupported_state".into(),
+                instrument_hint: None,
+                impact: if envelope.raw_payload.as_str() == "instrument_reject" {
+                    FaultImpact::Instrument(instrument.clone())
+                } else {
+                    FaultImpact::AuditCoverageOnly(lane.clone())
+                },
+            }),
             "unknown" => Normalization::Reject(ParseReject {
                 parser_version: 1,
                 error_code: "unknown_lane".into(),
@@ -202,6 +213,86 @@ impl Normalize for Fake {
                     reason: "closed".into(),
                 },
             )]),
+            "controls" => Normalization::Events(vec![
+                SegmentEvent::Control(ControlEvent::ConnectionOpened {
+                    epoch: "e".into(),
+                    instruments: vec![instrument.clone()],
+                    delivers_deltas: true,
+                    target_digest: Some("target".into()),
+                }),
+                SegmentEvent::Control(ControlEvent::SubscriptionChanged {
+                    from: None,
+                    to: "target".into(),
+                }),
+                SegmentEvent::Control(ControlEvent::MetadataChanged {
+                    from: Some("target".into()),
+                    to: "new".into(),
+                }),
+                SegmentEvent::Control(ControlEvent::ConnectionClosed { epoch: "e".into() }),
+                SegmentEvent::Control(ControlEvent::ConnectionFailed {
+                    epoch: "e".into(),
+                    reason: "closed".into(),
+                }),
+            ]),
+            "mixed" => {
+                let other = InstrumentId::new(format!("{lane}:B")).unwrap();
+                let scale = DecimalScale::new(2).unwrap();
+                let price = ConditionalMarketPrice::from_atoms(37, scale).unwrap();
+                let quantity = PositiveQty::parse("3", DecimalScale::new(0).unwrap()).unwrap();
+                Normalization::Events(vec![
+                    SegmentEvent::Book(BookEvent::Full(
+                        FullBook::new(
+                            instrument.clone(),
+                            ContractOrientation::Outcome,
+                            vec![Level::new(price, quantity)],
+                            vec![],
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )),
+                    SegmentEvent::Book(BookEvent::Delta(
+                        BookDelta::new(
+                            other.clone(),
+                            ContractOrientation::Complement,
+                            Side::Ask,
+                            price,
+                            LevelChange::Delete,
+                            None,
+                        )
+                        .unwrap(),
+                    )),
+                    SegmentEvent::Trade(TradeEvent::new(
+                        instrument,
+                        ContractOrientation::Outcome,
+                        price,
+                        quantity,
+                        Some(Side::Bid),
+                    )),
+                    SegmentEvent::AuditAnchor(
+                        AuditAnchor::new(
+                            other.clone(),
+                            ContractOrientation::Outcome,
+                            vec![],
+                            vec![],
+                            BookStateHash::Sha1(Sha1::from_hex(&"a".repeat(40)).unwrap()),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    SegmentEvent::Book(BookEvent::Full(
+                        FullBook::new(
+                            other,
+                            ContractOrientation::Complement,
+                            vec![],
+                            vec![],
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    )),
+                ])
+            }
             _ => Normalization::Events(
                 [
                     ContractOrientation::Outcome,
@@ -828,6 +919,444 @@ fn first_seqs(groups: &[AtomicGroup]) -> Vec<i64> {
 }
 
 #[test]
+fn input_filter_matches_full_decode_groups_deliveries_and_counts() {
+    let source = TempDir::new("input-filter-source").unwrap();
+    let out = TempDir::new("input-filter-out").unwrap();
+    canonical(
+        source.path(),
+        0,
+        10,
+        1,
+        &[
+            row("kalshi", 1, "controls"),
+            row("kalshi", 2, "mixed"),
+            row("polymarket", 2, "mixed"),
+            row("limitless", 3, "mixed"),
+            Row {
+                epoch: "second",
+                continuity: "gap_proven",
+                ..row("kalshi", 4, "mixed")
+            },
+            Row {
+                epoch: "old-duplicate",
+                continuity: "duplicate",
+                ..row("kalshi", 5, "mixed")
+            },
+            Row {
+                epoch: "third",
+                ..row("kalshi", 6, "ignore")
+            },
+            row("kalshi", 7, "instrument_reject"),
+            row("polymarket", 8, "audit_reject"),
+            row("polymarket", 9, "unknown"),
+        ],
+        true,
+    );
+    canonical(source.path(), 10, 20, 11, &[], false);
+    canonical(
+        source.path(),
+        20,
+        30,
+        11,
+        &[
+            row("limitless", 21, "controls"),
+            row("kalshi", 22, "reject"),
+            Row {
+                continuity: "conflict",
+                ..row("polymarket", 23, "mixed")
+            },
+        ],
+        true,
+    );
+    let inputs: Vec<_> = [(0, 10), (10, 20), (20, 30)]
+        .into_iter()
+        .map(|(start, end)| build(source.path(), out.path(), start, end, &mut Fake::new()))
+        .collect();
+    for instruments in [
+        vec!["kalshi:A"],
+        vec!["kalshi:B", "polymarket:A"],
+        vec![],
+        vec!["other:X"],
+    ] {
+        for lanes in [vec!["kalshi"], vec![], vec!["polymarket", "limitless"]] {
+            for (start, end, lower_bound) in [
+                (0, 30, LowerBoundPolicy::RequireWindowBoundary),
+                (2, 23, LowerBoundPolicy::Clip),
+                (2, 23, LowerBoundPolicy::ExpandToWindowStart),
+            ] {
+                let mut req = request(start, end);
+                req.lower_bound = lower_bound;
+                req.scope.instruments = instruments
+                    .iter()
+                    .map(|id| InstrumentId::new(*id).unwrap())
+                    .collect();
+                req.scope.lanes = lanes
+                    .iter()
+                    .map(|lane| LaneId::new(*lane).unwrap())
+                    .collect();
+                let (fast, fast_status, fast_done) = drain(
+                    DerivativeWalker::open(inputs.clone(), req.clone(), ReadLimits::default())
+                        .unwrap(),
+                );
+                let (projection, projection_status, projection_done) = drain(
+                    DerivativeWalker::open_without_input_fastpath(
+                        inputs.clone(),
+                        req.clone(),
+                        ReadLimits::default(),
+                    )
+                    .unwrap(),
+                );
+                let (full, full_status, full_done) = drain(
+                    DerivativeWalker::open_without_input_filter(
+                        inputs.clone(),
+                        req,
+                        ReadLimits::default(),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(fast, full);
+                assert_eq!(projection, full);
+                assert_eq!(projection_done.counts(), full_done.counts());
+                assert_eq!(
+                    projection_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>(),
+                    full_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(fast_done.counts(), full_done.counts());
+                assert_eq!(fast_done.counts().source_deliveries, 13);
+                assert_eq!(fast_done.counts().rejected_sources, 4);
+                assert_eq!(fast_done.counts().ignored_sources, 1);
+                assert_eq!(fast_done.request(), full_done.request());
+                assert_eq!(
+                    fast_done.effective_interval(),
+                    full_done.effective_interval()
+                );
+                assert_eq!(fast_done.pins(), full_done.pins());
+                assert_eq!(
+                    fast_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>(),
+                    full_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn input_filter_rejects_unplanned_malformed_headers_json_and_selection() {
+    let source = TempDir::new("input-filter-malformed").unwrap();
+    canonical(source.path(), 0, 10, 1, &[row("kalshi", 9, "book")], true);
+    for (before, after, error) in [
+        (
+            "\"canonical_seq\":1",
+            "\"canonical_seq\":0",
+            "invalid normalized event",
+        ),
+        (
+            "\"order_ns\":9",
+            "\"order_ns\":8",
+            "invalid normalized event",
+        ),
+        (
+            "\"source_line_number\":1",
+            "\"source_line_number\":0",
+            "invalid normalized event",
+        ),
+        (
+            "\"continuity\":\"continuous\"",
+            "\"continuity\":\"unknown\"",
+            "invalid normalized event",
+        ),
+        (
+            "\"delivery_index\":1",
+            "\"delivery_index\":\"bad\"",
+            "invalid normalized event",
+        ),
+        (
+            "\"lane\":\"kalshi\"",
+            "\"lane\":null",
+            "invalid normalized event",
+        ),
+        (
+            "\"event_index\":1",
+            "\"event_index\":3",
+            "canonical child order",
+        ),
+        (
+            "\"visible_tie_group\":null",
+            "\"visible_tie_group\":[]",
+            "invalid normalized event",
+        ),
+        (
+            "\"schema_version\":4",
+            "\"schema_version\":99",
+            "invalid normalized event",
+        ),
+        (
+            "\"kind\":\"book\"",
+            "\"kind\":\"unknown\"",
+            "invalid normalized event",
+        ),
+        (
+            "\"kind\":\"full\"",
+            "\"kind\":\"unknown\"",
+            "invalid normalized event",
+        ),
+        (
+            "\"instrument\":\"kalshi:A\"",
+            "\"instrument\":\"bad\"",
+            "invalid normalized event",
+        ),
+    ] {
+        let out = TempDir::new("input-filter-malformed-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            assert!(text.contains(before), "missing mutation target {before}");
+            *text = text.replacen(before, after, 1);
+        });
+        // Check both in-interval and fully clipped tails. The instrument is
+        // unplanned, but the lane epoch is still state-bearing when in bounds.
+        for end in [1, 10] {
+            let mut req = request(0, end);
+            req.scope.instruments = [InstrumentId::new("kalshi:B").unwrap()]
+                .into_iter()
+                .collect();
+            for walker in [
+                DerivativeWalker::open(vec![input.clone()], req.clone(), ReadLimits::default())
+                    .unwrap(),
+                DerivativeWalker::open_without_input_filter(
+                    vec![input.clone()],
+                    req.clone(),
+                    ReadLimits::default(),
+                )
+                .unwrap(),
+            ] {
+                let (_, observed) = fails_without_completion(walker);
+                assert!(observed.contains(error), "{before}: {observed}");
+            }
+        }
+    }
+}
+
+#[test]
+fn input_filter_does_not_lex_pinned_excluded_bodies_and_keeps_source_epoch() {
+    let source = TempDir::new("input-filter-schema").unwrap();
+    canonical(source.path(), 0, 10, 1, &[row("kalshi", 1, "book")], true);
+    for body in ["false", "[,]", "[\"bad\\x\"]"] {
+        let out = TempDir::new("input-filter-schema-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            // Rebind intentionally invalid test bytes to distinguish hot selection
+            // from independent audit. Real installations must build/audit first.
+            *text = text.replace("\"bids\":[]", &format!("\"bids\":{body}"));
+        });
+        let mut req = request(0, 10);
+        req.scope.instruments.clear();
+        let (groups, _, done) = drain(
+            DerivativeWalker::open(vec![input.clone()], req.clone(), ReadLimits::default())
+                .unwrap(),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].last().event_index(), 1);
+        assert_eq!(groups[0].deliveries()[0].connection_epoch(), Some("e"));
+        assert!(groups[0].deliveries()[0].records().is_empty());
+        assert_eq!(done.counts().included_sources, 1);
+        assert_eq!(done.counts().included_events, 0);
+        assert_eq!(done.counts().excluded_events, 2);
+        fails_without_completion(
+            DerivativeWalker::open_without_input_filter(
+                vec![input.clone()],
+                req,
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
+        fails_without_completion(
+            DerivativeWalker::open(vec![input.clone()], request(0, 10), ReadLimits::default())
+                .unwrap(),
+        );
+        assert!(replay_materialize::verify_derivative(&input.directory).is_err());
+        if body != "false" {
+            fails_without_completion(
+                DerivativeWalker::open_without_input_fastpath(
+                    vec![input],
+                    {
+                        let mut req = request(0, 10);
+                        req.scope.instruments.clear();
+                        req
+                    },
+                    ReadLimits::default(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+}
+
+#[test]
+fn input_fastpath_falls_back_for_noncanonical_and_escaped_selection() {
+    let source = TempDir::new("input-fastpath-fallback").unwrap();
+    canonical(
+        source.path(),
+        0,
+        10,
+        1,
+        &[
+            row("kalshi", 1, "controls"),
+            row("kalshi", 2, "mixed"),
+            row("polymarket", 2, "mixed"),
+            row("kalshi", 3, "instrument_reject"),
+        ],
+        true,
+    );
+    for spelling in ["whitespace", "escaped_instrument", "escaped_header"] {
+        let out = TempDir::new("input-fastpath-fallback-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            *text = match spelling {
+                "whitespace" => text.replace("{\"schema_version\":", "{ \"schema_version\": "),
+                "escaped_instrument" => text.replace(
+                    "\"instrument\":\"kalshi:A\"",
+                    "\"instrument\":\"kalshi:\\u0041\"",
+                ),
+                _ => text.replace("\"lane\":\"kalshi\"", "\"lane\":\"kal\\u0073hi\""),
+            };
+        });
+        for selected in [false, true] {
+            let mut req = request(0, 10);
+            if !selected {
+                req.scope.instruments.clear();
+                req.scope.lanes.clear();
+            }
+            let (full, full_status, full_done) = drain(
+                DerivativeWalker::open_without_input_filter(
+                    vec![input.clone()],
+                    req.clone(),
+                    ReadLimits::default(),
+                )
+                .unwrap(),
+            );
+            for open in [
+                DerivativeWalker::open,
+                DerivativeWalker::open_without_input_fastpath,
+            ] {
+                let (actual, status, done) =
+                    drain(open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap());
+                assert_eq!(actual, full, "{spelling}, selected={selected}");
+                assert_eq!(done.counts(), full_done.counts());
+                assert_eq!(
+                    status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>(),
+                    full_status
+                        .iter()
+                        .map(WindowStatus::metadata)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn input_fastpath_preserves_complete_excluded_header_equality() {
+    let source = TempDir::new("input-fastpath-header").unwrap();
+    canonical(source.path(), 0, 10, 1, &[row("kalshi", 1, "book")], true);
+    for field in [
+        "record_id",
+        "source_segment_sha256",
+        "source_line_number",
+        "content_hash",
+        "continuity",
+        "lane",
+        "delivery_index",
+        "visible_tie_group",
+    ] {
+        let out = TempDir::new("input-fastpath-header-out").unwrap();
+        let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+        rewrite(&mut input, "events.ndjson.zst", |text| {
+            // Keep the exact canonical spelling, but change child 1 only so
+            // source evidence and the first child remain a contrary control.
+            let mut lines: Vec<_> = text.lines().map(str::to_owned).collect();
+            let mut record: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+            let header = &mut record["header"];
+            let target = match field {
+                "source_segment_sha256" | "source_line_number" | "content_hash" | "continuity" => {
+                    &mut header["provenance"][field]
+                }
+                "lane" | "delivery_index" => &mut header["address"][field],
+                _ => &mut header[field],
+            };
+            let before = serde_json::to_string(target).unwrap();
+            let after = match field {
+                "record_id" | "lane" => json!("other"),
+                "source_segment_sha256" | "content_hash" => json!("0".repeat(64)),
+                "source_line_number" | "delivery_index" => json!(2),
+                "continuity" => json!("duplicate"),
+                _ => json!(1),
+            };
+            lines[1] = lines[1].replacen(
+                &format!("\"{field}\":{before}"),
+                &format!("\"{field}\":{after}"),
+                1,
+            );
+            *text = format!("{}\n", lines.join("\n"));
+        });
+        let mut req = request(0, 10);
+        req.scope.instruments.clear();
+        for open in [
+            DerivativeWalker::open,
+            DerivativeWalker::open_without_input_fastpath,
+            DerivativeWalker::open_without_input_filter,
+        ] {
+            let (_, error) = fails_without_completion(
+                open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap(),
+            );
+            assert_eq!(
+                error, "normalized children disagree on source header or index",
+                "{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn input_filter_still_pairs_excluded_faults_with_exact_reject_evidence() {
+    let source = TempDir::new("input-filter-fault").unwrap();
+    let out = TempDir::new("input-filter-fault-out").unwrap();
+    canonical(source.path(), 0, 10, 1, &[row("kalshi", 1, "reject")], true);
+    let mut input = build(source.path(), out.path(), 0, 10, &mut Fake::new());
+    rewrite(&mut input, "events.ndjson.zst", |text| {
+        *text = text.replace("\"reject_id\":\"", "\"reject_id\":\"x");
+    });
+    let mut req = request(0, 10);
+    req.scope.instruments.clear();
+    let (_, fast) = fails_without_completion(
+        DerivativeWalker::open(vec![input.clone()], req.clone(), ReadLimits::default()).unwrap(),
+    );
+    let (_, full) = fails_without_completion(
+        DerivativeWalker::open_without_input_filter(vec![input], req, ReadLimits::default())
+            .unwrap(),
+    );
+    assert_eq!(fast, full);
+    assert_eq!(
+        fast,
+        "normalization fault events do not pair exactly with parse rejects"
+    );
+}
+
+#[test]
 fn late_window_corruption_streams_earlier_groups_but_never_completes() {
     let source = TempDir::new("late-source").unwrap();
     let out = TempDir::new("late-out").unwrap();
@@ -1016,6 +1545,13 @@ fn codec_and_pin_corruption_never_becomes_eof() {
         if mutation == "checksum" {
             assert!(open_pinned(&input, &ReadLimits::default()).is_ok());
             let error = read_fails_without_completion(&input);
+            assert!(error.contains("events.ndjson.zst"), "{error}");
+            let mut req = request(0, 10);
+            req.scope.instruments.clear();
+            req.scope.lanes.clear();
+            let (_, error) = fails_without_completion(
+                DerivativeWalker::open(vec![input.clone()], req, ReadLimits::default()).unwrap(),
+            );
             assert!(error.contains("events.ndjson.zst"), "{error}");
         } else {
             assert!(
@@ -1579,6 +2115,41 @@ fn mixed_profiles_preserve_pins_but_cannot_mint_complete_source_capability() {
     };
     canonical(source.path(), 10, 20, 4, &[row("kalshi", 12, "book")], true);
     let new = build(source.path(), out.path(), 10, 20, &mut Fake::new());
+    for empty_scope in [false, true] {
+        let mut req = request(0, 20);
+        if empty_scope {
+            req.scope.instruments.clear();
+            req.scope.lanes.clear();
+        }
+        let (fast, _, fast_done) = drain(
+            DerivativeWalker::open(
+                vec![new.clone(), old.clone()],
+                req.clone(),
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
+        let (projection, _, projection_done) = drain(
+            DerivativeWalker::open_without_input_fastpath(
+                vec![new.clone(), old.clone()],
+                req.clone(),
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
+        let (full, _, full_done) = drain(
+            DerivativeWalker::open_without_input_filter(
+                vec![new.clone(), old.clone()],
+                req,
+                ReadLimits::default(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(fast, full); // schema 3/profile 1 and schema 4/profile 2
+        assert_eq!(projection, full);
+        assert_eq!(projection_done.counts(), full_done.counts());
+        assert_eq!(fast_done.counts(), full_done.counts());
+    }
     let (groups, statuses, done) = drain(
         DerivativeWalker::open(
             vec![new.clone(), old.clone()],
