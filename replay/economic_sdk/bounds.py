@@ -20,7 +20,7 @@ MAX_LINE = 64 * 1024
 MAX_METADATA = 8 * 1024 * 1024
 # Layout-2 entities.json repeats every scope's descriptors, so long events need
 # more than MAX_METADATA. Reason tables and summaries keep MAX_METADATA.
-MAX_ENTITY_TABLE = 256 * 1024 * 1024
+MAX_ENTITY_TABLE = 512 * 1024 * 1024
 MAX_STATE = 512 * 1024 * 1024
 MAX_CONSUMED_LEVELS = 1024
 MAX_SKEW_POINTS = 100_000
