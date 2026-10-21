@@ -401,6 +401,22 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "resolved snapshot conflict"):
             load_snapshot(path.parent)
 
+    def test_snapshot_aggregates_bodies_beyond_the_body_budget(self):
+        # Each Universe body stays within MAX_BYTES; the evidence and the closed
+        # snapshot aggregate up to MAX_OCCURRENCES of them under their own bound.
+        d = detail()
+        with patch("replay.preparation.MAX_BYTES", len(encoded(d))):
+            snapshot = prepare(config(d), self.root / "run", universe=lambda *_: d)
+            self.assertGreater(
+                len((self.root / "run/context.json").read_bytes()), len(encoded(d))
+            )
+            self.assertEqual(load_snapshot(self.root / "run"), snapshot)
+        with (
+            patch("replay.preparation.MAX_SNAPSHOT_BYTES", len(encoded(d))),
+            self.assertRaisesRegex(ProtocolError, "evidence byte budget"),
+        ):
+            prepare(config(d), self.root / "small", universe=lambda *_: d)
+
     def test_closed_schema_and_uncommitted_snapshot(self):
         c = config()
         c["latest"] = True
