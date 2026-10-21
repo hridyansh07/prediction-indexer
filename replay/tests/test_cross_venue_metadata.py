@@ -164,6 +164,11 @@ class MetadataRegressionTests(unittest.TestCase):
             self.assertEqual(entity_tables.preflight(strategy,{"plans":[]},{}),
                              {"entities.json":287_054_103})
 
+    def test_reader_state_bound_admits_the_densest_cover_validation(self):
+        # The same bundle's cover_same validation retained 536,870,943 bytes of reader state.
+        from replay.economic_sdk import bounds
+        self.assertGreater(bounds.MAX_STATE, 536_870_943)
+
     def test_compressed_storage_preserves_early_entity_preflight_before_any_spool(self):
         from replay.streams.protocol import ProtocolError
         with tempfile.TemporaryDirectory() as tmp:
