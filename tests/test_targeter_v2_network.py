@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from analysis.durable_http import HttpRequestError
+from replay.catalog import project_record, projection_sha256
 from targeter.v2.adapters.clients import durable_client
 from targeter.v2.continuity import ContinuityBundle, ContinuityTarget, TerminalProbe
 from targeter.v2.models import CatalogSnapshot, SUPPORTED_VENUES
@@ -40,6 +41,46 @@ class _Client:
 
 
 class DiscoveryConcurrencyTests(unittest.TestCase):
+    def test_parallel_target_records_use_polymarket_v2_delay_projection(self) -> None:
+        catalogs = {
+            venue: snapshot(venue, f"{venue}-event", f"{venue}-market")
+            for venue in SUPPORTED_VENUES
+        }
+        polymarket = catalogs["polymarket"]
+        record = {**polymarket.markets[0].raw, "secondsDelay": 3}
+        catalogs["polymarket"] = replace(
+            polymarket, markets=(replace(polymarket.markets[0], raw=record),)
+        )
+
+        class Adapter:
+            def __init__(self, venue):
+                self.venue = venue
+
+            def discover(self, _client, *, now):
+                return catalogs[self.venue]
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "targeter.v2.run.durable_client", side_effect=lambda *_args, **_kwargs: _Client()
+        ):
+            root = Path(directory)
+            result = run_shadow(
+                strategy=load_strategy(ROOT / "configs/targeter_v2.json"), now=NOW,
+                output_root=root / "runs", cache_root=root / "cache",
+                adapters=tuple(Adapter(venue) for venue in SUPPORTED_VENUES),
+                artifact_format="ndjson",
+            )
+            rows = [
+                json.loads(line)
+                for line in (result.directory / "target_records_polymarket.ndjson").read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["projection_id"], "polymarket.v2")
+            self.assertEqual(project_record("polymarket", row["record"])["secondsDelay"], 3)
+            self.assertEqual(row["projection_sha256"], projection_sha256("polymarket", record))
+            changed_delay = {**record, "secondsDelay": 4}
+            self.assertNotEqual(row["projection_sha256"], projection_sha256("polymarket", changed_delay))
+
     def test_venues_overlap_with_isolated_clients_and_deterministic_reports(self) -> None:
         barrier = threading.Barrier(3, timeout=2)
         completed = {venue: threading.Event() for venue in SUPPORTED_VENUES}
