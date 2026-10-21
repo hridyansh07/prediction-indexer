@@ -78,8 +78,17 @@ class DiscoveryConcurrencyTests(unittest.TestCase):
             self.assertEqual(row["projection_id"], "polymarket.v2")
             self.assertEqual(project_record("polymarket", row["record"])["secondsDelay"], 3)
             self.assertEqual(row["projection_sha256"], projection_sha256("polymarket", record))
+            from universe.derive.execution_terms import target_record_terms
+
+            terms = target_record_terms(row, run_id=result.run_id, venue="polymarket")
+            self.assertEqual(terms["taker_delay_ms"], 3000)
             changed_delay = {**record, "secondsDelay": 4}
             self.assertNotEqual(row["projection_sha256"], projection_sha256("polymarket", changed_delay))
+            limitless_rows = [
+                json.loads(line)
+                for line in (result.directory / "target_records_limitless.ndjson").read_text().splitlines()
+            ]
+            self.assertEqual(limitless_rows[0]["projection_id"], "limitless.v1")
 
     def test_venues_overlap_with_isolated_clients_and_deterministic_reports(self) -> None:
         barrier = threading.Barrier(3, timeout=2)

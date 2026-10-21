@@ -1,6 +1,52 @@
 # Targeter network performance, 2026-10-21
 
-## Objective and result
+## Current-origin verification
+
+The performance branch is now based on `origin/feat/corpus-runner` at
+`2ce0711783dd5a2b0997e7cb9d695c6fe17417db`; the PR targets `feat/corpus-runner`.
+That base already declares `polymarket.v2`, including `secondsDelay`, while
+`origin/master` at `fd85857` still declares v1. The current catalogue projection,
+target-record writer, parsing fixes and consumers are inherited unchanged.
+
+A regression first failed on the older branch because its emitted record named
+`polymarket.v1`. On the current base it verifies the emitted v2 identity,
+`secondsDelay` participation in the hash, strict downstream consumption of
+3 seconds as 3000 ms, and the unchanged `limitless.v1` identity.
+
+| Current-base experiment | Runtime | Completeness | Selected bundles | Polymarket v2 rows |
+|---|---:|---|---:|---:|
+| Local current-origin source | 36.21 s | All three venues complete | 3 | 11 |
+| Current-origin source in `prediction-indexer-capture:targeter-2ce0711` | 38.19 s | All three venues complete | 3 | 11 |
+
+Both fresh runs used `--no-response-cache` and no probe caps. Container timing
+includes startup. Each made 75 Kalshi, eight Polymarket and 15 Limitless
+requests, with `input_complete: true` and no discovery failures. The runs began
+without a committed continuity generation. No production publication or remote
+archival was performed.
+
+The independent reader and strict streaming decoder verified both reports and
+all 11 artifacts in each run. The current Universe execution-terms reader
+accepted all 19 selected target records per run, including all 11 Polymarket
+v2 projections and their record/projection hashes; all 11 observations
+projected to 1000 ms. Limitless selected no live markets in these snapshots;
+its v1 identity is covered offline.
+
+249 focused tests passed, including current Universe execution-term/migration
+and replay catalogue/execution-terms tests. The full host gate ran 1007 tests
+with the same existing macOS stale-retrieval cleanup failure; its test and
+cleanup implementation are unchanged from the base. Rust/UI gates and the full
+Linux suite were not rerun for this base update.
+
+Current preserved evidence is under `/tmp/targeter-performance-current-v2/`:
+`local-runs/20261021T160611.498891Z/`,
+`container-runs/20261021T160803.673976Z/`, `local-independent-audit.json`,
+`container-independent-audit.json`, both `*-run.log` files and `full-tests.log`.
+Audits and timings live outside the committed runs' artifact inventories.
+
+The original master-based measurements below are historical; the fresh
+current-base measurements above are the acceptance evidence for this PR.
+
+## Original objective and measurement history
 
 The user supplied a ten-minute shadow-run baseline from the same Targeter
 implementation, tested roughly one hour before this work, and confirmed that
@@ -53,7 +99,7 @@ Polymarket and 15 Limitless requests, with no request failures. The first run
 decoded approximately 346 MB of Kalshi JSON; compression avoids transferring
 that representation uncompressed.
 
-## Verification
+## Verification of original measurements
 
 - 209 focused offline tests passed, covering targeter discovery, matching,
   selection, publication, retention, replay streaming and durable HTTP retries.
@@ -80,9 +126,11 @@ that representation uncompressed.
 - `git diff --check` passed. Rust and UI gates were not run; their sources and
   interfaces were unchanged. Production publish/deployment were not performed.
 
-## Preserved evidence
+## Original temporary evidence
 
-Each directory contains its normalized run, request/phase measurements and a
+These paths describe the earlier experiments and may not survive temporary
+directory cleanup; current verification paths are listed above. Each original
+directory contained its normalized run, request/phase measurements and a
 separate independent audit. None of the measurement files were added to a
 committed run's inventory.
 

@@ -83,15 +83,16 @@ that nothing was subscribed. Rows are in `target_id` order:
 ```json
 {"version": 1, "run_id": "...", "venue": "...", "target_id": "...",
  "subscription_ids": ["..."], "observed_at": "...", "provenance": "captured",
- "projection_id": "polymarket.v1", "projection_sha256": "...",
+ "projection_id": "polymarket.v2", "projection_sha256": "...",
  "record_sha256": "...", "record": { }}
 ```
 
 `record_sha256` and `projection_sha256` use the canonical JSON encoding (sorted
 keys, compact separators, `ensure_ascii=False`, `allow_nan=False`) from
 `replay/catalog.py`, which owns the projection (the fields the reader consumes)
-beside `_instrument`. `projection_id` and `projection_sha256` are `null` for a
-venue with no declared projection (Kalshi). Rows are written on every run; there
+beside `_instrument`. Polymarket uses `polymarket.v2`, including `secondsDelay`;
+Limitless remains `limitless.v1`. `projection_id` and `projection_sha256` are
+`null` for a venue with no declared projection (Kalshi). Rows are written on every run; there
 is no write-on-change compaction. A selected market missing from the catalogue,
 or without a raw record, is skipped and listed under the report's
 `target_record_diagnostics`. `replay_stream.py` serves the archived target
