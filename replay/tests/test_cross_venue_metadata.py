@@ -144,11 +144,25 @@ class MetadataRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             from replay.streams.protocol import ProtocolError
-            # 70 scopes exceed 8 MiB; the 64 MiB bound itself is pinned byte for byte below.
+            # 70 scopes exceed 8 MiB; the 256 MiB bound itself is pinned byte for byte below.
             with patch("replay.economic_sdk.bounds.MAX_ENTITY_TABLE",8*1024*1024), \
                  self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
                 WideHarness(root,scope_count=70)
             self.assertEqual(list((root/"output").iterdir()),[])
+
+    def test_dense_cover_table_fits_the_entity_bound(self):
+        # A dense corpus bundle's cover_same entities.json needed 127,802,677 bytes.
+        from types import SimpleNamespace
+        from replay.economic_sdk import entity_tables
+        chunk=b"x"*(1024*1024)
+        def chunks(*_):
+            for _ in range(121): yield chunk
+            yield b"x"*(127_802_677-121*len(chunk))
+        strategy=SimpleNamespace(experiment=SimpleNamespace(layout=2))
+        with patch.object(entity_tables,"aggregate_files",return_value=[""]), \
+             patch.object(entity_tables,"table_chunks",chunks):
+            self.assertEqual(entity_tables.preflight(strategy,{"plans":[]},{}),
+                             {"entities.json":127_802_677})
 
     def test_compressed_storage_preserves_early_entity_preflight_before_any_spool(self):
         from replay.streams.protocol import ProtocolError

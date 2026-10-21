@@ -754,6 +754,8 @@ class RunnerConfigTest(unittest.TestCase):
         self.assertEqual(config.orchestration, c.Orchestration(20, 86400, 60))
         self.assertIn("small", config.limits)
         self.assertEqual(config.limits["small"]["publish_batch_entries"], 1024)
+        # Dense corpus bundles publish single entries above 1 MiB (a deep book snapshot).
+        self.assertEqual(config.limits["small"]["max_entry_bytes"], 8 * 1024 * 1024)
         self.assertEqual(
             config.strategies["bundle_coverage"],
             c.StrategyEntry(
