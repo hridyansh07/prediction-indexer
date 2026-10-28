@@ -9,11 +9,14 @@ nothing checking it is how `_lane_of` came to exist twice and be wrong twice.
 
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
 
-from replay.lanes import LANE_RANK, lane_rank
+from replay.lanes import LANE_RANK
+from replay.legacy.order import OrderedTape
+from replay.stream import MemoryByteStreamer
 
 RANK_SOURCE = (
     Path(__file__).resolve().parents[2]
@@ -73,85 +76,36 @@ class LaneRankParityTests(unittest.TestCase):
 
 
 class TieOrderTests(unittest.TestCase):
-    """What the two tie-break rules actually produce, side by side.
-
-    `replay/legacy/order.py` sorts ties on `(order_ns, venue, lane, …)` — plain strings,
-    ascending. This records exactly where that lands relative to the ranked order
-    so the difference is a fact on the record rather than an argument.
-    """
-
-    LANES = (
-        "polymarket",
-        "polymarket_snapshots",
-        "polymarket_sports",
-        "polymarket_rtds",
-        "kalshi",
-        "limitless",
-    )
-
-    @staticmethod
-    def venue_of(lane: str) -> str:
-        # What the envelope carries. All four Polymarket lanes say `polymarket`.
-        return lane.split("_")[0]
-
-    def ranked_order(self) -> list[str]:
-        return sorted(self.LANES, key=lane_rank)
-
-    def string_order(self) -> list[str]:
-        return sorted(self.LANES, key=lambda lane: (self.venue_of(lane), lane))
-
-    def test_the_ranked_order_is_the_spec_order(self):
-        self.assertEqual(
-            self.ranked_order(),
-            [
-                "polymarket",
-                "polymarket_snapshots",
-                "polymarket_sports",
-                "polymarket_rtds",
-                "kalshi",
-                "limitless",
-            ],
+    def test_tape_merges_equal_timestamps_by_lane_then_delivery(self):
+        lanes = (
+            "polymarket", "polymarket_snapshots", "polymarket_sports",
+            "polymarket_rtds", "kalshi", "limitless",
         )
-
-    def test_the_string_order_differs_at_the_venue_level(self):
-        # Alphabetical venues put Polymarket last where the spec puts it first.
+        objects = {}
+        for lane in reversed(lanes):
+            records = []
+            for index in (1, 2):
+                records.append(json.dumps({
+                    "envelope_version": 2,
+                    "delivery_index": index,
+                    "record_id": f"{lane}:{index}",
+                    "visible_ns": 100,
+                    "monotonic_ns": 200 + index,
+                    "venue": lane.split("_")[0],
+                    "stream": "public_book",
+                    "connection_epoch": "epoch",
+                    "local_counter": index,
+                    "source_cursor": None,
+                    "kind": "venue_frame",
+                    "raw_payload": "{}",
+                }).encode() + b"\n")
+            objects[f"lane={lane}/date=2026-01-01/segment.ndjson"] = b"".join(records)
+        tape = OrderedTape(MemoryByteStreamer(objects))
         self.assertEqual(
-            [self.venue_of(lane) for lane in self.string_order()][:1], ["kalshi"]
+            [(item.lane, item.envelope.delivery_index) for item in tape],
+            [(lane, index) for lane in lanes for index in (1, 2)],
         )
-        self.assertEqual(
-            [self.venue_of(lane) for lane in self.ranked_order()][:1], ["polymarket"]
-        )
-
-    def test_the_string_order_also_differs_inside_polymarket(self):
-        # The subtler half. `venue` is `polymarket` for all four lanes, so it
-        # cannot separate them and the `lane` term sorts them alphabetically —
-        # which puts `polymarket_rtds` second where §1 ranks it fourth.
-        polymarket_only = [
-            lane for lane in self.string_order() if self.venue_of(lane) == "polymarket"
-        ]
-        self.assertEqual(
-            polymarket_only,
-            [
-                "polymarket",
-                "polymarket_rtds",
-                "polymarket_snapshots",
-                "polymarket_sports",
-            ],
-        )
-        self.assertEqual(
-            [lane for lane in self.ranked_order() if self.venue_of(lane) == "polymarket"],
-            [
-                "polymarket",
-                "polymarket_snapshots",
-                "polymarket_sports",
-                "polymarket_rtds",
-            ],
-        )
-
-    def test_the_two_orders_are_not_the_same(self):
-        # The claim in one assertion. If `replay/legacy/order.py` is ever switched onto
-        # `lane_rank`, this is the test that has to be revisited deliberately.
-        self.assertNotEqual(self.string_order(), self.ranked_order())
+        self.assertEqual(tape.delivery_breaks, [])
 
 
 if __name__ == "__main__":

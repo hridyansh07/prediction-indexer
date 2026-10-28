@@ -38,9 +38,10 @@ Settled decisions that older material may contradict:
   [`targeter/v2/SELECTION.md`](targeter/v2/SELECTION.md),
   [`targeter/v2/DELIVERY.md`](targeter/v2/DELIVERY.md)). Targeter v1 was
   removed.
-- Pending, not yet implemented work is specified under
-  [`docs/specs/`](docs/specs/). A component README describes what the code does
-  today.
+- [`docs/specs/README.md`](docs/specs/README.md) distinguishes implemented
+  contracts from pending proposals. A component README describes current
+  behavior; [`docs/OPEN_WORK.md`](docs/OPEN_WORK.md) tracks unresolved acceptance
+  and deferred work.
 
 If two still-current specifications genuinely conflict, stop and surface the
 conflict instead of inventing compatibility behavior.
@@ -199,6 +200,7 @@ Read only the rows relevant to the task, but read those documents completely.
 | Replay derivative materialization, normalizers, walker, risk reconstruction | [`engine/README.md`](engine/README.md), [`engine/DERIVATIVES.md`](engine/DERIVATIVES.md) | Rust crate-local tests under `engine/crates/` |
 | Replay Redis delivery, supervisor, bundle runner | [`docs/REPLAY_STREAMS_V1.md`](docs/REPLAY_STREAMS_V1.md), [`docs/REPLAY_SUPERVISOR_V1.md`](docs/REPLAY_SUPERVISOR_V1.md) | `replay/tests/test_streams*.py`, `test_supervisor.py`, `test_bundle_runner.py`; Redis tests need a disposable Redis ≥8.2 |
 | Local replay bench, fixture runs, run comparison | [`docs/LOCAL_REPLAY_BENCH_V1.md`](docs/LOCAL_REPLAY_BENCH_V1.md) | [`docs/STRATEGY_PREPARATION_V1.md`](docs/STRATEGY_PREPARATION_V1.md), [`docs/REPLAY_SUPERVISOR_V1.md`](docs/REPLAY_SUPERVISOR_V1.md), [`replay/fees/README.md`](replay/fees/README.md), `replay/tests/test_bench.py` |
+| Corpus runs, derivative cache, result receipts and deep audits | [`replay/corpus/README.md`](replay/corpus/README.md), [`configs/corpus/README.md`](configs/corpus/README.md) | [`docs/LOCAL_REPLAY_BENCH_V1.md`](docs/LOCAL_REPLAY_BENCH_V1.md), `replay/tests/test_corpus*.py`, `replay/tests/test_derivative_cache.py` |
 | Replay jobs production runtime, preflight, backup, restore, audit | [`docs/REPLAY_JOBS_V1.md`](docs/REPLAY_JOBS_V1.md) §8, [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | `compose.universe.yaml`, `docker/replay-runner.Dockerfile`, `docker/Caddyfile`, `tests/test_replay_operations.py`, `tests/test_deployment.py`; never use retained/live production data |
 | Replay strategy layout and entry points | [`replay/strategies/README.md`](replay/strategies/README.md) | Each strategy's README, SPEC and configuration example; `replay/tests/test_strategy_packages.py` |
 | Cross-venue complete sets and implication covers | [`replay/strategies/cross_venue_arbitrage/SPEC.md`](replay/strategies/cross_venue_arbitrage/SPEC.md), [`replay/strategies/_shared/implication_cover/SPEC.md`](replay/strategies/_shared/implication_cover/SPEC.md) | Economic SDK and outcome-mask specs; `replay/tests/test_cross_venue_arbitrage.py`, `test_implication_cover.py` |
@@ -211,7 +213,7 @@ Read only the rows relevant to the task, but read those documents completely.
 | Outcome spaces, masks, claims, event relationships | [`analysis/README.md`](analysis/README.md) | [`universe/README.md`](universe/README.md) for claim storage, `tests/test_outcome_space.py`, `tests/test_masks.py`, `tests/test_claims.py` |
 | Universe event store, API, bundle history, outcomes, Replay job control plane | [`universe/README.md`](universe/README.md) | `tests/test_event_universe_store.py`, `tests/test_universe_outcomes.py`, `tests/test_universe_layout.py`, `tests/test_replay_jobs*.py` |
 | Game-state pulls, scheduling, event-keyed raw receipts and timelines | [`gamestate/README.md`](gamestate/README.md), [`scripts/KALSHI_GAME_STATE_PULL_V1.md`](scripts/KALSHI_GAME_STATE_PULL_V1.md) | `tests/test_kalshi_game_state.py`, `tests/test_gamestate_scheduled.py` |
-| Pending specifications | [`docs/specs/`](docs/specs/) | the component README the spec extends |
+| Extension contracts, pending proposals and acceptance | [`docs/specs/README.md`](docs/specs/README.md), [`docs/OPEN_WORK.md`](docs/OPEN_WORK.md) | the owning component README |
 
 ## 5. Component boundaries
 
@@ -266,6 +268,7 @@ Full gate:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests
+.venv/bin/python -m unittest discover -s replay/tests
 ```
 
 ### Rust ingester/finalizer

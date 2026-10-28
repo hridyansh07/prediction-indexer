@@ -1,8 +1,8 @@
 # Venue event time in normalized derivatives
 
 Status: **implemented; offline, retained materialization/Risk acceptance, and
-Linux Redis/strategy smoke verified.** Strategy run scope and the October 3
-metadata-cap limitation are recorded in [the verification report](VENUE_EVENT_TIME_REVIEW.md).
+Linux Redis/strategy smoke verified.** Remaining acceptance scope and deployment
+limits are recorded in [open work](../OPEN_WORK.md).
 Scope: Kalshi and Polymarket WebSocket book/trade events. Limitless only takes
 the schema bump. REST audit semantics remain unchanged.
 
@@ -194,7 +194,7 @@ All are offline, hand-authored, contract-shaped payloads.
    - the golden cut includes `venue_time`.
    - `protocol.py` accepts valid values and rejects malformed ones.
 6. **Retained-data acceptance (completed on September 27–28 and October 3
-   fixtures; results in [the verification report](VENUE_EVENT_TIME_REVIEW.md)):**
+   fixtures; strategy-smoke scope is recorded in [open work](../OPEN_WORK.md)):**
    - re-materialize one real bundle from before 2026-09-28 and one from after.
    - Kalshi deltas and trades and Polymarket changes and trades have
      `event_ns` on ≥99.9% of events.

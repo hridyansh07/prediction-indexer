@@ -29,7 +29,7 @@ from archive.storage.base import (
     ObjectStoreError,
     VerificationFailure,
 )
-from encoder import StoredIdentity
+from encoder import StoredIdentity, stored_identity_of
 from replay.jobs.bundle import BundleFailure, BundleReady, NotReady, StaleCache
 from replay.jobs.contracts import (
     MAX_BUNDLE_RECEIPT_BYTES,
@@ -947,13 +947,8 @@ def _archive_files(root: Path):
 
 
 def _identity(path: Path) -> StoredIdentity:
-    digest = hashlib.sha256()
-    length = 0
     with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-            length += len(chunk)
-    return StoredIdentity(digest.hexdigest(), length)
+        return stored_identity_of(source)
 
 
 def _stage_identities(root: Path, row):

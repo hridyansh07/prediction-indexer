@@ -2,10 +2,9 @@
 
 import hashlib
 import json
-from pathlib import Path
 
 from replay.fees.artifacts import MAX_BYTES, build_catalog, load_catalog, parse_canonical, source_from_bytes
-from replay.fees.domain import canonical, tree
+from replay.fees.domain import tree
 from replay.fees.schedules import Catalog, Schedule, Polymarket, Rounding, Kalshi, LimitlessClob
 from replay.preparation import encoded
 from replay.streams.protocol import obj, require

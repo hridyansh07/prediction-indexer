@@ -1,9 +1,10 @@
 # Universe offline migrations V1
 
-Status: **proposed**. Lifts the "no in-place migrations" rule for the Event Universe
-database ([universe/README.md](../../universe/README.md),
-[universe/schema/README.md](../../universe/schema/README.md)) and defines the first two
-migrations:
+Status: **implemented**. The Event Universe database supports offline copy-based
+migrations ([universe/README.md](../../universe/README.md),
+[universe/schema/README.md](../../universe/schema/README.md)). Production-copy
+verification and rollout remain operator gates (§4–§5), tracked in
+[open work](../OPEN_WORK.md). The supported migrations are:
 
 - **m1** totals direction: schema `user_version` 6 → 7
   ([UNIVERSE_TOTALS_DIRECTION_V1.md](UNIVERSE_TOTALS_DIRECTION_V1.md)).
@@ -114,16 +115,20 @@ at v7. A test compares `sqlite_master`.
   call the projection's own `_corrected_totals_parameters`. Use the same function,
   not a copy.
   - Its inputs are the row's `title` and `outcome_labels_json`, plus the event
-    participants that ingestion passes (`_event_participants`). The step takes
-    those from the same stored source that ingestion's context carries.
+    participants that ingestion passes (`_event_participants`). Complete contexts
+    supply participants; unselected/context-less candidates fall back to
+    `umbrella_events.participants_json`. All available sources must agree after
+    normalization. The summary counts `context` versus `umbrella` sources.
   - If a market's participants can't be reconstructed, the step aborts and names
     the market, rather than guessing.
 - **Corrected rows:** `parameters_json` gets the corrected direction. A correction
   row goes into `universe_run_projection_corrections` for each run in which
   ingestion would have recorded one.
-  - If per-run membership can't be reconstructed exactly from stored rows, the
-    step records the correction for every run with a `selected_market_occurrences`
-    row for that market. §4 reports any difference.
+  - Membership uses complete contexts, otherwise candidate eligible IDs or
+    exclusions. When those cannot prove exact membership, the step uses the
+    event's candidate-decision runs within the market's inclusive first/last-seen
+    span and names the market in `correction_membership_fallback`. It does not
+    fall back to selected occurrences, which omit unselected candidates.
 - **Claims:**
   - For the bundles containing a corrected market, the step re-derives claims and
     verification relations through `project_claims` / `rebuild_bundle` with the
@@ -133,20 +138,27 @@ at v7. A test compares `sqlite_master`.
     `last_seen_run_id` keep the span of the markets' occurrences.
   - A `claim_classes` row left unreferenced is deleted only if ingestion would
     never have created it.
+  - Context-less reconstruction uses stored event/market rows, participant
+    evidence and candidate exclusions. Missing report relations remain visibly
+    unavailable: preserve existing relations touching the event and their claim
+    endpoints, emit no new relations for it, and list it in
+    `relations_not_rederived`. This gap does not abort m1.
+  - Market-projection hashes stay unchanged. `projection_row_count` accounts for
+    correction rows and canonical-market merge/split deltas; the summary records
+    nonzero per-run deltas. Rewritten claim/relation counts measure removed plus
+    added row values, not upsert attempts.
 - **Summary:** the markets examined and changed, by venue; correction rows written;
   claims and relations rewritten; and the changed list
   (`venue:venue_market_id`, `report_value → projected_value`).
 
 ### 2.4 Expected result
 
-The changed list equals the acceptance set in UNIVERSE_TOTALS_DIRECTION_V1 "Known
-gaps":
-
-- the 7 Kalshi `total_maps` markets;
-- the 3 Limitless Sunderland markets;
-- and, decided by the rule, the 2 uninspected Sunderland bundles.
-
-Anything else stops the deployment until it has been reviewed.
+The reviewed full-file expectation is 16 Kalshi and 4 Limitless corrections,
+all under → over, including unselected candidates. This is an expectation for
+the reviewed snapshot, not a production configuration or a unit-test acceptance
+claim. Verify the actual production-copy diff and review changes outside the
+expected set before deployment. Lost context, exact candidate membership and
+venue-specific labels remain explicit serving-equivalence limits.
 
 ## 3. m2: execution terms (7 → 8)
 
@@ -192,25 +204,17 @@ Anything else stops the deployment until it has been reviewed.
   one row per (run, venue, venue_market_id), with `taker_delay_ms` and
   `observed_at`. Its foreign key limits rows to `selected_market_occurrences`.
 - It fills the table from §3.1 and sets `user_version` 8.
-- Ingestion of new runs fills the same table with d0517ea sync semantics, including
+- Ingestion of new runs fills the same table with sync semantics, including
   Kalshi/Limitless observed-null rows, so fresh v8 ingestion and migration produce
   identical rows and outcomes v2 documents. `migrate --to 8` from v6 runs m1 then
   m2; a failed m2 leaves committed m1 and a v7 destination.
 
 ### 3.3 Not the public API
 
-The public Gamma API still serves closed markets with `secondsDelay`. Checked: market
-3580378, closed on 15 Aug, returns 1, and the archived record from that run says 1.
-It is not the source, for three reasons:
-
-- it gives only today's value, not the per-run history that the outcomes document's
-  `changes` are built from;
-- 25,194 Polymarket markets is many paced requests, about the same time as reading
-  the archive;
-- an API value is not archived evidence.
-
-`universe.tools.check_execution_terms` (optional) compares a sample of migrated
-markets with the API and only reports. It writes nothing.
+Current public API responses cannot establish archived per-run history. The
+outcomes document's `changes` must come from verified target records; a fresh
+API value never substitutes for missing archive evidence. No API probe is part
+of migration or its offline tests.
 
 ### 3.4 Command and environment
 
@@ -272,8 +276,8 @@ m1 alone needs no archive environment. Tests use disposable local stores only.
 
 1. Build the image. Pause the sync and game-state cron entries and wait for running
    jobs.
-2. On the VM, run `migrate --to N` from the live file into
-   `/srv/event-universe/build7/`. The live server keeps serving while this runs.
+2. On the VM, run `migrate --to N` from the live file into a new staging file.
+   The live server keeps serving while this runs.
    Check §4.2.
 3. Stop `event-universe`. Rename the live file to
    `event-universe.sqlite3.v<old>-retired`. Move the migrated file into place and
@@ -283,13 +287,12 @@ m1 alone needs no archive environment. Tests use disposable local stores only.
 m1 output remains v7 and is readable by the prior v7 image; this integration's
 server requires v8. m2 upgrades an m1-only v7 file to v8 the same way.
 
-## 6. Rules after this spec
+## 6. Schema-change rules
 
-- "No in-place migrations" becomes: **"Schema changes ship with an offline migration
+- **Schema changes ship with an offline migration
   under this spec or require a rebuild. A migration never runs inside the server and
-  never modifies the live file."**
-- `universe/README.md`, `universe/schema/README.md` and `docs/DEPLOYMENT.md` "Safe full
-  rebuild ordering" are updated to say so.
+  never modifies the live file.** This also governs `universe/README.md`,
+  `universe/schema/README.md` and `docs/DEPLOYMENT.md` rebuild ordering.
 - A rebuild stays the canonical answer when a migration's inputs aren't in the
   database or the archive's small artifacts. It is also the answer when serving
   equivalence can't be shown on a short range.

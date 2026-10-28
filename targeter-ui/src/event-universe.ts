@@ -1,5 +1,3 @@
-export const EVENT_UNIVERSE_SCHEMA_VERSION = 6 as const;
-
 export type UniverseSort = 'activation' | 'selected';
 export type OccurrenceKind = 'complete' | 'retained';
 export type SelectionDisposition = 'held_current_candidate' | 'retained' | null;
@@ -114,49 +112,6 @@ export interface UniverseBundlePage {
   next_cursor: string | null;
 }
 
-export interface UniverseRun {
-  run_id: string;
-  generated_at: string;
-  generated_at_ns: number;
-  input_complete: boolean;
-  report_version: 3;
-  strategy_version: number;
-  manifest_key: string;
-  manifest_sha256: string;
-  manifest_byte_length: number;
-  report_key: string;
-  report_sha256: string;
-  report_byte_length: number;
-  report_decoded_sha256: string;
-  report_decoded_byte_length: number;
-  projection_version: 1;
-  projection_sha256: string;
-  projection_row_count: number;
-  indexed_at_ns: number;
-}
-
-export interface UniverseAudit {
-  run_id: string;
-  ok: boolean;
-  projection_version: number;
-  stored_sha256: string;
-  actual_sha256: string;
-  stored_row_count: number;
-  actual_row_count: number;
-  selection_row_count: number;
-  retirement_row_count: number;
-  contexts_ok: boolean;
-}
-
-export interface UniverseRunDetail extends UniverseRun {
-  audit: UniverseAudit;
-}
-
-export interface UniverseRunPage {
-  runs: UniverseRun[];
-  next_cursor: string | null;
-}
-
 export interface UniverseFreshness {
   state: 'current' | 'late' | 'unavailable';
   expected_run_seconds: number;
@@ -201,17 +156,6 @@ export interface UniverseEvent {
   venue_count?: number;
   market_count?: number;
   selected_run_count?: number;
-}
-
-export interface UniverseEventPage {
-  events: Array<
-    UniverseEvent & {
-      venue_count: number;
-      market_count: number;
-      selected_run_count: number;
-    }
-  >;
-  next_cursor: string | null;
 }
 
 export interface UniverseCanonicalMarket {
@@ -290,52 +234,6 @@ export interface UniverseEventDetail {
   }>;
 }
 
-export interface UniverseVenueMarket {
-  venue: string;
-  venue_market_id: string;
-  venue_event_id: string;
-  event_id: string;
-  market_id: string;
-  market_template_version: number;
-  outcome_space_version: number;
-  canonical_class: string;
-  market_type: string;
-  scope: string;
-  title: string;
-  parameters: Record<string, unknown>;
-  subscription_ids: string[];
-  outcome_labels: string[];
-  status: string;
-  accepting_orders: boolean;
-  rules_hash: string | null;
-  rule_template_id: string | null;
-  source_ref: string;
-  created_at: string | null;
-  volume_24h: number | null;
-  volume_total: number | null;
-  volume_total_usd: number | null;
-  liquidity: number | null;
-  first_seen_run_id: string;
-  last_seen_run_id: string;
-}
-
-export interface UniverseMarketDetail {
-  market: UniverseCanonicalMarket;
-  venue_markets: UniverseVenueMarket[];
-  selections: Array<{
-    run_id: string;
-    generated_at: string;
-    bundle_id: string;
-    venue: string;
-    venue_market_id: string;
-    continuity_score: number;
-    selection_reason: UniverseSelectedMarket['selection_reason'];
-    origin_run_id: string;
-  }>;
-  claims: UniverseClaimSummary[];
-  relations: UniverseClaimRelation[];
-}
-
 export interface UniverseClaimDetail {
   claim: {
     claim_id: string;
@@ -380,15 +278,6 @@ export interface UniverseClaimMarketPage {
     last_seen_run_id: string;
   }>;
   next_cursor: string | null;
-}
-
-export interface UniverseRelationshipTypeCatalog {
-  relationship_type_catalog_version: 2;
-  types: Array<{
-    type: string;
-    directed: boolean;
-    member_roles: string[];
-  }>;
 }
 
 export interface UniverseTargeterDecision {
@@ -439,43 +328,6 @@ export interface UniverseTargeterRunDetail {
   decisions: UniverseTargeterDecision[];
   events: UniverseEvent[];
   selected_markets: UniverseSelectedMarket[];
-}
-
-export interface UniverseHealth {
-  status: 'ok' | 'degraded';
-  schema_version: typeof EVENT_UNIVERSE_SCHEMA_VERSION;
-  latest_run: {
-    run_id: string;
-    generated_at: string;
-    indexed_at_ns: number;
-    input_complete: boolean;
-    age_seconds: number;
-    stale_after_seconds: number;
-    stale: boolean;
-  } | null;
-  counts: {
-    targeter_runs: number;
-    selection_occurrences: number;
-    bundle_retirements: number;
-    bundle_contexts: number;
-    context_targets: number;
-    umbrella_events: number;
-    canonical_markets: number;
-    venue_markets: number;
-    claim_classes: number;
-  };
-  /**
-   * Claim coverage the recomputation did not reach. Zero on a healthy build;
-   * non-zero means reduced coverage rather than ordinary absence.
-   */
-  claim_coverage: {
-    relation_shortfall: number;
-    unreconstructed_bundles: number;
-    runs_with_shortfall: number;
-  };
-  sync: {
-    pending_failures: number;
-  };
 }
 
 export interface UniverseFilters {

@@ -14,7 +14,6 @@ from splices.kalshi.auth import (
     WEBSOCKET_SIGNING_PATH,
     KalshiCredentials,
     KalshiCredentialsError,
-    credentials_available,
     load_credentials,
     load_private_key,
     signing_string,
@@ -190,9 +189,6 @@ class KeyLoadingTests(unittest.TestCase):
             env={ENV_KEY_ID: "from-env", ENV_PRIVATE_KEY_PATH: str(path)}, dotenv_path=dotenv
         )
         self.assertEqual(credentials.key_id, "from-env")
-
-    def test_availability_check_never_raises(self) -> None:
-        self.assertFalse(credentials_available(env={}))
 
 
 if __name__ == "__main__":

@@ -71,16 +71,6 @@ impl ContinuityCause {
             Self::Conflict { .. } => "conflict",
         }
     }
-
-    /// Whether this cause means the book on this epoch can no longer be trusted.
-    pub fn stales_the_epoch(&self) -> bool {
-        matches!(
-            self,
-            Self::GapProven { .. }
-                | Self::CursorWentBackwards { .. }
-                | Self::LocalCounterBroken { .. }
-        )
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

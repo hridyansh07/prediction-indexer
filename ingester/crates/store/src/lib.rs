@@ -189,9 +189,6 @@ impl<T> CommittedFact<T> {
     pub fn value(&self) -> &T {
         &self.value
     }
-    pub fn into_value(self) -> T {
-        self.value
-    }
 }
 
 impl<T> Committed<T> for CommittedFact<T> {

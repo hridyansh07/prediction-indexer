@@ -1,6 +1,8 @@
 # Probe exit source: unwind into the acquired book's real bids
 
-Status: **approved for implementation**. Amends
+Status: **implemented**, including §8's bounded exits and uncovered sold excess.
+The defect descriptions record pre-fix behavior; final compatibility also
+includes [optional legacy probes](LEGACY_PROBE_RETENTION_V1.md). Amends
 [EXECUTION_DELAY_V1.md](EXECUTION_DELAY_V1.md) §2.5 (excess and leg loss) and
 [STRATEGY_EXECUTION_REALISM_V1.md](STRATEGY_EXECUTION_REALISM_V1.md) §2 (exit
 ladders). Fixes audit finding R12. Also sets the Polymarket unknown-delay default
@@ -56,8 +58,8 @@ book's own native bids**, at that leg's arrival time.
   sold leg with probes enabled fails closed at bind time with
   `"probe exit unsupported for Kalshi sold leg"`, rather than reading a
   ladder that is always empty.
-- Exit walks stay best-first, bounded by `max_levels + 1`, with no limit price,
-  exactly as today. Only the book and ladder they read change.
+- Exit walks stay best-first with no limit price. The final rule in §8 caps
+  saved/walked exit depth at `max_levels` and treats the rest as a shortfall.
 
 ## 3. Interfaces
 
@@ -90,10 +92,12 @@ book's own native bids**, at that leg's arrival time.
 
 ## 4. Versions and compatibility
 
-- Policies cross-venue 4, multi-market 2, implication covers 4 have produced no
-  retained corpus result yet. They change in place, with no new policy version.
-  Old policies (cross 3/2, multi 1, covers 3) are byte-identical: they have no
-  probes.
+- This amendment keeps the execution-realism versions cross-venue 4,
+  multi-market 2 and implication covers 4. Earlier policies preserve their
+  schemas and bytes. Legacy fill policies may explicitly enable probes; those
+  retain the SDK's entry-source reverse exit mapping, as specified in
+  [LEGACY_PROBE_RETENTION_V1.md](LEGACY_PROBE_RETENTION_V1.md). Sweep policies
+  do not admit fills or probes.
 - The A1 SDK default hook keeps today's behaviour for any other probe user, so
   existing A1 probe goldens that use non-Kalshi books stay byte-identical.
 
@@ -152,8 +156,8 @@ Per AGENTS.md, write the regressions first and show them failing on
   `test_same_venue_multi_market`, `test_implication_cover`,
   `test_strategy_packages`, `test_economic_sdk_port`, `test_streams`. Then the full
   Python gate.
-- The validation document (`STRATEGY_EXECUTION_REALISM_VALIDATION.md`) gains an
-  R12 section: before/after failure evidence and the test list.
+- Preserve the falsifying regressions and independent-reader controls. Remaining
+  retained-data acceptance is tracked in [open work](../OPEN_WORK.md).
 - No corpus, bench, service or production-data run is part of this change.
 
 ## 8. Addendum: bounded exit walks and uncovered sold excess
