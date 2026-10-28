@@ -342,13 +342,6 @@ def compile_mask(market: Mapping[str, Any], space: OutcomeSpace) -> Mask:
     )
 
 
-def compile_masks(
-    markets: Sequence[Mapping[str, Any]],
-    space: OutcomeSpace,
-) -> list[Mask]:
-    return [compile_mask(market, space) for market in markets]
-
-
 def relationship(
     left: Mask,
     right: Mask,

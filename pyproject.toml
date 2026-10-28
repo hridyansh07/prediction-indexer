@@ -9,7 +9,6 @@ description = "Durable prediction-market discovery and partition analysis"
 requires-python = ">=3.11"
 dependencies = [
   "requests>=2.32,<3",
-  "pyarrow>=17",
   "websockets>=15",
   "python-socketio[asyncio_client]>=5",
   "cryptography>=42",

@@ -1,7 +1,6 @@
 """Outcome warm-up and preparation using exported configuration only."""
 
 from collections import Counter
-from pathlib import Path
 import time
 from urllib.error import HTTPError
 from urllib.parse import quote

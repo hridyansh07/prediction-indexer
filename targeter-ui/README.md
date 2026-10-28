@@ -34,7 +34,7 @@ sessions are removed immediately; session tokens must never be logged.
 The targets and decisions views resolve the newest complete run through:
 
 ```text
-GET /api/event-universe/v1/targeter/status?limit=5
+GET /v1/targeter/status?limit=5
 ```
 
 TanStack React Query deduplicates in-flight browser requests. Status is fresh for
@@ -48,7 +48,7 @@ current complete target summary. Current targets and decisions fetch the full
 run on demand from:
 
 ```text
-GET /api/event-universe/v1/targeter/runs/<run_id>
+GET /v1/targeter/runs/<run_id>
 ```
 
 They use `current_complete_run.run_id` and render the run's compact embedded

@@ -181,6 +181,8 @@ executed trades.
 | Universe | [`universe/README.md`](universe/README.md) |
 | Normalizers, derivatives, risk | [`engine/README.md`](engine/README.md) |
 | Replay and strategies | [`replay/README.md`](replay/README.md) |
+| Corpus runs and audits | [`replay/corpus/README.md`](replay/corpus/README.md) |
 | Outcome spaces and masks | [`analysis/README.md`](analysis/README.md) |
 | Deployment and operations | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), [`docs/RUNBOOK.md`](docs/RUNBOOK.md) |
-| Pending specifications | [`docs/specs/`](docs/specs/) |
+| Extension contracts and pending proposals | [`docs/specs/README.md`](docs/specs/README.md) |
+| Outstanding acceptance and deferred work | [`docs/OPEN_WORK.md`](docs/OPEN_WORK.md) |

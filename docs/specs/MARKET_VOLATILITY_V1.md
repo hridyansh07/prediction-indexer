@@ -1,9 +1,11 @@
 # Market volatility in the market profile
 
-Status: **proposed**. Adds a `volatility` group to the market profile, policy
+Status: **implemented**. The [precise contract](MARKET_VOLATILITY_V1_CONTRACT.md)
+defines final row shapes, units and bounds; retained acceptance remains in
+[open work](../OPEN_WORK.md). Adds a `volatility` group to the market profile, policy
 version 2 ([MARKET_PROFILE_V2.md](MARKET_PROFILE_V2.md),
 [replay/strategies/market_profile/README.md](../../replay/strategies/market_profile/README.md)).
-Companion specs: [EXECUTION_DELAY_SDK_V1.md](EXECUTION_DELAY_SDK_V1.md) and
+Companion specs: [EXECUTION_DELAY_V1.md](EXECUTION_DELAY_V1.md) and
 [STRATEGY_EXECUTION_REALISM_V1.md](STRATEGY_EXECUTION_REALISM_V1.md).
 
 ## 0. Why
@@ -79,21 +81,22 @@ indices are derived by consumers as sums over consecutive buckets. A 5-minute
 moving RMS at 1 s is `sqrt(Σ sum_sq4 / Σ n) / 2` over 5 buckets. Rows are ordered
 by (scope, bucket, type, book).
 
-### 2.1 Wire v3 (REPLAY_THROUGHPUT_V1 T1)
+### 2.1 Sparse delivery
 
-The sample grid is a clock, not a cut stream. Under wire v3 most cuts are not
-published, so samples are **caught up**:
+The sample grid is a clock, not a cut stream. Under the current
+[wire V4 sparse delivery](../REPLAY_STREAMS_V1.md), most cuts are not published,
+so samples are **caught up**:
 
 - before a cut with time `> s` refreshes state, every grid instant ≤ `s` that is not
   yet sampled reads the current state;
 - the terminal flush samples the rest of the scope.
 
 This is exact, because an omitted cut changes no planned book. The group declares
-no retained boundaries; a 250 ms grid there would undo T1. Bucket rows count
-`top_updates` and `mid_changes` from top-of-book changes of planned books, which are
-identical under v2 and v3.
+no retained boundaries; a 250 ms retention grid would defeat sparse delivery.
+Bucket rows count `top_updates` and `mid_changes` from top-of-book changes of
+planned books, which are identical for full-cut and sparse-cut delivery.
 
-A test publishes the same tape at v2 and at v3 and requires identical
+A test publishes the same tape with full and sparse cuts and requires identical
 `volatility.ndjson.zst` bytes.
 
 ## 3. Complete-set gap series
@@ -167,7 +170,7 @@ long run. Parity tests in the engine repository should feed a recorded
   sample. The reader must pass.
 - Report per game and per market type the 1 s and 3 s RMS move and jump rates.
 - Report per gap pair the 1 s and 3 s gap RMS against that pair's cross-venue
-  delayed-fill leg loss (EXECUTION_DELAY_SDK_V1), as a first check that gap
+  delayed-fill leg loss (EXECUTION_DELAY_V1), as a first check that gap
   volatility explains leg risk.
 
 ## 8. Not in V1

@@ -27,15 +27,16 @@ encoder/             the shared Zstandard codec (Python, Rust, Node)
 archive/             raw/canonical archivers, local and GCS object stores, receipts, reapers
 universe/            event store, bundle history, outcomes, Replay jobs API
 engine/              Rust: Replay domain, venue normalizers, derivatives, risk, Redis transport
-replay/              current strategy runtime, SDKs, bench and jobs
+replay/              current strategy runtime, SDKs, bench, corpus and jobs
   strategies/        per-strategy code, readers, configs and docs
+  corpus/            resumable retired-bundle runs, receipts and deep audits
   legacy/            original raw-envelope replay and five-gate audits
 analysis/            outcome spaces, masks and claims shared by targeter, universe, replay
 targeter-ui/         web UI for the Universe and Replay
 configs/             Targeter strategy, replay runner, bench and strategy examples
 docker/              Dockerfiles, Caddyfile
 scripts/             archive probe, codec fixtures, coverage backfill, bundle runner
-docs/                deployment, runbook, pending specs (docs/specs/)
+docs/                deployment, runbook, extension contracts and open work
 ```
 
 ## Running
@@ -75,6 +76,8 @@ Replay strategies run locally through the bench:
 ```
 
 See [`replay/README.md`](replay/README.md).
+Resumable corpus runs and deep audits are documented in
+[`replay/corpus/README.md`](replay/corpus/README.md).
 
 ## Tests
 
@@ -104,7 +107,9 @@ the compression ratio and decode ceiling.
 | Universe | [`universe/README.md`](universe/README.md) |
 | Normalizers, derivatives, risk | [`engine/README.md`](engine/README.md), [`engine/DERIVATIVES.md`](engine/DERIVATIVES.md) |
 | Replay and strategies | [`replay/README.md`](replay/README.md) |
+| Corpus runs and audits | [`replay/corpus/README.md`](replay/corpus/README.md), [`configs/corpus/README.md`](configs/corpus/README.md) |
 | Outcome spaces, masks, claims | [`analysis/README.md`](analysis/README.md) |
 | UI | [`targeter-ui/README.md`](targeter-ui/README.md) |
 | Deployment, operations | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), [`docs/RUNBOOK.md`](docs/RUNBOOK.md) |
-| Pending specifications | [`docs/specs/`](docs/specs/) |
+| Extension contracts and pending proposals | [`docs/specs/README.md`](docs/specs/README.md) |
+| Outstanding acceptance and deferred work | [`docs/OPEN_WORK.md`](docs/OPEN_WORK.md) |

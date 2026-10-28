@@ -1,10 +1,14 @@
 # Strategy changes for execution realism
 
-Status: **proposed**. Applies the mechanisms of
-[EXECUTION_DELAY_SDK_V1.md](EXECUTION_DELAY_SDK_V1.md) and
+Status: **producer implemented**. The
+[producer contract](STRATEGY_EXECUTION_REALISM_CONTRACT.md) defines current
+schemas and compatibility. Research consumption is a separate lineage; site UI
+is deferred, and retained acceptance/full corpus execution remain in
+[open work](../OPEN_WORK.md). Applies the mechanisms of
+[EXECUTION_DELAY_V1.md](EXECUTION_DELAY_V1.md) and
 [MARKET_VOLATILITY_V1.md](MARKET_VOLATILITY_V1.md) to the corpus strategies, the
-research build and the corpus run. It is the last set of changes before the full
-corpus rerun that sizes the $200 live pilot.
+research build and the corpus run. Implementation alone does not establish
+execution viability or authorize a live pilot.
 
 ## 0. Scope
 
@@ -83,7 +87,7 @@ Every fill episode row gains a closed `flags` object:
   venue was seen staying open while the other priced the map as decided, and totals
   are where the direction bug lived. The allowlist is policy, not code.
 - **`stale_legs`** lists the leg indexes whose opening `ages.best_ns`
-  (EXECUTION_DELAY_SDK_V1 §3) exceeds `stale_ms`.
+  (EXECUTION_DELAY_V1 §3) exceeds `stale_ms`.
 
 The strategy policy carries them:
 
@@ -122,8 +126,9 @@ These changes land in `replay/research` on the research-site branch.
 - **No selection by eventual duration:** "lasted ≥ 500 ms" is known only after the
   fact. Its causal replacement is the `confirm_ms` decision. The episode-duration
   tables stay as research context, labelled non-causal.
-- **The site:** the episode panel lists an episode's probes (sizing, `c`, `L`,
-  sequencing, status, matched sets, value). Lens layers and charts are unchanged.
+- **Deferred site UI:** the proposed episode panel would list an episode's probes
+  (sizing, `c`, `L`, sequencing, status, matched sets, value). It is outside the
+  implemented producer contract.
 
 ## 5. Corpus run
 
@@ -131,21 +136,17 @@ The corpus spec's groups take the new strategy policies with §1–§3. The prof
 group adds `volatility`, keeping `transitions` and `levels`. The settings in this
 spec are the reference values, and the corpus key binds them.
 
-A new key and one full rerun follow once all of these are merged:
-
-- this spec, EXECUTION_DELAY_SDK_V1 and MARKET_VOLATILITY_V1;
-- the Universe totals-direction rebuild, with the execution-terms table in the same
-  rebuild;
-- the corpus interrupt fix;
-- PRs #65, #66 and #67.
-
-Soccer runs under the same key once the rebuilt Universe is live.
+The tracked [corpus template](../../configs/corpus/README.md) carries these
+settings. Universe execution terms require schema v8, reached by fresh rebuild
+or the [offline migrations](UNIVERSE_MIGRATIONS_V1.md); totals corrections alone
+are v7. A fresh retained acceptance and full corpus rerun require the complete
+pinned inputs and operator configuration recorded in [open work](../OPEN_WORK.md).
 
 ## 6. Acceptance
 
 1. **Bench run** on the five-bundle sample: every reader passes, including probe and
    volatility recomputation.
-2. **Agreement with the screen:** EXECUTION_DELAY_SDK_V1 §5, with matched steps
+2. **Agreement with the screen:** EXECUTION_DELAY_V1 §5, with matched steps
    equal.
 3. **Reasonableness:**
    - `t10` probes fill more often than `edge` probes at every `L`;
@@ -165,31 +166,15 @@ Soccer runs under the same key once the rebuilt Universe is live.
 - Hard eligibility filters: the engine applies them using these flags.
 - Game-phase conditioning, which needs `game_state.prepare`.
 
-## 8. Implementation order
+## 8. Sparse delivery and shared valuation
 
-These parts can proceed in parallel:
-
-- **A. EXECUTION_DELAY_SDK_V1:**
-  - A1, the SDK: probes and quote ages;
-  - A2, Universe and preparation: execution terms and outcomes v2, on top of
-    `fix/universe-totals-direction`.
-- **B. MARKET_VOLATILITY_V1:** independent of A.
-- **C. This spec:** the `t10` sizing and the `pairing_class` and `settlement_review`
-  flags can start at once. `stale_legs` and probes wait for A1's interfaces. The
-  research build changes can start against hand-written probe rows in A1's
-  documented shape.
-
-Each part needs offline tests first, its reader checks, and the five-bundle bench
-acceptance before review.
-
-Build on the validated throughput stack (REPLAY_THROUGHPUT_V1): the tip
-`perf/t3-derivative-cache`, or its merge. That includes wire v3, so:
+The current [wire V4 contract](../REPLAY_STREAMS_V1.md) preserves sparse timing:
 
 - no new time-based behaviour may rely on cuts at its own times;
-- probes and volatility catch up (EXECUTION_DELAY_SDK_V1 §2.9, MARKET_VOLATILITY_V1
+- probes and volatility catch up (EXECUTION_DELAY_V1 §2.9, MARKET_VOLATILITY_V1
   §2.1);
 - a genuinely new trigger that needs a cut at a time must declare it through
   `retain_boundaries_ns` or `retain_shift_offsets_ns`, or the runtime's coverage
   check fails at bind time;
-- fee valuation must go through the shared `FeeBridge`/`assess_net` path to keep
-  T2's fee memo.
+- fee valuation goes through the shared `FeeBridge`/`assess_net` path and its
+  memoized assessments.

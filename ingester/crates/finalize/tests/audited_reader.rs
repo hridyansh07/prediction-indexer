@@ -404,7 +404,7 @@ fn receipt_documents_are_exact_bounded_and_rechecked_against_selection() {
     let selection = select_canonical_windows(temp.path(), 0, 10, Default::default()).unwrap();
     assert_eq!(
         selection.receipt_documents(bytes.len() as u64).unwrap(),
-        [bytes.clone()]
+        std::slice::from_ref(&bytes)
     );
     assert!(selection.receipt_documents(bytes.len() as u64 - 1).is_err());
     let mut changed = bytes;

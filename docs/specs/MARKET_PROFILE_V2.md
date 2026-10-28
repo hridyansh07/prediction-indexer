@@ -1,7 +1,8 @@
 # Market profile V2: transitions, levels and availability
 
-Status: **proposed.** Base branch: `codex/venue-event-time`, whose cuts carry
-`venue_time` on `market_events`.
+Status: **implemented**, including standalone profile storage (§1.1). Retained
+performance/size acceptance (§9) remains separate from offline contract tests;
+see [`../OPEN_WORK.md`](../OPEN_WORK.md).
 
 This adds three opt-in groups to the market profile
 (`replay/strategies/market_profile`, collector `replay/economic_sdk/profile.py`,

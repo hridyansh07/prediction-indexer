@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterator
 
 from encoder import DEFAULT_BUFFER_BYTES, StoredIdentity
+from archive.common.durable import fsync_directory as _fsync_directory
 from archive.storage.base import (
     CONFORMANCE,
     INDEPENDENT,
@@ -88,14 +89,6 @@ __all__ = [
 def _fsync_file(handle: BinaryIO) -> None:
     handle.flush()
     os.fsync(handle.fileno())
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _hash_file(path: Path, buffer_bytes: int) -> tuple[str, int]:

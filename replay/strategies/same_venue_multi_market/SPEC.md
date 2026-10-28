@@ -3,9 +3,8 @@
 Status: **implemented.** Synthetic contract tests cover enumeration, admission,
 pricing, fills and the reader; one retained fixture run is recorded in §7.
 
-This is the first structural strategy from
-[ECONOMIC_STRATEGY_RESEARCH_V2.md](../../../docs/ECONOMIC_STRATEGY_RESEARCH_V2.md) §1. Several
-separately traded markets on one venue can jointly pay a fixed amount: on a
+Several separately traded markets on one venue can jointly pay a fixed amount,
+using the [outcome-mask contract](../../../docs/OUTCOME_MASKS_V1.md): on a
 best-of-3, "Alpha wins 2–0", "Alpha wins 2–1" and "Beta wins" partition the
 series. A matching engine enforces the relationship inside one market, not
 across markets, so the combined asks can sum below one unit.
