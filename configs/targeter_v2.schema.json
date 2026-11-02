@@ -232,8 +232,9 @@
           }
         },
         "venue_products": {
-          "description": "venue -> product mappings onto canonical classes. At least one venue must be non-empty.",
+          "description": "venue -> product mappings onto canonical classes. Every venue must be named (an empty array disables it); at least one venue must be non-empty.",
           "type": "object",
+          "required": ["kalshi", "polymarket", "limitless"],
           "propertyNames": {"$ref": "#/$defs/venue"},
           "additionalProperties": {
             "type": "array",

@@ -1,6 +1,6 @@
 # Targeter selection config (V1)
 
-Status: **proposed**. Extends [`targeter/v2/SELECTION.md`](../../targeter/v2/SELECTION.md).
+Status: **implemented on feat/targeter-selection-config**. Extends [`targeter/v2/SELECTION.md`](../../targeter/v2/SELECTION.md).
 Schema: [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json).
 
 ## 0. Goal
