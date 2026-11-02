@@ -465,9 +465,9 @@ class PerBundleCapTests(unittest.TestCase):
         candidate = select_targets(self.six(), strategy=strategy, now=NOW).candidates[0]
         self.assertEqual({m.market_type for m in candidate.eligible_markets}, {"series_moneyline"})
 
-    def test_pruning_drops_a_market_left_without_a_partner(self) -> None:
-        # Cap 3 keeps both moneylines plus the lexically first map market, which
-        # has no kept cross-venue partner and is pruned.
+    def test_a_market_that_cannot_bring_its_partner_is_skipped(self) -> None:
+        # Cap 3 keeps both moneylines; the map-1 pair needs two slots, so the
+        # lexically first map market is skipped rather than kept unpartnered.
         candidate = select_targets(self.six(), strategy=v1(per_bundle=3), now=NOW).candidates[0]
         self.assertEqual(
             sorted(m.target_id for m in candidate.eligible_markets),
@@ -476,6 +476,27 @@ class PerBundleCapTests(unittest.TestCase):
         self.assertEqual(
             candidate.market_exclusions["limitless:a-limitless-map_winner-1"],
             ("market_cap_per_bundle",),
+        )
+
+    def test_cap_spends_slots_on_partnered_pairs(self) -> None:
+        # Cap 4 must keep both moneylines plus the map-1 pair. Taking the first
+        # four in order would pick both limitless maps, which have no kept
+        # partner, and leave only the two moneylines.
+        candidate = select_targets(self.six(), strategy=v1(per_bundle=4), now=NOW).candidates[0]
+        self.assertTrue(candidate.eligible)
+        self.assertEqual(
+            sorted(m.target_id for m in candidate.eligible_markets),
+            [
+                "limitless:a-limitless-map_winner-1",
+                "limitless:a-limitless-series_moneyline-",
+                "polymarket:a-polymarket-map_winner-1",
+                "polymarket:a-polymarket-series_moneyline-",
+            ],
+        )
+        dropped = sorted(t for t, why in candidate.market_exclusions.items() if "market_cap_per_bundle" in why)
+        self.assertEqual(
+            dropped,
+            ["limitless:a-limitless-map_winner-2", "polymarket:a-polymarket-map_winner-2"],
         )
 
     def test_cap_that_leaves_one_venue_rejects_the_event(self) -> None:
@@ -533,7 +554,7 @@ class PerBundleCapTests(unittest.TestCase):
             _capped_markets(markets, everyone, 3, load_strategy(STRATEGY_PATH)),
             {"anchor-a", "anchor-b", "low-hot"},
         )
-        # Pruning: a kept market without a partner among the kept set is dropped.
+        # A market joins only next to a kept partner (or together with one).
         sparse = [pair("anchor-a", "anchor-b"), pair("anchor-a", "low-hot")]
         self.assertEqual(
             _capped_markets(markets, sparse, 3, load_strategy(STRATEGY_PATH)),

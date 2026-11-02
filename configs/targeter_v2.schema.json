@@ -106,7 +106,7 @@
           "type": "integer", "minimum": 1
         },
         "maximum_markets_per_bundle": {
-          "description": "Keep at most N markets of each bundle: moneyline anchors first, then market-class priority, activity, target_id. Dropped markets are excluded as market_cap_per_bundle.",
+          "description": "Keep at most N markets of each bundle: moneyline anchors first, then market-class priority, activity, target_id; a market is kept only next to (or together with) a cross-venue partner. Dropped markets are excluded as market_cap_per_bundle.",
           "type": "integer", "minimum": 1
         },
         "maximum_markets": {

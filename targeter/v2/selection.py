@@ -417,31 +417,46 @@ def _capped_markets(
     cap: int,
     strategy: Strategy,
 ) -> set[str]:
-    """Keep the first `cap` markets, then prune markets left without a partner."""
-    ordered = sorted(
-        markets,
-        key=lambda market: (
-            0 if market.market_type in _MONEYLINE_TYPES else 1,
-            -strategy.market_class_priority(market.canonical_class),
-            -_activity(market),
-            market.target_id,
-        ),
-    )
-    kept = {market.target_id for market in ordered[:cap]}
-    pairs = {
-        (_base_market_id(item.left), _base_market_id(item.right))
-        for item in cross_relationships
-    }
-    while True:
-        partnered = {
-            market_id
-            for left, right in pairs
-            if left != right and left in kept and right in kept
-            for market_id in (left, right)
-        }
-        if partnered == kept:
-            return kept
-        kept = partnered
+    """Keep at most `cap` markets, each with a cross-venue partner in the kept set.
+
+    Markets are taken in cap order. A market joins alone when a partner is
+    already kept, or together with its first not-yet-kept partner when both fit;
+    otherwise it is skipped, so no slot is spent on a market left unpartnered.
+    """
+    ordered = [
+        market.target_id
+        for market in sorted(
+            markets,
+            key=lambda market: (
+                0 if market.market_type in _MONEYLINE_TYPES else 1,
+                -strategy.market_class_priority(market.canonical_class),
+                -_activity(market),
+                market.target_id,
+            ),
+        )
+    ]
+    partners: dict[str, set[str]] = {market_id: set() for market_id in ordered}
+    for item in cross_relationships:
+        left, right = _base_market_id(item.left), _base_market_id(item.right)
+        if left != right and left in partners and right in partners:
+            partners[left].add(right)
+            partners[right].add(left)
+    kept: set[str] = set()
+    for market_id in ordered:
+        if len(kept) >= cap:
+            break
+        if market_id in kept:
+            continue
+        if partners[market_id] & kept:
+            kept.add(market_id)
+            continue
+        partner = next(
+            (other for other in ordered if other in partners[market_id] and other not in kept),
+            None,
+        )
+        if partner is not None and len(kept) + 2 <= cap:
+            kept.update((market_id, partner))
+    return kept
 
 
 def _class_priority_values(

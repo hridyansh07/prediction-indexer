@@ -91,12 +91,17 @@ and the scope filter, and before the event gates are evaluated.
    - then market-class priority, descending (§1.3, `default` when unlisted);
    - then activity, descending (the existing `_activity`);
    - then `target_id`, ascending.
-2. Keep the first N.
-3. Repeat until nothing changes: drop any kept market that has no cross-venue,
-   non-`OVERLAP` relationship with another kept market.
-4. Every market dropped by steps 2 or 3 is excluded as
-   `market_cap_per_bundle`.
-5. The event gates (`fewer_than_minimum_eligible_venues`,
+2. Walk that order, while fewer than N are kept. A *partner* is a market with
+   a cross-venue, non-`OVERLAP` relationship to this one.
+   - If a partner is already kept, keep the market.
+   - Otherwise, keep it together with its first not-yet-kept partner in the
+     order, if both fit within N.
+   - Otherwise, skip it.
+
+   Every kept market therefore has a kept partner, and no slot goes to a
+   market that would be left unpartnered.
+3. Every market not kept is excluded as `market_cap_per_bundle`.
+4. The event gates (`fewer_than_minimum_eligible_venues`,
    `no_cross_venue_structural_relationship`) are then evaluated on the kept
    set. A cap that breaks the event rejects it visibly through those reasons.
 
@@ -195,7 +200,7 @@ every addition is optional and existing readers read named fields only.
    class-filtered market, each visible with its reason. The class filter does
    not change the volume gate.
 4. **Per-bundle cap:** anchors are kept first; priority order is respected;
-   pruning drops markets left without a partner; a cap that leaves one venue
+   slots go to partnered pairs, not to unpartnered markets; a cap that leaves one venue
    rejects the event.
 5. **Total cap:** a bundle skipped as `maximum_markets_reached`, and a smaller
    later bundle that is still selected.

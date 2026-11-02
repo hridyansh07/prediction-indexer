@@ -51,7 +51,7 @@ worked example in
 | `scope.sports` | listed sports only; others are rejected `sport_outside_scope` |
 | `scope.games` | esports bundles of other games are rejected `game_outside_scope`; other sports are unaffected |
 | `scope.market_classes` | other markets are excluded `market_class_outside_scope`, after the volume gate and before relationship analysis |
-| `selection.maximum_markets_per_bundle` | keep N markets per bundle (anchors, class priority, activity, `target_id`), then prune markets with no kept cross-venue partner; the rest are excluded `market_cap_per_bundle` |
+| `selection.maximum_markets_per_bundle` | keep at most N markets per bundle, taken in order (anchors, class priority, activity, `target_id`) and only alongside a kept cross-venue partner or together with one; the rest are excluded `market_cap_per_bundle` |
 | `selection.maximum_markets` | bundle-atomic budget on markets across the selection, additive allocation only; a bundle over it is skipped `maximum_markets_reached` |
 | `ranking.keys` / `ranking.priorities` | lexical comparison keys with `asc`/`desc`, and config-supplied integer priorities |
 
