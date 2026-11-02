@@ -60,8 +60,8 @@ Conservative rules the code enforces:
   and ambiguous times are visible false negatives with stable diagnostic codes,
   not guesses. A configured anchor-shaped record that cannot be classified
   makes that venue's catalogue incomplete.
-- **Semantics come from configuration, not prose.** `configs/targeter_v2.json`
-  maps reusable vendor product shapes to canonical classes
+- **Semantics come from configuration, not prose.** The catalogue shipped with
+  Targeter, `targeter/v2/catalogue.json`, maps reusable vendor product shapes to canonical classes
   (`soccer.moneyline_3way`, `soccer.spread`, `soccer.total_goals`,
   `soccer.both_teams_to_score`, `soccer.correct_score`,
   `esports.series_moneyline`, `esports.map_winner`, `esports.total_maps`,

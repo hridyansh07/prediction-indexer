@@ -6,6 +6,7 @@ selection pipeline reads.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import tempfile
@@ -27,6 +28,7 @@ from targeter.v2.domain import (
     ClassificationEvidence,
 )
 from targeter.v2.publication import audit_current_publication, publish_run
+from targeter.v2.publication_validation import PublicationError
 from targeter.v2.registry import StrategyError, load_strategy
 from targeter.v2.run import run_shadow
 from targeter.v2.run_archive import archive_run
@@ -37,6 +39,8 @@ ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_PATH = ROOT / "configs" / "targeter_v2.json"
 EXAMPLE_PATH = ROOT / "configs" / "examples" / "targeter_v2_cs2_single_event.json"
 SCHEMA_PATH = ROOT / "configs" / "targeter_v2.schema.json"
+CATALOGUE_PATH = ROOT / "targeter" / "v2" / "catalogue.json"
+CATALOGUE_SCHEMA_PATH = ROOT / "targeter" / "v2" / "catalogue.schema.json"
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
 START = NOW + timedelta(minutes=50)
 
@@ -113,6 +117,16 @@ def strategy_from(
         target = Path(directory) / "strategy.json"
         target.write_text(json.dumps(document), encoding="utf-8")
         return load_strategy(target)
+
+
+def catalogue_from(mutate: Callable[[dict[str, Any]], None]) -> registry.Strategy:
+    """The shipped strategy resolved against a mutated copy of the catalogue."""
+    document = json.loads(CATALOGUE_PATH.read_text(encoding="utf-8"))
+    mutate(document)
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "catalogue.json"
+        target.write_text(json.dumps(document), encoding="utf-8")
+        return load_strategy(STRATEGY_PATH, catalogue_path=target)
 
 
 def v1(
@@ -828,12 +842,48 @@ class PublicationAcceptsCappedSelectionTests(unittest.TestCase):
             self.assertEqual(audited.run_id, outcome.directory.name)
             self.assertEqual(audited.venue_counts, {"kalshi": 0, "limitless": 2, "polymarket": 2})
 
+    def test_a_run_is_not_published_under_a_different_catalogue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            strategy = v1(per_bundle=2, total=2, scope={"games": [CS2]})
+            groups = catalogs(esports("a", maps=(1, 2)))
+
+            class Adapter:
+                def __init__(self, catalog: CatalogSnapshot) -> None:
+                    self.venue = catalog.venue
+                    self.catalog = catalog
+
+                def discover(self, _client, *, now):
+                    return self.catalog
+
+            adapters = [Adapter(c) for c in groups] + [Adapter(CatalogSnapshot("kalshi", (), ()))]
+            outcome = run_shadow(
+                strategy=strategy,
+                output_root=root / "runs",
+                cache_root=root / "cache",
+                live_root=root / "live",
+                now=NOW,
+                adapters=adapters,
+                client=object(),
+                artifact_format="zstd",
+            )
+            store = LocalObjectStore(root / "store", store_id="selection-config", durability=INDEPENDENT)
+            receipt = archive_run(outcome.directory, store, now=NOW)
+            changed = replace(strategy, catalogue_sha256="0" * 64)
+            with self.assertRaisesRegex(PublicationError, "catalogues differ"):
+                publish_run(
+                    outcome.directory, receipt, store, live_root=root / "live", strategy=changed, now=NOW
+                )
+            self.assertFalse((root / "live" / "targeter-v2" / "current.json").exists())
+
 
 class SchemaSyncTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         cls.defs = cls.schema["$defs"]
+        cls.catalogue_schema = json.loads(CATALOGUE_SCHEMA_PATH.read_text(encoding="utf-8"))
+        cls.catalogue_defs = cls.catalogue_schema["$defs"]
 
     def properties(self, node: dict[str, Any]) -> frozenset[str]:
         self.assertIs(node.get("additionalProperties"), False)
@@ -848,9 +898,10 @@ class SchemaSyncTests(unittest.TestCase):
             "ranking": (ranking, registry.RANKING_KEYS),
             "ranking.keys item": (ranking["properties"]["keys"]["items"], registry.RANKING_KEY_ITEM_KEYS),
             "priorities": (ranking["properties"]["priorities"], registry.PRIORITIES_KEYS),
-            "market class": (self.defs["market_class"], registry.MARKET_CLASS_KEYS),
-            "game family": (self.defs["game_family"], registry.GAME_FAMILY_KEYS),
-            "product mapping": (self.defs["product_mapping"], registry.PRODUCT_MAPPING_KEYS),
+            "catalogue": (self.catalogue_schema, registry.CATALOGUE_KEYS),
+            "market class": (self.catalogue_defs["market_class"], registry.MARKET_CLASS_KEYS),
+            "game family": (self.catalogue_defs["game_family"], registry.GAME_FAMILY_KEYS),
+            "product mapping": (self.catalogue_defs["product_mapping"], registry.PRODUCT_MAPPING_KEYS),
         }
         for name, (node, accepted) in pairs.items():
             with self.subTest(name):
@@ -868,10 +919,24 @@ class SchemaSyncTests(unittest.TestCase):
         }
         venue_set = self.defs["ranking"]["properties"]["priorities"]["properties"]["venue_set"]
         self.assertEqual(set(venue_set["propertyNames"]["enum"]), combos)
-        self.assertEqual(set(self.defs["venue"]["enum"]), set(venues))
-        aliases = self.defs["game_family"]["properties"]["venue_game_aliases"]
-        self.assertEqual(frozenset(aliases["properties"]), frozenset(venues))
-        self.assertEqual(frozenset(self.defs["game_family"]["properties"]["venue_products"]["required"]), frozenset(venues))
+        self.assertEqual(set(self.catalogue_defs["venue"]["enum"]), set(venues))
+        family = self.catalogue_defs["game_family"]["properties"]
+        self.assertEqual(frozenset(family["venue_game_aliases"]["properties"]), frozenset(venues))
+        self.assertEqual(frozenset(family["venue_products"]["required"]), frozenset(venues))
+
+    def test_strategy_schema_names_exactly_the_catalogue_ids(self) -> None:
+        catalogue = registry.load_catalogue()
+        sports = list(catalogue.sports)
+        games = [family.id for family in catalogue.game_families]
+        classes = [definition.id for definition in catalogue.classes]
+        scope = self.defs["scope"]["properties"]
+        priorities = self.defs["ranking"]["properties"]["priorities"]["properties"]
+        self.assertEqual(self.schema["properties"]["sports"]["items"]["enum"], sports)
+        self.assertEqual(scope["sports"]["items"]["enum"], sports)
+        self.assertEqual(scope["games"]["items"]["enum"], games)
+        self.assertEqual(scope["market_classes"]["items"]["enum"], classes)
+        self.assertEqual(priorities["game"]["propertyNames"]["enum"], games)
+        self.assertEqual(priorities["market_class"]["propertyNames"]["enum"], classes)
 
     def test_required_fields_are_required_by_the_loader(self) -> None:
         for field in self.schema["required"]:
@@ -882,10 +947,14 @@ class SchemaSyncTests(unittest.TestCase):
             with self.subTest(selection=field):
                 with self.assertRaises(StrategyError):
                     strategy_from(lambda d, f=field: d["selection"].pop(f))
-        for venue in self.defs["game_family"]["properties"]["venue_products"]["required"]:
+        for field in self.catalogue_schema["required"]:
+            with self.subTest(catalogue=field):
+                with self.assertRaises(StrategyError):
+                    catalogue_from(lambda d, f=field: d.pop(f))
+        for venue in self.catalogue_defs["game_family"]["properties"]["venue_products"]["required"]:
             with self.subTest(venue_products=venue):
                 with self.assertRaises(StrategyError):
-                    strategy_from(lambda d, v=venue: d["game_families"][0]["venue_products"].pop(v))
+                    catalogue_from(lambda d, v=venue: d["game_families"][0]["venue_products"].pop(v))
 
     def test_example_config_loads_and_matches_its_description(self) -> None:
         strategy = load_strategy(EXAMPLE_PATH)
@@ -904,13 +973,59 @@ class SchemaSyncTests(unittest.TestCase):
         ):
             self.assertEqual(getattr(strategy, field), getattr(shipped, field), field)
 
-    def test_example_is_a_full_copy_plus_the_v1_fields(self) -> None:
+    def test_example_is_the_shipped_strategy_plus_the_v1_fields(self) -> None:
         shipped = json.loads(STRATEGY_PATH.read_text(encoding="utf-8"))
         example = json.loads(EXAMPLE_PATH.read_text(encoding="utf-8"))
-        added = {"scope", "ranking"}
-        self.assertEqual(set(example) - set(shipped), added)
+        self.assertEqual(set(example) - set(shipped), {"scope", "ranking"})
         for key in set(shipped) - {"note", "selection"}:
             self.assertEqual(example[key], shipped[key], key)
+
+
+class CatalogueTests(unittest.TestCase):
+    """The venue mapping is static data shipped with Targeter, not strategy."""
+
+    def test_strategy_records_the_catalogue_it_resolved_against(self) -> None:
+        strategy = load_strategy(STRATEGY_PATH)
+        catalogue = json.loads(CATALOGUE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(strategy.catalogue_version, catalogue["version"])
+        self.assertEqual(
+            strategy.catalogue_sha256, hashlib.sha256(CATALOGUE_PATH.read_bytes()).hexdigest()
+        )
+        self.assertEqual([d.id for d in strategy.classes], [c["id"] for c in catalogue["market_classes"]])
+        self.assertEqual([f.id for f in strategy.game_families], [f["id"] for f in catalogue["game_families"]])
+        self.assertEqual(strategy.polymarket_tags, tuple(catalogue["polymarket_tags"]))
+
+    def test_strategy_files_cannot_carry_catalogue_fields(self) -> None:
+        catalogue = json.loads(CATALOGUE_PATH.read_text(encoding="utf-8"))
+        for field in sorted(registry.CATALOGUE_KEYS - registry.TOP_LEVEL_KEYS):
+            with self.subTest(field):
+                with self.assertRaises(StrategyError) as caught:
+                    strategy_from(lambda d, f=field: d.update({f: catalogue[f]}))
+                self.assertEqual(str(caught.exception), f"unknown strategy fields: {field}")
+
+    def test_strategy_sports_must_be_catalogue_sports(self) -> None:
+        with self.assertRaisesRegex(StrategyError, "sports not in the catalogue: tennis"):
+            strategy_from(lambda d: d.update(sports=["esports", "tennis"]))
+
+    def test_only_the_strategy_sports_are_resolved(self) -> None:
+        strategy = strategy_from(lambda d: d.update(sports=["esports"]))
+        self.assertEqual({d.sport for d in strategy.classes}, {"esports"})
+        self.assertEqual(len(strategy.game_families), 4)
+        soccer = strategy_from(lambda d: d.update(sports=["soccer"]))
+        self.assertEqual({d.sport for d in soccer.classes}, {"soccer"})
+        self.assertEqual(soccer.game_families, ())
+        with self.assertRaisesRegex(StrategyError, "scope.games"):
+            strategy_from(lambda d: d.update(sports=["soccer"], scope={"games": [CS2]}))
+
+    def test_catalogue_is_a_closed_schema(self) -> None:
+        with self.assertRaisesRegex(StrategyError, "unknown catalogue fields: bogus"):
+            catalogue_from(lambda d: d.update(bogus=1))
+        with self.assertRaisesRegex(StrategyError, "unknown fields: bogus"):
+            catalogue_from(lambda d: d["market_classes"][0].update(bogus=1))
+        with self.assertRaisesRegex(StrategyError, "catalogue version"):
+            catalogue_from(lambda d: d.update(version=0))
+        with self.assertRaisesRegex(StrategyError, "invalid sport"):
+            catalogue_from(lambda d: d["market_classes"][0].update(sport="tennis"))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -20,10 +21,15 @@ class StrategyError(ValueError):
 # Key sets the loader accepts, shared with tests/test_targeter_v2_selection_config.py
 # so configs/targeter_v2.schema.json can be checked against them.
 TOP_LEVEL_KEYS = frozenset({
-    "version", "sports", "selection", "scope", "ranking", "target_budgets",
-    "polymarket_tags", "limitless_category_ids", "market_classes", "game_families",
-    "known_rule_templates", "participant_aliases", "note",
+    "version", "note", "sports", "selection", "scope", "ranking", "target_budgets",
 })
+# The venue-catalogue mapping is static data shipped with Targeter
+# (targeter/v2/catalogue.json), not part of any strategy file.
+CATALOGUE_KEYS = frozenset({
+    "version", "note", "sports", "polymarket_tags", "limitless_category_ids",
+    "participant_aliases", "known_rule_templates", "market_classes", "game_families",
+})
+DEFAULT_CATALOGUE_PATH = Path(__file__).with_name("catalogue.json")
 SELECTION_KEYS = frozenset({
     "minimum_venues", "preferred_venues", "discovery_horizon_seconds",
     "pre_event_seconds", "run_interval_seconds", "subscription_guard_seconds",
@@ -37,7 +43,6 @@ SCOPE_KEYS = frozenset({"sports", "games", "market_classes"})
 RANKING_KEYS = frozenset({"keys", "priorities"})
 RANKING_KEY_ITEM_KEYS = frozenset({"key", "order"})
 PRIORITIES_KEYS = frozenset({"default", "game", "market_class", "venue_set"})
-# The loader reads exactly these market class fields and ignores any others.
 MARKET_CLASS_KEYS = frozenset({"id", "sport", "market_type", "scope", "venue_patterns"})
 GAME_FAMILY_KEYS = frozenset({
     "id", "sport", "topology", "polymarket_game_tags", "venue_game_aliases", "venue_products",
@@ -155,6 +160,10 @@ class Strategy:
     maximum_markets_per_bundle: int | None = None
     maximum_markets: int | None = None
     ranking: RankingConfig | None = None
+    # The catalogue this strategy was resolved against.
+    catalogue_version: int = 0
+    catalogue_sha256: str = ""
+    catalogue_source: str = ""
 
     @property
     def uses_selection_config(self) -> bool:
@@ -545,47 +554,53 @@ def _load_ranking(
     return RankingConfig(tuple(keys), priorities)
 
 
-def load_strategy(path: Path) -> Strategy:
-    path = Path(path)
+@dataclass(frozen=True)
+class Catalogue:
+    """Static venue-catalogue mapping: what venues call things, not what to select."""
+
+    version: int
+    sha256: str
+    source_path: str
+    sports: tuple[str, ...]
+    polymarket_tags: tuple[str, ...]
+    limitless_category_ids: tuple[int, ...]
+    participant_aliases: Mapping[str, str]
+    classes: tuple[ClassDefinition, ...]
+    game_families: tuple[GameFamily, ...]
+    known_rule_templates: frozenset[str]
+
+
+def _read_json_object(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        data = path.read_bytes()
     except FileNotFoundError as error:
-        raise StrategyError(f"strategy not found: {path}") from error
-    except json.JSONDecodeError as error:
-        raise StrategyError(f"strategy is not valid JSON: {error}") from error
+        raise StrategyError(f"{label} not found: {path}") from error
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StrategyError(f"{label} is not valid JSON: {error}") from error
     if not isinstance(document, dict):
-        raise StrategyError("strategy must be a JSON object")
+        raise StrategyError(f"{label} must be a JSON object")
+    return document, data
 
-    unknown = sorted(set(document) - TOP_LEVEL_KEYS)
+
+def load_catalogue(path: Path = DEFAULT_CATALOGUE_PATH) -> Catalogue:
+    path = Path(path)
+    document, data = _read_json_object(path, "catalogue")
+    unknown = sorted(set(document) - CATALOGUE_KEYS)
     if unknown:
-        raise StrategyError(f"unknown strategy fields: {', '.join(unknown)}")
-
+        raise StrategyError(f"unknown catalogue fields: {', '.join(unknown)}")
+    version = document.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise StrategyError("catalogue version must be a positive integer")
     sports = document.get("sports")
-    if not isinstance(sports, list) or not sports or not all(isinstance(item, str) for item in sports):
-        raise StrategyError("sports must be a non-empty string array")
-    selection = document.get("selection")
-    if not isinstance(selection, dict):
-        raise StrategyError("selection must be an object")
-
-    minimum_venues = _positive_integer(selection, "minimum_venues")
-    preferred_venues = _positive_integer(selection, "preferred_venues")
-    if minimum_venues < 2 or preferred_venues < minimum_venues or preferred_venues > 3:
-        raise StrategyError("venue thresholds must satisfy 2 <= minimum <= preferred <= 3")
-
-    unknown_selection = sorted(set(selection) - SELECTION_KEYS)
-    if unknown_selection:
-        raise StrategyError(f"unknown selection fields: {', '.join(unknown_selection)}")
-    continuity_hold_enabled = selection.get("continuity_hold_enabled")
-    if not isinstance(continuity_hold_enabled, bool):
-        raise StrategyError("continuity_hold_enabled must be a boolean")
-    terminal_clamp_seconds = _positive_integer(selection, "terminal_clamp_seconds")
-    continuity_degraded_after_seconds = _positive_integer(
-        selection, "continuity_degraded_after_seconds"
-    )
-    if continuity_degraded_after_seconds >= terminal_clamp_seconds:
-        raise StrategyError(
-            "continuity_degraded_after_seconds must be less than terminal_clamp_seconds"
-        )
+    if (
+        not isinstance(sports, list)
+        or not sports
+        or not all(isinstance(item, str) and item for item in sports)
+        or len(set(sports)) != len(sports)
+    ):
+        raise StrategyError("catalogue sports must be a non-empty array of unique strings")
 
     raw_classes = document.get("market_classes")
     if not isinstance(raw_classes, list) or not raw_classes:
@@ -599,6 +614,11 @@ def load_strategy(path: Path) -> Strategy:
         if not isinstance(identifier, str) or not identifier or identifier in seen:
             raise StrategyError(f"market class {index} has a missing or duplicate id")
         seen.add(identifier)
+        unknown_class = sorted(set(item) - MARKET_CLASS_KEYS)
+        if unknown_class:
+            raise StrategyError(
+                f"market class {identifier} has unknown fields: {', '.join(unknown_class)}"
+            )
         sport = item.get("sport")
         market_type = item.get("market_type")
         scope = item.get("scope")
@@ -632,16 +652,6 @@ def load_strategy(path: Path) -> Strategy:
         )
 
     game_families = _load_game_families(document, sports)
-
-    budgets = document.get("target_budgets")
-    if not isinstance(budgets, dict) or set(budgets) != {"kalshi", "polymarket", "limitless"}:
-        raise StrategyError("target_budgets must name kalshi, polymarket, and limitless")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in budgets.values()
-    ):
-        raise StrategyError("target budgets must be positive integers")
-    target_budgets = dict(budgets)
 
     tags = document.get("polymarket_tags")
     if not isinstance(tags, list) or not tags or not all(isinstance(item, str) for item in tags):
@@ -680,6 +690,77 @@ def load_strategy(path: Path) -> Strategy:
                 raise StrategyError(f"participant alias {alias!r} maps to more than one preferred name")
             participant_aliases[alias_key] = preferred_key
 
+    return Catalogue(
+        version=version,
+        sha256=hashlib.sha256(data).hexdigest(),
+        source_path=str(path),
+        sports=tuple(sports),
+        polymarket_tags=tuple(tags),
+        limitless_category_ids=limitless_category_ids,
+        participant_aliases=participant_aliases,
+        classes=tuple(classes),
+        game_families=game_families,
+        known_rule_templates=frozenset(known),
+    )
+
+
+def load_strategy(path: Path, *, catalogue_path: Path = DEFAULT_CATALOGUE_PATH) -> Strategy:
+    """Load a strategy file and resolve it against the shipped catalogue.
+
+    The strategy says what to select; the catalogue says how venues name
+    things. Only the strategy file is consumer-owned.
+    """
+    path = Path(path)
+    document, _ = _read_json_object(path, "strategy")
+
+    unknown = sorted(set(document) - TOP_LEVEL_KEYS)
+    if unknown:
+        raise StrategyError(f"unknown strategy fields: {', '.join(unknown)}")
+
+    sports = document.get("sports")
+    if not isinstance(sports, list) or not sports or not all(isinstance(item, str) for item in sports):
+        raise StrategyError("sports must be a non-empty string array")
+    catalogue = load_catalogue(catalogue_path)
+    outside = sorted(set(sports) - set(catalogue.sports))
+    if outside:
+        raise StrategyError(f"sports not in the catalogue: {', '.join(outside)}")
+    # Only the strategy's sports are resolved; other catalogue entries are inert.
+    classes = [definition for definition in catalogue.classes if definition.sport in sports]
+    game_families = tuple(family for family in catalogue.game_families if family.sport in sports)
+    selection = document.get("selection")
+    if not isinstance(selection, dict):
+        raise StrategyError("selection must be an object")
+
+    minimum_venues = _positive_integer(selection, "minimum_venues")
+    preferred_venues = _positive_integer(selection, "preferred_venues")
+    if minimum_venues < 2 or preferred_venues < minimum_venues or preferred_venues > 3:
+        raise StrategyError("venue thresholds must satisfy 2 <= minimum <= preferred <= 3")
+
+    unknown_selection = sorted(set(selection) - SELECTION_KEYS)
+    if unknown_selection:
+        raise StrategyError(f"unknown selection fields: {', '.join(unknown_selection)}")
+    continuity_hold_enabled = selection.get("continuity_hold_enabled")
+    if not isinstance(continuity_hold_enabled, bool):
+        raise StrategyError("continuity_hold_enabled must be a boolean")
+    terminal_clamp_seconds = _positive_integer(selection, "terminal_clamp_seconds")
+    continuity_degraded_after_seconds = _positive_integer(
+        selection, "continuity_degraded_after_seconds"
+    )
+    if continuity_degraded_after_seconds >= terminal_clamp_seconds:
+        raise StrategyError(
+            "continuity_degraded_after_seconds must be less than terminal_clamp_seconds"
+        )
+
+    budgets = document.get("target_budgets")
+    if not isinstance(budgets, dict) or set(budgets) != {"kalshi", "polymarket", "limitless"}:
+        raise StrategyError("target_budgets must name kalshi, polymarket, and limitless")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in budgets.values()
+    ):
+        raise StrategyError("target budgets must be positive integers")
+    target_budgets = dict(budgets)
+
     version = document.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
         raise StrategyError("version must be a positive integer")
@@ -709,15 +790,18 @@ def load_strategy(path: Path) -> Strategy:
         continuity_hold_enabled=continuity_hold_enabled,
         maximum_bundles=_positive_integer(selection, "maximum_bundles"),
         target_budgets=target_budgets,
-        polymarket_tags=tuple(tags),
-        limitless_category_ids=limitless_category_ids,
-        participant_aliases=participant_aliases,
+        polymarket_tags=catalogue.polymarket_tags,
+        limitless_category_ids=catalogue.limitless_category_ids,
+        participant_aliases=catalogue.participant_aliases,
         classes=tuple(classes),
         game_families=game_families,
-        known_rule_templates=frozenset(known),
+        known_rule_templates=catalogue.known_rule_templates,
         source_path=str(path),
         scope=scope,
         maximum_markets_per_bundle=maximum_markets_per_bundle,
         maximum_markets=maximum_markets,
         ranking=ranking,
+        catalogue_version=catalogue.version,
+        catalogue_sha256=catalogue.sha256,
+        catalogue_source=catalogue.source_path,
     )

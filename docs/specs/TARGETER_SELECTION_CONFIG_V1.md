@@ -1,7 +1,8 @@
 # Targeter selection config (V1)
 
 Status: **implemented on feat/targeter-selection-config**. Extends [`targeter/v2/SELECTION.md`](../../targeter/v2/SELECTION.md).
-Schema: [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json).
+Schemas: [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json) (strategy),
+[`targeter/v2/catalogue.schema.json`](../../targeter/v2/catalogue.schema.json) (catalogue).
 
 ## 0. Goal
 
@@ -20,9 +21,14 @@ V1 adds three optional parts to the strategy file:
 3. **`ranking`**: an ordered list of comparison keys, plus priority values
    supplied by the config itself.
 
-**Compatibility rule.** A strategy file without any of these fields behaves
-exactly as today. On the same inputs, its selection report is byte-identical
-to the one from before this change.
+It also moves the venue mapping out of the strategy file into a static
+catalogue shipped with Targeter (§1.4), so a consumer's strategy file holds
+only selection choices.
+
+**Compatibility rule.** A strategy file without any of the V1 fields selects
+exactly as before: on the same inputs it yields the same candidates, the same
+eligible markets and identical target records. The selection report differs
+only by the two catalogue identity fields of §1.4.
 
 Out of scope:
 - the admission gates: 2 or 3 venues, the one-hour pre-activation window, and
@@ -162,6 +168,38 @@ Ranking stays a lexical tuple. No weighted sum decides the order.
 `score` and `score_components` are still reported unchanged, and
 continuity-protected bundles keep ordering by `score`, as today.
 
+### 1.4 The catalogue
+
+The venue mapping is static data: what each venue calls a sport, a game and a
+market class. It changes only when a venue's data format or product set
+changes, or a game is added; never per strategy or consumer. It lives in
+[`targeter/v2/catalogue.json`](../../targeter/v2/catalogue.json), inside the
+Targeter image, with these top-level fields:
+
+| Field | Meaning |
+|---|---|
+| `version` | required positive integer, bumped on every change |
+| `note` | free text |
+| `sports` | the sports a strategy file may name |
+| `polymarket_tags`, `limitless_category_ids` | discovery sources |
+| `participant_aliases`, `known_rule_templates` | reviewed aliases and rule templates |
+| `market_classes`, `game_families` | the class and game mapping, unchanged in shape |
+
+- The strategy file keeps `version`, `note`, `sports`, `selection`,
+  `target_budgets`, `scope` and `ranking`. A catalogue field in a strategy
+  file is an unknown field, and fatal.
+- The strategy's `sports` must be catalogue sports. Only catalogue classes and
+  game families of those sports are resolved; the rest are inert.
+- The catalogue is a closed schema, market classes included.
+- `load_strategy(path, catalogue_path=DEFAULT_CATALOGUE_PATH)`. The CLI takes
+  no catalogue option: a different catalogue means a different image.
+- Every selection report records `catalogue_version` and `catalogue_sha256`,
+  the SHA-256 of the catalogue file's bytes. Publication refuses a report
+  whose `catalogue_sha256` differs from the strategy it is given, as it does
+  for `strategy_version`.
+- The strategy schema enumerates the catalogue's sport, game and class ids,
+  and a test keeps them equal.
+
 ## 2. Report additions
 
 These appear **only when the strategy file uses at least one V1 field**. A
@@ -178,7 +216,9 @@ every addition is optional and existing readers read named fields only.
 ## 3. JSON schema
 
 [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json)
-(draft 2020-12) documents the whole strategy file, including these fields.
+(draft 2020-12) documents the strategy file, and
+[`targeter/v2/catalogue.schema.json`](../../targeter/v2/catalogue.schema.json)
+the catalogue.
 
 - It is a guide for writing a config. `load_strategy` stays the authority,
   because cross-references (classes and games named in `scope` or
@@ -209,5 +249,9 @@ every addition is optional and existing readers read named fields only.
    config than under the default order.
 7. **Report:** `configuration` and `rank_values` are present only with V1
    fields; publication validation accepts a capped selection.
-8. **Schema:** the schema stays in step with the loader, and the example
-   config loads.
+8. **Schema:** both schemas stay in step with the loader, the strategy
+   schema's ids equal the catalogue's, and the example config loads.
+9. **Catalogue:** the strategy records the catalogue's version and hash; a
+   strategy file carrying a catalogue field is rejected; strategy sports must
+   be catalogue sports and only those are resolved; the catalogue rejects
+   unknown fields; publication refuses a run made under a different catalogue.

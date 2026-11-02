@@ -12,10 +12,31 @@ budgets (`selection.py`).
 
 ## Strategy configuration
 
-`configs/targeter_v2.json` is the single semantic configuration, loaded by
-`registry.load_strategy`. Unknown top-level fields, invalid regular
+Configuration is two files, loaded together by `registry.load_strategy`:
+
+- **The catalogue**, [`targeter/v2/catalogue.json`](catalogue.json) (schema
+  [`catalogue.schema.json`](catalogue.schema.json)): static venue mapping
+  shipped inside the Targeter image. It holds `sports`, `polymarket_tags`,
+  `limitless_category_ids`, `participant_aliases`, `known_rule_templates`,
+  `market_classes` and `game_families`: how venues name things, never what to
+  select. It changes only when a venue's data format or product set changes,
+  or a game is added, and that change ships as a new image.
+- **The strategy file**, `configs/targeter_v2.json` for capture (schema
+  [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json)):
+  what to select. It holds `version`, `note`, `sports`, `selection`,
+  `target_budgets` and the optional `scope` and `ranking`, and names catalogue
+  ids only. Each consumer, such as the executor, keeps its own.
+
+The strategy's `sports` must be catalogue sports; catalogue classes and game
+families of other sports are not resolved. A catalogue field in a strategy
+file is an unknown field. Unknown fields in either file, invalid regular
 expressions, duplicate class or game-family identifiers, bad venue thresholds
 and non-positive timing or budget values are fatal (`StrategyError`).
+
+Every selection report records `catalogue_version` and `catalogue_sha256`
+(the SHA-256 of the catalogue file's bytes). Publication refuses a report
+whose catalogue hash differs from the one it is given, just as it refuses a
+different `strategy_version`.
 
 | Field | Shipped value |
 |---|---|
@@ -33,13 +54,13 @@ and non-positive timing or budget values are fatal (`StrategyError`).
 | `continuity_hold_enabled` | true |
 | `maximum_bundles` | 50 |
 | `target_budgets` | kalshi 1000, polymarket 400, limitless 400 subscription IDs |
-| `polymarket_tags` | `soccer`, `esports` |
-| `limitless_category_ids` | `[53]` |
-| `participant_aliases` | empty |
-| `known_rule_templates` | empty |
+| catalogue `polymarket_tags` | `soccer`, `esports` |
+| catalogue `limitless_category_ids` | `[53]` |
+| catalogue `participant_aliases` | empty |
+| catalogue `known_rule_templates` | empty |
 
 Optional selection-config fields (all absent from the shipped file; a file
-without them behaves exactly as before and yields a byte-identical report).
+without them behaves exactly as before).
 Unknown keys are fatal. Specified in
 [`docs/specs/TARGETER_SELECTION_CONFIG_V1.md`](../../docs/specs/TARGETER_SELECTION_CONFIG_V1.md);
 guide schema in [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json);
@@ -58,14 +79,14 @@ worked example in
 `version` is copied into the report as `strategy_version`; publication refuses
 a report whose version differs from the strategy it is given.
 
-`market_classes` maps vendor product shapes to a canonical class, market type
+The catalogue's `market_classes` maps vendor product shapes to a canonical class, market type
 and settlement scope. The shipped classes are `soccer.moneyline_3way`,
 `soccer.spread`, `soccer.total_goals`, `soccer.both_teams_to_score`,
 `soccer.correct_score`, `esports.series_moneyline`, `esports.map_winner`,
 `esports.total_maps` and `esports.map_handicap`. Soccer patterns reject
 first-half, second-half, extra-time, penalty and corners products from the
 regulation-fulltime classes. Adding or changing a reusable venue product is a
-strategy edit plus a small adapter-shape test; it never needs an event-specific
+catalogue edit plus a small adapter-shape test; it never needs an event-specific
 parser or fixture.
 
 `participant_aliases` maps a preferred team identity to reviewed aliases and
@@ -141,7 +162,7 @@ exist for bounded validation, not production runs.
 
 ## Esports game families
 
-`game_families` in the strategy is the classification authority for esports.
+The catalogue's `game_families` is the classification authority for esports.
 Generic esports `market_classes` patterns do not apply once a record belongs to
 a configured family. Each family has `id` (lower snake case), `sport: esports`,
 `topology: best_of_series`, `polymarket_game_tags`, `venue_game_aliases` and
