@@ -19,7 +19,7 @@ from targeter.v2.models import (
 )
 from targeter.v2.matching import MatchRejection, match_events
 from targeter.v2.relationships import RelationshipAnalysis, derive_bundle_relationships, validate_esports_market
-from targeter.v2.registry import Strategy
+from targeter.v2.registry import RankingKey, Strategy
 from targeter.v2.rules import RuleAssessment, assess_rules
 
 
@@ -39,8 +39,17 @@ class Candidate:
     moneyline_volume_usd_by_venue: Mapping[str, float]
     moneyline_volume_usd_coverage: Mapping[str, Mapping[str, int]]
     minimum_moneyline_volume_usd: float
+    # Present only when the strategy uses a selection-config V1 field and the
+    # candidate is eligible; see docs/specs/TARGETER_SELECTION_CONFIG_V1.md.
+    rank_values: Mapping[str, object] | None = None
 
     def as_record(self) -> dict[str, object]:
+        record = self._base_record()
+        if self.rank_values is not None:
+            record["rank_values"] = dict(self.rank_values)
+        return record
+
+    def _base_record(self) -> dict[str, object]:
         return {
             **self.bundle.as_record(),
             **format_observation(self.bundle.observed_formats),
@@ -86,8 +95,15 @@ class SelectionResult:
     targets: Mapping[str, tuple[dict[str, object], ...]]
     allocation_rejections: Mapping[str, str]
     continuity_dispositions: Mapping[str, str]
+    configuration: Mapping[str, object] | None = None
 
     def as_record(self) -> dict[str, object]:
+        record = self._base_record()
+        if self.configuration is not None:
+            record["selection"]["configuration"] = dict(self.configuration)  # type: ignore[index]
+        return record
+
+    def _base_record(self) -> dict[str, object]:
         return {
             "report_version": 3,
             "mode": "shadow",
@@ -270,32 +286,45 @@ def _candidate(bundle: EventBundle, *, strategy: Strategy, now: datetime) -> Can
     trusted_markets = tuple(
         market for market in bundle.markets if market.target_id not in excluded
     )
+    # The volume gate measures the event's moneyline liquidity before any
+    # configured class scope or market cap narrows the capture surface.
     combined_volume, volume_by_venue, volume_coverage = _moneyline_volume_usd(
         trusted_markets
     )
-    analysis = derive_bundle_relationships(bundle, excluded_market_ids=excluded)
-    cross_relationships = [
-        item
-        for item in analysis.relationships
-        if item.cross_venue and item.relationship != "OVERLAP"
-    ]
-    relationship_market_ids = {
-        _base_market_id(value)
-        for item in cross_relationships
-        for value in (item.left, item.right)
-    }
-    # Do not spend subscription budget on markets which currently participate
-    # in no modeled combinatorial relationship.
-    for market in trusted_markets:
-        if market.target_id not in relationship_market_ids:
+    scope = strategy.scope
+    if scope is not None and scope.market_classes is not None:
+        out_of_scope = [
+            market for market in trusted_markets
+            if market.canonical_class not in scope.market_classes
+        ]
+        for market in out_of_scope:
             market_exclusions.setdefault(market.target_id, []).append(
-                "no_modeled_cross_venue_relationship"
+                "market_class_outside_scope"
             )
-    markets = tuple(
-        market
-        for market in trusted_markets
-        if market.target_id in relationship_market_ids
-    )
+        if out_of_scope:
+            trusted_markets = tuple(
+                market for market in trusted_markets
+                if market.canonical_class in scope.market_classes
+            )
+            excluded = set(market_exclusions)
+    analysis = derive_bundle_relationships(bundle, excluded_market_ids=excluded)
+    cross_relationships = _cross_relationships(analysis)
+    markets = _relationship_participants(trusted_markets, cross_relationships, market_exclusions)
+    cap = strategy.maximum_markets_per_bundle
+    if cap is not None and len(markets) > cap:
+        kept = _capped_markets(markets, cross_relationships, cap, strategy)
+        dropped = [market for market in markets if market.target_id not in kept]
+        for market in dropped:
+            market_exclusions.setdefault(market.target_id, []).append("market_cap_per_bundle")
+        # Relationships, scores and the event gates must describe the kept set.
+        excluded = excluded | {market.target_id for market in dropped}
+        analysis = derive_bundle_relationships(bundle, excluded_market_ids=excluded)
+        cross_relationships = _cross_relationships(analysis)
+        markets = _relationship_participants(
+            tuple(market for market in markets if market.target_id in kept),
+            cross_relationships,
+            market_exclusions,
+        )
     venues = {market.venue for market in markets}
     cross_venue = cross_relationships
     capture_start = bundle.activation_at - timedelta(seconds=strategy.pre_event_seconds)
@@ -314,7 +343,21 @@ def _candidate(bundle: EventBundle, *, strategy: Strategy, now: datetime) -> Can
         reasons.append("before_capture_lookahead")
     if bundle.activation_at < now - timedelta(seconds=strategy.post_start_retention_seconds):
         reasons.append("past_post_start_retention")
+    if scope is not None and scope.sports is not None and bundle.sport not in scope.sports:
+        reasons.append("sport_outside_scope")
+    if (
+        scope is not None
+        and scope.games is not None
+        and bundle.sport == "esports"
+        and bundle.game not in scope.games
+    ):
+        reasons.append("game_outside_scope")
     score, components = _score_candidate(bundle, markets, analysis, strategy)
+    rank_values = (
+        _rank_values(bundle, markets, combined_volume, components, strategy)
+        if strategy.uses_selection_config and not reasons
+        else None
+    )
     return Candidate(
         bundle=bundle,
         eligible_markets=markets,
@@ -332,7 +375,182 @@ def _candidate(bundle: EventBundle, *, strategy: Strategy, now: datetime) -> Can
         moneyline_volume_usd_by_venue=volume_by_venue,
         moneyline_volume_usd_coverage=volume_coverage,
         minimum_moneyline_volume_usd=strategy.minimum_combined_moneyline_volume_usd,
+        rank_values=rank_values,
     )
+
+
+def _cross_relationships(analysis: RelationshipAnalysis) -> list:
+    return [
+        item
+        for item in analysis.relationships
+        if item.cross_venue and item.relationship != "OVERLAP"
+    ]
+
+
+def _relationship_participants(
+    trusted_markets: tuple[CanonicalMarket, ...],
+    cross_relationships: list,
+    market_exclusions: dict[str, list[str]],
+) -> tuple[CanonicalMarket, ...]:
+    relationship_market_ids = {
+        _base_market_id(value)
+        for item in cross_relationships
+        for value in (item.left, item.right)
+    }
+    # Do not spend subscription budget on markets which currently participate
+    # in no modeled combinatorial relationship.
+    for market in trusted_markets:
+        if market.target_id not in relationship_market_ids:
+            market_exclusions.setdefault(market.target_id, []).append(
+                "no_modeled_cross_venue_relationship"
+            )
+    return tuple(
+        market
+        for market in trusted_markets
+        if market.target_id in relationship_market_ids
+    )
+
+
+def _capped_markets(
+    markets: tuple[CanonicalMarket, ...],
+    cross_relationships: list,
+    cap: int,
+    strategy: Strategy,
+) -> set[str]:
+    """Keep the first `cap` markets, then prune markets left without a partner."""
+    ordered = sorted(
+        markets,
+        key=lambda market: (
+            0 if market.market_type in _MONEYLINE_TYPES else 1,
+            -strategy.market_class_priority(market.canonical_class),
+            -_activity(market),
+            market.target_id,
+        ),
+    )
+    kept = {market.target_id for market in ordered[:cap]}
+    pairs = {
+        (_base_market_id(item.left), _base_market_id(item.right))
+        for item in cross_relationships
+    }
+    while True:
+        partnered = {
+            market_id
+            for left, right in pairs
+            if left != right and left in kept and right in kept
+            for market_id in (left, right)
+        }
+        if partnered == kept:
+            return kept
+        kept = partnered
+
+
+def _class_priority_values(
+    markets: tuple[CanonicalMarket, ...], strategy: Strategy
+) -> list[int]:
+    return [
+        strategy.market_class_priority(canonical_class)
+        for canonical_class in sorted({market.canonical_class for market in markets})
+    ]
+
+
+def _rank_values(
+    bundle: EventBundle,
+    markets: tuple[CanonicalMarket, ...],
+    combined_volume: float,
+    components: Mapping[str, float],
+    strategy: Strategy,
+) -> dict[str, object]:
+    priorities = strategy.ranking.priorities if strategy.ranking else None
+    default = priorities.default if priorities else 0
+    values: dict[str, object] = {}
+    for item in _effective_ranking_keys(strategy):
+        name = item.key
+        if name in components:
+            values[name] = components[name]
+        elif name == "moneyline_volume_usd":
+            values[name] = combined_volume
+        elif name == "activation_time":
+            values[name] = isoformat(bundle.activation_at)
+        elif name == "game_priority":
+            values[name] = (
+                priorities.game.get(bundle.game, default)
+                if priorities and bundle.game
+                else default
+            )
+        elif name == "market_class_priority_max":
+            values[name] = max(_class_priority_values(markets, strategy), default=default)
+        elif name == "market_class_priority_sum":
+            values[name] = sum(_class_priority_values(markets, strategy))
+        elif name == "venue_set_priority":
+            venue_set = "+".join(sorted({market.venue for market in markets}))
+            values[name] = priorities.venue_set.get(venue_set, default) if priorities else default
+    return values
+
+
+_DEFAULT_RANKING = (
+    RankingKey("venue_coverage", "desc"),
+    RankingKey("cross_venue_relationships", "desc"),
+    RankingKey("market_class_breadth", "desc"),
+    RankingKey("activity", "desc"),
+    RankingKey("activation_time", "asc"),
+)
+
+
+def _effective_ranking_keys(strategy: Strategy) -> tuple[RankingKey, ...]:
+    return strategy.ranking.keys if strategy.ranking else _DEFAULT_RANKING
+
+
+def selection_configuration(strategy: Strategy) -> dict[str, object]:
+    """Echo of the resolved V1 selection configuration for the report."""
+    scope = strategy.scope
+    priorities = strategy.ranking.priorities if strategy.ranking else None
+    return {
+        "scope": None
+        if scope is None
+        else {
+            "sports": None if scope.sports is None else sorted(scope.sports),
+            "games": None if scope.games is None else sorted(scope.games),
+            "market_classes": None
+            if scope.market_classes is None
+            else sorted(scope.market_classes),
+        },
+        "maximum_markets_per_bundle": strategy.maximum_markets_per_bundle,
+        "maximum_markets": strategy.maximum_markets,
+        "ranking": {
+            "keys": [
+                *[
+                    {"key": item.key, "order": item.order}
+                    for item in _effective_ranking_keys(strategy)
+                ],
+                {"key": "bundle_id", "order": "asc"},
+            ],
+            "priorities": None
+            if priorities is None
+            else {
+                "default": priorities.default,
+                "game": dict(sorted(priorities.game.items())),
+                "market_class": dict(sorted(priorities.market_class.items())),
+                "venue_set": dict(sorted(priorities.venue_set.items())),
+            },
+        },
+    }
+
+
+def _configured_ranking_key(strategy: Strategy):
+    keys = _effective_ranking_keys(strategy)
+
+    def key(candidate: Candidate) -> tuple:
+        values = candidate.rank_values or {}
+        parts: list[object] = []
+        for item in keys:
+            value = values[item.key]
+            if item.key == "activation_time":
+                value = candidate.bundle.activation_at.timestamp()
+            parts.append(-value if item.order == "desc" else value)  # type: ignore[operator]
+        parts.append(candidate.bundle.bundle_id)
+        return tuple(parts)
+
+    return key
 
 
 def _ranking_key(candidate: Candidate) -> tuple[float, float, float, float, datetime, str]:
@@ -366,7 +584,11 @@ def select_targets(
     candidates = tuple(_candidate(bundle, strategy=strategy, now=now) for bundle in bundles)
     ranked = sorted(
         (candidate for candidate in candidates if candidate.eligible),
-        key=_ranking_key,
+        key=(
+            _configured_ranking_key(strategy)
+            if strategy.ranking is not None
+            else _ranking_key
+        ),
     )
     continuity = tuple(continuity_bundles) if strategy.continuity_hold_enabled else ()
     continuity_dispositions: dict[str, str] = {}
@@ -537,6 +759,13 @@ def select_targets(
                 "continuity_identity_collision"
             )
             continue
+        if strategy.maximum_markets is not None and (
+            sum(len(ids) for ids in selected_target_ids.values())
+            + len(candidate.eligible_markets)
+            > strategy.maximum_markets
+        ):
+            allocation_rejections[candidate.bundle.bundle_id] = "maximum_markets_reached"
+            continue
         increments = {
             venue: sum(
                 len(market.subscription_ids)
@@ -595,4 +824,7 @@ def select_targets(
         },
         allocation_rejections=allocation_rejections,
         continuity_dispositions=continuity_dispositions,
+        configuration=(
+            selection_configuration(strategy) if strategy.uses_selection_config else None
+        ),
     )
