@@ -219,16 +219,6 @@ def load_private_key(pem_bytes: bytes, source: str = "<memory>") -> object:
     return key
 
 
-def credentials_available(*, env: dict[str, str] | None = None,
-                          dotenv_path: Path | None = None) -> bool:
-    """Whether `load_credentials` would succeed. Never raises."""
-    try:
-        load_credentials(env=env, dotenv_path=dotenv_path)
-    except KalshiCredentialsError:
-        return False
-    return True
-
-
 def _read_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():

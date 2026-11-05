@@ -1,6 +1,7 @@
 # Execution delay in the economic SDK
 
-Status: **proposed**. Extends [ECONOMIC_STRATEGY_SDK_V1.md](../ECONOMIC_STRATEGY_SDK_V1.md)
+Status: **implemented**. Retained five-bundle/screen acceptance remains pending
+([open work](../OPEN_WORK.md)). Extends [ECONOMIC_STRATEGY_SDK_V1.md](../ECONOMIC_STRATEGY_SDK_V1.md)
 §13 (fill checks), [STRATEGY_PREPARATION_V1.md](../STRATEGY_PREPARATION_V1.md) and the
 Universe outcomes document ([universe/README.md](../../universe/README.md)).
 Companion specs: [MARKET_VOLATILITY_V1.md](MARKET_VOLATILITY_V1.md) and
@@ -304,9 +305,10 @@ probe:
 Writer-attested: the ladders at arrival and at decision for `c > 0`. The reader
 cannot see the book, which is the same limit as fill checks' no-fill split.
 
-### 2.9 Wire v3 (REPLAY_THROUGHPUT_V1 T1)
+### 2.9 Sparse delivery
 
-Wire v3 publishes only non-empty cuts, window cuts, and cuts at declared retained
+The current [wire V4 contract](../REPLAY_STREAMS_V1.md) preserves sparse delivery:
+it publishes non-empty cuts, window cuts, and cuts at declared retained
 boundaries and time-shift deadlines. Probes must not depend on a cut arriving at a
 decision time or an arrival time.
 
@@ -320,13 +322,13 @@ decision time or an arrival time.
 - Probe outputs carry the computed times (`time_ns`, `sent_ns`, `arrival_ns`), never
   the time of the cut that triggered resolution.
 - Probes therefore declare **no** `retain_boundaries_ns` or `retain_shift_offsets_ns`.
-  Declaring a 100 ms-scale grid there would undo T1.
+  A 100 ms-scale retention grid would defeat sparse delivery.
 - Opening quote ages (§3) measure planned books' own updates, which omitted cuts
   never touch.
 
-Acceptance (§5) runs with wire v3. A test publishes the same tape at v2, with every
-cut, and at v3, with empty cuts omitted, and requires identical `probes.ndjson`
-bytes.
+Acceptance (§5) uses the current wire contract. Offline tests compare full-cut
+and sparse-cut V4 tapes with preserved Risk sequence identities and require
+identical `probes.ndjson` bytes; obsolete wire v2 is not a compatibility path.
 
 ## 3. Opening quote ages
 
