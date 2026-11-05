@@ -46,7 +46,7 @@ and missing ask sources are visible rejections. Identity covers (A = B) belong
 to the existing complete-set strategies. Rejections have null sizes and one
 full scoped denominator rather than one rejection per sweep size.
 
-Candidate pairs are sorted and capped at 4,096 per scope before the size sweep.
+Candidate pairs are sorted and capped at 8,192 per scope before the size sweep.
 Exceeding the cap or the SDK's metadata/state/row limits fails visibly.
 Kalshi buys consume the opposite orientation's bids projected at 1 minus price;
 mask and fee bindings retain the acquired orientation. Native scales are exact.

@@ -332,7 +332,7 @@ full slices, and `placebo_episodes.ndjson`. It is pinned byte for byte by
 file/profile initialization, layout-2 construction runs
 `replay.economic_sdk.entity_tables.preflight(strategy)`. It returns exact canonical
 bytes per real/control `entities.json`, including wrappers, scope/row separators,
-empty scopes, UTF-8 encoding and the final LF. Each table must fit the 256 MiB
+empty scopes, UTF-8 encoding and the final LF. Each table must fit the 512 MiB
 `MAX_ENTITY_TABLE` limit; an oversized table names itself, its exact required
 bytes and the limit in a construction error. The limit is separate from the
 8 MiB `MAX_METADATA` that still bounds `reasons.json`, configurations, summaries
@@ -374,7 +374,7 @@ duplicates, missing files, staging leftovers, unknown paths and symlinks; verify
 stored and logical hashes/lengths/counts; and reject corrupt, truncated,
 concatenated or trailing frames/bytes without decoded temporary files. Ordinary
 streams keep 2,000,000 records, 512 MiB logical bytes, and 64 KiB including LF per
-line. Entity tables keep their separate one-record 256 MiB document path and exact
+line. Entity tables keep their separate one-record 512 MiB document path and exact
 early preflight; reasons keep the one-record 8 MiB path. Transition/levels bounds
 do not apply. Summaries are independently recomputed with the same semantics.
 
@@ -615,8 +615,8 @@ Recursive size accounting is replaced by **count-based bounds**.
   - entities × kinds open episodes;
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
-  - the 512 MiB detached-state limit;
-  - the 256 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
+  - the 1 GiB detached-state limit;
+  - the 512 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
     one-record tables and documents;
   - the file, line and row limits of the complement spec.
 

@@ -118,7 +118,7 @@ Existing streaming frame commit order and stored/logical identities apply.
 Volatility has a 1 MiB LF-inclusive line limit, 50000000 rows and 16 GiB logical
 bytes. At most 4096 pairs across scopes, 100000 unfinished bucket/series entries
 and 1000000 pending scalar sample values are admitted. Tables, totals, buckets
-and samples charge the 512 MiB state budget; conservative shape costs include
+and samples charge the 1 GiB state budget; conservative shape costs include
 all horizon and threshold maps. Exceeding a limit fails visibly. State stops
 growing with elapsed run time once buckets and horizon history have expired.
 
