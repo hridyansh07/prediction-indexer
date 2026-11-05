@@ -162,15 +162,6 @@ def _sort_key(item: OrderedEnvelope) -> tuple[object, ...]:
     dataset replayed from raw segments and the same dataset replayed from
     canonical evidence resolve an exact timestamp collision the same way.
 
-    This used to sort ties on `(venue, lane)` as plain ascending strings, which
-    disagreed with `ingester/README.md` (Orderings) in two places. The
-    obvious one is venue order: alphabetically Polymarket sorts last where §1
-    ranks it first. The quieter one is inside Polymarket — all four of its lanes
-    carry `venue: polymarket`, so the `venue` term never separated them and the
-    `lane` term ordered them alphabetically, putting `polymarket_rtds` second
-    where §1 ranks it fourth. `replay/tests/test_lane_rank.py` holds both orders
-    side by side.
-
     Rank decides a tie and nothing else — see `replay.lanes.LANE_RANK` for what
     analysis may not read out of it. The remaining terms are all captured facts;
     source path is last and matters only for an exact collision with identical

@@ -262,19 +262,6 @@ backend cannot authorize deletion. See `docs/DEPLOYMENT.md`.
 5. Run the shared object-store tests plus archiver, verifier, manifest, reaper,
    crash-boundary and deployment tests.
 
-**S3.** A complete `S3ObjectStore` (boto3, conditional `If-None-Match` puts,
-SHA-256 checksums, owner checks) was removed while unused. To bring it back,
-restore it from commit `6411ab3`:
-
-```bash
-git checkout 6411ab3 -- archive/storage/s3.py tests/test_s3store.py \
-  tests/test_s3_pipeline.py archive/S3_RAW_ARCHIVE_ADAPTER_V1.md
-```
-
-Then do steps 4–5, re-add `boto3` to `pyproject.toml`, and re-add the
-`ARCHIVE_S3_*` variables to the compose files and `.env.example`. Receipts
-still carry the `s3_checksum_sha256` field.
-
 ## Tests
 
 ```bash

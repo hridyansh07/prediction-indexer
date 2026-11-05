@@ -1,7 +1,6 @@
 """Private container entry: imports, one supervisor attempt, readers and checks."""
 
 import argparse
-from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import sys

@@ -1,6 +1,8 @@
 # Universe totals direction V1
 
-Status: `proposed`. Not implemented until the code and tests say so.
+Status: **implemented** as market projection version 4. Schema v8 is current;
+offline migration and operator verification are governed by
+[UNIVERSE_MIGRATIONS_V1.md](UNIVERSE_MIGRATIONS_V1.md).
 
 ## Problem
 
@@ -10,18 +12,19 @@ names both teams, so "ThunderTalk" or "Sunderland" read as `under` and
 removed first). Universe still projects markets from the archived Targeter v3
 reports' stored catalogue `parameters`, and the claim engine reads
 `parameters.direction` for single-token Kalshi and Limitless totals. History
-therefore holds wrong claims: `KXLOLTOTALMAPS-26AUG280500IGTT-4` ("Over 3.5
+can therefore hold wrong claims: `KXLOLTOTALMAPS-26AUG280500IGTT-4` ("Over 3.5
 maps", IG vs ThunderTalk) expresses the under set, and the Limitless "Sunderland
 and Arsenal have 3 or more total goals?" market the low-score set.
 
 ## Decision
 
-Projection version `MARKET_PROJECTION_VERSION` 3 becomes 4. Because Universe has
-no in-place migration, the schema changes with it: `PRAGMA user_version` 6
-becomes 7, `universe_run_projections.projection_version` is `CHECK(= 4)`, and
-one table is added (below). A fresh oldest-first backfill from the archive is
-required. The archived reports and catalogue objects are never touched; they stay
-as evidence.
+Projection version `MARKET_PROJECTION_VERSION` is 4. The v6 → v7 offline m1
+migration adds the correction table below and allows market-projection rows at
+versions 3 and 4. Migrated v3 rows retain their hashes and require m1 metadata;
+fresh ingestion writes v4. The v7 → v8 m2 migration adds execution terms.
+Alternatively, rebuild oldest-first into a new v8 file. The archived reports
+and catalogue objects remain unchanged as evidence; neither path changes the
+live database in place.
 
 ### Scope
 
@@ -90,54 +93,25 @@ rejects the run (`EvidenceConflict`), missed is counted in
 
 ## Rollback and backup
 
-The existing schema-v6 SQLite file is the rollback and the backup: keep it
-untouched. Universe has no in-place migration and v4 needs a fresh rebuild into a
-new file. To roll back, stop Universe and run the v3 code against the old file.
+Keep the source SQLite file untouched. Migrate offline or rebuild into a new
+file, verify it, then deploy with the file-swap procedure in
+[UNIVERSE_MIGRATIONS_V1 §5](UNIVERSE_MIGRATIONS_V1.md#5-deployment). Rollback
+restores the retired file with its matching code version.
 
 ## Known gaps
 
 - Polymarket totals are not corrected by this rule, by decision.
-- Scan result: a scan of all 1,223 bundles and 1,057 totals claims found exactly
-  7 inverted claims, in 6 bundles. All are Kalshi `total_maps` markets labelled
-  "Over N" that were stored as under. These are the expected corrections, and
-  the acceptance set for the rebuild diff:
-  - bundle_7eadbbc9be7138c1a36c0964: kalshi:KXLOLTOTALMAPS-26AUG280500IGTT-4
-    (Over 3.5) and kalshi:KXLOLTOTALMAPS-26AUG280500IGTT-5 (Over 4.5); team
-    "ThunderTalk Gaming"
-  - bundle_6724a13e0c07d5ee5ff643c4: kalshi:KXCS2TOTALMAPS-26SEP281600MIBRUND-3
-    (Over 2.5); team "underw0rld"
-  - bundle_2bd68b388bb9628bad6ad6f8: kalshi:KXCS2TOTALMAPS-26SEP171945YOUUND-3;
-    "underw0rld"
-  - bundle_c3449808ec0bfd3a0b0d3807: kalshi:KXCS2TOTALMAPS-26SEP141945QUINUND-3;
-    "underw0rld"
-  - bundle_82a8b36b01284882c50d3cca: kalshi:KXCS2TOTALMAPS-26SEP010500GROTHU-3;
-    "THUNDER dOWNUNDER"
-  - bundle_10ed769064dd5d86dfcbb083: kalshi:KXCS2TOTALMAPS-26AUG300500GROTHU-3;
-    "THUNDER dOWNUNDER"
-
-  Limitless soccer `total_goals` markets in Sunderland events were stored as
-  `{"direction": "under", "line": 2.5, "published_line": 3}`: the "3 or more
-  goals" market, over 2.5, flipped by "Sunderland". Each is expected
-  under -> over, with `line` and `published_line` unchanged:
-  - bundle_718135a9426746093f1e744a: limitless:387279 (Universe market:8637f100...)
-  - bundle_87498ed23545abc32b6b8aa9: Universe market:f13b7a80...
-  - bundle_2853dd2c1412a175d147471c: Universe market:867f9dcc...
-
-  Two further Sunderland bundles, 6f8f27cd... and 5ea86a10... (prefixes only),
-  were not inspected. By the rule alone: a Limitless `total_goals` market whose
-  title names Sunderland in an "N or more total goals" form with a stored
-  `under` is corrected the same way; one whose stored direction is already right
-  is not. The rebuild diff confirms or rules out each.
-
-  No Polymarket claim was wrong; the "Overtake" events are fine. A correction
-  outside this set after the rebuild needs review before the rebuilt file is
-  adopted. One case to watch is a direction removed because only the unarchived
-  raw subtitle stated it.
 - Kalshi markets whose direction came only from the raw subtitle lose it and
   produce no claim until a later archive-side fix exists.
+- Unselected candidates also project markets. Migration correction membership
+  follows candidate evidence rather than only selected occurrences;
+  [the migration contract](UNIVERSE_MIGRATIONS_V1.md#23-data) records its visible
+  fallback and unavailable-relation handling. Review the full-file diff before
+  adopting a migrated or rebuilt file.
 
 ## Verification
 
 A read-only `python -m universe.tools.rebuild_diff OLD NEW` reports changed
-venue markets, claims and affected bundles between a v6/v3 and a v7/v4 file,
-and the new file's recorded corrections.
+venue markets, claims, affected bundles and recorded corrections. Current
+production-copy and short-range serving-equivalence checks remain operator gates
+under [UNIVERSE_MIGRATIONS_V1 §4](UNIVERSE_MIGRATIONS_V1.md#4-proof).

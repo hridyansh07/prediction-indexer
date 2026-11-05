@@ -1,8 +1,9 @@
 # Legacy opt-in probes and acceptance limits
 
-Scope: local offline remediation on integration `e3f9330` (#82), containing
-R12 (#81). No retained-data acceptance, workload, deployment or cap increase is
-authorized by this document.
+Status: **implemented**, including the phase-aware retention rules in §6.
+This contract retains optional legacy probes and their original economics.
+Outstanding capacity evidence and operational acceptance are tracked in
+[open work](../OPEN_WORK.md).
 
 ## 1. Supported policies
 

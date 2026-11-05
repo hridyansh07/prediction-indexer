@@ -1,10 +1,10 @@
 # Strategy execution realism: producer contract
 
-The user authorized implementation of the preserved supplied
-[specification](STRATEGY_EXECUTION_REALISM_V1.md). The four producer policies,
-independent reading and reference examples are implemented. Retained-data bench
-acceptance and the full corpus rerun remain pending; this document claims no
-live pilot, deployment or database migration.
+Status: **implemented**. This is the producer contract for
+[strategy execution realism](STRATEGY_EXECUTION_REALISM_V1.md): the four policies,
+independent reading and reference examples. Retained-data bench acceptance and
+the full corpus rerun remain in [open work](../OPEN_WORK.md); implementation
+does not establish a live pilot, deployment or database migration.
 
 ## Closed policy versions
 

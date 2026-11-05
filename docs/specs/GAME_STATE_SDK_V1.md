@@ -3,8 +3,9 @@
 Status: **implemented for offline replay.** Uses the event-keyed game-state
 archive (`gamestate/`, receipt v2, `timeline.v2.json`). Synthetic preparation,
 runtime, bench and independent-reader tests cover the contract. The retained
-C9–LYON acceptance in §8 remains unverified; live capture and corpus execution
-are not implemented by this change.
+C9–LYON acceptance in §8 remains unverified. Corpus preparation is implemented
+in [`replay/corpus`](../../replay/corpus/README.md); live game-state capture is
+outside this contract. See [open work](../OPEN_WORK.md).
 
 Strategies that condition on the match (a map ending, the series score, time into
 a map) need game state inside replay. This spec adds it to the economic strategy
@@ -14,9 +15,9 @@ book time a live observer would have known them**, then drops.
 
 ## 0. Decisions
 
-- **The runner prepares, the strategy consumes.** The corpus runner (the bench
-  until the corpus runner exists) prepares the file once per event, before any
-  strategy line for that event starts. Every line reads the same file read-only.
+- **The runner prepares, the strategy consumes.** The corpus runner or bench
+  prepares the file before any strategy line for that event starts. Every line
+  reads the same file read-only.
   A strategy never contacts the archive or an API. The walker and the materializer
   stay out of it: they are network-free and per book.
 - **One file, built in memory.** The prepared file is a few kilobytes of JSON. The
@@ -268,8 +269,8 @@ In policy:
   preparation, writes one `game_state/game_state.json`, and verifies an existing
   file before reuse without refreshing it. Only this builder source is tracked;
   downloaded windows, derivatives and run outputs remain ignored.
-- The corpus runner prepares game state per event as one stage before strategy
-  lines. The jobs runner is out of scope (it is retiring).
+- The corpus runner prepares game state before strategy lines. The jobs runner
+  does not provide this stage.
 
 `python -m replay.bench prepare-game-state <context_dir> <out_dir>` exposes the
 same preparation stage. Bench resolves the SHA-256 before Docker, rejects policy

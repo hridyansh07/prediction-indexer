@@ -1,9 +1,8 @@
 # Market volatility V1 implementation contract
 
-The supplied [specification](MARKET_VOLATILITY_V1.md) is preserved byte for byte,
-including its pasted `proposed` status. The user authorized its implementation.
-The standalone group is implemented; retained-data acceptance remains pending.
-These conventions make its implicit row shapes and units precise.
+Status: **implemented**. This contract makes the
+[overview specification](MARKET_VOLATILITY_V1.md)'s implicit row shapes and units
+precise. Retained-data acceptance remains in [open work](../OPEN_WORK.md).
 
 ## Policy and units
 

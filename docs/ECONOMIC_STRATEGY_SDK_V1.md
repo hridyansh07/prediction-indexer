@@ -1,15 +1,15 @@
 # Economic strategy SDK V1
 
-Status: **implemented; offline gates pass; bench acceptance pending.** The
-following are implemented on `feat/economic-strategy-sdk`:
+Status: **implemented.** Outstanding retained-data and operational checks are
+tracked in [`OPEN_WORK.md`](OPEN_WORK.md). The SDK includes:
 
 - the SDK (`replay/economic_sdk/`);
 - the same-venue complement on it (policies 1 and 2, §11);
 - the market profile (`replay.strategies.market_profile:build`, §7);
-- opt-in fill checks (§13), proven by synthetic offline tests only.
+- opt-in fill checks (§13), execution-delay probes (§15), and structural-strategy
+  execution-realism policies (§16).
 
-The bench-corpus acceptance in §11 runs outside the repository and has not yet
-been run against this revision. The document builds on the same-venue complement
+The document builds on the same-venue complement
 strategy ([SAME_VENUE_COMPLEMENT_V1.md](../replay/strategies/same_venue_complement/SPEC.md)).
 
 Every economic strategy needs the same machinery:
@@ -332,7 +332,7 @@ full slices, and `placebo_episodes.ndjson`. It is pinned byte for byte by
 file/profile initialization, layout-2 construction runs
 `replay.economic_sdk.entity_tables.preflight(strategy)`. It returns exact canonical
 bytes per real/control `entities.json`, including wrappers, scope/row separators,
-empty scopes, UTF-8 encoding and the final LF. Each table must fit the 64 MiB
+empty scopes, UTF-8 encoding and the final LF. Each table must fit the 256 MiB
 `MAX_ENTITY_TABLE` limit; an oversized table names itself, its exact required
 bytes and the limit in a construction error. The limit is separate from the
 8 MiB `MAX_METADATA` that still bounds `reasons.json`, configurations, summaries
@@ -374,7 +374,7 @@ duplicates, missing files, staging leftovers, unknown paths and symlinks; verify
 stored and logical hashes/lengths/counts; and reject corrupt, truncated,
 concatenated or trailing frames/bytes without decoded temporary files. Ordinary
 streams keep 2,000,000 records, 512 MiB logical bytes, and 64 KiB including LF per
-line. Entity tables keep their separate one-record 64 MiB document path and exact
+line. Entity tables keep their separate one-record 256 MiB document path and exact
 early preflight; reasons keep the one-record 8 MiB path. Transition/levels bounds
 do not apply. Summaries are independently recomputed with the same semantics.
 
@@ -616,7 +616,7 @@ Recursive size accounting is replaced by **count-based bounds**.
   - 100,000 skew changes per open slice;
   - ring entries per book, from policy.
   - the 512 MiB detached-state limit;
-  - the 64 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
+  - the 256 MiB `entities.json` limit (§5) and the 8 MiB limit on the other
     one-record tables and documents;
   - the file, line and row limits of the complement spec.
 
@@ -1320,7 +1320,7 @@ walk limits/order/arithmetic, matched valuation, unwind losses, delay provenance
 computed times, statuses and resolution order. Arrival ladders, confirmation
 ladders and quote ages remain writer-attested. Without probes there is no new
 file or fill field; existing semantic outputs and the complement V1 golden stay
-byte-identical. Synthetic full-cut and sparse-v3 tapes compare probe bytes;
+byte-identical. Synthetic full-cut and sparse-cut V4 tapes compare probe bytes;
 the current decoder continues to reject obsolete wire v2. Five-bundle corpus
 acceptance remains pending until the retained sample and independent screen are
 available.
