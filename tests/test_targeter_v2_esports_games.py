@@ -12,7 +12,7 @@ from targeter.v2.domain import ActivationEvidence, CanonicalEvent, CanonicalMark
 from targeter.v2.adapters import PolymarketSportsAdapter, durable_client
 from targeter.v2.parsing.esports import parse_best_of_values, parse_participants
 from targeter.v2.matching import MatchRejection, match_events
-from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
+from targeter.v2.registry import DEFAULT_CATALOGUE_PATH, MarketClassRegistry, StrategyError, load_strategy
 from targeter.v2.relationships import derive_bundle_relationships
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,13 +34,13 @@ class EsportsRegistryAndParserTests(unittest.TestCase):
         self.assertEqual(len({tag for family in families.values() for tag in family.polymarket_game_tags}), 4)
 
     def test_game_tags_are_globally_unique(self):
-        document = json.loads(STRATEGY.read_text())
+        document = json.loads(DEFAULT_CATALOGUE_PATH.read_text())
         document["game_families"][1]["polymarket_game_tags"] = document["game_families"][0]["polymarket_game_tags"]
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "strategy.json"
+            path = Path(directory) / "catalogue.json"
             path.write_text(json.dumps(document))
             with self.assertRaises(StrategyError):
-                load_strategy(path)
+                load_strategy(STRATEGY, catalogue_path=path)
 
     def test_parser_matrix_preserves_even_format_and_only_reviewed_suffixes(self):
         cases = {

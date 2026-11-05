@@ -301,6 +301,8 @@ def run_shadow(
     record = selection.as_record()
     record["run_id"] = run_id
     record["strategy_source"] = strategy.source_path
+    record["catalogue_version"] = strategy.catalogue_version
+    record["catalogue_sha256"] = strategy.catalogue_sha256
     record["discovery_failures"] = dict(sorted(failures.items()))
     record["continuity_diagnostics"] = continuity_diagnostics
     record["continuity_degraded_base_run_id"] = continuity_degraded_base_run_id

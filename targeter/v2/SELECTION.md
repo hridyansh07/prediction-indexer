@@ -12,10 +12,31 @@ budgets (`selection.py`).
 
 ## Strategy configuration
 
-`configs/targeter_v2.json` is the single semantic configuration, loaded by
-`registry.load_strategy`. Unknown top-level fields, invalid regular
+Configuration is two files, loaded together by `registry.load_strategy`:
+
+- **The catalogue**, [`targeter/v2/catalogue.json`](catalogue.json) (schema
+  [`catalogue.schema.json`](catalogue.schema.json)): static venue mapping
+  shipped inside the Targeter image. It holds `sports`, `polymarket_tags`,
+  `limitless_category_ids`, `participant_aliases`, `known_rule_templates`,
+  `market_classes` and `game_families`: how venues name things, never what to
+  select. It changes only when a venue's data format or product set changes,
+  or a game is added, and that change ships as a new image.
+- **The strategy file**, `configs/targeter_v2.json` for capture (schema
+  [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json)):
+  what to select. It holds `version`, `note`, `sports`, `selection`,
+  `target_budgets` and the optional `scope` and `ranking`, and names catalogue
+  ids only. Each consumer, such as the executor, keeps its own.
+
+The strategy's `sports` must be catalogue sports; catalogue classes and game
+families of other sports are not resolved. A catalogue field in a strategy
+file is an unknown field. Unknown fields in either file, invalid regular
 expressions, duplicate class or game-family identifiers, bad venue thresholds
 and non-positive timing or budget values are fatal (`StrategyError`).
+
+Every selection report records `catalogue_version` and `catalogue_sha256`
+(the SHA-256 of the catalogue file's bytes). Publication refuses a report
+whose catalogue hash differs from the one it is given, just as it refuses a
+different `strategy_version`.
 
 | Field | Shipped value |
 |---|---|
@@ -33,22 +54,39 @@ and non-positive timing or budget values are fatal (`StrategyError`).
 | `continuity_hold_enabled` | true |
 | `maximum_bundles` | 50 |
 | `target_budgets` | kalshi 1000, polymarket 400, limitless 400 subscription IDs |
-| `polymarket_tags` | `soccer`, `esports` |
-| `limitless_category_ids` | `[53]` |
-| `participant_aliases` | empty |
-| `known_rule_templates` | empty |
+| catalogue `polymarket_tags` | `soccer`, `esports` |
+| catalogue `limitless_category_ids` | `[53]` |
+| catalogue `participant_aliases` | empty |
+| catalogue `known_rule_templates` | empty |
+
+Optional selection-config fields (all absent from the shipped file; a file
+without them behaves exactly as before).
+Unknown keys are fatal. Specified in
+[`docs/specs/TARGETER_SELECTION_CONFIG_V1.md`](../../docs/specs/TARGETER_SELECTION_CONFIG_V1.md);
+guide schema in [`configs/targeter_v2.schema.json`](../../configs/targeter_v2.schema.json);
+worked example in
+[`configs/examples/targeter_v2_cs2_single_event.json`](../../configs/examples/targeter_v2_cs2_single_event.json).
+
+| Field | Meaning |
+|---|---|
+| `scope.sports` | listed sports only; others are rejected `sport_outside_scope` |
+| `scope.games` | esports bundles of other games are rejected `game_outside_scope`; other sports are unaffected |
+| `scope.market_classes` | other markets are excluded `market_class_outside_scope`, after the volume gate and before relationship analysis |
+| `selection.maximum_markets_per_bundle` | keep at most N markets per bundle, taken in order (anchors, class priority, activity, `target_id`) and only alongside a kept cross-venue partner or together with one; the rest are excluded `market_cap_per_bundle` |
+| `selection.maximum_markets` | bundle-atomic budget on markets across the selection, additive allocation only; a bundle over it is skipped `maximum_markets_reached` |
+| `ranking.keys` / `ranking.priorities` | lexical comparison keys with `asc`/`desc`, and config-supplied integer priorities |
 
 `version` is copied into the report as `strategy_version`; publication refuses
 a report whose version differs from the strategy it is given.
 
-`market_classes` maps vendor product shapes to a canonical class, market type
+The catalogue's `market_classes` maps vendor product shapes to a canonical class, market type
 and settlement scope. The shipped classes are `soccer.moneyline_3way`,
 `soccer.spread`, `soccer.total_goals`, `soccer.both_teams_to_score`,
 `soccer.correct_score`, `esports.series_moneyline`, `esports.map_winner`,
 `esports.total_maps` and `esports.map_handicap`. Soccer patterns reject
 first-half, second-half, extra-time, penalty and corners products from the
 regulation-fulltime classes. Adding or changing a reusable venue product is a
-strategy edit plus a small adapter-shape test; it never needs an event-specific
+catalogue edit plus a small adapter-shape test; it never needs an event-specific
 parser or fixture.
 
 `participant_aliases` maps a preferred team identity to reviewed aliases and
@@ -124,7 +162,7 @@ exist for bounded validation, not production runs.
 
 ## Esports game families
 
-`game_families` in the strategy is the classification authority for esports.
+The catalogue's `game_families` is the classification authority for esports.
 Generic esports `market_classes` patterns do not apply once a record belongs to
 a configured family. Each family has `id` (lower snake case), `sport: esports`,
 `topology: best_of_series`, `polymarket_game_tags`, `venue_game_aliases` and
@@ -312,6 +350,16 @@ validation, or participates in no cross-venue relationship
 surviving set can no longer meet an event-level gate. A missing creation time
 is not treated as proof of a new market.
 
+With `scope` or `selection.maximum_markets_per_bundle` set, the same exclusion
+mechanism applies: the class filter runs after the moneyline-volume gate is
+computed (the gate still measures moneyline liquidity when moneylines are out
+of scope) and before relationship analysis. The per-bundle cap runs after the
+exclusions and scope filter and before the event gates, so a cap that breaks
+the event rejects it visibly through the usual reasons; `eligible_market_ids`
+lists only the kept markets, which keeps publication's equality check intact.
+Relationships and score are recomputed only when a class scope or cap actually
+removed a market.
+
 Ranking is a lexical tuple, not a weighted scalar: venue coverage (3 venues
 outrank any number of 2-venue bundles), cross-venue relationship quality
 (`IDENTITY` 40, implications 20, `MUTUAL_EXCLUSION` 10), market-class breadth,
@@ -321,6 +369,18 @@ subscription-ID budgets and `maximum_bundles`; a bundle that does not fit is
 not partially selected and is reported under `selection.allocation_rejections`
 as `target_budget_exceeded` or `maximum_bundles_reached`. Continuity-protected
 bundles are allocated first; see `DELIVERY.md`.
+
+With `ranking` configured, the tuple is the configured `keys` (each `asc` or
+`desc`) followed by `bundle_id` ascending. Available keys: `venue_coverage`,
+`cross_venue_relationships`, `market_class_breadth`, `activity`
+(the `score_components`), `moneyline_volume_usd` (the gate figure),
+`activation_time`, and the config-priority keys `game_priority`,
+`market_class_priority_max`, `market_class_priority_sum` and
+`venue_set_priority` (values from `ranking.priorities`, `default` when
+unlisted). `score` and `score_components` are unchanged and continuity-protected
+bundles still order by `score`. `selection.maximum_markets` counts markets
+already allocated, including protected ones, and never alters protected
+allocation or publication's protected-floor check.
 
 ## Selection report
 
@@ -338,7 +398,13 @@ esports `game`, `topology`, `format_observed`, `best_of`, `format_status`
 (`supported`/`unknown`/`conflicting`/`unsupported`) and `outcome_space_status`
 (`exhaustive_normal_path`, `not_built_unknown_format`,
 `not_built_format_conflict`, `not_built_unsupported_format`). Arrays are
-deterministically sorted. `input_complete` is true only when every supported
+deterministically sorted. Only when the strategy uses at least one
+selection-config field, `selection.configuration` echoes the resolved scope,
+both market caps (`null` when unset), the effective ranking keys including the
+implicit `bundle_id`, and the priorities, and each eligible candidate carries
+`rank_values` (`{key: value}` for every effective ranking key, timestamps in
+`isoformat`; the default order is reported when only scope or caps are set).
+`report_version` stays 3. `input_complete` is true only when every supported
 venue produced a complete catalogue with no adapter failure.
 
 ## Tests
@@ -347,7 +413,8 @@ Offline and contract-shaped; no live APIs and no frozen vendor responses.
 
 ```bash
 .venv/bin/python -m unittest tests.test_targeter_v2 tests.test_targeter_v2_lol \
-  tests.test_targeter_v2_esports_games tests.test_masks
+  tests.test_targeter_v2_esports_games tests.test_targeter_v2_selection_config \
+  tests.test_masks
 ```
 
 A live acceptance pass is `targeter/run_v2.py --mode shadow --no-response-cache`

@@ -111,6 +111,8 @@ def selection_report(run_directory: Path, strategy: Strategy) -> dict[str, Any]:
         raise PublicationError("publication requires a phase-5 v3 shadow report")
     if report.get("strategy_version") != strategy.version:
         raise PublicationError("selection report and publication strategy versions differ")
+    if report.get("catalogue_sha256") != strategy.catalogue_sha256:
+        raise PublicationError("selection report and publication catalogues differ")
     if report.get("input_complete") is not True or report.get("discovery_failures") != {}:
         raise PublicationError("incomplete targeter runs cannot be published")
     catalogs = report.get("catalogs")

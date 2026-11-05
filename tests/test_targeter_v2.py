@@ -33,7 +33,12 @@ from targeter.v2.continuity import (
     load_continuity_bundles,
 )
 from targeter.v2.matching import match_events
-from targeter.v2.registry import MarketClassRegistry, StrategyError, load_strategy
+from targeter.v2.registry import (
+    DEFAULT_CATALOGUE_PATH,
+    MarketClassRegistry,
+    StrategyError,
+    load_strategy,
+)
 from targeter.v2.rules import assess_rules, normal_path_contradictions, template_for
 from targeter.v2.run import (
     ShadowRun,
@@ -195,15 +200,15 @@ class StrategyAndMatchingTests(unittest.TestCase):
 
     def test_strategy_rejects_an_alias_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            document = json.loads(STRATEGY_PATH.read_text(encoding="utf-8"))
+            document = json.loads(DEFAULT_CATALOGUE_PATH.read_text(encoding="utf-8"))
             document["participant_aliases"] = {
                 "Heart of Midlothian": ["Hearts"],
                 "Queen of the South": ["Hearts"],
             }
-            path = Path(directory) / "strategy.json"
+            path = Path(directory) / "catalogue.json"
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(StrategyError, "more than one"):
-                load_strategy(path)
+                load_strategy(STRATEGY_PATH, catalogue_path=path)
 
     def test_strategy_rejects_a_non_positive_moneyline_volume_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
