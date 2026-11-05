@@ -31,7 +31,7 @@ September 27–28 and October 3 retained fixtures. The full October 3 seven-grou
 attempt was blocked by the then-8 MiB entity cap; a bounded occurrence passed
 all seven groups, and the full interval passed coverage, complement,
 multi-market and profile. October 3 outcomes were unavailable, so those runs
-did not prove admitted mask-dependent economics. The current 256 MiB entity
+did not prove admitted mask-dependent economics. The current 512 MiB entity
 limit does not retroactively complete that acceptance. Deployment and live
 execution were not verified by those runs.
 
@@ -42,7 +42,7 @@ execution were not verified by those runs.
   attempted bytes/rows/line size or retained-state usage/request/cap. The prior
   report lacked that evidence; do not infer which limit failed.
 - Keep ordinary logical file limits (512 MiB, 2,000,000 rows, 64 KiB lines)
-  separate from the shared 512 MiB retained-state budget and from the special
+  separate from the shared 1 GiB retained-state budget and from the special
   entity, availability and profile-stream limits. Compression cannot bypass a
   logical cap, and phase-aware probe reservations do not certify corpus capacity.
   Any measured cap change needs consistent writer/plain/zstd-reader checks.

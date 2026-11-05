@@ -17,7 +17,7 @@ STRATEGIES = {"same_venue": "same_venue_implication_cover_v1",
               "cross_venue": "cross_venue_implication_cover_v1"}
 FACTORIES = {mode: "replay.strategies." + strategy.removesuffix("_v1") + ":build"
              for mode, strategy in STRATEGIES.items()}
-MAX_PAIRS = 4096
+MAX_PAIRS = 8192  # a corpus bundle's same-venue scope had 98 + 6 books: 4,768 pairs
 
 
 def experiment_identity(snapshot_sha, policy, fees, valuation, mode):
