@@ -9,14 +9,11 @@ nothing checking it is how `_lane_of` came to exist twice and be wrong twice.
 
 from __future__ import annotations
 
-import json
 import re
 import unittest
 from pathlib import Path
 
 from replay.lanes import LANE_RANK
-from replay.legacy.order import OrderedTape
-from replay.stream import MemoryByteStreamer
 
 RANK_SOURCE = (
     Path(__file__).resolve().parents[2]
@@ -73,39 +70,6 @@ class LaneRankParityTests(unittest.TestCase):
         # A shared rank pushes the decision onto `delivery_index`, comparing
         # counters minted by two independent splices as if they were one run.
         self.assertEqual(len(set(LANE_RANK.values())), len(LANE_RANK))
-
-
-class TieOrderTests(unittest.TestCase):
-    def test_tape_merges_equal_timestamps_by_lane_then_delivery(self):
-        lanes = (
-            "polymarket", "polymarket_snapshots", "polymarket_sports",
-            "polymarket_rtds", "kalshi", "limitless",
-        )
-        objects = {}
-        for lane in reversed(lanes):
-            records = []
-            for index in (1, 2):
-                records.append(json.dumps({
-                    "envelope_version": 2,
-                    "delivery_index": index,
-                    "record_id": f"{lane}:{index}",
-                    "visible_ns": 100,
-                    "monotonic_ns": 200 + index,
-                    "venue": lane.split("_")[0],
-                    "stream": "public_book",
-                    "connection_epoch": "epoch",
-                    "local_counter": index,
-                    "source_cursor": None,
-                    "kind": "venue_frame",
-                    "raw_payload": "{}",
-                }).encode() + b"\n")
-            objects[f"lane={lane}/date=2026-01-01/segment.ndjson"] = b"".join(records)
-        tape = OrderedTape(MemoryByteStreamer(objects))
-        self.assertEqual(
-            [(item.lane, item.envelope.delivery_index) for item in tape],
-            [(lane, index) for lane in lanes for index in (1, 2)],
-        )
-        self.assertEqual(tape.delivery_breaks, [])
 
 
 if __name__ == "__main__":

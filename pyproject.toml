@@ -26,7 +26,6 @@ include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "univers
 
 [tool.setuptools.package-data]
 replay = ["README.md"]
-"replay.legacy" = ["README.md", "GATE1_FAILURES.md", "policy.json"]
 "replay.strategies" = ["README.md"]
 "replay.strategies.bundle_coverage" = ["README.md", "SPEC.md", "config.example.json", "bench.example.json"]
 "replay.strategies.same_venue_complement" = ["README.md", "SPEC.md", "config.example.json"]

@@ -72,7 +72,7 @@ A restart does **not** break `delivery_index`. `resume_state`
 (`splices/common/spool.py`) rebuilds the next index from the seals, because
 the index is dense across a splice's lifetime rather than per connection. A new
 `connection_epoch` is minted and `local_counter` restarts inside it, which is
-what gate 1 expects to see.
+what the capture audit expects to see.
 
 `stop_grace_period` is 30s so the splice seals its open segment on the way down.
 That matters: a cleanly sealed segment means the next start resumes from seals
@@ -217,10 +217,8 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 ```
 
 Limitless produces a lot of these — it is a low-volume venue and a quiet
-30-minute window is expected. **Gate 1 can report an empty segment as
-`"<segment>: sealed but the segment is absent"`**, which is a wording issue, not
-data loss: its seen-segment set is populated per parsed record, so a segment with
-no records is never marked seen. Check before worrying:
+30-minute window is expected. A segment with no records is not data loss; a
+record-driven dataset audit can mis-report it as absent. Check before worrying:
 
 ```bash
 sudo python3 -c "
@@ -243,7 +241,7 @@ for seal in glob.glob('$DATA/spool/lane=*/date=*/*.seal.json'):
 sudo python3 -m json.tool $DATA/ops/last_targeter_v2_reaper_sweep.json | head -40
 ```
 
-Different command, different gate, **different retention semantics** — see §8.
+Different command, different gate, **different retention semantics** — see §7.
 
 | Reason | Means |
 |---|---|
@@ -291,48 +289,7 @@ sudo python3 -m json.tool $DATA/ops/last_finalizer_sweep.json | head -30
 
 ---
 
-## 7. Reading gate 1
-
-```bash
-dc run --rm --no-deps targeter \
-  python -u -m replay.legacy.gate1 /var/lib/prediction-indexer \
-    --output /var/lib/prediction-indexer/ops/gate1.json
-```
-
-Failures only:
-
-```bash
-sudo python3 -c "
-import json
-r = json.load(open('$DATA/ops/gate1.json'))
-for c in r['checks']:
-    if c['status'] != 'PASS':
-        print(c['status'], c['name'])
-        print('   ', c['requirement'])
-        print('   ', json.dumps(c['evidence'])[:600]); print()
-"
-```
-
-Gate 1 is deliberately strict and a failure is a capture-side gap, not an
-invitation to filter until it passes. Two checks matter more than the rest:
-
-- **`byte_and_envelope_integrity`** and **`deterministic_capture_order`** — these
-  are the ones that cannot be repaired after the fact. If they pass, the tape is
-  sound and everything else is metadata or configuration.
-
-The other checks, why each currently fails or passes, and what clears it are in
-[`replay/legacy/GATE1_FAILURES.md`](../replay/legacy/GATE1_FAILURES.md). Gate 1 reads only
-`spool/**/*.ndjson`, `*.seal.json`, the metadata snapshots and `coverage.json`; it
-cannot read `.ndjson.zst`, which is why the ordering in §8 matters.
-
-**If it aborts with `object changed after stream snapshot: .../coverage.json`:**
-the targeter rewrote the ledger mid-run (every publish replaces it atomically, so
-its inode changes every 10 minutes). Pause the targeter cron for the duration of a
-gate run.
-
----
-
-## 8. Enabling deletion — the ordering that matters
+## 7. Enabling deletion — the ordering that matters
 
 The two evidence/run reapers behave very differently and this is the single most
 important thing on this page. The ingest-store reaper is independent of both:
@@ -350,11 +307,11 @@ not delete raw or canonical evidence.
 `REAPER_MODE=delete` removes *everything* archived and ingested on the very next
 hourly sweep, however recent. It is not a rolling window.
 
-Because gate 1 reads exactly those files and cannot read the `.ndjson.zst` copies
-in the archive, run the analysis you want **before** flipping it:
+Any local analysis that reads the spool or the run directories must finish **before**
+flipping either reaper:
 
 1. Backfill coverage (reads run directories the run reaper reclaims)
-2. Run gate 1 to completion (reads the spool the raw reaper deletes)
+2. Finish any analysis of the spool the raw reaper deletes
 3. Then `TARGETER_RUN_REAPER_MODE=delete` — safe independently, 18h floor
 4. Then `REAPER_MODE=delete` — irreversible for local analysis
 
@@ -363,7 +320,7 @@ and `counts.unarchived` is zero.
 
 ---
 
-## 9. Capacity
+## 8. Capacity
 
 ```bash
 sudo du -sh $DATA/* | sort -h
@@ -410,7 +367,7 @@ removes it.
 
 ---
 
-## 10. Quick health sweep
+## 9. Quick health sweep
 
 ```bash
 dc --profile ops --profile kalshi ps
