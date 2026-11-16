@@ -30,7 +30,6 @@ engine/              Rust: Replay domain, venue normalizers, derivatives, risk, 
 replay/              current strategy runtime, SDKs, bench and corpus
   strategies/        per-strategy code, readers, configs and docs
   corpus/            resumable retired-bundle runs, receipts and deep audits
-  legacy/            original raw-envelope replay and five-gate audits
 analysis/            outcome spaces, masks and claims shared by targeter, universe, replay
 targeter-ui/         web UI for the Universe and Replay
 configs/             Targeter strategy, replay runner, bench and strategy examples
@@ -87,7 +86,13 @@ Resumable corpus runs and deep audits are documented in
 cargo test --manifest-path ingester/Cargo.toml --workspace
 cargo test --manifest-path engine/Cargo.toml --workspace
 cargo test --manifest-path encoder/rust/Cargo.toml
-yarn install && yarn test          # targeter-ui and the Node decoder
+yarn install && yarn test          # targeter-ui
+```
+
+After cloning, enable the repository pre-commit hook (it runs the root lint gate):
+
+```bash
+git config core.hooksPath .githooks
 ```
 
 `scripts/archive_probe.py` archives and decodes real captured bytes and reports

@@ -26,7 +26,6 @@ from encoder import (
     stored_identity_of,
 )
 from replay.catalog import canonical_sha256
-from replay.legacy.gate1 import Gate1Auditor
 from replay.stream import CompositeByteStreamer, MemoryByteStreamer
 from targeter.v2.replay_stream import (
     ArchivedTargetRecordByteStreamer,
@@ -390,7 +389,7 @@ class ArchivedTargetRecordByteStreamerTests(unittest.TestCase):
     def test_unrelated_missing_run_objects_do_not_block_target_records(self) -> None:
         predecessor = self.fixture.receipt(RUN_IDS[0])
         current = self.fixture.receipt(RUN_IDS[1])
-        # The fixture deliberately never stores selection_report.json. Gate 1
+        # The fixture deliberately never stores selection_report.json. Replay
         # needs the receipted manifest and target record, not unrelated reports.
         streamer = self.streamer((predecessor, current))
         self.assertTrue(b"".join(streamer.iter_bytes(streamer.object_keys()[0])))
@@ -444,26 +443,28 @@ class ArchivedTargetRecordByteStreamerTests(unittest.TestCase):
         with self.assertRaisesRegex(VerificationFailure, "lacks decoded identity"):
             self.streamer((malformed, current))
 
-    def test_gate1_consumes_decoded_target_records_through_composition(self) -> None:
-        predecessor = self.fixture.receipt(RUN_IDS[0])
-        current = self.fixture.receipt(RUN_IDS[1])
+    def test_composition_exposes_decoded_target_records_beside_the_tape(self) -> None:
+        predecessor = self.fixture.receipt(RUN_IDS[0], compressed=True)
+        current = self.fixture.receipt(RUN_IDS[1], compressed=False)
+        tape = _tape("asset")
         composite = CompositeByteStreamer(
-            MemoryByteStreamer(_tape("asset")),
+            MemoryByteStreamer(tape),
             self.streamer((predecessor, current)),
         )
-        report = Gate1Auditor().audit(composite).as_record()
-        checks = {check["name"]: check for check in report["checks"]}
+        keys = composite.object_keys()
+        target_keys = [key for key in keys if "target_records_" in key]
 
-        self.assertEqual(checks["market_rules_and_metadata"]["status"], "PASS")
-        self.assertEqual(checks["fee_model_evidence"]["status"], "PASS")
-        self.assertEqual(checks["discovery_coverage"]["status"], "PASS")
-        target_inputs = [
-            item
-            for item in report["input"]["objects"]
-            if "target_records_" in item["key"]
-        ]
-        self.assertEqual(len(target_inputs), 2)
-        self.assertTrue(all(item["key"].endswith(".ndjson") for item in target_inputs))
+        self.assertEqual(len(target_keys), 2)
+        self.assertEqual(len(keys), len(tape) + 2)
+        self.assertEqual(list(keys), sorted(keys))
+        self.assertTrue(all(key.endswith(".ndjson") for key in target_keys))
+        for key, run_id in zip(sorted(target_keys), RUN_IDS[:2], strict=True):
+            self.assertEqual(
+                b"".join(composite.iter_bytes(key)),
+                _target_record("asset", run_id=run_id),
+            )
+        for key, payload in tape.items():
+            self.assertEqual(b"".join(composite.iter_bytes(key)), payload)
 
 
 if __name__ == "__main__":

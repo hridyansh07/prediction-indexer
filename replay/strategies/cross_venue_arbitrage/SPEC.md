@@ -305,10 +305,8 @@ Base: `a11bbf0ba4f78af7b27b382b913dbd71a41ea3f4`, verified against the remote
 `codex/cross-venue-arbitrage-v1`. Managed worktree:
 `/Users/hridyansh/.codex/worktrees/cross-venue-arbitrage/Prediction Indexer`.
 Changes are unstaged and uncommitted. The main checkout and untracked research
-memo are preserved. The code/config source identity is recorded in
-[CROSS_VENUE_ARBITRAGE_V1_SOURCE.json](SOURCE.json); it lists
-SHA-256 values for every changed executable/configuration file and supporting SDK
-documentation. This report itself is not part of the source digest.
+memo are preserved. The historical source-identity attestation (a SHA-256 list of every changed
+file) has been removed.
 
 Changed files:
 

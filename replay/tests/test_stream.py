@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import unittest
 
-from replay.legacy.envelope import EnvelopeError, parse_envelope
 from replay.stream import (
     CompositeByteStreamer,
     MemoryByteStreamer,
@@ -54,35 +52,6 @@ class ByteStreamerTests(unittest.TestCase):
         composite = CompositeByteStreamer(MemoryByteStreamer({"known": b"value"}))
         with self.assertRaises(StreamError):
             next(composite.iter_bytes("missing"))
-
-
-class EnvelopeTests(unittest.TestCase):
-    def _record(self, **updates):
-        record = {
-            "envelope_version": 2,
-            "delivery_index": 1,
-            "record_id": "pm-a-1",
-            "visible_ns": 10,
-            "monotonic_ns": 5,
-            "venue": "polymarket",
-            "stream": "public_book",
-            "connection_epoch": "a",
-            "local_counter": 1,
-            "source_cursor": None,
-            "kind": "venue_frame",
-            "raw_payload": "{}",
-        }
-        record.update(updates)
-        return json.dumps(record, separators=(",", ":")).encode()
-
-    def test_v2_is_read_without_importing_capture_code(self) -> None:
-        parsed = parse_envelope(self._record())
-        self.assertEqual(parsed.envelope_version, 2)
-        self.assertEqual(parsed.monotonic_ns, 5)
-
-    def test_unknown_field_is_rejected(self) -> None:
-        with self.assertRaises(EnvelopeError):
-            parse_envelope(self._record(secret_interpretation=True))
 
 
 if __name__ == "__main__":

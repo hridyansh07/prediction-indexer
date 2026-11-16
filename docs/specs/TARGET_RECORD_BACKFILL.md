@@ -23,8 +23,7 @@ current record and writes rows in the shape of `DELIVERY.md` with
 - Record a per-market outcome (`fetched`, `not_found`, `error`) so coverage is
   a number.
 - Open: whether asserted rows live in a parallel per-run tree or one store
-  keyed by `run_id`. Gate 1 already honours `--allow-asserted-records` (off by
-  default: only `captured` rows count).
+  keyed by `run_id`. Asserted rows stay off by default: only `captured` rows count.
 
 ## 2. Write-on-change compaction
 
