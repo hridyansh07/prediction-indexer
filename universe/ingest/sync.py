@@ -25,7 +25,7 @@ from archive.storage.base import (
     ObjectStore,
 )
 from archive.storage.verification import verify_metadata_objects
-from encoder import StoredIdentity
+from encoder import CodecError, StoredIdentity
 from targeter.v2.manifest import (
     RunManifest,
     RunManifestError,
@@ -36,6 +36,7 @@ from targeter.v2.manifest import (
 )
 from targeter.v2.models import isoformat, parse_timestamp
 from universe.derive.market_projection import project_market_universe
+from universe.derive.execution_terms import ExecutionTermsError, target_record_terms
 from universe.derive.projection import (
     PROJECTION_VERSION,
     project_bundle_retirements,
@@ -70,6 +71,21 @@ def _logical_size(item: RunObject) -> int:
             f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
         )
     return item.logical.byte_length
+
+
+def _execution_term_items(manifest: RunManifest) -> list[RunObject]:
+    items = [
+        item for item in manifest.objects
+        if item.file in {
+            f"target_records_{venue}.ndjson{suffix}"
+            for venue in ("kalshi", "polymarket", "limitless")
+            for suffix in ("", ".zst")
+        }
+    ]
+    for item in manifest.objects:
+        if item.file.startswith("target_records_") and item not in items:
+            raise UniverseSyncError(f"target record artifact filename is invalid: {item.key}")
+    return items
 
 
 @dataclass
@@ -126,6 +142,7 @@ class _VerifiedRun:
     retirements: tuple[dict[str, Any], ...]
     catalog_decoded_bytes: int
     catalog_rows_retained: int
+    execution_terms: tuple[dict[str, Any], ...]
 
 
 class UniverseSync:
@@ -455,7 +472,9 @@ class UniverseSync:
             raise UniverseSyncError(
                 f"run manifest {key} identity disagrees with continuity origin"
             )
-        if not force and self.database.known_manifest(key, metadata.sha256):
+        if not force and self.database.known_manifest(
+            key, metadata.sha256, reingest=identity_backfill
+        ):
             return "skipped", None
         if key in stack:
             raise UniverseSyncError(f"continuity origin cycle reaches {key}")
@@ -534,6 +553,7 @@ class UniverseSync:
                     else verified.report_item.stored.byte_length
                 ),
                 market_projection=verified.market_projection,
+                execution_terms=verified.execution_terms,
                 occurrences=resolved,
                 retirements=resolved_retirements,
                 identity_backfill=identity_backfill,
@@ -818,6 +838,18 @@ class UniverseSync:
             catalog_markets=catalog_markets,
             rule_templates=rule_templates,
         )
+        selected = {
+            target["target_id"]: target
+            for occurrence in projected
+            for target in occurrence["targets"]
+        }
+        term_bytes = sum(_logical_size(item) for item in _execution_term_items(manifest))
+        if catalog_bytes + term_bytes > MAX_CATALOG_BYTES_PER_RUN:
+            raise UniverseSyncError(
+                f"normalized artifacts for run {manifest.run_id} exceed "
+                f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
+            )
+        terms = self._read_execution_terms(manifest, bound_expectations, selected)
         return _VerifiedRun(
             manifest,
             manifest_stored,
@@ -826,9 +858,55 @@ class UniverseSync:
             market_projection,
             projected,
             retirements,
-            catalog_bytes,
-            len(catalog_events) + len(catalog_markets) + len(rule_templates),
+            catalog_bytes + term_bytes,
+            len(catalog_events) + len(catalog_markets) + len(rule_templates) + len(terms),
+            terms,
         )
+
+    def _read_execution_terms(
+        self, manifest: RunManifest, bound_expectations: Mapping[str, ObjectExpectation],
+        selected: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        # Read the run's own evidence, including retained selections. Copying
+        # an origin's old delay would invent a current observation.
+        term_items = _execution_term_items(manifest)
+        term_bytes = sum(_logical_size(item) for item in term_items)
+        if term_bytes > MAX_CATALOG_BYTES_PER_RUN:
+            raise UniverseSyncError(
+                f"normalized artifacts for run {manifest.run_id} exceed "
+                f"{MAX_CATALOG_BYTES_PER_RUN} decoded bytes"
+            )
+        terms = []
+        seen_venues = set()
+        for item in term_items:
+            venue = item.file.removeprefix("target_records_").split(".", 1)[0]
+            if venue in seen_venues:
+                raise UniverseSyncError(f"target record artifacts repeat venue {venue}: {item.key}")
+            seen_venues.add(venue)
+            previous_id = ""
+
+            def retain(row):
+                nonlocal previous_id
+                try:
+                    term = target_record_terms(row, run_id=manifest.run_id, venue=venue)
+                except ExecutionTermsError as error:
+                    raise UniverseSyncError(f"{item.key}: {error}") from error
+                target_id = row["target_id"]
+                if target_id <= previous_id:
+                    raise UniverseSyncError(f"target record rows are not sorted and unique: {item.key}")
+                previous_id = target_id
+                if manifest.input_complete:
+                    target = selected.get(target_id)
+                    if target is None or sorted(row["subscription_ids"]) != sorted(target["subscription_ids"]):
+                        raise UniverseSyncError(f"target record {target_id} disagrees with selected subscriptions: {item.key}")
+                    terms.append(term)
+                return False
+
+            try:
+                self._read_ndjson(item, bound_expectations[item.key], keep=retain)
+            except CodecError as error:
+                raise UniverseSyncError(f"{item.key}: {error}") from error
+        return tuple(sorted(terms, key=lambda term: (term["venue"], term["venue_market_id"])))
 
     def _read_run_manifest(
         self, key: str, *, expected_sha256: str | None
@@ -1073,12 +1151,26 @@ def _ndjson_row(line: bytes, key: str) -> Mapping[str, Any]:
     if not line:
         raise UniverseSyncError(f"normalized artifact {key} contains an empty line")
     try:
-        value = json.loads(line)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = json.loads(line, object_pairs_hook=_unique_json_object,
+                           parse_constant=_invalid_json_constant)
+    except (UnicodeDecodeError, ValueError) as error:
         raise UniverseSyncError(f"normalized artifact {key} contains invalid JSON") from error
     if not isinstance(value, dict):
         raise UniverseSyncError(f"normalized artifact {key} row is not an object")
     return value
+
+
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key}")
+        value[key] = item
+    return value
+
+
+def _invalid_json_constant(value):
+    raise ValueError(f"non-finite JSON constant {value}")
 
 
 def _catalog_references(report: Mapping[str, Any]) -> tuple[set[str], set[str]]:

@@ -50,6 +50,8 @@ def aggregate_files(experiment):
     """Every file layout 2 writes, by group, in a fixed order."""
     files = {"": ["entities.json", "reasons.json", "denominators.ndjson", "episodes.ndjson",
                   "slices.ndjson"]}
+    if experiment.fills is not None and experiment.fills.probes is not None:
+        files[""] += ["probes.ndjson"]
     if experiment.audit_intervals:
         files[""] += ["audit/measurements.ndjson", "audit/slices.ndjson"]
     for control in experiment.controls:

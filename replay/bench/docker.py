@@ -77,6 +77,12 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
     code, started = 3, time.monotonic()
     runner, redis = resource + '-runner', resource + '-redis'
     owner = resource
+    interrupted = []   # re-raised after cleanup and evidence, so a caller stops instead of reading exit 3
+    def record(error):
+        failures.append(error_document(error))
+        if isinstance(error, KeyboardInterrupt):
+            interrupted.append(error)
+
     def ownership(kind, identifier):
         prefix = ['inspect'] if kind == 'container' else [kind, 'inspect']
         field = '.Labels' if kind == 'network' else '.Config.Labels'
@@ -86,7 +92,7 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
                 failures.append(error_document(DockerError('resource ownership mismatch; preserved')))
             return matched
         except (Exception, KeyboardInterrupt) as error:
-            failures.append(error_document(error))
+            record(error)
             return False
 
     try:
@@ -124,7 +130,11 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
         docker.run(['exec', redis, 'sh', '-c', 'for i in $(seq 1 100); do redis-cli ping && exit 0; sleep 0.1; done; exit 1'], timeout=20)
         args = ['create', '--label', OWNER + '=' + owner, '--name', runner, '--network', resource, '--read-only', '--cap-drop', 'ALL',
                 '--user', str(os.getuid()) + ':' + str(os.getgid()),
-                '--tmpfs', '/tmp:rw,nosuid,noexec,size=1g', '--entrypoint', 'python']
+                '--tmpfs', '/tmp:rw,nosuid,noexec,size=1g', '--entrypoint', 'python',
+                # A fixed literal, not a forwarded host value: failed participants leave failure.json.
+                '--env', 'REPLAY_PARTICIPANT_DIAGNOSTICS=1']
+        if os.environ.get('REPLAY_FEE_CROSSCHECK') == '1':
+            args += ['--env', 'REPLAY_FEE_CROSSCHECK=1']
         args += _mount(root, '/bench', readonly=False)
         args += _mount(Path(spec['context_directory']).resolve(), '/bench/context')
         if spec.get('game_state_path') is not None:
@@ -151,7 +161,7 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
                 (code == 2 and result['status'] == 'CHECKS_FAILED') or
                 (code in {1, 3} and result['status'] == 'FAILED'), 'runner exit/result mismatch')
     except (Exception, KeyboardInterrupt) as error:
-        failures.append(error_document(error))
+        record(error)
         code = 3
         if not (root / 'result.json').exists():
             result = initial_result(resolved)
@@ -168,30 +178,32 @@ def run_bench(spec_path, output, *, keep_image=False, prune_build_cache=False, l
             try:
                 docker.run(['logs', container], log=root / 'logs' / filename)
             except (Exception, KeyboardInterrupt) as error:
-                failures.append(error_document(error))
+                record(error)
             try:
                 docker.run(['rm', '--force', container])
             except (Exception, KeyboardInterrupt) as error:
-                failures.append(error_document(error))
+                record(error)
         if owned_network and ownership('network', resource):
             try:
                 docker.run(['network', 'rm', resource])
             except (Exception, KeyboardInterrupt) as error:
-                failures.append(error_document(error))
+                record(error)
         if owned_image and not keep_image and ownership('image', image_tag):
             try:
                 docker.run(['image', 'rm', image_tag])
             except (Exception, KeyboardInterrupt) as error:
-                failures.append(error_document(error))
+                record(error)
         if prune_build_cache:
             try:
                 docker.run(['builder', 'prune', '--force'], log=root / 'logs' / 'prune.log')
             except (Exception, KeyboardInterrupt) as error:
-                failures.append(error_document(error))
+                record(error)
         if failures:
             code = 3
         write_json(root / 'orchestration.json', {'version': 1, 'exit_code': code, 'errors': failures,
                                                 'network': resource, 'containers': owned_containers,
                                                 'image_tag': image_tag if owned_image else None,
                                                 'image_kept': bool(owned_image and keep_image)})
+    if interrupted:
+        raise interrupted[0]
     return code

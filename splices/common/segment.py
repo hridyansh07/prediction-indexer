@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 __all__ = [
     "DEFAULT_SEGMENT_SECONDS",
@@ -674,15 +674,3 @@ def open_segments(root: Path, lane: str) -> list[Path]:
         (path for path in directory.glob(f"date=*/*{OPEN_SUFFIX}") if path.is_file()),
         key=lambda path: (path.parent.name, path.name),
     )
-
-
-def iter_records(lines: Iterable[bytes]) -> Iterable[Record]:
-    """Decodes encoded envelopes back into `Record`s — recovery paths only."""
-    for line in lines:
-        document = json.loads(line)
-        yield Record(
-            line=line,
-            visible_ns=int(document["visible_ns"]),
-            delivery_index=int(document["delivery_index"]),
-            epoch=str(document["connection_epoch"]),
-        )

@@ -111,7 +111,7 @@ def policy(*sizings, step="1", max_legs=4, **overrides):
 
 
 class Harness(BaseHarness):
-    def __init__(self, root, *, doc=None, fees="zero", value=None, **kwargs):
+    def __init__(self, root, *, doc=None, fees="zero", value=None, storage=None, **kwargs):
         d = sibling_detail()
         document = sibling_document() if doc is None else doc
 
@@ -140,6 +140,8 @@ class Harness(BaseHarness):
             directory = build_catalog(root / "kalshi-fees", catalog, {source.sha256: raw})
             cfg["fees"].update(catalog_directory=str(directory), catalog_identity=catalog.identity)
             cfg["policy"] = value or policy()
+            if storage is not None:
+                cfg["storage"] = storage
             self.multi_config = cfg
             return build({**context, "config": cfg})
 

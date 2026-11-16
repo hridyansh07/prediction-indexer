@@ -154,12 +154,14 @@ def _quote(value, scale):
 
 def _ladder(value, scale, descending):
     require(type(value) is list, "ladder shape")
-    prices, result = [], {}
+    previous, ordered, result = None, True, {}
     for entry in value:
         price, quantity = _quote(entry, scale)
-        prices.append(price)
+        if previous is not None:
+            ordered &= price < previous if descending else price > previous
+        previous = price
         result[price] = quantity
-    require(prices == sorted(set(prices), reverse=descending), "ladder order")
+    require(ordered, "ladder order")
     return result
 
 
@@ -232,8 +234,9 @@ class _Layout:
 class _Tops:
     """Row-by-row checks of ``transitions.ndjson.zst``; yields one group per cut."""
 
-    def __init__(self, root, layout, identity, facts, groups):
+    def __init__(self, root, layout, identity, facts, groups, on_top=None):
         self.layout, self.facts, self.groups = layout, facts, groups
+        self.on_top = on_top
         self.logical, self.stored = identity_record(identity)
         self.path = Path(root) / TRANSITIONS_FILE
         require(self.path.is_file() and not self.path.is_symlink(), "regular transitions required")
@@ -302,6 +305,8 @@ class _Tops:
         state.last, state.at = top, t
         self.types["top"] = self.types.get("top", 0) + 1
         self.causes[cause] = self.causes.get(cause, 0) + 1
+        if self.on_top is not None:
+            self.on_top(row)
         return {"type": "top", "scope": scope, "book": book, "cut": cut, "cause": cause,
                 "bid": bid, "ask": ask}
 
@@ -426,23 +431,36 @@ class _Levels:
             require(state is not None, "first level row is not an open ladder")
             changes = row["levels"]
             require(type(changes) is list and changes, "diff levels")
-            seen = []
+            previous, ordered = None, True
+            best, dirty = list(state.best), [False, False]
             out["before"] = state.top()
             for entry in changes:
                 require(type(entry) is list and len(entry) == 3 and entry[0] in ("bid", "ask"), "diff entry")
                 side = 0 if entry[0] == "bid" else 1
                 price, delta = _big(entry[1]), _signed(entry[2])
                 require(price <= 10 ** int(scale) and delta != 0, "diff entry range")
-                seen.append((side, price))
+                key = (side, price)
+                if previous is not None:
+                    ordered &= previous < key
+                previous = key
                 levels = state.sides[side]
                 new = levels.get(price, 0) + delta
                 require(new >= 0, "diff drives a level negative")
                 if new:
                     levels[price] = new
+                    if best[side] is None or (price > best[side] if side == 0 else price < best[side]):
+                        best[side] = price
                 else:
                     levels.pop(price, None)
-            require(seen == sorted(set(seen)), "diff order")
-            state.settle(0), state.settle(1)
+                    if price == best[side]:
+                        dirty[side] = True
+            # Order errors follow all entry/range/negative-quantity checks, as before.
+            require(ordered, "diff order")
+            for side in (0, 1):
+                if dirty[side]:
+                    state.settle(side)
+                else:
+                    state.best[side] = best[side]
         self.types[kind] = self.types.get(kind, 0) + 1
         out["after"] = state.top()
         out["opening"] = opening
@@ -524,17 +542,18 @@ def _drain(groups):
         pass
 
 
-def validate_streams(root, snapshot, files, policy, facts, groups):
+def validate_streams(root, snapshot, files, policy, facts, groups, *, on_top=None):
     """Check the stream files against the snapshot, policy and the profile rows' ``facts``.
 
     Returns the summary additions. ``facts`` carries, per (scope, book key), the
     profile's state durations, bucket-open quotes and per-bucket activity counts;
-    each cross-check applies only when its group produced them.
+    each cross-check applies only when its group produced them. ``on_top`` sees
+    each strictly parsed top row in file order, without retaining it here.
     """
     layout = _Layout(snapshot, policy)
     tops = levels = None
     if "transitions" in groups:
-        tops = _Tops(root, layout, files[TRANSITIONS_FILE], facts, groups)
+        tops = _Tops(root, layout, files[TRANSITIONS_FILE], facts, groups, on_top)
     if "levels" in groups:
         levels = _Levels(root, layout, files[LEVELS_FILE])
     if tops is not None and levels is not None:

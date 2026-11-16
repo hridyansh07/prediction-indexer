@@ -29,7 +29,7 @@ from archive.storage.base import (
     ObjectStoreError,
     VerificationFailure,
 )
-from encoder import StoredIdentity
+from encoder import StoredIdentity, stored_identity_of
 from replay.jobs.bundle import BundleFailure, BundleReady, NotReady, StaleCache
 from replay.jobs.contracts import (
     MAX_BUNDLE_RECEIPT_BYTES,
@@ -361,8 +361,11 @@ class HistoryClient:
         require(type(value["continuity_selected"]) is bool)
         if value["continuity_disposition"] is not None:
             choice(value["continuity_disposition"], "held_current_candidate retained")
-        for field in ("sport", "game", "topology", "activation_at", "capture_start_at"):
+        for field in ("sport", "activation_at", "capture_start_at"):
             require(type(value[field]) is str and bool(value[field]))
+        # Optional in the Universe context: a non-esports event has no game or topology.
+        for field in ("game", "topology"):
+            require(value[field] is None or (type(value[field]) is str and bool(value[field])))
         source = obj(value["source"], "manifest_key manifest_sha256 report_key report_sha256")
         HistoryClient._source(value["run_id"], source)
         origin = obj(
@@ -682,6 +685,8 @@ def supervisor_config(
         },
     }
     try:
+        from replay.economic_sdk.retention import for_groups
+        document["transport"].update(for_groups(snapshot, document["strategies"].values()))
         validate_supervisor(document)
     except OSError as error:
         raise StageFailure("resource_exhausted", str(error)) from error
@@ -942,13 +947,8 @@ def _archive_files(root: Path):
 
 
 def _identity(path: Path) -> StoredIdentity:
-    digest = hashlib.sha256()
-    length = 0
     with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-            length += len(chunk)
-    return StoredIdentity(digest.hexdigest(), length)
+        return stored_identity_of(source)
 
 
 def _stage_identities(root: Path, row):

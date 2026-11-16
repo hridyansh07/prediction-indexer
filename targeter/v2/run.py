@@ -8,10 +8,12 @@ cannot silently overlap or retain stale vendor state between runs.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from archive.common.durable import write_json_durable
 from archive.storage.base import ObjectStoreError
@@ -28,6 +30,7 @@ from targeter.v2.adapters import durable_client, live_adapters
 from targeter.v2.continuity import (
     ContinuityBundle,
     ContinuityError,
+    ContinuityTarget,
     TerminalProbe,
     TerminalState,
     load_continuity_bundles,
@@ -130,6 +133,8 @@ def _continuity_for_run(
     client: Any,
     strategy: Strategy,
     now: datetime,
+    clients: Mapping[str, Any] | None = None,
+    executor: Executor | None = None,
 ) -> tuple[tuple[ContinuityBundle, ...], list[str], str | None]:
     if not strategy.continuity_hold_enabled:
         return (), [], None
@@ -153,41 +158,50 @@ def _continuity_for_run(
     by_venue = target_ids_by_venue(bundles)
     probes: dict[str, TerminalProbe] = {}
     adapters_by_venue = {str(adapter.venue): adapter for adapter in adapters}
-    for venue, targets in by_venue.items():
+
+    def probe_venue(
+        venue: str, targets: tuple[ContinuityTarget, ...]
+    ) -> dict[str, TerminalProbe]:
         adapter = adapters_by_venue.get(venue)
         if adapter is None or not hasattr(adapter, "probe_terminal"):
-            probes.update(
-                {
-                    target.target_id: TerminalProbe(
-                        TerminalState.UNKNOWN,
-                        "terminal_adapter_unavailable",
-                    )
-                    for target in targets
-                }
-            )
-            continue
+            return {
+                target.target_id: TerminalProbe(
+                    TerminalState.UNKNOWN,
+                    "terminal_adapter_unavailable",
+                )
+                for target in targets
+            }
+        http = clients[venue] if clients is not None else client
         if venue == "limitless":
-            venue_probes = adapter.probe_terminal(
-                client,
+            return adapter.probe_terminal(
+                http,
                 {target.target_id: target.source_ref for target in targets},
             )
-            probes.update(venue_probes)
-        else:
-            venue_probes = adapter.probe_terminal(
-                client, tuple(target.venue_market_id for target in targets)
+        venue_probes = adapter.probe_terminal(
+            http, tuple(target.venue_market_id for target in targets)
+        )
+        return {
+            target.target_id: venue_probes.get(
+                target.venue_market_id,
+                TerminalProbe(
+                    TerminalState.UNKNOWN,
+                    "terminal_probe_missing_record",
+                ),
             )
-            probes.update(
-                {
-                    target.target_id: venue_probes.get(
-                        target.venue_market_id,
-                        TerminalProbe(
-                            TerminalState.UNKNOWN,
-                            "terminal_probe_missing_record",
-                        ),
-                    )
-                    for target in targets
-                }
-            )
+            for target in targets
+        }
+
+    if executor is None:
+        for venue, targets in by_venue.items():
+            probes.update(probe_venue(venue, targets))
+    else:
+        pending = [
+            executor.submit(probe_venue, venue, targets)
+            for venue, targets in by_venue.items()
+        ]
+        # Consume in input order, irrespective of network completion order.
+        for future in pending:
+            probes.update(future.result())
     return tuple(bundle.with_probes(probes) for bundle in bundles), [], None
 
 
@@ -219,35 +233,68 @@ def run_shadow(
             max_limitless_pages=max_limitless_pages,
         )
     )
-    http = client or durable_client(
-        cache_root,
-        force_refresh=force_refresh,
-        persist_responses=persist_responses,
-    )
     continuity_bundles: tuple[ContinuityBundle, ...] = ()
     continuity_diagnostics: list[str] = []
     continuity_degraded_base_run_id: str | None = None
-    if live_root is not None:
-        (
-            continuity_bundles,
-            continuity_diagnostics,
-            continuity_degraded_base_run_id,
-        ) = _continuity_for_run(
-            live_root=live_root,
-            adapters=adapter_set,
-            client=http,
-            strategy=strategy,
-            now=now,
-        )
-    if any(bundle.origin is None for bundle in continuity_bundles):
-        raise ContinuityError("v3 continuity origin evidence is missing")
     catalogs: list[CatalogSnapshot] = []
     failures: dict[str, str] = {}
-    for adapter in adapter_set:
-        try:
-            catalogs.append(adapter.discover(http, now=now))
-        except Exception as error:  # noqa: BLE001 - one vendor must not hide the others
-            failures[str(adapter.venue)] = f"{type(error).__name__}: {error}"
+    with ExitStack() as resources:
+        # A session and counters belong to one venue worker. The filesystem
+        # request slots still serialize requests to each host across processes.
+        # An injected client retains the serial calling convention for callers
+        # whose test/debug clients may not be safe to share between threads.
+        clients: dict[str, Any] = {}
+        executor: ThreadPoolExecutor | None = None
+        for adapter in adapter_set:
+            if adapter.venue in clients:
+                continue
+            http = (
+                client
+                if client is not None
+                else durable_client(
+                    cache_root,
+                    force_refresh=force_refresh,
+                    persist_responses=persist_responses,
+                )
+            )
+            clients[adapter.venue] = http
+            if client is None:
+                resources.callback(http.close)
+        if client is None:
+            executor = resources.enter_context(ThreadPoolExecutor(max_workers=3))
+        if live_root is not None:
+            (
+                continuity_bundles,
+                continuity_diagnostics,
+                continuity_degraded_base_run_id,
+            ) = _continuity_for_run(
+                live_root=live_root,
+                adapters=adapter_set,
+                client=client,
+                clients=clients,
+                executor=executor,
+                strategy=strategy,
+                now=now,
+            )
+        if any(bundle.origin is None for bundle in continuity_bundles):
+            raise ContinuityError("v3 continuity origin evidence is missing")
+        pending = (
+            [
+                executor.submit(adapter.discover, clients[adapter.venue], now=now)
+                for adapter in adapter_set
+            ]
+            if executor is not None
+            else None
+        )
+        for index, adapter in enumerate(adapter_set):
+            try:
+                catalogs.append(
+                    pending[index].result()
+                    if pending is not None
+                    else adapter.discover(clients[adapter.venue], now=now)
+                )
+            except Exception as error:  # noqa: BLE001 - preserve every other venue
+                failures[str(adapter.venue)] = f"{type(error).__name__}: {error}"
 
     selection = select_targets(
         catalogs,

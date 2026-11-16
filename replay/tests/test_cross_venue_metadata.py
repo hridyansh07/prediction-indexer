@@ -60,7 +60,7 @@ def wide_fixture(scope_count=14):
 
 
 class WideHarness(Harness):
-    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False):
+    def __init__(self, root, *, sizes=SIZES, controls=False, pin=None, scope_count=14, changing=False, storage=None):
         self.root=root
         d, doc, c=wide_fixture(scope_count)
         if pin:
@@ -92,6 +92,8 @@ class WideHarness(Harness):
                                      controls_episodes=True,controls_slices=True)
             cfg["valuation"]={"version":1,"kind":"PARITY_SCENARIO","unit":"research_dollar",
                               "assets":sorted(cfg["fees"]["assets"].values(),key=encoded)}
+            if storage is not None:
+                cfg["storage"] = storage
             self.cross_config=cfg
             return build({**context,"config":cfg})
         with patch("replay.tests.test_bundle_coverage.detail",side_effect=lambda:copy.deepcopy(d)), \
@@ -142,11 +144,39 @@ class MetadataRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             from replay.streams.protocol import ProtocolError
-            # 70 scopes exceed 8 MiB; the 64 MiB bound itself is pinned byte for byte below.
+            # 70 scopes exceed 8 MiB; the 512 MiB bound itself is pinned byte for byte below.
             with patch("replay.economic_sdk.bounds.MAX_ENTITY_TABLE",8*1024*1024), \
                  self.assertRaisesRegex(ProtocolError,"entity metadata preflight.*entities.json"):
                 WideHarness(root,scope_count=70)
             self.assertEqual(list((root/"output").iterdir()),[])
+
+    def test_dense_cover_table_fits_the_entity_bound(self):
+        # Dense corpus bundles' cover_same entities.json needed 127,802,677 and 287,054,103 bytes.
+        from types import SimpleNamespace
+        from replay.economic_sdk import entity_tables
+        chunk=b"x"*(1024*1024)
+        def chunks(*_):
+            for _ in range(273): yield chunk
+            yield b"x"*(287_054_103-273*len(chunk))
+        strategy=SimpleNamespace(experiment=SimpleNamespace(layout=2))
+        with patch.object(entity_tables,"aggregate_files",return_value=[""]), \
+             patch.object(entity_tables,"table_chunks",chunks):
+            self.assertEqual(entity_tables.preflight(strategy,{"plans":[]},{}),
+                             {"entities.json":287_054_103})
+
+    def test_reader_state_bound_admits_the_densest_cover_validation(self):
+        # The same bundle's cover_same validation retained 536,870,943 bytes of reader state.
+        from replay.economic_sdk import bounds
+        self.assertGreater(bounds.MAX_STATE, 536_870_943)
+
+    def test_compressed_storage_preserves_early_entity_preflight_before_any_spool(self):
+        from replay.streams.protocol import ProtocolError
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("replay.economic_sdk.bounds.MAX_ENTITY_TABLE", 1), \
+                 self.assertRaisesRegex(ProtocolError, "entity metadata preflight.*entities.json"):
+                WideHarness(root, scope_count=1, storage={"version": 1, "economic": "zstd"})
+            self.assertEqual(list((root / "output").iterdir()), [])
 
     def test_eight_and_four_sizes_have_identical_shared_route_time_and_episodes(self):
         summaries=[]

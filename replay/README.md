@@ -60,6 +60,8 @@ declares its book requirements, its baskets, and a pure `evaluate`. The SDK owns
 - controls;
 - opt-in fill checks: strategy-declared governing and recording sizings, one priced
   fill per episode, ended by a per-leg kill price;
+- optional delayed-fill probes, pinned market taker delays and opening quote ages
+  ([execution delay contract](../docs/specs/EXECUTION_DELAY_V1.md));
 - bounded output;
 - the independent reader.
 

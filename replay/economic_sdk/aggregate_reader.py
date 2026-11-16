@@ -38,10 +38,12 @@ from replay.economic_sdk.entities import resolve
 from replay.economic_sdk.fills import (FILL_LIVE, FILL_STATES, KILL_PRICE, MAX_END_REASON,
                                        check_experiment)
 from replay.economic_sdk.entity_tables import entity_rows
-from replay.economic_sdk.output import aggregate_files, file_list, group_of
-from replay.economic_sdk.reader import Budget, check_files, document, lines, quantiles, signed
+from replay.economic_sdk.output import aggregate_files, group_of
+from replay.economic_sdk.reader import Budget, document, lines, quantiles, signed
+from replay.economic_sdk.storage import check_inventory, logical_files
 from replay.economic_sdk.types import ADMISSIONS, EVALUATED, SDK_STATUSES, SELL_SOURCES
 from replay.economic_sdk.game import check_binding, check_episode_game
+from replay.economic_sdk.probe_reader import check_ages, validate as validate_probes
 from replay.preparation import digest, encoded
 from replay.strategy_sdk import plain
 from replay.streams.protocol import obj, require, uint
@@ -184,12 +186,15 @@ def _check_fill(value, entity, end_reason, policy, strategy, maxima, start):
     killed at or above its kill price; a sold leg walks bids downward and is
     killed at or below it.
     """
-    value = obj(value, "sources units results kill_prices kill_leg kill_best end_books")
+    age_fields = " ages" if policy.probes is not None else ""
+    value = obj(value, "sources units results kill_prices kill_leg kill_best end_books" + age_fields)
     spec = strategy.fill_spec(entity)
     legs = len(entity.legs)
     require(value["sources"] == list(spec.sources) and value["units"] == [str(u) for u in spec.units]
             and len(spec.units) == legs, "fill spec")
     sell = [source in SELL_SOURCES for source in spec.sources]
+    if age_fields:
+        check_ages(value["ages"], legs)
 
     def reached(best, kill, leg):
         return kill is not None and (best <= kill if sell[leg] else best >= kill)
@@ -327,8 +332,8 @@ def validate(directory, snapshot, manifest, strategy):
     check_experiment(experiment)
     snapshot = plain(snapshot)
     root = Path(directory)
-    files = manifest["files"]
-    check_files(files, file_list(experiment) + strategy.extra_files())
+    files = logical_files(manifest, experiment)
+    check_inventory(root, manifest["files"])
     plans = {(p["instrument"], p["orientation"]): p for p in snapshot["plans"]}
     scopes = snapshot["scopes"]
     run_end = int(scopes[-1]["end_ns"])
@@ -362,6 +367,11 @@ def validate(directory, snapshot, manifest, strategy):
         return value
 
     resolved = [resolve(strategy, snapshot, index, plans) for index in range(len(scopes))]
+    if experiment.fills is not None and experiment.fills.probes is not None:
+        defaults = experiment.fills.probes.unknown_taker_delay_ms
+        require(all(plans[key]["venue"] in defaults for members in resolved
+                    for entity in members.values() if entity.admission is None for key in entity.legs),
+                "probe delay default venue")
     aggregates, all_entities = {}, {}
     for group, names in aggregate_files(experiment).items():
         entities = []
@@ -456,7 +466,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         _closed(row, ("scope", "entity", "episode_id", "kind", "start_ns", "end_ns", "end_reason",
                       "censored", "opening_slice_survival_ns", "viable_tiers", "qualified_ns",
                       "qualified_by_skew_ns", "class_ns", "qualifying_class_ns", "open", "maxima",
-                      "at_max") + (("fill",) if is_fill else ()))
+                      "at_max") + (("fill",) if is_fill else ())
+                + (("flags",) if is_fill and strategy.probe_decision_evidence else ()))
         scope, index, kind = row["scope"], row["entity"], row["kind"]
         require(type(scope) is int and 0 <= scope < len(entities) and type(index) is int
                 and 0 <= index < len(entities[scope]), "episode entity")
@@ -479,6 +490,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
         if is_fill:
             _check_fill(row["fill"], entity, row["end_reason"], fill, strategy,
                         [10 ** int(plans[key]["price_scale"]) for key in entity.legs], start)
+            if strategy.probe_decision_evidence:
+                strategy.check_fill_flags(row["flags"], entity, row["fill"]["ages"])
             fill_lifetime[scope, index] = fill_lifetime.get((scope, index), 0) + end - start
         order = (end, scope) + entity.order + (kind, start)
         require(last is None or last <= order, "episode close order")
@@ -539,6 +552,18 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
                     "skew": opening_skew, "tiers": row["viable_tiers"],
                     "q": [uint(qualified[t]) for t in tiers], "seen_q": [0] * len(tiers), "reached": 0,
                     "last": start, "slices": [], "open": opening, "fill": is_fill})
+        if is_fill and fill.probes is not None:
+            # Legacy probes retain only quantities and limits. New strategy
+            # policies also bind their carried decision walks to this opening.
+            evidence = strategy.probe_decision_evidence
+            probe_opening = {result["name"]: {
+                "steps": result["steps"], "tradeable": result["tradeable"],
+                "limits": [leg["taken"][-1][0] if leg["taken"] else None
+                           for leg in result["legs"]], "ages": row["fill"]["ages"],
+                **({"value": result["value"], "legs": result["legs"]} if evidence else {})}
+                for result in row["fill"]["results"]}
+            budget.reserve(bounds.json_cost(probe_opening), "reader state budget (probe openings)")
+            eps[-1]["probe_opening"] = probe_opening
         target = facts_for(entity)
         target.episode_count[kind] += 1
         if is_fill:
@@ -616,6 +641,8 @@ def _group(root, group, names, files, entities, scopes, run_end, experiment, str
     if group == "" and experiment.audit_intervals:
         _audit(root, files, entities, scopes, experiment, strategy, statuses, kinds, texts,
                reason_indexes, denominators, eps, index_of, budget)
+    if group == "" and fill is not None and fill.probes is not None:
+        validate_probes(root, files["probes.ndjson"], eps, scopes, fill, strategy, plans, budget)
     return facts
 
 

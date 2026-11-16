@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Durable prediction-market discovery and partition analysis"
 requires-python = ">=3.11"
 dependencies = [
-  "pyarrow>=17",
+  "requests>=2.32,<3",
   "websockets>=15",
   "python-socketio[asyncio_client]>=5",
   "cryptography>=42",
@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = []
-replay-redis = ["redis>=6.4,<7"]
+replay-redis = ["redis[hiredis]>=6.4,<7", "orjson>=3.11,<4"]
 
 [tool.setuptools.packages.find]
 include = ["encoder*", "analysis*", "replay*", "targeter*", "archive*", "universe*", "gamestate*"]

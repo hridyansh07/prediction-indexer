@@ -51,8 +51,10 @@ def _output(path, logical):
     }
 
 
-def write_two_venue_canonical(root):
-    directory = root / "date=1970-01-01" / "window=0"
+def write_two_venue_canonical(root, *, start_ns=0, end_ns=100, first_sequence=1, delivery_index=1):
+    from datetime import datetime, timezone
+    day = datetime.fromtimestamp(start_ns // 1_000_000_000, timezone.utc).strftime("%Y-%m-%d")
+    directory = root / f"date={day}" / f"window={start_ns}"
     directory.mkdir(parents=True)
     kalshi = (
         ROOT
@@ -77,13 +79,14 @@ def write_two_venue_canonical(root):
         ),
     ]
     evidence, provenance = bytearray(), bytearray()
-    for sequence, (lane, payload, cursor, continuity) in enumerate(rows, 1):
+    for offset, (lane, payload, cursor, continuity) in enumerate(rows, 1):
+        sequence = first_sequence + offset - 1
         envelope = {
             "envelope_version": 2,
-            "delivery_index": 1,
+            "delivery_index": delivery_index,
             "record_id": f"{lane}-1",
-            "visible_ns": sequence,
-            "monotonic_ns": sequence,
+            "visible_ns": start_ns + offset,
+            "monotonic_ns": start_ns + offset,
             "venue": lane,
             "stream": "public_book",
             "connection_epoch": f"{lane}-epoch",
@@ -113,8 +116,8 @@ def write_two_venue_canonical(root):
         )
     receipt = {
         "receipt_version": 1,
-        "window_start_ns": 0,
-        "window_end_ns": 100,
+        "window_start_ns": start_ns,
+        "window_end_ns": end_ns,
         "completeness": "complete",
         "certified": True,
         "expected_lanes": ["kalshi", "polymarket"],
@@ -124,7 +127,7 @@ def write_two_venue_canonical(root):
         "invalid_lanes": [],
         "finalization_deadline_seconds": 300,
         "deadline_expired": False,
-        "finalized_at_ns": 100,
+        "finalized_at_ns": end_ns,
         "inputs": [
             {
                 "lane": lane,
@@ -132,15 +135,15 @@ def write_two_venue_canonical(root):
                 "segment_index": 0,
                 "line_count": 1,
                 "sha256": hashlib.sha256(lane.encode()).hexdigest(),
-                "first_delivery_index": 1,
-                "last_delivery_index": 1,
+                "first_delivery_index": delivery_index,
+                "last_delivery_index": delivery_index,
             }
             for lane in ("kalshi", "polymarket")
         ],
         "evidence": _output(directory / "evidence.ndjson.zst", evidence),
         "provenance": _output(directory / "provenance.ndjson.zst", provenance),
-        "first_canonical_seq": 1,
-        "last_canonical_seq": 2,
+        "first_canonical_seq": first_sequence,
+        "last_canonical_seq": first_sequence + 1,
         "carried": {
             "ordering": {"connections": [], "epochs": []},
             "lane_visible_ns": {},

@@ -14,7 +14,7 @@ pub use event::{
     AuditAnchor, BookDelta, BookEvent, BookKey, CanonicalProvenance, ContinuityVerdict,
     ContractOrientation, ControlEvent, DomainError, EventAddress, EventHeader, EventKind,
     FaultImpact, FullBook, InstrumentId, LaneId, Level, LevelChange, NormalizationFault,
-    Resolution, SegmentEvent, SegmentRecord, Side, TradeEvent, VenueTime,
+    RawSegmentRecord, Resolution, SegmentEvent, SegmentRecord, Side, TradeEvent, VenueTime,
 };
 pub use hash::{BookStateHash, Sha1, Sha1Error};
 pub use indexer_types::Sha256;

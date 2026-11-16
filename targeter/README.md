@@ -203,6 +203,10 @@ store factory, durable filesystem primitives) and `analysis/`; nothing under
 Tests are offline and use small hand-authored vendor shapes; do not freeze live
 responses or volatile totals as fixtures.
 
+`tests.test_targeter_v2_network` also checks HTTP compression and connection
+reuse against a disposable localhost server, and verifies that concurrent venue
+discovery preserves exact run artifacts, failures and continuity evidence.
+
 ## Rollout
 
 Run shadow monitoring until the selector repeatedly finds complete, liquid,

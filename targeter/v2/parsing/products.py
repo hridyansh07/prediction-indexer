@@ -21,6 +21,14 @@ _PAREN_LINE = re.compile(r"\(\s*([-+]?\d+(?:\.\d+)?)\s*\)")
 _OU_LINE = re.compile(r"\bo\s*/\s*u\s*([-+]?\d+(?:\.\d+)?)", re.IGNORECASE)
 _SCORE = re.compile(r"(?<!\d)(\d+)\s*[-:]\s*(\d+)(?!\d)")
 _MAP_INDEX = re.compile(r"\b(?:game|map)\s*(\d+)\b", re.IGNORECASE)
+_UNDER = re.compile(r"\bunder\b")
+_OVER = re.compile(r"\bover\b")
+
+
+def _without_participants(text: str, participants: Sequence[str]) -> str:
+    for name in sorted((str(p) for p in participants if p), key=len, reverse=True):
+        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+    return text
 
 
 def market_parameters(
@@ -79,10 +87,12 @@ def market_parameters(
             parameters["map_index"] = int(match.group(1))
 
     if market_type in {"total_goals", "total_maps"}:
-        normalized = searchable.casefold()
-        if "under" in normalized:
+        # Titles name the teams, and "ThunderTalk", "Sunderland" and "Overtake" contain
+        # the direction words: read whole words from the text without the team names.
+        normalized = _without_participants(searchable, participants).casefold()
+        if _UNDER.search(normalized):
             parameters["direction"] = "under"
-        elif "over" in normalized or "or more" in normalized:
+        elif _OVER.search(normalized) or "or more" in normalized:
             parameters["direction"] = "over"
         # A discrete claim such as "3 or more goals" is exactly the same mask
         # as Over 2.5, not Over 3.  Store the open threshold used by the mask

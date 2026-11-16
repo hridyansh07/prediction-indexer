@@ -27,7 +27,7 @@ from fractions import Fraction
 from replay.economic_fills import kill_price, walk_basket
 from replay.economic_sdk import bounds
 from replay.economic_sdk.types import (BUY_SOURCES, SELL_SOURCES, FillPolicy, FillSizing,
-                                       FillSpec)
+                                       FillSpec, ProbePolicy)
 from replay.streams.protocol import obj, require
 
 FILL_LIVE, FILL_DEPTH_SHORT, FILL_VALUE_UNKNOWN, FILL_NONPOSITIVE = (
@@ -82,7 +82,8 @@ def fill_policy(value, kind):
     steps) or ``edge: true``. Names are unique, there are at most eight
     sizings, and at least one governs.
     """
-    value = obj(value, "version step_contracts max_levels sizings")
+    value = obj(value, "version step_contracts max_levels sizings"
+                + (" probes" if type(value) is dict and "probes" in value else ""))
     require(type(value["version"]) is int and value["version"] == 1, "fill policy version")
     step = contracts(value["step_contracts"])
     levels = value["max_levels"]
@@ -93,7 +94,35 @@ def fill_policy(value, kind):
     require(len({sizing.name for sizing in sizings}) == len(sizings), "fill sizing names must be unique")
     require(any(sizing.role == GOVERNS for sizing in sizings), "a fill sizing must govern")
     require(type(kind) is str and kind, "fill trigger kind")
-    return FillPolicy(kind, value["step_contracts"], levels, sizings)
+    probes = probe_policy(value["probes"], sizings) if "probes" in value else None
+    return FillPolicy(kind, value["step_contracts"], levels, sizings, probes)
+
+
+def probe_policy(value, sizings):
+    """Closed, finite grid; missing venue defaults are checked against traded legs."""
+    value = obj(value, "version sizings confirm_ms arrival_ms sequencing unknown_taker_delay_ms")
+    require(type(value["version"]) is int and value["version"] == 1, "probe policy version")
+    names = value["sizings"]
+    require(type(names) is list and names and all(type(n) is str for n in names)
+            and len(set(names)) == len(names)
+            and set(names) <= {s.name for s in sizings}, "probe sizings")
+    times = []
+    for field in ("confirm_ms", "arrival_ms"):
+        entries = value[field]
+        require(type(entries) is list and 1 <= len(entries) <= 8
+                and all(type(t) is int and 0 <= t <= (2**64 - 1) // 1_000_000 for t in entries)
+                and entries == sorted(set(entries)), "probe " + field)
+        times.append(tuple(entries))
+    modes = value["sequencing"]
+    require(type(modes) is list and modes and all(type(m) is str for m in modes)
+            and len(set(modes)) == len(modes)
+            and set(modes) <= {"simultaneous", "slow_first"}, "probe sequencing")
+    defaults = value["unknown_taker_delay_ms"]
+    require(type(defaults) is dict and set(defaults) <= {"kalshi", "limitless", "polymarket"}
+            and all(type(t) is int and 0 <= t <= (2**64 - 1) // 1_000_000
+                    for t in defaults.values()), "probe unknown taker delays")
+    require(len(names) * len(times[0]) * len(times[1]) * len(modes) <= 64, "probe product bound")
+    return ProbePolicy(tuple(names), times[0], times[1], tuple(modes), dict(defaults))
 
 
 def step_atoms(policy, quantity_scale, ratio=1):
@@ -113,6 +142,14 @@ def check_experiment(experiment):
     require(experiment.layout == 2, "fill checks require output layout 2")
     require(not experiment.controls, "controls are not supported with fill checks (deferred)")
     require(policy.kind in experiment.kinds, "fill trigger kind must be a declared episode kind")
+    if policy.probes is not None:
+        probes = policy.probes
+        require(type(probes) is ProbePolicy, "probe policy")
+        checked = probe_policy({"version": 1, "sizings": list(probes.sizings),
+                                "confirm_ms": list(probes.confirm_ms), "arrival_ms": list(probes.arrival_ms),
+                                "sequencing": list(probes.sequencing),
+                                "unknown_taker_delay_ms": probes.unknown_taker_delay_ms}, policy.sizings)
+        require(checked == probes, "probe policy")
 
 
 def check_spec(spec, entity):

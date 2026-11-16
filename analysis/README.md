@@ -4,7 +4,7 @@ Pure, offline libraries that define what a prediction market *means* relative to
 an event: the set of terminal outcomes the event can end in, the subset of those
 outcomes a market resolves YES on, and the claim and relation algebra over those
 subsets. They are used by Targeter v2 (`targeter/v2/relationships.py`,
-`selection.py`), Universe (`universe/claim_projection.py`, `universe/outcomes.py`)
+`selection.py`), Universe (`universe/claims/claim_projection.py`, `universe/claims/outcomes.py`)
 and Replay. Nothing here touches capture evidence or filters at capture time.
 
 ## Modules
@@ -14,7 +14,7 @@ and Replay. Nothing here touches capture evidence or filters at capture time.
 | `outcome_space.py` | Terminal outcome spaces (Omega): `Outcome`, `OutcomeSpace`, `build_score_space`, `build_series_space`, `series_sequences`, `parse_best_of`, `parse_score_ticker`, `reachable_keys`, `build_state_timeline`, `settled_outcome_key` |
 | `masks.py` | Compile a normalized market to a `Mask` over a space; classify mask pairs; partition check; state-conditioned relationships |
 | `claims.py` | Claim identity (`claim_id`, `space_shape_id`), `Claim`, `ClaimRelation`, `derive_claims`, `derive_claim_algebra`, `implied_market_relations` |
-| `storage.py` | Durable file helpers: atomic JSON/NDJSON writes with fsync of file and directory, one-frame Zstandard JSON/NDJSON via the shared `encoder`, `sha256_text` |
+| `storage.py` | Durable file helpers: atomic JSON/NDJSON writes with fsync of file and directory, one-frame Zstandard JSON/NDJSON via the shared `encoder` |
 | `durable_http.py` | `DurableJsonClient` / `RetryingJsonClient`: content-addressed response cache, cross-process per-host rate limiting, bounded retries |
 
 Tests: `tests/test_outcome_space.py`, `tests/test_masks.py`, `tests/test_claims.py`,

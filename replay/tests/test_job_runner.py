@@ -281,6 +281,26 @@ class HistoryTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "bundle_not_retired")
 
+    def test_game_and_topology_are_optional_like_the_universe_context(self):
+        # Universe stores game and topology as optional text; a soccer bundle has neither.
+        at = "2026-09-20T12:00:00Z"
+        later = "2026-09-20T13:00:00Z"
+        request = c.parse_request(request_bytes(), runner_config())
+        soccer = {**selection("run-a", at, later), "sport": "soccer", "game": None, "topology": None}
+        pages = [{"selections": [soccer], "sort": "selected", "next_cursor": None}]
+        resolved = HistoryClient("http://universe", opener=Opener(pages)).resolve(
+            "20260924T120000Z-0123456789abcdef", request, runner_config()
+        )
+        self.assertEqual(resolved.bundle_interval, (ns(at), ns(later)))
+        for field, value in (("sport", None), ("game", ""), ("topology", 7), ("activation_at", None)):
+            bad = {**soccer, field: value}
+            with self.subTest(field=field, value=value), self.assertRaises(StageFailure) as caught:
+                HistoryClient(
+                    "http://universe",
+                    opener=Opener([{"selections": [bad], "sort": "selected", "next_cursor": None}]),
+                ).resolve("20260924T120000Z-0123456789abcdef", request, runner_config())
+            self.assertEqual(caught.exception.code, "bundle_history_invalid")
+
 
 class ArchiveTests(unittest.TestCase):
     def setUp(self):

@@ -8,11 +8,19 @@ import math
 from typing import Any, Iterable, Mapping
 
 from targeter.v2.models import isoformat, parse_timestamp
+from targeter.v2.parsing.products import market_parameters
 
-MARKET_PROJECTION_VERSION = 3
+MARKET_PROJECTION_VERSION = 4
 MARKET_TEMPLATE_VERSION = 1
 OUTCOME_SPACE_VERSION = 1
 RELATION_GENERATION_VERSION = 1
+
+# Totals whose `direction` was read by substring over a text naming both teams
+# (docs/specs/UNIVERSE_TOTALS_DIRECTION_V1.md).
+TOTALS_DIRECTION_RULE_ID = "totals-direction-v1"
+_TOTALS_TYPES = frozenset({"total_maps", "total_goals"})
+# The reviewed scope of the rule. It must only grow by an explicit decision.
+TOTALS_DIRECTION_VENUES = frozenset({"kalshi", "limitless"})
 
 _SYMMETRIC = {"IDENTITY", "MUTUAL_EXCLUSION", "OVERLAP"}
 _DIRECTED = {"IMPLICATION", "REVERSE_IMPLICATION"}
@@ -124,6 +132,7 @@ def project_market_universe(
     market_rows: dict[str, dict[str, Any]] = {}
     venue_market_rows: dict[tuple[str, str], dict[str, Any]] = {}
     decisions: list[dict[str, Any]] = []
+    corrections: dict[tuple[str, str, str], dict[str, Any]] = {}
     event_for_bundle: dict[str, str] = {}
 
     for bundle_id, candidate in sorted(by_bundle.items()):
@@ -137,6 +146,7 @@ def project_market_universe(
             venue_event_rows=venue_event_rows,
             market_rows=market_rows,
             venue_market_rows=venue_market_rows,
+            corrections=corrections,
         )
         event_for_bundle[bundle_id] = event_id
         eligible = candidate.get("eligible")
@@ -198,6 +208,7 @@ def project_market_universe(
         "decisions": sorted(decisions, key=lambda row: row["bundle_id"]),
         "selected_markets": selected_markets,
         "relations": relations,
+        "corrections": [corrections[key] for key in sorted(corrections)],
     }
 
 
@@ -212,6 +223,7 @@ def _project_candidate(
     venue_event_rows: dict[tuple[str, str], dict[str, Any]],
     market_rows: dict[str, dict[str, Any]],
     venue_market_rows: dict[tuple[str, str], dict[str, Any]],
+    corrections: dict[tuple[str, str, str], dict[str, Any]],
 ) -> str:
     sport = _text(candidate, "sport", f"candidate {bundle_id}")
     game = _optional_text(candidate.get("game"), f"candidate {bundle_id} game")
@@ -305,6 +317,14 @@ def _project_candidate(
         )
         if not isinstance(parameters, dict):
             raise MarketProjectionError(f"market {target_id} parameters must be an object")
+        parameters = _corrected_totals_parameters(
+            source,
+            parameters,
+            participants=_event_participants(
+                events_by_ref.get(f"{venue}:{venue_event_id}"), participants
+            ),
+            corrections=corrections,
+        )
         coordinates = {
             "event_id": event_id,
             "canonical_class": _text(
@@ -676,7 +696,81 @@ def _empty_projection(run_id: str, generated_at: str) -> dict[str, Any]:
         "decisions": [],
         "selected_markets": [],
         "relations": [],
+        "corrections": [],
     }
+
+
+def _event_participants(
+    event: Mapping[str, Any] | None, fallback: list[str]
+) -> list[str]:
+    """The participants the venue's own event carried when the targeter parsed."""
+    stated = event.get("participants") if event is not None else None
+    if isinstance(stated, list) and stated and all(isinstance(p, str) for p in stated):
+        return list(stated)
+    return list(fallback)
+
+
+def _corrected_totals_parameters(
+    source: Mapping[str, Any],
+    parameters: dict[str, Any],
+    *,
+    participants: list[str],
+    corrections: dict[tuple[str, str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Re-derive a totals direction with the fixed whole-word rule.
+
+    Only `direction` of a Kalshi or Limitless `total_maps`/`total_goals` market
+    is touched. The inputs are what the archived row still carries: its title,
+    the event's participants and, for Kalshi only, the first outcome label as
+    the yes subtitle (when both labels were published). The Limitless adapter
+    fed the rule no subtitle fields, so none are supplied for it. The raw
+    subtitle is not archived.
+    """
+    if (
+        source.get("venue") not in TOTALS_DIRECTION_VENUES
+        or source.get("market_type") not in _TOTALS_TYPES
+    ):
+        return parameters
+    title = source.get("title")
+    labels = source.get("outcome_labels")
+    if not isinstance(title, str) or not isinstance(labels, list):
+        return parameters
+    stored = parameters.get("direction")
+    if stored is not None and not isinstance(stored, str):
+        raise MarketProjectionError(
+            f"market {source.get('target_id')} direction must be text"
+        )
+    raw = (
+        {"yes_sub_title": labels[0]}
+        if source["venue"] == "kalshi"
+        and len(labels) == 2
+        and isinstance(labels[0], str)
+        else {}
+    )
+    derived = market_parameters(
+        str(source["market_type"]),
+        title=title,
+        participants=tuple(participants),
+        outcome_labels=[str(label) for label in labels],
+        raw=raw,
+    ).get("direction")
+    if derived == stored:
+        return parameters
+    corrected = dict(parameters)
+    if derived is None:
+        del corrected["direction"]
+    else:
+        corrected["direction"] = derived
+    venue, native = str(source["venue"]), str(source["venue_market_id"])
+    corrections[(venue, native, "direction")] = {
+        "venue": venue,
+        "venue_market_id": native,
+        "field": "direction",
+        "report_value": stored,
+        "projected_value": derived,
+        "rule_id": TOTALS_DIRECTION_RULE_ID,
+    }
+    return corrected
 
 
 def _event_ref(row: Mapping[str, Any]) -> str:

@@ -17,7 +17,7 @@ STRATEGIES = {"same_venue": "same_venue_implication_cover_v1",
               "cross_venue": "cross_venue_implication_cover_v1"}
 FACTORIES = {mode: "replay.strategies." + strategy.removesuffix("_v1") + ":build"
              for mode, strategy in STRATEGIES.items()}
-MAX_PAIRS = 4096
+MAX_PAIRS = 8192  # a corpus bundle's same-venue scope had 98 + 6 books: 4,768 pairs
 
 
 def experiment_identity(snapshot_sha, policy, fees, valuation, mode):
@@ -74,7 +74,7 @@ def baskets(snapshot, policy, scope_index, mode):
                 "settlement_model": SETTLEMENT,
                 "outcomes_provider": snapshot.get("outcomes", {}).get("provider")}
             inputs = None if admission else tuple(
-                (("kalshi_complement_ask", int(size)), ("bid", int(size)))
+                (("kalshi_complement_ask", int(size)), ("bid", int(size)), ("crossed", None))
                 if k[0].startswith("kalshi:") else (("ask", int(size)), ("crossed", None)) for k in keys)
             result.append(Basket(descriptor, sources, (venue, route, "buy", 0 if size is None else int(size)),
                 admission, tuple(reason(r) for r in reasons), 1 if len(legs) == 2 else None,

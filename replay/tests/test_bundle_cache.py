@@ -91,6 +91,28 @@ class BundleCacheTest(unittest.TestCase):
         outcome = CanonicalArchiver(canonical, self.store).archive_window(receipt)
         self.assertEqual(outcome.status, "archived")
 
+    def test_nonempty_window_pins_and_bytes_are_range_independent(self):
+        from replay.tests.test_bundle_runner import write_two_venue_canonical
+        width = WINDOW_SECONDS * 1_000_000_000
+        canonical = self.root / "source"
+        for index in range(3):
+            start = BASE_NS + index * width
+            write_two_venue_canonical(canonical, start_ns=start, end_ns=start + width,
+                                      first_sequence=2 * index + 1, delivery_index=index + 1)
+            receipt = next(canonical.glob(f"date=*/window={start}/receipt.json"))
+            self.assertEqual(CanonicalArchiver(canonical, self.store).archive_window(receipt).status, "archived")
+        outputs = []
+        for label, interval in (("full", (BASE_NS, BASE_NS + 3 * width)),
+                                ("middle", (BASE_NS + width, BASE_NS + 2 * width))):
+            outputs.append(ensure_bundle(label, interval, store=self.store,
+                                         work_root=self.root / label / "work",
+                                         derivatives_root=self.root / label / "derivatives",
+                                         materializer=MATERIALIZER, window_seconds=WINDOW_SECONDS))
+        full, middle = outputs[0].pins[1], outputs[1].pins[0]
+        self.assertEqual(full[1:], middle[1:])
+        for name in bundle.DERIVATIVE_FILES:
+            self.assertEqual((full.directory / name).read_bytes(), (middle.directory / name).read_bytes())
+
     def ensure(self, materializer=MATERIALIZER):
         return ensure_bundle(
             "bundle-1",

@@ -1,19 +1,23 @@
 //! Pinned, privately snapshotted derivative reads. No canonical input is reopened.
+//! Optional scope decodes only selected event bodies. Every line still passes
+//! header/order/evidence checks and the unchanged byte-verifying decoder.
+//! Excluded bodies were validated at build/audit and are receipt-bound by
+//! stored SHA-256; independent audits always deserialize every body.
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use replay_domain::{EventHeader, LaneId, SegmentRecord};
+use replay_domain::{EventAddress, EventHeader, LaneId, SegmentRecord};
 use tempfile::TempDir;
 
 use crate::verify::{
-    ReadMode, VerificationCounts, VerifiedLines, decode_receipt_document, inspect_contents,
-    parse_event, parse_reject, verify_counts, verify_disposition,
+    ParsedEvent, ReadMode, VerificationCounts, VerifiedLines, decode_receipt_document,
+    inspect_contents, parse_event, parse_reject, verify_counts, verify_disposition,
 };
 use crate::{
     CompressedOutput, DerivativeManifest, DerivativePin, DerivativeReceipt, RejectDisposition,
-    RejectRecord, Sha256,
+    RejectRecord, ScopeFilter, Sha256,
 };
 
 #[derive(Clone, Debug)]
@@ -173,6 +177,8 @@ pub struct SourceDelivery {
     header: EventHeader,
     connection_epoch: Option<String>,
     records: Vec<SegmentRecord>,
+    event_count: u64,
+    last_event_address: EventAddress,
     disposition: Option<RejectDisposition>,
     logical_bytes: u64,
     record_count: u64,
@@ -189,6 +195,13 @@ impl SourceDelivery {
     pub fn records(&self) -> &[SegmentRecord] {
         &self.records
     }
+    /// All children, including bodies omitted by the optional input scope.
+    pub fn event_count(&self) -> u64 {
+        self.event_count
+    }
+    pub fn last_event_address(&self) -> &EventAddress {
+        &self.last_event_address
+    }
     pub fn disposition(&self) -> Option<&RejectDisposition> {
         self.disposition.as_ref()
     }
@@ -200,8 +213,8 @@ impl SourceDelivery {
     }
 }
 
-/// The single pass over one derivative. Each output is decoded once and each
-/// line parsed once; that one parsed record feeds every check. Per-line checks
+/// The single pass over one derivative. Each output is decoded once; one parsed
+/// header feeds every evidence check, with optional two-phase body selection. Per-line checks
 /// run as a line is read, per-delivery checks before its delivery is returned,
 /// and whole-window checks in `finish`. A delivery returned here is therefore
 /// checked as far as its own and its lookahead's lines go: a later violation
@@ -211,7 +224,7 @@ struct Deliveries {
     events: VerifiedLines,
     rejects: VerifiedLines,
     sources: Option<VerifiedLines>,
-    event: Option<(SegmentRecord, u64)>,
+    event: Option<(ParsedEvent, u64)>,
     reject: Option<(RejectRecord, u64)>,
     limits: ReadLimits,
     primed: bool,
@@ -221,6 +234,7 @@ struct Deliveries {
     previous_reject_seq: Option<i64>,
     checks: DeliveryChecks,
     mode: ReadMode,
+    scope: Option<(ScopeFilter, bool)>,
 }
 
 impl Deliveries {
@@ -229,6 +243,7 @@ impl Deliveries {
         manifest: &DerivativeManifest,
         limits: &ReadLimits,
         mode: ReadMode,
+        scope: Option<(ScopeFilter, bool)>,
     ) -> Result<Self, String> {
         Ok(Self {
             events: VerifiedLines::open_limit(
@@ -265,6 +280,7 @@ impl Deliveries {
             previous_reject_seq: None,
             checks: DeliveryChecks::default(),
             mode,
+            scope,
         })
     }
     fn read_event(&mut self) -> Result<(), String> {
@@ -276,6 +292,7 @@ impl Deliveries {
                     &mut self.counts,
                     self.mode,
                     self.manifest.normalized_schema_version,
+                    self.scope.as_ref().map(|(scope, fast)| (scope, *fast)),
                 )?,
                 line.len() as u64 + 1,
             )),
@@ -305,10 +322,7 @@ impl Deliveries {
             self.read_reject()?;
             self.primed = true;
         }
-        let event_seq = self
-            .event
-            .as_ref()
-            .map(|(r, _)| r.header().address().canonical_seq());
+        let event_seq = self.event.as_ref().map(|(r, _)| r.header.sequence());
         let reject_seq = self
             .reject
             .as_ref()
@@ -325,23 +339,21 @@ impl Deliveries {
                 return Ok(None);
             }
         };
-        let header = if event_seq == Some(seq) {
-            self.event.as_ref().unwrap().0.header().clone()
+        let index = if event_seq == Some(seq) {
+            self.event.as_ref().unwrap().0.header.index()
         } else {
-            self.reject.as_ref().unwrap().0.header().clone()
+            self.reject
+                .as_ref()
+                .unwrap()
+                .0
+                .header()
+                .address()
+                .event_index()
         };
-        if header.address().event_index() != 0 {
+        if index != 0 {
             return Err("source must start at event index zero".into());
         }
-        let mut delivery = SourceDelivery {
-            header,
-            connection_epoch: None,
-            records: Vec::new(),
-            disposition: None,
-            logical_bytes: 0,
-            record_count: 0,
-        };
-        if let Some(sources) = &mut self.sources {
+        let source = if let Some(sources) = &mut self.sources {
             let bytes = sources
                 .next_line()?
                 .ok_or("missing source evidence record")?;
@@ -351,24 +363,67 @@ impl Deliveries {
                 crate::verify::probe::canonical_check();
             }
             let source = crate::evidence::SourceEvidence::decode(bytes, canonical)?;
-            if source.header != delivery.header {
+            let agrees = if event_seq == Some(seq) {
+                self.event
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .header
+                    .same_source(&source.header, self.events.current_line())
+            } else {
+                self.reject.as_ref().unwrap().0.header() == &source.header
+            };
+            if !agrees {
                 return Err("source evidence header disagrees with delivery".into());
             }
-            add_size(
-                &mut delivery.logical_bytes,
-                bytes.len() as u64 + 1,
-                self.limits.max_group_bytes,
-            )?;
-            delivery.connection_epoch = Some(source.connection_epoch);
-        }
+            Some((source, bytes.len() as u64 + 1))
+        } else {
+            None
+        };
+        // Profile 2 already owns the exact source header. Excluded event views
+        // compare against it without allocating record_id/lane for each child.
+        let (header, connection_epoch, logical_bytes) = if let Some((source, bytes)) = source {
+            (source.header, Some(source.connection_epoch), bytes)
+        } else if event_seq == Some(seq) {
+            (
+                self.event
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .header
+                    .to_owned(self.events.current_line()),
+                None,
+                0,
+            )
+        } else {
+            (self.reject.as_ref().unwrap().0.header().clone(), None, 0)
+        };
+        let mut delivery = SourceDelivery {
+            last_event_address: header.address().clone(),
+            header,
+            connection_epoch,
+            records: Vec::new(),
+            event_count: 0,
+            disposition: None,
+            logical_bytes: 0,
+            record_count: 0,
+        };
+        add_size(
+            &mut delivery.logical_bytes,
+            logical_bytes,
+            self.limits.max_group_bytes,
+        )?;
+        let mut faults = Vec::new();
         while self
             .event
             .as_ref()
-            .is_some_and(|(r, _)| r.header().address().canonical_seq() == seq)
+            .is_some_and(|(r, _)| r.header.sequence() == seq)
         {
             let (record, bytes) = self.event.take().unwrap();
-            if !same_source(&delivery.header, record.header())
-                || record.header().address().event_index() as usize != delivery.records.len()
+            if !record
+                .header
+                .same_source(&delivery.header, self.events.current_line())
+                || u64::from(record.header.index()) != delivery.event_count
             {
                 return Err("normalized children disagree on source header or index".into());
             }
@@ -378,7 +433,14 @@ impl Deliveries {
                 self.limits.max_group_bytes,
             )?;
             add_size(&mut delivery.record_count, 1, self.limits.max_group_records)?;
-            delivery.records.push(record);
+            delivery.event_count += 1;
+            delivery.last_event_address = delivery.header.address().child(record.header.index());
+            if let Some(fault) = record.fault {
+                faults.push(fault);
+            }
+            if let Some(record) = record.record {
+                delivery.records.push(record);
+            }
             self.read_event()?;
         }
         let mut reject = None;
@@ -404,7 +466,12 @@ impl Deliveries {
             self.read_reject()?;
             reject = Some(record);
         }
-        verify_disposition(&delivery.records, reject.as_ref(), &mut self.counts)?;
+        verify_disposition(
+            delivery.event_count,
+            &faults,
+            reject.as_ref(),
+            &mut self.counts,
+        )?;
         delivery.disposition = reject.map(|record| record.disposition().clone());
         self.checks
             .observe(&delivery, &self.manifest, &self.limits)?;
@@ -425,15 +492,6 @@ impl Deliveries {
     }
 }
 
-fn same_source(a: &EventHeader, b: &EventHeader) -> bool {
-    a.order_ns() == b.order_ns()
-        && a.visible_ns() == b.visible_ns()
-        && a.visible_tie_group() == b.visible_tie_group()
-        && a.record_id() == b.record_id()
-        && a.provenance() == b.provenance()
-        && a.address().child(b.address().event_index()) == *b.address()
-}
-
 pub fn add_size(total: &mut u64, amount: u64, maximum: u64) -> Result<(), String> {
     *total = total
         .checked_add(amount)
@@ -449,7 +507,7 @@ pub(crate) fn verify_stream(
     limits: &ReadLimits,
     mode: ReadMode,
 ) -> Result<(), String> {
-    let mut stream = Deliveries::open(directory, manifest, limits, mode)?;
+    let mut stream = Deliveries::open(directory, manifest, limits, mode, None)?;
     while stream.next()?.is_some() {}
     stream.finish()
 }
@@ -629,6 +687,47 @@ pub fn open_pinned(
     open_pinned_with_checkpoint(input, limits, |_, _| {})
 }
 
+/// Same pinned evidence checks, but only in-scope event bodies are constructed.
+pub fn open_pinned_scoped(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: ScopeFilter,
+) -> Result<VerifiedWindowReader, String> {
+    open_scoped(input, limits, scope, true)
+}
+
+/// T4 projection reference for fast/full equivalence checks.
+#[doc(hidden)]
+pub fn open_pinned_scoped_without_fastpath(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: ScopeFilter,
+) -> Result<VerifiedWindowReader, String> {
+    open_scoped(input, limits, scope, false)
+}
+
+fn open_scoped(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: ScopeFilter,
+    fast: bool,
+) -> Result<VerifiedWindowReader, String> {
+    limits.validate()?;
+    if scope.instruments.len().saturating_add(scope.lanes.len()) > limits.max_scope_entries {
+        return Err("scope exceeds entry limit".into());
+    }
+    let mut bytes = 0;
+    for len in scope
+        .instruments
+        .iter()
+        .map(|id| id.as_str().len())
+        .chain(scope.lanes.iter().map(|id| id.as_str().len()))
+    {
+        add_size(&mut bytes, len as u64, limits.max_metadata_bytes)?;
+    }
+    open_pinned_inner(input, limits, Some((scope, fast)), |_, _| {})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadCheckpoint {
     MetadataCaptured,
@@ -639,6 +738,15 @@ pub(crate) enum ReadCheckpoint {
 pub(crate) fn open_pinned_with_checkpoint(
     input: &PinnedDerivative,
     limits: &ReadLimits,
+    checkpoint: impl FnMut(ReadCheckpoint, &Path),
+) -> Result<VerifiedWindowReader, String> {
+    open_pinned_inner(input, limits, None, checkpoint)
+}
+
+fn open_pinned_inner(
+    input: &PinnedDerivative,
+    limits: &ReadLimits,
+    scope: Option<(ScopeFilter, bool)>,
     mut checkpoint: impl FnMut(ReadCheckpoint, &Path),
 ) -> Result<VerifiedWindowReader, String> {
     let metadata = inspect_pinned(input, limits)?;
@@ -667,8 +775,8 @@ pub(crate) fn open_pinned_with_checkpoint(
     // The installed directory's exact bytes were bound to this pin by SHA-256
     // at install, and the receipt and manifest were just re-bound to it by
     // SHA-256 above. The copy re-proves only each data file's exact stored
-    // length; the structural decode re-proves frame, checksum, length and LF
-    // count. Data bytes are not re-hashed on this hot path.
+    // length; the structural decode re-proves stored SHA-256, frame, checksum,
+    // length and LF count. Only the decoded-side digest is omitted.
     for output in metadata.manifest.outputs() {
         copy_bound(
             &input.directory.join(&output.file),
@@ -684,6 +792,7 @@ pub(crate) fn open_pinned_with_checkpoint(
         &metadata.manifest,
         limits,
         ReadMode::PinnedReplay,
+        scope,
     )?;
     checkpoint(ReadCheckpoint::ReaderOpened, snapshot.path());
     Ok(VerifiedWindowReader {

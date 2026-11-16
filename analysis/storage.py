@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -15,10 +14,6 @@ from encoder import EncodeResult, LogicalIdentity, StoredIdentity, decode_stream
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def parse_iso8601(value: str | None) -> datetime | None:

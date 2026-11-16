@@ -10,6 +10,7 @@ from replay.strategies.same_venue_complement.contract import (EPISODE_CLASSES, R
                                         reason)
 from replay.strategies.cross_venue_arbitrage.contract import SCALE, UNIT, source_key  # noqa: F401  (shared helpers)
 from replay.economic_sdk.fills import fill_policy
+from replay.economic_sdk.storage import closed_config, configured_storage
 from replay.economic_sdk.outcomes import outcome_scope
 from replay.economic_sdk.types import Basket, Experiment
 from replay.economic_sdk.game import game_policy, experiment_policy
@@ -40,13 +41,16 @@ def _numbers(value, cap, positive):
 
 
 def policy_config(value):
-    """Closed policy version 1; fill checks are the only mode."""
+    """Closed fill policy 1 or execution-realism policy 2."""
     value = plain(value)
-    value = obj(value, _FIELDS + (" game" if type(value) is dict and "game" in value else ""))
+    value = obj(value, _FIELDS + (" flags" if type(value) is dict and value.get("version") == 2 else "") + (" game" if type(value) is dict and "game" in value else ""))
     if "game" in value:
         game_policy(value["game"])
-    require(type(value["version"]) is int and value["version"] == 1, "policy version")
-    fill_policy(value["fills"], FILL_KIND)
+    require(type(value["version"]) is int and value["version"] in (1, 2), "policy version")
+    fill = fill_policy(value["fills"], FILL_KIND)
+    if value["version"] == 2:
+        from replay.strategies._shared.execution_realism import rollout_policy
+        rollout_policy(value, fill)
     require(type(value["max_legs"]) is int and 2 <= value["max_legs"] <= MAX_LEGS, "max_legs")
     _numbers(value["latency_tiers_ns"], 8, True)
     require(value["headline_latency_ns"] in value["latency_tiers_ns"], "headline membership")
@@ -80,12 +84,13 @@ def experiment(policy, identity):
 class Inputs:
     def __init__(self, config):
         from replay.strategies._shared.fee_bridge import FeeBridge
-        config = obj(plain(config), "version snapshot_directory snapshot_sha256 fees policy")
+        config = closed_config(config, "version snapshot_directory snapshot_sha256 fees policy")
         require(type(config["version"]) is int and config["version"] == 1, "config version")
         require(len(encoded(config)) <= 8 * 1024 * 1024, "configuration budget")
         self.prepared = PreparedInput({k: config[k] for k in ("version", "snapshot_directory", "snapshot_sha256")})
         self.snapshot = plain(self.prepared.snapshot)
         self.policy = policy_config(config["policy"])
+        self.storage = configured_storage(config, 2)
         self.bridge = FeeBridge(config["fees"], self.snapshot["plans"])
         self.identity = experiment_identity(self.prepared.sha256, self.policy, self.bridge.semantic_config)
 
@@ -126,7 +131,7 @@ def baskets(snapshot, policy, scope_index):
             "settlement_model": SETTLEMENT, "outcomes_provider": provider,
         }
         inputs = None if admission is not None else tuple(
-            (("kalshi_complement_ask", 1), ("bid", 1)) if k[0].startswith("kalshi:")
+            (("kalshi_complement_ask", 1), ("bid", 1), ("crossed", None)) if k[0].startswith("kalshi:")
             else (("ask", 1), ("crossed", None)) for k in acquired)
         result.append(Basket(descriptor, sources, (venue, set_id, "buy", 0 if admission else 1),
                              admission, tuple(reason(r) for r in why), None, (venue,), set_id, inputs))

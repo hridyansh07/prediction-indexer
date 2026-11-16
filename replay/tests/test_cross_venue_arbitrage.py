@@ -55,7 +55,7 @@ def fill_policy_v3(policy, sizings, step="1"):
 
 class Harness(BaseHarness):
     def __init__(self, root, *, doc=True, native=True, fees="zero", limitless=False, policy=None, valuation=True, scales=None,
-                 fills=None, step="1", **kwargs):
+                 fills=None, step="1", storage=None, **kwargs):
         self.root = root
         d = fixture_detail(limitless)
         def prep_config():
@@ -108,6 +108,8 @@ class Harness(BaseHarness):
                 cfg["fees"].update(catalog_directory=str(directory), catalog_identity=cat.identity)
             assets = sorted(cfg["fees"]["assets"].values(), key=encoded)
             cfg["valuation"] = {"version": 1, "kind": "PARITY_SCENARIO", "unit": "research_dollar", "assets": assets} if valuation else None
+            if storage is not None:
+                cfg["storage"] = storage
             self.cross_config = cfg
             return build({**context, "config": cfg})
         with patch("replay.tests.test_bundle_coverage.detail", side_effect=lambda: copy.deepcopy(d)), \

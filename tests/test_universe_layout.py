@@ -17,6 +17,7 @@ ALLOWED = {
     "jobs": {"config"},
     "api": {"store", "claims", "derive", "jobs", "config"},
     "config": set(),
+    "tools": set(),  # standalone read-only diagnostics
 }
 
 
@@ -47,12 +48,6 @@ class UniverseLayoutTests(unittest.TestCase):
                 violations = sorted((target, where) for target, where in edges.get(package, ())
                                     if target not in allowed)
                 self.assertEqual(violations, [])
-
-    def test_store_and_claims_never_import_api_or_ingest(self):
-        edges = imports_by_package()
-        for package in ("store", "claims", "derive", "jobs"):
-            targets = {target for target, _ in edges.get(package, ())}
-            self.assertFalse(targets & {"api", "ingest", "commands"}, package)
 
     def test_every_module_belongs_to_a_known_layer(self):
         top = {p.relative_to(UNIVERSE).parts[0].removesuffix(".py") for p in UNIVERSE.rglob("*.py")}

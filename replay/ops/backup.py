@@ -22,7 +22,7 @@ from archive.storage.base import (
     VerificationFailure,
     normalize_key,
 )
-from encoder import StoredIdentity
+from encoder import StoredIdentity, stored_identity_of
 
 SQLITE_CONTENT_TYPE = "application/vnd.sqlite3"
 BACKUP_VERSION = 1
@@ -72,13 +72,8 @@ class BackupReceipt:
 
 
 def _identity(path: Path) -> StoredIdentity:
-    digest = hashlib.sha256()
-    length = 0
     with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-            length += len(chunk)
-    return StoredIdentity(digest.hexdigest(), length)
+        return stored_identity_of(source)
 
 
 def _fsync_directory(path: Path) -> None:

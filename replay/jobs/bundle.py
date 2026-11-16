@@ -549,9 +549,7 @@ def _upload_derivative(store, pin: BundlePin, budget: list[int]) -> None:
             )
 
 
-def _build(bundle_id, interval, store, derivatives_root, materializer, window_seconds, remotes, producer, scratch):
-    canonical_root = scratch / "canonical"
-    output_root = scratch / "materialized"
+def _check_canonical_budget(remotes):
     canonical_stored_bytes = sum(
         remote.evidence.expected.stored.byte_length + remote.provenance.expected.stored.byte_length
         for remote in remotes
@@ -562,6 +560,12 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
     )
     if max(canonical_stored_bytes, canonical_decoded_bytes) > MAX_CANONICAL_SCRATCH_BYTES:
         raise BundleFailure("integrity_failure", "aggregate canonical scratch exceeds budget")
+
+
+def _materialize(interval, store, materializer, remotes, producer, scratch):
+    canonical_root = scratch / "canonical"
+    output_root = scratch / "materialized"
+    _check_canonical_budget(remotes)
     for remote in remotes:
         restore_canonical_window(store, remote, canonical_root)
     request = encoded(
@@ -595,25 +599,69 @@ def _build(bundle_id, interval, store, derivatives_root, materializer, window_se
         window_root = output_root / f"window={remote.window_start_ns}"
         _validate_materialized_window(window_root, address)
         source = window_root / address
-        # materialize_range verified this derivative before committing its
-        # receipt; the local install binds the copy to that pin by hash.
-        pin = _install_local(
-            source, address, receipt_sha256, derivatives_root, materializer, scratch,
-            freshly_verified=True,
-        )
-        pins.append(pin)
+        pins.append(BundlePin(source, address, receipt_sha256))
         windows.append(BundleWindow(remote.window_start_ns, remote.window_end_ns, remote.receipt_sha256, address, receipt_sha256))
-    receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, tuple(windows))
+    return tuple(windows), tuple(pins)
+
+
+def _publish(store, receipt, pins, *, locally_cached=False):
     raw = bundle_receipt_bytes(receipt)
     derivative_budget = [0]
-    for pin in pins:
-        _upload_derivative(store, pin, derivative_budget)
+    # The corpus's disposable sink keeps no derivative objects. A cache lease
+    # already hash-bound these exact files; don't stream them to nowhere again.
+    if not (locally_cached and getattr(store, "discard_verified_derivatives", False)):
+        for pin in pins:
+            _upload_derivative(store, pin, derivative_budget)
     identity = StoredIdentity(hashlib.sha256(raw).hexdigest(), len(raw))
     with tempfile.SpooledTemporaryFile(max_size=MAX_BUNDLE_RECEIPT_BYTES) as source:
         source.write(raw)
         source.seek(0)
-        store.put_immutable(bundle_receipt_key(bundle_id), source, identity, content_type=JSON_CONTENT_TYPE)
+        store.put_immutable(bundle_receipt_key(receipt.bundle_id), source, identity, content_type=JSON_CONTENT_TYPE)
     return BundleReady(receipt, raw, tuple(pins))
+
+
+def _build(bundle_id, interval, store, derivatives_root, materializer, window_seconds, remotes, producer, scratch):
+    windows, sources = _materialize(interval, store, materializer, remotes, producer, scratch)
+    # materialize_range verified each derivative before committing its receipt;
+    # the local install binds the copy to that pin by hash.
+    pins = tuple(_install_local(pin.directory, pin.address, pin.receipt_sha256,
+                                derivatives_root, materializer, scratch, freshly_verified=True)
+                 for pin in sources)
+    receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, windows)
+    return _publish(store, receipt, pins)
+
+
+def _build_cached(bundle_id, interval, store, derivatives_root, materializer, window_seconds,
+                  remotes, producer, scratch, cache):
+    pins = {remote.window_start_ns: cache.lookup(remote, producer) for remote in remotes}
+    runs = []
+    for remote in remotes:
+        if pins[remote.window_start_ns] is not None:
+            continue
+        if not runs or runs[-1][-1].window_end_ns != remote.window_start_ns:
+            runs.append([])
+        runs[-1].append(remote)
+    _check_canonical_budget([remote for run in runs for remote in run])
+    built = {}
+    for run in runs:
+        run_scratch = scratch / f"run-{run[0].window_start_ns}"
+        _owned_root(run_scratch, "cache miss scratch")
+        _, sources = _materialize((run[0].window_start_ns, run[-1].window_end_ns), store,
+                                  materializer, run, producer, run_scratch)
+        built.update((remote.window_start_ns, pin) for remote, pin in zip(run, sources, strict=True))
+    _tree_bytes(scratch, MAX_BUILD_SCRATCH_BYTES)
+    for remote in remotes:
+        if pins[remote.window_start_ns] is None:
+            pins[remote.window_start_ns] = cache.install(built[remote.window_start_ns], remote, producer,
+                                                        derivatives_root, materializer, scratch)
+    ordered = tuple(pins[remote.window_start_ns] for remote in remotes)
+    if sum((pin.directory / name).stat().st_size for pin in ordered for name in DERIVATIVE_FILES) > MAX_DERIVATIVE_BYTES:
+        raise BundleFailure("integrity_failure", "aggregate derivative bytes exceed budget")
+    windows = tuple(BundleWindow(remote.window_start_ns, remote.window_end_ns, remote.receipt_sha256,
+                                 pin.address, pin.receipt_sha256)
+                    for remote, pin in zip(remotes, ordered, strict=True))
+    receipt = BundleReceipt(bundle_id, interval[0], interval[1], window_seconds, producer, windows)
+    return _publish(store, receipt, ordered, locally_cached=True)
 
 
 def ensure_bundle(
@@ -625,8 +673,9 @@ def ensure_bundle(
     derivatives_root,
     materializer,
     window_seconds,
+    derivative_cache=None,
 ):
-    """Return verified local pins behind one immutable receipt per bundle."""
+    """Return verified local pins; an optional window lease must outlive their use."""
     work_root = Path(work_root)
     derivatives_root = Path(derivatives_root)
     materializer = Path(materializer)
@@ -656,6 +705,9 @@ def ensure_bundle(
             return _ready(store, *decision, derivatives_root, materializer, tool_scratch)
         scratch = Path(tempfile.mkdtemp(prefix=f"bundle-{bundle_id}-", dir=work_root))
         try:
+            if derivative_cache is not None:
+                return _build_cached(bundle_id, (first, last), store, derivatives_root, materializer,
+                                     window_seconds, remotes, producer, scratch, derivative_cache)
             return _build(
                 bundle_id, (first, last), store, derivatives_root,
                 materializer, window_seconds, remotes, producer, scratch,

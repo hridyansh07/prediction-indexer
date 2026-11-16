@@ -38,7 +38,7 @@ def validate_document(doc, bundle_id):
         doc,
         "version bundle_id event_id identities status diagnostics participants spaces claims markets",
     )
-    require(type(doc["version"]) is int and doc["version"] == 1)
+    require(type(doc["version"]) is int and doc["version"] in (1, 2))
     require(doc["bundle_id"] == bundle_id, "outcome bundle identity")
     text(doc["event_id"])
     obj(doc["identities"], "claim_identity_version claim_algebra_version")
@@ -113,8 +113,12 @@ def validate_document(doc, bundle_id):
     for market in doc["markets"]:
         obj(
             market,
-            "market_id venue market_type market_status subscription_ids outcome_labels mask_status reason claims tokens",
+            "market_id venue market_type market_status subscription_ids outcome_labels mask_status reason claims tokens"
+            + (" execution_terms" if doc["version"] == 2 else ""),
         )
+        if doc["version"] == 2:
+            from replay.execution_terms import validate_terms
+            validate_terms(market["execution_terms"])
         choice(market["venue"], "kalshi polymarket limitless")
         text(market["market_id"])
         text(market["market_type"])

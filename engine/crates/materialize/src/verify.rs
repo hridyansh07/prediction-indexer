@@ -8,10 +8,12 @@ use prediction_encoder::{
     LogicalIdentity as CodecLogicalIdentity, StoredIdentity as CodecStoredIdentity,
     StreamingDecoder, StructuralDecoder, StructuralIdentity,
 };
-use replay_domain::{SegmentEvent, SegmentRecord};
+use replay_domain::{RawSegmentRecord, SegmentEvent, SegmentRecord};
 use serde::{Serialize, de::DeserializeOwned};
 
+use super::input::{ParsedHeader, ScannedEvent, classify_event};
 use super::schema::{DerivativeManifest, DerivativeReceipt, RejectDisposition, RejectRecord};
+use super::scope::{EventProjection, ScopeFilter};
 use super::{DERIVATIVE_MANIFEST_FILE, DERIVATIVE_RECEIPT_FILE, DerivativeSpec};
 
 #[derive(Default)]
@@ -25,9 +27,15 @@ pub(crate) struct VerificationCounts {
     ignored: u64,
 }
 
-struct Binding {
+pub(crate) struct Binding {
     reject_id: String,
     bytes: Vec<u8>,
+}
+
+pub(crate) struct ParsedEvent {
+    pub(crate) header: ParsedHeader,
+    pub(crate) record: Option<SegmentRecord>,
+    pub(crate) fault: Option<Binding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,10 +190,10 @@ pub(crate) fn verify_data(
 
 /// How much of a derivative's byte identity one read re-proves.
 ///
-/// Every mode applies the same semantic, ordering, count, limit and Zstandard
-/// frame checks (one checksummed frame, no truncation or trailing bytes, the
-/// stored length, decoded length and LF count). They differ only in work that
-/// re-proves bytes another boundary already bound by SHA-256.
+/// Every mode applies the same ordering, evidence, count, limit and Zstandard
+/// frame checks (one checksummed frame, no truncation or trailing bytes, stored
+/// SHA-256/length, decoded length and LF count). A scoped pinned read may defer
+/// excluded body schema checks already proved by build/audit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadMode {
     /// `verify_derivative`, and through it `--inspect-pin`, the existing
@@ -195,44 +203,126 @@ pub(crate) enum ReadMode {
     Audit,
     /// `open_pinned`, the Replay walker's hot read. The installed directory
     /// was bound to the pin by SHA-256 at install, and `open_pinned` binds the
-    /// receipt and manifest to the pin again by SHA-256. Data bytes are not
-    /// re-hashed and lines are decoded once without re-encoding them.
+    /// receipt and manifest to the pin again by SHA-256. The stored frame is
+    /// hashed, but decoded bytes are not re-hashed or re-encoded.
     PinnedReplay,
 }
 
 /// Parses one normalized event line and checks canonical child order. `Audit`
-/// also proves the line's canonical encoding; `PinnedReplay` decodes it in a
-/// single typed pass with the same closed-schema and domain validation.
+/// also proves the line's canonical encoding. An unscoped `PinnedReplay` uses
+/// one typed pass. A recognized selected event uses scoped typed decoding;
+/// unrecognized layouts, faults and decode failures retain the projection path.
 pub(crate) fn parse_event(
     line: &[u8],
     previous: &mut Option<(i64, u32)>,
     counts: &mut VerificationCounts,
     mode: ReadMode,
     schema_version: u16,
-) -> Result<SegmentRecord, String> {
-    let record = match mode {
-        ReadMode::Audit => {
-            #[cfg(test)]
-            probe::canonical_check();
-            SegmentRecord::from_canonical_json(line)
+    scope: Option<(&ScopeFilter, bool)>,
+) -> Result<ParsedEvent, String> {
+    let invalid = |error| format!("invalid normalized event: {error}");
+    let scanned =
+        scope.and_then(|(scope, fast)| fast.then(|| classify_event(line, scope)).flatten());
+    // A failed typed attempt must not replace the fallback's ordered validation
+    // or its body-relative diagnostics, even when the prefix was recognized.
+    let selected = if matches!(scanned, Some(ScannedEvent::Selected)) {
+        SegmentRecord::from_json_scoped(line).ok()
+    } else {
+        None
+    };
+    let (version, parsed) = if let Some(record) = selected {
+        debug_assert_eq!(mode, ReadMode::PinnedReplay);
+        (
+            record.schema_version(),
+            ParsedEvent {
+                header: ParsedHeader::Typed(record.header().clone()),
+                record: Some(record),
+                fault: None,
+            },
+        )
+    } else if let Some(ScannedEvent::Excluded(version, header)) = scanned {
+        debug_assert_eq!(mode, ReadMode::PinnedReplay);
+        (
+            version,
+            ParsedEvent {
+                header,
+                record: None,
+                fault: None,
+            },
+        )
+    } else if let Some((scope, _)) = scope {
+        debug_assert_eq!(mode, ReadMode::PinnedReplay);
+        let raw = RawSegmentRecord::from_json(line).map_err(invalid)?;
+        let projection: EventProjection = serde_json::from_str(raw.event_json())
+            .map_err(|error| format!("invalid normalized event: {error}"))?;
+        let fault = match &projection {
+            EventProjection::NormalizationFault(fault) => {
+                if fault.reject_id.is_empty() || fault.reject_id.chars().any(char::is_control) {
+                    return Err(invalid(replay_domain::DomainError::Empty("reject_id")));
+                }
+                Some(Binding {
+                    reject_id: fault.reject_id.clone(),
+                    bytes: serde_json::to_vec(&(raw.header(), &fault.impact)).map_err(|error| {
+                        format!("encoding normalization fault binding: {error}")
+                    })?,
+                })
+            }
+            _ => None,
+        };
+        let keep = scope.projected_event(&projection, raw.header().address().lane());
+        let version = raw.schema_version();
+        let (header, record) = if keep {
+            let record = raw.into_record().map_err(invalid)?;
+            (record.header().clone(), Some(record))
+        } else {
+            (raw.into_header(), None)
+        };
+        (
+            version,
+            ParsedEvent {
+                header: ParsedHeader::Typed(header),
+                record,
+                fault,
+            },
+        )
+    } else {
+        let record = match mode {
+            ReadMode::Audit => {
+                #[cfg(test)]
+                probe::canonical_check();
+                SegmentRecord::from_canonical_json(line)
+            }
+            ReadMode::PinnedReplay => SegmentRecord::from_json(line),
         }
-        ReadMode::PinnedReplay => SegmentRecord::from_json(line),
-    }
-    .map_err(|error| format!("invalid normalized event: {error}"))?;
-    if record.schema_version() != schema_version {
+        .map_err(invalid)?;
+        let fault = match record.event() {
+            SegmentEvent::NormalizationFault(fault) => Some(Binding {
+                reject_id: fault.reject_id().to_owned(),
+                bytes: serde_json::to_vec(&(record.header(), fault.impact()))
+                    .map_err(|error| format!("encoding normalization fault binding: {error}"))?,
+            }),
+            _ => None,
+        };
+        (
+            record.schema_version(),
+            ParsedEvent {
+                header: ParsedHeader::Typed(record.header().clone()),
+                record: Some(record),
+                fault,
+            },
+        )
+    };
+    if version != schema_version {
         return Err("normalized event schema disagrees with manifest".into());
     }
-    let current = (
-        record.header().address().canonical_seq(),
-        record.header().address().event_index(),
-    );
+    let current = (parsed.header.sequence(), parsed.header.index());
     verify_event_order(*previous, current)?;
     *previous = Some(current);
     counts.event_lines += 1;
-    if matches!(record.event(), SegmentEvent::NormalizationFault(_)) {
+    if parsed.fault.is_some() {
         counts.faults += 1;
     }
-    Ok(record)
+    Ok(parsed)
 }
 
 /// Parses one sidecar line: exact envelope provenance, source order, and, for
@@ -296,25 +386,15 @@ pub(crate) fn parse_reject(
 /// only on identical headers, so this per-delivery check is exactly the former
 /// whole-file lockstep pairing of the fault stream against the reject stream.
 pub(crate) fn verify_disposition(
-    records: &[SegmentRecord],
+    event_count: u64,
+    faults: &[Binding],
     reject: Option<&RejectRecord>,
     counts: &mut VerificationCounts,
 ) -> Result<(), String> {
     let unpaired =
         || "normalization fault events do not pair exactly with parse rejects".to_owned();
-    let mut faults = records.iter().filter_map(|record| match record.event() {
-        SegmentEvent::NormalizationFault(fault) => Some((record, fault)),
-        _ => None,
-    });
-    let fault = match faults.next() {
-        Some((record, fault)) => Some(Binding {
-            reject_id: fault.reject_id().to_owned(),
-            bytes: serde_json::to_vec(&(record.header(), fault.impact()))
-                .map_err(|error| format!("encoding normalization fault binding: {error}"))?,
-        }),
-        None => None,
-    };
-    if faults.next().is_some() {
+    let fault = faults.first();
+    if faults.len() > 1 {
         return Err(unpaired());
     }
     let parse = match reject {
@@ -336,9 +416,7 @@ pub(crate) fn verify_disposition(
             if left.reject_id == right.reject_id && left.bytes == right.bytes => {}
         _ => return Err(unpaired()),
     }
-    let accepted = records
-        .iter()
-        .any(|record| !matches!(record.event(), SegmentEvent::NormalizationFault(_)));
+    let accepted = event_count > faults.len() as u64;
     if accepted && reject.is_some() {
         return Err("source has more than one normalization disposition".to_owned());
     }
@@ -477,6 +555,10 @@ impl VerifiedLines {
             line: Vec::new(),
             max_line_bytes,
         })
+    }
+
+    pub(crate) fn current_line(&self) -> &[u8] {
+        &self.line[..self.line.len() - 1]
     }
 
     pub(crate) fn next_line(&mut self) -> Result<Option<&[u8]>, String> {

@@ -209,14 +209,6 @@ impl WindowStatus {
         matches!(self.lanes.get(lane), Some(LaneStatus::Valid))
     }
 
-    pub fn valid_lanes(&self) -> Vec<&str> {
-        self.lanes
-            .iter()
-            .filter(|(_, status)| **status == LaneStatus::Valid)
-            .map(|(lane, _)| lane.as_str())
-            .collect()
-    }
-
     pub fn invalid_lanes(&self) -> Vec<(&str, &str)> {
         self.lanes
             .iter()

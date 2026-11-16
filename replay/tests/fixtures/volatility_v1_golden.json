@@ -1,0 +1,38 @@
+{
+  "mixed-scopes": {
+    "availability.ndjson": "0cc07d4e252ef7cbbaa08d381b4d3991d9a354f0a09375b9f1f1c8654f1fd9cd",
+    "content_receipt.json": "bbbf6295978fd5540b885201d06e76c139829b11b22354abc314a53aff5d9b96",
+    "incidents.ndjson": "884130a66d47578b093cb250c3048360470f824f59953433b66e064aa6925dc7",
+    "levels.ndjson.zst": "6bf456eb11b054241b7d7fa0f3fd630816198e356609223edc51e22b628b75c2",
+    "manifest.json": "6ee1fab6b74e21361d1cc74d4e5bc4546ea54f7ff3db4ad14769740b601cb828",
+    "pair_profile.ndjson": "7c3409ac754c8168985f79ded0769581fd8898d67dbc75cd092878d476614462",
+    "profile.ndjson": "ea140d527c3703020f4dae6fcd145ae1617ef729e92a0cbb017bbab70a708613",
+    "summary.json": "a639b6ae0c02faac8a2ddba4b671d004e2a57424a8e0e1beb5d3f9508f8dc516",
+    "transitions.ndjson.zst": "5bb24e00bdd0d3b1639f8dcc81caa2052c994d24f6b7bb10f7f441afe48d7021",
+    "volatility.ndjson.zst": "6f258f4b2239572b2904cbb5f66e00e2b549b21d56e05a1c656295f5007b2cc9"
+  },
+  "strategy-full.ndjson": {
+    "availability.ndjson": "ef69aa25f59807a500e0d8c1fbbd12ea92cae53a5972f9e90558d797abdaef99",
+    "content_receipt.json": "5db5af641568359cfa88e9e99933cded9063ec77e57cd55dbba81c733056affc",
+    "incidents.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "levels.ndjson.zst": "31ca56e0da1177987fdef91db137a2a845e927b9b7b70b01278cf5ff6dda382b",
+    "manifest.json": "894d087309ed459f6141693089e3fced2d3f546a51b782dbb22cb1ab3bd8a24f",
+    "pair_profile.ndjson": "6324cc51ab725bf3206b16d3f6f788c0f95d4c7609c8c126d18d02cb4c4719e4",
+    "profile.ndjson": "81b9d2001e00d79ec957b9376c8525914919f460ba31fd0fc233dcd52eeeb01c",
+    "summary.json": "00b8723caedf744016361e602ef54f15df4b28d545977d278f4b16c4c96c40e7",
+    "transitions.ndjson.zst": "f5dde09a4d8dfb7ffa52e4d13d652304533172abaa95e108b7eff4876a326c9b",
+    "volatility.ndjson.zst": "a6e20d6b1f97f3cd2826c8457ef0dee2d966a45d2b47db71f760a4ac7eecec8f"
+  },
+  "strategy-sparse.ndjson": {
+    "availability.ndjson": "ef69aa25f59807a500e0d8c1fbbd12ea92cae53a5972f9e90558d797abdaef99",
+    "content_receipt.json": "e3299a05792c4a6ef57abf475c1ab4047e040e363da0466e8182a4fcf5dc907c",
+    "incidents.ndjson": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "levels.ndjson.zst": "31ca56e0da1177987fdef91db137a2a845e927b9b7b70b01278cf5ff6dda382b",
+    "manifest.json": "894d087309ed459f6141693089e3fced2d3f546a51b782dbb22cb1ab3bd8a24f",
+    "pair_profile.ndjson": "6324cc51ab725bf3206b16d3f6f788c0f95d4c7609c8c126d18d02cb4c4719e4",
+    "profile.ndjson": "81b9d2001e00d79ec957b9376c8525914919f460ba31fd0fc233dcd52eeeb01c",
+    "summary.json": "00b8723caedf744016361e602ef54f15df4b28d545977d278f4b16c4c96c40e7",
+    "transitions.ndjson.zst": "f5dde09a4d8dfb7ffa52e4d13d652304533172abaa95e108b7eff4876a326c9b",
+    "volatility.ndjson.zst": "a6e20d6b1f97f3cd2826c8457ef0dee2d966a45d2b47db71f760a4ac7eecec8f"
+  }
+}

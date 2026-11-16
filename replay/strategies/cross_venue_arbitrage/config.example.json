@@ -19,7 +19,7 @@
     "assets": []
   },
   "policy": {
-    "version": 3,
+    "version": 4,
     "fills": {
       "version": 1,
       "step_contracts": "0.01",
@@ -29,8 +29,41 @@
           "name": "edge",
           "role": "governs",
           "edge": true
+        },
+        {
+          "name": "t10",
+          "role": "records",
+          "target_contracts": "10"
         }
-      ]
+      ],
+      "probes": {
+        "version": 1,
+        "sizings": [
+          "edge",
+          "t10"
+        ],
+        "confirm_ms": [
+          0,
+          500,
+          1000
+        ],
+        "arrival_ms": [
+          100,
+          250,
+          500,
+          1000,
+          2000
+        ],
+        "sequencing": [
+          "simultaneous",
+          "slow_first"
+        ],
+        "unknown_taker_delay_ms": {
+          "kalshi": 0,
+          "limitless": 0,
+          "polymarket": 1000
+        }
+      }
     },
     "latency_tiers_ns": [
       "250000000",
@@ -51,6 +84,13 @@
       "minimum_evaluated_ns": "3600000000000"
     },
     "audit_intervals": false,
-    "profile": null
+    "profile": null,
+    "flags": {
+      "version": 1,
+      "stale_ms": 5000,
+      "settlement_allowlist": [
+        "series_moneyline"
+      ]
+    }
   }
 }

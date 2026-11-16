@@ -24,6 +24,8 @@ from replay.streams.protocol import (
 from replay.supervisor import fsync_directory, write_json_durable
 
 MAX_BYTES = 8 * 1024 * 1024
+# evidence and the closed snapshot aggregate up to MAX_OCCURRENCES bounded bodies
+MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_OCCURRENCES = 128
 MAX_MARKETS = 4096
 MAX_BOOKS = 8192
@@ -391,7 +393,7 @@ def build_snapshot(config, evidence, outcomes=None):
     if outcomes is not None:
         validate_outcomes(outcomes, config["bundle_id"])
     array(evidence)
-    require(len(encoded(evidence)) <= MAX_BYTES, "evidence byte budget")
+    require(len(encoded(evidence)) <= MAX_SNAPSHOT_BYTES, "evidence byte budget")
     require(len(evidence) == len(config["occurrences"]))
     scopes = []
     seen = {}
@@ -430,10 +432,10 @@ def build_snapshot(config, evidence, outcomes=None):
     }
     if outcomes is not None:
         snapshot["outcomes"] = outcomes
-    require(len(encoded(snapshot)) <= MAX_BYTES, "context snapshot too large")
+    require(len(encoded(snapshot)) <= MAX_SNAPSHOT_BYTES, "context snapshot too large")
     require(
         len((json.dumps(snapshot, sort_keys=True, allow_nan=False) + "\n").encode())
-        <= MAX_BYTES,
+        <= MAX_SNAPSHOT_BYTES,
         "serialized snapshot too large",
     )
     return snapshot
@@ -450,10 +452,10 @@ def load_snapshot(directory, *, expected_sha256=None):
     sha(receipt["config_sha256"])
     require(
         type(receipt["snapshot_byte_length"]) is int
-        and 0 < receipt["snapshot_byte_length"] <= MAX_BYTES
+        and 0 < receipt["snapshot_byte_length"] <= MAX_SNAPSHOT_BYTES
     )
     with (root / "context.json").open("rb") as stream:
-        payload = stream.read(MAX_BYTES + 1)
+        payload = stream.read(MAX_SNAPSHOT_BYTES + 1)
     require(
         len(payload) == receipt["snapshot_byte_length"]
         and hashlib.sha256(payload).hexdigest() == receipt["snapshot_sha256"],
@@ -461,7 +463,7 @@ def load_snapshot(directory, *, expected_sha256=None):
     )
     if expected_sha256 is not None:
         require(receipt["snapshot_sha256"] == expected_sha256, "snapshot pin mismatch")
-    snapshot = decode(payload, MAX_BYTES)
+    snapshot = decode(payload, MAX_SNAPSHOT_BYTES)
     require(type(snapshot.get("version")) is int and snapshot["version"] in (1, 2))
     obj(
         snapshot,
@@ -526,7 +528,7 @@ def prepare(config, directory, *, universe, fallback=None, outcomes=None):
             detail = decode(encoded(detail), MAX_BYTES)
             validate_detail(detail, occurrence, config["bundle_id"])
             evidence.append({"provider": provider, "detail": detail})
-            require(len(encoded(evidence)) <= MAX_BYTES, "evidence byte budget")
+            require(len(encoded(evidence)) <= MAX_SNAPSHOT_BYTES, "evidence byte budget")
         from replay.outcome_model import UNAVAILABLE
 
         source = (
@@ -549,7 +551,7 @@ def prepare(config, directory, *, universe, fallback=None, outcomes=None):
         snapshot = build_snapshot(config, evidence, recorded_outcomes)
         write_json_durable(root / "context.json", snapshot)
         payload = (root / "context.json").read_bytes()
-        require(len(payload) <= MAX_BYTES, "serialized snapshot too large")
+        require(len(payload) <= MAX_SNAPSHOT_BYTES, "serialized snapshot too large")
         write_json_durable(
             root / "receipt.json",
             {

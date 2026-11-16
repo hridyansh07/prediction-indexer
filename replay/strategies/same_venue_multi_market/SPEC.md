@@ -3,9 +3,8 @@
 Status: **implemented.** Synthetic contract tests cover enumeration, admission,
 pricing, fills and the reader; one retained fixture run is recorded in §7.
 
-This is the first structural strategy from
-[ECONOMIC_STRATEGY_RESEARCH_V2.md](../../../docs/ECONOMIC_STRATEGY_RESEARCH_V2.md) §1. Several
-separately traded markets on one venue can jointly pay a fixed amount: on a
+Several separately traded markets on one venue can jointly pay a fixed amount,
+using the [outcome-mask contract](../../../docs/OUTCOME_MASKS_V1.md): on a
 best-of-3, "Alpha wins 2–0", "Alpha wins 2–1" and "Beta wins" partition the
 series. A matching engine enforces the relationship inside one market, not
 across markets, so the combined asks can sum below one unit.
@@ -77,6 +76,12 @@ The strategy uses SDK fill checks only
 
 Controls are not supported with fill checks.
 
+With explicit probes, `fill_loss` converts every signed native gross unwind
+loss to scale 36 in the set's common quote asset, matching `fill_value` units.
+Unknown economics or different quote assets fail conversion. Native leg costs
+and exit proceeds remain unchanged. Reader-only instances retain the pinned
+snapshot for the default execution-terms lookup. Probes remain opt-in.
+
 ## 4. Configuration
 
 The closed run config is `{version: 1, snapshot_directory, snapshot_sha256,
@@ -110,6 +115,14 @@ positive payload carries `gap_gross`, `gap_net`, the gross and net payout
 floors, one native leg per book (outcome asset, cost, quote delta, received,
 charges, assessment identities), `quote_asset`, fee status and labels,
 `settlement_model: "normal_resolution_only"` and the outcomes provider.
+
+The closed configuration optionally accepts `storage: {"version": 1,
+"economic": "zstd"}` beside `policy` (SDK §5). This selects stored manifest
+version **2**, requiring the storage block and nested logical/stored identities
+for `.zst` economic evidence, including probes/audits. Summary format 1 and
+embedded profiles remain unchanged. Omission preserves manifest 1 and exact
+legacy bytes. Policy/experiment identity stays equal; physical manifest and
+receipt digests differ. Explicit null and unknown storage combinations fail.
 
 The independent reader (`replay.strategies.same_venue_multi_market.output`) reconstructs
 entities, re-walks consumed quotes, checks fee, cashflow and payout arithmetic,
@@ -147,3 +160,13 @@ completed reader re-priced every fill, and bench cleanup reported no errors.
 - **Independent check** against the published fee formulas, not the fee SDK:
   all 29 opening payloads (1-set gross and net), all 3 fill values, all 6 kill
   prices, and all 3 edge stops' next steps (from `beyond`) agree.
+
+## Execution-realism policy 2
+
+The newer closed policy and upgraded example implement the authorized
+[strategy-realism specification](../../../docs/specs/STRATEGY_EXECUTION_REALISM_V1.md).
+Its [producer contract](../../../docs/specs/STRATEGY_EXECUTION_REALISM_CONTRACT.md)
+owns required t10/probes/flags, independent reader checks and exact monetary/native
+units. Earlier policies above retain their schemas and bytes. The reference is
+60 probes per fill; no flag filters an episode. Retained-data acceptance remains
+pending.

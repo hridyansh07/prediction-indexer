@@ -1,4 +1,4 @@
-"""Streaming reads of the market profile's Zstandard row files.
+"""Streaming reads of the SDK's profile and economic Zstandard evidence.
 
 ``stream_lines`` decodes one committed frame through the shared codec in two
 passes and never writes a decoded byte to disk: pass one verifies both
@@ -106,15 +106,17 @@ def stream_lines(path, logical, stored, max_line, label):
             parts = (partial + chunk).split(b"\n")
             partial = parts.pop()
             for part in parts:
-                require(len(part) < max_line, f"{label} line/truncation")
+                if len(part) >= max_line:
+                    require(False, f"{label} line/truncation: line_bytes={len(part) + 1} max_line_bytes={max_line}")
                 yield part + b"\n"
-            require(len(partial) < max_line, f"{label} line/truncation")
+            if len(partial) >= max_line:
+                require(False, f"{label} line/truncation: line_bytes>={len(partial) + 1} max_line_bytes={max_line}")
         if failure:
             error = failure[0]
             if isinstance(error, CodecError):
                 require(False, f"{label} codec: {error}")
             raise error
-        require(not partial, f"{label} line/truncation")
+        require(not partial, f"{label} line/truncation: unterminated line")
     finally:
         pipe.abandoned.set()
         while True:

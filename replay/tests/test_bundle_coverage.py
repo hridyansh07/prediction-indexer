@@ -16,7 +16,8 @@ from replay.strategies.bundle_coverage.output import (
 )
 from replay.preparation import encoded, prepare
 from replay.strategy_sdk import plain
-from replay.streams.protocol import Decoder, ProtocolError, books_sha256, freeze
+from replay.streams.protocol import SECTIONS, Decoder, ProtocolError, books_sha256, freeze
+from replay.tests.test_streams import fields
 from replay.tests.test_preparation import G2, R1, R2, config, detail
 from replay.tests.test_supervisor import config as supervisor_config, metadata_pin
 
@@ -34,6 +35,9 @@ class Harness:
         attempt="a" * 32,
         lower_bound="clip",
         pin=None,
+        wire_records=None,
+        defer_initial=False,
+        sections=SECTIONS,
     ):
         self.root = root
         d = detail()
@@ -112,16 +116,29 @@ class Harness:
             "max_entry_bytes": "65536",
             "max_queue_bytes": "1048576",
         }
-        self.decoder = Decoder("coverage-test", attempt, self.initial, 65536)
+        from replay.economic_sdk.retention import configured
+        self.initial.update(copy.deepcopy(getattr(self.strategy, "retention", None) or configured(self.snapshot, {})))
+        if wire_records is not None:
+            self.initial = wire_records[0]["body"]
+        self.decoder = Decoder("coverage-test", attempt, self.initial, 65536, sections=sections)
         self.seq = 0
         self.pin = self.initial["pins"][0]
-        self.send("initial", self.initial)
+        if wire_records is None and not defer_initial:
+            self.send("initial", self.initial)
+        elif wire_records is not None:
+            for record in wire_records:
+                cut = self.decoder.apply(fields({**record, "version": "4", "run_id": "coverage-test", "attempt_id": attempt}))
+                self.strategy(cut)
+            self.decoder.finish()
+            self.strategy.finish()
 
     def send(self, kind, body):
+        if kind == "cut":
+            body = {**body, "risk_sequence": str(self.seq)}
         cut = self.decoder.apply(
-            encoded(
+            fields(
                 {
-                    "version": "2",
+                    "version": "4",
                     "run_id": "coverage-test",
                     "attempt_id": self.context["attempt_id"],
                     "sequence": str(self.seq),
@@ -227,7 +244,7 @@ class Harness:
         # Hand-authored decisions: the expected final digest is the local state.
         return self.send(
             "terminal",
-            {"cuts": str(self.seq - 1), "books_sha256": books_sha256(self.decoder.books)},
+            {"cuts": str(self.seq - 1), "risk_cuts": str(self.seq - 1), "books_sha256": books_sha256(self.decoder.books)},
         )
 
     def finish(self):
@@ -327,6 +344,38 @@ class CoverageTests(unittest.TestCase):
         other.mkdir()
         with self.assertRaisesRegex(ProtocolError, "no native risk plans"):
             Harness(other, all_uncaptured=True)
+
+    def test_s5_shared_keys_keep_membership_counts_row_order_and_first_provenance(self):
+        from replay.economic_sdk.availability import IntervalEngine
+
+        h = self.harness(scopes=True)
+        snapshot = copy.deepcopy(plain(h.snapshot))
+        first = snapshot["scopes"][0]["members"][0]
+        shared = {**copy.deepcopy(first), "market_id": "polymarket:shared", "books": first["books"][:1]}
+        snapshot["scopes"][0]["members"].insert(1, shared)
+        writer = type("Rows", (), {"append": lambda _, row: rows.append(row)})()
+        rows = []
+        engine = IntervalEngine(snapshot, writer)
+        from replay.streams.protocol import Cut
+        engine.initial(Cut(0, 0, "initial", {}, h.decoder.books))
+        engine.cut(h.window(), 0, 10)
+        # Reverse wire order must not reverse member/book visitation.
+        engine.cut(h.group(12, list(reversed(h.initial["plans"]))), 12, 12)
+        engine.cut(h.group(13, h.initial["plans"][:1]), 13, 13)  # status unchanged
+        engine.cut(h.group(17, h.initial["plans"][:1], {"kind": "connection_closed"}), 17, 17)
+        engine.cut(h.group(26, h.initial["plans"][:1]), 26, 26)  # quiet scope entry at 23
+        engine.terminal(40)
+        member = "member:" + first["market_id"]
+        shared_id = "member:polymarket:shared"
+        book = book_id(first["books"][0])
+        self.assertEqual([r["entity"] for r in rows if r["end_ns"] == "12"],
+                         [book_id(b) for b in first["books"]] + [member, shared_id, "bundle"])
+        self.assertEqual([(r["start_ns"], r["end_ns"], r["usable_books"], r["required_books"])
+                          for r in rows if r["entity"] == "bundle" and r["scope"] == 0],
+                         [("10", "12", 0, 3), ("12", "17", 3, 3), ("17", "23", 1, 3)])
+        self.assertEqual([(r["start_ns"], r["end_ns"], r["source"]["visible_ns"])
+                          for r in rows if r["entity"] == book and r["state"] == "usable"],
+                         [("12", "17", "12"), ("26", "40", "26")])
 
     def test_window_evidence_is_not_latched_reason_and_clip_preserves_origin(self):
         h = self.harness()

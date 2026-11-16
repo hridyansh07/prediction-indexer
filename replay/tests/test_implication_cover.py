@@ -161,6 +161,11 @@ class ImplicationTests(unittest.TestCase):
         with patch("replay.strategies._shared.implication_cover.contract.MAX_PAIRS", 1), self.assertRaisesRegex(ProtocolError, "pair limit"):
             baskets(h.strategy.snapshot, h.cross_config["policy"], 0, "same_venue")
 
+    def test_pair_bound_admits_the_densest_corpus_scope(self):
+        # Corpus bundle_991a64db: 98 polymarket and 6 kalshi books in one same-venue scope.
+        from replay.strategies._shared.implication_cover import contract
+        self.assertGreaterEqual(contract.MAX_PAIRS, 98 * 97 // 2 + 6 * 5 // 2)
+
     def test_token_fee_recomputes_each_state_and_removes_floor_edge(self):
         h = self.harness(mode="cross_venue", limitless=True, fees="token")
         h.populate()

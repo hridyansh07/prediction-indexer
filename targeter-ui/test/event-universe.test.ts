@@ -2,17 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { InfiniteQueryObserver, QueryObserver } from '@tanstack/react-query';
-import express from 'express';
+import { universeGet } from '../src/client/universe-api.js';
 import {
-  createEventUniverseRouter,
-  EventUniverseClient,
-  universePublicFailure,
-  validateTargeterRun,
-  validateUniverseQuery,
-} from '../src/server/event-universe.js';
+  UniverseApiError,
+  UniverseClient,
+} from '../src/client/universe-client.js';
 import {
   boundedRenderPage,
   occurrenceExplanation,
@@ -28,14 +24,10 @@ import {
   targeterRunQuery,
   universeKeys,
 } from '../src/client/universe-queries.js';
-import { handleDirectUniverseTestRequest as handleEventUniverseProxy } from './direct-client-test-helper.js';
-import { EVENT_UNIVERSE_SCHEMA_VERSION } from '../src/event-universe.js';
 import type {
-  UniverseRun,
   UniverseSelection,
   UniverseSelectionDetail,
   UniverseTargeterRunDetail,
-  UniverseTargeterStatus,
 } from '../src/event-universe.js';
 
 const sha = 'a'.repeat(64);
@@ -123,56 +115,9 @@ const detail = (
   },
   ...overrides,
 });
-const run = (overrides: Partial<UniverseRun> = {}): UniverseRun => ({
+const run = () => ({
   run_id: '20260820T120000.000001Z',
   generated_at: '2026-08-20T12:00:00Z',
-  generated_at_ns: 1,
-  input_complete: true,
-  report_version: 3,
-  strategy_version: 2,
-  manifest_key: source.manifest_key,
-  manifest_sha256: sha,
-  manifest_byte_length: 100,
-  report_key: source.report_key,
-  report_sha256: sha,
-  report_byte_length: 80,
-  report_decoded_sha256: sha,
-  report_decoded_byte_length: 120,
-  projection_version: 1,
-  projection_sha256: sha,
-  projection_row_count: 1,
-  indexed_at_ns: 2,
-  ...overrides,
-});
-const status = (
-  overrides: Partial<UniverseTargeterStatus> = {},
-): UniverseTargeterStatus => ({
-  status_projection_version: 1,
-  observed_at: '2026-08-20T12:05:18Z',
-  freshness: {
-    state: 'current',
-    expected_run_seconds: 600,
-    latest_run_age_seconds: 318,
-    latest_indexed_at: '2026-08-20T12:01:00Z',
-  },
-  latest_run: {
-    run_id: run().run_id,
-    generated_at: run().generated_at,
-    input_complete: true,
-    indexed_at: '2026-08-20T12:01:00Z',
-  },
-  current_complete_run: {
-    run_id: run().run_id,
-    generated_at: run().generated_at,
-    input_complete: true,
-    indexed_at: '2026-08-20T12:01:00Z',
-  },
-  current_complete_summary: {
-    selected_bundles: 1,
-    selected_targets: 2,
-    venues: ['kalshi', 'polymarket'],
-  },
-  ...overrides,
 });
 const normalizedEventSummary = () => ({
   event_id: 'event-alpha',
@@ -261,19 +206,6 @@ const claimRelation = () => ({
   consequent_scope: 'series',
   consequent_coverage: 'EXHAUSTIVE',
 });
-const claimMarket = (claimKey: unknown = '') => ({
-  venue: 'kalshi',
-  venue_market_id: 'K-ALPHA',
-  claim_key: claimKey,
-  event_id: 'event-alpha',
-  market_id: 'market-alpha',
-  market_template_version: 1,
-  outcome_space_version: 1,
-  canonical_class: 'esports.series_moneyline',
-  title: 'Alpha vs Beta',
-  first_seen_run_id: run().run_id,
-  last_seen_run_id: run().run_id,
-});
 const normalizedEvent = () => ({
   event: normalizedEventSummary(),
   venue_events: [
@@ -317,89 +249,6 @@ const normalizedEvent = () => ({
     },
   ],
 });
-const relationshipTypes = () => ({
-  relationship_type_catalog_version: 2,
-  types: [
-    {
-      type: 'IMPLICATION',
-      directed: true,
-      member_roles: ['antecedent', 'consequent'],
-    },
-    { type: 'MUTUAL_EXCLUSION', directed: false, member_roles: ['member'] },
-  ],
-});
-const normalizedMarket = () => ({
-  market: normalizedEvent().markets[0],
-  venue_markets: [
-    {
-      venue: 'kalshi',
-      venue_market_id: 'K-ALPHA',
-      venue_event_id: 'event-a',
-      event_id: 'event-alpha',
-      market_id: 'market-alpha',
-      market_template_version: 1,
-      outcome_space_version: 1,
-      canonical_class: 'esports.series_moneyline',
-      market_type: 'moneyline',
-      scope: 'series',
-      title: 'Alpha vs Beta',
-      parameters: {},
-      subscription_ids: ['K-ALPHA'],
-      outcome_labels: ['Alpha', 'Beta'],
-      status: 'open',
-      accepting_orders: true,
-      rules_hash: null,
-      rule_template_id: null,
-      source_ref: 'kalshi:event-a',
-      created_at: null,
-      volume_24h: null,
-      volume_total: 30_000,
-      volume_total_usd: 30_000,
-      liquidity: null,
-      first_seen_run_id: run().run_id,
-      last_seen_run_id: run().run_id,
-    },
-  ],
-  selections: [
-    {
-      run_id: run().run_id,
-      generated_at: run().generated_at,
-      bundle_id: 'bundle alpha',
-      venue: 'kalshi',
-      venue_market_id: 'K-ALPHA',
-      continuity_score: 10,
-      selection_reason: 'selected',
-      origin_run_id: run().run_id,
-    },
-  ],
-  claims: normalizedEvent().claims,
-  relations: normalizedEvent().relations,
-});
-const normalizedClaim = () => ({
-  claim: {
-    claim_id: sha,
-    space_shape_id: shapeSha,
-    scope: 'series',
-    coverage: 'EXHAUSTIVE',
-    outcome_key_count: 3,
-    claim_identity_version: 1,
-    first_seen_run_id: run().run_id,
-    last_seen_run_id: run().run_id,
-  },
-  counts: { markets: 2, venues: 2, events: 1 },
-  relations: [
-    {
-      space_shape_id: shapeSha,
-      left_claim_id: sha,
-      right_claim_id: otherSha,
-      relation_type: 'IMPLICATION',
-    },
-  ],
-});
-const normalizedClaimMarkets = (claimKey: unknown = '') => ({
-  markets: [claimMarket(claimKey)],
-  next_cursor: null,
-});
 const json = (value: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(value), {
     status: 200,
@@ -419,22 +268,26 @@ function realUniverseContract(): ContractCase[] {
     ),
   );
   assert.equal(document.fixture_version, 1);
-  assert.equal(document.schema_version, EVENT_UNIVERSE_SCHEMA_VERSION);
   return document.cases;
 }
 
-async function proxyContractCase(contract: ContractCase) {
-  const [pathname, query = ''] = contract.path.split('?');
-  return handleEventUniverseProxy(
-    new Request(
-      `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(pathname)}${query ? `&${query}` : ''}`,
-    ),
-    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
-    (async () => json(contract.body)) as typeof fetch,
-  );
+async function readContractCase(contract: ContractCase) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const requested = new URL(String(input));
+    assert.equal(`${requested.pathname}${requested.search}`, contract.path);
+    assert.equal(init?.credentials, 'omit');
+    assert.equal(new Headers(init?.headers).get('authorization'), null);
+    return json(contract.body);
+  }) as typeof fetch;
+  try {
+    return await universeGet(contract.path);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
-test('real UniverseApplication responses satisfy every proxy contract', async () => {
+test('browser transport reads real UniverseApplication responses', async () => {
   const contracts = realUniverseContract();
   assert.deepEqual(
     contracts.map(({ name }) => name),
@@ -454,86 +307,50 @@ test('real UniverseApplication responses satisfy every proxy contract', async ()
     ],
   );
   for (const contract of contracts) {
-    const response = await proxyContractCase(contract);
-    assert.equal(response.status, 200, contract.name);
-    assert.deepEqual(await response.json(), contract.body, contract.name);
+    assert.deepEqual(
+      await readContractCase(contract),
+      contract.body,
+      contract.name,
+    );
   }
   const degraded = contracts.find(({ name }) => name === 'health_degraded')!;
   assert.equal(degraded.body.status, 'degraded');
   assert.equal(degraded.body.sync.pending_failures, 1);
 });
 
-test('real Universe contracts remain closed to key-set drift', async () => {
-  const contracts = new Map(
-    realUniverseContract().map((contract) => [contract.name, contract]),
+test('browser bundle discovery validates the real Universe bundle schema', async () => {
+  const contract = realUniverseContract().find(
+    ({ name }) => name === 'bundles',
+  )!;
+  const api = (body: unknown) =>
+    new UniverseClient({
+      baseUrl: 'https://universe.example',
+      fetch: (async () => json(body)) as typeof fetch,
+    });
+  assert.deepEqual(
+    (await api(contract.body).bundles()).bundles,
+    contract.body.bundles,
   );
-  const mutations: Array<[string, (body: any) => void]> = [
-    ['health_ok', (body) => (body.unexpected = true)],
-    ['health_degraded', (body) => (body.sync.pending_failures = 0)],
-    ['events', (body) => delete body.events[0].event_refs],
-    ['event_detail', (body) => (body.observations[0].unexpected = true)],
-    ['targeter_run', (body) => delete body.events[0].event_refs],
-    ['event_detail', (body) => delete body.claims[0].venue_count],
-    ['market_detail', (body) => (body.claims = undefined)],
-    ['claim_detail', (body) => delete body.claim.coverage],
-    ['claim_detail', (body) => delete body.counts.venues],
-    ['claim_markets', (body) => (body.markets[0].unexpected = true)],
-    ['health_ok', (body) => delete body.claim_coverage],
-  ];
-  for (const [name, mutate] of mutations) {
-    const contract = structuredClone(contracts.get(name)!);
-    mutate(contract.body);
-    const response = await proxyContractCase(contract);
-    assert.equal(response.status, 502, name);
+  for (const mutate of [
+    (body: any) => {
+      body.unexpected = true;
+    },
+    (body: any) => {
+      delete body.bundles[0].participants;
+    },
+    (body: any) => {
+      body.bundles[0].unexpected = true;
+    },
+  ]) {
+    const body = structuredClone(contract.body);
+    mutate(body);
+    await assert.rejects(() => api(body).bundles(), { kind: 'contract' });
   }
-});
-
-test('proxy allowlists one encoded value per supported query field', async () => {
-  let requested = '';
-  let authorization = '';
-  const client = new EventUniverseClient({
-    baseUrl: 'https://universe.internal/root/',
-    authorization: 'Bearer server-secret',
-    fetch: (async (input, init) => {
-      requested = String(input);
-      authorization = new Headers(init?.headers).get('authorization') ?? '';
-      return json({ selections: [], sort: 'selected', next_cursor: null });
-    }) as typeof fetch,
-  });
-  await client.bundleHistory(
-    'bundle / unicode ✓'.replace('/', '-'),
-    new URLSearchParams({
-      venue: 'venue with spaces',
-      sort: 'selected',
-      cursor: 'opaque+/=',
-    }),
-  );
-  const url = new URL(requested);
-  assert.equal(
-    decodeURIComponent(url.pathname),
-    '/root/v1/bundles/bundle - unicode ✓/history',
-  );
-  assert.equal(url.searchParams.get('venue'), 'venue with spaces');
-  assert.equal(url.searchParams.get('cursor'), 'opaque+/=');
-  assert.equal(authorization, 'Bearer server-secret');
-
-  assert.throws(() =>
-    validateUniverseQuery(
-      new URLSearchParams('venue=kalshi&venue=polymarket'),
-      new Set(['venue']),
-    ),
-  );
-  assert.throws(() =>
-    validateUniverseQuery(
-      new URLSearchParams({ raw_segments: 'true' }),
-      new Set(['venue']),
-    ),
-  );
 });
 
 test('strictly validates selection detail and rejects schema drift', async () => {
   const valid = detail();
-  const client = new EventUniverseClient({
+  const client = new UniverseClient({
     baseUrl: 'https://universe.internal',
     fetch: (async () => json(valid)) as typeof fetch,
   });
@@ -544,7 +361,7 @@ test('strictly validates selection detail and rejects schema drift', async () =>
 
   const invalid: any = structuredClone(valid);
   invalid.ended_at = '2026-08-20T15:00:00Z';
-  const rejecting = new EventUniverseClient({
+  const rejecting = new UniverseClient({
     baseUrl: 'https://universe.internal',
     fetch: (async () => json(invalid)) as typeof fetch,
   });
@@ -553,95 +370,35 @@ test('strictly validates selection detail and rejects schema drift', async () =>
   );
 });
 
-test('bundle summaries are closed, grouped records', async () => {
-  const bundle = {
-    bundle_id: 'bundle alpha',
-    latest_run_id: '20260820T120000.000001Z',
-    sport: 'esports',
-    game: 'counter_strike_2',
-    topology: 'series',
-    participants: ['Alpha', 'Beta'],
-    activation_at: '2026-08-20T14:00:00Z',
-    capture_start_at: '2026-08-20T13:00:00Z',
-    first_selected_at: '2026-08-20T12:00:00Z',
-    last_selected_at: '2026-08-20T12:10:00Z',
-    occurrence_count: 2,
-    venues: ['kalshi', 'polymarket'],
-    target_count: 2,
-    lifecycle: 'active',
-  };
-  const client = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    fetch: (async () =>
-      json({ bundles: [bundle], next_cursor: null })) as typeof fetch,
-  });
-  const result = await client.bundles(new URLSearchParams({ limit: '100' }));
-  assert.equal(result.bundles[0].latest_run_id, bundle.latest_run_id);
-  assert.equal(result.bundles[0].occurrence_count, 2);
-
-  const rejecting = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    fetch: (async () =>
-      json({
-        bundles: [{ ...bundle, raw_report: 'must not pass' }],
-        next_cursor: null,
-      })) as typeof fetch,
-  });
-  await assert.rejects(() =>
-    rejecting.bundles(new URLSearchParams({ limit: '100' })),
-  );
-});
-
-test('bounds timeout, response bytes, content type, and upstream status', async () => {
-  const timedOut = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
+test('browser transport bounds timeout and response bytes', async () => {
+  const timedOut = new UniverseClient({
+    baseUrl: 'https://universe.example',
     timeoutMs: 5,
     fetch: ((_input, init) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () =>
-          reject(new DOMException('token must not leak', 'AbortError')),
+          reject(new DOMException('aborted', 'AbortError')),
         );
       })) as typeof fetch,
   });
-  const timeout = await timedOut
-    .status(new URLSearchParams())
-    .catch((error) => error);
-  assert.deepEqual(universePublicFailure(timeout), {
-    status: 504,
-    body: { error: 'Event Universe unavailable' },
-  });
-
-  const oversize = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    maxResponseBytes: 10,
-    fetch: (async () =>
-      json({ secret: 'upstream-body-must-not-leak' })) as typeof fetch,
-  });
-  const tooLarge = await oversize
-    .status(new URLSearchParams())
-    .catch((error) => error);
-  assert.deepEqual(universePublicFailure(tooLarge), {
-    status: 502,
-    body: { error: 'Event Universe unavailable' },
-  });
-
+  await assert.rejects(
+    () => timedOut.get('/v1/targeter/status', (value) => value),
+    (error: unknown) =>
+      error instanceof UniverseApiError && error.kind === 'timeout',
+  );
   for (const response of [
-    new Response('not json', {
-      status: 200,
-      headers: { 'content-type': 'text/plain' },
-    }),
-    json({ error: 'private upstream failure' }, { status: 500 }),
+    json({}, { headers: { 'content-length': '1750001' } }),
+    json({ oversized: 'x'.repeat(1_750_000) }),
   ]) {
-    const failed = new EventUniverseClient({
-      baseUrl: 'https://universe.internal',
+    const api = new UniverseClient({
+      baseUrl: 'https://universe.example',
       fetch: (async () => response) as typeof fetch,
     });
-    const error = await failed
-      .status(new URLSearchParams())
-      .catch((reason) => reason);
-    assert.deepEqual(universePublicFailure(error).body, {
-      error: 'Event Universe unavailable',
-    });
+    await assert.rejects(
+      () => api.get('/v1/targeter/status', (value) => value),
+      (error: unknown) =>
+        error instanceof UniverseApiError && error.kind === 'contract',
+    );
   }
 });
 
@@ -694,160 +451,27 @@ test('view models preserve cursor filters and explain lifecycle without ended_at
   );
 });
 
-test('status proxy allows only a bounded limit and validates selection detail', async () => {
+test('browser selection reads preserve dense contexts and nullable fields', async () => {
+  const valid = detail({ game: null, topology: null });
+  valid.context.game = null;
+  valid.context.topology = null;
+  valid.context.relationships = Array.from({ length: 3240 }, () => ({
+    ...valid.context.relationships[0],
+  }));
   let requested = '';
-  let fetches = 0;
-  const client = new EventUniverseClient({
-    baseUrl: 'https://universe.internal/base',
+  const api = new UniverseClient({
+    baseUrl: 'https://universe.example/base',
     fetch: (async (input) => {
-      fetches++;
       requested = String(input);
-      return json(
-        requested.includes('/v1/targeter/runs/')
-          ? normalizedRun()
-          : requested.includes('/v1/events/')
-            ? normalizedEvent()
-            : status(),
-      );
+      return json(valid);
     }) as typeof fetch,
   });
-  const result = await client.status(new URLSearchParams({ limit: '5' }));
+  const result = await api.selection(valid.run_id, valid.bundle_id);
   assert.equal(
-    requested,
-    'https://universe.internal/base/v1/targeter/status?limit=5',
+    new URL(requested).pathname,
+    `/base/v1/runs/${valid.run_id}/selections/bundle%20alpha`,
   );
-  assert.equal(result.current_complete_summary.selected_bundles, 1);
-  assert.equal(result.current_complete_summary.selected_targets, 2);
-  assert.equal(result.latest_run?.input_complete, true);
-  assert.equal(result.freshness.state, 'current');
-
-  for (const query of [
-    'limit=6',
-    'limit=5&limit=4',
-    'cursor=forbidden',
-    'limit=0',
-  ]) {
-    assert.throws(() => client.status(new URLSearchParams(query)));
-  }
-  assert.equal(fetches, 1);
-
-  const detail = await client.targeterRun(run().run_id);
-  assert.equal(
-    requested,
-    `https://universe.internal/base/v1/targeter/runs/${run().run_id}`,
-  );
-  assert.equal(detail.decisions[0].bundle_id, 'bundle alpha');
-  assert.equal(detail.selected_markets[0].event_id, 'event-alpha');
-
-  const event = await client.event('event-alpha');
-  assert.equal(event.event.participants.join(' vs '), 'Alpha vs Beta');
-  assert.equal(event.markets[0].market_id, 'market-alpha');
-});
-
-test('same-origin proxy dispatches every normalized collection and detail route', async () => {
-  const requested: string[] = [];
-  const upstreamFetch = (async (input) => {
-    const url = new URL(String(input));
-    requested.push(`${url.pathname}${url.search}`);
-    if (url.pathname.endsWith('/v1/events'))
-      return json({
-        events: [
-          {
-            ...normalizedEventSummary(),
-            venue_count: 1,
-            market_count: 1,
-            selected_run_count: 1,
-          },
-        ],
-        next_cursor: 'opaque-events-cursor',
-      });
-    if (url.pathname.endsWith('/v1/events/event-alpha'))
-      return json(normalizedEvent());
-    if (url.pathname.endsWith('/v1/relationship-types'))
-      return json(relationshipTypes());
-    if (url.pathname.endsWith('/v1/markets/market-alpha'))
-      return json(normalizedMarket());
-    if (url.pathname.endsWith(`/v1/claims/${sha}`))
-      return json(normalizedClaim());
-    throw new Error(`unexpected route ${url.pathname}`);
-  }) as typeof fetch;
-  const environment = {
-    UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
-    UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
-  };
-
-  for (const route of [
-    '/v1/events?limit=25&cursor=opaque-events-cursor',
-    '/v1/relationship-types',
-    '/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
-    `/v1/claims/${sha}`,
-  ]) {
-    const [path, query = ''] = route.split('?');
-    const response = await handleEventUniverseProxy(
-      new Request(
-        `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(path)}${query ? `&${query}` : ''}`,
-      ),
-      environment,
-      upstreamFetch,
-    );
-    assert.equal(response.status, 200, route);
-    if (route === `/v1/claims/${sha}`)
-      assert.equal(
-        response.headers.get('cache-control'),
-        'private, max-age=300',
-      );
-  }
-  assert.deepEqual(requested, [
-    '/base/v1/events?limit=25&cursor=opaque-events-cursor',
-    '/base/v1/relationship-types',
-    '/base/v1/markets/market-alpha?market_template_version=1&outcome_space_version=1',
-    `/base/v1/claims/${sha}`,
-  ]);
-
-  for (const route of [
-    '/v1/events?limit=101',
-    '/v1/relationship-types?cursor=nope',
-    '/v1/markets/market-alpha?market_template_version=0',
-    '/v1/claims/0',
-  ]) {
-    const [path, query = ''] = route.split('?');
-    const response = await handleEventUniverseProxy(
-      new Request(
-        `https://ui.example/api/event-universe-proxy?__universe_path=${encodeURIComponent(path)}${query ? `&${query}` : ''}`,
-      ),
-      environment,
-      upstreamFetch,
-    );
-    assert.equal(response.status, 400, route);
-  }
-  assert.equal(requested.length, 4);
-
-  const eventDetail = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/events/event-alpha',
-    ),
-    environment,
-    upstreamFetch,
-  );
-  assert.equal(eventDetail.status, 200);
-  assert.equal(eventDetail.headers.get('cache-control'), 'no-store');
-});
-
-test('claim markets accept an empty claim key but reject schema drift', async () => {
-  const valid = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedClaimMarkets())) as typeof fetch,
-  });
-  assert.equal(
-    (await valid.claimMarkets(sha, new URLSearchParams())).markets[0].claim_key,
-    '',
-  );
-
-  const invalid = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    fetch: (async () => json(normalizedClaimMarkets(null))) as typeof fetch,
-  });
-  await assert.rejects(() => invalid.claimMarkets(sha, new URLSearchParams()));
+  assert.deepEqual(result, valid);
 });
 
 test('run summaries avoid event-detail fan-out and render in bounded pages', async () => {
@@ -901,49 +525,6 @@ test('run summaries avoid event-detail fan-out and render in bounded pages', asy
   assert.equal(last.items.length, 100);
   assert.deepEqual(last.items.slice(-2), [998, 999]);
   assert.equal(last.pageCount, 10);
-  assert.throws(() =>
-    validateTargeterRun({
-      ...normalizedRun(),
-      events: Array.from({ length: 1001 }, (_, index) => ({
-        ...normalizedEventSummary(),
-        event_id: `event-${index}`,
-      })),
-    }),
-  );
-  for (const field of ['bundles', 'selections', 'runs']) {
-    const payload =
-      field === 'bundles'
-        ? {
-            bundles: Array(101).fill((normalizedRun() as any).run),
-            next_cursor: null,
-          }
-        : field === 'selections'
-          ? {
-              selections: Array(101).fill(detail()),
-              sort: 'selected',
-              next_cursor: null,
-            }
-          : {
-              runs: Array(101).fill((normalizedRun() as any).run),
-              next_cursor: null,
-            };
-    await assert.rejects(
-      field === 'bundles'
-        ? new EventUniverseClient({
-            baseUrl: 'https://x',
-            fetch: (async () => json(payload)) as typeof fetch,
-          }).bundles(new URLSearchParams())
-        : field === 'selections'
-          ? new EventUniverseClient({
-              baseUrl: 'https://x',
-              fetch: (async () => json(payload)) as typeof fetch,
-            }).selections(new URLSearchParams())
-          : new EventUniverseClient({
-              baseUrl: 'https://x',
-              fetch: (async () => json(payload)) as typeof fetch,
-            }).runs(new URLSearchParams()),
-    );
-  }
 });
 
 test('query keys are stable, typed by endpoint, and independent', () => {
@@ -1138,156 +719,8 @@ test('bundle infinite query preserves opaque cursors and bounds retained pages',
   }
 });
 
-test('Express status proxy rejects non-GET refreshes before upstream access', async () => {
-  let fetches = 0;
-  const client = new EventUniverseClient({
-    baseUrl: 'https://universe.internal',
-    fetch: (async () => {
-      fetches++;
-      return json(status());
-    }) as typeof fetch,
-  });
-  const app = express();
-  app.use('/api/event-universe', createEventUniverseRouter(client));
-  const server = app.listen(0, '127.0.0.1');
-  await new Promise<void>((resolve, reject) => {
-    server.once('listening', resolve);
-    server.once('error', reject);
-  });
-  try {
-    const port = (server.address() as AddressInfo).port;
-    const response = await fetch(
-      `http://127.0.0.1:${port}/api/event-universe/v1/targeter/status?limit=5`,
-      { method: 'POST' },
-    );
-    assert.equal(response.status, 405);
-    assert.deepEqual(await response.json(), { error: 'Method not allowed' });
-    assert.equal(fetches, 0);
-
-    const detailClient = new EventUniverseClient({
-      baseUrl: 'https://universe.internal',
-      fetch: (async () => json(normalizedEvent())) as typeof fetch,
-    });
-    const detailApp = express();
-    detailApp.use(
-      '/api/event-universe',
-      createEventUniverseRouter(detailClient),
-    );
-    const detailServer = detailApp.listen(0, '127.0.0.1');
-    await new Promise<void>((resolve, reject) => {
-      detailServer.once('listening', resolve);
-      detailServer.once('error', reject);
-    });
-    try {
-      const detailPort = (detailServer.address() as AddressInfo).port;
-      const detailResponse = await fetch(
-        `http://127.0.0.1:${detailPort}/api/event-universe/v1/events/event-alpha`,
-      );
-      assert.equal(detailResponse.status, 200);
-      assert.equal(detailResponse.headers.get('cache-control'), 'no-store');
-    } finally {
-      await new Promise<void>((resolve, reject) =>
-        detailServer.close((error) => (error ? reject(error) : resolve())),
-      );
-    }
-  } finally {
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
-  }
-});
-
-test('Vercel proxy hydrates Universe only through server-side configuration', async () => {
-  let upstreamUrl = '';
-  let upstreamAuthorization = '';
-  let upstreamFetches = 0;
-  const upstreamFetch = (async (input, init) => {
-    upstreamFetches++;
-    upstreamUrl = String(input);
-    upstreamAuthorization =
-      new Headers(init?.headers).get('authorization') ?? '';
-    return json({ selections: [], sort: 'selected', next_cursor: null });
-  }) as typeof fetch;
-  const response = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
-    ),
-    {
-      UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
-      UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
-    },
-    upstreamFetch,
-  );
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    selections: [],
-    sort: 'selected',
-    next_cursor: null,
-  });
-  assert.equal(
-    upstreamUrl,
-    'https://universe.internal/base/v1/selections?sort=selected&limit=25',
-  );
-  assert.equal(upstreamAuthorization, 'Bearer server-only');
-  assert.equal(response.headers.get('cache-control'), 'private, max-age=300');
-
-  const cachedResponse = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/selections&sort=selected&limit=25',
-    ),
-    {
-      UNIVERSE_API_BASE_URL: 'https://universe.internal/base',
-      UNIVERSE_API_AUTHORIZATION: 'Bearer server-only',
-    },
-    upstreamFetch,
-  );
-  assert.equal(cachedResponse.status, 200);
-  assert.equal(upstreamFetches, 1);
-
-  const statusResponse = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/targeter/status&limit=5',
-    ),
-    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
-    (async (input) => {
-      assert.equal(
-        String(input),
-        'https://universe.internal/v1/targeter/status?limit=5',
-      );
-      return json(status());
-    }) as typeof fetch,
-  );
-  assert.equal(statusResponse.status, 200);
-  assert.equal((await statusResponse.json()).status_projection_version, 1);
-
-  const unconfigured = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/healthz',
-    ),
-    {},
-    (async () => {
-      throw new Error('must not fetch');
-    }) as typeof fetch,
-  );
-  assert.equal(unconfigured.status, 503);
-
-  const forbidden = await handleEventUniverseProxy(
-    new Request(
-      'https://ui.example/api/event-universe-proxy?__universe_path=/v1/segments',
-    ),
-    { UNIVERSE_API_BASE_URL: 'https://universe.internal' },
-    (async () => {
-      throw new Error('must not fetch');
-    }) as typeof fetch,
-  );
-  assert.equal(forbidden.status, 404);
-  assert.deepEqual(await forbidden.json(), {
-    error: 'Event Universe route not found',
-  });
-});
-
-test('live routes use the Universe proxy without cadence or archive dependencies', async () => {
-  const [client, apiClient, queryClient, server, proxy, packageDocument] =
+test('live routes use the browser API client and the server serves static files', async () => {
+  const [client, apiClient, queryClient, server, packageDocument] =
     await Promise.all([
       readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
       readFile(
@@ -1299,10 +732,6 @@ test('live routes use the Universe proxy without cadence or archive dependencies
         'utf8',
       ),
       readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
-      readFile(
-        new URL('../src/server/event-universe.ts', import.meta.url),
-        'utf8',
-      ),
       readFile(new URL('../package.json', import.meta.url), 'utf8'),
     ]);
   assert.match(client, /QueryClientProvider client={queryClient}/);
@@ -1311,7 +740,11 @@ test('live routes use the Universe proxy without cadence or archive dependencies
   assert.match(client, /path="\/"[\s\S]*<TargetsPage/);
   assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
   assert.doesNotMatch(client, /StatusPage|>Status</);
-  assert.doesNotMatch(proxy, /validateCadence|UniverseCadence|CADENCE_QUERY/);
+  assert.match(server, /express\.static\(web\)/);
+  assert.doesNotMatch(
+    server,
+    /EventUniverseClient|createEventUniverseRouter|api\/event-universe/,
+  );
   assert.match(apiClient, /UniverseClient/);
   for (const removed of [
     '/api/refresh',

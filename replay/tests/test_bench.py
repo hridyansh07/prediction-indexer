@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from replay.bench.__main__ import main as bench_main
 from replay.bench.common import read_json, write_json
 from replay.bench.compare import compare_contexts, compare_runs
 from replay.bench.docker import DockerError, git_source, run_bench
@@ -62,8 +63,9 @@ def resolved(spec):
 
 
 class FakeDocker:
-    def __init__(self, *, fail=None, interrupt=False, collision=False, network_collision=False):
+    def __init__(self, *, fail=None, interrupt=False, collision=False, network_collision=False, interrupt_on=None):
         self.calls = []
+        self.interrupt_on = interrupt_on   # raise KeyboardInterrupt once, on the first call whose verb matches
         self.fail, self.interrupt, self.collision = fail, interrupt, collision
         self.network_collision = network_collision
         self.objects = {}
@@ -71,6 +73,9 @@ class FakeDocker:
 
     def run(self, args, *, timeout=None, log=None):
         self.calls.append((list(args), log))
+        if self.interrupt_on is not None and args[0] == self.interrupt_on:
+            self.interrupt_on = None
+            raise KeyboardInterrupt()
         if log is not None:
             Path(log).write_text('synthetic Docker log\n')
         if args[0] == 'build':
@@ -224,15 +229,53 @@ class BenchTests(unittest.TestCase):
             self.assertFalse(any(args[:2] in (['image', 'rm'], ['builder', 'prune']) for args, _ in fake.calls))
         self.assertEqual(len(set(names)), 4)
 
-    def test_cleanup_failure_interrupt_keeps_evidence(self):
-        for label, fake in [('failure', FakeDocker(fail='runner')), ('interrupt', FakeDocker(interrupt=True))]:
+    def test_fee_crosscheck_forwarding_is_literal_and_opt_in(self):
+        for index, value in enumerate((None, '', '0', 'true', '1 ', '1')):
+            fake = FakeDocker()
+            with patch.dict(os.environ, {}, clear=True):
+                if value is not None:
+                    os.environ['REPLAY_FEE_CROSSCHECK'] = value
+                self.assertEqual(self._docker(self.root / ('crosscheck' + str(index)), fake), 0)
+            runner = next(args for args, _ in fake.calls if args[0] == 'create'
+                          and args[args.index('--name') + 1].endswith('-runner'))
+            env = [runner[i + 1] for i, arg in enumerate(runner) if arg == '--env']
+            self.assertEqual(env, ['REPLAY_PARTICIPANT_DIAGNOSTICS=1']
+                             + (['REPLAY_FEE_CROSSCHECK=1'] if value == '1' else []))
+
+    def _assert_evidence(self, output, fake):
+        self.assertEqual(fake.objects, {})
+        self.assertEqual(read_json(output / 'result.json')['status'], 'FAILED')
+        self.assertTrue((output / 'logs/runner.log').exists())
+        self.assertTrue((output / 'logs/redis.log').exists())
+        self.assertTrue((output / 'orchestration.json').exists())
+        self.assertFalse(any('--volumes' in args or '-v' in args for args, _ in fake.calls))
+
+    def test_cleanup_failure_keeps_evidence(self):
+        output, fake = self.root / 'failure', FakeDocker(fail='runner')
+        self.assertEqual(self._docker(output, fake), 3)
+        self._assert_evidence(output, fake)
+
+    def test_interrupt_cleans_up_keeps_evidence_then_reraises(self):
+        # An interrupt must stop the caller (the corpus runner), not look like an ordinary exit 3.
+        for label, fake in [('create', FakeDocker(interrupt=True)), ('wait', FakeDocker(interrupt_on='wait'))]:
             output = self.root / label
-            self.assertEqual(self._docker(output, fake), 3)
-            self.assertEqual(fake.objects, {})
-            self.assertEqual(read_json(output / 'result.json')['status'], 'FAILED')
-            self.assertTrue((output / 'logs/runner.log').exists())
-            self.assertTrue((output / 'logs/redis.log').exists())
-            self.assertFalse(any('--volumes' in args or '-v' in args for args, _ in fake.calls))
+            with self.assertRaises(KeyboardInterrupt):
+                self._docker(output, fake)
+            self._assert_evidence(output, fake)
+            self.assertEqual(read_json(output / 'orchestration.json')['exit_code'], 3)
+
+    def test_interrupt_during_a_cleanup_step_finishes_cleanup_then_reraises(self):
+        output, fake = self.root / 'cleanup', FakeDocker(interrupt_on='logs')
+        with self.assertRaises(KeyboardInterrupt):
+            self._docker(output, fake)
+        self.assertEqual(fake.objects, {})
+        self.assertTrue((output / 'orchestration.json').exists())
+        self.assertTrue((output / 'logs/redis.log').exists() or (output / 'logs/runner.log').exists())
+        self.assertFalse(any('--volumes' in args for args, _ in fake.calls))
+
+    def test_cli_returns_3_on_interrupt(self):
+        with patch('replay.bench.__main__.run_bench', side_effect=KeyboardInterrupt):
+            self.assertEqual(bench_main(['run', str(self.spec_path), str(self.root / 'cli')]), 3)
 
     def test_create_collision_does_not_remove_unowned_container(self):
         fake = FakeDocker(collision=True)

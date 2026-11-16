@@ -13,7 +13,7 @@ from replay.streams.protocol import require
 
 class Entity:
     __slots__ = ("id", "descriptor", "legs", "order", "admission", "admission_reasons",
-                 "cls", "control", "shift", "basket")
+                 "cls", "control", "shift", "basket", "metadata", "delay_index")
 
     def __init__(self, descriptor, legs, order, admission, admission_reasons, cls,
                  control, shift, basket):
@@ -21,6 +21,10 @@ class Entity:
         self.descriptor, self.legs, self.order = descriptor, legs, order
         self.admission, self.admission_reasons = admission, admission_reasons
         self.cls, self.control, self.shift, self.basket = cls, control, shift, basket
+        # Strategy-owned constants follow this resolved entity, not its original
+        # basket (a cyclic control may have substituted a leg). No global cache.
+        self.metadata = None
+        self.delay_index = None
 
 
 def scale_admission(legs, plans, *, native_scales=False):

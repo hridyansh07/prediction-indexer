@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from archive.common.durable import fsync_directory as _fsync_directory
 from archive.storage.base import (
     JSON_CONTENT_TYPE,
     NDJSON_CONTENT_TYPE,
@@ -346,14 +347,6 @@ class _LineSink:
     def finish(self) -> None:
         if self.current:
             raise CanonicalRestoreError("canonical NDJSON ends without LF")
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _restore_frame(store: ObjectStore, frame: CanonicalFrame, directory: Path) -> None:

@@ -20,7 +20,7 @@ pub use error::DomainError;
 pub use fault::{FaultImpact, NormalizationFault};
 pub use identity::{InstrumentId, LaneId};
 pub use provenance::{CanonicalProvenance, ContinuityVerdict, EventAddress, EventHeader};
-pub use record::{SegmentEvent, SegmentRecord};
+pub use record::{RawSegmentRecord, SegmentEvent, SegmentRecord};
 pub use time::{EventKind, Resolution, VenueTime};
 pub use trade::TradeEvent;
 

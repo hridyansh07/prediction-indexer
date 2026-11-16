@@ -237,6 +237,7 @@ impl FinishedRisk {
 pub struct RiskEngine {
     walker: DerivativeWalker,
     plans: BTreeMap<BookKey, BookPlan>,
+    lane_keys: BTreeMap<LaneId, Vec<BookKey>>,
     books: BTreeMap<BookKey, Arc<BookView>>,
     epochs: BTreeMap<LaneId, String>,
     blocked: BTreeMap<LaneId, Reason>,
@@ -315,9 +316,19 @@ impl RiskEngine {
                 )
             })
             .collect();
+        // One key per plan, in BookKey order; lane/key text is bounded by the
+        // existing max_books and max_plan_bytes reservations, not tape length.
+        let mut lane_keys = BTreeMap::<LaneId, Vec<BookKey>>::new();
+        for (key, plan) in &map {
+            lane_keys
+                .entry(plan.lane.clone())
+                .or_default()
+                .push(key.clone());
+        }
         Ok(Self {
             walker,
             plans: map,
+            lane_keys,
             books,
             epochs: BTreeMap::new(),
             blocked: BTreeMap::new(),
@@ -419,23 +430,25 @@ impl RiskEngine {
             let h = delivery.header();
             let lane = h.address().lane();
             let duplicate = h.provenance().continuity() == ContinuityVerdict::Duplicate;
-            let relevant: Vec<_> = self
-                .plans
-                .iter()
-                .filter(|(_, p)| &p.lane == lane)
-                .map(|(k, _)| k.clone())
-                .collect();
+            let relevant = self.lane_keys.get(lane).map(Vec::as_slice).unwrap_or(&[]);
             let epoch = delivery.connection_epoch().ok_or("missing source epoch")?;
             if !duplicate && !relevant.is_empty() {
-                if self
-                    .epochs
-                    .insert(lane.clone(), epoch.into())
-                    .is_some_and(|old| old != epoch)
-                {
+                let changed = match self.epochs.get_mut(lane) {
+                    Some(old) if old != epoch => {
+                        *old = epoch.into();
+                        true
+                    }
+                    Some(_) => false,
+                    None => {
+                        self.epochs.insert(lane.clone(), epoch.into());
+                        false
+                    }
+                };
+                if changed {
                     invalidate(
                         &mut staged,
                         &self.books,
-                        &relevant,
+                        relevant,
                         Reason::EpochChanged,
                         false,
                     );
@@ -456,7 +469,7 @@ impl RiskEngine {
                     invalidate(
                         &mut staged,
                         &self.books,
-                        &relevant,
+                        relevant,
                         Reason::Continuity(h.provenance().continuity()),
                         true,
                     );
@@ -581,7 +594,7 @@ impl RiskEngine {
                             }
                             ControlEvent::MetadataChanged { .. } => continue,
                         };
-                        invalidate(&mut staged, &self.books, &relevant, reason, latch);
+                        invalidate(&mut staged, &self.books, relevant, reason, latch);
                     }
                     _ => {}
                 }

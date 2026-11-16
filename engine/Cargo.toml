@@ -31,3 +31,7 @@ replay-materialize = { path = "crates/materialize" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
