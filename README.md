@@ -30,7 +30,6 @@ engine/              Rust: Replay domain, venue normalizers, derivatives, risk, 
 replay/              current strategy runtime, SDKs, bench, corpus and jobs
   strategies/        per-strategy code, readers, configs and docs
   corpus/            resumable retired-bundle runs, receipts and deep audits
-  legacy/            original raw-envelope replay and five-gate audits
 analysis/            outcome spaces, masks and claims shared by targeter, universe, replay
 targeter-ui/         web UI for the Universe and Replay
 configs/             Targeter strategy, replay runner, bench and strategy examples

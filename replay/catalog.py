@@ -1,8 +1,7 @@
 """Content-addressed market metadata read through the byte-stream boundary.
 
 Targeter v2 uses this module's target-record projections and fee-evidence
-checks. The legacy gates also use its MetadataCatalogue; both consumers share
-the same captured-record contract, so this module stays outside replay.legacy.
+checks; every consumer shares the same captured-record contract.
 """
 
 from __future__ import annotations
@@ -379,11 +378,11 @@ def _instrument(venue: str, target: dict[str, Any]) -> InstrumentMetadata | None
 def has_fee_terms(record: Any) -> bool:
     """Whether `record` yields fee terms, asked exactly as `_instrument` asks it.
 
-    Gate 1 counts records carrying a fee model, and it used to do so with its own
+    Counting records that carry a fee model used to be done with its own
     predicate — `feeSchedule is not None or feeType is not None`. That disagreed
     with the reader in both directions: it missed `feesEnabled: false`, which is
     a *complete* fee model (no fees) and the one Polymarket publishes most often,
-    and it counted a bare `feeType`, which alone produces nothing. A gate whose
+    and it counted a bare `feeType`, which alone produces nothing. A check whose
     idea of "measurable" differs from the code that measures is reporting on a
     dataset nobody reads.
     """

@@ -15,8 +15,7 @@ Strategy code, configuration examples and strategy specifications live under
 | `bench/`, `jobs/`, `ops/` | Local runs, queued jobs and operational checks |
 | `economic_fills.py`, `economic_intervals.py` | Shared economic fill and interval contracts |
 | `stream.py`, `lanes.py`, `catalog.py` | Byte adapters, lane ranking and target-record projection shared with archive or Targeter |
-| [legacy/](legacy/README.md) | Original five-gate raw-envelope pipeline, frozen policy and audit notes |
-| `tests/` | Tests for both the current runtime and legacy gates |
+| `tests/` | Tests for the current runtime |
 
 Replay accepts only named immutable byte objects through `ByteStreamer`. Storage
 selection is therefore an adapter decision:
@@ -29,11 +28,10 @@ selection is therefore an adapter decision:
 - capture-window Targeter records: `targeter.v2.replay_stream.ArchivedTargetRecordByteStreamer`
 
 `CompositeByteStreamer` snapshots disjoint adapters into one lexically ordered
-dataset and rejects duplicate logical keys. [Legacy Gate 1](legacy/README.md)
-can therefore consume raw segments and decoded `target_records_<venue>.ndjson` together without learning
+dataset and rejects duplicate logical keys. Replay can therefore consume raw segments and decoded `target_records_<venue>.ndjson` together without learning
 about S3, Zstandard, or either receipt protocol.
 
-Replay reconstruction imports no capture, ingester, targeter, or legacy-analysis
+Replay reconstruction imports no capture, ingester, targeter, or analysis
 module. The optional pre-run `replay.preparation` boundary reuses Universe/Targeter
 historical evidence validators and archived streaming adapters; it freezes a
 hash-bound context before runtime. See
@@ -72,10 +70,3 @@ freshly verifies the receipted remote manifest and selected object, fully stages
 and verifies the decoded logical identity, and only then yields bytes.
 
 `replay.economic_sdk.outcomes.outcome_scope` exposes frozen normal-resolution masks, payoffs, implications, and exhaustive complete sets during basket construction; see [OUTCOME_MASKS_V1.md](../docs/OUTCOME_MASKS_V1.md).
-
-## Legacy fixture audits
-
-The original Gate 1–5 pipeline and its trust, economic and execution semantics
-are documented in [legacy/README.md](legacy/README.md). Commands use
-`python -m replay.legacy.gate1` through `python -m replay.legacy.gate5`.
-The legacy package and its frozen policy remain included in the distribution.

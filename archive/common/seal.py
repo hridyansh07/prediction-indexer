@@ -5,7 +5,7 @@ decide whether a segment is committed — `indexer-ingest`, `indexer-finalize`,
 and the archiver — and §6.1 requires this one to enforce the same fields and
 relationships as the Rust crate: filename, lane, window, segment index, lengths,
 ordering flags, delivery bounds, and digest. It deliberately does **not** reuse
-replay's Gate 1 checks, which verify a dataset rather than validate a seal and
+replay's dataset checks, which verify a dataset rather than validate a seal and
 would arrive here as a partial second opinion.
 
 The split between structure and content is load-bearing:
