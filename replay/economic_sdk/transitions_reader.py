@@ -61,11 +61,6 @@ def _signed(value):
     return int(value)
 
 
-def _count(value, name):
-    require(type(value) is int and value >= 0, name)
-    return value
-
-
 def identity_record(value):
     """Closed manifest identity of a stored file: logical and stored sides."""
     require(type(value) is dict and set(value) == {"logical", "stored"}, "closed schema")

@@ -5,12 +5,7 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: [
-      '**/dist/**',
-      '**/dist-server/**',
-      '**/node_modules/**',
-      'encoder/rust/target/**',
-    ],
+    ignores: ['**/dist/**', '**/node_modules/**', 'encoder/rust/target/**'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
@@ -27,8 +22,6 @@ export default tseslint.config(
   {
     files: [
       'api/**/*.ts',
-      'encoder/node/**/*.ts',
-      'targeter-ui/src/server/**/*.ts',
       'targeter-ui/test/**/*.ts',
       'targeter-ui/vite.config.ts',
     ],

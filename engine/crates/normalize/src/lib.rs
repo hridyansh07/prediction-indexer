@@ -366,10 +366,6 @@ impl<'a> CanonicalEnvelope<'a> {
         &self.payload
     }
 
-    pub fn into_payload(self) -> Value {
-        self.payload
-    }
-
     pub fn reject(
         &self,
         parser_version: u32,

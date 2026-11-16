@@ -86,7 +86,13 @@ Resumable corpus runs and deep audits are documented in
 cargo test --manifest-path ingester/Cargo.toml --workspace
 cargo test --manifest-path engine/Cargo.toml --workspace
 cargo test --manifest-path encoder/rust/Cargo.toml
-yarn install && yarn test          # targeter-ui and the Node decoder
+yarn install && yarn test          # targeter-ui
+```
+
+After cloning, enable the repository pre-commit hook (it runs the root lint gate):
+
+```bash
+git config core.hooksPath .githooks
 ```
 
 `scripts/archive_probe.py` archives and decodes real captured bytes and reports

@@ -41,6 +41,3 @@ This leaves original run config bytes, hashes and receipts intact. Completed
 readers accept the corresponding historical factory name while retaining all
 content and SUCCESS checks. New configurations should use the package paths
 above; Python imports should use the new packages or their implementation modules.
-
-`cross_venue_arbitrage/SOURCE.json` is the unchanged historical source attestation.
-Its hashes and paths describe its original revision, before this folder move.

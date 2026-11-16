@@ -719,32 +719,22 @@ test('bundle infinite query preserves opaque cursors and bounds retained pages',
   }
 });
 
-test('live routes use the browser API client and the server serves static files', async () => {
-  const [client, apiClient, queryClient, server, packageDocument] =
-    await Promise.all([
-      readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
-      readFile(
-        new URL('../src/client/universe-api.ts', import.meta.url),
-        'utf8',
-      ),
-      readFile(
-        new URL('../src/client/universe-queries.ts', import.meta.url),
-        'utf8',
-      ),
-      readFile(new URL('../src/server/index.ts', import.meta.url), 'utf8'),
-      readFile(new URL('../package.json', import.meta.url), 'utf8'),
-    ]);
+test('live routes use the browser API client', async () => {
+  const [client, apiClient, queryClient, packageDocument] = await Promise.all([
+    readFile(new URL('../src/client/main.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/client/universe-api.ts', import.meta.url), 'utf8'),
+    readFile(
+      new URL('../src/client/universe-queries.ts', import.meta.url),
+      'utf8',
+    ),
+    readFile(new URL('../package.json', import.meta.url), 'utf8'),
+  ]);
   assert.match(client, /QueryClientProvider client={queryClient}/);
   assert.match(queryClient, /universeGet<UniverseTargeterStatus>/);
   assert.match(queryClient, /\/v1\/targeter\/status\?limit=\$\{limit\}/);
   assert.match(client, /path="\/"[\s\S]*<TargetsPage/);
   assert.match(client, /path="\/targets" element={<Navigate to="\/" replace/);
   assert.doesNotMatch(client, /StatusPage|>Status</);
-  assert.match(server, /express\.static\(web\)/);
-  assert.doesNotMatch(
-    server,
-    /EventUniverseClient|createEventUniverseRouter|api\/event-universe/,
-  );
   assert.match(apiClient, /UniverseClient/);
   for (const removed of [
     '/api/refresh',
@@ -754,7 +744,7 @@ test('live routes use the browser API client and the server serves static files'
     'S3ReadOnlyObjectStore',
     'SnapshotService',
   ]) {
-    assert.doesNotMatch(`${client}\n${server}`, new RegExp(removed));
+    assert.doesNotMatch(client, new RegExp(removed));
   }
   const dependencies = JSON.parse(packageDocument).dependencies;
   assert.equal(

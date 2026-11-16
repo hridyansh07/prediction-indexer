@@ -2,7 +2,7 @@
 
 The public Kalshi adapter owns pulls, immutable raw responses and offline
 timeline derivation. It imports archive/encoder, not Universe implementation
-or Replay. `python -m gamestate.run_pull` retains the explicit-bundle CLI.
+or Replay.
 
 `gamestate.prepared` projects verified Kalshi timelines and receipted raw labels
 into generic segments for runner-side preparation. `gamestate.timeline.read_fetch`

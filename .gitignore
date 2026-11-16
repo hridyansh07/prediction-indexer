@@ -31,17 +31,8 @@ data/live/
 
 # Node workspace build/dependencies
 node_modules/
-archive/node/node_modules/
-archive/node/dist/
-encoder/node/node_modules/
-encoder/node/dist/
 targeter-ui/node_modules/
 targeter-ui/dist/
-targeter-ui/dist-server/
-
-# Orb service runtime state
-.amp/portals/
-.amp/runtime/
 
 # Local replay benchmark workspace (downloaded windows, rebuilt derivatives, run outputs)
 .bench/

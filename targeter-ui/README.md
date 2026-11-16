@@ -98,17 +98,16 @@ keep them exactly aligned with Universe when either deployment changes. No AWS,
 S3, OIDC, archive-prefix, staging, decoder, or private-key variables belong in
 Vercel.
 
-## Local and orb operation
+## Local operation
 
 ```sh
 yarn install --frozen-lockfile
-yarn workspace prediction-indexer-targeter-ui build
-yarn workspace prediction-indexer-targeter-ui start
+yarn workspace prediction-indexer-targeter-ui dev
 ```
 
-The optional Express server serves only `dist/` and `/healthz` on `PORT`; API
-traffic still goes directly from the browser to Universe.
+`dev` runs the Vite dev server; API traffic goes directly from the browser to
+Universe.
 
 From the repository root, use `yarn lint`, `yarn typecheck`, `yarn test`, and
-`yarn build`. Repository setup configures `.githooks/pre-commit`; it runs the
+`yarn build`. The `.githooks/pre-commit` hook (see the root README) runs the
 root lint gate before each commit.

@@ -273,13 +273,6 @@ class EventUniverseDeploymentTests(unittest.TestCase):
         ):
             self.assertIn(contract, section)
 
-    def test_orb_setup_creates_and_installs_the_project_virtual_environment(
-        self,
-    ) -> None:
-        setup = (ROOT / ".agents" / "setup").read_text(encoding="utf-8")
-        self.assertIn('python3 -m venv "$REPO_ROOT/.venv"', setup)
-        self.assertIn('"$REPO_ROOT/.venv/bin/python" -m pip install -e', setup)
-
 
 class ReplayProductionDeploymentTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -7,8 +7,7 @@ values require the configured parity research scenario.
 Read `contract.py` for mask routes and configuration, `strategy.py` for
 pricing and fills, and `output.py` for the independent native-cashflow
 reader. Multi-market and implication strategies reuse its all-BUY fee
-accounting and reader hooks. The unchanged [SOURCE.json](SOURCE.json)
-attests the historical implementation revision, before this reorganization.
+accounting and reader hooks.
 
 Factory: `replay.strategies.cross_venue_arbitrage:build`.
 Completed bench reader: `replay.strategies.cross_venue_arbitrage:read_completed`.
