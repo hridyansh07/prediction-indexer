@@ -90,6 +90,12 @@ cargo test --manifest-path encoder/rust/Cargo.toml
 yarn install && yarn test          # targeter-ui
 ```
 
+After cloning, enable the repository pre-commit hook (it runs the root lint gate):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 `scripts/archive_probe.py` archives and decodes real captured bytes and reports
 the compression ratio and decode ceiling.
 
