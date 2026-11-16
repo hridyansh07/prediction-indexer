@@ -10,15 +10,6 @@ import {
 } from 'react-router-dom';
 import { EventUniversePage } from './event-universe';
 import { DecisionsPage, TargetsPage } from './observability';
-import {
-  AccountMenu,
-  NewReplayPage,
-  ReplayAdminPage,
-  ReplayJobPage,
-  ReplayJobsPage,
-  ReplayOutputPage,
-} from './replay';
-import { UniverseAuthProvider } from './universe-auth';
 import { createUniverseQueryClient } from './universe-queries';
 import './style.css';
 
@@ -44,9 +35,7 @@ function App() {
           </NavLink>
           <NavLink to="/history">History</NavLink>
           <NavLink to="/decisions">Decisions</NavLink>
-          <NavLink to="/replay">Replay</NavLink>
         </nav>
-        <AccountMenu />
       </header>
       <main>
         <Routes>
@@ -54,14 +43,6 @@ function App() {
           <Route path="/targets" element={<Navigate to="/" replace />} />
           <Route path="/history" element={<EventUniversePage />} />
           <Route path="/decisions" element={<DecisionsPage />} />
-          <Route path="/replay" element={<ReplayJobsPage />} />
-          <Route path="/replay/new" element={<NewReplayPage />} />
-          <Route path="/replay/admin" element={<ReplayAdminPage />} />
-          <Route path="/replay/jobs/:jobId" element={<ReplayJobPage />} />
-          <Route
-            path="/replay/jobs/:jobId/output"
-            element={<ReplayOutputPage />}
-          />
           <Route path="/operations" element={<Navigate to="/" replace />} />
           <Route
             path="/operations/selections"
@@ -86,11 +67,9 @@ function App() {
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <UniverseAuthProvider>
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
-      </UniverseAuthProvider>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
     </QueryClientProvider>
   </React.StrictMode>,
 );

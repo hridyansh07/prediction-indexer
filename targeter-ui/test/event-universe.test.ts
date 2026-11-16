@@ -780,12 +780,6 @@ test('Vercel builds only the client with no API proxy', async () => {
   assert.equal(config.outputDirectory, 'targeter-ui/dist');
   assert.deepEqual(config.env, {
     VITE_UNIVERSE_API_BASE_URL: 'https://34-182-18-247.sslip.io',
-    VITE_REPLAY_SIWE_DOMAIN: 'prediction-indexer-targeter-ui-b8xg.vercel.app',
-    VITE_REPLAY_SIWE_URI:
-      'https://prediction-indexer-targeter-ui-b8xg.vercel.app/',
-    VITE_REPLAY_SIWE_STATEMENT: 'Sign in to Prediction Indexer.',
-    VITE_REPLAY_SIWE_CHAIN_ID: '1',
-    VITE_REPLAY_FIXTURES: 'false',
   });
   assert.deepEqual(config.rewrites, [
     { source: '/(.*)', destination: '/index.html' },
