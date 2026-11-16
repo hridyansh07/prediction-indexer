@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "catalogue.schema.json",
+  "title": "Targeter v2 venue catalogue",
+  "description": "Static venue-catalogue mapping shipped inside the Targeter image (targeter/v2/catalogue.json). It says how venues name sports, games and market classes; it never says what to select. It changes only when a venue's data format or product set changes, or a game is added. targeter/v2/registry.py load_catalogue is the authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "sports",
+    "polymarket_tags",
+    "market_classes"
+  ],
+  "properties": {
+    "version": {
+      "description": "Recorded in every selection report as catalogue_version, next to catalogue_sha256.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "note": {
+      "type": "string"
+    },
+    "sports": {
+      "description": "Sports a strategy file may name.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "polymarket_tags": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "limitless_category_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "participant_aliases": {
+      "description": "Preferred team identity -> reviewed aliases. Never event-specific fixtures.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "known_rule_templates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "market_classes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/market_class"
+      }
+    },
+    "game_families": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/game_family"
+      }
+    }
+  },
+  "$defs": {
+    "venue": {
+      "enum": [
+        "kalshi",
+        "polymarket",
+        "limitless"
+      ]
+    },
+    "market_class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sport",
+        "market_type",
+        "scope",
+        "venue_patterns"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sport": {
+          "description": "One of the catalogue sports.",
+          "type": "string"
+        },
+        "market_type": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "venue_patterns": {
+          "description": "venue -> vendor field -> regular expressions (case-insensitive search). May be empty only for esports classes mapped by game_families.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/venue"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "game_family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sport",
+        "topology",
+        "polymarket_game_tags",
+        "venue_game_aliases",
+        "venue_products"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+        },
+        "sport": {
+          "const": "esports"
+        },
+        "topology": {
+          "const": "best_of_series"
+        },
+        "polymarket_game_tags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          }
+        },
+        "venue_game_aliases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kalshi",
+            "polymarket",
+            "limitless"
+          ],
+          "properties": {
+            "kalshi": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "polymarket": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "limitless": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "venue_products": {
+          "description": "venue -> product mappings onto canonical classes. Every venue must be named (an empty array disables it); at least one venue must be non-empty.",
+          "type": "object",
+          "required": [
+            "kalshi",
+            "polymarket",
+            "limitless"
+          ],
+          "propertyNames": {
+            "$ref": "#/$defs/venue"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/product_mapping"
+            }
+          }
+        }
+      }
+    },
+    "product_mapping": {
+      "description": "Exactly one of values or patterns. Polymarket patterns must be anchored with ^ and $.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "canonical_class"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "values"
+          ]
+        },
+        {
+          "required": [
+            "patterns"
+          ]
+        }
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "patterns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "canonical_class": {
+          "description": "A market_classes id.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}
