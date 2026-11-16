@@ -1,8 +1,6 @@
 import hashlib
 import json
-import sqlite3
 import unittest
-from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -18,7 +16,6 @@ ADDRESS = "0x" + "ab" * 20
 SECOND = 1_000_000_000
 HOUR = 3600 * SECOND
 HALF = HOUR // 2
-ORCH = c.Orchestration(max_stage_attempts=3, max_job_seconds=1000, retry_backoff_seconds=60)
 
 
 def raw(value):
@@ -92,17 +89,6 @@ def bundle_receipt(**changes):
     }
     value.update(changes)
     return c.BundleReceipt(**value)
-
-
-def queued(now=10 * SECOND):
-    return c.new_job(JOB, submitted_by=ADDRESS, request_sha256="a" * 64, now_ns=now)
-
-
-def running(stage="resolve", now=10 * SECOND):
-    row = c.claim(queued(now), ORCH, now)
-    for next_stage in c.WORK_STAGES[1 : c.WORK_STAGES.index(stage) + 1]:
-        row = c.advance(row, next_stage, now)
-    return row
 
 
 def history(*times):
@@ -258,237 +244,6 @@ class RequestTest(unittest.TestCase):
         parsed = c.parse_request(raw(request()), runner_config())
         with self.assertRaises(TypeError):
             parsed.document["bundle_id"] = "other"
-
-
-class TransitionTest(unittest.TestCase):
-    """Review items 1, 2, 3: every accepted job archives before it is terminal."""
-
-    def test_success_path_archives_before_terminal(self):
-        row = running("read")
-        row = c.succeed(row, 20 * SECOND)
-        self.assertEqual((row.status, row.pending_outcome, row.stage), ("archiving", "succeeded", "archive"))
-        row = c.finish(row, 30 * SECOND, 30 * SECOND)
-        self.assertEqual(row.status, "succeeded")
-        self.assertEqual(row.archive_receipt_key, c.job_receipt_key(JOB))
-
-    def test_every_work_outcome_goes_through_archiving(self):
-        for code, outcome in c.OUTCOME_OF_CODE.items():
-            if code == "cancelled":
-                continue
-            with self.subTest(code):
-                row = c.fail(running("bundle"), code, "detail", 20 * SECOND)
-                self.assertEqual((row.status, row.pending_outcome, row.reason_code), ("archiving", outcome, code))
-                self.assertEqual(c.finish(row, 30 * SECOND, 30 * SECOND).status, outcome)
-
-    def test_cancel_goes_through_archiving(self):
-        row = c.cancel(queued(), 20 * SECOND)
-        self.assertEqual((row.status, row.pending_outcome, row.stage_attempts), ("archiving", "cancelled", 0))
-        self.assertEqual(c.finish(c.claim(row, ORCH, 20 * SECOND), 30 * SECOND, 30 * SECOND).status, "cancelled")
-        with self.assertRaises(c.ContractError):
-            c.cancel(running(), 20 * SECOND)
-
-    def test_terminal_status_cannot_bypass_archiving(self):
-        for status in c.TERMINAL:
-            with self.subTest(status), self.assertRaises(c.ContractError):
-                replace(running(), status=status)
-        with self.assertRaises(c.ContractError):
-            c.finish(running("read"), 1, 1)
-        with self.assertRaises(c.ContractError):
-            c.fail(queued(), "tool_failure", None, 1)
-        with self.assertRaises(c.ContractError):
-            c.fail(running(), "cancelled", None, 1)
-        with self.assertRaises(c.ContractError):
-            c.succeed(running("run"), 1)
-
-    def test_every_terminal_row_requires_archive_receipt(self):
-        done = c.finish(c.succeed(running("read"), 20 * SECOND), 30 * SECOND, 30 * SECOND)
-        for field, value in (("archive_receipt_key", None), ("finished_at_ns", None)):
-            with self.subTest(field), self.assertRaises(c.ContractError):
-                replace(done, **{field: value})
-        with self.assertRaises(c.ContractError):
-            replace(done, archive_receipt_key="replay/jobs/other/job_receipt.json")
-
-    def test_finish_preserves_frozen_receipt_time_during_later_reconciliation(self):
-        row = c.fail(running("run"), "supervisor_failed", "exit 20", 20 * SECOND)
-        done = c.finish(row, 25 * SECOND, 40 * SECOND)
-        self.assertEqual(done.finished_at_ns, 25 * SECOND)
-        self.assertEqual(done.updated_at_ns, 40 * SECOND)
-        for finished, reconciled in (
-            (9 * SECOND, 40 * SECOND),
-            (41 * SECOND, 40 * SECOND),
-        ):
-            with self.subTest(finished=finished), self.assertRaises(c.ContractError):
-                c.finish(row, finished, reconciled)
-
-    def test_pending_outcome_only_while_archiving(self):
-        with self.assertRaises(c.ContractError):
-            replace(running(), pending_outcome="failed")
-        row = c.fail(running(), "tool_failure", None, 20 * SECOND)
-        with self.assertRaises(c.ContractError):
-            replace(row, pending_outcome=None)
-        with self.assertRaises(c.ContractError):
-            replace(row, reason_code="bundle_not_retired")  # outcome mismatch
-
-    def test_stage_advance_is_ordered(self):
-        row = running()
-        with self.assertRaises(c.ContractError):
-            c.advance(row, "prepare", 1)
-        with self.assertRaises(c.ContractError):
-            c.advance(running("read"), "archive", 1)
-
-
-class SchedulingTest(unittest.TestCase):
-    """Review item 2: circuit breaker, backoff, and no starvation."""
-
-    def test_claim_counts_attempt_and_schedules_backoff(self):
-        row = c.claim(queued(), ORCH, 10 * SECOND)
-        self.assertEqual((row.status, row.stage, row.stage_attempts), ("running", "resolve", 1))
-        self.assertEqual(row.next_attempt_at_ns, 70 * SECOND)
-        self.assertFalse(c.claimable(row, 69 * SECOND))
-        self.assertTrue(c.claimable(row, 70 * SECOND))
-        with self.assertRaises(c.ContractError):
-            c.claim(row, ORCH, 69 * SECOND)
-
-    def test_advance_resets_attempts(self):
-        row = c.claim(c.claim(queued(), ORCH, 0), ORCH, 60 * SECOND)
-        self.assertEqual(row.stage_attempts, 2)
-        self.assertEqual(c.advance(row, "bundle", 61 * SECOND).stage_attempts, 1)
-
-    def test_retry_later_requires_retryable_code(self):
-        row = c.retry_later(running(), "universe_unavailable", "503", ORCH, 20 * SECOND)
-        self.assertEqual((row.status, row.reason_code, row.next_attempt_at_ns), ("running", "universe_unavailable", 80 * SECOND))
-        for code in ("tool_failure", "integrity_failure", "cancelled"):
-            with self.subTest(code), self.assertRaises(c.ContractError):
-                c.retry_later(running(), code, None, ORCH, 20 * SECOND)
-
-    def test_archival_retry_preserves_pending_outcome_detail(self):
-        row = c.fail(running("run"), "supervisor_failed", "original detail", 20 * SECOND)
-        retried = c.retry_later(
-            row, "archive_unavailable", "provider diagnostic", ORCH, 30 * SECOND
-        )
-        self.assertEqual(retried.reason_code, "supervisor_failed")
-        self.assertEqual(retried.reason_detail, "original detail")
-        self.assertEqual(retried.next_attempt_at_ns, 90 * SECOND)
-
-    def test_work_stage_exhaustion_moves_to_archived_failure(self):
-        row = running()
-        now = 10 * SECOND
-        while row.status == "running":
-            now += 60 * SECOND
-            row = c.claim(row, ORCH, now)
-        self.assertEqual((row.status, row.pending_outcome, row.reason_code), ("archiving", "failed", "stage_attempts_exhausted"))
-
-    def test_job_deadline(self):
-        row = running()
-        row = c.claim(row, ORCH, 10 * SECOND + 1000 * SECOND)
-        self.assertEqual(row.reason_code, "job_deadline_exceeded")
-        self.assertEqual(row.pending_outcome, "failed")
-
-    def test_archive_exhaustion_blocks_and_resumes_manually(self):
-        row = c.fail(running(), "tool_failure", None, 10 * SECOND)
-        now = 10 * SECOND
-        while row.status == "archiving":
-            now += 60 * SECOND
-            row = c.claim(row, ORCH, now)
-        self.assertEqual((row.status, row.blocked_reason_code, row.pending_outcome), ("archive_blocked", "stage_attempts_exhausted", "failed"))
-        self.assertFalse(c.claimable(row, now + HOUR))
-        resumed = c.resume_blocked(row, now + HOUR)
-        self.assertEqual((resumed.status, resumed.stage_attempts), ("archiving", 0))
-        self.assertTrue(c.claimable(resumed, now + HOUR))
-
-    def test_blocked_or_waiting_jobs_do_not_starve_queued(self):
-        waiting = c.retry_later(running(), "universe_unavailable", None, ORCH, 10 * SECOND)
-        blocked = c.block_archive(c.fail(running(), "tool_failure", None, 10 * SECOND), "archive_unavailable", 10 * SECOND)
-        fresh = replace(queued(20 * SECOND), job_id="20260924T120000Z-fedcba9876543210")
-        self.assertIs(c.select_next([waiting, blocked, fresh], 30 * SECOND), fresh)
-        self.assertIs(c.select_next([waiting, blocked, fresh], 70 * SECOND), waiting)
-        self.assertIsNone(c.select_next([blocked], 70 * SECOND))
-
-    def test_select_next_orders_by_age(self):
-        older = queued(1)
-        newer = replace(queued(2), job_id="20260924T120000Z-fedcba9876543210")
-        self.assertIs(c.select_next([newer, older], 5), older)
-
-
-class LocalStateTest(unittest.TestCase):
-    """Review item 3."""
-
-    def test_running_job_with_lost_state_fails_through_archiving(self):
-        row = c.lose_local_state(running("run"), "job directory missing", 20 * SECOND)
-        self.assertEqual((row.status, row.pending_outcome, row.reason_code), ("archiving", "failed", "local_state_lost"))
-        self.assertEqual(row.job_id, JOB)  # never re-queued under a fresh identity
-
-    def test_archiving_job_with_lost_state_fails(self):
-        row = c.succeed(running("read"), 20 * SECOND)
-        lost = c.lose_local_state(row, None, 30 * SECOND)
-        self.assertEqual((lost.status, lost.pending_outcome, lost.reason_code), ("archiving", "failed", "local_state_lost"))
-
-    def test_lost_state_never_restarts_work(self):
-        row = c.lose_local_state(running("run"), None, 20 * SECOND)
-        with self.assertRaises(c.ContractError):
-            c.advance(row, "read", 30 * SECOND)
-        with self.assertRaises(c.ContractError):
-            c.lose_local_state(queued(), None, 1)
-
-
-class JobsTableTest(unittest.TestCase):
-    """Review items 3, 7: relational constraints mirror JobRow."""
-
-    def insert(self, connection, row):
-        record = row.as_record()
-        record["request_json"] = b"{}"
-        columns = ", ".join(c.JOB_COLUMNS)
-        connection.execute(
-            f"INSERT INTO jobs({columns}) VALUES ({', '.join('?' * len(c.JOB_COLUMNS))})",
-            [record[name] for name in c.JOB_COLUMNS],
-        )
-
-    def rows(self):
-        base = running("read")
-        archiving = c.succeed(base, 20 * SECOND)
-        return {
-            "queued": queued(),
-            "running": base,
-            "retrying": c.retry_later(running(), "archive_unavailable", "s3", ORCH, 20 * SECOND),
-            "archiving": archiving,
-            "blocked": c.block_archive(archiving, "archive_conflict", 30 * SECOND),
-            "succeeded": c.finish(archiving, 40 * SECOND, 40 * SECOND),
-            "failed": c.finish(c.fail(base, "tool_failure", "x", 20 * SECOND), 40 * SECOND, 40 * SECOND),
-            "cancelled": c.finish(c.cancel(queued(), 20 * SECOND), 40 * SECOND, 40 * SECOND),
-        }
-
-    def test_every_valid_row_inserts(self):
-        for name, row in self.rows().items():
-            with self.subTest(name), closing(sqlite3.connect(":memory:")) as connection:
-                connection.executescript(c.JOBS_SCHEMA_SQL)
-                connection.executescript(c.JOBS_SCHEMA_SQL)  # idempotent
-                self.insert(connection, row)
-
-    def test_database_rejects_invalid_rows(self):
-        rows = self.rows()
-        updates = {
-            "terminal without receipt": "UPDATE jobs SET archive_receipt_key = NULL WHERE status = 'succeeded'",
-            "terminal without finish": "UPDATE jobs SET finished_at_ns = NULL WHERE status = 'failed'",
-            "wrong receipt key": "UPDATE jobs SET archive_receipt_key = 'x' WHERE status = 'succeeded'",
-            "pending outside archiving": "UPDATE jobs SET pending_outcome = 'failed' WHERE status = 'running'",
-            "archiving without pending": "UPDATE jobs SET pending_outcome = NULL WHERE status = 'archiving'",
-            "blocked without code": "UPDATE jobs SET blocked_reason_code = NULL WHERE status = 'archive_blocked'",
-            "nonterminal claims completion": "UPDATE jobs SET finished_at_ns = 1 WHERE status = 'running'",
-            "queued with stage": "UPDATE jobs SET stage = 'resolve' WHERE status = 'queued'",
-            "failed without code": "UPDATE jobs SET reason_code = NULL WHERE status = 'failed'",
-            "succeeded with code": "UPDATE jobs SET reason_code = 'tool_failure' WHERE status = 'succeeded'",
-            "scheduled terminal": "UPDATE jobs SET next_attempt_at_ns = 1 WHERE status = 'succeeded'",
-            "bad hash": "UPDATE jobs SET request_sha256 = 'A' || substr(request_sha256, 2) WHERE status = 'queued'",
-            "bad address": "UPDATE jobs SET submitted_by = '0xZZ' WHERE status = 'queued'",
-            "unknown code": "UPDATE jobs SET reason_code = 'oops' WHERE status = 'failed'",
-        }
-        for name, statement in updates.items():
-            with self.subTest(name), closing(sqlite3.connect(":memory:")) as connection:
-                connection.executescript(c.JOBS_SCHEMA_SQL)
-                for index, row in enumerate(rows.values()):
-                    self.insert(connection, replace(row, job_id=f"20260924T120000Z-{index:016x}", archive_receipt_key=None if row.archive_receipt_key is None else c.job_receipt_key(f"20260924T120000Z-{index:016x}")))
-                with self.assertRaises(sqlite3.IntegrityError):
-                    connection.execute(statement)
 
 
 class IdentifierTest(unittest.TestCase):

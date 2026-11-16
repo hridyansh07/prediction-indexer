@@ -14,8 +14,7 @@ ALLOWED = {
     "claims": {"derive", "store"},  # store: only DetailTooLarge, imported lazily
     "store": {"derive", "claims"},
     "ingest": {"store", "derive", "claims"},
-    "jobs": {"config"},
-    "api": {"store", "claims", "derive", "jobs", "config"},
+    "api": {"store", "claims", "derive", "config"},
     "config": set(),
     "tools": set(),  # standalone read-only diagnostics
 }

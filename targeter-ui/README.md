@@ -15,21 +15,13 @@ credentials. Event Universe owns report verification and lifecycle projection.
 
 ```text
 VITE_UNIVERSE_API_BASE_URL=https://34-182-18-247.sslip.io
-VITE_REPLAY_SIWE_DOMAIN=<the exact domain in Universe replay.auth.siwe_domain>
-VITE_REPLAY_SIWE_URI=<the exact canonical URI in Universe replay.auth.siwe_uri, including its trailing slash>
-VITE_REPLAY_SIWE_STATEMENT=Sign in to Prediction Indexer.
-VITE_REPLAY_SIWE_CHAIN_ID=1
-VITE_REPLAY_FIXTURES=false # local visual-regression builds only
 PORT=3000 # optional local static server
 ```
 
 These values are public and embedded at build time. They must contain no token,
-wallet key, signature, or other secret. The browser client validates closed
-response schemas, bounds response sizes and polling, handles `Retry-After`, and
-sends bearer sessions with `credentials: omit`. The closed session response is
-stored in browser `localStorage` so a refresh can restore the wallet, role, and
-expiry without another signature. Invalid, expired, signed-out, or rejected
-sessions are removed immediately; session tokens must never be logged.
+key, or other secret. The browser client validates closed response schemas,
+bounds response sizes and polling, and sends read-only GETs with
+`credentials: omit`. The UI has no sign-in and holds no session.
 
 The targets and decisions views resolve the newest complete run through:
 
@@ -71,19 +63,6 @@ their drawer closes.
 - `/targets` — compatibility redirect to `/`
 - `/history` — one grouped row per historically selected bundle
 - `/decisions` — latest complete run's candidate decision funnel
-- `/replay` — public Replay jobs workspace
-- `/replay/jobs/:jobId` — public Replay progress, events, request, and audit detail
-- `/replay/new` — authenticated desktop Replay request workflow
-- `/replay/admin` — admin-only allowlist management
-- `/replay/jobs/:jobId/output` — reserved Coming soon route
-
-Replay production paths use Universe directly. URL fixture controls remain for
-design regression coverage: `?auth=entry`, `?auth=expired`, list
-`?view=loading|empty|error`, detail `?state=<job-status>`, new replay
-`?fixture=true`, and admin `?state=loading|error|forbidden|ready`. Except for the
-real sign-in entry route, these controls are disabled unless the explicit
-test-only `VITE_REPLAY_FIXTURES=true` build flag is present. Never set that flag
-in a production or Vercel environment.
 
 Legacy Event Universe and operations paths redirect to the corresponding new
 routes.
@@ -93,8 +72,8 @@ routes.
 Create the Vercel project from the repository root. [`vercel.json`](../vercel.json)
 builds only the Vite client, serves `targeter-ui/dist`, and supplies the SPA
 fallback. It has no API rewrite or function. The same file supplies the public
-`VITE_UNIVERSE_API_BASE_URL` and `VITE_REPLAY_SIWE_*` production build values;
-keep them exactly aligned with Universe when either deployment changes. No AWS,
+`VITE_UNIVERSE_API_BASE_URL` production build value; keep it aligned with
+Universe when either deployment changes. No AWS,
 S3, OIDC, archive-prefix, staging, decoder, or private-key variables belong in
 Vercel.
 

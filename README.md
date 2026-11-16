@@ -25,9 +25,9 @@ targeter/            Targeter v2: discovery, matching, selection, run archive, p
 ingester/            Rust: sealed segments, ingest store, canonical windows, continuity
 encoder/             the shared Zstandard codec (Python, Rust, Node)
 archive/             raw/canonical archivers, local and GCS object stores, receipts, reapers
-universe/            event store, bundle history, outcomes, Replay jobs API
+universe/            event store, bundle history, outcomes, read API
 engine/              Rust: Replay domain, venue normalizers, derivatives, risk, Redis transport
-replay/              current strategy runtime, SDKs, bench, corpus and jobs
+replay/              current strategy runtime, SDKs, bench and corpus
   strategies/        per-strategy code, readers, configs and docs
   corpus/            resumable retired-bundle runs, receipts and deep audits
 analysis/            outcome spaces, masks and claims shared by targeter, universe, replay

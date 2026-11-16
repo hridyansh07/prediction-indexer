@@ -11,8 +11,7 @@ context or run against another.
 
 It turns a loop that has so far been run by hand into one command surface any
 agent or operator can use. The bench is for development and verification. It
-does not replace production Replay jobs ([REPLAY_JOBS_V1.md](REPLAY_JOBS_V1.md))
-or `scripts/replay_bundle.py`.
+does not replace the corpus runner (`replay/corpus/`) or `scripts/replay_bundle.py`.
 
 Nothing in the bench names a fixture, an event, a bundle or a strategy. All of
 that comes from input files the caller supplies.

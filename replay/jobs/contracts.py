@@ -1,9 +1,10 @@
-"""Closed shared contracts for Replay jobs V1 (``docs/REPLAY_JOBS_V1.md`` §3).
+"""Closed shared contracts for bundle replay: requests, bundle and job receipts, runner config.
 
 Pure: no filesystem, network, clock, or randomness; callers pass time and
-random suffixes in. The Universe server and the runner both import this module
-and neither redefines these shapes. A change here is a W0 contract amendment,
-not a local edit by one workstream.
+random suffixes in. The bundle cache, the stages and the corpus runner import
+this module and none redefines these shapes. The job-queue state machine that
+once lived here was retired; ``JobRow`` and its terminal transitions remain only
+because the archive stage's job receipt validates against them.
 """
 
 import hashlib
@@ -394,94 +395,6 @@ def new_job(job_id_value, *, submitted_by, request_sha256, now_ns):
     )
 
 
-def claimable(row, now_ns):
-    return row.status in RESUMABLE and (
-        row.next_attempt_at_ns is None or row.next_attempt_at_ns <= now_ns
-    )
-
-
-def select_next(rows, now_ns):
-    """Reference claim order: oldest claimable resumable row, else oldest queued.
-
-    A resumable row waiting on backoff, and every ``archive_blocked`` row, is
-    skipped, so neither prevents queued work from starting.
-    """
-    order = lambda row: (row.created_at_ns, row.job_id)
-    resumable = sorted((r for r in rows if claimable(r, now_ns)), key=order)
-    if resumable:
-        return resumable[0]
-    queued = sorted((r for r in rows if r.status == QUEUED), key=order)
-    return queued[0] if queued else None
-
-
-def claim(row, orchestration, now_ns):
-    """Start or resume ``row``. The attempt is counted before any work runs, so a
-    process that dies mid-stage still spends budget."""
-    backoff = orchestration.retry_backoff_seconds * 1_000_000_000
-    if row.status == QUEUED:
-        return replace(
-            row,
-            status=RUNNING,
-            stage=STAGES[0],
-            stage_attempts=1,
-            started_at_ns=now_ns,
-            next_attempt_at_ns=now_ns + backoff,
-            updated_at_ns=now_ns,
-        )
-    _require(claimable(row, now_ns), f"job {row.job_id} is not claimable now")
-    if row.status == RUNNING:
-        deadline = row.started_at_ns + orchestration.max_job_seconds * 1_000_000_000
-        if now_ns >= deadline:
-            return fail(row, "job_deadline_exceeded", None, now_ns)
-        if row.stage_attempts >= orchestration.max_stage_attempts:
-            return fail(
-                row,
-                "stage_attempts_exhausted",
-                f"stage {row.stage} started {row.stage_attempts} times",
-                now_ns,
-            )
-    elif row.stage_attempts >= orchestration.max_stage_attempts:
-        return block_archive(row, "stage_attempts_exhausted", now_ns)
-    return replace(
-        row,
-        stage_attempts=row.stage_attempts + 1,
-        next_attempt_at_ns=now_ns + backoff,
-        updated_at_ns=now_ns,
-    )
-
-
-def advance(row, stage, now_ns):
-    """Commit the current work stage and start the next; the running attempt counts."""
-    _require(row.status == RUNNING, "only running jobs advance")
-    _require(
-        stage in WORK_STAGES and STAGES.index(stage) == STAGES.index(row.stage) + 1,
-        f"stage {stage!r} does not follow {row.stage!r}",
-    )
-    return replace(row, stage=stage, stage_attempts=1, reason_code=None, reason_detail=None, updated_at_ns=now_ns)
-
-
-def retry_later(row, code, detail, orchestration, now_ns):
-    """A retryable failure: keep the stage, wait for backoff."""
-    _require(row.status in RESUMABLE, "only resumable jobs retry")
-    _require(code in RETRYABLE_CODES, f"{code!r} is not retryable")
-    backoff = orchestration.retry_backoff_seconds * 1_000_000_000
-    if row.status == ARCHIVING:
-        # Pending outcome evidence is frozen before archival. Archive diagnostics
-        # belong to the runner's durable reconciliation state, not this row.
-        return replace(
-            row,
-            next_attempt_at_ns=now_ns + backoff,
-            updated_at_ns=now_ns,
-        )
-    return replace(
-        row,
-        reason_code=code,
-        reason_detail=reason_detail(detail) if detail else None,
-        next_attempt_at_ns=now_ns + backoff,
-        updated_at_ns=now_ns,
-    )
-
-
 def _enter_archiving(row, outcome, code, detail, now_ns):
     return replace(
         row,
@@ -496,62 +409,10 @@ def _enter_archiving(row, outcome, code, detail, now_ns):
     )
 
 
-def succeed(row, now_ns):
-    _require(row.status == RUNNING and row.stage == "read", "only a read-complete job succeeds")
-    return _enter_archiving(row, SUCCEEDED, None, None, now_ns)
-
-
-def fail(row, code, detail, now_ns):
-    """End the work stages with an outcome code; archival follows."""
-    _require(row.status == RUNNING, "only running jobs end their work stages")
-    _require(code in OUTCOME_OF_CODE and code != "cancelled", f"{code!r} is not a work outcome")
-    return _enter_archiving(row, OUTCOME_OF_CODE[code], code, detail, now_ns)
-
-
 def cancel(row, now_ns):
     """Only a queued job can be cancelled in V1; the runner archives it."""
     _require(row.status == QUEUED, "only queued jobs can be cancelled")
     return _enter_archiving(row, CANCELLED, "cancelled", None, now_ns)
-
-
-def lose_local_state(row, detail, now_ns):
-    """The job directory is missing or invalid. Never rebuild it under this ID."""
-    _require(row.status in RESUMABLE, "only resumable jobs can lose local state")
-    if row.status == RUNNING:
-        return fail(row, "local_state_lost", detail, now_ns)
-    return replace(
-        row,
-        pending_outcome=FAILED,
-        reason_code="local_state_lost",
-        reason_detail=reason_detail(detail) if detail else None,
-        updated_at_ns=now_ns,
-    )
-
-
-def block_archive(row, code, now_ns):
-    _require(row.status == ARCHIVING, "only archiving jobs block")
-    _require(code in ARCHIVE_BLOCK_CODES, f"{code!r} is not an archive block code")
-    return replace(
-        row,
-        status=ARCHIVE_BLOCKED,
-        blocked_reason_code=code,
-        blocked_at_ns=now_ns,
-        next_attempt_at_ns=None,
-        updated_at_ns=now_ns,
-    )
-
-
-def resume_blocked(row, now_ns):
-    """Manual operator action after fixing the archive backend."""
-    _require(row.status == ARCHIVE_BLOCKED, "only blocked jobs resume")
-    return replace(
-        row,
-        status=ARCHIVING,
-        stage_attempts=0,
-        blocked_reason_code=None,
-        blocked_at_ns=None,
-        updated_at_ns=now_ns,
-    )
 
 
 def finish(row, finished_at_ns, now_ns):
@@ -597,62 +458,6 @@ JOB_COLUMNS = (
     "blocked_at_ns",
     "archive_receipt_key",
 )
-
-
-def _sql_set(values):
-    return "(" + ", ".join(f"'{v}'" for v in sorted(values)) + ")"
-
-
-_TERMINAL_SQL = _sql_set(TERMINAL)
-_JOB_ID_GLOB = "[0-9]" * 8 + "T" + "[0-9]" * 6 + "Z-" + "[0-9a-f]" * 16
-
-JOBS_SCHEMA_SQL = f"""
-CREATE TABLE IF NOT EXISTS jobs (
-    job_id TEXT PRIMARY KEY CHECK(job_id GLOB '{_JOB_ID_GLOB}'),
-    created_at_ns INTEGER NOT NULL CHECK(created_at_ns >= 0),
-    submitted_by TEXT NOT NULL CHECK(
-        length(submitted_by) = 42 AND substr(submitted_by, 1, 2) = '0x'
-        AND substr(submitted_by, 3) NOT GLOB '*[^0-9a-f]*'
-    ),
-    request_json BLOB NOT NULL,
-    request_sha256 TEXT NOT NULL CHECK(
-        length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
-    ),
-    status TEXT NOT NULL CHECK(status IN {_sql_set(STATUSES)}),
-    stage TEXT CHECK(stage IS NULL OR stage IN {_sql_set(STAGES)}),
-    stage_attempts INTEGER NOT NULL CHECK(stage_attempts >= 0),
-    next_attempt_at_ns INTEGER,
-    started_at_ns INTEGER,
-    updated_at_ns INTEGER NOT NULL,
-    finished_at_ns INTEGER,
-    pending_outcome TEXT CHECK(pending_outcome IS NULL OR pending_outcome IN {_TERMINAL_SQL}),
-    reason_code TEXT CHECK(reason_code IS NULL OR reason_code IN {_sql_set(REASON_CODES)}),
-    reason_detail TEXT CHECK(reason_detail IS NULL OR length(reason_detail) <= {MAX_REASON_DETAIL}),
-    blocked_reason_code TEXT CHECK(
-        blocked_reason_code IS NULL OR blocked_reason_code IN {_sql_set(ARCHIVE_BLOCK_CODES)}
-    ),
-    blocked_at_ns INTEGER,
-    archive_receipt_key TEXT,
-    CHECK((status IN ('archiving', 'archive_blocked')) = (pending_outcome IS NOT NULL)),
-    CHECK((status = 'archive_blocked') = (blocked_reason_code IS NOT NULL)),
-    CHECK((status = 'archive_blocked') = (blocked_at_ns IS NOT NULL)),
-    CHECK((status IN {_TERMINAL_SQL}) = (finished_at_ns IS NOT NULL)),
-    CHECK((status IN {_TERMINAL_SQL}) = (archive_receipt_key IS NOT NULL)),
-    CHECK(archive_receipt_key IS NULL
-          OR archive_receipt_key = 'replay/jobs/' || job_id || '/job_receipt.json'),
-    CHECK(next_attempt_at_ns IS NULL OR status IN ('running', 'archiving')),
-    CHECK(status <> 'queued' OR (stage IS NULL AND stage_attempts = 0
-                                 AND started_at_ns IS NULL AND reason_code IS NULL)),
-    CHECK(status <> 'running' OR (stage IS NOT NULL AND stage <> 'archive'
-                                  AND stage_attempts >= 1 AND started_at_ns IS NOT NULL)),
-    CHECK(status IN ('queued', 'running') OR stage = 'archive'),
-    CHECK(status <> 'succeeded' AND coalesce(pending_outcome, '') <> 'succeeded'
-          OR reason_code IS NULL),
-    CHECK(status NOT IN ('failed', 'exhausted', 'not_ready', 'stale_bundle_cache', 'cancelled')
-          OR reason_code IS NOT NULL)
-) STRICT;
-CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status, created_at_ns, job_id);
-"""
 
 
 def job_id(now_ns, suffix_hex):
