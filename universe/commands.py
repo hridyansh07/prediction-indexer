@@ -8,14 +8,10 @@ import json
 from datetime import datetime, timezone
 
 from encoder import StoredIdentity
-from replay.jobs.contracts import parse_runner_config
 from universe.api import serve as serve_api
-from universe.api.rate_limit import RateLimiter
 from universe.config import load_config
 from universe.ingest.backfill import backfill_targeter_history
 from universe.ingest.sync import UniverseSync
-from universe.jobs.auth import AuthStore
-from universe.jobs.store import ReplayJobStore
 from universe.store import SQLITE_CONTENT_TYPE, UniverseStore, file_sha256
 
 
@@ -24,23 +20,7 @@ def serve() -> None:
     config = load_config()
     database = UniverseStore(config.database_path)
     database.initialize()
-    auth = AuthStore(config.replay.database_path, config.replay.auth)
-    auth.initialize()
-    runner_config = parse_runner_config(
-        config.replay.jobs.runner_config_path.read_bytes()
-    )
-    replay_jobs = ReplayJobStore(config.replay.database_path, config.replay.jobs)
-    replay_jobs.initialize()
-    rate_limiter = RateLimiter(config.replay.rate_limit, auth)
-    serve_api(
-        database,
-        auth,
-        config.api.host,
-        config.api.port,
-        replay_jobs,
-        runner_config,
-        rate_limiter,
-    )
+    serve_api(database, config.api.host, config.api.port)
 
 
 def sync() -> int:

@@ -1,17 +1,11 @@
 # Universe
 
-The Universe server is the query and control-plane service in front of committed
-Targeter runs. It has three roles:
-
-1. **Event Universe**: a rebuildable SQLite view of committed Targeter v3 runs
-   (events, venue events, canonical and venue markets, selection decisions,
-   claims, bundle history), served read-only over HTTP.
-2. **Authentication**: Sign-In With Ethereum (SIWE) sessions and a member
-   allowlist.
-3. **Replay jobs control plane**: durable submission, idempotency, quota and
-   transition records for Replay jobs (`universe/jobs/store.py`). The runner
-   that executes jobs lives under `replay/` (see
-   [`docs/REPLAY_JOBS_V1.md`](../docs/REPLAY_JOBS_V1.md)).
+The Universe server is the read-only query service in front of committed
+Targeter runs: a rebuildable SQLite view of committed Targeter v3 runs (events,
+venue events, canonical and venue markets, selection decisions, claims, bundle
+history), served over HTTP. It has no authentication, no write routes and no job
+queue; the Replay jobs control plane and SIWE sign-in were retired in favour of
+the corpus runner (`replay/corpus/`).
 
 The SQLite database is a query accelerator, not an evidence archive. Immutable
 Targeter run manifests and their objects in the configured object store remain
@@ -23,13 +17,13 @@ credentials; sync, backfill and backup own all archive access.
 ## Commands
 
 Servers and jobs read the JSON config named by `EVENT_UNIVERSE_CONFIG`
-(default `configs/event_universe.json`, config version 4;
+(default `configs/event_universe.json`, config version 5;
 `${VAR}` references are expanded, an unset reference is an error). Unknown
 fields are rejected.
 
 | Command | Purpose |
 |---|---|
-| `python -m universe serve` | Open/initialize all three SQLite schemas and serve the API (`ThreadingHTTPServer`, host/port from `api`) |
+| `python -m universe serve` | Open/initialize the SQLite schema and serve the API (`ThreadingHTTPServer`, host/port from `api`) |
 | `python -m universe sync` | One-shot incremental ingestion of newly committed runs |
 | `python -m universe backfill` | One-shot oldest-first backfill of `backfill.generated_start` to `backfill.generated_end` (both required) |
 | `python -m universe backup` | Online-backup the SQLite file, upload it immutably under `backup.object_prefix`, print path, key, SHA-256, length |
@@ -240,33 +234,6 @@ Read (no authentication):
 | `GET /v1/runs/<run_id>`, `/audit`, `/selections`, `/selections/<bundle_id>` | Run detail, audit, and its selections |
 | `GET /v1/relationship-types` | Closed stored relation-type catalogue (version 2: IMPLICATION, MUTUAL_EXCLUSION) |
 
-Authentication and administration:
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /v1/auth/nonce` | Issue a SIWE nonce |
-| `POST /v1/auth/siwe` `{message, signature}` | Verify and open a bearer session |
-| `POST /v1/auth/logout` `{}` | Revoke the bearer session |
-| `GET /v1/admin/allowlist` | List members (admin) |
-| `POST /v1/admin/allowlist` `{address, note}` | Add a member (admin) |
-| `DELETE /v1/admin/allowlist/<address>` | Remove a member (admin); the configured admin cannot be removed |
-
-Replay jobs (served only when auth and the replay job store are configured):
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /v1/replay/strategies` | Strategy registry from the runner config |
-| `GET /v1/replay/jobs?status=&limit=&cursor=` | List jobs |
-| `GET /v1/replay/jobs/<job_id>` | Job record (validated against the registry at submission, not re-validated on read) |
-| `GET /v1/replay/jobs/<job_id>/events` | Append-only transition events |
-| `POST /v1/replay/jobs` | Submit (member; exactly one `Idempotency-Key` header). 201 on create, 200 with `replayed: true` for an idempotent repeat |
-| `POST /v1/replay/jobs/<job_id>/cancel` `{}` | Cancel (member) |
-
-Submission requires the bundle to exist in the selection history and respects
-the configured quotas (`max_active_jobs_total`, `max_active_jobs_per_submitter`,
-`max_queued_jobs_total`). A retired strategy still resolves for an idempotent
-repeat of an earlier submission; new jobs naming it are refused.
-
 `GET /v1/targeter/cadence` and `/v1/relations/<id>` no longer exist (404).
 
 The outcomes document is version 2. Each market adds closed `execution_terms`
@@ -280,22 +247,6 @@ delay values are observed `null`. Before the first change the delay is unknown.
 Strict preparation readers continue accepting version-1 outcomes as unavailable
 terms. The full mechanism contract is
 [`EXECUTION_DELAY_V1.md`](../docs/specs/EXECUTION_DELAY_V1.md).
-
-## Authentication and rate limiting
-
-`universe/jobs/auth.py` implements SIWE: the server issues a nonce (kept in process
-memory with a TTL, at most 500 live, lost on restart), verifies the signed
-message against the configured domain, URI, statement and chain ID, and issues
-a bearer token whose SHA-256 digest is stored in `sessions`. A member must be on
-the allowlist; the configured `admin_address` is the admin. Allowlist changes are
-recorded in the append-only `allowlist_events` table. Failed sign-ins return a
-uniform 401. Session and nonce TTLs come from `replay.auth`.
-
-`universe/api/rate_limit.py` applies a bounded in-process token bucket only to
-requests whose TCP peer is in `replay.rate_limit.trusted_proxy_addresses`
-(the reverse proxy); it keys on the final `X-Forwarded-For` address for
-unauthenticated requests and on the session otherwise. Direct internal callers
-are exempt. Exceeding the limit returns 429 with `Retry-After`.
 
 ## Schema and migrations
 
@@ -324,15 +275,10 @@ Two independent SQLite files:
   a missing row remains distinct from a row with unknown delay. v7 is exactly
   m1 output (totals corrections, migration metadata and relaxed projection CHECK),
   with no execution-terms objects. v8 adds the terms table and indexes.
-- **Replay database** (`replay.database_path`, `jobs.sqlite3`): additive,
-  non-rebuildable. `schema/replay_auth.sql` (`sessions`, `allowlist`,
-  `allowlist_events`) and `schema/replay_jobs.sql` (job rows, idempotency
-  `job_submissions`, component metadata, append-only `job_events`) coexist in one
-  file; neither uses `user_version`. Each component validates only its own
-  objects; replay jobs compares a SHA-256 over its ordered,
-  whitespace-normalized `sqlite_master` definitions. SIWE nonces are not
-  persisted. Never place these records in the rebuildable Event Universe
-  database or remove them during a rebuild.
+
+An older deployment may still hold `jobs.sqlite3` (the retired Replay jobs and
+SIWE tables). Nothing creates, reads or writes it any more; it can be archived
+and deleted by the operator.
 
 ### Offline migration and its limits
 
@@ -471,20 +417,18 @@ serving equivalence cannot be shown.
 |---|---|
 | `__main__.py`, `commands.py` | `python -m universe {serve,sync,backfill,backup,migrate}` |
 | `config.py` | Closed JSON config |
-| `schema/` | `schema.sql`, `replay_auth.sql`, `replay_jobs.sql` |
+| `schema/` | `schema.sql` |
 | `store/` | `UniverseStore` facade over `connection.py` (open, pragmas, schema validation), `ingest_tx.py` (the admitted-run write transaction, checkpoints, sync-failure ledger), `reads/` (`health`, `runs`, `events`, `markets`, `claims`, `bundles`), `backup.py`, shared row helpers in `records.py` and response limits in `limits.py` |
 | `ingest/` | `sync.py`, `backfill.py`: verified archive retrieval, ingestion, retry ledger; `migrations.py`: offline copy-based migrations |
 | `derive/` | `projection.py`, `market_projection.py`, `event_identity.py`: bundle history and market projections, identity allocation |
 | `claims/` | `claim_projection.py`, `outcomes.py`: claim reconstruction and the ingestion equivalence check; bundle outcomes read |
-| `api/` | `server.py` (application and HTTP handler), `routes.py` (the ordered route table), `framing.py` (validation, cursors, body framing, error mapping, response budget), `rate_limit.py`, `replay_jobs.py` (auth and job endpoints) |
+| `api/` | `server.py` (application and HTTP handler), `routes.py` (the ordered route table), `framing.py` (validation, cursors, error mapping, response budget) |
 | `tools/` | `rebuild_diff.py`: read-only comparison of two Event Universe SQLite files (standalone, imports nothing from Universe) |
-| `jobs/` | `store.py` (durable Replay jobs store) and `auth.py` (SIWE sessions, allowlist); retiring with the jobs UI |
 
 Dependencies point one way: `derive` imports nothing else from Universe;
 `claims` imports `derive` (and the store's `DetailTooLarge`, lazily); `store`
 imports `derive` and `claims`; `ingest` imports `store`, `derive` and `claims`;
-`jobs` imports only `config`; `api` imports `store`, `claims`, `derive`, `jobs`
-and `config`. Nothing below `api`/`ingest` imports them.
+`api` imports `store`, `claims`, `derive` and `config`. Nothing below `api`/`ingest` imports them.
 `tests/test_universe_layout.py` asserts this.
 
 `rebuild_diff` additionally reports the new file's execution-terms row counts

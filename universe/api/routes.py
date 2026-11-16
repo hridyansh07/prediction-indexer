@@ -1,11 +1,9 @@
-"""One route table replacing the former if-chain: ``(method, pattern, handler, requires)``.
+"""One route table replacing the former if-chain: ``(method, pattern, handler)``.
 
 The first matching route wins, in exactly the former order. ``Exact`` compares the
 whole path. ``Prefix`` tests ``startswith``/``endswith`` and hands the handler the
 remainder after ``removeprefix``/``removesuffix``, the same string operations the
-if-chain used. ``requires`` names an optional application component (``auth``,
-``replay_jobs`` or ``runner_config``); when it is absent the route is skipped, as
-the former ``and self.<component> is not None`` conditions did.
+if-chain used. The API is read-only: every route is a GET.
 """
 
 from __future__ import annotations
@@ -14,7 +12,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Callable
 
-from universe.api import replay_jobs as jobs
 from universe.api.framing import _integer, _only, _optional_positive_integer, _path_value
 from universe.store import BundleEventConflict
 
@@ -29,8 +26,6 @@ class Request:
     query: dict[str, list[str]]
     headers: Any
     value: str = ""  # the path remainder a Prefix pattern matched
-    document: dict[str, Any] | None = None
-    raw_body: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +52,6 @@ class Route:
     method: str
     pattern: Exact | Prefix
     handler: Callable[[UniverseApplication, Request], Response]
-    requires: str | None = None
 
 
 def _relationship_types() -> dict[str, Any]:
@@ -222,12 +216,6 @@ def run_paths(app: UniverseApplication, r: Request) -> Response:
 
 
 ROUTES: tuple[Route, ...] = (
-    Route("GET", Exact("/v1/auth/nonce"), jobs.nonce, "auth"),
-    Route("GET", Exact("/v1/admin/allowlist"), jobs.list_members, "auth"),
-    Route("GET", Exact("/v1/replay/jobs"), jobs.list_jobs, "replay_jobs"),
-    Route("GET", Exact("/v1/replay/strategies"), jobs.strategies, "runner_config"),
-    Route("GET", Prefix("/v1/replay/jobs/", "/events"), jobs.job_events, "replay_jobs"),
-    Route("GET", Prefix("/v1/replay/jobs/"), jobs.job, "replay_jobs"),
     Route("GET", Exact("/healthz"), health),
     Route("GET", Exact("/v1/runs"), runs),
     Route("GET", Exact("/v1/selections"), selections),
@@ -243,11 +231,4 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", Prefix("/v1/bundles/", "/outcomes"), bundle_outcomes),
     Route("GET", Prefix("/v1/bundles/", "/history"), bundle_history),
     Route("GET", Prefix("/v1/runs/"), run_paths),
-    # POST and DELETE run only when auth is configured and the query is empty.
-    Route("POST", Exact("/v1/auth/siwe"), jobs.siwe),
-    Route("POST", Exact("/v1/auth/logout"), jobs.logout),
-    Route("POST", Exact("/v1/admin/allowlist"), jobs.add_member),
-    Route("POST", Exact("/v1/replay/jobs"), jobs.submit, "replay_jobs"),
-    Route("POST", Prefix("/v1/replay/jobs/", "/cancel"), jobs.cancel, "replay_jobs"),
-    Route("DELETE", Prefix("/v1/admin/allowlist/"), jobs.remove_member),
 )

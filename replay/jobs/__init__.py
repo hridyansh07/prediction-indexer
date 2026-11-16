@@ -1,5 +1,6 @@
-"""Replay jobs V1: registration, queueing, and end-to-end bundle replay.
+"""Bundle materialization, preparation stages and shared contracts.
 
-See ``docs/REPLAY_JOBS_V1.md``. ``replay.jobs.contracts`` is the shared, pure
-contract module imported by both the Universe server and the runner.
+``replay.jobs.contracts`` is the shared, pure contract module used by the bundle
+cache, the stages and the corpus runner (``replay/corpus/``). The job queue and
+runner that once lived here were retired.
 """

@@ -55,12 +55,9 @@ COPY --from=rust-builder /build/engine/target/release/examples/materialize_range
 RUN python -m pip install ".[replay-redis]" \
     && test -x /usr/local/bin/replay-publish \
     && materialize_range --describe >/tmp/materializer-descriptor.json \
-    && python -c "import json,replay.jobs,replay.ops; json.load(open('/tmp/materializer-descriptor.json'))" \
+    && python -c "import json,replay.jobs.contracts; json.load(open('/tmp/materializer-descriptor.json'))" \
     && rm /tmp/materializer-descriptor.json
 
 LABEL org.opencontainers.image.revision=${REPLAY_IMAGE_REVISION}
 
 USER replay:replay
-
-ENTRYPOINT ["python", "-m", "replay.jobs"]
-CMD ["tick", "/etc/prediction-indexer/replay_runner.json"]

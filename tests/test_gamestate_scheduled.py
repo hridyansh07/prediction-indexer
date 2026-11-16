@@ -107,7 +107,7 @@ class ScheduledTests(unittest.TestCase):
 
     def test_job_temporary_storage_fits_the_adapter_raw_bound(self):
         compose = Path("compose.universe.yaml").read_text()
-        service = compose.split("  event-universe-game-state:\n", 1)[1].split("\n  replay-redis:", 1)[0]
+        service = compose.split("  event-universe-game-state:\n", 1)[1].split("\n  caddy:", 1)[0]
         self.assertIn("/tmp:size=512m", service)
 
     def test_permanently_bad_live_data_stops_after_the_retry_budget(self):

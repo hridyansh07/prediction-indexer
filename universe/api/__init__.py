@@ -1,4 +1,4 @@
-"""HTTP surface: server, routing, framing and rate limiting."""
+"""HTTP surface: read-only server, routing and framing."""
 
 from universe.api.server import UniverseApplication, build_server, serve
 
