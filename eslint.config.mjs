@@ -7,7 +7,6 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
-      '**/dist-server/**',
       '**/node_modules/**',
       'encoder/rust/target/**',
     ],
@@ -27,8 +26,6 @@ export default tseslint.config(
   {
     files: [
       'api/**/*.ts',
-      'encoder/node/**/*.ts',
-      'targeter-ui/src/server/**/*.ts',
       'targeter-ui/test/**/*.ts',
       'targeter-ui/vite.config.ts',
     ],

@@ -1,5 +1,4 @@
 **/dist/
-**/dist-server/
 **/node_modules/
 encoder/rust/target/
 yarn.lock

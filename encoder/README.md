@@ -8,8 +8,6 @@ while measuring both sides of the operation.
 encoder/compression.py   Python: encode_stream / decode_stream, identities
 encoder/whole_buffer.py  test-only conveniences built on those two
 encoder/rust/            same contract over Read and Write (crate prediction-encoder)
-encoder/rust/src/bin/decode_v1.rs   CLI wrapper around the Rust decoder
-encoder/node/            TypeScript RustV1Decoder that spawns decode_v1 (no codec of its own)
 encoder/fixtures/        cross-language proof: roundtrip_v1.{ndjson,python.ndjson.zst,rust.ndjson.zst,json}
 ```
 
