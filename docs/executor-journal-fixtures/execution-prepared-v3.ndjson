@@ -1,0 +1,1 @@
+{"version":3,"run":"11","sequence":2,"record":{"kind":"prepared","intent":"93","command":"42","summary":{"instrument":{"venue":"Kalshi","instrument":"2","outcome":"7","asset":"9"},"side":"Buy","quantity":{"atoms":"3170000","atoms_per_unit":1000000},"notional":{"atoms":"1657910","atoms_per_unit":1000000},"limit":{"atoms":"523000","atoms_per_unit":1000000},"client_order_id":"42"}}}
